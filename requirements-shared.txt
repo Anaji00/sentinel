@@ -1,0 +1,13 @@
+# Install everything with: pip install -r requirements-shared.txt
+kafka-python==2.0.2
+pydantic==1.10.13
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+neo4j==5.14.1
+redis==5.0.1
+aiohttp==3.9.1
+websockets==12.0
+feedparser==6.0.11
+honcho==1.1.0
+spacy==3.7.2
+# After pip install, also run: python -m spacy download en_core_web_sm

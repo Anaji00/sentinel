@@ -1,0 +1,33 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Node (future frontend)
+node_modules/
+.next/
+
+# Logs
+*.log
+
+# Docker volumes (if accidentally created locally)
+postgres_data/
+neo4j_data/
+redis_data/
+kafka_data/

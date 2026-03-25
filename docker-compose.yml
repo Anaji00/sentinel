@@ -1,0 +1,228 @@
+# infrastructure only (Kafka, DBs, Redis)
+
+version: '3.8'
+# Specifies the Docker Compose file version. Think of it as setting the "language" Docker Compose understands.
+
+# Infrastructure only — no app services here.
+# Start with: docker-compose up -d
+# Then run services with: honcho start
+
+# Define the services that make up the application.
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    # Zookeeper:  A centralized service for maintaining configuration information, naming, providing distributed synchronization, and group services. Kafka uses it to manage brokers.  Think of it as a phonebook for Kafka.
+    container_name: sentinel-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      # ZOOKEEPER_CLIENT_PORT: The port that Zookeeper listens on for client connections.
+      # ZOOKEEPER_TICK_TIME: The basic unit of time in milliseconds used by Zookeeper.
+    ports:
+      - "2181:2181"
+      # Maps port 2181 on your computer to port 2181 inside the Zookeeper container.  This allows you to connect to Zookeeper from your local machine.
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+      # zookeeper_data:  A named volume that persists Zookeeper's data across container restarts.  This prevents data loss when the container is stopped or restarted.
+      # zookeeper_log: Persists Zookeeper logs across container restarts.
+    healthcheck: # Checks if Zookeeper is healthy and responsive.
+      test: echo ruok | nc localhost 2181 | grep imok
+      interval: 10s # How often to perform the health check.
+      timeout: 5s
+      retries: 10 # How many times to retry the health check before considering Zookeeper unhealthy.
+      # Check Zookeeper's health by sending the 'ruok' command and checking for 'imok' response.
+  kafka:
+    # Apache Kafka is a distributed event streaming platform.
+    # Kafka is like a central hub for messages, where different parts of your application can send and receive data.
+
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sentinel-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      # Maps port 9092 on the host to port 9092 on the container.
+      - "9092:9092" # Maps port 9092 on your computer to port 9092 inside the Kafka container, making Kafka accessible locally.
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      # KAFKA_BROKER_ID: Unique ID for the Kafka broker.
+      # KAFKA_ZOOKEEPER_CONNECT: Specifies the Zookeeper connection string.
+      # KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: Configures the security protocol for listeners.
+      # KAFKA_ADVERTISED_LISTENERS: Defines the listeners that clients use to connect to Kafka.
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      # KAFKA_INTER_BROKER_LISTENER_NAME: Listener name for communication between brokers.
+      # KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: Replication factor for the Kafka offsets topic.
+      # KAFKA_AUTO_CREATE_TOPICS_ENABLE: Enables automatic topic creation.
+      # KAFKA_LOG_RETENTION_HOURS: How long Kafka should retain logs.
+      # KAFKA_MESSAGE_MAX_BYTES: The maximum allowable size of a message.
+    volumes:
+      - kafka_data:/var/lib/kafka/data # A named volume that stores Kafka's data. This ensures data is not lost when the container is stopped or restarted.
+      # Persists Kafka data across container restarts.
+    healthcheck: # Configures a health check to ensure Kafka is running properly.
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092
+      interval: 15s # How often to check Kafka's health.
+      timeout: 10s # How long to wait for Kafka to respond before considering it unhealthy.
+      # Checks if the Kafka broker is running by querying its API versions.
+      retries: 15 # The number of times to retry the health check.
+      start_period: 30s #  How long to wait before starting the health check after the container starts.
+     # ── KAFKA UI ───────────────────────────────────────────────────────────────
+    # Open http://localhost:8080 to watch topics in real time
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    # Kafka UI gives you a web-based view of your Kafka data.
+
+    container_name: sentinel-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      # Maps port 8080 on the host to port 8080 on the container.
+    environment: # Environment variables to configure Kafka UI to connect to your Kafka cluster.
+      KAFKA_CLUSTERS_0_NAME: sentinel-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      # KAFKA_CLUSTERS_0_NAME: Name of the Kafka cluster.
+      # KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: Kafka bootstrap servers.
+      # KAFKA_CLUSTERS_0_ZOOKEEPER: Zookeeper connection string.
+    # ── TIMESCALEDB ────────────────────────────────────────────────────────────
+    # PostgreSQL + time-series extension + PostGIS
+  timescaledb:
+    # TimescaleDB: A time-series database built on PostgreSQL. It's designed for storing and analyzing data that changes over time, like sensor readings or stock prices.
+    # TimescaleDB is a time-series database built on PostgreSQL.
+    image: timescale/timescaledb-ha:pg15-;atest
+    container_name: sentinel-timescaledb
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    volumes:
+      - timescaledb_data:/home/postgres/pgdata/data
+      # timescaledb_data:  A named volume for storing TimescaleDB data, ensuring data persistence.
+      - ./shared/db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql # Executes this SQL file when TimescaleDB starts, setting up the database schema.
+      # ./shared/db/init.sql: Initializes the database schema when the container starts.
+    healthcheck:
+      test: pg_isready -U sentinel -d sentinel
+      interval: 10s # How often to check if the database is ready.
+      timeout: 5s
+      # Checks if the PostgreSQL server is ready to accept connections.
+      # -U sentinel: Specifies the user to connect as.
+      # -d sentinel: Specifies the database to connect to.
+      retries: 10
+      start_period: 20s
+    # ── NEO4J ──────────────────────────────────────────────────────────────────
+  # Entity graph — vessel ownership, company networks, sanctions links
+  # Browser: http://localhost:7474  (neo4j / sentinel_graph)
+  neo4j:
+    image: neo4j:5.13
+    # Neo4j: A graph database that stores data as nodes and relationships, making it ideal for analyzing connections between data points.
+    container_name: sentinel-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474" # Browser
+      - "7687:7687" # Bolt protocol
+    environment:
+      NEO4J_AUTH: neo4j/sentinel_graph
+      # NEO4J_AUTH: Sets the authentication credentials for Neo4j.
+      NEO4J_PLUGINS: '["apoc"]'
+       # NEO4J_PLUGINS: Installs the APOC (Awesome Procedures On Cypher) plugin.
+      NEO4J_dbms_security_procedures_unrestricted: apoc.* # Allow unrestricted access to APOC procedures
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_dbms_memory_pagecache_size: 512m
+      # NEO4J_dbms_security_procedures_unrestricted: apoc.*: Grants unrestricted access to APOC procedures.
+      # NEO4J_server_memory_heap_initial__size: Sets the initial heap size for the Neo4j server.
+      # NEO4J_server_memory_heap_max__size: Sets the maximum heap size for the Neo4j server.
+      # NEO4J_dbms_memory_pagecache_size: Sets the page cache size for Neo4j.
+    volumes:
+      - neo4j_data:/data
+      # neo4j_data: Persists Neo4j data across container restarts.
+      - neo4g_logs:/logs
+      # neo4g_logs: Persists Neo4j logs across container restarts.
+    healthcheck: # Checks if Neo4j is responsive.
+      test: wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      # Checks if the Neo4j server is running by sending an HTTP request to its web interface.
+      start_period: 30s
+    # ── REDIS ─────────────────────────────────────────────────────────────────\
+  redis:
+    image: redis:7.2-alpine # Redis is an in-memory data structure store, used as a database, cache and message broker.
+    container_name: sentinel-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+      # Maps port 6379 on the host to port 6379 on the container.
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      # redis_data: Persists Redis data across container restarts.
+    healthcheck:
+      test: redis-cli ping || exit 1 # Uses the redis-cli to send a ping command. If redis is running it will respond with a PONG.
+      interval: 5s
+      timeout: 3s
+      # Checks if the Redis server is running by sending a PING command.
+      retries: 15
+
+# Volumes save data even when the containers are stopped and started
+volumes:
+  zookeeper_data:
+    # zookeeper_data: Persists Zookeeper data across container restarts.
+  zookeeper_log:
+  kafka_data:
+  timescaledb_data:
+  neo4j_data:
+  neo4g_logs:
+  redis_data:
+
+networks:
+  default:
+    # Connects all the services together so they can talk to each other.
+    # sentinel-network: all containers are on the same network, allowing them to communicate using their service names as hostnames.
+    name: sentinel-network
+
+# Overview of the Infrastructure:
+#
+# This docker-compose.yml file sets up the core infrastructure for a data-intensive application. It includes:
+#
+# 1. Zookeeper: Manages and coordinates Kafka brokers.  It's the central authority for cluster metadata.
+# 2. Kafka: A distributed streaming platform used for building real-time data pipelines and streaming applications.  It allows different parts of the application to communicate asynchronously.
+# 3. Kafka UI: A web interface for monitoring and managing Kafka topics, partitions, and consumers.
+# 4. TimescaleDB: A time-series database built on PostgreSQL, optimized for storing and querying time-stamped data.
+# 5. Neo4j: A graph database used for storing and querying relationships between entities.
+# 6. Redis: An in-memory data store used as a cache, message broker, and database.
+#
+# How They Connect and Run:
+#
+# - Docker Compose orchestrates the startup and shutdown of these services.
+# - The `depends_on` directive ensures that services are started in the correct order (e.g., Kafka starts after Zookeeper).
+# - The `networks` section creates a network that allows the services to communicate with each other using their service names as hostnames.
+# - Each service exposes ports that allow you to access them from your local machine.
+# - Volumes are used to persist data across container restarts.
+#
+# Data Flow:
+#
+# - Data can be ingested into Kafka from various sources.
+# - Kafka streams can be consumed by applications that process and transform the data.
+# - Processed data can be stored in TimescaleDB for time-series analysis or in Neo4j for relationship analysis.
+# - Redis can be used to cache frequently accessed data to improve performance.
+#
+# This infrastructure provides a foundation for building scalable and resilient data-driven applications.
