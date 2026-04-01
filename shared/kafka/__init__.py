@@ -143,15 +143,19 @@ class SentinelConsumer:
             # Every 1 second, the code tells Kafka "I've finished reading up to Page 50".
             # If the code crashes and restarts, it looks up the bookmark and starts at Page 51.
             # (It's simpler than doing it manually, though slightly less precise).
-            enable_auto_commit=True,
-            auto_commit_interval_ms=1000,
+            enable_auto_commit=False,
         )
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
 
     def __iter__(self):
         return iter(self._c)
+    
+    def commit(self):
+        self._c.commit()
         
     def close(self):
         self._c.close()
+
+    
 
     

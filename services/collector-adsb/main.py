@@ -204,7 +204,7 @@ async def poll_zone(
                     if not parsed or parsed["latitude"] is None:
                         continue  # Skip malformed or positionless vectors
 
-                    squawk = str(parsed.get("squawk") pr "").strip()
+                    squawk = str(parsed.get("squawk") or "").strip()
                     is_emergency = squawk in EMERGENCY_SQUAWKS
 
                     event = RawEvent(

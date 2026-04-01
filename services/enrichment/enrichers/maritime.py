@@ -98,7 +98,7 @@ class MaritimeEnricher:
 
         # 5. WRITE TO DB (The Archive)
         # Store the raw ping in the massive TimescaleDB table.
-        self.db.write_vessel_position(
+        self.db_writer.write_vessel_position(
             mmsi, lat, lon, speed, heading, nav_status,
             raw.occurred_at or datetime.now(timezone.utc),
         )
@@ -117,7 +117,7 @@ class MaritimeEnricher:
         
         # 7. UPDATE GRAPH (The Knowledge Base)
         # Update the Node in Neo4j. This is "upsert" - creates it if missing.
-        self.graph.upsert_vessel(mmsi, {
+        self.graph_writer.upsert_vessel(mmsi, {
             "name": vessel.get("name", ""),
             "vessel_type": vtype,
             "flag_state": vessel.get("flag_state", ""),

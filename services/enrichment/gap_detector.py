@@ -129,7 +129,7 @@ class VesselGapDetector:
                     anomaly_score=score,
                 )
 
-                self.db.write_event(event)
+                self.db_writer.write_event(event)
                 self.producer.send(Topics.ENRICHED_EVENTS, event.dict(), key=mmsi)
                 fired += 1
 

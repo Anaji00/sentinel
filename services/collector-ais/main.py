@@ -39,7 +39,7 @@ from shared.models import RawEvent
 from dotenv import load_dotenv
 
 # Setup the project root path so we can import 'shared' modules like shared.kafka
-ROOT = Path(__file__).resolve().parents(2)
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
