@@ -73,7 +73,7 @@ class SoftCorrelator:
             self._client = QdrantClient(host="localhost", port=6333)
             # Mark the correlator as fully active and ready to process events.
             self._enabled = True
-            logger.info("Qdrant client initialized and SoftCorrelator enabled")
+            logger.info(r"Qdrant client initialized and SoftCorrelator enabled")
             
         except ImportError as e:
             # If the required pip packages aren't installed, fail gracefully.
