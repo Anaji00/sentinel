@@ -98,7 +98,7 @@ def _reasoning_loop(consumer, context_builder, generator, library, db):
                 try:
                     cluster = CorrelationCluster(**message.value)
 
-                    if cluster.aler_tier == AlertTier.WATCH:
+                    if cluster.alert_tier == AlertTier.WATCH:
                         logger.info("WATCH SIGNAL: SKIPPING...")
                         processed += 1
                         continue

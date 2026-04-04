@@ -22,7 +22,7 @@ class DBWriter:
         self.db = timescale_client
 
     def write_event(self, event: NormalizedEvent):
-        coords+wkt = None
+        coords_wkt = None
         if event.latitude is not None and event.longitude is not None:
             coords_wkt = f"SRID=4326;POINT({event.longitude} {event.latitude})"
         try:

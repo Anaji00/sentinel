@@ -73,6 +73,9 @@ RATE_LIMIT_WINDOW = 3600    # 1 hour
 RATE_LIMIT_MAX    = 10      # max Telegram per hour
 
 class AlertManager:
+    # THE 'INIT' METHOD (Constructor)
+    # This sets up our AlertManager object with all the tools it needs to do its job.
+    # 'self' means "store this tool/data on the object so other methods can use it later."
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._db      = get_timescale()
@@ -80,31 +83,44 @@ class AlertManager:
         self._sent = []
 
     async def handle(self, cluster: CorrelationCluster):
+        # 1. FILTERING: We don't send external notifications for low-tier (WATCH) events.
         if cluster.alert_tier == AlertTier.WATCH:
             logger.info(f"WATCH (no alert): {cluster.rule_name}")
             return
         
+        # 2. DEDUPLICATION: Check the Redis cache to see if we already alerted about 
+        # this exact anomaly ID in the last 6 hours. If so, skip it to prevent spam.
         dedup_key = f"alert:sent:{cluster.correlation_id}"
         if self._redis.exists(dedup_key):
             logger.debug(f"deduplication skip: {cluster.correlation_id}")
             return
         
         now = time.time()
-        cutoff = now = RATE_LIMIT_WINDOW
+        # FIX: Subtracted the window from 'now'. Previously this was `now = RATE_LIMIT_WINDOW`
+        # which overwrote the current timestamp and broke the rate limiter.
+        cutoff = now - RATE_LIMIT_WINDOW
+        
+        # 3. RATE LIMITING: Clean up our history array (`self._sent`), keeping 
+        # only the timestamps of alerts sent within the last hour.
         self._sent = [t for t in self._sent if t > cutoff]
 
         if len(self._sent) >= RATE_LIMIT_MAX:
             logger.warning("Rate limit reached — sleeping 60s")
             await asyncio.sleep(60)
  
+        # 4. ENRICHMENT: If this is a critical Tier 3 intelligence event, reach into 
+        # the database to grab the AI-generated context/scenario to attach to the alert.
         scenario = None
         if cluster.alert_tier == AlertTier.INTELLIGENCE:
             scenario = self._fetch_scenario(cluster.correlation_id)
         
+        # 5. FORMATTING: Use our functional formatters to build the message text.
         tg_text = format_correlation(cluster, scenario)
         if scenario:
-            tg_text += "/n/n" + format_scenario(scenario)
+            # FIX: Corrected newline character from "/n/n" to "\n\n"
+            tg_text += "\n\n" + format_scenario(scenario)
         
+        # 6. DELIVERY: Send the alert out to our external webhooks and APIs.
         await self._send_telegram(tg_text)
         if WEBHOOK_URL:
             await self._send_webhook(format_generic(tg_text))
@@ -159,6 +175,11 @@ class AlertManager:
             logger.error(f"Webhook error: {e}")
 
     def _fetch_scenario(self, correlation_id: str):
+        # BEST PRACTICE TIP: 
+        # This method fetches scenario data synchronously from the PostgreSQL database.
+        # Because this is called from inside an `async def handle`, it might slightly block 
+        # the event loop during heavy loads. In the future, wrapping this in 
+        # `asyncio.get_event_loop().run_in_executor()` would make it fully non-blocking!
         try:
             from shared.models import Scenario, ScenarioStatus
             row = self._db.query_one("""
