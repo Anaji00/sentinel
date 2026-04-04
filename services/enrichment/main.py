@@ -42,3 +42,23 @@ from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent
 from shared.db import get_timescale, get_neo4j, get_redis
 
+from services.enrichment.anomaly_scorer import AnomalyScorer
+from services.enrichment.db_writer import DBWriter
+from services.enrichment.graph_writer import GraphWriter
+from services.enrichment.entity_resolver import EntityResolver
+from services.enrichment.gap_detector import VesselGapDetector
+from services.enrichment.enrichers.maritime import MaritimeEnricher
+from services.enrichment.enrichers.financial import FinancialEnricher
+from services.enrichment.enrichers.aviation import AviationEnricher
+from services.enrichment.enrichers.news import NewsEnricher
+from services.enrichment.enrichers.cyber import CyberEnricher
+
+def _consume_loop(consumer, maritime, aviation, 
+                  news, cyber, financial, db, producer, dlq):
+    """
+    Blocking Kafka consume loop — runs in ThreadPoolExecutor so the
+    asyncio event loop stays free for the gap detector task.
+    """
+    processed = 0
+    errors  = 0
+

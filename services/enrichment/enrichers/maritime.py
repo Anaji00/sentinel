@@ -38,7 +38,7 @@ class MaritimeEnricher:
         # graph_writer: Updates Neo4j (The Graph).
         # db_writer:    Updates TimescaleDB (The Archive).
         # redis:        Fast caching.
-        # resolver:     Finds vessel details (The Detective).
+        # resolver:    Finds vessel details (The Detective).
         self.scorer = scorer
         self.graph_writer = graph_writer
         self.db_writer = db_writer
@@ -53,7 +53,7 @@ class MaritimeEnricher:
         payload = raw.raw_payload
         msg_type = payload.get("MessageType", "")
         meta = payload.get("MetaData", {})
-        mmsi = payload.get("MMSI", "").strip()
+        mmsi = meta.get("MMSI", "").strip()
 
         # Filter: Garbage data often has MMSI 0 or empty.
         if not mmsi or mmsi == "0":

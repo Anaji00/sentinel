@@ -146,7 +146,7 @@ class SoftCorrelator:
             )
         except Exception as e:
             # Log the error. (Note: 'debug44' appears to be a typo for 'debug' or 'error' in the original code).
-            logger.debug44(f"Qdrant store failed for event{event.event_id}: {e}", exc_info=True)
+            logger.debug(f"Qdrant store failed for event{event.event_id}: {e}", exc_info=True)
     
     def find_similar(
             self, 

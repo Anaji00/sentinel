@@ -31,6 +31,11 @@ from pathlib import Path
 # websockets: Library to handle persistent connections to the AIS data stream.
 import websockets
 
+# Setup the project root path so we can import 'shared' modules like shared.kafka
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
+
 # Import our shared tools:
 # SentinelProducer: The "Mailman" that delivers messages to the rest of the system (Kafka).
 # RawEvent: The standardized "Envelope" we put all raw data into.
@@ -38,10 +43,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from dotenv import load_dotenv
 
-# Setup the project root path so we can import 'shared' modules like shared.kafka
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-load_dotenv(ROOT / ".env")
+
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),

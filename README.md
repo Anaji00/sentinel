@@ -4,6 +4,16 @@ Sentinel is a comprehensive, multi-source intelligence and analysis platform des
 
 The platform is built for scalability and extensibility, allowing new data sources and analytical capabilities to be integrated with ease. Its primary goal is to transform raw data into actionable intelligence, presenting it through an intuitive interface that facilitates exploration and investigation.
 
+## Code Structure
+
+The project is organized into the following directories:
+
+-   `services/`: Contains the individual microservices that make up the platform.
+-   `shared/`: Holds common code, such as data models and utility functions, shared across the microservices.
+-   `frontend/`: Contains the user interface of the platform.
+-   `infrastructure/`: Includes infrastructure-as-code configurations, such as Kubernetes deployment files.
+-   `docs/`: Contains additional documentation for the project.
+
 ## Architecture
 
 The Sentinel platform is built on a distributed, event-driven microservices architecture. This design promotes loose coupling, scalability, and resilience. Services communicate asynchronously using [Apache Kafka](https://kafka.apache.org/) as a central message bus, ensuring that data flows reliably through the processing pipeline.
@@ -63,22 +73,66 @@ The platform is composed of the following services:
 
 ## Getting Started
 
-To get started with Sentinel, you will need to have Docker and `docker-compose` installed.
+### Prerequisites
 
-1.  Clone the repository:
+Before you begin, ensure you have the following tools installed:
+
+*   [Docker](https://www.docker.com/get-started)
+*   [Docker Compose](https://docs.docker.com/compose/install/)
+*   [Python](https://www.python.org/downloads/) (version 3.x recommended)
+
+### Installation
+
+1.  **Clone the repository:**
     ```bash
     git clone <repository-url>
-    ```
-2.  Navigate to the project directory:
-    ```bash
     cd sentinel
     ```
-3.  Start the services:
+
+2.  **Install Python dependencies:**
+    The project's Python dependencies are listed in `requirements-shared.txt`.
     ```bash
-    docker-compose up
+    pip install -r requirements-shared.txt
     ```
 
-This will start all the services in the platform. You can then access the frontend at `http://localhost:3000`.
+3.  **Download SpaCy model:**
+    After installing the Python dependencies, you need to download the English language model for SpaCy.
+    ```bash
+    python -m spacy download en_core_web_sm
+    ```
+
+### Running the Application
+
+Running the Sentinel platform is a two-step process:
+
+1.  **Start the infrastructure services:**
+    This command will start all the backing services (Kafka, databases, etc.) in detached mode.
+    ```bash
+    docker-compose up -d
+    ```
+    You can monitor the health of the services using the built-in health checks in the `docker-compose.yml` file.
+
+2.  **Start the application services:**
+    This command, using `honcho`, will start all the application services defined in the `Procfile`.
+    ```bash
+    honcho start
+    ```
+    Alternatively, you can run a specific service. For example, to run only the AIS collector:
+    ```bash
+    honcho start ais
+    ```
+
+### Accessing the Services
+
+*   **Kafka UI:** http://localhost:8080
+*   **Neo4j Browser:** http://localhost:7474 (credentials: `neo4j` / `sentinel_graph`)
+*   **Frontend:** The frontend service is not yet integrated into the startup process. Further investigation of the `frontend` directory is needed. The original `README.md` mentioned `http://localhost:3000`.
+
+## Deployment
+
+The application can be deployed to a Kubernetes cluster using the configuration files in the `infrastructure/k8s` directory.
+
+**Note:** This section is a placeholder. Detailed deployment instructions will be added soon.
 
 ## Contributing
 

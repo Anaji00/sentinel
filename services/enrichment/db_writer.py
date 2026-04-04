@@ -52,7 +52,7 @@ class DBWriter:
                 event.collected_at,
                 event.source,
                 event.source_reliability,
-                event.primary_entity.idk,
+                event.primary_entity.id,
                 event.primary_entity.type.value,
                 event.primary_entity.name,
                 event.primary_entity.flags,

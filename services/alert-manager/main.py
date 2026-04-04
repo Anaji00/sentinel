@@ -115,7 +115,7 @@ class AlertManager:
             scenario = self._fetch_scenario(cluster.correlation_id)
         
         # 5. FORMATTING: Use our functional formatters to build the message text.
-        tg_text = format_correlation(cluster, scenario)
+        tg_text = format_correlation(cluster)
         if scenario:
             # FIX: Corrected newline character from "/n/n" to "\n\n"
             tg_text += "\n\n" + format_scenario(scenario)
@@ -123,7 +123,7 @@ class AlertManager:
         # 6. DELIVERY: Send the alert out to our external webhooks and APIs.
         await self._send_telegram(tg_text)
         if WEBHOOK_URL:
-            await self._send_webhook(format_generic(tg_text))
+            await self._send_webhook(format_generic(cluster))
 
         self._redis.set(dedup_key, "1", ttl=DEDUP_TTL)
         self._sent.append(now)
