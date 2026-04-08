@@ -18,6 +18,10 @@ import os
 import sys
 from pathlib import Path
 
+# ── 1. ENVIRONMENT & PATH SETUP ───────────────────────────────────────────────
+# BEST PRACTICE: We dynamically calculate the project root directory and add it 
+# to the system path. This ensures that Python can find our custom 'shared' modules 
+# (like shared.kafka or shared.models) no matter which directory we run this script from.
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +48,10 @@ def main():
     logger.info(f"Rules loaded: {len(ALL_RULES)}")
     logger.info("=" * 60)
 
+    # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
+    # EventStore: Connects to PostgreSQL (TimescaleDB) to allow rules to query past events.
+    # Producer: The "Mailman" that sends generated alerts to the next microservice.
+    # Consumer: The "Inbox" that receives standardized events from the Enrichment service.
     store    = EventStore()
     producer = SentinelProducer()
     consumer = SentinelConsumer(
@@ -56,23 +64,41 @@ def main():
     corr_fired = 0
 
     try:
+        # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
+        # The 'while True' keeps the application running forever.
         while True:
             try:
+                # The consumer pauses (blocks) here until a new message arrives from Kafka.
                 for message in consumer:
                     try:
+                        # Unpack the raw JSON message into our strictly-typed Python object.
                         event = NormalizedEvent(**message.value)
 
+                        # ── 4. RULE ENGINE (PLUGIN PATTERN) ───────────────────
+                        # ARCHITECTURE TIP: The Strategy/Plugin Pattern.
+                        # Instead of writing massive, hard-to-read "if/else" blocks, we loop 
+                        # through a list of independent rule functions (`ALL_RULES`). 
+                        # Each rule evaluates the event and decides if an alert should be triggered.
                         for rule_fn in ALL_RULES:
                             try:
                                 cluster: CorrelationCluster = rule_fn(event, store)
                             except Exception as e:
+                                # TARGETED ERROR HANDLING: If one specific rule crashes (e.g., 
+                                # due to a bad data lookup), we log the error and `continue`. 
+                                # This prevents a single buggy rule from taking down the whole engine.
                                 logger.error(f"Rule {rule_fn.__name__} error: {e}", exc_info=True)
                                 continue
 
+                            # If the rule returns None, it means "Nothing suspicious found."
                             if cluster is None:
                                 continue
 
+                            # ── 5. PERSIST & FORWARD ALERTS ───────────────────
+                            # If a rule returned a cluster, an anomaly pattern was detected!
+                            # First, save a permanent record to our database.
                             store.save_correlation(cluster)
+                            # Second, send it to Kafka so the Alert Manager and Reasoning 
+                            # engine can notify analysts or generate AI briefings.
                             producer.send(
                                 Topics.CORRELATIONS,
                                 cluster.dict(),
@@ -96,8 +122,10 @@ def main():
                 continue
 
     except KeyboardInterrupt:
+        # Graceful shutdown when the user presses Ctrl+C
         logger.info("Shutting down...")
     finally:
+        # CLEANUP: Always close network connections to prevent memory/socket leaks.
         producer.close()
         consumer.close()
         logger.info(f"Final — processed: {processed}  correlations: {corr_fired}")
