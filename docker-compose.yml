@@ -100,7 +100,7 @@ services:
   timescaledb:
     # TimescaleDB: A time-series database built on PostgreSQL. It's designed for storing and analyzing data that changes over time, like sensor readings or stock prices.
     # TimescaleDB is a time-series database built on PostgreSQL.
-    image: timescale/timescaledb-ha:pg15-;atest
+    image: timescale/timescaledb-ha:pg15-latest
     container_name: sentinel-timescaledb
     restart: unless-stopped
     ports:

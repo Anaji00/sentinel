@@ -40,7 +40,7 @@ class MaritimeEnricher:
         # redis:        Fast caching.
         # resolver:    Finds vessel details (The Detective).
         self.scorer = scorer
-        self.graph_writer = graph_writer
+        self.graph = graph_writer
         self.db_writer = db_writer
         self.redis = redis_client
         self.resolver = resolver # Used for vessel lookup
@@ -117,7 +117,7 @@ class MaritimeEnricher:
         
         # 7. UPDATE GRAPH (The Knowledge Base)
         # Update the Node in Neo4j. This is "upsert" - creates it if missing.
-        self.graph_writer.upsert_vessel(mmsi, {
+        self.graph.upsert_vessel(mmsi, {
             "name": vessel.get("name", ""),
             "vessel_type": vtype,
             "flag_state": vessel.get("flag_state", ""),

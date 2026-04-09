@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 # websockets: Library to handle persistent connections to the AIS data stream.
 import websockets
+from dotenv import load_dotenv
+
 
 # Setup the project root path so we can import 'shared' modules like shared.kafka
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,7 +43,6 @@ load_dotenv(ROOT / ".env")
 # RawEvent: The standardized "Envelope" we put all raw data into.
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
-from dotenv import load_dotenv
 
 
 
