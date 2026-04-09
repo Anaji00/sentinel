@@ -163,6 +163,22 @@ class ContextBuilder:
             logger.error(f"Error fetching recent news: {e}")
             return []
         
+
+    def _fetch_pattern_matches(self, cluster: CorrelationCluster) -> List[Dict]:
+        """
+        Stub — returns empty list.
+ 
+        Pattern matching is handled by PatternLibrary.find_similar() in
+        reasoning/main.py, which passes results directly to
+        scenario_generator.generate(). If you ever want the context
+        builder to bundle patterns itself (e.g. for a standalone call),
+        inject a PatternLibrary instance and call it here.
+ 
+        TODO Phase 2: wire in PatternLibrary if the calling pattern changes.
+        """
+        return []
+ 
+        
     def _serialize_row(self, row: Dict) -> Dict:
         """
         Make a DB row JSON-safe (convert datetime, parse JSONB).
