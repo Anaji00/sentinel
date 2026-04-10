@@ -133,8 +133,8 @@ class ScenarioGenerator:
 
         try:
             # Call the Gemini API.
-            llm = genai.Generative(
-                model=model,
+            llm = genai.GenerativeModel(
+                model_name=model,
                 system_instruction = SYSTEM_PROMPT,
             )
             response = llm.generate_content(

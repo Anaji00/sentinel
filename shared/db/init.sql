@@ -165,7 +165,20 @@ CREATE TABLE IF NOT EXISTS entity_watchlist (
     alert_tier_min INT         DEFAULT 1,
     active        BOOLEAN      DEFAULT TRUE
 );
- 
+
+-- shared/db/init.sql (Append this to the bottom)
+
+CREATE TABLE IF NOT EXISTS failed_events (
+    id SERIAL PRIMARY KEY,
+    failed_at TIMESTAMPTZ DEFAULT NOW(),
+    original_topic VARCHAR(255) NOT NULL,
+    error_message TEXT NOT NULL,
+    raw_payload JSONB NOT NULL,
+    resolved BOOLEAN DEFAULT FALSE
+);
+
+-- Index for fast querying by topic and resolution status
+CREATE INDEX IF NOT EXISTS idx_failed_events_topic ON failed_events(original_topic, resolved);
 -- ── VIEWS ─────────────────────────────────────────────────────────────────────
 
 -- VIEW (Virtual Table): INTERACTION

@@ -24,7 +24,7 @@ class EventStore:
     def __init__(self, redis_client):
         self._redis = redis_client
         self._db = get_timescale()
-        self.cache_ley = "events:recent_window"
+        self.cache_key = "events:recent_window"
         self.window_seconds = 48 * 3600
           
     def add_event(self, event: Any):
@@ -68,7 +68,7 @@ class EventStore:
             cutoff = time.time() - (hours * 3600)
             
             # Fetch events from 'now' down to the 'cutoff' timestamp, ordered newest to oldest
-            raw_results = self.redis.zrevrangebyscore(
+            raw_results = self._redis.zrevrangebyscore(
                 self.cache_key, 
                 max="+inf", 
                 min=cutoff
