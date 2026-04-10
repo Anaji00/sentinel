@@ -9,8 +9,10 @@ All queries are parameterized. The only f-string interpolation is the safe
 `LIMIT {int(limit)}` cast and the `AND`-join of hardcoded condition strings.
 """
 
+import time
+import json
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from shared.db import get_timescale
 
@@ -19,64 +21,92 @@ logger = logging.getLogger("correlation.store")
 
 class EventStore:
 
-    def __init__(self):
+    def __init__(self, redis_client):
+        self._redis = redis_client
         self._db = get_timescale()
+        self.cache_ley = "events:recent_window"
+        self.window_seconds = 48 * 3600
+          
+    def add_event(self, event: Any):
+        """Add a normalized event to the Redis Sliding Window cache."""
+        try:
+            timestamp = event.occurred_at.timestamp()
+            payload = json.dumps({
+                "event_id": event.event_id,
+                "type": event.type.value,
+                "domain": event.type.value.split("_")[0],
+                "anomaly_score": event.anomaly_score,
+                "tags": event.tags,
+                "region": event.region,
+                "latitude": event.latitude,
+                "longitude": event.longitude,
+                "headline": event.headline,
+                "named_entities": event.named_entities,
+            })
+            self._redis.zadd(self.cache_key, {payload: timestamp})
+
+            # Sliding Window Maintenance
+            cutoff = time.time() - self.window_seconds
+            self._redis.zremrangebyscore(self.cache_key, "-inf", cutoff)
+        except Exception as e:
+            logger.error(f"EventStore.add_event to redis cache failed: {e}")
+            
 
     def get_recent(
         self,
         event_types: List[str],
-        hours:       int   = 72,
+        exclude_event_id: str = None,
+        hours:       int   = 48,
         region:      str   = None,
         min_anomaly: float = 0.0,
         tags:        List[str] = None,
         limit:       int   = 50,
     ) -> List[Dict]:
-        """
-        Fetch recent events. All filters are optional.
+        """Fetch historical events instantly from RAM instead of Postgres."""
 
-        Args:
-            event_types: list of EventType.value strings to include
-            hours:       look-back window
-            region:      exact region string match (from regions.py)
-            min_anomaly: lower bound on anomaly_score
-            tags:        PostgreSQL array overlap — event must have at least
-                         one of these tags
-            limit:       max rows returned, ordered by anomaly DESC
-
-        Returns:
-            List of row dicts. Empty list on query error (logged).
-        """
-        conditions = [
-            "type = ANY(%s)",
-            "occurred_at > NOW() - INTERVAL '1 hour' * %s",
-        ]
-        params: list = [event_types, hours]
-
-        if region:
-            conditions.append("region = %s")
-            params.append(region)
-        if min_anomaly > 0:
-            conditions.append("anomaly_score >= %s")
-            params.append(min_anomaly)
-        if tags:
-            conditions.append("tags && %s")   # && = array overlap in PostgreSQL
-            params.append(tags)
-
-        # LIMIT uses f-string with explicit int() cast — not user input, safe
-        sql = f"""
-            SELECT event_id, type, occurred_at, source,
-                   primary_entity_id, primary_entity_name, primary_entity_flags,
-                   region, latitude, longitude, anomaly_score,
-                   headline, named_entities, financial_data, vessel_data, tags
-            FROM events
-            WHERE {" AND ".join(conditions)}
-            ORDER BY anomaly_score DESC, occurred_at DESC
-            LIMIT {int(limit)}
-        """
         try:
-            return self._db.query(sql, tuple(params))
+            cutoff = time.time() - (hours * 3600)
+            
+            # Fetch events from 'now' down to the 'cutoff' timestamp, ordered newest to oldest
+            raw_results = self.redis.zrevrangebyscore(
+                self.cache_key, 
+                max="+inf", 
+                min=cutoff
+            )
+            
+            results = []
+            for raw in raw_results:
+                e = json.loads(raw)
+                
+                # FILTER FIX: Translated SQL conditions into native Python checks
+                if exclude_event_id and e["event_id"] == exclude_event_id:
+                    continue
+                if min_anomaly > 0 and e["anomaly_score"] < min_anomaly:
+                    continue
+                if event_types and e["type"] not in event_types:
+                    continue
+                if region and e.get("region") != region:
+                    continue
+                if tags:
+                    # Python equivalent of PostgreSQL's "tags && %s" (array overlap check)
+                    # Returns True if ANY tag in the required 'tags' list exists in the event's tags.
+                    event_tags = e.get("tags") or []
+                    if not any(t in event_tags for t in tags):
+                        continue
+                
+                results.append(e)
+                
+                # Enforce the row limit
+                if len(results) >= limit:
+                    break
+                    
+            # The SQL query ordered by anomaly_score DESC, then occurred_at DESC.
+            # Redis sorted them by occurred_at DESC natively. Now we just sort by anomaly.
+            results.sort(key=lambda x: x["anomaly_score"], reverse=True)
+            return results
+            
         except Exception as e:
-            logger.error(f"EventStore.get_recent failed: {e}")
+            logger.error(f"Redis cache fetch failed: {e}")
             return []
 
     def save_correlation(self, cluster) -> None:

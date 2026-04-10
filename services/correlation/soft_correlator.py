@@ -106,7 +106,8 @@ class SoftCorrelator:
             parts.append(f"headline:{event.headline}") # Headline is often the most semantically rich part, so we keep it as a separate section
             
         if event.named_entities:
-            parts.append(f"entities:{" ".join(event.named_entities[:50])}")  # Limit to first 50 for embedding size
+            entities_str = " ".join(event.named_entities[:50])
+            parts.append(f"entities:{entities_str}")  # Limit to first 50 for embedding size
         
         # Combine all the descriptive parts into one single sentence/string separated by ' | '.
         text = " | ".join(parts) # Simple concatenation — can experiment with more sophisticated templates
@@ -131,7 +132,7 @@ class SoftCorrelator:
                 points = [{
                     # Qdrant requires IDs to be specific formats (like a 16-byte UUID or integer).
                     # We strip the hyphens from our event UUID and take the first 16 characters.
-                    "id": event.event_id.replace("-", "")[:16],  # Qdrant expects a 16-byte hex string for ID
+                    "id": event.event_id,  # Qdrant expects a 16-byte hex string for ID
                     "vector": embedding, # The embedding vector for similarity search
                     "payload": { # Metadata to help us understand what this event is about when we retrieve it
                         "event_id": event.event_id, # JSON-serializable ID for reference

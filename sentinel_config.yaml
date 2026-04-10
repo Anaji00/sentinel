@@ -1,0 +1,89 @@
+maritime:
+  chokepoints:
+    - "Taiwan Strait"
+    - "Strait of Hormuz"
+    - "Bab el-Mandeb"
+    - "Malacca Strait"
+    # Additional Global Trade Chokepoints
+    - "Suez Canal"
+    - "Panama Canal"
+    - "Bosphorus Strait"
+    - "Dardanelles"
+    - "Cape of Good Hope"
+  dark_threshold_hours: 4
+
+financial:
+  geo_instruments:
+    # Energy & Oil
+    - "USO"   # Oil
+    - "BNO"   # Brent Oil
+    - "UCO"   # Ultra Bloomberg Crude Oil
+    - "XOP"   # Oil & Gas Exploration
+    - "UNG"   # Natural Gas
+    # Defense & Aerospace
+    - "DFEN"  # Defense
+    - "ITA"   # Aerospace
+    - "NOC"   # Northrop Grumman
+    - "RTX"   # Raytheon Technologies
+    - "GD"    # General Dynamics
+    - "LMT"   # Lockheed Martin
+    # Shipping & Commodities
+    - "GLD"   # Gold Trust
+    - "ZIM"   # Integrated Shipping Services
+    - "DAC"   # Danaos Corp (Shipping)
+    - "SLV"   # Silver Trust
+    # Agriculture & Critical Minerals (Geopolitical)
+    - "WEAT"  # Wheat Fund
+    - "CORN"  # Corn Fund
+    - "SOY"   # Soybean Fund
+    - "URA"   # Uranium ETF
+    - "LIT"   # Lithium & Battery Tech
+    # Cybersecurity & Tech Infrastructure
+    - "HACK"  # Cybersecurity ETF
+    - "CIBR"  # Cybersecurity ETF
+    - "CRWD"  # CrowdStrike
+    - "PANW"  # Palo Alto Networks
+    - "NVDA"  # Nvidia
+    - "SMH"   # Semiconductor ETF
+  high_yield_etfs:
+    - "XDTE"
+    - "QDTE"
+    # Covered Call & Premium Income ETFs
+    - "JEPI"  # JPMorgan Equity Premium Income
+    - "JEPQ"  # JPMorgan Nasdaq Equity Premium Income
+    - "QYLD"  # Global X NASDAQ 100 Covered Call
+    - "XYLD"  # Global X S&P 500 Covered Call
+
+cyber:
+  high_value_orgs:
+    # Defense Contractors
+    - "Lockheed Martin"
+    - "Boeing"
+    - "BAE Systems"
+    - "Northrop Grumman"
+    - "Thales"
+    - "General Dynamics"
+    - "SpaceX"
+    # Semiconductors & Core Tech
+    - "TSMC"
+    - "ASML"
+    - "Intel"
+    - "Microsoft"
+    - "Google"
+    - "Cisco"
+    - "Cloudflare"
+    # Global Energy Infrastructure
+    - "Aramco"
+    - "Chevron"
+    - "ExxonMobil"
+    - "Gazprom"
+    - "Eni"
+    # Global Finance Clearing & Payment
+    - "SWIFT"
+    - "Euroclear"
+    - "Visa"
+    - "Mastercard"
+    # Global Logistics
+    - "Maersk"
+    - "MSC"
+    - "FedEx"

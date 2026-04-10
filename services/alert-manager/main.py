@@ -112,7 +112,12 @@ class AlertManager:
         # the database to grab the AI-generated context/scenario to attach to the alert.
         scenario = None
         if cluster.alert_tier == AlertTier.INTELLIGENCE:
-            scenario = self._fetch_scenario(cluster.correlation_id)
+            loop = asyncio.get_running_loop()
+            scenario = await loop.run_in_executor(
+                None,
+                self._fetch_scenario(),
+                cluster.correlation_id,
+            )
         
         # 5. FORMATTING: Use our functional formatters to build the message text.
         tg_text = format_correlation(cluster)

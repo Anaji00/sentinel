@@ -10,7 +10,7 @@ websockets==12.0
 feedparser==6.0.11
 honcho==1.1.0
 spacy==3.7.2
-fastapi = 0.109.0
+fastapi == 0.109.0
 uvicorn[standard]==0.27.0
 
 # After pip install, also run: python -m spacy download en_core_web_sm

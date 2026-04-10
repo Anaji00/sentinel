@@ -33,6 +33,9 @@ import json
 import logging
 import os
 from typing import Dict, Any, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import google.api_core.exceptions
+
  
 # Import the official Google Generative AI SDK for calling Gemini.
 import google.generativeai as genai
@@ -101,8 +104,16 @@ class ScenarioGenerator:
         if not api_key:
             raise ValueError("GOOGLE_API_KEY not set")
         # Configure the global genai client with our API key.
-        self._client = genai.configure(api_key=api_key)
+        genai.configure(api_key=api_key)
 
+    @retry(
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            stop=stop_after_attempt(5),
+            retry=retry_if_exception_type((
+                google.api_core.exceptions.ServiceUnavailable,
+                google.api_core.exceptions.DeadlineExceeded,
+            ))
+    )
     def generate(
             self, 
             cluster: CorrelationCluster,
@@ -122,12 +133,15 @@ class ScenarioGenerator:
 
         try:
             # Call the Gemini API.
-            response = self._client.generate_content(
+            llm = genai.Generative(
+                model=model,
+                system_instruction = SYSTEM_PROMPT,
+            )
+            response = llm.generate_content(
                 prompt, 
                 generation_config = genai.GenerationConfig(
                     max_output_tokens=2000,                  # Cap the response length
                     response_mime_type="application/json",   # Request strict JSON formatting
-                    messages=[{"role": "user", "content": prompt}], 
                 )
             )
             # Extract the raw text from the AI's response.
