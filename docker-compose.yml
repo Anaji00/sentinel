@@ -18,6 +18,7 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
       # ZOOKEEPER_CLIENT_PORT: The port that Zookeeper listens on for client connections.
       # ZOOKEEPER_TICK_TIME: The basic unit of time in milliseconds used by Zookeeper.
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok"
     ports:
       - "2181:2181"
       # Maps port 2181 on your computer to port 2181 inside the Zookeeper container.  This allows you to connect to Zookeeper from your local machine.

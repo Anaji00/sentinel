@@ -9,4 +9,5 @@ enrichment:   python -m services.enrichment.main
 correlation:  python -m services.correlation.main
 alerts:       python -m services.alert-manager.main
 reasoning:    python -m services.reasoning.main
-api:          uvicorn services.api.main:app --host 0.0.0.0 --port 8000
+api:          cd services/api-gateway && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+dlq:          python services/dlq-worker/main.py
