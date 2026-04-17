@@ -9,7 +9,7 @@ and raw correlation clusters from the TimescaleDB database.
 import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
-from dependencies import get_db
+from services.api_gateway.dependencies import get_db
 
 logger = logging.getLogger("api-gateway.scenarios")
 router = APIRouter(prefix="/api/v1", tags=["Intelligence"])

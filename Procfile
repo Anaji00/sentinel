@@ -7,7 +7,7 @@ adsb:         python -m services.collector-adsb.main
 news:         python -m services.collector-news.main
 enrichment:   python -m services.enrichment.main
 correlation:  python -m services.correlation.main
-alerts:       python -m services.alert-manager.main
+alerts:       python -m services.alert_manager.main
 reasoning:    python -m services.reasoning.main
-api:          cd services/api-gateway && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+api:          uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --reload
 dlq:          python services/dlq-worker/main.py

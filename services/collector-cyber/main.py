@@ -205,7 +205,7 @@ async def poll_censys(
                         )
                         # Send to the Kafka 'raw.cyber' topic so the Enrichment 
                         # service can process it later.
-                        producer.send(Topics.RAW_CYBER, event.dict(), key=ip)
+                        producer.send(Topics.RAW_CYBER, event.model_dump(), key=ip)
                         new_c += 1
 
                         if is_critical or is_ics_vendor:
@@ -328,7 +328,7 @@ async def poll_cisa_kev(
                 "is_ics_vendor":   any(v in vendor.lower() for v in ICS_VENDORS),
             },
         )
-        producer.send(Topics.RAW_CYBER, event.dict(), key=cve_id)
+        producer.send(Topics.RAW_CYBER, event.model_dump(), key=cve_id)
         new_count += 1
 
         # High-priority: ransomware-linked CVEs or ICS/OT vendor vulnerabilities
@@ -387,7 +387,7 @@ async def poll_ransomware(
                     "data_types":   [],
                 },
             )
-            producer.send(Topics.RAW_CYBER, event.dict(), key="ransomware")
+            producer.send(Topics.RAW_CYBER, event.model_dump(), key="ransomware")
             new_count += 1
 
             if any(kw in sector for kw in CRITICAL_SECTORS):
@@ -455,7 +455,7 @@ async def stream_bgp(producer: SentinelProducer):
                                         "country_code": "",
                                     },
                                 )
-                                producer.send(Topics.RAW_CYBER, event.dict(), key=prefix)
+                                producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
 
                     except json.JSONDecodeError:
                         pass

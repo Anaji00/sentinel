@@ -94,6 +94,7 @@ class SentinelProducer:
             # COMPRESSION: Zip it up.
             # Makes the payload smaller. Saves network bandwidth and disk space.
             compression_type="gzip",
+            api_version=(3, 5, 0),
         )
         logger.info(f"Kafka Producer -> {servers}")
 

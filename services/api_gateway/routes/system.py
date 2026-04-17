@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends
-from dependencies import get_redis_client
+from services.api_gateway.dependencies import get_redis_client
 from shared.utils.config import config
 
 logger = logging.getLogger("api-gateway.system")

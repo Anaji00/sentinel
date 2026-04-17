@@ -190,7 +190,7 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                             occurred_at = occurred_at,
                             raw_payload = data,
                         )
-                        producer.send(Topics.RAW_MARITIME, event.dict(), key=mmsi)
+                        producer.send(Topics.RAW_MARITIME, event.model_dump(), key=mmsi)
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to decode AIS message: {e}")
                     except Exception as e:

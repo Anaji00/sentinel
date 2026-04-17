@@ -149,7 +149,7 @@ async def poll_options(
                         },
                     )
                     # Send the event to the 'raw.financial' Kafka topic. The ticker is used as the key to ensure ordering.
-                    producer.send(Topics.RAW_FINANCIAL, event.dict(), key=ticker)
+                    producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=ticker)
                     # Log a summary of the trade for real-time monitoring.
                     logger.info(f"Options: {ticker} ${premium/1e6:.1f}M "
                                 f"{trade.get('put_call','?')} {trade.get('trade_type','?')}")
@@ -241,7 +241,7 @@ async def poll_form4(
             
             )
             # Send the event to Kafka. 'form4' is used as the key.
-            producer.send(Topics.RAW_FINANCIAL, event.dict(), key="form4")
+            producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key="form4")
 
     except Exception as e:
         logger.error(f"Error polling SEC Form 4 feed: {e}", exc_info=True)

@@ -223,7 +223,7 @@ async def poll_zone(
                     )
                     producer.send(
                         topic = Topics.RAW_AVIATION,
-                        data = event.dict(),
+                        data = event.model_dump(),
                         key = parsed["icao24"] or "unknown",
                     )
 

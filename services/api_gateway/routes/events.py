@@ -8,7 +8,7 @@ and anomaly score, or dive deep into the full JSON payload of a single specific 
 
 import logging
 from fastapi import APIRouter, HTTPException, Query, Depends
-from dependencies import get_db
+from services.api_gateway.dependencies import get_db
 
 logger = logging.getLogger("api-gateway.events")
 router = APIRouter(prefix="/api/v1/events", tags=["Domain Events"])

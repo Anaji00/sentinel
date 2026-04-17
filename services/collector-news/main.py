@@ -51,8 +51,8 @@ DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestibl
 
 FEEDS = [
     # Wire services
-    ("reuters_world",   "https://feeds.reuters.com/reuters/worldnews",        "wire",       0.95),
-    ("reuters_markets", "https://feeds.reuters.com/reuters/businessnews",     "wire",       0.95),
+   # ("reuters_world",   "https://feeds.reuters.com/reuters/worldnews",        "wire",       0.95),
+   # ("reuters_markets", "https://feeds.reuters.com/reuters/businessnews",     "wire",       0.95),
     ("ap_world",        "https://apnews.com/rss",                             "wire",       0.95),
     ("aljazeera",       "https://www.aljazeera.com/xml/rss/all.xml",          "wire",       0.95),
     # Maritime
@@ -238,7 +238,7 @@ async def poll_feed(
             # Kafka Producer: The 'key' determines the partition.
             # Using 'feed_name' ensures all news from 'Reuters' lands in the same
             # Kafka partition, preserving partial ordering if needed.
-            producer.send(Topics.RAW_NEWS, event.dict(), key=feed_name)
+            producer.send(Topics.RAW_NEWS, event.model_dump(mode="json"), key=feed_name)
             dedup.mark_seen(url)
             new_count += 1
 

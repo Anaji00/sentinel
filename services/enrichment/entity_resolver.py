@@ -80,7 +80,7 @@ class EntityResolver:
         # But the AIS signal itself contains some raw text (e.g., "SHIPNAME: BOaty McBoatface").
         # We use that + the MMSI country code to build a temporary profile.
         meta  = ais_meta or {}
-        name  = meta.get("ShipName", "")
+        name  = str(meta.get("ShipName", "")).strip()
         data  = {
             "name":        name,
             "vessel_type": "Unknown",

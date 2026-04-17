@@ -52,8 +52,8 @@ from shared.db import get_timescale, get_redis
 # BEGINNER EXPLANATION: The dot (.) before formatters means "look in the current 
 # directory". This imports formatting functions specifically built for Telegram 
 # and Webhooks, keeping the main logic clean (Separation of Concerns).
-from formatters.telegram import format_correlation, format_scenario
-from formatters.webhook  import format_generic
+from services.alert_manager.formatters.telegram import format_correlation, format_scenario
+from services.alert_manager.formatters.webhook import format_generic
  
 # ── CONFIGURATION & SECRETS ───────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

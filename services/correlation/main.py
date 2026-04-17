@@ -37,8 +37,9 @@ logger = logging.getLogger("correlation")
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster
-
+from shared.db import get_redis
 from services.correlation.event_store import EventStore
+
 from services.correlation.rules import ALL_RULES
 
 
@@ -52,7 +53,8 @@ def main():
     # EventStore: Connects to PostgreSQL (TimescaleDB) to allow rules to query past events.
     # Producer: The "Mailman" that sends generated alerts to the next microservice.
     # Consumer: The "Inbox" that receives standardized events from the Enrichment service.
-    store    = EventStore()
+    redis_client = get_redis()
+    store    = EventStore(redis_client)
     producer = SentinelProducer()
     consumer = SentinelConsumer(
         topics=[Topics.ENRICHED_EVENTS],

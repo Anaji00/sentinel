@@ -25,8 +25,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-gateway-main")
 
 from shared.db import get_neo4j, get_timescale, get_redis
-from dependencies import verify_api_key
-from routes import system, scenarios, graph, events
+from services.api_gateway.dependencies import verify_api_key
+from services.api_gateway.routes import system, scenarios, events, graph
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

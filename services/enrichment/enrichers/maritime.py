@@ -53,7 +53,7 @@ class MaritimeEnricher:
         payload = raw.raw_payload
         msg_type = payload.get("MessageType", "")
         meta = payload.get("MetaData", {})
-        mmsi = meta.get("MMSI", "").strip()
+        mmsi = str(meta.get("MMSI", "")).strip()
 
         # Filter: Garbage data often has MMSI 0 or empty.
         if not mmsi or mmsi == "0":
@@ -158,8 +158,8 @@ class MaritimeEnricher:
         # Static messages contain the Ship Name, Destination, Dimensions, etc.
         # They don't update position, but they update Identity.
         s = payload.get("Message", {}).get("ShipStaticData", {})
-        name = s.get("Name", meta.get("ShipName", "")).strip()
-        dest = s.get("Destination", "").strip()
+        name = str(s.get("Name", meta.get("ShipName", ""))).strip()
+        dest = str(s.get("Destination", "")).strip()
         code = int(s.get("Type") or 0)
         vtype = decode_vessel_type(code)
         

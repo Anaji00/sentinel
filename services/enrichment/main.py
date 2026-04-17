@@ -98,7 +98,7 @@ def _consume_loop(consumer, maritime, aviation,
                         db.write_event(enriched)
                         producer.send(
                             Topics.ENRICHED_EVENTS,
-                            enriched.dict(),
+                            enriched.model_dump(),
                             key=enriched.primary_entity.id,
                         )
                         processed += 1

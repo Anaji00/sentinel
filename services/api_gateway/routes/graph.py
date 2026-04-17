@@ -8,7 +8,7 @@ and connection paths between different entities (like vessels, companies, and co
 
 import logging
 from fastapi import APIRouter, HTTPException, Depends
-from dependencies import get_graph
+from services.api_gateway.dependencies import get_graph
 
 logger = logging.getLogger("api-gateway.graph")
 router = APIRouter(prefix="/api/v1/graph", tags=["Graph Analysis"])

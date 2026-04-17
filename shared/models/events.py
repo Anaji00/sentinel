@@ -76,13 +76,35 @@ class AlertTier(int, Enum):
     ALERT = 2
     INTELLIGENCE = 3
 
-class ScenarioStatus(str, Enum):
-    HYPOTHESIS = "hypothesis"
-    DEVELOPING = "developing"
-    CONFIRMED = "confirmed"
-    DENIED = "denied"
-    EXPIRED = "expired"
+from enum import Enum
+from pydantic import BaseModel
+from typing import List
 
+class ScenarioStatus(Enum):
+    HYPOTHESIS = "HYPOTHESIS"
+    CONFIRMED = "CONFIRMED"
+    DENIED = "DENIED"
+
+class ScenarioHypothesis(BaseModel):
+    label: str
+    probability: int
+    mechanism: str
+    beneficiaries: List[str]
+    watch_signals: List[str]
+    deny_signals: List[str]
+    time_horizon: str
+
+class Scenario(BaseModel):
+    correlation_id: str
+    status: ScenarioStatus
+    headline: str
+    significance: str
+    hypotheses: List[ScenarioHypothesis]
+    recommended_monitoring: List[str]
+    confidence_overall: int
+    confidence_rationale: str
+
+    
 class Entity(BaseModel):
     # Mapped to 'events' table columns via flattening:
     # primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags
