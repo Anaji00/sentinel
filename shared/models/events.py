@@ -58,6 +58,10 @@ class EventType(str, Enum):
     # POlitical/economic
     CLIMATE_STRESS = "climate_stress"
     INFASTRUCTURE = "infrastructure"
+    SPORTS_LINE_MOVEMENT = "sports_line_movement"
+    PREDICTION_MARKET_TRADE = "prediction_market_trade"
+    CRYPTO_LIQUIDATION = "crypto_liquidation"
+    CRYPTO_PERP_FUNDING = "crypto_perp_funding"
     CUSTOM = "custom"
 
 class EntityType(str, Enum):
@@ -155,6 +159,30 @@ class FlightData(BaseModel):
     operator: Optional[str] = None
     registration: Optional[str] = None
 
+class BettingData(BaseModel):
+    # draftkins/fandue;/pinnnacle
+    mactchup: str
+    market_type: str
+    selection: str
+    implied_probablity: float
+    american_odds: int
+    sharp_book_deviation = Optional[float] = None
+
+class PredictionMarketData(BaseModel):
+   market_id: str
+   question: str
+   outcome: str
+   shares_traded: float
+   price_usd: float
+   liquidity_pool_size: Optional[float] = None
+
+class CryptoData(BaseModel):
+    pair: str
+    trade_type: str
+    side: str
+    price: float
+    size_tokens: float
+    leverage: Optional[float] = None
 
 class FinancialData(BaseModel):
     # Stored in 'events.financial_data' as JSONB
@@ -225,6 +253,10 @@ class NormalizedEvent(BaseModel):
     flight_data: Optional[FlightData] = None
     financial_data: Optional[FinancialData] = None
     security_data: Optional[SecurityData] = None
+    betting_data: Optional[BettingData]
+    prediction_market_data: Optional[PredictionMarketData]
+    crypto_data: Optional[CryptoData]
+
     tags: List[str] = Field(default_factory=list) # Maps to TEXT[] via GIN Index
     named_entities: List[str] = Field(default_factory=list) # Maps to TEXT[]
     sentiment: Optional[float] = None

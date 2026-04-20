@@ -47,7 +47,7 @@ class EventStore:
 
             # Sliding Window Maintenance
             cutoff = time.time() - self.window_seconds
-            self._redis.zremrangebyscore(self.cache_key, "-inf", cutoff)
+            self._redis.raw.zremrangebyscore(self.cache_key, "-inf", cutoff)
         except Exception as e:
             logger.error(f"EventStore.add_event to redis cache failed: {e}")
             
@@ -68,10 +68,12 @@ class EventStore:
             cutoff = time.time() - (hours * 3600)
             
             # Fetch events from 'now' down to the 'cutoff' timestamp, ordered newest to oldest
-            raw_results = self._redis.zrevrangebyscore(
+            raw_results = self._redis.zrange(
                 self.cache_key, 
-                max="+inf", 
-                min=cutoff
+                "+inf", 
+                cutoff,
+                desc = True,
+                byscore=True
             )
             
             results = []

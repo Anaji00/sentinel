@@ -146,6 +146,7 @@ class SentinelConsumer:
             # (It's simpler than doing it manually, though slightly less precise).
             enable_auto_commit=True,
             auto_commit_interval_ms=1000,
+            api_version=(3, 5, 0),
         )
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
 

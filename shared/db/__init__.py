@@ -14,11 +14,13 @@ import logging
 import os
 import time
 from typing import Optional, Dict, List, Any
+import asyncio
 
 import psycopg2  # The PostgreSQL database driver (the "phone line" to the DB)
 from psycopg2.extras import RealDictCursor, execute_values  # Helpers for dictionary rows and fast inserts
 from psycopg2 import pool as pgpool  # Manages the "Connection Pool" (explained below)
 
+import asyncpg
 import redis as _redis  # The official Python client for Redis
 from neo4j import GraphDatabase as _Neo4j  # The official Python driver for Neo4j
 
@@ -135,6 +137,68 @@ class TimescaleClient:
         finally:
             self._pool.putconn(conn)
 
+class AsyncTimescaleClient:
+    # CONCEPT: The "Non-Blocking Ledger"
+    # Same destination as TimescaleClient, but uses an asynchronous network path.
+    # Crucial for services using asyncio (like collector-financial) so they can 
+    # check historical data without freezing the websocket/HTTP polling loops.
+    def __init__(self):
+        self._pool = None
+    
+    async def connect(self, retries: int = 12):
+        for attempt in range(retries):
+            try:
+            # asyncpg handles connection pooling natively.
+                self._pool = await asyncpg.create_pool(
+                    host=os.getenv("POSTGRES_HOST", "localhost"),
+                    port=int(os.getenv("POSTGRES_PORT", 5432)),
+                    database=os.getenv("POSTGRES_DB", "sentinel"),
+                    user=os.getenv("POSTGRES_USER", "sentinel"),
+                    password=os.getenv("POSTGRES_PASSWORD", "sentinel_local_dev"),
+                    min_size=2,
+                    max_size=20,
+                    command_timeout=60
+                )
+                logger.info("AsyncTimescaleDB connected")
+                return
+            except Exception as e:
+                wait = min(2 ** attempt, 30)
+                logger.warning(f"AsynceTimescaleDB attempt {attempt+1}/{retries} — retry in {wait}s")
+                if attempt < retries - 1:
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+    
+    async def query(self, sql: str, *args) -> List[Dict]:
+        # READ OPERATION (SELECT)
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(sql, *args)
+            return [dict(r) for r in records]
+        
+    async def query_one(self, sql: str, *args) -> Optional[Dict]:
+        # READ OPERATION (SELECT)
+        # asyncpg natively returns 'Record' objects. We convert them to standard Dicts.
+        # Note: asyncpg uses $1, $2 for parameters, unlike psycopg2 which uses %s.
+        async with self._pool.acquire() as conn:
+            record = await conn.fetchrow(sql, *args)
+            return dict(record) if record else None
+        
+    async def execute(self, sql: str, *args):
+        # WRITE OPERATION
+        # asyncpg has built-in context managers for transactions.
+        # If an error is thrown inside the 'async with conn.transaction()' block,
+        # asyncpg automatically rolls it back.
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(sql, *args)
+
+    async def execute_many(self, sql: str, rows: List[tuple]):
+        # BATCH INSERT
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(sql, rows)
+
+                    
 
 # ── NEO4J ─────────────────────────────────────────────────────────────────────
 
@@ -233,9 +297,24 @@ class RedisClient:
         # SET IS MEMBER: Efficiently checks "Is X in the list?"
         return bool(self._client.sismember(key, value))
 
-    def publish(self, channel: str, message: str):
-        # PUB/SUB: Broadcasts a message to anyone listening on 'channel'.
-        self._client.publish(channel, message)
+
+
+# --- NEW SORTED SET (Z-INDEX) METHODS ---
+
+    def zadd(self, key: str, mapping: dict):
+        # SORTED SET ADD: Adds items with a score (e.g., a timestamp)
+        # mapping format: {value: score}
+        self._client.zadd(key, mapping)
+
+    def zremrangebyscore(self, key: str, min_val, max_val):
+        # SORTED SET REMOVE: Drops items outside our sliding window
+        self._client.zremrangebyscore(key, min_val, max_val)
+
+    def zrange(self, key: str, start, end, desc=False, byscore=False):
+        # SORTED SET FETCH: Retrieves a range of elements.
+        # If byscore=True, start and end refer to the scores (timestamps).
+        # If desc=True and byscore=True, start must be the max score, and end the min score.
+        return self._client.zrange(key, start, end, desc=desc, byscore=byscore)
 
     def incr(self, key: str) -> int:
         return self._client.incr(key)
@@ -254,6 +333,7 @@ class RedisClient:
 # The `get_timescale()` function checks: "Do we have one? If yes, use it. If no, make one."
 
 _timescale: Optional[TimescaleClient] = None
+_async_timescale: Optional[AsyncTimescaleClient] = None
 _neo4j:     Optional[Neo4jClient]     = None
 _redis_cli: Optional[RedisClient]     = None
 
@@ -265,6 +345,13 @@ def get_timescale() -> TimescaleClient:
         _timescale = TimescaleClient()
     return _timescale
 
+async def get_async_timescale() -> AsyncTimescaleClient:
+    # Because establishing the pool requires 'await', this getter must be async.
+    global _async_timescale
+    if _async_timescale is None:
+        _async_timescale = AsyncTimescaleClient()
+        await _async_timescale.connect()
+    return _async_timescale
 
 def get_neo4j() -> Neo4jClient:
     global _neo4j

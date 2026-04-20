@@ -214,13 +214,14 @@ async def poll_feed(
             if not url or dedup.is_seen(url):
                 continue
 
-            title = entry.get("title", "").strip()
+            title = str(entry.get("title", "")).strip()
             if not title:
                 continue
 
-            summary = entry.get("summary", "").strip()
+            summary = str(entry.get("summary", ""))
             pub_date = _parse_pub_date(entry)
-            tags = [t.term for t in entry.get("tags", []) if hasattr(t, "term")]
+            tags = [str(t.term) for t in entry.get("tags", []) if hasattr(t, "term")]
+            author = str(entry.get("author", ""))
 
             event = RawEvent(
                 source = feed_name,
@@ -232,7 +233,7 @@ async def poll_feed(
                     "category": category,
                     "reliability": reliability,
                     "tags": tags,
-                    "author": entry.get("author", ""),
+                    "author": author,
                 },
             )
             # Kafka Producer: The 'key' determines the partition.

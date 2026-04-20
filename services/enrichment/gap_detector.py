@@ -64,11 +64,17 @@ class VesselGapDetector:
 
         for key in keys:
             try:
-                mmsi = key.replace("vessel:last_seen:", "")
+                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                mmsi = key_str.replace("vessel:last_seen:", "")
                 raw_val = self.redis.get(key)
                 if not raw_val:
                     continue
                 val = json.loads(raw_val)
+                if not isinstance(val, dict):
+                    logger.debug(f"Deleting corrupted cache key: {key}")
+                    self.redis.delete(key)
+                    continue
+
                 ts_str = val.get("ts", "")
                 region = val.get("region")
                 try:
@@ -96,8 +102,17 @@ class VesselGapDetector:
                 
                 info_raw = self.redis.get(f"vessel:info:{mmsi}")
                 info = json.loads(info_raw) if info_raw else {}
+                if not isinstance(info, dict):
+                    info={}
                 flags = info.get("flags", [])
+                if not isinstance(flags, list):
+                    flags = []
+
                 vtype = info.get("vessel_type", "Unknown")
+                heading = val.get("heading", 0)
+                if not isinstance(heading, (int, float)):
+                    heading = 0
+                
                 score = self.scorer.score_vessel_dark(
                     mmsi, gap_hours, region, val.get("heading"), flags
                 )
@@ -130,7 +145,7 @@ class VesselGapDetector:
                 )
 
                 self.db_writer.write_event(event)
-                self.producer.send(Topics.ENRICHED_EVENTS, event.dict(), key=mmsi)
+                self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)
                 fired += 1
 
                 if score >= 0.6:
