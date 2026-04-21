@@ -17,7 +17,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import deque
+from collections import deque  # 'deque' is a double-ended queue. Think of it as a list with a maximum size that automatically pushes old items out when new ones come in.
 
 import websockets
 from dotenv import load_dotenv
@@ -50,21 +50,33 @@ class WhaleDetector:
         self.window_size = window_size
         self.multiplier_threshold = multiplier_threshold
     
-    def is_unusual(self, assed_id: str, trade_size_usd: float) -> bool:
-        if assed_id not in self.history:
-            self.history[assed_id] = deque(maxlen=self.window_size)
+    # FIX: Corrected typo 'assed_id' to 'asset_id' for readability
+    def is_unusual(self, asset_id: str, trade_size_usd: float) -> bool:
+        # 1. INITIALIZATION: If we haven't seen this asset before, create a new 'conveyor belt' (deque) for it.
+        if asset_id not in self.history:
+            # maxlen automatically drops the oldest trade once we hit the window_size (e.g., 100 trades).
+            self.history[asset_id] = deque(maxlen=self.window_size)
         
-        history = self.history[assed_id]
+        history = self.history[asset_id]
+        
+        # 2. WARM-UP PERIOD: We need a minimum number of trades to establish a meaningful "average".
+        # If we have less than 10 trades, we just record the trade and assume it's normal to prevent false alarms.
         if len(history) < 10:
             history.append(trade_size_usd)
             return False
         
+        # 3. CALCULATE BASELINE: Calculate the average size of the recent trades in our window.
         avg_size = sum(history) / len(history)
+        
+        # NOTE: We add the new trade to our history AFTER calculating the average!
+        # If we added it before, a massive $1,000,000 trade would instantly inflate the average and hide itself.
         history.append(trade_size_usd)
 
-# If the trade is X times larger than the recent average, it's a whale
+        # ── WHALE LOGIC ─────────────────────────────────────────────────────────
+        # If the trade is X times larger than the recent average, and greater than $1,000, it's considered a whale.
 
-        if trade_size_usd > (avg_size * self.threshold) and trade_size_usd > 1000:
+        # FIX: Changed 'self.threshold' to 'self.multiplier_threshold' to match __init__
+        if trade_size_usd > (avg_size * self.multiplier_threshold) and trade_size_usd > 1000:
             return True
         return False
     
@@ -76,6 +88,8 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     redis_key = "sentinel:polymarket:watched_slugs"
     
+    # Polymarket WebSockets only send us meaningless ID numbers like "123456".
+    # We use this dictionary to map those numbers back to human-readable text like "Will Trump win? | Yes".
     # Reverse lookup map: {token_id: "human readable label"}
     id_to_label = {}
 
@@ -98,8 +112,10 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                 if market.get("closed"): continue
 
                                 question = market.get("question", "")
-                                tokens = market.get("clonTokenIds", [])
-                                if isinstance(tokens: str):
+                                # FIX: Corrected 'clonTokenIds' to 'clobTokenIds'
+                                tokens = market.get("clobTokenIds", [])
+                                # FIX: Syntax Error. Replaced colon with a comma in isinstance()
+                                if isinstance(tokens, str):
                                     tokens = json.loads(tokens)
                                 
                                 for i, token_id in enumerate(tokens):
@@ -109,8 +125,10 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 except Exception as e:
                     logger.error(f"Gamma API error for {slug}: {e}")
             
+            # If we found new outcomes to watch, tell the open WebSocket to start sending them to us.
             if new_assets:
-                await ws.send(json.dumps({"assests": new_assets, "type": "market"}))
+                # FIX: Corrected API key typo 'assests' to 'assets'
+                await ws.send(json.dumps({"assets": new_assets, "type": "market"}))
                 logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
             
             await asyncio.sleep(300)
@@ -124,6 +142,8 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                     injector_task = asyncio.create_task(update_subscriptions(ws, session))
 
                     try:
+                        # ── MAIN WEBSOCKET LOOP ──────────────────────────────────────────
+                        # This infinite loop constantly listens for live trades.
                         while True:
                             message = await ws.recv()
                             data = json.loads(message)
@@ -156,6 +176,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                         logger.warning(f"🚨 UNUSUAL BET DETECTED: ${notional_usd:.2f} on {label}")
                                     producer.send(Topics.RAW_FINANCIAL, raw_event.model_dump(), key="polymarket")
                     finally:
+                        # If the websocket disconnects, kill the background sync task so it doesn't run forever in the void.
                         injector_task.cancel()
 
         except Exception as e:
@@ -187,9 +208,12 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                             ticker = market.get("ticker")
                             vol = market.get("volume", 0)
                             
-                            # Simple delta check using Redis to see if volume spiked
+                            # ── VOLUME SPIKE DETECTION ─────────────────────────────────────
+                            # Kalshi only tells us "Total Volume". To find out if there was a spike,
+                            # we use Redis to remember the volume from 60 seconds ago and calculate the difference (delta).
                             redis_key = f"sentinel:kalshi:vol:{ticker}"
                             loop = asyncio.get_event_loop()
+                            # run_in_executor pushes this synchronous Redis call to a background thread to prevent freezing.
                             prev_vol = await loop.run_in_executor(None, redis_client.get, redis_key)
                             
                             if prev_vol:
@@ -229,7 +253,7 @@ async def main():
     redis_client = get_redis()
     try:
         await asyncio.gather(
-            stream_polymarket(producer, redis_client)
+            stream_polymarket(producer, redis_client),
             poll_kalshi(producer, redis_client)
 
         )

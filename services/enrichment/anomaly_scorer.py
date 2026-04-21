@@ -1,26 +1,25 @@
 """
 services/enrichment/anomaly_scorer.py
  
-THE JUDGE
-=========
-This module acts as the "Judge" for every event entering the system.
-It calculates a Score from 0.0 (Normal) to 1.0 (Critical/Anomalous).
-It doesn't decide what to DO with the event (that's the Alert system's job),
-it just decides how "suspicious" the event looks right now.
- 
-Scoring is additive: each risk signal contributes a partial score,
-the region sensitivity multiplier amplifies the total.
-The intent is that a sanctioned vessel in the Strait of Hormuz
-at unusual speed produces a high composite score, while a normal
-cargo vessel in the same region produces a low but non-zero score.
+THE JUDGE (ML UPGRADED)
+=======================
+Calculates a Score from 0.0 (Normal) to 1.0 (Critical/Anomalous).
+Now features Unsupervised Machine Learning (Isolation Forests) for 
+financial data to automatically adapt to dynamic market baselines.
 """
 
-
 import logging
+import pandas as pd  # Pandas is used for handling tabular data (like spreadsheets) in memory.
 from typing import List, Optional
+
+# Isolation Forest is an unsupervised Machine Learning algorithm.
+# It detects anomalies by randomly "cutting" data points. Normal points take many
+# cuts to isolate, while weird/anomalous points take very few cuts.
+from sklearn.ensemble import IsolationForest
 
 # We import a helper that tells us if a location (like "Strait of Hormuz")
 # is a high-risk zone.
+from shared.db import get_timescale
 from shared.utils.regions import get_region_sensitivity_multiplier
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
@@ -55,7 +54,86 @@ class AnomalyScorer:
     def __init__(self, redis_client):
         # Store the connection to Redis (memory cache) for later use.
         self._redis = redis_client
- 
+        self._db = get_timescale()
+        self._ml_models = {}
+
+    def _train_financial_model(self, ticker: str, domain: str) -> Optional[IsolationForest]:
+        """
+        Pulls the last 7 days of trade data for a specific ticker to train 
+        an unsupervised Isolation Forest model on the fly.
+        """
+        try:
+            # Query recent history to understand what "normal" looks like for this asset
+            sql = """
+                SELECT payload->>'premium_usd' as notional, payload->>'volume' as size
+                FROM events 
+                WHERE type = %s AND payload->>'ticker' = %s 
+                AND occurred_at > NOW() - INTERVAL '7 days'
+                LIMIT 5000
+            """
+            rows = self._db.query(sql, (domain, ticker))
+
+            if len(rows) < 50:
+                # We need a minimum amount of historical data to know what "normal" is.
+                # If we have less than 50 trades, we refuse to train the model to prevent false positives.
+                return None
+            
+            # Convert the raw database rows (dictionaries) into a Pandas DataFrame for easy ML processing.
+            df = pd.DataFrame(rows).astype(float).fillna(0)
+
+            # ── MACHINE LEARNING SETUP ──────────────────────────────────────────
+            # n_estimators=100: Create 100 "trees" to vote on whether a point is weird.
+            # contamination=0.01: We assume only 1% of the training data is actually anomalous.
+            # random_state=42: Ensures our results are reproducible (always generates the same trees).
+            model = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
+            
+            # "Fit" tells the model to study the historical trade sizes and premium amounts.
+            model.fit(df[['notional', 'size']])
+            self._ml_models[f"{domain}_{ticker}"] = model
+            return model
+        
+        except Exception as e:
+            logger.error(f"Failed to train ML model for {ticker}: {e}")
+            return None
+        
+    def score_financial_trade(self, domain: str, ticker: str, notional_usd: float, size: float) -> float:
+        """
+        Scores a live trade against the ML model. Returns 0.0 to 1.0.
+        """
+        if not ticker or notional_usd <= 0:
+            return 0.0
+        
+        model_key = f"{domain}_{ticker}"
+        model = self._ml_models.get(model_key)
+
+        if not model:
+            model = self._train_financial_model(ticker, domain)
+        
+        # Fallback to standard heuristics (hardcoded math) if there isn't enough historical data
+        if not model:
+            return round(min(1.0, notional_usd/2_000_000), 3)
+        
+        # Prepare the new, incoming live trade in the exact same format as the training data.
+        X_new = pd.DataFrame([{"notional": notional_usd, "size": size}])
+
+        # ── ML INFERENCE (PREDICTION) ─────────────────────────────────────────
+        # predict() returns an array. [1] means normal (inlier), [-1] means anomaly (outlier).
+        is_inlier = model.predict(X_new)[0]
+        if is_inlier == 1:
+            return 0.1  # Normal Baseline, low risk.
+        
+        # If anomalous (-1), use decision_function to gauge EXACTLY how weird it is.
+        # Returns a negative float. The more negative, the more severe the anomaly.
+        raw_score = model.decision_function(X_new)[0]
+
+        # Convert the negative ML score into a 0.0 to 1.0 percentage for our system.
+        anomaly_score = min(1.0, abs(raw_score) * 2)
+
+        if anomaly_score > 0.7:
+            logger.warning(f"🤖 ML OUTLIER DETECTED ({anomaly_score:.2f}): {ticker} | ${notional_usd:,.2f}")
+
+        return round(anomaly_score, 3)
+
     # ── Vessel Position ───────────────────────────────────────────────────────
 
     def score_vessel_position(
