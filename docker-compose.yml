@@ -182,6 +182,115 @@ services:
       timeout: 3s
       # Checks if the Redis server is running by sending a PING command.
       retries: 15
+  
+  enrichment:
+    build: .
+    container_name: sentinel-enrichment
+    command: python services/enrichment/main.py
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+  
+  correlation:
+    build: .
+    container_name: sentinel-correlation
+    command: python services/correlation/main.py
+    restart: always
+    depends_on:
+      - enrichment
+  
+  reasoning:
+    build: .
+    container_name: sentinel-reasoning
+    command: python services/reasoning/main.py
+    restart: always
+    depends_on:
+      - correlation
+# 2. DYNAMIC COLLECTORS
+  
+  collector-tradefi:
+    build: .
+    container_name: sentinel-tradefi
+    command: python services/collector-tradefi/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+  
+  collector-crypto:
+    build: .
+    container_name: sentinel-crypto
+    command: python services/collector-crypto/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  collector-prediction:
+    build: .
+    container_name: sentinel-prediction
+    command: python services/collector-prediction/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+# 3. PHYSICAL / CYBER COLLECTORS
+  collector-cyber:
+    build: .
+    container_name: sentinel-cyber
+    command: python services/collector-cyber/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+  
+  collector-ais:
+    build: .
+    container_name: sentinel-ais
+    command: python services/collector-ais/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+  collector-adsb:
+    build: .
+    container_name: sentinel-adsb
+    command: python services/collector-adsb/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+  collector-news:
+    build: .
+    container_name: sentinel-news
+    command: python services/collector-news/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+  api-gateway:
+    build: .
+    container_name: sentinel-api_gateway
+    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    ports:
+      - "8000:8000"
+    restart: always
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
 
 # Volumes save data even when the containers are stopped and started
 volumes:

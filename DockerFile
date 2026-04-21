@@ -1,0 +1,32 @@
+# Use the official lightweight Python image. 
+# "slim" strips out unnecessary OS tools (like heavy compilers) to keep the image small and secure.
+FROM python:3.11-slim
+
+# Set environment variables to optimize Python for containers
+# PYTHONDONTWRITEBYTECODE: Stops Python from cluttering the container with .pyc files
+# PYTHONUNBUFFERED: Forces Python to stream logs instantly to the terminal instead of buffering them
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Install system-level dependencies required for building certain Python packages (like psycopg2)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy your requirements file first.
+# Docker caches layers. By copying the requirements separately from the code, 
+# Docker won't re-download all your pip packages every time you change a line of code.
+COPY requirements-shared.txt .
+
+# Install the Python packages
+RUN pip install --no-cache-dir -r requirements-shared.txt
+
+# Copy the rest of the Sentinel application code into the container
+COPY . .
+
+# We don't set a default CMD here. We will define the CMD inside docker-compose.yml 
+# so we can use this exact same image for all our different services.

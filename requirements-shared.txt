@@ -12,5 +12,6 @@ honcho==1.1.0
 spacy==3.7.1
 fastapi == 0.109.0
 uvicorn[standard]==0.27.0
-
+google-genai == 1.73
+scikit-learn==1.2.3
 # After pip install, also run: python -m spacy download en_core_web_sm
