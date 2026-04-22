@@ -101,7 +101,9 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
         while True:
             try:
                 raw_slugs = await loop.run_in_executor(None, redis_client.raw.smembers, redis_key)
-                watched_slugs = [s for s in raw_slugs] if raw_slugs else []
+                watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else [
+                    "us-x-iran-permanent-peace-deal-by"
+                ]
                 new_assets = []
 
                 logger.info(f"Polymarket Watchlist: {watched_slugs}")
@@ -224,8 +226,8 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                             
                             if prev_vol:
                                 delta = vol - int(prev_vol)
-                                if delta > 5000: # Configurable spike threshold
-                                    logger.warning(f"📈 KALSHI VOLUME SPIKE: {ticker} (+{delta} contracts)")
+                                if delta > 100: # Configurable spike threshold
+                                    logger.warning(f"KALSHI VOLUME SPIKE: {ticker} (+{delta} contracts)")
                                     
                                     event = RawEvent(
                                         source="kalshi",

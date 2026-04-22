@@ -122,10 +122,13 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
             await asyncio.sleep(5)
 
 async def main():
+    logger.info("=" * 60)
+    logger.info("SENTINEL Crypt0 Service")
+    logger.info("=" * 60)
     producer = SentinelProducer()
     redis_client = get_redis()
-    logger.info("Starting Crypto Collector")
     try:
+        logger.info("Starting Crypto Collector")
         # asyncio.gather runs both infinite loops side-by-side at the exact same time.
         await asyncio.gather(
             stream_binance_liquidations(producer),

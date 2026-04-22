@@ -70,39 +70,62 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
             )
             producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
     except Exception as e:
-        logger.error(f"SEC Form 4 error: {e}")
+        logger.error("SEC Form 4 error: %s", e, exc_info=True)
 
 # ── FINNHUB EQUITIES (WEBSOCKET) ──────────────────────────────────────────────
 
-class MinuteBarAggregator:
-    """Aggregates raw Finnhub ticks into 60-second volume bars for ML baseline scoring."""
-    def __init__(self, producer: SentinelProducer):
+class OHLCVAggregator:
+    """Builds true Open, High, Low, Close, Volume candles and stores them in Redis."""
+    def __init__(self, producer: SentinelProducer, redis_client):
         self.producer = producer
+        self.redis_client = redis_client
         self.buffer = {}
-
+    
     def add_trade(self, ticker: str, price: float, volume: float):
         if ticker not in self.buffer:
-            self.buffer[ticker] = {"volume": 0, "close_price": price}
-        self.buffer[ticker]["volume"] += volume
-        self.buffer[ticker]["close_price"] = price # Continually update to the latest price
-
+            # First trade of the minute sets the Open, High, Low, and Close
+            self.buffer[ticker] = {
+                "O": price, "H": price, "L": price, "C": price, "V": volume
+            }
+        else:
+            d = self.buffer[ticker]
+            d["H"] = max(d["H"], price)
+            d["L"] = min(d["L"], price)
+            d["C"] = price
+            d["V"] = d["V"] + volume
     def flush(self):
-        """Called every 60 seconds to push aggregates to Kafka and clear the buffer."""
+        now = datetime.now(timezone.utc)
+
         for ticker, data in self.buffer.items():
-            if data["volume"] > 0:
+            if data["V"] > 0:
+                candle = {
+                    "ticker": ticker,
+                    "trade_type": "OHLCV_MINUTE_BAR",
+                    "open": data["O"],
+                    "high": data["H"],
+                    "low": data["L"],
+                    "close": data["C"],
+                    "volume": data["V"],
+                    "notional_usd": data["C"] * data["V"]
+                
+                }
                 event = RawEvent(
                     source="finnhub_equities",
-                    occurred_at=datetime.now(timezone.utc),
-                    raw_payload={
-                        "ticker": ticker,
-                        "trade_type": "VOLUME_MINUTE_BAR",
-                        "volume": data["volume"],
-                        "price": data["close_price"],
-                        "notional_usd": data["volume"] * data["close_price"]
-                    }
+                    occurred_at=now,
+                    raw_payload=candle
                 )
                 self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+
+                redis_list_key= f"sentinel:candles:1m:{ticker}"
+                candle_json = json.dumps({"ts": now.isoformat, **candle})
+                try:
+                    self.redis_client.lpush(redis_list_key, candle_json)
+                    # Keep only the last 1440 minutes (24 hours) of candles
+                    self.redis.ltrim(redis_list_key, 0, 1439)
+                except Exception as e:
+                    logger.error("Redis error: %s", e, exc_info=True)
         self.buffer.clear()
+                    
 
 async def stream_equities(producer: SentinelProducer, redis_client):
     if not FINNHUB_API_KEY: 
@@ -110,22 +133,21 @@ async def stream_equities(producer: SentinelProducer, redis_client):
         return
         
     url = f"wss://ws.finnhub.io?token={FINNHUB_API_KEY}"
-    aggregator = MinuteBarAggregator(producer)
+    aggregator = OHLCVAggregator(producer, redis_client)
     
     async def sync_subscriptions(ws):
         """Watches Redis and dynamically subscribes/unsubscribes using Finnhub JSON formats."""
         loop = asyncio.get_event_loop()
         current_subs = set()
-        logger.info(f"TradFi Watchlist: {desired_subs}")
 
         while True:
             try:
                 raw_tickers = await loop.run_in_executor(None, redis_client.raw.smembers, REDIS_EQUITIES_KEY)
-                desired_subs = {t.upper() for t in raw_tickers} if raw_tickers else {"SPY"}
+                desired_subs = {t.upper() for t in raw_tickers} if raw_tickers else {"SPY", "QQQ"}
                 
                 # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
                 if len(desired_subs) > 50:
-                    logger.warning(f"Watchlist exceeds Finnhub limit (50). Truncating {len(desired_subs) - 50} symbols.")
+                    logger.warning("Watchlist exceeds Finnhub limit (50). Truncating %d symbols.", len(desired_subs) - 50)
                     desired_subs = set(list(desired_subs)[:50])
                 
                 to_add = desired_subs - current_subs
@@ -138,9 +160,11 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                     
                 if to_add or to_remove:
                     current_subs = desired_subs
-                    logger.info(f"Finnhub: Synced subs. Currently tracking {len(current_subs)}/50 limit.")
+                    logger.info("Finnhub: Synced subs. Currently tracking %d/50 limit.", len(current_subs))
+                    # Show exactly which tickers are currently being streamed
+                    logger.info("Active Tickers: %s", ", ".join(current_subs))
             except Exception as e:
-                logger.error(f"Sync Task Error: {e}", exc_info=True)
+                logger.error("Sync Task Error: %s", e, exc_info=True)
             await asyncio.sleep(60)
 
     async def flush_aggregator():
@@ -172,8 +196,8 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                                 aggregator.add_trade(ticker, price, volume)
                                 
                                 # 2. Instant Block Trade Detection (> $500k)
-                                if notional > 500_000:
-                                    logger.warning(f"🐳 EQUITY BLOCK: {ticker} ${notional/1e6:.2f}M at ${price}")
+                                if notional > 100_000:
+                                    logger.warning("🐳 EQUITY BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
                                     event = RawEvent(
                                         source="finnhub_equities",
                                         occurred_at=datetime.now(timezone.utc),
@@ -187,7 +211,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                     sync_task.cancel()
                     flush_task.cancel()
         except Exception as e:
-            logger.error(f"Finnhub error: {e}. Reconnecting...")
+            logger.error("Finnhub error: %s. Reconnecting...", e, exc_info=True)
             await asyncio.sleep(5)
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
@@ -203,6 +227,9 @@ async def run_polling(producer: SentinelProducer, redis_client):
             await asyncio.sleep(60)
 
 async def main():
+    logger.info("=" * 60)
+    logger.info("SENTINEL TradFi Service")
+    logger.info("=" * 60)
     producer = SentinelProducer()
     redis_client = get_redis()
     logger.info("Starting TradFi Collector (Finnhub & SEC Only)")
