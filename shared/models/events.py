@@ -166,7 +166,7 @@ class BettingData(BaseModel):
     selection: str
     implied_probablity: float
     american_odds: int
-    sharp_book_deviation = Optional[float] = None
+    sharp_book_deviation: Optional[float] = None
 
 class PredictionMarketData(BaseModel):
    market_id: str

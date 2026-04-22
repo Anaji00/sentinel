@@ -213,8 +213,8 @@ services:
   
   collector-tradefi:
     build: .
-    container_name: sentinel-tradefi
-    command: python services/collector-tradefi/main.py
+    container_name: sentinel-tradfi
+    command: python services/collector-tradfi/main.py
     env_file: .env
     restart: always
     depends_on:
