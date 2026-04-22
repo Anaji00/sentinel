@@ -29,11 +29,13 @@ class Topics:
     # RAW TOPICS: The "Firehose".
     # These contain messy, raw data straight from the collectors (APIs/scrapers).
     # It might be missing fields or have weird formatting.
-    RAW_MARITIME = "raw.maritime"
-    RAW_FINANCIAL = "raw.financial"
-    RAW_NEWS = "raw.news"
-    RAW_AVIATION = "raw.aviation"
-    RAW_CYBER = "raw.cyber"
+    RAW_MARITIME = "events.raw.maritime"
+    RAW_TRADFI     = "events.raw.tradfi"
+    RAW_CRYPTO     = "events.raw.crypto"
+    RAW_PREDICTION = "events.raw.prediction"
+    RAW_NEWS = "events.raw.news"
+    RAW_AVIATION = "events.raw.aviation"
+    RAW_CYBER = "events.raw.cyber"
 
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
@@ -44,7 +46,7 @@ class Topics:
     # When our engine notices a pattern (e.g., 2 vessels meeting at night), it
     # bundles those events together into a Correlation and puts it here.
     CORRELATIONS = "correlations.detected"
-
+    NORMALIZED     = "events.normalized"
     # ALERTS: The "Megaphone".
     # High-priority stuff that needs to go to a Dashboard, SMS, or Email immediately.
     ALERTS = "alerts.outbound"
@@ -54,7 +56,7 @@ class Topics:
     # get stuck in a loop trying to process it forever.
     DLQ = "dead.letter"
 
-    ALL_RAW = [RAW_MARITIME, RAW_FINANCIAL, RAW_NEWS, RAW_AVIATION, RAW_CYBER]
+    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER]
 
 
 # ── SERIALIZATION ─────────────────────────────────────────────────────────────

@@ -60,9 +60,11 @@ def _save_scenario(db, scenario):
             scenario.confidence_overall,
             scenario.confidence_rationale,
         ))
-        logger.info(f"✅ Intelligence Synthesis Saved: {scenario.headline[:80]}")
+        # BEST PRACTICE: Lazy evaluation. We pass variables as arguments instead of using f-strings.
+        logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
     except Exception as e:
-        logger.error(f"Error saving scenario to DB: {e}")
+        # BEST PRACTICE: Added exc_info=True to automatically attach the traceback to the log!
+        logger.error("Error saving scenario %s to DB: %s", scenario.scenario_id, e, exc_info=True)
 
 async def apply_autonomous_feedback(scenario, redis_client):
     """
@@ -83,13 +85,13 @@ async def apply_autonomous_feedback(scenario, redis_client):
     for ticker in tickers:
         is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:equities", ticker)
         if is_new:
-            logger.warning(f"🤖 AUTONOMOUS PIVOT: Instructing TradFi collector to track {ticker}")
+            logger.warning("🤖 AUTONOMOUS PIVOT: Instructing TradFi collector to track %s", ticker)
 
     # Push new wallets to the Crypto collector
     for wallet in wallets:
         is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:wallets", wallet)
         if is_new:
-            logger.warning(f"🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet {wallet}")
+            logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
 
 
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, context_builder, generator, library):
@@ -99,10 +101,10 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, context
     """
     try:
         if cluster.alert_tier == AlertTier.WATCH:
-            logger.debug(f"Skipping Tier 1 WATCH signal: {cluster.rule_name}")
+            logger.debug("Skipping Tier 1 WATCH signal: %s", cluster.rule_name)
             return
             
-        logger.info(f"🧠 Synthesizing [{cluster.alert_tier.name}] {cluster.rule_name} via Gemini...")
+        logger.info("🧠 Synthesizing [%s] %s via Gemini...", cluster.alert_tier.name, cluster.rule_name)
 
         # 1. Fetch Graph Relationships (Neo4j)
         context = context_builder.build(cluster)
@@ -121,7 +123,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, context
             await apply_autonomous_feedback(scenario, redis_client)
 
     except Exception as e:
-        logger.error(f"Failed to process cluster {cluster.correlation_id}: {e}", exc_info=True)
+        logger.error("Failed to process cluster %s: %s", cluster.correlation_id, e, exc_info=True)
 
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
@@ -149,7 +151,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.error(f"Reasoning consumer crashed: {e}", exc_info=True)
+        logger.error("Reasoning consumer crashed: %s", e, exc_info=True)
     finally:
         consumer.close()
 

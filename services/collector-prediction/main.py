@@ -174,7 +174,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
                                     if is_whale:
                                         logger.warning(f"🚨 UNUSUAL BET DETECTED: ${notional_usd:.2f} on {label}")
-                                    producer.send(Topics.RAW_FINANCIAL, raw_event.model_dump(), key="polymarket")
+                                    producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
                     finally:
                         # If the websocket disconnects, kill the background sync task so it doesn't run forever in the void.
                         injector_task.cancel()
@@ -233,7 +233,7 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                                             "no_bid": market.get("no_bid")
                                         }
                                     )
-                                    producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=ticker)
+                                    producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
                             
                             # Update state
                             await loop.run_in_executor(None, redis_client.set, redis_key, vol, 3600)

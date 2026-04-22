@@ -57,7 +57,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
                         }
                     )
                     # Send the event to the Kafka queue for the enrichment service to process.
-                    producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=symbol)
+                    producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
         except Exception as e:
             # If the connection drops, log the error, wait 5 seconds, and try to reconnect (Infinite retry).
             logger.error(f"Binance WS error: {e}. Reconnecting...")
@@ -116,7 +116,7 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
                                     "receiver_wallet": receiver, "is_suspect_wallet": is_suspect
                                 }
                             )
-                            producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=token)
+                            producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=token)
         except Exception as e:
             logger.error(f"ETH RPC error: {e}. Reconnecting...")
             await asyncio.sleep(5)

@@ -57,7 +57,7 @@ FEEDS = [
     ("aljazeera",       "https://www.aljazeera.com/xml/rss/all.xml",          "wire",       0.95),
     # Maritime
     ("maritime_exec",   "https://maritime-executive.com/rss-feed",            "maritime",   0.90),
-    ("tanker_trackers", "https://www.tankertracker.com/feed",                 "maritime",   0.88),
+    ("tanker_trackers", "https://tankertrackers.com/feed",                 "maritime",   0.88),
     ("seatrade",        "https://www.seatrade-maritime.com/rss/all",          "maritime",   0.85),
     ("lloyds_list",     "https://lloydslist.com/rss",                         "maritime",   0.92),
     ("gcaptain",        "https://gcaptain.com/feed",                          "maritime",   0.85),

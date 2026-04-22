@@ -63,7 +63,9 @@ class EventType(str, Enum):
     CRYPTO_LIQUIDATION = "crypto_liquidation"
     CRYPTO_PERP_FUNDING = "crypto_perp_funding"
     CUSTOM = "custom"
-
+    EQUITY_BLOCK = "equity_block"
+    CRYPTO_TRANSFER = "crypto_transfer"
+    PREDICTION_MARKET = "prediction_market"
 class EntityType(str, Enum):
     VESSEL = "vessel"
     AIRCRAFT = "aircraft"
@@ -253,9 +255,9 @@ class NormalizedEvent(BaseModel):
     flight_data: Optional[FlightData] = None
     financial_data: Optional[FinancialData] = None
     security_data: Optional[SecurityData] = None
-    betting_data: Optional[BettingData]
-    prediction_market_data: Optional[PredictionMarketData]
-    crypto_data: Optional[CryptoData]
+    betting_data: Optional[BettingData] = None
+    prediction_market_data: Optional[PredictionMarketData] = None
+    crypto_data: Optional[CryptoData] = None
 
     tags: List[str] = Field(default_factory=list) # Maps to TEXT[] via GIN Index
     named_entities: List[str] = Field(default_factory=list) # Maps to TEXT[]

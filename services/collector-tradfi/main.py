@@ -68,7 +68,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     "summary": entry.get("summary", "")
                 }
             )
-            producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key="form4")
+            producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
     except Exception as e:
         logger.error(f"SEC Form 4 error: {e}")
 
@@ -101,7 +101,7 @@ class MinuteBarAggregator:
                         "notional_usd": data["volume"] * data["close_price"]
                     }
                 )
-                self.producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=ticker)
+                self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
         self.buffer.clear()
 
 async def stream_equities(producer: SentinelProducer, redis_client):
@@ -179,7 +179,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                                             "price": price, "size_shares": volume, "notional_usd": notional
                                         }
                                     )
-                                    producer.send(Topics.RAW_FINANCIAL, event.model_dump(), key=ticker)
+                                    producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
                 finally:
                     sync_task.cancel()
                     flush_task.cancel()

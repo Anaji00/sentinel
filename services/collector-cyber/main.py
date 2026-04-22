@@ -74,7 +74,7 @@ CENSYS_API_SECRET = os.getenv("CENSYS_API_SECRET")
 CENSYS_BASE       = "https://search.censys.io/api/v2"
 
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-RIPE_RIS_URL = "wss://ris-live.ripe.net/v1/stream/?client=sentinel"
+RIPE_RIS_URL = "wss://ris-live.ripe.net/v1/ws/?client=sentinel"
 
 # ── 3. DOMAIN KNOWLEDGE (CONSTANTS) ───────────────────────────────────────────
 # ICS/SCADA and critical infrastructure protocols
