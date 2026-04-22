@@ -69,12 +69,25 @@ class VesselGapDetector:
                 raw_val = self.redis.get(key)
                 if not raw_val:
                     continue
-                val = json.loads(raw_val)
+                if isinstance(raw_val, dict):
+                    val = raw_val
+                # Check if it's a string or bytes before loading
+                elif isinstance(raw_val, (str, bytes)):
+                    try:
+                        val = json.loads(raw_val)
+                    except json.JSONDecodeError:
+                        logger.debug(f"Could not parse JSON for {key}")
+                        continue
+                else:
+                    # If it's an int, float, or something else, skip it.
+                    logger.debug(f"Skipping non-string/dict value for {key}")
+                    continue
+
                 if not isinstance(val, dict):
                     logger.debug(f"Deleting corrupted cache key: {key}")
                     self.redis.delete(key)
                     continue
-
+                
                 ts_str = val.get("ts", "")
                 region = val.get("region")
                 try:

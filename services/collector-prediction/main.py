@@ -99,38 +99,44 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
         loop = asyncio.get_event_loop()
         
         while True:
-            raw_slugs = await loop.run_in_executor(None, redis_client.smembers, redis_key)
-            watched_slugs = [s for s in raw_slugs] if raw_slugs else []
-            new_assets = []
+            try:
+                raw_slugs = await loop.run_in_executor(None, redis_client.raw.smembers, redis_key)
+                watched_slugs = [s for s in raw_slugs] if raw_slugs else []
+                new_assets = []
 
-            for slug in watched_slugs:
-                try:
-                    async with session.get(f"{base_url}{slug}", timeout=10) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            for market in data.get("markets", []):
-                                if market.get("closed"): continue
+                logger.info(f"Polymarket Watchlist: {watched_slugs}")
 
-                                question = market.get("question", "")
-                                # FIX: Corrected 'clonTokenIds' to 'clobTokenIds'
-                                tokens = market.get("clobTokenIds", [])
-                                # FIX: Syntax Error. Replaced colon with a comma in isinstance()
-                                if isinstance(tokens, str):
-                                    tokens = json.loads(tokens)
-                                
-                                for i, token_id in enumerate(tokens):
-                                    if token_id not in id_to_label:
-                                        id_to_label[token_id] = f"{slug} | {question} | Outcome {i}"
-                                        new_assets.append(token_id)
-                except Exception as e:
-                    logger.error(f"Gamma API error for {slug}: {e}")
+                for slug in watched_slugs:
+                    try:
+                        async with session.get(f"{base_url}{slug}", timeout=10) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for market in data.get("markets", []):
+                                    if market.get("closed"): continue
+
+                                    question = market.get("question", "")
+                                    # FIX: Corrected 'clonTokenIds' to 'clobTokenIds'
+                                    tokens = market.get("clobTokenIds", [])
+                                    # FIX: Syntax Error. Replaced colon with a comma in isinstance()
+                                    if isinstance(tokens, str):
+                                        tokens = json.loads(tokens)
+                                    
+                                    for i, token_id in enumerate(tokens):
+                                        if token_id not in id_to_label:
+                                            id_to_label[token_id] = f"{slug} | {question} | Outcome {i}"
+                                            new_assets.append(token_id)
+                    except Exception as e:
+                        logger.error(f"Gamma API error for {slug}: {e}")
+                
+                # If we found new outcomes to watch, tell the open WebSocket to start sending them to us.
+                if new_assets:
+                    # FIX: Corrected API key typo 'assests' to 'assets'
+                    await ws.send(json.dumps({"assets": new_assets, "type": "market"}))
+                    logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
             
-            # If we found new outcomes to watch, tell the open WebSocket to start sending them to us.
-            if new_assets:
-                # FIX: Corrected API key typo 'assests' to 'assets'
-                await ws.send(json.dumps({"assets": new_assets, "type": "market"}))
-                logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
-            
+            except Exception as e:
+                logger.error(f"Polymarket sync error: {e}")
+
             await asyncio.sleep(300)
 
     while True:

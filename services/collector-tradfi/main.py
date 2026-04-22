@@ -116,28 +116,31 @@ async def stream_equities(producer: SentinelProducer, redis_client):
         """Watches Redis and dynamically subscribes/unsubscribes using Finnhub JSON formats."""
         loop = asyncio.get_event_loop()
         current_subs = set()
-        
+        logger.info(f"TradFi Watchlist: {desired_subs}")
+
         while True:
-            raw_tickers = await loop.run_in_executor(None, redis_client.smembers, REDIS_EQUITIES_KEY)
-            desired_subs = {t.upper() for t in raw_tickers} if raw_tickers else {"SPY"}
-            
-            # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
-            if len(desired_subs) > 50:
-                logger.warning(f"Watchlist exceeds Finnhub limit (50). Truncating {len(desired_subs) - 50} symbols.")
-                desired_subs = set(list(desired_subs)[:50])
-            
-            to_add = desired_subs - current_subs
-            to_remove = current_subs - desired_subs
-            
-            for ticker in to_add:
-                await ws.send(json.dumps({"type": "subscribe", "symbol": ticker}))
-            for ticker in to_remove:
-                await ws.send(json.dumps({"type": "unsubscribe", "symbol": ticker}))
+            try:
+                raw_tickers = await loop.run_in_executor(None, redis_client.raw.smembers, REDIS_EQUITIES_KEY)
+                desired_subs = {t.upper() for t in raw_tickers} if raw_tickers else {"SPY"}
                 
-            if to_add or to_remove:
-                current_subs = desired_subs
-                logger.info(f"Finnhub: Synced subs. Currently tracking {len(current_subs)}/50 limit.")
-            
+                # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
+                if len(desired_subs) > 50:
+                    logger.warning(f"Watchlist exceeds Finnhub limit (50). Truncating {len(desired_subs) - 50} symbols.")
+                    desired_subs = set(list(desired_subs)[:50])
+                
+                to_add = desired_subs - current_subs
+                to_remove = current_subs - desired_subs
+                
+                for ticker in to_add:
+                    await ws.send(json.dumps({"type": "subscribe", "symbol": ticker}))
+                for ticker in to_remove:
+                    await ws.send(json.dumps({"type": "unsubscribe", "symbol": ticker}))
+                    
+                if to_add or to_remove:
+                    current_subs = desired_subs
+                    logger.info(f"Finnhub: Synced subs. Currently tracking {len(current_subs)}/50 limit.")
+            except Exception as e:
+                logger.error(f"Sync Task Error: {e}", exc_info=True)
             await asyncio.sleep(60)
 
     async def flush_aggregator():
