@@ -135,6 +135,8 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                     # FIX: Corrected API key typo 'assests' to 'assets'
                     await ws.send(json.dumps({"assets": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
+                logger.info(f"Polymarket Heartbeat: Watching {len(id_to_label)} active outcomes across {len(watched_slugs)} slugs.")
+                await asyncio.sleep(30)
             
             except Exception as e:
                 logger.error(f"Polymarket sync error: {e}")
@@ -245,7 +247,7 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                             
                             # Update state
                             await loop.run_in_executor(None, redis_client.set, redis_key, vol, 3600)
-                            
+                    logger.info(f"Kalshi Heartbeat: Scanned {len(markets)} active markets. No spikes > 100 detected.")        
             except Exception as e:
                 logger.error(f"Kalshi polling error: {e}")
             

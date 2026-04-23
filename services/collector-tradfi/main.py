@@ -161,6 +161,8 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                 if to_add or to_remove:
                     current_subs = desired_subs
                     logger.info("Finnhub: Synced subs. Currently tracking %d/50 limit.", len(current_subs))
+                else:
+                    logger.info(f"Finnhub Heartbeat: Monitoring {len(current_subs)} symbols (Awaiting live trades).")
                     # Show exactly which tickers are currently being streamed
                     logger.info("Active Tickers: %s", ", ".join(current_subs))
             except Exception as e:
