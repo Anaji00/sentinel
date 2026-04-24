@@ -87,7 +87,7 @@ class VesselGapDetector:
                     logger.debug(f"Deleting corrupted cache key: {key}")
                     self.redis.delete(key)
                     continue
-                
+
                 ts_str = val.get("ts", "")
                 region = val.get("region")
                 try:
@@ -111,23 +111,18 @@ class VesselGapDetector:
 
                 # trim the set to prevent unbounded growth (keep last 1000 entries)
                 if len(self._seen_gaps) > 10_000:
-                    self._seen_gaps = set(list(self._seen_gaps)[-5_000:])
+                    self._seen_gaps.clear()
                 
                 info_raw = self.redis.get(f"vessel:info:{mmsi}")
                 info = json.loads(info_raw) if info_raw else {}
-                if not isinstance(info, dict):
-                    info={}
-                flags = info.get("flags", [])
-                if not isinstance(flags, list):
-                    flags = []
-
-                vtype = info.get("vessel_type", "Unknown")
+                flags = info.get("flags", []) if isinstance(info, dict) else []
+                vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"
                 heading = val.get("heading", 0)
                 if not isinstance(heading, (int, float)):
                     heading = 0
                 
                 score = self.scorer.score_vessel_dark(
-                    mmsi, gap_hours, region, val.get("heading"), flags
+                    mmsi, gap_hours, region, flags, heading
                 )
                 event = NormalizedEvent(
                     type=EventType.VESSEL_DARK, 

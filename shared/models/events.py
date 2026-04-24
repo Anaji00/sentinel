@@ -177,6 +177,8 @@ class PredictionMarketData(BaseModel):
    shares_traded: float
    price_usd: float
    liquidity_pool_size: Optional[float] = None
+   notional_usd: Optional[float] = None
+
 
 class CryptoData(BaseModel):
     pair: str

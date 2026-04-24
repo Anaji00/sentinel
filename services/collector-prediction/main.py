@@ -206,8 +206,10 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
     
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
         while True:
-            try:
+            
+            markets = []
                 # Example: Fetching markets sorted by recent volume
+            try:   
                 url = f"{KALSHI_BASE_URL}/markets?status=active&limit=50"
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -246,7 +248,7 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                                     producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
                             
                             # Update state
-                            await loop.run_in_executor(None, redis_client.set, redis_key, vol, 3600)
+                            await loop.run_in_executor(None, redis_client.set, redis_key, str(vol), 3600)
                     logger.info(f"Kalshi Heartbeat: Scanned {len(markets)} active markets. No spikes > 100 detected.")        
             except Exception as e:
                 logger.error(f"Kalshi polling error: {e}")

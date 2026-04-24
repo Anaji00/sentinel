@@ -15,7 +15,10 @@ from .events import (
     ScenarioStatus,
     ScenarioHypothesis,
     Scenario,
+    CryptoData,
     FinancialData,
+    PredictionMarketData,
+    BettingData,
     FlightData,
     SecurityData,
 )

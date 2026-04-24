@@ -121,7 +121,7 @@ class OHLCVAggregator:
                 try:
                     self.redis_client.lpush(redis_list_key, candle_json)
                     # Keep only the last 1440 minutes (24 hours) of candles
-                    self.redis.ltrim(redis_list_key, 0, 1439)
+                    self.redis_client.ltrim(redis_list_key, 0, 1439)
                 except Exception as e:
                     logger.error("Redis error: %s", e, exc_info=True)
         self.buffer.clear()
