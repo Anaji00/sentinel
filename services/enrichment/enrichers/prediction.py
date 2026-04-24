@@ -20,10 +20,12 @@ class PredictionEnricher:
     Standardizes events from prediction markets. It uses a routing mechanism to handle 
     different data sources (e.g., Polymarket's real-time trades vs. Kalshi's volume spikes).
     """
-    def __init__(self, scorer):
+    def __init__(self, scorer, redis_client):
         # The scorer is used to determine how "unusual" an event is, though 
         # currently this class calculates some baseline anomaly scores itself.
         self.scorer = scorer
+        self.redis = redis_client
+
 
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         # Extract the raw dictionary payload and the source identifier
@@ -69,6 +71,13 @@ class PredictionEnricher:
             tags = ["prediction_market", "whale_bet", slug.lower()]
             headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
 
+        # DYNAMIC WATCHLIST PROPAGATION
+            # If a whale drops money here, force the Polymarket WS to track all outcomes for this slug
+            try:
+                self.redis.sadd("sentinel:polymarket:watched_slugs", slug)
+            except Exception as e:
+                logger.error(f"Failed to push {slug} to watchlist: {e}")
+            
         # The primary entity is the market outcome itself (e.g., "Will X happen? | Yes").
         entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
 

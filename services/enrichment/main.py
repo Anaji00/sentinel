@@ -117,9 +117,9 @@ async def main():
     aviation = AviationEnricher(scorer, graph)
     news = NewsEnricher(scorer)
     cyber = CyberEnricher(scorer)
-    tradfi = TradFiEnricher(scorer)
-    crypto = CryptoEnricher(scorer)
-    prediction = PredictionEnricher(scorer)
+    tradfi = TradFiEnricher(scorer, redis)
+    crypto = CryptoEnricher(scorer, redis)
+    prediction = PredictionEnricher(scorer, redis)
 
     producer = SentinelProducer()
     dlq = SentinelProducer()

@@ -68,7 +68,7 @@ class TradFiEnricher:
             tags.append("geo_linked_asset")
             try:
                 # Dynamically sync downstream watchlist sweeps
-                self.redis.sadd("sentinel:watched:equities", ticker)
+                self.redis_client.sadd("sentinel:watched:equities", ticker)
             except Exception as e:
                 logger.error(f"Failed to push {ticker} to watchlist: {e}")
 
@@ -136,8 +136,8 @@ class TradFiEnricher:
         """EMA baselining (α=0.05) to detect accumulation sweeps in thin markets."""
         try:
             key = f"baseline:volume:{ticker}"
-            current = self.redis.get(key)
+            current = self.redis_client.get(key)
             updated = (0.95 * float(current) + 0.05 * volume) if current else volume
-            self.redis.set(key, str(round(updated, 3)), ex=604800)
+            self.redis_client.set(key, str(round(updated, 3)), ex=604800)
         except Exception:
             pass # Failsafe against cache drops

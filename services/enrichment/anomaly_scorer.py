@@ -65,13 +65,13 @@ class AnomalyScorer:
         try:
             # Query recent history to understand what "normal" looks like for this asset
             sql = """
-                SELECT payload->>'premium_usd' as notional, payload->>'volume' as size
+                SELECT financial_data->>'premium_usd' as notional, financial_data->>'volume' as size
                 FROM events 
-                WHERE type = %s AND payload->>'ticker' = %s 
+                WHERE financial_data->>'ticker' = %s 
                 AND occurred_at > NOW() - INTERVAL '7 days'
                 LIMIT 5000
             """
-            rows = self._db.query(sql, (domain, ticker))
+            rows = self._db.query(sql, (ticker,))
 
             if len(rows) < 50:
                 # We need a minimum amount of historical data to know what "normal" is.

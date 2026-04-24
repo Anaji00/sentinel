@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData
 
+
 logger = logging.getLogger("enrichment.crypto")
 
 class CryptoEnricher:
@@ -18,10 +19,12 @@ class CryptoEnricher:
     Standardizes cryptocurrency events. It uses a routing mechanism to handle 
     different types of crypto data sources (e.g., on-chain RPCs vs. CEX WebSockets).
     """
-    def __init__(self, scorer):
+    def __init__(self, scorer, redis_client):
         # The scorer is used to determine how "unusual" an event is.
         # This class calculates baseline anomaly scores mathematically.
         self.scorer = scorer
+        self.redis = redis_client
+
 
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         # Extract the raw dictionary payload and the source identifier
@@ -67,6 +70,12 @@ class CryptoEnricher:
             tags = ["crypto", "whale_transfer", asset.lower()]
             if is_suspect: tags.append("suspect_wallet")
             headline = f"{'🚨 SUSPECT ' if is_suspect else ''}Whale Transfer: ${notional/1e6:.1f}M {asset}"
+
+            if notional > 5_000_00:
+                try:
+                    self.redis.sadd("sentinel:watched:wallets", wallet)
+                except Exception as e:
+                    logger.error(f"Failed to push {wallet[:6]} to watchlist: {e}")
 
         # Create a unified Entity object to represent the wallet in our graph database
         entity = Entity(id=wallet, type=EntityType.ORGANIZATION, name=f"Wallet_{wallet[:6]}")
