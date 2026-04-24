@@ -28,7 +28,7 @@ class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
     def __init__(self, scorer, redis_client):
         self.scorer = scorer
-        self.redis = redis_client
+        self.redis_client = redis_client
 
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         p = raw.raw_payload
