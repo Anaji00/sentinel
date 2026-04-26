@@ -53,31 +53,16 @@ class PredictionEnricher:
         notional = float(p.get("notional_usd", 0))
         shares = float(p.get("size_shares", 0))
         price = float(p.get("price", 0))
-        is_whale = p.get("is_whale_bet", False)
-
-        # DATA BASELINING: The collector has already done the hard work of detecting
-        # if a bet is unusually large. We just check the boolean flag.
-        is_baseline =  not is_whale
-        
-        if is_baseline:
-            # If it's a normal trade, give it a very low anomaly score.
-            anomaly = 0.1
-            tags = ["prediction_market", "baseline_data"]
-            headline = f"Market Flow on {label}: ${notional:,.2f}"
-        else:
-            # For whale bets, calculate a score. Start with a base of 0.5 and add more
-            # based on size, maxing out the size contribution at $100k.
-            anomaly = min(1.0, 0.5 + (notional / 100_000) * 0.4)
-            tags = ["prediction_market", "whale_bet", slug.lower()]
-            headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
-
+        anomaly = min(1.0, 0.5 + (notional / 100_000) * 0.4)
+        tags = ["prediction_market", "whale_bet", slug.lower()]
+        headline =f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
         # DYNAMIC WATCHLIST PROPAGATION
             # If a whale drops money here, force the Polymarket WS to track all outcomes for this slug
-            try:
-                self.redis.sadd("sentinel:polymarket:watched_slugs", slug)
-            except Exception as e:
-                logger.error(f"Failed to push {slug} to watchlist: {e}")
-            
+        try:
+            self.redis.sadd("sentinel:polymarket:watched_slugs", slug)
+        except Exception as e:
+            logger.error(f"Failed to push {slug} to watchlist: {e}")
+        
         # The primary entity is the market outcome itself (e.g., "Will X happen? | Yes").
         entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
 
@@ -108,21 +93,17 @@ class PredictionEnricher:
         title = p.get("title", "Unknown Market")
         delta = float(p.get("volume_delta", 0))
         price = float(p.get("yes_bid") or p.get("no_bid") or 0.0)
-        is_anomaly = p.get("is_anomaly", False)
-
-        is_baseline = not is_anomaly
-
-        if is_baseline:
-            anomaly = 0.1
-            tags = ["prediction_market", "baseline_data"]
-            headline = f"Kalshi Volume Flow: {ticker} (+{int(delta)})"
-        else:
-            anomaly = 0.65
-            tags = ["prediction_market", "volume_spike", ticker.lower()]
-            headline = f"🚨 KALSHI SPIKE: {ticker} (+{int(delta)} contracts)"
-
+        notional_usd = float(p.get("notional_usd", 0))
+        anomaly = min(1.0, 0.65 + (notional_usd / 50_000) * 0.3)
+        tags = ["kalshi_prediction", "volume_spike", ticker.lower()]
+        headline = f"🚨 KALSHI SPIKE: {ticker} (+${notional_usd:,.2f})"
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
+        try:
+            self.redis.sadd("sentinel:kalshi:watched_tickers", ticker)
+        except Exception as e:
+            logger.error(f"Failed to push {ticker} to watchlist: {e}")
+            
         return NormalizedEvent(
             event_id=raw.event_id,
             type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
@@ -134,6 +115,7 @@ class PredictionEnricher:
                 question=title,
                 outcome="Volume Spike",
                 shares_traded=delta,
+                notional_usd=notional_usd,
                 price_usd=price
             ),
             headline=headline,

@@ -106,7 +106,8 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 ]
                 new_assets = []
 
-                logger.info(f"Polymarket Watchlist: {watched_slugs}")
+                if watched_slugs:
+                    logger.info(f"Polymarket Watchlist: {watched_slugs}")
 
                 for slug in watched_slugs:
                     try:
@@ -127,6 +128,9 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                         if token_id not in id_to_label:
                                             id_to_label[token_id] = f"{slug} | {question} | Outcome {i}"
                                             new_assets.append(token_id)
+                            else:
+                                logger.error(f"Gamma API error for {slug}: HTTP {resp.status}")
+
                     except Exception as e:
                         logger.error(f"Gamma API error for {slug}: {e}")
                 
@@ -136,7 +140,6 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                     await ws.send(json.dumps({"assets": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
                 logger.info(f"Polymarket Heartbeat: Watching {len(id_to_label)} active outcomes across {len(watched_slugs)} slugs.")
-                await asyncio.sleep(30)
             
             except Exception as e:
                 logger.error(f"Polymarket sync error: {e}")
@@ -169,22 +172,22 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     label = id_to_label.get(asset_id, "UNKNOWN")
                                     is_whale = whale_detector.is_unusual(asset_id, notional_usd)
 
-                                    raw_event = RawEvent(
-                                        source="polymarket",
-                                        occurred_at=datetime.now(timezone.utc),
-                                        raw_payload={
-                                            "asset_label": label,
-                                            "side": event.get("side", ""),
-                                            "price": price,
-                                            "size_shares": size,
-                                            "notional_usd": notional_usd,
-                                            "is_whale_bet": is_whale
-                                        }
-                                    )
-
                                     if is_whale:
-                                        logger.warning(f"🚨 UNUSUAL BET DETECTED: ${notional_usd:.2f} on {label}")
-                                    producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
+                                        logger.warning(f"🚨 POLY MARKET WHALE UNUSUAL BET: ${notional_usd:.2f} on {label}")
+                                    
+                                        raw_event = RawEvent(
+                                            source="polymarket",
+                                            occurred_at=datetime.now(timezone.utc),
+                                            raw_payload={
+                                                "asset_label": label,
+                                                "side": event.get("side", ""),
+                                                "price": price,
+                                                "size_shares": size,
+                                                "notional_usd": notional_usd,
+                                                "is_whale_bet": True
+                                            }
+                                        )
+                                        producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
                     finally:
                         # If the websocket disconnects, kill the background sync task so it doesn't run forever in the void.
                         injector_task.cancel()
@@ -230,9 +233,14 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                             
                             if prev_vol:
                                 delta = vol - int(prev_vol)
-                                if delta > 100: # Configurable spike threshold
-                                    logger.warning(f"KALSHI VOLUME SPIKE: {ticker} (+{delta} contracts)")
-                                    
+                                
+                                yes_bid = market.get("yes_bid", 50)
+                                price_usd = yes_bid / 100  # Kalshi prices are often in percentage format (e.g., 75 means $0.75)
+                                notional_delta = delta * price_usd
+
+                                if notional_delta >= 1000:  # If there's a spike of $1,000 or more in the last minute, flag it.
+                                    logger.warning(f"📈 KALSHI USD SPIKE: {ticker} (+${notional_delta:,.2f})")
+                               
                                     event = RawEvent(
                                         source="kalshi",
                                         occurred_at=datetime.now(timezone.utc),
@@ -240,18 +248,22 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
                                             "ticker": ticker,
                                             "title": market.get("title"),
                                             "volume_delta": delta,
+                                            "notional_usd": notional_delta,
                                             "total_volume": vol,
-                                            "yes_bid": market.get("yes_bid"),
-                                            "no_bid": market.get("no_bid")
+                                            "price": price_usd,
+                                            "is_anomaly": True
                                         }
                                     )
                                     producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
                             
                             # Update state
                             await loop.run_in_executor(None, redis_client.set, redis_key, str(vol), 3600)
-                    logger.info(f"Kalshi Heartbeat: Scanned {len(markets)} active markets. No spikes > 100 detected.")        
+                        logger.info(f"Kalshi Heartbeat: Scanned {len(markets)} active markets. No spikes > $1,000 detected.")
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Kalshi API Rejected Connection: HTTP {resp.status} - {text}")    
             except Exception as e:
-                logger.error(f"Kalshi polling error: {e}")
+                logger.error(f"Kalshi polling error: {e}", exc_info=True)
             
             await asyncio.sleep(60) # Poll every 60 seconds
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
