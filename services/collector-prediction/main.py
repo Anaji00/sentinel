@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("collector.prediction")
 
-KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 # ── ANOMALY DETECTION ENGINE ─────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
     async def update_subscriptions(ws, session):
         """Background task: syncs active markets from Redis to the WS connection."""
-        base_url = "https://gamma-api.polymarket.com/events/slug/"
+        base_url = "https://gamma-api.polymarket.com/markets"
         loop = asyncio.get_event_loop()
         
         while True:
@@ -111,10 +111,11 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
                 for slug in watched_slugs:
                     try:
-                        async with session.get(f"{base_url}{slug}", timeout=10) as resp:
+                        url = f"{base_url}?event_slug={slug}"
+                        async with session.get(url, timeout=10) as resp:
                             if resp.status == 200:
-                                data = await resp.json()
-                                for market in data.get("markets", []):
+                                markets = await resp.json()
+                                for market in markets:
                                     if market.get("closed"): continue
 
                                     question = market.get("question", "")
@@ -160,7 +161,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                         while True:
                             message = await ws.recv()
                             data = json.loads(message)
-                            events = data if isinstance(data, list) else data
+                            events = data if isinstance(data, list) else [data]
 
                             for event in events:
                                 if event.get("event_type") == "trade":
@@ -213,7 +214,7 @@ async def poll_kalshi(producer: SentinelProducer, redis_client):
             markets = []
                 # Example: Fetching markets sorted by recent volume
             try:   
-                url = f"{KALSHI_BASE_URL}/markets?status=active&limit=50"
+                url = f"{KALSHI_BASE_URL}/markets?status=open&limit=50"
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()

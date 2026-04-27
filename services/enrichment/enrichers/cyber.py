@@ -34,9 +34,22 @@ HIGH_VALUE_ORGS = {
     "nato", "government", "ministry", "defense",
 }
 
+ICS_VENDORS = {
+    "siemens", "schneider", "rockwell", "honeywell",
+    "ge", "abb", "moxa", "emerson", "yokogawa", "mitsubishi",
+}
+
+# Nation-state / APT groups tracked on ransomware blogs
+APT_GROUPS = {
+    "sandworm", "lazarus", "apt41", "apt28", "apt29", "apt40",
+    "volt typhoon", "salt typhoon", "cl0p", "lockbit", "blackcat",
+    "alphv", "hive", "royal", "play", "akira", "black basta",
+}
+
 class CyberEnricher:
     """
     Translates raw cyber security alerts into standardized NormalizedEvents.
+    Routes on raw.source to the correct private handler.
     """
     def __init__(self, scorer):
         # Save the anomaly scorer instance passed into this class so we can use it later.
@@ -52,13 +65,13 @@ class CyberEnricher:
         source = raw.source
 
         # Route to specific handlers.
-        if source in ("censys_monitor", "shadowserver_feed"):
+        if source in ("censys", "censys_monitor", "shadowserver_feed"):
             return self._enrich_exposure(raw, p)
-        elif source == "cisa_kev_feed":
+        elif source in ("cisa_kev", "cisa_kev_feed"):
             return self._enrich_cisa_kev(raw, p)
         elif source in ("bgp_monitor", "ripe_ris"):
             return self._enrich_bgp(raw, p)
-        elif source in ("ransomware_feed", "darkfeed"):
+        elif source in ("ransomware_feed", "ransomware_live", "darkfeed"):
             return self._enrich_ransomware(raw, p)
         elif source == "breach_monitor":
             return self._enrich_breach(raw, p)
@@ -90,15 +103,23 @@ class CyberEnricher:
         # Check if ANY of our high-value keywords are found inside the organization's name.
         # (FIX: Corrected a typo here where 'jw' was used instead of 'kw')
         is_critical = any(kw in org for kw in HIGH_VALUE_ORGS)
-        
+        is_ics_vendor = any(v in org for v in ICS_VENDORS)
         # Baseline anomaly is 0.2 (low). If it's a critical org, jump immediately to 0.6 (high).
-        anomaly = 0.6 if is_critical else 0.2
-        
+        if is_ics_vendor:
+            anomaly = 0.80
+        elif is_critical:
+            anomaly = 0.60
+        else:
+            anomaly = 0.20
         # Build the tags list for downstream correlation rules.
         tags = ["infra_exposed", raw.source]
         if is_critical:
             tags.append("critical_infrastructure")
         
+        if is_ics_vendor:
+            tags.append("ics_vendor")
+        if p.get("protocol"):
+            tags.append(p["protocol"])
         # Build the primary Entity representation of this exposed server.
         # (FIX: Corrected a typo here where 'nme' was used instead of 'name')
         entity = Entity(
@@ -140,36 +161,49 @@ class CyberEnricher:
         vendor = (p.get("vendor") or p.get("vendorProject") or "").lower()
         # Extract the CVSS score, which indicates severity (0.0 to 10.0).
         vuln_name = p.get("vulnerabilityName", "Unknown Vulnerability")
-        
+        ransomware_use = (p.get("ransomware_use") or "Unknown")
         if not cve_id:
             return None
+
+        is_ics_vendor  = any(v in vendor for v in ICS_VENDORS)
+        is_critical_org = any(kw in vendor or kw in product for kw in HIGH_VALUE_ORGS)
+        is_ransomware  = str(ransomware_use).lower() == "known"
         
-        is_critical = any(kw in vendor or kw in product for kw in HIGH_VALUE_ORGS)
-        
-        # For KEV, we can directly use the CVSS score as the anomaly score, normalized to 0.0 - 1.0.
-        anomaly = 0.95 if is_critical else 0.8
-        
+        if is_ics_vendor and is_ransomware:
+            anomaly = 0.95
+        elif is_ics_vendor:
+            anomaly = 0.88
+        elif is_ransomware:
+            anomaly = 0.85
+        elif is_critical_org:
+            anomaly = 0.80
+        else:
+            anomaly = 0.70      # Floor: confirmed exploitation warrants ALERT tier
         tags = ["cve_kev", "exploited_vuln", "cve"]
-        if is_critical:
+        if is_critical_org:
             tags.append("critical_infrastructure")
-        
+        if is_ics_vendor:
+            tags.append("ics_vendor")
+        if is_ransomware:
+            tags.append("ransomware_linked")
         entity = Entity(
             id=cve_id or vendor, type=EntityType.COMPANY,
             name=vendor.title() or "Unknown Vendor",
             country_code= "US" if vendor else None,  # Assume US-based if vendor is known, else None
         )
         
-        event_type = getattr(EventType, "VULNERABILITY", EventType.INFRASTRUCTURE)
+        event_type = getattr(EventType, "VULNERABILITY", EventType.INFRA_EXPOSED)
         return NormalizedEvent(
             event_id=raw.event_id,
             type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
-            headline=f"Exploited Vulnerability Added: {cve_id} ({vendor} {product})",
+            headline=f"KEV Added: {cve_id} — {vendor} {product} (ransomware:{ransomware_use})",
             security_data=SecurityData(
                 breach_type="known_exploited_vulnerability",
                 affected_org=vendor,
+                cve_id=cve_id,
                 data_types = [cve_id, vuln_name]
             ),
             tags=tags,
@@ -234,7 +268,7 @@ class CyberEnricher:
         # Extract the name of the hacking group.
         group = p.get("group", "Unknown")
         country = (p.get("country") or p.get("country_code") or "")[:2].upper()
-        sector = (p.get("sector") or "").lower()
+        sector = (p.get("sector") or p.get("activity") or "").lower()
 
         if not victim:
             return None
@@ -242,10 +276,19 @@ class CyberEnricher:
         # Check if the victim's name or industry sector matches our critical list.
         is_critical = any(kw in victim or kw in sector for kw in HIGH_VALUE_ORGS)
         # Standard ransomware is 0.45. Critical infrastructure ransomware is 0.75.
-        anomaly = 0.75 if is_critical else 0.45
+        is_apt = any(apt in group.lower() for apt in APT_GROUPS)
+        if is_apt:
+            anomaly = 0.95
+        elif is_critical:
+            anomaly = 0.75
+        else:
+            anomaly = 0.45
         tags = ["ransomware", group.lower().replace(" ", "_")]
         if is_critical:
             tags.append("critical_infrastructure")
+        if is_apt:
+            tags.append("apt_group")
+            
  
         # Build the Company entity that got attacked.
         entity = Entity(

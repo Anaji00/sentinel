@@ -1,8 +1,4 @@
 # infrastructure only (Kafka, DBs, Redis)
-
-version: '3.8'
-# Specifies the Docker Compose file version. Think of it as setting the "language" Docker Compose understands.
-
 # Infrastructure only — no app services here.
 # Start with: docker-compose up -d
 # Then run services with: honcho start
@@ -151,8 +147,8 @@ services:
     volumes:
       - neo4j_data:/data
       # neo4j_data: Persists Neo4j data across container restarts.
-      - neo4g_logs:/logs
-      # neo4g_logs: Persists Neo4j logs across container restarts.
+      - neo4j_logs:/logs
+      # neo4j_logs: Persists Neo4j logs across container restarts.
     healthcheck: # Checks if Neo4j is responsive.
       test: wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1
       interval: 15s
@@ -187,6 +183,7 @@ services:
     build: .
     container_name: sentinel-enrichment
     command: python services/enrichment/main.py
+    env_file: .env
     restart: always
     depends_on:
       kafka:
@@ -198,6 +195,7 @@ services:
     build: .
     container_name: sentinel-correlation
     command: python services/correlation/main.py
+    env_file: .env
     restart: always
     depends_on:
       - enrichment
@@ -206,6 +204,7 @@ services:
     build: .
     container_name: sentinel-reasoning
     command: python services/reasoning/main.py
+    env_file: .env
     restart: always
     depends_on:
       - correlation
@@ -300,7 +299,7 @@ volumes:
   kafka_data:
   timescaledb_data:
   neo4j_data:
-  neo4g_logs:
+  neo4j_logs:
   redis_data:
 
 networks:

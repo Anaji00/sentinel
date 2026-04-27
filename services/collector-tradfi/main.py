@@ -117,11 +117,11 @@ class OHLCVAggregator:
                 self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
 
                 redis_list_key= f"sentinel:candles:1m:{ticker}"
-                candle_json = json.dumps({"ts": now.isoformat, **candle})
+                candle_json = json.dumps({"ts": now.isoformat(), **candle})
                 try:
-                    self.redis_client.lpush(redis_list_key, candle_json)
+                    self.redis_client.raw.lpush(redis_list_key, candle_json)
                     # Keep only the last 1440 minutes (24 hours) of candles
-                    self.redis_client.ltrim(redis_list_key, 0, 1439)
+                    self.redis_client.raw.ltrim(redis_list_key, 0, 1439)
                 except Exception as e:
                     logger.error("Redis error: %s", e, exc_info=True)
         self.buffer.clear()
