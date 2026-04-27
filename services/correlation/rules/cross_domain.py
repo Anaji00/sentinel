@@ -47,41 +47,59 @@ def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[Correla
     
     # 1. GATEKEEPING: Only consider High-Risk events as triggers.
     # We don't want to run expensive cross-checks on every minor anomaly.
-    if event.anomaly_score < 0.70:
+    if event.anomaly_score < 0.50:
         return None  # Only trigger on high-anomaly events
     
     # 2. DETERMINE SEARCH SCOPE
     # "I am a Maritime event. Find me everything that ISN'T Maritime."
-    my_domain = _domain_of(event.type.value)
+    event_type_str = event.type.value if hasattr(event.type, 'value') else str(event.type)
+    my_domain = _domain_of(event_type_str)
     other_types = _all_types_except(my_domain)
 
     # 3. QUERY HISTORY
     # Look back 48 hours for high-risk events in those other domains.
-    others = [
-        e for e in store.get_recent(
-            other_types, 
-            hours=48,
-            min_anomaly=0.65, # Threshold is slightly lower for supporting evidence.
-        )
-        if e["event_id"] != event.event_id  # Exclude the trigger event itself
-    ]
+    recent_events = store.get_recent(
+        other_types, 
+        hours=48,
+        min_anomaly=0.65, 
+    )
+
+    valid_others = []
+    my_tags = set(event.tags)
+
+    for other_event in recent_events:
+        if other_event["event_id"] == event.event_id:
+            continue  # Skip self
+
+        other_tags = set(other_event.get("tags", []))
+        overlap_found = False
+
+        for my_tag in my_tags:
+            for their_tag in other_tags:
+                if my_tag in their_tag or their_tag in my_tag:
+                    overlap_found = True
+                    break
+            if overlap_found:
+                break
+        if overlap_found:
+            valid_others.append(other_event)
 
     # 4. MINIMUM CO-OCCURRENCE
     # We need at least 2 distinct anomalous events in other domains to call this a cluster.
-    if len(others) < 2:
+    if len(valid_others) < 1:
         return None  # Need at least 2 other high-anomaly events in different domains
     
     # 5. TIERING LOGIC
     # INTELLIGENCE (High): If we have a swarm of 4+ anomalies.
     # ALERT (Medium): If we have 2-3 anomalies.
-    tier = AlertTier.INTELLIGENCE if len(others) >= 4 else AlertTier.ALERT
-    domains = list({_domain_of(e["type"]) for e in others})
+    tier = AlertTier.INTELLIGENCE if len(valid_others) >= 3 else AlertTier.ALERT
+    domains = list({_domain_of(e["type"]) for e in valid_others})
 
     # 6. BUILD DESCRIPTION
     desc = (
-        f"High anomaly ({event.anomaly_score:.2f}) in {event.type.value}. "
-        f"Co-occurring anomalies in: {', '.join(domains)}. "
-        f"Total cross-domain signals: {len(others)}."
+        f"Thematic Cross-Domain Cluster: High anomaly ({event.anomaly_score:.2f}) in {event_type_str}. "
+        f"Correlated thematically with anomalies in: {', '.join(domains)}. "
+        f"Total linked signals: {len(valid_others)}."
     )
  
     return CorrelationCluster(
@@ -89,8 +107,8 @@ def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[Correla
         rule_name="Multi-Domain High Anomaly Cluster",
         alert_tier=tier,
         trigger_event_id=event.event_id,
-        supporting_event_ids=[e["event_id"] for e in others[:5]],
+        supporting_event_ids=[e["event_id"] for e in valid_others[:5]],
         entity_ids=[event.primary_entity.id],
         description=desc,
-        tags=["cross_domain", "anomaly_cluster"] + domains,
+        tags=["cross_domain", "anomaly_cluster", "thematic_link"] + domains,
     )

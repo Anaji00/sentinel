@@ -58,7 +58,7 @@ class TradFiEnricher:
         anomaly = self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
 
         # Drop noise if it's below block limits AND doesn't flag ML anomalies
-        if notional < 500_000 and anomaly < 0.7:
+        if notional < 50_000 and anomaly < 0.5:
             return None
 
         tags = ["tradfi", "equity_block", ticker.lower()]
@@ -66,6 +66,7 @@ class TradFiEnricher:
         # DYNAMIC WATCHLIST PROPAGATION
         if ticker in GEO_INSTRUMENTS:
             tags.append("geo_linked_asset")
+            tags.append(GEO_INSTRUMENTS[ticker])  # e.g., "defense", "oil", "gold"
             try:
                 # Dynamically sync downstream watchlist sweeps
                 self.redis_client.sadd("sentinel:watched:equities", ticker)
@@ -138,6 +139,6 @@ class TradFiEnricher:
             key = f"baseline:volume:{ticker}"
             current = self.redis_client.get(key)
             updated = (0.95 * float(current) + 0.05 * volume) if current else volume
-            self.redis_client.set(key, str(round(updated, 3)), ex=604800)
+            self.redis_client.set(key, str(round(updated, 3)), ttl=604800)
         except Exception:
             pass # Failsafe against cache drops

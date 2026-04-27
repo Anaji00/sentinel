@@ -172,7 +172,7 @@ async def main():
     db              = get_timescale()
     redis_client    = get_redis()
     context_builder = ContextBuilder()
-    generator       = ScenarioGenerator() 
+    generator       = ScenarioGenerator(db) 
     tracker         = ScenarioTracker()
     library         = PatternLibrary()
  

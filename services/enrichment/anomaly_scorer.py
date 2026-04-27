@@ -127,7 +127,7 @@ class AnomalyScorer:
         raw_score = model.decision_function(X_new)[0]
 
         # Convert the negative ML score into a 0.0 to 1.0 percentage for our system.
-        anomaly_score = min(1.0, abs(raw_score) * 2)
+        anomaly_score = min(1.0, 0.75 + abs(raw_score))
 
         if anomaly_score > 0.7:
             logger.warning(f"🤖 ML OUTLIER DETECTED ({anomaly_score:.2f}): {ticker} | ${notional_usd:,.2f}")

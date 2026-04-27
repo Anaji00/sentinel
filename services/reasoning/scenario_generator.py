@@ -20,17 +20,36 @@ from shared.models import CorrelationCluster, Scenario, ScenarioStatus
 logger = logging.getLogger("reasoning.generator")
 
 class ScenarioGenerator:
-    def __init__(self):
-        # Initialize the synchronous Gemini client.
-        # We will wrap the generation call in asyncio.to_thread in the main loop to keep it non-blocking.
+    # Accept the TimescaleDB client via dependency injection to hydrate events
+    def __init__(self, db_client):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model_name = "gemini-2.5-pro"
+        self.db = db_client
 
     async def generate(self, cluster: CorrelationCluster, context: dict, patterns: list) -> Optional[Scenario]:
         """
         Builds the prompt and calls Gemini to analyze the cluster.
         """
-        # 1. Construct the Intelligence Briefing Prompt
+        # 1. EVENT HYDRATION: Fetch the full raw events from TimescaleDB using the IDs
+        event_ids = [cluster.trigger_event_id] + cluster.supporting_event_ids
+        raw_events = []
+        
+        try:
+            # Query the database for the exact events that triggered this cluster
+            format_strings = ','.join(['%s'] * len(event_ids))
+            sql = f"SELECT type, source, tags, anomaly_score, occurred_at, raw_payload, financial_data, prediction_market_data FROM events WHERE event_id IN ({format_strings})"
+            rows = self.db.query(sql, tuple(event_ids))
+            
+            # Clean up datetime objects for JSON serialization
+            for row in rows:
+                if 'occurred_at' in row and isinstance(row['occurred_at'], datetime):
+                    row['occurred_at'] = row['occurred_at'].isoformat()
+                raw_events.append(row)
+                
+        except Exception as e:
+            logger.error(f"Failed to hydrate events for cluster {cluster.correlation_id}: {e}")
+
+        # 2. Construct the Intelligence Briefing Prompt
         prompt = f"""
         You are 'Sentinel', an elite multi-domain intelligence analyst system.
         You have detected a complex anomaly spanning multiple data streams.
@@ -41,8 +60,8 @@ class ScenarioGenerator:
         Tags: {', '.join(cluster.tags)}
 
         === RAW EVENT DATA ===
-        The following events triggered this alert:
-        {json.dumps([e for e in cluster.events], indent=2)}
+        The following deeply-analyzed events triggered this alert:
+        {json.dumps(raw_events, indent=2)}
 
         === GRAPH DATABASE CONTEXT (NEO4J) ===
         Known background intelligence on the entities involved:
@@ -58,8 +77,7 @@ class ScenarioGenerator:
         Maintain a highly objective, analytical, and professional tone.
         """
 
-        # 2. Define the exact JSON schema we want Gemini to return.
-        # This matches the shape of your shared.models.Scenario object.
+        # 3. Define the exact JSON schema
         scenario_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -95,7 +113,6 @@ class ScenarioGenerator:
         try:
             logger.info(f"Invoking Gemini for cluster {cluster.correlation_id}...")
             
-            # 3. Call the model using the structured output configuration
             import asyncio
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
@@ -104,14 +121,12 @@ class ScenarioGenerator:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=scenario_schema,
-                    temperature=0.2, # Keep it deterministic
+                    temperature=0.2, 
                 )
             )
 
-            # 4. Parse the structured JSON response
             ai_data = json.loads(response.text)
 
-            # 5. Assemble and return the final Scenario object
             scenario = Scenario(
                 scenario_id=f"scn_{uuid.uuid4().hex[:8]}",
                 correlation_id=cluster.correlation_id,
