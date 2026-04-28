@@ -4,9 +4,8 @@ services/collector-prediction/main.py
 ENTERPRISE PREDICTION MARKET COLLECTOR
 ======================================
 Ingests Polymarket and Kalshi.
-Features: 
-- Real-time WebSocket streaming
-- Stateless architecture: Forwards high-signal data to Kafka for central ML scoring.
+Stateless Mode: Pipes raw volume and trades directly to Kafka.
+Anomaly scoring (Whales/EMA) is handled downstream by the Enrichment service.
 """
 
 import asyncio
@@ -29,10 +28,14 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s"
+)
 logger = logging.getLogger("collector.prediction")
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
 # ── POLYMARKET STREAM ─────────────────────────────────────────────────────────        
 
 async def stream_polymarket(producer: SentinelProducer, redis_client):
@@ -41,7 +44,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
     id_to_label = {}
 
     async def update_subscriptions(ws, session):
-        base_url = "https://gamma-api.polymarket.com/events"
+        base_url = "https://gamma-api.polymarket.com/markets"
         loop = asyncio.get_event_loop()
         
         while True:
@@ -50,24 +53,39 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else [
                     "us-x-iran-permanent-peace-deal-by"
                 ]
+                
+                logger.info(f"Heartbeat | Polymarket sync. Tracked slugs ({len(watched_slugs)}): {watched_slugs}")
                 new_assets = []
-
-                if watched_slugs:
-                    logger.info(f"Polymarket Watchlist: {watched_slugs}")
 
                 for slug in watched_slugs:
                     try:
-                        url = f"{base_url}?slug={slug}"
+                        url = f"{base_url}?event_slug={slug}"
                         async with session.get(url, timeout=10) as resp:
                             if resp.status == 200:
-                                events_data = await resp.json()
-                                for market in events_data.get("markets", []):
-                                    if market.get("closed"): continue
+                                data = await resp.json()
+                                
+                                # FIX: Gamma API returns a list of Events, which contain Markets.
+                                markets = []
+                                if isinstance(data, list):
+                                    for item in data:
+                                        if isinstance(item, dict) and "markets" in item:
+                                            markets.extend(item["markets"])
+                                        elif isinstance(item, dict):
+                                            markets.append(item)
+                                else:
+                                    continue
+
+                                for market in markets:
+                                    if not isinstance(market, dict) or market.get("closed"): 
+                                        continue
 
                                     question = market.get("question", "")
                                     tokens = market.get("clobTokenIds", [])
                                     if isinstance(tokens, str):
-                                        tokens = json.loads(tokens)
+                                        try:
+                                            tokens = json.loads(tokens)
+                                        except:
+                                            continue
                                     
                                     for i, token_id in enumerate(tokens):
                                         if token_id not in id_to_label:
@@ -77,13 +95,12 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                 logger.error(f"Gamma API error for {slug}: HTTP {resp.status}")
 
                     except Exception as e:
-                        logger.error(f"Gamma API error for {slug}: {e}")
+                        logger.error(f"Gamma API connection error for {slug}: {e}")
                 
                 if new_assets:
-                    await ws.send(json.dumps({"asset_ids": new_assets, "type": "market"}))
+                    await ws.send(json.dumps({"asset_jds": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
-                logger.info(f"Polymarket Heartbeat: Watching {len(id_to_label)} active outcomes.")
-            
+                
             except Exception as e:
                 logger.error(f"Polymarket sync error: {e}")
 
@@ -101,11 +118,8 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                         while True:
                             message = await ws.recv()
                             data = json.loads(message)
-                            
-                            # FIX: Properly cast single dictionaries to a list to prevent dropping trades
                             events = data if isinstance(data, list) else [data]
 
-                            
                             for event in events:
                                 if event.get("event_type") == "trade":
                                     asset_id = event.get("asset_id")
@@ -113,23 +127,23 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     size = float(event.get("size", 0.0))
                                     notional_usd = price * size
 
-                                    # Static filter: Only forward trades > $1000 to save bandwidth
-                                    if notional_usd >= 1000:
-                                        label = id_to_label.get(asset_id, "UNKNOWN")
-                                        
-                                        raw_event = RawEvent(
-                                            source="polymarket",
-                                            occurred_at=datetime.now(timezone.utc),
-                                            raw_payload={
-                                                "asset_id": asset_id,  # Passed for Redis baselining
-                                                "asset_label": label,
-                                                "side": event.get("side", ""),
-                                                "price": price,
-                                                "size_shares": size,
-                                                "notional_usd": notional_usd
-                                            }
-                                        )
-                                        producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
+                                    label = id_to_label.get(asset_id, "UNKNOWN")
+                                    
+                                    logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label}")
+
+                                    # STATELESS: Pipe directly to Kafka. Let Enrichment score anomalies.
+                                    raw_event = RawEvent(
+                                        source="polymarket",
+                                        occurred_at=datetime.now(timezone.utc),
+                                        raw_payload={
+                                            "asset_label": label,
+                                            "side": event.get("side", ""),
+                                            "price": price,
+                                            "size_shares": size,
+                                            "notional_usd": notional_usd
+                                        }
+                                    )
+                                    producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
                     finally:
                         injector_task.cancel()
 
@@ -139,73 +153,64 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
 # ── KALSHI POLLER ─────────────────────────────────────────────────────────────
 
-async def poll_kalshi(producer: SentinelProducer, redis_client):
+async def poll_kalshi(producer: SentinelProducer):
+    """
+    Polls Kalshi REST API for active event volumes.
+    STATELESS: Sends raw volume to Kafka for Enrichment to calculate Deltas/Spikes.
+    """
     session_timeout = aiohttp.ClientTimeout(total=10)
     
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
         while True:
-            markets = []
             try:   
-                url = f"{KALSHI_BASE_URL}/markets?status=active&limit=50"
+                # FIX: Removed status=open to prevent 400 Bad Request error
+                url = f"{KALSHI_BASE_URL}/markets?limit=50"
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         markets = data.get("markets", [])
                         
-                        max_delta_seen = 0
                         for market in markets:
                             ticker = market.get("ticker")
                             vol = market.get("volume", 0)
+                            yes_bid = market.get("yes_bid", 50)
+                            price_usd = yes_bid / 100 
                             
-                            redis_key = f"sentinel:kalshi:vol:{ticker}"
-                            loop = asyncio.get_event_loop()
-                            prev_vol = await loop.run_in_executor(None, redis_client.get, redis_key)
+                            event = RawEvent(
+                                source="kalshi",
+                                occurred_at=datetime.now(timezone.utc),
+                                raw_payload={
+                                    "ticker": ticker,
+                                    "title": market.get("title"),
+                                    "total_volume": vol,
+                                    "price": price_usd
+                                }
+                            )
+                            producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
                             
-                            if prev_vol:
-                                delta = vol - int(prev_vol)
-                                yes_bid = market.get("yes_bid", 50)
-                                price_usd = yes_bid / 100 
-                                notional_delta = delta * price_usd
-                                
-                                if notional_delta > max_delta_seen:
-                                    max_delta_seen = notional_delta
-
-                                # Static filter: Only forward deltas > $1000 to save bandwidth
-                                if notional_delta >= 500:  
-                                    event = RawEvent(
-                                        source="kalshi",
-                                        occurred_at=datetime.now(timezone.utc),
-                                        raw_payload={
-                                            "ticker": ticker,
-                                            "title": market.get("title"),
-                                            "volume_delta": delta,
-                                            "notional_usd": notional_delta,
-                                            "total_volume": vol,
-                                            "price": price_usd
-                                        }
-                                    )
-                                    producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
-                            
-                            await loop.run_in_executor(None, redis_client.set, redis_key, str(vol), 3600)
-                        logger.info(f"Kalshi Heartbeat: Scanned {len(markets)} active markets. Max 1-min delta was ${max_delta_seen:,.2f}")
                     else:
                         text = await resp.text()
                         logger.error(f"Kalshi API Rejected Connection: HTTP {resp.status} - {text}")    
             except Exception as e:
                 logger.error(f"Kalshi polling error: {e}", exc_info=True)
             
-            await asyncio.sleep(60)
+            await asyncio.sleep(60) 
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
 async def main():
+    logger.info("=" * 60)
+    logger.info("SENTINEL PREDICTION MARKET COLLECTOR (STATELESS)")
+    logger.info("=" * 60)
+
     producer = SentinelProducer()
     redis_client = get_redis()
     try:
         await asyncio.gather(
             stream_polymarket(producer, redis_client),
-            poll_kalshi(producer, redis_client)
+            poll_kalshi(producer)
         )
+
     except KeyboardInterrupt:
         logger.info("Shutting down prediction collector...")
     finally:

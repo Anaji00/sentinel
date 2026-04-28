@@ -93,6 +93,8 @@ class NewsEnricher:
 
         tags = list(p.get("tags", []))
         tags.append(p.get("category", "news"))
+        
+        logger.info(f"Enriched News | Anomaly: {anomaly} | Sentiment: {sentiment} | {title[:60]}...")
 
         return NormalizedEvent(
             event_id=raw.event_id,

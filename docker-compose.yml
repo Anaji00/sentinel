@@ -289,6 +289,11 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
 
 
 # Volumes save data even when the containers are stopped and started

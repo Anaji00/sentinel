@@ -70,6 +70,7 @@ def _consume_loop(consumer, maritime, aviation, news, cyber,
                     elif topic == Topics.RAW_PREDICTION:
                         enriched = prediction.enrich(raw)
                     
+                    
                     if enriched:
                         db.write_event(enriched)
                         producer.send(

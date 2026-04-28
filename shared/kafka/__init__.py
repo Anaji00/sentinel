@@ -36,6 +36,7 @@ class Topics:
     RAW_NEWS = "events.raw.news"
     RAW_AVIATION = "events.raw.aviation"
     RAW_CYBER = "events.raw.cyber"
+    SCENARIOS_GENERATED = "scenarios.generated"
 
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
@@ -56,7 +57,7 @@ class Topics:
     # get stuck in a loop trying to process it forever.
     DLQ = "dead.letter"
 
-    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER]
+    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, SCENARIOS_GENERATED]
 
 
 # ── SERIALIZATION ─────────────────────────────────────────────────────────────

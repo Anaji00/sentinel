@@ -38,6 +38,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
     url = "wss://fstream.binance.com/ws/!forceOrder@arr"
     while True:
         try:
+            logger.info("Heartbeat | Connecting to Binance liquidations stream...")
             # ping_interval=20 sends a heartbeat every 20 seconds so the server doesn't disconnect us.
             async with websockets.connect(url, ping_interval=20) as ws:
                 logger.info("Connected to Binance Liquidations")
@@ -46,6 +47,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
                     order = data.get("o", {})
                     # Extract the symbol (e.g., "BTCUSDT"), side (Buy/Sell), price, and quantity.
                     symbol, side, price, qty = order.get("s"), order.get("S"), float(order.get("p", 0)), float(order.get("q", 0))
+                    logger.info(f"Binance Liquidation | {symbol} | {side} | ${price:,.2f} | Size: {qty}")
 
                     # Standardize the raw data into our internal RawEvent format.
                     event = RawEvent(
@@ -78,6 +80,9 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
 
     while True:
         try:
+            suspects_for_log = await loop.run_in_executor(None, redis_client.smembers, "sentinel:watched:wallets")
+            logger.info(f"Heartbeat | Connecting to ETH RPC. Tracking {len(CONTRACTS)} contracts, {len(suspects_for_log)} wallets.")
+
             async with websockets.connect(ETH_WSS_URL, ping_interval=30) as ws:
                 # Subscribe to the Ethereum node using JSON-RPC format.
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", 
@@ -105,7 +110,7 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
                         # We only care if it's a massive transfer OR if it involves a known bad actor.
                         if amount_usd >= WHALE_THRESHOLD_USD or is_suspect:
                             token = "USDT" if log.get("address").lower() == CONTRACTS[0] else "USDC"
-                            logger.warning(f"🐋 WHALE/SUSPECT TX: ${amount_usd:,.2f} {token} ({sender} -> {receiver})")
+                            logger.info(f"🐋 WHALE/SUSPECT TX | ${amount_usd:,.2f} {token} | {sender} -> {receiver}")
                             
                             event = RawEvent(
                                 source="ethereum_rpc",
