@@ -30,7 +30,7 @@ logger = logging.getLogger("collector.crypto")
 
 ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL")
 # Any transfer above this USD amount is considered a "Whale" move.
-WHALE_THRESHOLD_USD = 5_000_000
+WHALE_THRESHOLD_USD = 50_000
 
 async def stream_binance_liquidations(producer: SentinelProducer):
     # Connects to the Binance Futures stream for "Forced Orders" (Liquidations).

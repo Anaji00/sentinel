@@ -16,6 +16,7 @@ import os
 import sys
 import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -39,6 +40,9 @@ from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 
+# Maintain strong references to background tasks so the Garbage Collector doesn't kill them
+background_tasks = set()
+
 def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
     try:
@@ -60,10 +64,8 @@ def _save_scenario(db, scenario):
             scenario.confidence_overall,
             scenario.confidence_rationale,
         ))
-        # BEST PRACTICE: Lazy evaluation. We pass variables as arguments instead of using f-strings.
         logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
     except Exception as e:
-        # BEST PRACTICE: Added exc_info=True to automatically attach the traceback to the log!
         logger.error("Error saving scenario %s to DB: %s", scenario.scenario_id, e, exc_info=True)
 
 async def apply_autonomous_feedback(scenario, redis_client):
@@ -81,18 +83,15 @@ async def apply_autonomous_feedback(scenario, redis_client):
     
     loop = asyncio.get_event_loop()
     
-    # Push new tickers to the TradFi collector
     for ticker in tickers:
-        is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:equities", ticker)
+        is_new = await loop.run_in_executor(None, redis_client.raw.sadd, "sentinel:watched:equities", ticker)
         if is_new:
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing TradFi collector to track %s", ticker)
 
-    # Push new wallets to the Crypto collector
     for wallet in wallets:
-        is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:wallets", wallet)
+        is_new = await loop.run_in_executor(None, redis_client.raw.sadd, "sentinel:watched:wallets", wallet)
         if is_new:
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
-
 
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, context_builder, generator, library):
     """
@@ -106,54 +105,39 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, context
             
         logger.info("🧠 Synthesizing [%s] %s via Gemini...", cluster.alert_tier.name, cluster.rule_name)
 
-        # 1. Fetch Graph Relationships (Neo4j)
         context = context_builder.build(cluster)
-        
-        # 2. Find historical precedents
         patterns = library.find_similar(cluster.tags, cluster.rule_id)
-
-        # 3. LLM Generation (Gemini 2.5 Pro)
+        
         scenario = await generator.generate(cluster, context, patterns)
         
         if scenario:
-            # Save to TimescaleDB
             await asyncio.to_thread(_save_scenario, db, scenario)
-            
-            # Close the loop: Let Gemini steer the collectors
             await apply_autonomous_feedback(scenario, redis_client)
 
     except Exception as e:
         logger.error("Failed to process cluster %s: %s", cluster.correlation_id, e, exc_info=True)
 
-async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
-    """Main asynchronous Kafka consumption loop."""
-    consumer = SentinelConsumer(
-        topics=[Topics.CORRELATIONS],
-        group_id="reasoning-service-group",
-        auto_offset_reset="latest",
-    )
-    
-    logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
-    
-    try:
-        loop = asyncio.get_running_loop()
-        while True:
-            messages = await loop.run_in_executor(None, consumer.raw.poll, 1.0)
+def _consume_loop(consumer, db, redis_client, context_builder, generator, library, loop):
+    """
+    Blocking Kafka consume loop. Runs in a ThreadPoolExecutor so the 
+    asyncio event loop stays free for the heavy Gemini API calls.
+    """
+    for message in consumer:
+        try:
+            # FIX: message.value is already a dict, no need to decode/json.loads
+            cluster = CorrelationCluster(**message.value)
             
-            for tp, msgs in messages.items():
-                for message in msgs:
-                    cluster_data = json.loads(message.value.decode('utf-8'))
-                    cluster = CorrelationCluster(**cluster_data)
-                    
-                    # Fire and forget the synthesis task
-                    asyncio.create_task(process_cluster(cluster, db, redis_client, context_builder, generator, library))
-                    
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.error("Reasoning consumer crashed: %s", e, exc_info=True)
-    finally:
-        consumer.close()
+            # Create the task and assign it to the main async loop
+            task = asyncio.run_coroutine_threadsafe(
+                process_cluster(cluster, db, redis_client, context_builder, generator, library), 
+                loop
+            )
+            # Prevent garbage collection
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+        except Exception as e:
+            logger.error("Reasoning message processing error: %s", e, exc_info=True)
 
 async def _tracker_loop(tracker: ScenarioTracker):
     """Background task to evaluate if active scenarios have resolved."""
@@ -163,30 +147,48 @@ async def _tracker_loop(tracker: ScenarioTracker):
             await asyncio.to_thread(tracker.check_all)
         except Exception as e:
             logger.error(f"Scenario Tracker error: {e}")
- 
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL AI REASONING SERVICE (GEMINI)")
     logger.info("=" * 60)
- 
+
+    if not os.getenv("GEMINI_API_KEY"):
+        logger.error("CRITICAL: GEMINI_API_KEY not found in environment!")
+        return
+
     db              = get_timescale()
     redis_client    = get_redis()
     context_builder = ContextBuilder()
     generator       = ScenarioGenerator(db) 
     tracker         = ScenarioTracker()
     library         = PatternLibrary()
- 
-    # Start the background tracker
+
+    consumer = SentinelConsumer(
+        topics=[Topics.CORRELATIONS],
+        group_id="reasoning-service-group",
+        auto_offset_reset="latest",
+    )
+
+    logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
+
     tracker_task = asyncio.create_task(_tracker_loop(tracker))
-    
-    # Start the main reasoning pump
-    reasoning_task = asyncio.create_task(run_reasoning_loop(context_builder, generator, library, db, redis_client))
-    
+    loop = asyncio.get_running_loop()
+
     try:
-        await asyncio.gather(tracker_task, reasoning_task)
+        # Run the synchronous Kafka consumer in a separate thread
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="reason_consumer") as pool:
+            await loop.run_in_executor(
+                pool, 
+                _consume_loop, 
+                consumer, db, redis_client, context_builder, generator, library, loop
+            )
     except KeyboardInterrupt:
         logger.info("Shutting down Reasoning Service...")
- 
+    finally:
+        consumer.close()
+        tracker_task.cancel()
+
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

@@ -288,4 +288,74 @@ class AnomalyScorer:
         # If we stop seeing this vessel type, the baseline expires in a week.
         self._redis.set(key, str(round(updated, 3)), ttl=604800)
 
-    
+    # ── Prediction Markets ────────────────────────────────────────────────────
+
+    def score_prediction_trade(self, asset_id: str, notional_usd: float) -> float:
+        """
+        Evaluates a single prediction market trade (Polymarket).
+        Uses an EMA (Exponential Moving Average) stored in Redis to determine baseline.
+        """
+        if not asset_id or notional_usd < 1000:
+            return 0.1
+
+        key = f"baseline:pred:trade:{asset_id}"
+        try:
+            raw_val = self._redis.get(key)
+            current_ema = float(raw_val) if raw_val else None
+
+            if not current_ema:
+                # First time seeing this asset, set baseline and return low score
+                self._redis.set(key, str(notional_usd), ttl=604800) # 7 days
+                return 0.1
+
+            # Check if it's a whale BEFORE updating the EMA
+            multiplier = notional_usd / current_ema
+            anomaly_score = 0.1
+
+            if multiplier > 5.0: # 5x larger than average
+                # Base score of 0.6, scaling up to 1.0 based on size and multiplier
+                anomaly_score = min(1.0, 0.6 + (notional_usd / 50_000) * 0.2 + (multiplier / 20) * 0.2)
+            
+            # Update EMA (slowly, so huge spikes don't ruin the baseline)
+            # If it's a massive anomaly, weight it less to preserve the normal baseline
+            alpha = 0.01 if multiplier > 5.0 else 0.1
+            new_ema = (notional_usd * alpha) + (current_ema * (1 - alpha))
+            self._redis.set(key, str(round(new_ema, 2)), ttl=604800)
+
+            return round(anomaly_score, 3)
+        
+        except Exception as e:
+            logger.error(f"Prediction scorer error for {asset_id}: {e}")
+            return 0.1
+
+    def score_prediction_spike(self, ticker: str, notional_delta_usd: float) -> float:
+        """
+        Evaluates a minute-to-minute volume spike (Kalshi).
+        """
+        if not ticker or notional_delta_usd < 1000:
+            return 0.1
+
+        key = f"baseline:pred:vol:{ticker}"
+        try:
+            raw_val = self._redis.get(key)
+            current_ema = float(raw_val) if raw_val else None
+
+            if not current_ema:
+                self._redis.set(key, str(notional_delta_usd), ttl=604800)
+                return 0.1
+
+            multiplier = notional_delta_usd / current_ema
+            anomaly_score = 0.1
+
+            if multiplier > 3.0: # 3x larger than average minute volume
+                anomaly_score = min(1.0, 0.6 + (notional_delta_usd / 20_000) * 0.3)
+
+            alpha = 0.05 if multiplier > 3.0 else 0.2
+            new_ema = (notional_delta_usd * alpha) + (current_ema * (1 - alpha))
+            self._redis.set(key, str(round(new_ema, 2)), ttl=604800)
+
+            return round(anomaly_score, 3)
+        
+        except Exception as e:
+            logger.error(f"Kalshi scorer error for {ticker}: {e}")
+            return 0.1

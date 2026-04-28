@@ -1,38 +1,24 @@
 """
 services/enrichment/enrichers/prediction.py
-
-This module is responsible for taking raw, unstructured data from prediction markets 
-(like Polymarket and Kalshi) and transforming it into a standardized `NormalizedEvent` 
-that the rest of the Sentinel system can understand and analyze.
 """
 
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-# FIX: Imported the missing `PredictionMarketData` model.
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, PredictionMarketData
 
 logger = logging.getLogger("enrichment.prediction")
 
 class PredictionEnricher:
-    """
-    Standardizes events from prediction markets. It uses a routing mechanism to handle 
-    different data sources (e.g., Polymarket's real-time trades vs. Kalshi's volume spikes).
-    """
     def __init__(self, scorer, redis_client):
-        # The scorer is used to determine how "unusual" an event is, though 
-        # currently this class calculates some baseline anomaly scores itself.
         self.scorer = scorer
         self.redis = redis_client
 
-
     def enrich(self, raw) -> Optional[NormalizedEvent]:
-        # Extract the raw dictionary payload and the source identifier
         p = raw.raw_payload
         source = raw.source
 
-        # ROUTER: Decide which private processing method to use based on the source
         if source == "polymarket":
             return self._enrich_polymarket(raw, p)
         elif source == "kalshi":
@@ -41,40 +27,40 @@ class PredictionEnricher:
         return None
 
     def _enrich_polymarket(self, raw, p) -> Optional[NormalizedEvent]:
-        """Processes real-time trades from Polymarket, identifying large 'whale' bets."""
-        # The collector sends a human-readable label like "slug | question | outcome".
-        # We parse this string to get structured data for our event.
         label = p.get("asset_label", "UNKNOWN | UNKNOWN | UNKNOWN")
         parts = label.split(" | ")
         slug = parts[0] if len(parts) > 0 else label
         question = parts[1] if len(parts) > 1 else "UNKNOWN QUESTION"
         outcome = parts[2] if len(parts) > 2 else "UNKNOWN OUTCOME"
-        # Safely extract financial details, defaulting to 0 if they don't exist.
+        
         notional = float(p.get("notional_usd", 0))
         shares = float(p.get("size_shares", 0))
         price = float(p.get("price", 0))
-        anomaly = min(1.0, 0.5 + (notional / 100_000) * 0.4)
+        asset_id = p.get("asset_id", slug)
+
+        # BRAIN CHECK: Ask the AnomalyScorer if this is unusual
+        anomaly = self.scorer.score_prediction_trade(asset_id, notional)
+
+        # GATEKEEPER: Drop normal trades. We only care about anomalies > 0.6
+        if anomaly < 0.6:
+            return None
+
         tags = ["prediction_market", "whale_bet", slug.lower()]
-        headline =f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
-        # DYNAMIC WATCHLIST PROPAGATION
-            # If a whale drops money here, force the Polymarket WS to track all outcomes for this slug
+        headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
+
         try:
             self.redis.sadd("sentinel:polymarket:watched_slugs", slug)
         except Exception as e:
-            logger.error(f"Failed to push {slug} to watchlist: {e}")
+            pass
         
-        # The primary entity is the market outcome itself (e.g., "Will X happen? | Yes").
         entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
 
-        # Package everything into our system-wide NormalizedEvent format.
         return NormalizedEvent(
             event_id=raw.event_id,
-            # Use a specific EventType for prediction markets.
             type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
-            # Use the dedicated data model for prediction market events.
             prediction_market_data=PredictionMarketData(
                 market_id = slug,
                 question = question,
@@ -85,7 +71,7 @@ class PredictionEnricher:
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )
     
     def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
@@ -94,7 +80,14 @@ class PredictionEnricher:
         delta = float(p.get("volume_delta", 0))
         price = float(p.get("yes_bid") or p.get("no_bid") or 0.0)
         notional_usd = float(p.get("notional_usd", 0))
-        anomaly = min(1.0, 0.65 + (notional_usd / 50_000) * 0.3)
+        
+        # BRAIN CHECK: Ask the AnomalyScorer if this volume spike is unusual
+        anomaly = self.scorer.score_prediction_spike(ticker, notional_usd)
+
+        # GATEKEEPER: Drop normal volume variance.
+        if anomaly < 0.6:
+            return None
+
         tags = ["kalshi_prediction", "volume_spike", ticker.lower()]
         headline = f"🚨 KALSHI SPIKE: {ticker} (+${notional_usd:,.2f})"
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
@@ -102,7 +95,7 @@ class PredictionEnricher:
         try:
             self.redis.sadd("sentinel:kalshi:watched_tickers", ticker)
         except Exception as e:
-            logger.error(f"Failed to push {ticker} to watchlist: {e}")
+            pass
             
         return NormalizedEvent(
             event_id=raw.event_id,
@@ -120,5 +113,5 @@ class PredictionEnricher:
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )

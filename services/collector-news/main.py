@@ -78,6 +78,17 @@ FEEDS = [
     ("ofac_news",       "https://home.treasury.gov/system/files/126/ofac.xml","official",   0.99),
 ]
 
+NEWS_ONTOLOGY = {
+    "theater_middle_east": ["israel", "iran", "gaza", "lebanon", "syria", "houthi", "yemen", "tehran", "tel aviv", "hezbollah"],
+    "theater_apac": ["taiwan", "china", "beijing", "taipei", "south china sea", "philippines", "ccp"],
+    "theater_eeur": ["ukraine", "russia", "moscow", "kyiv", "crimea", "putin", "zelensky", "black sea", "nato"],
+    "energy_oil": ["hormuz", "red sea", "persian gulf", "brent", "crude", "tanker", "aramco", "opec", "oil "],
+    "macro_rates": ["fed", "fomc", "interest rates", "inflation", "cpi", "treasury", "central bank", "powell"],
+    "maritime_shipping": ["suez", "bab el-mandeb", "panama canal", "maersk", "freight", "supply chain", "maritime", "piracy", "vessel", "ship "],
+    "cyber_warfare": ["ransomware", "apt", "ddos", "cyberattack", "hacker", "breach", "botnet", "malware"],
+    "sector_defense": ["military", "war", "weapons", "missile", "drone", "uav", "pentagon", "dod", "airstrike"]
+}
+
 # ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 class URLDeduplicator:
     """

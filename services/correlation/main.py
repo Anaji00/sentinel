@@ -28,12 +28,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("correlation")
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster
@@ -42,6 +36,21 @@ from services.correlation.event_store import EventStore
 
 from services.correlation.rules import ALL_RULES
 
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("correlation")
+
+
+def fetch_messages(consumer):
+    """Synchronous fetch to run in a background thread."""
+    msg_pack = consumer.poll(timeout_ms=2000)
+    messages = []
+    for _, msgs in msg_pack.items():
+        messages.extend(msgs)
+    return messages
 
 def main():
     logger.info("=" * 60)
@@ -75,6 +84,12 @@ def main():
                     try:
                         # Unpack the raw JSON message into our strictly-typed Python object.
                         event = NormalizedEvent(**message.value)
+                        
+                        try:
+                            store.add_event(event)
+                        except Exception as e:
+                            logger.error(f"Failed to store event {event.id}: {e}", exc_info=True)
+                            continue
 
                         # ── 4. RULE ENGINE (PLUGIN PATTERN) ───────────────────
                         # ARCHITECTURE TIP: The Strategy/Plugin Pattern.
@@ -103,7 +118,7 @@ def main():
                             # engine can notify analysts or generate AI briefings.
                             producer.send(
                                 Topics.CORRELATIONS,
-                                cluster.dict(),
+                                cluster.model_dump(),
                                 key=cluster.correlation_id,
                             )
                             corr_fired += 1

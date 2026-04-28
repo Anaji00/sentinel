@@ -18,10 +18,26 @@ _NEG = {
     "attack", "war", "kill", "explosion", "sanction", "seizure", "crash",
     "disaster", "collapse", "crisis", "threat", "missile", "detained",
     "conflict", "strike", "blockade", "arrested", "hijack", "piracy",
+    "bankruptcy", "default", "liquidation", "plunge", "recession", 
+    "inflation", "margin_call", "downgrade", "bearish",
+    # Cyber & Infrastructure
+    "breach", "ransomware", "hack", "vulnerability", "exploit", "outage", "malware",
+    # Geopolitical & Kinetic
+    "escalation", "invasion", "coup", "riot", "embargo", "tension", "terrorism",
+    # Financial, Crypto & Legal
+    "fraud", "scam", "indictment", "lawsuit", "selloff", "penalty", "rugpull",
+    "delisted", "slump", "tanked", "underperform", "capitulation", "dilution", "deflation",
 }
 _POS = {
     "deal", "agreement", "peace", "growth", "recovery", "cooperation",
     "ceasefire", "diplomatic", "alliance", "trade", "accord",
+    "bullish", "merger", "acquisition", "profit", "dividend",
+    "surge", "rally", "stimulus", "breakout", "upgrade",
+    # Tech, Cyber & Diplomatic
+    "treaty", "negotiation", "partnership", "aid", "patched", "secured",
+    "resolved", "rescued", "funding", "adoption", "approved", "breakthrough",
+    # Stocks & Markets
+    "outperform", "buyback", "uptrend", "skyrocket", "lucrative", "undervalued", "bull-run", "soar",
 }
 
 
