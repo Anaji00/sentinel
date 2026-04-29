@@ -123,7 +123,7 @@ class EventStore:
                     correlation_id, rule_id, rule_name, alert_tier,
                     detected_at, trigger_event_id, supporting_event_ids,
                     entity_ids, description, tags
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ) VALUES (%s::uuid,%s,%s,%s,%s,%s::uuid,%s::uuid[],%s,%s,%s)
             """, (
                 cluster.correlation_id,
                 cluster.rule_id,
@@ -136,5 +136,6 @@ class EventStore:
                 cluster.description,
                 cluster.tags,
             ))
+            logger.info(f"💾 Persisted correlation {cluster.correlation_id} to TimescaleDB.")
         except Exception as e:
             logger.error(f"save_correlation failed ({cluster.correlation_id}): {e}")

@@ -151,8 +151,9 @@ class SentinelConsumer:
             auto_commit_interval_ms=1000,
             api_version=(3, 5, 0),
         )
+        self.raw = self._c
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
-
+        
     def __iter__(self):
         return iter(self._c)
 

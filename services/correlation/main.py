@@ -84,7 +84,7 @@ def main():
                     try:
                         # Unpack the raw JSON message into our strictly-typed Python object.
                         event = NormalizedEvent(**message.value)
-                        
+
                         try:
                             store.add_event(event)
                         except Exception as e:
@@ -128,8 +128,8 @@ def main():
                             )
 
                         processed += 1
-                        if processed % 5000 == 0:
-                            logger.info(f"Processed {processed} | Correlations fired {corr_fired}")
+                        if processed % 100 == 0:
+                            logger.info(f"Heartbeat | Processed {processed} events (last: {event.type.name}) | Total correlations: {corr_fired}")
 
                     except Exception as e:
                         logger.error(f"Correlation loop error: {e}", exc_info=True)

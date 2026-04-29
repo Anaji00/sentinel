@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS events (
     flight_data JSONB,
     financial_data JSONB,
     security_data JSONB,
+    prediction_market_data JSONB,
+    crypto_data JSONB,
+    cyber_data JSONB,
 
     tags TEXT[],
     named_entities TEXT[],

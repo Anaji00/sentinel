@@ -69,8 +69,9 @@ class PatternLibrary:
                 ORDER BY s.created_at DESC
                 LIMIT %s
             """, (rule_id, limit))
-
-            if len(rows) < limit:
+            
+            remaining_limit = limit - len(rows)
+            if remaining_limit > 0:
                 # CRITICAL THINKING: Two-Stage Retrieval (Fuzzy Match Second).
                 # If we don't have enough exact matches, we backfill the list using "Tag Overlap".
                 # Even if the rule_id is different, an event sharing tags like ['strait_of_hormuz', 'tanker'] 
@@ -92,11 +93,11 @@ class PatternLibrary:
                       -- BEGINNER EXPLANATION: The '&&' operator in PostgreSQL means "Array Overlap".
                       -- It checks if the array of tags in the database shares ANY elements 
                       -- with the array of tags we passed in (%s). It's much faster than looping in Python!
-                      AND c.tags && %s
+                      AND c.tags && %s::text[]
                       AND c.rule_id != %s
                     ORDER BY s.created_at DESC
                     LIMIT %s
-                """, (tags, rule_id, limit - len(rows)))
+                """, (list(tags), rule_id, int(remaining_limit)))
                 rows += extra
             return [self._format_pattern(r) for r in rows]
         
@@ -122,7 +123,7 @@ class PatternLibrary:
                 UPDATE scenarios
                 SET status     = %s,
                     updated_at = NOW()
-                WHERE scenario_id = %s
+                WHERE scenario_id = %s::uuid
             """, (status, scenario_id))
 
             if notes:

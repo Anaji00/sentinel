@@ -71,7 +71,7 @@ class ContextBuilder:
                 """SELECT event_id, type, occurred_at, source, region,
                           primary_entity_id, primary_entity_name, primary_entity_flags,
                           headline, summary, anomaly_score,
-                          vessel_data, flight_data, financial_data, tags
+                          vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events WHERE event_id = %s""",
                 (event_id,)
             )
@@ -92,9 +92,9 @@ class ContextBuilder:
                 """SELECT event_id, type, occurred_at, source, region,
                           primary_entity_id, primary_entity_name, primary_entity_flags,
                           headline, summary, anomaly_score,
-                          vessel_data, flight_data, financial_data, tags
+                          vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id = ANY(%s)
+                   WHERE event_id = ANY(%s::uuid[])
                    ORDER BY occurred_at DESC""",
                 (event_ids,)
             )
@@ -154,7 +154,6 @@ class ContextBuilder:
                      AND anomaly_score >= 0.4
                      AND occurred_at BETWEEN %s AND %s
                    ORDER BY anomaly_score DESC
-                   -- Capped at 10 to preserve LLM token context budget
                    LIMIT 10""",
                 (cutoff, cluster.detected_at)
             )

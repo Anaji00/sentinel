@@ -60,13 +60,16 @@ async def stream_binance_liquidations(producer: SentinelProducer):
                     )
                     # Send the event to the Kafka queue for the enrichment service to process.
                     producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                logger.debug(f"Produced RAW_CRYPTO event for {symbol} liquidation")
         except Exception as e:
             # If the connection drops, log the error, wait 5 seconds, and try to reconnect (Infinite retry).
-            logger.error(f"Binance WS error: {e}. Reconnecting...")
+            logger.error(f"Binance WS error: {e}. Reconnecting...", exc_info=True)
             await asyncio.sleep(5)
 
 async def stream_onchain_whales(producer: SentinelProducer, redis_client):
-    if not ETH_WSS_URL: return
+    if not ETH_WSS_URL:
+        logger.warning("ETH_RPC_WSS_URL environment variable is missing. On-chain whale tracking is disabled.")
+        return
     
     # ── BLOCKCHAIN TARGETS ────────────────────────────────────────────────────
     # We only care about massive stablecoin movements, so we watch the smart contracts for USDT and USDC.
@@ -122,8 +125,9 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
                                 }
                             )
                             producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=token)
+                        logger.debug(f"Produced RAW_CRYPTO event for {token} whale transfer")
         except Exception as e:
-            logger.error(f"ETH RPC error: {e}. Reconnecting...")
+            logger.error(f"ETH RPC error: {e}. Reconnecting...", exc_info=True)
             await asyncio.sleep(5)
 
 async def main():
