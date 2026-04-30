@@ -11,7 +11,7 @@ financial data to automatically adapt to dynamic market baselines.
 import logging
 import pandas as pd  # Pandas is used for handling tabular data (like spreadsheets) in memory.
 from typing import List, Optional
-
+from concurrent.futures import ThreadPoolExecutor  # For running ML training in the background without blocking the main app.
 # Isolation Forest is an unsupervised Machine Learning algorithm.
 # It detects anomalies by randomly "cutting" data points. Normal points take many
 # cuts to isolate, while weird/anomalous points take very few cuts.
@@ -57,6 +57,39 @@ class AnomalyScorer:
         self._db = get_timescale()
         self._ml__trade_models = {}
         self._ml_candle_models = {}
+        self._crypto_trade_models = {}
+        self._crypto_candle_models = {}
+
+        self._training_locks = set()  # To prevent multiple simultaneous trainings for the same asset
+        self._training_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ml_trainer")  # Limit to 5 concurrent trainings to avoid overload
+    
+    def trigger_background_training(self, domain: str, ticker: str, model_type: str):
+        """Spawns a background thread to train an ML model without blocking the consumer."""
+        lock_key = f"{domain}_{model_type}_{ticker}"
+        if lock_key in self._training_locks:
+            logger.info(f"Training already in progress for {lock_key}, skipping duplicate trigger.")
+            return
+        
+        self._training_locks.add(lock_key)
+
+        def train_task():
+            try:
+                if model_type == "tradfi_trade":
+                    self._train_financial_trade_model(ticker, domain)
+                elif model_type == "tradfi_candle":
+                    self._train_market_candle_model(ticker, domain)
+                elif model_type == "crypto_trade":
+                    self._train_crypto_trade_model(ticker)
+                elif model_type == "crypto_candle":
+                    self._train_crypto_candle_model(ticker)
+                logger.info(f"✅ ML Model Ready: {lock_key}")
+            except Exception as e:
+                logger.error(f"Error during ML training for {lock_key}: {e}")
+            finally:
+                self._training_locks.remove(lock_key)
+        
+        self._training_pool.submit(train_task)
+
 
     def _train_financial_trade_model(self, ticker: str, domain: str) -> Optional[IsolationForest]:
         """
@@ -92,9 +125,10 @@ class AnomalyScorer:
             
             # "Fit" tells the model to study the historical trade sizes and premium amounts.
             model.fit(df[['notional', 'size']])
+
             self._ml_trade_models[f"{domain}_{ticker}"] = model
-            return model
-        
+           
+
         except Exception as e:
             logger.error(f"Failed to train ML model for {ticker}: {e}")
             return None
@@ -171,12 +205,10 @@ class AnomalyScorer:
         model = self._ml_models.get(model_key)
 
         if not model:
-            model = self._train_financial_trade_model(ticker, domain)
-        
-        # Fallback to standard heuristics (hardcoded math) if there isn't enough historical data
-        if not model:
-            return round(min(1.0, notional_usd/2_000_000), 3)
-        
+            self.trigger_background_training(ticker, domain, "tradfi_trade")
+
+            return round(min(1.0, notional_usd / 2_000_000), 3)
+    
         # Prepare the new, incoming live trade in the exact same format as the training data.
         X_new = pd.DataFrame([{"notional": notional_usd, "size": size}])
 
@@ -265,6 +297,7 @@ class AnomalyScorer:
                     ABS(close_price - LAG(close_price) OVER (ORDER BY occurred_at ASC)) / NULLIF(LAG(close_price) OVER (ORDER BY occurred_at ASC), 0) as price_change_pct,
                     close_price * volume as notional
                 FROM OrderedCandles
+                WHERE EXTRACT(EPOCH FROM (occurred_at - LAG(occurred_at) OVER (ORDER BY occurred_at ASC))) <= 60
             """
             rows = self._db.query(sql, (asset,))
 
@@ -278,7 +311,6 @@ class AnomalyScorer:
             model.fit(df[['price_change_pct', 'notional']])
             
             self._crypto_candle_models[asset] = model
-            return model
         except Exception as e:
             logger.error(f"Failed to train Crypto Candle model for {asset}: {e}")
             return None
@@ -291,13 +323,10 @@ class AnomalyScorer:
         
         model = self._crypto_candle_models.get(asset)
         if not model:
-            model = self._train_crypto_candle_model(asset)
-        
-        # features[0] is price_change_pct, features[2] is notional
-        if not model:
-            # Crypto fallback: 1% move in 1 minute is highly anomalous
+            self._trigger_background_training(asset, "crypto", "crypto_candle")
             return round(min(1.0, (features[0] * 20) + (features[1] * 5)), 3)
-        
+        # features[0] is price_change_pct, features[2] is notional
+
         X_new = pd.DataFrame([{
             "price_change_pct": features[0], 
             "notional": features[2]
@@ -307,6 +336,8 @@ class AnomalyScorer:
             return 0.1 
         
         raw_score = model.decision_function(X_new)[0]
+        return round(min(1.0, 0.75 + abs(raw_score)), 3)
+    
 
     # ── Vessel Position ───────────────────────────────────────────────────────
 
