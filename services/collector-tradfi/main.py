@@ -143,7 +143,8 @@ async def stream_equities(producer: SentinelProducer, redis_client):
         while True:
             try:
                 raw_tickers = await loop.run_in_executor(None, redis_client.raw.smembers, REDIS_EQUITIES_KEY)
-                desired_subs = {t.upper() for t in raw_tickers} if raw_tickers else {"SPY", "QQQ"}
+                decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
+                desired_subs = {t.upper() for t in decoded_tickers} if decoded_tickers else {"SPY", "QQQ"}
                 
                 # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
                 if len(desired_subs) > 50:

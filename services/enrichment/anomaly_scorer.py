@@ -55,7 +55,7 @@ class AnomalyScorer:
         # Store the connection to Redis (memory cache) for later use.
         self._redis = redis_client
         self._db = get_timescale()
-        self._ml__trade_models = {}
+        self._ml_trade_models = {}
         self._ml_candle_models = {}
         self._crypto_trade_models = {}
         self._crypto_candle_models = {}
@@ -140,26 +140,26 @@ class AnomalyScorer:
         try:
             # Reconstruct the 3D feature vector from historical candle closes
             sql = """
-                SELECT 
-                    ABS(((financial_data->>'underlying_price')::numeric - (financial_data->>'open_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0)) as price_change_pct,
-                    ((financial_data->>'high_price')::numeric - (financial_data->>'low_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0) as volatility_pct,
-                    (financial_data->>'premium_usd')::numeric as notional
-                FROM events 
-                WHERE financial_data->>'ticker' = %s 
-                AND financial_data->>'trade_type' = 'OHLCV_MINUTE_BAR'
-                AND occurred_at > NOW() - INTERVAL '7 days'
-                LIMIT 5000
-            """
+            SELECT 
+                ABS(((financial_data->>'close_price')::numeric - (financial_data->>'open_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0)) as price_change_pct,
+                ((financial_data->>'high_price')::numeric - (financial_data->>'low_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0) as volatility_pct,
+                (financial_data->>'premium_usd')::numeric as notional
+            FROM events 
+            WHERE financial_data->>'ticker' = %s 
+            AND financial_data->>'trade_type' = 'OHLCV_MINUTE_BAR'
+            AND occurred_at > NOW() - INTERVAL '7 days'
+            LIMIT 5000
+        """
             rows = self._db.query(sql, (ticker,))
+            valid_rows = [r for r in rows if r['price_change_pct'] is not None and r['volatility_pct'] is not None]
 
-            if len(rows) < 50: return None # Require more data for structural baselines
+            if len(rows) < 50: return
             
-            df = pd.DataFrame(rows).astype(float).fillna(0)
+            df = pd.DataFrame(valid_rows).astype(float).fillna(0)
             model = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
             model.fit(df[['price_change_pct', 'volatility_pct', 'notional']])
             
             self._ml_candle_models[f"{domain}_{ticker}"] = model
-            return model
         except Exception as e:
             logger.error(f"Failed to train candle model for {ticker}: {e}")
             return None
@@ -175,13 +175,10 @@ class AnomalyScorer:
         model = self._ml_candle_models.get(model_key)
 
         if not model:
-            model = self._train_market_candle_model(ticker, domain)
-        
-        if not model:
-            # Mathematical fallback: Weight price change heavily, followed by volatility
-            price_change_pct, volatility_pct, notional = features
-            return round(min(1.0, (price_change_pct * 15) + (volatility_pct * 5)), 3)
-        
+            self.trigger_background_training(domain, ticker, "tradfi_candle")
+            # Mathematical fallback using both price delta and intra-candle volatility
+            return round(min(1.0, (features[0] * 15) + (features[1] * 5)), 3)
+       
         X_new = pd.DataFrame([{
             "price_change_pct": features[0], 
             "volatility_pct": features[1], 
@@ -202,7 +199,7 @@ class AnomalyScorer:
             return 0.0
         
         model_key = f"{domain}_{ticker}"
-        model = self._ml_models.get(model_key)
+        model = self._ml_trade_models.get(model_key)
 
         if not model:
             self.trigger_background_training(ticker, domain, "tradfi_trade")
@@ -281,34 +278,26 @@ class AnomalyScorer:
             # we can approximate volatility by comparing consecutive minute closes 
             # using Postgres window functions (LAG).
             sql = """
-                WITH OrderedCandles AS (
-                    SELECT 
-                        (crypto_data->>'price')::numeric as close_price,
-                        (crypto_data->>'size_tokens')::numeric as volume,
-                        occurred_at
-                    FROM events 
-                    WHERE crypto_data->>'pair' = %s 
-                    AND crypto_data->>'trade_type' = 'OHLCV_1M'
-                    AND occurred_at > NOW() - INTERVAL '7 days'
-                    ORDER BY occurred_at DESC
-                    LIMIT 5000
-                )
-                SELECT 
-                    ABS(close_price - LAG(close_price) OVER (ORDER BY occurred_at ASC)) / NULLIF(LAG(close_price) OVER (ORDER BY occurred_at ASC), 0) as price_change_pct,
-                    close_price * volume as notional
-                FROM OrderedCandles
-                WHERE EXTRACT(EPOCH FROM (occurred_at - LAG(occurred_at) OVER (ORDER BY occurred_at ASC))) <= 60
-            """
+            SELECT 
+                ABS(((crypto_data->>'close_price')::numeric - (crypto_data->>'open_price')::numeric) / NULLIF((crypto_data->>'open_price')::numeric, 0)) as price_change_pct,
+                ((crypto_data->>'high_price')::numeric - (crypto_data->>'low_price')::numeric) / NULLIF((crypto_data->>'open_price')::numeric, 0) as volatility_pct,
+                ((crypto_data->>'close_price')::numeric * (crypto_data->>'size_tokens')::numeric) as notional
+            FROM events 
+            WHERE crypto_data->>'pair' = %s 
+            AND crypto_data->>'trade_type' = 'OHLCV_1M'
+            AND occurred_at > NOW() - INTERVAL '7 days'
+            LIMIT 5000
+        """
             rows = self._db.query(sql, (asset,))
 
             # Filter out the first row which will have a NULL price_change_pct due to LAG
-            valid_rows = [r for r in rows if r['price_change_pct'] is not None]
+            valid_rows = [r for r in rows if r['price_change_pct'] is not None and r['volatility_pct'] is not None]
             
-            if len(valid_rows) < 100: return None
+            if len(valid_rows) < 50: return
             
             df = pd.DataFrame(valid_rows).astype(float).fillna(0)
             model = IsolationForest(n_estimators=100, contamination=0.015, random_state=42)
-            model.fit(df[['price_change_pct', 'notional']])
+            model.fit(df[['price_change_pct', 'volatility_pct', 'notional']])
             
             self._crypto_candle_models[asset] = model
         except Exception as e:
@@ -329,7 +318,8 @@ class AnomalyScorer:
 
         X_new = pd.DataFrame([{
             "price_change_pct": features[0], 
-            "notional": features[2]
+            "volatility_pct": features[1],
+            "notional": features[2],
         }])
         
         if model.predict(X_new)[0] == 1:

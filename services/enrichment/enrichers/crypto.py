@@ -106,7 +106,7 @@ class CryptoEnricher:
         notional_volume = close_p * volume
         try:
             features = [price_change_pct, volatility_pct, notional_volume]
-            anomaly = self.scorer.score_crypto_candle("crypto", asset, features)
+            anomaly = self.scorer.score_crypto_candle(asset, features)
         except AttributeError as e:
             logger.error(f"Scorer missing method for crypto candle: {e}")
             anomaly = min(1.0, (price_change_pct * 10) + (volatility_pct * 3))
@@ -130,7 +130,11 @@ class CryptoEnricher:
                 trade_type="OHLCV_1M",
                 side="MARKET",
                 price=close_p,
-                size_tokens=volume
+                size_tokens=volume,
+                open_price=open_p,
+                high_price=high_p,
+                low_price=low_p,
+                close_price=close_p
             ),
             headline=headline,
             tags=tags,

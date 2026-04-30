@@ -131,6 +131,10 @@ class TradFiEnricher:
                 premium_usd=notional,
                 underlying_price=close_p,
                 volume=volume,
+                open_price=open_p,
+                high_price=high_p,
+                low_price=low_p,
+                close_price=close_p
             ),
             headline=f"{direction} Structural Anomaly: {ticker} moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol",
             tags=tags,

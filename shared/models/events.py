@@ -188,7 +188,11 @@ class CryptoData(BaseModel):
     pair: str
     trade_type: str
     side: str
-    price: float
+    price: float  # Used for single spot trades/liquidations
+    open_price: Optional[float] = None
+    high_price: Optional[float] = None
+    low_price: Optional[float] = None
+    close_price: Optional[float] = None
     size_tokens: float
     leverage: Optional[float] = None
 
@@ -205,6 +209,10 @@ class FinancialData(BaseModel):
     open_interest: Optional[int] = None
     implied_volatility: Optional[float] = None
     underlying_price: Optional[float] = None
+    open_price: Optional[float] = None
+    close_price: Optional[float] = None
+    high_price: Optional[float] = None
+    low_price: Optional[float] = None
     exchange: Optional[str] = None
     volume_oi_ratio: Optional[float] = None
     otm_percentage: Optional[float] = None
