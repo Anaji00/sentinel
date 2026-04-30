@@ -47,17 +47,12 @@ class TradFiEnricher:
 
     def _enrich_equity_trade(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
-        if not ticker: return None
+        if not ticker or ticker == "UNKNOWN": return None
         
         price = float(p.get("close") or p.get("price", 0))
         volume = float(p.get("volume") or p.get("size_shares", 0))
         notional = float(p.get("notional_usd") or (price * volume))
         
-        # ML ENHANCEMENT: All-data baseline volume training (Circular Bias Fix)
-        # We track baseline volume for ALL trades to detect thin market sweeps
-        if volume > 0:
-            self._update_volume_baseline(ticker, volume)
-
         # Send to Anomaly Scorer for ML isolation forest & volume ratio check
         anomaly = self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
         if anomaly < 0.6:  # Strict floor. Ignore non-anomalous trades.
@@ -85,7 +80,7 @@ class TradFiEnricher:
             ),
             headline=f"🐋 ML Outlier Block Trade {ticker} ${notional/1e6:.2f}M",
             tags=tags,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )
 
     def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
@@ -138,7 +133,7 @@ class TradFiEnricher:
             ),
             headline=f"{direction} Structural Anomaly: {ticker} moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol",
             tags=tags,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )
 
     def _sync_geo_watchlist(self, ticker, tags):

@@ -162,7 +162,7 @@ class CyberEnricher:
                 port = port,
             ), 
             tags = tags,
-            anomaly_score = round(anomaly, 3),
+            anomaly_score = anomaly,
         )
         
     # ── BGP Anomaly ───────────────────────────────────────────────────────────
@@ -226,7 +226,7 @@ class CyberEnricher:
                 data_types = [cve_id, vuln_name]
             ),
             tags=tags,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )
     def _enrich_bgp(self, raw, p) -> Optional[NormalizedEvent]:
         """
@@ -277,8 +277,7 @@ class CyberEnricher:
             ),
             tags = tags,
             country_code = country or None,
-            anomaly_score = round(anomaly, 3),
-        
+            anomaly_score = anomaly
         )
         
     # ── Ransomware Victim Post ───────────────────────────────────────────────
@@ -334,7 +333,7 @@ class CyberEnricher:
             ),
             tags=tags,
             country_code=country or None,
-            anomaly_score=round(anomaly, 3),
+            anomaly_score=anomaly,
         )
      
     # ── Credential Breach ─────────────────────────────────────────────────────

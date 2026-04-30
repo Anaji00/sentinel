@@ -24,7 +24,7 @@ class CryptoEnricher:
         # This class calculates baseline anomaly scores mathematically.
         self.scorer = scorer
         self.redis = redis_client
-
+    
 
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         # Extract the raw dictionary payload and the source identifier
@@ -58,13 +58,7 @@ class CryptoEnricher:
 # ISOLATION FOREST SCORING: 
         # Compare this trade's notional value against the recent historical distribution for THIS specific asset.
 
-        try:
-            anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
-        except Exception as e:
-            logger.error(f"Scorer missing method for crypto trade: {e}")
-            anomaly = min(1.0, notional / 5_000_000 * 0.5)
-            logger.warning(f"Falling back to mathematical scoring for {asset} spot trade: {anomaly}")
-        
+        anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
         if anomaly < 0.6:
             return None
     
@@ -105,13 +99,10 @@ class CryptoEnricher:
         price_change_pct = abs((close_p - open_p) / open_p)
         volatility_pct = (high_p - low_p) / open_p
         notional_volume = close_p * volume
-        try:
-            features = [price_change_pct, volatility_pct, notional_volume]
-            anomaly = self.scorer.score_crypto_candle(asset, features)
-        except AttributeError as e:
-            logger.error(f"Scorer missing method for crypto candle: {e}")
-            anomaly = min(1.0, (price_change_pct * 10) + (volatility_pct * 3))
-            
+        
+        features = [price_change_pct, volatility_pct, notional_volume]
+        anomaly = self.scorer.score_crypto_candle(asset, features)
+    
         if anomaly < 0.6:
             return None
         
