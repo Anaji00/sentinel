@@ -45,8 +45,8 @@ class CryptoEnricher:
         return None
     
     def _enrich_spot_trade(self, raw, p) -> Optional[NormalizedEvent]:
-        asset = p.get("asset", "UNKNOWN")
-        side = p.get("side", "UNKNOWN")
+        asset = p.get("asset", "UNKNOWN").upper()
+        side = p.get("side", "UNKNOWN").upper()
 
         try:
             price = float(p.get("price", 0))
@@ -60,9 +60,10 @@ class CryptoEnricher:
 
         try:
             anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
-        except AttributeError as e:
+        except Exception as e:
             logger.error(f"Scorer missing method for crypto trade: {e}")
             anomaly = min(1.0, notional / 5_000_000 * 0.5)
+            logger.warning(f"Falling back to mathematical scoring for {asset} spot trade: {anomaly}")
         
         if anomaly < 0.6:
             return None
@@ -89,7 +90,7 @@ class CryptoEnricher:
         )
     
     def _enrich_candle(self, raw, p) -> Optional[NormalizedEvent]:
-        asset = p.get("asset", "UNKNOWN")
+        asset = p.get("asset", "UNKNOWN").upper()
         try:
             open_p = float(p.get("open", 0))
             close_p = float(p.get("close", 0))
@@ -144,7 +145,7 @@ class CryptoEnricher:
     def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes large on-chain token/coin movements (whale transfers)."""
         wallet = p.get("receiver_wallet", "UNKNOWN")
-        asset = p.get("asset", "UNKNOWN")
+        asset = p.get("asset", "UNKNOWN").upper()
         is_suspect = p.get("is_suspect_wallet", False)
 
         # Safely attempt to parse the monetary value. Fallback to 0.0 if invalid.
@@ -176,7 +177,7 @@ class CryptoEnricher:
                 try:
                     self.redis.sadd("sentinel:watched:wallets", wallet)
                 except Exception as e:
-                    logger.error(f"Failed to push {wallet[:6]} to watchlist: {e}")
+                    logger.error(f"Redis connection failed while saving wallet {wallet[:6]}: {e}")
 
         # Create a unified Entity object to represent the wallet in our graph database
         entity = Entity(id=wallet, type=EntityType.ORGANIZATION, name=f"Wallet_{wallet[:6]}")

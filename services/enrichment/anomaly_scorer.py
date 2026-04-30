@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor  # For running ML training in 
 # cuts to isolate, while weird/anomalous points take very few cuts.
 from sklearn.ensemble import IsolationForest
 
+import time
 # We import a helper that tells us if a location (like "Strait of Hormuz")
 # is a high-risk zone.
 from shared.db import get_timescale
@@ -59,6 +60,7 @@ class AnomalyScorer:
         self._ml_candle_models = {}
         self._crypto_trade_models = {}
         self._crypto_candle_models = {}
+        self.MODEL_TTL_SECONDS = 86400
 
         self._training_locks = set()  # To prevent multiple simultaneous trainings for the same asset
         self._training_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ml_trainer")  # Limit to 5 concurrent trainings to avoid overload
@@ -126,7 +128,7 @@ class AnomalyScorer:
             # "Fit" tells the model to study the historical trade sizes and premium amounts.
             model.fit(df[['notional', 'size']])
 
-            self._ml_trade_models[f"{domain}_{ticker}"] = model
+            self._ml_trade_models[f"{domain}_{ticker}"] = (model, time.time())
            
 
         except Exception as e:
@@ -159,7 +161,7 @@ class AnomalyScorer:
             model = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
             model.fit(df[['price_change_pct', 'volatility_pct', 'notional']])
             
-            self._ml_candle_models[f"{domain}_{ticker}"] = model
+            self._ml_candle_models[f"{domain}_{ticker}"] = (model, time.time())
         except Exception as e:
             logger.error(f"Failed to train candle model for {ticker}: {e}")
             return None
@@ -172,9 +174,14 @@ class AnomalyScorer:
         if not ticker or len(features) != 3:
             return 0.0
         model_key = f"{domain}_{ticker}"
-        model = self._ml_candle_models.get(model_key)
+        cache_entry = self._ml_candle_models.get(model_key)
 
-        if not model:
+        if cache_entry:
+            model, trained_at = cache_entry
+            if time.time() - trained_at > self.MODEL_TTL_SECONDS:
+                logger.info(f"ML model for {model_key} expired. Triggering retrain.")
+                self.trigger_background_training(domain, ticker, "tradfi_candle")
+        else:
             self.trigger_background_training(domain, ticker, "tradfi_candle")
             # Mathematical fallback using both price delta and intra-candle volatility
             return round(min(1.0, (features[0] * 15) + (features[1] * 5)), 3)
@@ -244,8 +251,8 @@ class AnomalyScorer:
             model = IsolationForest(n_estimators=100, contamination=0.02, random_state=42)
             model.fit(df[['notional', 'size']])
             
-            self._crypto_trade_models[asset] = model
-            return model
+            self._crypto_trade_models[asset] = (model, time.time())
+            logger.info(f"Trained Crypto Trade model for {asset} with {len(df)} samples.")
         except Exception as e:
             logger.error(f"Failed to train Crypto Trade model for {asset}: {e}")
             return None
@@ -253,12 +260,13 @@ class AnomalyScorer:
     def score_crypto_trade(self, asset: str, notional_usd: float, size: float) -> float:
         if not asset or notional_usd <= 0: return 0.0
         
-        model = self._crypto_trade_models.get(asset)
-        if not model:
-            model = self._train_crypto_trade_model(asset)
-        
-        if not model:
-            # Mathematical baseline fallback
+        cached_entry = self._crypto_trade_models.get(asset)
+        if cached_entry:
+            model, trained_at = cached_entry
+            if time.time() - trained_at > self.MODEL_TTL_SECONDS:
+                self._trigger_background_training("crypto", asset, "crypto_trade")
+        else:
+            self.trigger_background_training("crypto", asset, "crypto_trade")
             return round(min(1.0, notional_usd / 3_000_000), 3)
         
         X_new = pd.DataFrame([{"notional": notional_usd, "size": size}])
@@ -299,7 +307,7 @@ class AnomalyScorer:
             model = IsolationForest(n_estimators=100, contamination=0.015, random_state=42)
             model.fit(df[['price_change_pct', 'volatility_pct', 'notional']])
             
-            self._crypto_candle_models[asset] = model
+            self._crypto_candle_models[asset] = (model, time.time())
         except Exception as e:
             logger.error(f"Failed to train Crypto Candle model for {asset}: {e}")
             return None
@@ -310,9 +318,13 @@ class AnomalyScorer:
         """
         if not asset or len(features) != 3: return 0.0
         
-        model = self._crypto_candle_models.get(asset)
-        if not model:
-            self._trigger_background_training(asset, "crypto", "crypto_candle")
+        cache_entry = self._crypto_candle_models.get(asset)
+        if cache_entry:
+            model, trained_at = cache_entry
+            if time.time() - trained_at > self.MODEL_TTL_SECONDS:
+                self._trigger_background_training("crypto", asset, "crypto_candle")
+        else:
+            self._trigger_background_training("crypto", asset, "crypto_candle")
             return round(min(1.0, (features[0] * 20) + (features[1] * 5)), 3)
         # features[0] is price_change_pct, features[2] is notional
 
