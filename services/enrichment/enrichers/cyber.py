@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 # Import Optional to indicate that a function might return a valid object OR None.
 from typing import Optional
-
+from shared.db import get_redis
 # Import the standard models (Data Schemas) shared across the SENTINEL platform.
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, SecurityData
 
@@ -54,7 +54,26 @@ class CyberEnricher:
     def __init__(self, scorer):
         # Save the anomaly scorer instance passed into this class so we can use it later.
         self.scorer = scorer
+        self.redis = get_redis()
     
+    def _calculate_velocity_score(self, entity_id: str, event_category: str, threshold: int = 100) -> float:
+        key = f"sentinel:velocity:{event_category}:{entity_id}"
+
+        try:
+            count = self.redis.incr(key)
+            if count == 1:
+                self.redis.expire(key, 60)
+            
+            if count < threshold:
+                return 0.0
+            base_score = 0.5
+            scale_factor = (count - threshold) / 1000.0
+            return min(1.0, base_score + scale_factor)
+        except Exception as e:
+            logger.error(f"Redis velocity check failed for {key}: {e}")
+            return 0.0
+
+
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         """
         Main entry point. Routes the raw event to the correct parser method based on
@@ -224,13 +243,18 @@ class CyberEnricher:
 
         if not prefix:
             return None
-            
-        # Hijacks are critical threats (0.8). Simple route fluctuations are minor (0.3).
-        anomaly = 0.8 if hijack else 0.3
+        
+        if hijack:
+            anomaly = 0.8
+        else:
+            anomaly = self._calculate_velocity_score(f"AS{origin}", "bgp", threshold=100)
+
+            if anomaly == 0.0:
+                return None
         tags = ["bgp_anomaly", "routing"]
         if hijack:
             tags.append("bgp_hijack")
-        
+
         # Represent the Autonomous System as the primary entity.
         # (FIX: Corrected a typo here where 'INFASTRUCTURE' was used instead of 'INFRASTRUCTURE')
         entity = Entity(
@@ -288,7 +312,7 @@ class CyberEnricher:
             tags.append("critical_infrastructure")
         if is_apt:
             tags.append("apt_group")
-            
+
  
         # Build the Company entity that got attacked.
         entity = Entity(

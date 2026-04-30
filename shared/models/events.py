@@ -40,12 +40,16 @@ class EventType(str, Enum):
     FLIGHT_POSITION = "flight_position"
     FLIGHT_DARK = "flight_dark"
     FLIGHT_ANOMALY = "flight_anomaly"
-    # FInancial
+    # Financial
     OPTIONS_FLOW = "options_flow"
     DARK_POOL = "dark_pool"
     FUTURES_COT = "futures_cot"
     PRICE_ANOMALY = "price_anomaly"
     INSIDER_TRADE = "insider_trade"
+    EQUITY_BLOCK = "equity_block"          # ALREADY EXISTS: Use for TradFi spot trades
+    CRYPTO_TRADE = "crypto_trade"          # NEW: Use for Crypto spot trades
+    MARKET_CANDLE = "market_candle"        # NEW: Standard 1m OHLCV bar
+    MARKET_ANOMALY = "market_anomaly"      # NEW: ML-flagged structural anomaly (High Volatility/Delta)
     # Information
     HEADLINE = "headline"
     SOCIAL_SIGNAL = "social_signal"
@@ -291,6 +295,13 @@ class NormalizedEvent(BaseModel):
             EventType.FUTURES_COT,
             EventType.PRICE_ANOMALY,
             EventType.INSIDER_TRADE,
+            EventType.EQUITY_BLOCK,             # ADDED
+            EventType.CRYPTO_TRADE,             # ADDED
+            EventType.MARKET_CANDLE,            # ADDED
+            EventType.MARKET_ANOMALY,           # ADDED
+            EventType.CRYPTO_LIQUIDATION,       # ADDED
+            EventType.PREDICTION_MARKET_TRADE,  # ADDED
+            EventType.CRYPTO_TRANSFER,
         ]
     
     def to_summary(self) -> str:

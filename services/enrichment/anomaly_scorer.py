@@ -55,9 +55,10 @@ class AnomalyScorer:
         # Store the connection to Redis (memory cache) for later use.
         self._redis = redis_client
         self._db = get_timescale()
-        self._ml_models = {}
+        self._ml__trade_models = {}
+        self._ml_candle_models = {}
 
-    def _train_financial_model(self, ticker: str, domain: str) -> Optional[IsolationForest]:
+    def _train_financial_trade_model(self, ticker: str, domain: str) -> Optional[IsolationForest]:
         """
         Pulls the last 7 days of trade data for a specific ticker to train 
         an unsupervised Isolation Forest model on the fly.
@@ -65,9 +66,11 @@ class AnomalyScorer:
         try:
             # Query recent history to understand what "normal" looks like for this asset
             sql = """
-                SELECT financial_data->>'premium_usd' as notional, financial_data->>'volume' as size
+                SELECT (financial_data->>'premium_usd')::numeric as notional, 
+                       (financial_data->>'volume')::numeric as size
                 FROM events 
                 WHERE financial_data->>'ticker' = %s 
+                AND financial_data->>'trade_type' = 'RAW_TRADE'
                 AND occurred_at > NOW() - INTERVAL '7 days'
                 LIMIT 5000
             """
@@ -89,12 +92,73 @@ class AnomalyScorer:
             
             # "Fit" tells the model to study the historical trade sizes and premium amounts.
             model.fit(df[['notional', 'size']])
-            self._ml_models[f"{domain}_{ticker}"] = model
+            self._ml_trade_models[f"{domain}_{ticker}"] = model
             return model
         
         except Exception as e:
             logger.error(f"Failed to train ML model for {ticker}: {e}")
             return None
+        
+    # ── 2. OHLCV CANDLE ML ────────────────────────────────────────────────────
+
+    def _train_market_candle_model(self, ticker: str, domain: str) -> Optional[IsolationForest]:
+        """Trains an Isolation Forest specifically on 1-minute market structures."""
+        try:
+            # Reconstruct the 3D feature vector from historical candle closes
+            sql = """
+                SELECT 
+                    ABS(((financial_data->>'underlying_price')::numeric - (financial_data->>'open_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0)) as price_change_pct,
+                    ((financial_data->>'high_price')::numeric - (financial_data->>'low_price')::numeric) / NULLIF((financial_data->>'open_price')::numeric, 0) as volatility_pct,
+                    (financial_data->>'premium_usd')::numeric as notional
+                FROM events 
+                WHERE financial_data->>'ticker' = %s 
+                AND financial_data->>'trade_type' = 'OHLCV_MINUTE_BAR'
+                AND occurred_at > NOW() - INTERVAL '7 days'
+                LIMIT 5000
+            """
+            rows = self._db.query(sql, (ticker,))
+
+            if len(rows) < 50: return None # Require more data for structural baselines
+            
+            df = pd.DataFrame(rows).astype(float).fillna(0)
+            model = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
+            model.fit(df[['price_change_pct', 'volatility_pct', 'notional']])
+            
+            self._ml_candle_models[f"{domain}_{ticker}"] = model
+            return model
+        except Exception as e:
+            logger.error(f"Failed to train candle model for {ticker}: {e}")
+            return None
+        
+    
+    def score_market_candle(self, domain: str, ticker: str, features: List[float]) -> float:
+        """
+        Scores a live market candle against the ML model. Returns 0.0 to 1.0.
+        """
+        if not ticker or len(features) != 3:
+            return 0.0
+        model_key = f"{domain}_{ticker}"
+        model = self._ml_candle_models.get(model_key)
+
+        if not model:
+            model = self._train_market_candle_model(ticker, domain)
+        
+        if not model:
+            # Mathematical fallback: Weight price change heavily, followed by volatility
+            price_change_pct, volatility_pct, notional = features
+            return round(min(1.0, (price_change_pct * 15) + (volatility_pct * 5)), 3)
+        
+        X_new = pd.DataFrame([{
+            "price_change_pct": features[0], 
+            "volatility_pct": features[1], 
+            "notional": features[2]
+        }])
+        
+        if model.predict(X_new)[0] == 1:
+            return 0.1 
+        
+        raw_score = model.decision_function(X_new)[0]
+        return round(min(1.0, 0.75 + abs(raw_score)), 3)
         
     def score_financial_trade(self, domain: str, ticker: str, notional_usd: float, size: float) -> float:
         """
@@ -107,7 +171,7 @@ class AnomalyScorer:
         model = self._ml_models.get(model_key)
 
         if not model:
-            model = self._train_financial_model(ticker, domain)
+            model = self._train_financial_trade_model(ticker, domain)
         
         # Fallback to standard heuristics (hardcoded math) if there isn't enough historical data
         if not model:
@@ -118,21 +182,131 @@ class AnomalyScorer:
 
         # ── ML INFERENCE (PREDICTION) ─────────────────────────────────────────
         # predict() returns an array. [1] means normal (inlier), [-1] means anomaly (outlier).
-        is_inlier = model.predict(X_new)[0]
-        if is_inlier == 1:
+        if model.predict(X_new)[0] == 1:
             return 0.1  # Normal Baseline, low risk.
         
         # If anomalous (-1), use decision_function to gauge EXACTLY how weird it is.
         # Returns a negative float. The more negative, the more severe the anomaly.
         raw_score = model.decision_function(X_new)[0]
-
+        logger.warning(f"Potential ML Anomaly Detected for {ticker}: Notional ${notional_usd}, Size {size}, Raw Score {raw_score}")
+        return round(min(1.0, 0.75 + abs(raw_score)), 3)
         # Convert the negative ML score into a 0.0 to 1.0 percentage for our system.
-        anomaly_score = min(1.0, 0.75 + abs(raw_score))
+    
+    def _train_crypto_trade_model(self, asset: str) -> Optional[IsolationForest]:
+        try:
+            # Query the crypto_data column, not financial_data
+            sql = """
+                SELECT ((crypto_data->>'price')::numeric * (crypto_data->>'size_tokens')::numeric) as notional, 
+                       (crypto_data->>'size_tokens')::numeric as size
+                FROM events 
+                WHERE crypto_data->>'pair' = %s 
+                AND crypto_data->>'trade_type' = 'LARGE_SPOT'
+                AND occurred_at > NOW() - INTERVAL '7 days'
+                ORDER BY occurred_at DESC
+                LIMIT 5000
+            """
+            rows = self._db.query(sql, (asset,))
 
-        if anomaly_score > 0.7:
-            logger.warning(f"🤖 ML OUTLIER DETECTED ({anomaly_score:.2f}): {ticker} | ${notional_usd:,.2f}")
+            if len(rows) < 50: return None
+            
+            df = pd.DataFrame(rows).astype(float).fillna(0)
+            
+            # Contamination is slightly higher for crypto due to fatter tails in the distribution
+            model = IsolationForest(n_estimators=100, contamination=0.02, random_state=42)
+            model.fit(df[['notional', 'size']])
+            
+            self._crypto_trade_models[asset] = model
+            return model
+        except Exception as e:
+            logger.error(f"Failed to train Crypto Trade model for {asset}: {e}")
+            return None
 
-        return round(anomaly_score, 3)
+    def score_crypto_trade(self, asset: str, notional_usd: float, size: float) -> float:
+        if not asset or notional_usd <= 0: return 0.0
+        
+        model = self._crypto_trade_models.get(asset)
+        if not model:
+            model = self._train_crypto_trade_model(asset)
+        
+        if not model:
+            # Mathematical baseline fallback
+            return round(min(1.0, notional_usd / 3_000_000), 3)
+        
+        X_new = pd.DataFrame([{"notional": notional_usd, "size": size}])
+        
+        if model.predict(X_new)[0] == 1:
+            return 0.1 # Normal in-line trade
+        
+        raw_score = model.decision_function(X_new)[0]
+        # Translate the negative anomaly score into our 0.0 to 1.0 spectrum
+        return round(min(1.0, 0.70 + abs(raw_score)), 3)
+
+    # ── CRYPTO OHLCV CANDLE ML ────────────────────────────────────────────────
+
+    def _train_crypto_candle_model(self, asset: str) -> Optional[IsolationForest]:
+        try:
+            # Because we might only store close_price and volume in CryptoData, 
+            # we can approximate volatility by comparing consecutive minute closes 
+            # using Postgres window functions (LAG).
+            sql = """
+                WITH OrderedCandles AS (
+                    SELECT 
+                        (crypto_data->>'price')::numeric as close_price,
+                        (crypto_data->>'size_tokens')::numeric as volume,
+                        occurred_at
+                    FROM events 
+                    WHERE crypto_data->>'pair' = %s 
+                    AND crypto_data->>'trade_type' = 'OHLCV_1M'
+                    AND occurred_at > NOW() - INTERVAL '7 days'
+                    ORDER BY occurred_at DESC
+                    LIMIT 5000
+                )
+                SELECT 
+                    ABS(close_price - LAG(close_price) OVER (ORDER BY occurred_at ASC)) / NULLIF(LAG(close_price) OVER (ORDER BY occurred_at ASC), 0) as price_change_pct,
+                    close_price * volume as notional
+                FROM OrderedCandles
+            """
+            rows = self._db.query(sql, (asset,))
+
+            # Filter out the first row which will have a NULL price_change_pct due to LAG
+            valid_rows = [r for r in rows if r['price_change_pct'] is not None]
+            
+            if len(valid_rows) < 100: return None
+            
+            df = pd.DataFrame(valid_rows).astype(float).fillna(0)
+            model = IsolationForest(n_estimators=100, contamination=0.015, random_state=42)
+            model.fit(df[['price_change_pct', 'notional']])
+            
+            self._crypto_candle_models[asset] = model
+            return model
+        except Exception as e:
+            logger.error(f"Failed to train Crypto Candle model for {asset}: {e}")
+            return None
+
+    def score_crypto_candle(self, asset: str, features: List[float]) -> float:
+        """
+        features = [price_change_pct, volatility_pct, notional_volume]
+        """
+        if not asset or len(features) != 3: return 0.0
+        
+        model = self._crypto_candle_models.get(asset)
+        if not model:
+            model = self._train_crypto_candle_model(asset)
+        
+        # features[0] is price_change_pct, features[2] is notional
+        if not model:
+            # Crypto fallback: 1% move in 1 minute is highly anomalous
+            return round(min(1.0, (features[0] * 20) + (features[1] * 5)), 3)
+        
+        X_new = pd.DataFrame([{
+            "price_change_pct": features[0], 
+            "notional": features[2]
+        }])
+        
+        if model.predict(X_new)[0] == 1:
+            return 0.1 
+        
+        raw_score = model.decision_function(X_new)[0]
 
     # ── Vessel Position ───────────────────────────────────────────────────────
 

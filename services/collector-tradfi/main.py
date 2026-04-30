@@ -198,13 +198,13 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                                 aggregator.add_trade(ticker, price, volume)
                                 
                                 # 2. Instant Block Trade Detection (> $500k)
-                                if notional > 100_000:
+                                if notional > 50_000:
                                     logger.warning("🐳 EQUITY BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
                                     event = RawEvent(
                                         source="finnhub_equities",
                                         occurred_at=datetime.now(timezone.utc),
                                         raw_payload={
-                                            "ticker": ticker, "trade_type": "BLOCK_TRADE",
+                                            "ticker": ticker, "trade_type": "RAW_TRADE",
                                             "price": price, "size_shares": volume, "notional_usd": notional
                                         }
                                     )

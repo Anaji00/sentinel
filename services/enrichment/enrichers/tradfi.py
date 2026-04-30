@@ -35,13 +35,17 @@ class TradFiEnricher:
         source = raw.source
 
         if source == "finnhub_equities":
-            return self._enrich_equity(raw, p)
+            trade_type = p.get("trade_type", "RAW_TRADE")
+            if trade_type == "OHLCV_MINUTE_BAR":
+                return self._enrich_candle(raw, p)
+            else:   
+                return self._enrich_equity_trade(raw, p)
         elif source == "sec_form4":
             return self._enrich_insider(raw, p)
             
         return None
 
-    def _enrich_equity(self, raw, p) -> Optional[NormalizedEvent]:
+    def _enrich_equity_trade(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
         if not ticker: return None
         
@@ -56,42 +60,91 @@ class TradFiEnricher:
 
         # Send to Anomaly Scorer for ML isolation forest & volume ratio check
         anomaly = self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
-
-        # Drop noise if it's below block limits AND doesn't flag ML anomalies
-        if notional < 50_000 and anomaly < 0.5:
+        if anomaly < 0.6:  # Strict floor. Ignore non-anomalous trades.
             return None
-
         tags = ["tradfi", "equity_block", ticker.lower()]
-        
-        # DYNAMIC WATCHLIST PROPAGATION
-        if ticker in GEO_INSTRUMENTS:
-            tags.append("geo_linked_asset")
-            tags.append(GEO_INSTRUMENTS[ticker])  # e.g., "defense", "oil", "gold"
-            try:
-                # Dynamically sync downstream watchlist sweeps
-                self.redis_client.sadd("sentinel:watched:equities", ticker)
-            except Exception as e:
-                logger.error(f"Failed to push {ticker} to watchlist: {e}")
+        self._sync_geo_watchlist(ticker, tags)
 
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         return NormalizedEvent(
             event_id=raw.event_id,
-            type=EventType.OPTIONS_FLOW, # Emits to financial correlation engine
+            type=EventType.EQUITY_BLOCK,
+             # Emits to financial correlation engine
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker, 
-                instrument_type="equity", 
+                instrument_type="equity",
+                trade_type="RAW_TRADE", 
                 premium_usd=notional,
-                underlying_price=price,      # BUG 4 FIXED: Pydantic field mapped correctly
+                underlying_price=price,
+                volume=volume,
                 volume_oi_ratio=p.get("vol_oi_ratio") # BUG 4 FIXED: Maps field
             ),
-            headline=f"Unusual Equity Flow: {ticker} ${notional/1e6:.2f}M",
+            headline=f"🐋 ML Outlier Block Trade {ticker} ${notional/1e6:.2f}M",
             tags=tags,
             anomaly_score=round(anomaly, 3),
         )
+
+    def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
+        # 1 minute ohcvl bars for volume spike detection
+        ticker = (p.get("ticker") or "").upper()
+        if not ticker: return None
+
+        open_p = float(p.get("open", 0))
+        close_p = float(p.get("close", 0))
+        volume = float(p.get("volume", 0))
+        low_p = float(p.get("low", 0))
+        high_p = float(p.get("high", 0))
+        close_p = float(p.get("close", 0))
+        notional = float(p.get("notional_usd") or (close_p * volume))
+
+        if open_p == 0 or close_p == 0:
+            return None
+        
+        price_change_pct = abs((close_p - open_p) / open_p)
+        volatility_pct   = (high_p - low_p) / open_p
+
+        # ML SCORING: Compare this minute's structure against historical 1-minute structures
+        features = [price_change_pct, volatility_pct, notional]
+        anomaly = self.scorer.score_market_candle("tradfi", ticker, features)
+
+        if anomaly < 0.6:
+            return None
+        tags = ["tradfi", "market_structure", "volatile_candle", ticker.lower()]
+        self._sync_geo_watchlist(ticker, tags)
+        entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
+        direction = "🟢 Bullish" if close_p >= open_p else "🔴 Bearish"
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            type=EventType.MARKET_ANOMALY,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            financial_data=FinancialData(
+                ticker=ticker, 
+                instrument_type="equity",
+                trade_type="OHLCV_MINUTE_BAR", 
+                premium_usd=notional,
+                underlying_price=close_p,
+                volume=volume,
+            ),
+            headline=f"{direction} Structural Anomaly: {ticker} moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol",
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
+        )
+
+    def _sync_geo_watchlist(self, ticker, tags):
+        if ticker in GEO_INSTRUMENTS:
+            tags.append("geo_linked_asset")
+            tags.append(GEO_INSTRUMENTS[ticker])
+            try:
+                self.redis_client.sadd("sentinel:watched:equities", ticker)
+            except Exception as e:
+                logger.error(f"Failed to update geo watchlist for {ticker}: {e}", exc_info=True)
 
     def _enrich_insider(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()

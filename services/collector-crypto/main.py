@@ -130,6 +130,47 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
             logger.error(f"ETH RPC error: {e}. Reconnecting...", exc_info=True)
             await asyncio.sleep(5)
 
+async def stream_binance_candles(producer: SentinelProducer):
+    TOP_10_PAIRS = [
+        "btcusdt", "ethusdt", "bnbusdt", "adausdt", 
+        "solusdt", "xrpusdt", "dotusdt", "dogeusdt", "avaxusdt", "linkusdt"
+        ]
+    
+    stream_params = "/".join([f"{pair}@kline_1m" for pair in TOP_10_PAIRS])
+    url = f"wss://stream.binance.com:9443/stream?streams={stream_params}"
+
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20) as ws:
+                logger.info("Connected to Binance 1m Candle Stream")
+                while True:
+                    payload = json.loads(await ws.recv())
+                    data = payload.get("data", {})
+                    if not data:
+                        logger.warning(f"Received unexpected message format: {payload}")
+                        continue
+                    kline = data.get("k", {})
+                    is_closed = kline.get("x", False)
+                    if is_closed:
+                        symbol = data.get("s")
+                        event = RawEvent(
+                            source="binance_candles",
+                            occurred_at=datetime.now(timezone.utc),
+                            raw_payload={
+                                "asset": symbol,
+                                "trade_type": "OHLCV",
+                                "open": float(kline.get("o")),
+                                "high": float(kline.get("h")),
+                                "low": float(kline.get("l")),
+                                "close": float(kline.get("c")),
+                                "volume": float(kline.get("v"))
+                            }
+                        )
+                        producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                        logger.info(f"📊 {symbol} 1m Candle Closed: ${float(kline.get('c')):,.2f}")
+        except Exception as e:
+            logger.error(f"Binance Candle WS error: {e}. Reconnecting...", exc_info=True)
+            await asyncio.sleep(5)
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL Crypt0 Service")
@@ -141,7 +182,8 @@ async def main():
         # asyncio.gather runs both infinite loops side-by-side at the exact same time.
         await asyncio.gather(
             stream_binance_liquidations(producer),
-            stream_onchain_whales(producer, redis_client)
+            stream_onchain_whales(producer, redis_client),
+            stream_binance_candles(producer)
         )
     finally:
         producer.close()

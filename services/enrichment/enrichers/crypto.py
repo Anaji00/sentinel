@@ -36,9 +36,106 @@ class CryptoEnricher:
             return self._enrich_whale_transfer(raw, p)
         elif source == "binance_futures":
             return self._enrich_liquidation(raw, p)
-
+        elif source == "binance_spot":
+            return self._enrich_spot_trade(raw, p)
+        elif source == "binance_candles":
+            return self._enrich_candle(raw, p)
+        
         # If the source is unknown, we drop the event by returning None
         return None
+    
+    def _enrich_spot_trade(self, raw, p) -> Optional[NormalizedEvent]:
+        asset = p.get("asset", "UNKNOWN")
+        side = p.get("side", "UNKNOWN")
+
+        try:
+            price = float(p.get("price", 0))
+            qty = float(p.get("size_tokens", 0))
+            notional = float(p.get("notional_usd", 0))
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse price/qty for spot trade: {e}")
+            return None
+# ISOLATION FOREST SCORING: 
+        # Compare this trade's notional value against the recent historical distribution for THIS specific asset.
+
+        try:
+            anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
+        except AttributeError as e:
+            logger.error(f"Scorer missing method for crypto trade: {e}")
+            anomaly = min(1.0, notional / 5_000_000 * 0.5)
+        
+        if anomaly < 0.6:
+            return None
+    
+        tags = ["crypto", "spot_trade", asset.lower(), side.lower()]
+        entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
+        headline = f"🐋 ML Outlier CRYPTO Trade ({side}): ${notional/1e6:.2f}M {asset} at ${price:,.2f}"
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            type = EventType.CRYPTO_TRADE,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            crypto_data=CryptoData(
+                pair=asset,
+                trade_type="LARGE_SPOT",
+                side=side,
+                price=price,
+                size_tokens=qty
+            ),
+            headline=headline,
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
+        )
+    
+    def _enrich_candle(self, raw, p) -> Optional[NormalizedEvent]:
+        asset = p.get("asset", "UNKNOWN")
+        try:
+            open_p = float(p.get("open", 0))
+            close_p = float(p.get("close", 0))
+            high_p = float(p.get("high", 0))
+            low_p = float(p.get("low", 0))
+            volume = float(p.get("volume", 0))
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to parse candle data for {asset}: {e}")
+            return None
+        if open_p == 0 or close_p == 0:
+            return None
+        price_change_pct = abs((close_p - open_p) / open_p)
+        volatility_pct = (high_p - low_p) / open_p
+        notional_volume = close_p * volume
+        try:
+            features = [price_change_pct, volatility_pct, notional_volume]
+            anomaly = self.scorer.score_crypto_candle("crypto", asset, features)
+        except AttributeError as e:
+            logger.error(f"Scorer missing method for crypto candle: {e}")
+            anomaly = min(1.0, (price_change_pct * 10) + (volatility_pct * 3))
+            
+        if anomaly < 0.6:
+            return None
+        
+        direction = "🟢 Bullish" if close_p >= open_p else "🔴 Bearish"
+        tags = ["crypto", "market_structure", "volatile_candle", direction, asset.lower()]
+        headline = f"{direction} Crypto Anomaly: {asset} moved {price_change_pct*100:.2f}% on ${notional_volume/1e6:.1f}M vol"
+        entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            type=EventType.MARKET_ANOMALY,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            crypto_data=CryptoData(
+                pair=asset,
+                trade_type="OHLCV_1M",
+                side="MARKET",
+                price=close_p,
+                size_tokens=volume
+            ),
+            headline=headline,
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
+        )
 
     def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes large on-chain token/coin movements (whale transfers)."""
