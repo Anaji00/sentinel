@@ -95,6 +95,7 @@ class OHLCVAggregator:
             d["V"] = d["V"] + volume
     def flush(self):
         now = datetime.now(timezone.utc)
+        count = 0
 
         for ticker, data in self.buffer.items():
             if data["V"] > 0:
@@ -115,16 +116,20 @@ class OHLCVAggregator:
                     raw_payload=candle
                 )
                 self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
-
-                redis_list_key= f"sentinel:candles:1m:{ticker}"
-                candle_json = json.dumps({"ts": now.isoformat(), **candle})
+                count += 1
                 try:
+                
+                    redis_list_key= f"sentinel:candles:1m:{ticker}"
+                    candle_json = json.dumps({"ts": now.isoformat(), **candle})
+                    
                     self.redis_client.raw.lpush(redis_list_key, candle_json)
                     # Keep only the last 1440 minutes (24 hours) of candles
                     self.redis_client.raw.ltrim(redis_list_key, 0, 1439)
                 except Exception as e:
-                    logger.error("Redis error: %s", e, exc_info=True)
+                    logger.debug(f"Redis cache warning for {ticker}: {e}")
         self.buffer.clear()
+        if count > 0:
+            logger.info(f"Flushed {count} minute bars to Kafka and Redis.")
                     
 
 async def stream_equities(producer: SentinelProducer, redis_client):
@@ -174,8 +179,10 @@ async def stream_equities(producer: SentinelProducer, redis_client):
         """Timer task to flush the minute-bar buffer."""
         while True:
             await asyncio.sleep(60)
-            aggregator.flush()
-
+            try:
+                aggregator.flush()
+            except Exception as e:
+                logger.error(f"FATAL: TradFi Aggregator flush crashed: {e}", exc_info=True)
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:

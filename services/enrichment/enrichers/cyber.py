@@ -240,17 +240,21 @@ class CyberEnricher:
         # Boolean flag indicating if the system suspects this is a malicious hijack.
         hijack   = p.get("is_hijack", False)
         country  = (p.get("country_code") or "")[:2].upper()
+        as_name = p.get("as_name", f"AS{origin}")
 
         if not prefix:
             return None
+        is_critical = any(kw in as_name.lower() for kw in HIGH_VALUE_ORGS)
+        
+        if not hijack and not is_critical:
+            return None
         
         if hijack:
-            anomaly = 0.8
+            anomaly = 0.90
         else:
-            anomaly = self._calculate_velocity_score(f"AS{origin}", "bgp", threshold=100)
+            anomaly = self._calculate_velocity_score(f"AS{origin}", "bgp", threshold=50)
+            if anomaly == 0.0: return None
 
-            if anomaly == 0.0:
-                return None
         tags = ["bgp_anomaly", "routing"]
         if hijack:
             tags.append("bgp_hijack")
@@ -259,7 +263,7 @@ class CyberEnricher:
         # (FIX: Corrected a typo here where 'INFASTRUCTURE' was used instead of 'INFRASTRUCTURE')
         entity = Entity(
             id=f"AS{origin}", type = EntityType.INFRASTRUCTURE,
-            name=p.get("as_name", f"AS{origin}"), country_code=country or None,
+            name=as_name, country_code=country or None,
         )
 
         # Build and return the standardized event.

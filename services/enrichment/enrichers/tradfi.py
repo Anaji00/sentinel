@@ -106,7 +106,7 @@ class TradFiEnricher:
         # ML SCORING: Compare this minute's structure against historical 1-minute structures
         features = [price_change_pct, volatility_pct, notional]
         anomaly = self.scorer.score_market_candle("tradfi", ticker, features)
-
+        logger.info(f"🧠 ML 1-MINUTE CANDLE INFERENCE | {ticker} Candle | Score: {anomaly:.3f} | Price Change: {price_change_pct*100:.2f}% | Volatility: {volatility_pct*100:.2f}% | Notional: ${notional/1e6:.2f}M")
         if anomaly < 0.6:
             return None
         tags = ["tradfi", "market_structure", "volatile_candle", ticker.lower()]
