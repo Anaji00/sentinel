@@ -55,6 +55,7 @@ class TradFiEnricher:
         
         # Send to Anomaly Scorer for ML isolation forest & volume ratio check
         anomaly = self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
+        logger.info(f"🧠 ML INFERENCE | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
         if anomaly < 0.6:  # Strict floor. Ignore non-anomalous trades.
             return None
         tags = ["tradfi", "equity_block", ticker.lower()]

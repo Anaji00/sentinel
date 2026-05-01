@@ -65,7 +65,7 @@ class AnomalyScorer:
         self._training_locks = set()  # To prevent multiple simultaneous trainings for the same asset
         self._training_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ml_trainer")  # Limit to 5 concurrent trainings to avoid overload
     
-    def trigger_background_training(self, domain: str, ticker: str, model_type: str):
+    def _trigger_background_training(self, domain: str, ticker: str, model_type: str):
         """Spawns a background thread to train an ML model without blocking the consumer."""
         lock_key = f"{domain}_{model_type}_{ticker}"
         if lock_key in self._training_locks:
@@ -180,9 +180,9 @@ class AnomalyScorer:
             model, trained_at = cache_entry
             if time.time() - trained_at > self.MODEL_TTL_SECONDS:
                 logger.info(f"ML model for {model_key} expired. Triggering retrain.")
-                self.trigger_background_training(domain, ticker, "tradfi_candle")
+                self._trigger_background_training(domain, ticker, "tradfi_candle")
         else:
-            self.trigger_background_training(domain, ticker, "tradfi_candle")
+            self._trigger_background_training(domain, ticker, "tradfi_candle")
             # Mathematical fallback using both price delta and intra-candle volatility
             return round(min(1.0, (features[0] * 15) + (features[1] * 5)), 3)
        
@@ -209,7 +209,7 @@ class AnomalyScorer:
         model = self._ml_trade_models.get(model_key)
 
         if not model:
-            self.trigger_background_training(ticker, domain, "tradfi_trade")
+            self._trigger_background_training(ticker, domain, "tradfi_trade")
 
             return round(min(1.0, notional_usd / 2_000_000), 3)
     
@@ -266,7 +266,7 @@ class AnomalyScorer:
             if time.time() - trained_at > self.MODEL_TTL_SECONDS:
                 self._trigger_background_training("crypto", asset, "crypto_trade")
         else:
-            self.trigger_background_training("crypto", asset, "crypto_trade")
+            self._trigger_background_training("crypto", asset, "crypto_trade")
             return round(min(1.0, notional_usd / 3_000_000), 3)
         
         X_new = pd.DataFrame([{"notional": notional_usd, "size": size}])

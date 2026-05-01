@@ -59,6 +59,7 @@ class CryptoEnricher:
         # Compare this trade's notional value against the recent historical distribution for THIS specific asset.
 
         anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
+        logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
         if anomaly < 0.6:
             return None
     
@@ -102,7 +103,7 @@ class CryptoEnricher:
         
         features = [price_change_pct, volatility_pct, notional_volume]
         anomaly = self.scorer.score_crypto_candle(asset, features)
-    
+        logger.info(f"🧠 ML INFERENCE | {asset} 1-min Candle | Score: {anomaly:.3f} | Price Change: {price_change_pct*100:.2f}% | Volatility: {volatility_pct*100:.2f}% | Notional Volume: ${notional_volume/1e6:.2f}M")
         if anomaly < 0.6:
             return None
         

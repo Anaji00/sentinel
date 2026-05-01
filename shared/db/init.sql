@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS events (
     sentiment FLOAT,
     anomaly_score FLOAT DEFAULT 0.0,
     correlation_ids UUID[],
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (event_id, occurred_at) -- Composite PK: UUID + Time. This allows efficient time-range queries while ensuring uniqueness.
 
 );  
@@ -82,7 +82,6 @@ CREATE INDEX IF NOT EXISTS events_region_time_idx ON events(region, occurred_at 
 -- OPTIMIZATION: Uses heavy compression because we rarely query individual historical pings, usually just aggregates or tracks.
 -- LOGICAL JOIN: mmsi -> events.primary_entity_id
 CREATE TABLE IF NOT EXISTS vessel_positions (
-    id BIGSERIAL,
     mmsi VARCHAR(20) NOT NULL, -- Maritime Mobile Service Identity. The unique ID for AIS.
     occurred_at TIMESTAMPTZ NOT NULL,
     lat FLOAT NOT NULL,
@@ -94,7 +93,7 @@ CREATE TABLE IF NOT EXISTS vessel_positions (
     -- COMPOSITE PRIMARY KEY (id + time):
     -- NECESSITY: TimescaleDB requires the partitioning column ('occurred_at') to be part of the Primary Key.
     -- This allows the database to instantly know which "chunk" (file) a specific row lives in.
-    PRIMARY KEY (id, occurred_at)
+    PRIMARY KEY (mmsi, occurred_at)
 );
 
 -- CHUNKING: Creates a new file partition every 1 day. 
@@ -102,6 +101,7 @@ CREATE TABLE IF NOT EXISTS vessel_positions (
 SELECT create_hypertable('vessel_positions', 'occurred_at', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
 -- COMPRESSION: Converts Row-Oriented storage (standard DB) to Columnar storage (Arrays) after 7 days.
 -- Reduces disk usage by ~90-95% for historical GPS data, at the cost of making older rows Read-Only.
+ALTER TABLE vessel_positions SET (timescaledb.compress, timescaledb.compress_segmentby = 'mmsi');
 SELECT add_compression_policy('vessel_positions', INTERVAL '7 days', if_not_exists => TRUE);
 
 CREATE INDEX IF NOT EXISTS vpo_mmsi_time_idx ON vessel_positions(mmsi, occurred_at DESC);
