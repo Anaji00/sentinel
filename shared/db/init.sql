@@ -18,26 +18,26 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE IF NOT EXISTS events (
     -- PRIMARY KEY (UUID): Essential for distributed systems. Unlike SERIAL (1, 2, 3), UUIDs can be generated 
     -- by multiple collectors simultaneously without checking a central database for the "next number."
-    event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    type VARCHAR(50) NOT NULL,
+    event_id UUID DEFAULT uuid_generate_v4(),
+    type TEXT NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL, -- TIMESTAMPTZ converts to UTC on storage. Critical for coordinating global events across timezones.
     collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    source VARCHAR(100),
+    source TEXT,
     source_reliability FLOAT DEFAULT 1.0,
 
     -- "Soft Foreign Key" (Logical Link): 
     -- We link loosely to strings (MMSI) rather than using 'REFERENCES vessels(id)'.
     -- NECESSITY: High-speed ingestion. If we enforced a hard FK, we would have to reject an event 
     -- if the vessel wasn't in our registry yet. We prefer to capture the data first, reconcile later.
-    primary_entity_id VARCHAR(100),
-    primary_entity_type VARCHAR(50),
-    primary_entity_name VARCHAR(200),
+    primary_entity_id TEXT,
+    primary_entity_type TEXT,
+    primary_entity_name TEXT,
     primary_entity_flags TEXT[],
 
     -- GEOGRAPHY(POINT, 4326): Uses WGS84 (GPS standard). 
     -- Calculations (ST_Distance) return meters on a curved earth, unlike GEOMETRY which uses planar degrees.
     coordinates GEOGRAPHY(POINT, 4326),
-    region VARCHAR(100),
+    region TEXT,
     country_code CHAR(2),
     headline TEXT,
     summary TEXT,
@@ -56,9 +56,11 @@ CREATE TABLE IF NOT EXISTS events (
     named_entities TEXT[],
     sentiment FLOAT,
     anomaly_score FLOAT DEFAULT 0.0,
-    correlation_ids UUID[]
+    correlation_ids UUID[],
+    created_at TIMESTAMPTZ DEFAULT NOW()
+    PRIMARY KEY (event_id, occurred_at) -- Composite PK: UUID + Time. This allows efficient time-range queries while ensuring uniqueness.
 
-);
+);  
 
 -- HYPERTABLE: Partitions the table into "chunks" by time.
 -- Benefit: Recent data stays in RAM (hot), old data moves to disk (cold). Queries on time ranges only scan relevant chunks.

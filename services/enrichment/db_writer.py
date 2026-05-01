@@ -45,7 +45,7 @@ class DBWriter:
                     %s,%s,%s,%s,
                     %s,%s,%s,%s,%s
                 )
-                ON CONFLICT (event_id) DO NOTHING
+                ON CONFLICT (event_id, occurred_at) DO NOTHING
             """, (
                 event.event_id,
                 event.type.value,
@@ -92,7 +92,7 @@ class DBWriter:
                 vessel_data, flight_data, financial_data, security_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids
             ) VALUES %s
-            ON CONFLICT (event_id) DO NOTHING
+            ON CONFLICT (event_id, occurred_at) DO NOTHING
         """
         values = []
         for e in events:

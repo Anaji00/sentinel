@@ -43,7 +43,7 @@ async def stream_binance_large_trades(producer: SentinelProducer):
         "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt"
     ]
     stream_params = "/".join([f"{pair}@aggTrade" for pair in TOP_10_PAIRS])
-    url = f"wss://stream.binance.com:9443/stream?streams={stream_params}"
+    url = f"wss://stream.binance.us:9443/stream?streams={stream_params}"
     
     msg_count = 0
     while True:
@@ -88,7 +88,7 @@ async def stream_binance_candles(producer: SentinelProducer):
         "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt"
     ]
     stream_params = "/".join([f"{pair}@kline_1m" for pair in TOP_10_PAIRS])
-    url = f"wss://stream.binance.com:9443/stream?streams={stream_params}"
+    url = f"wss://stream.binance.us:9443/stream?streams={stream_params}"
     
     while True:
         try:

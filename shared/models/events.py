@@ -67,7 +67,6 @@ class EventType(str, Enum):
     CRYPTO_LIQUIDATION = "crypto_liquidation"
     CRYPTO_PERP_FUNDING = "crypto_perp_funding"
     CUSTOM = "custom"
-    EQUITY_BLOCK = "equity_block"
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
 class EntityType(str, Enum):

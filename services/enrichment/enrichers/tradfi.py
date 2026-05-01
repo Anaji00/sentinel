@@ -37,7 +37,7 @@ class TradFiEnricher:
         if source == "finnhub_equities":
             trade_type = p.get("trade_type", "RAW_TRADE")
             if trade_type == "OHLCV_MINUTE_BAR":
-                return self._enrich_candle(raw, p)
+                return self._enrich_equity_candle(raw, p)
             else:   
                 return self._enrich_equity_trade(raw, p)
         elif source == "sec_form4":

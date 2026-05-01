@@ -62,7 +62,7 @@ class CyberEnricher:
         try:
             count = self.redis.incr(key)
             if count == 1:
-                self.redis.expire(key, 60)
+                self.redis.raw.expire(key, 60)
             
             if count < threshold:
                 return 0.0
