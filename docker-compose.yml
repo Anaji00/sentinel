@@ -171,6 +171,7 @@ services:
       --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
+      - ollama_data:/root/.ollama
       # redis_data: Persists Redis data across container restarts.
     healthcheck:
       test: redis-cli ping || exit 1 # Uses the redis-cli to send a ping command. If redis is running it will respond with a PONG.
@@ -178,6 +179,8 @@ services:
       timeout: 3s
       # Checks if the Redis server is running by sending a PING command.
       retries: 15
+  
+    
   
   enrichment:
     build: .
@@ -190,7 +193,8 @@ services:
         condition: service_healthy
       timescaledb:
         condition: service_healthy
-  
+    networks:
+      - sentinel-network
   correlation:
     build: .
     container_name: sentinel-correlation
@@ -199,7 +203,9 @@ services:
     restart: always
     depends_on:
       - enrichment
-  
+    networks:
+      - sentinel-network
+
   reasoning:
     build: .
     container_name: sentinel-reasoning
@@ -208,6 +214,8 @@ services:
     restart: always
     depends_on:
       - correlation
+    networks:
+      - sentinel-network
 # 2. DYNAMIC COLLECTORS
   
   collector-tradefi:
@@ -219,7 +227,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-  
+    networks:
+      - sentinel-network
+
   collector-crypto:
     build: .
     container_name: sentinel-crypto
@@ -229,6 +239,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    networks:
+      - sentinel-network
 
   collector-prediction:
     build: .
@@ -239,7 +251,25 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-
+    networks:
+      - sentinel-network
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sentinel-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - sentinel-network
+    
+    # Note: If you have a GPU, we will need to pass the NVIDIA runtime here
 # 3. PHYSICAL / CYBER COLLECTORS
   collector-cyber:
     build: .
@@ -250,6 +280,19 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+  
+  collector-radar:
+    build: 
+      context: .
+      dockerfile: ./DockerFile
+    command: ["python", "services/collector-radar/main.py"]
+    container_name: sentinel-radar
+    env_file: .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - sentinel_network
   
   collector-ais:
     build: .

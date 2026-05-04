@@ -46,7 +46,7 @@ class Topics:
     # CORRELATIONS: The "Findings".
     # When our engine notices a pattern (e.g., 2 vessels meeting at night), it
     # bundles those events together into a Correlation and puts it here.
-    CORRELATIONS = "correlations.detected"
+    CORRELATIONS = "sentinel.correlations"
     NORMALIZED     = "events.normalized"
     # ALERTS: The "Megaphone".
     # High-priority stuff that needs to go to a Dashboard, SMS, or Email immediately.
