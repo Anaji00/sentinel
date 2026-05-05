@@ -22,7 +22,9 @@ Thumbs.db
 # Node (future frontend)
 node_modules/
 .next/
-
+*.vsix
+*.suo
+*.pyproj
 # Logs
 *.log
 
