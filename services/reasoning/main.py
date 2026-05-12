@@ -65,24 +65,17 @@ def _save_scenario(db, scenario):
         logger.error("Error saving scenario %s to DB: %s", scenario.scenario_id, e, exc_info=True)
 
 async def apply_autonomous_feedback(scenario, redis_client):
-    """Parses the Gemini output for specific tracking recommendations and updates Redis."""
-    recommendations = scenario.recommended_monitoring.upper()
-    
-    tickers = set(re.findall(r'\$([A-Z]{1,5})', recommendations))
+    """
+    Parses Gemini output for crypto wallets. 
+    (Equity tickers are now handled deterministically by the QuantResearcherAgent).
+    """
     wallets = set(re.findall(r'(0x[a-fA-F0-9]{40})', scenario.recommended_monitoring))
-    
     loop = asyncio.get_event_loop()
-    
-    for ticker in tickers:
-        is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:equities", ticker)
-        if is_new:
-            logger.warning("🤖 AUTONOMOUS PIVOT: Instructing TradFi collector to track %s", ticker)
 
     for wallet in wallets:
         is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:wallets", wallet)
         if is_new:
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
-
 
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
     """The core synthesis pipeline."""

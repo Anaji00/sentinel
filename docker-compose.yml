@@ -171,7 +171,6 @@ services:
       --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
-      - ollama_data:/root/.ollama
       # redis_data: Persists Redis data across container restarts.
     healthcheck:
       test: redis-cli ping || exit 1 # Uses the redis-cli to send a ping command. If redis is running it will respond with a PONG.
@@ -280,6 +279,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    networks:
+      - sentinel-network
+
   
   collector-radar:
     build: 
@@ -292,7 +294,7 @@ services:
       - redis
     restart: unless-stopped
     networks:
-      - sentinel_network
+      - sentinel-network
   
   collector-ais:
     build: .
@@ -300,6 +302,8 @@ services:
     command: python services/collector-ais/main.py
     env_file: .env
     restart: always
+    networks:
+      - sentinel-network
     depends_on:
       kafka:
         condition: service_healthy
@@ -309,6 +313,8 @@ services:
     command: python services/collector-adsb/main.py
     env_file: .env
     restart: always
+    networks:
+      - sentinel-network
     depends_on:
       kafka:
         condition: service_healthy
@@ -318,6 +324,8 @@ services:
     command: python services/collector-news/main.py
     env_file: .env
     restart: always
+    networks:
+      - sentinel-network
     depends_on:
       kafka:
         condition: service_healthy
@@ -329,6 +337,8 @@ services:
     ports:
       - "8000:8000"
     restart: always
+    networks:
+      - sentinel-network
     depends_on:
       timescaledb:
         condition: service_healthy

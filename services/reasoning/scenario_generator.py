@@ -140,7 +140,7 @@ class ScenarioGenerator:
                     scenario = Scenario(
                         scenario_id=f"scn_{uuid.uuid4().hex[:8]}",
                         correlation_id=cluster.correlation_id,
-                        status=ScenarioStatus.ACTIVE,
+                        status=ScenarioStatus.HYPOTHESIS,
                         created_at=datetime.now(timezone.utc),
                         updated_at=datetime.now(timezone.utc),
                         headline=ai_data["headline"],

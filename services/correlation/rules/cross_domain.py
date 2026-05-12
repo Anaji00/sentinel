@@ -4,10 +4,12 @@ services/correlation/rules/cross_domain.py
 CROSS_001 — High anomaly event co-incident with high anomaly events in
             OTHER domains that share a THEMATIC LINK via the Ontology Map.
 """
-
+import json
+import logging
+from shared.db import get_redis
 from typing import Optional, List
 from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
-
+logger = logging.getLogger("correlation.cross_domain")
 DOMAIN_GROUPS = {
     "maritime":  ["vessel_position", "vessel_dark", "vessel_static", "vessel_sts", "vessel_spoof"],
     "aviation":  ["flight_position", "flight_anomaly", "flight_dark", "aircraft_squawk"],
@@ -55,18 +57,34 @@ THEMATIC_LINKS = {
 
 def get_expanded_tags(tags: set) -> set:
     """
-    Takes standard tags (e.g. 'tsm', 'taiwan') and explodes them using the ontology map.
-    This creates a massive 'thematic net' to catch cross-domain overlaps.
+    Takes standard tags and explodes them using BOTH the static Ontology Map 
+    and the dynamic AI-curated Redis Ontology.
     """
     expanded = set(tags)
+    
+    # 1. Static Fallback (Cold Start)
     for tag in tags:
         for theme, keywords in THEMATIC_LINKS.items():
-            # If the tag IS the theme, or exists IN the theme's keywords
             if tag == theme or tag in keywords:
                 expanded.add(theme)
                 expanded.update(keywords)
+                
+    # 2. Dynamic MAS Ontology (Llama 3 Curated)
+    try:
+        redis_client = get_redis()
+        if redis_client:
+            for tag in tags:
+                normalized_tag = tag.lower().strip()
+                # Check if the AI Agent has classified this entity
+                record_raw = redis_client.raw.get(f"sentinel:ontology:entity:{normalized_tag}")
+                if record_raw:
+                    record = json.loads(record_raw)
+                    concepts = record.get("macro_concepts", [])
+                    expanded.update(concepts)
+    except Exception as e:
+        logger.debug(f"Redis ontology lookup failed, relying on static map: {e}")
+        
     return expanded
-
 def _domain_of(event_type: str) -> str:
     """Maps a specific event type to its macro domain."""
     for domain, types in DOMAIN_GROUPS.items():
