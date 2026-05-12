@@ -43,7 +43,7 @@ class ContextBuilder:
         entity_graph = self._fetch_entity_graph(cluster.entity_ids) # Fetch ownership chains for all involved entities
         pattern_matches = self._fetch_pattern_matches(cluster) # Fetch historical pattern matches relevant to this
         recent_news = self._fetch_recent_news(cluster) # Fetch recent headlines related to the entities/events in this cluster
-
+        agent_intel = self._fetch_agent_intel(cluster)
         return {
             "correlation": {
                 "id": cluster.correlation_id,
@@ -60,6 +60,7 @@ class ContextBuilder:
             "recent_headlines": recent_news,
             # FIXED: Typo 'analysis_timestammp' changed to 'analysis_timestamp'.
             "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_intel_briefs": agent_intel,
         }
 
     def _fetch_event(self, event_id: str) -> Optional[Dict]:
@@ -197,3 +198,26 @@ class ContextBuilder:
             else:
                 out[k] = v
         return out
+
+    def _fetch_agent_intel(self, cluster: CorrelationCluster) -> list:
+        """
+        Fetch recent agent-generated intel briefs from Redis.
+        These are richer than raw news — already structured by the Intel Agent.
+        """
+        try:
+            from shared.db import get_redis
+            redis = get_redis()
+            
+            # Fetch recent high-severity briefs
+            raw = redis.get("sentinel:intel:briefs:latest")
+            if raw:
+                import json
+                brief = json.loads(raw)
+                # Check if thematically related to this cluster
+                cluster_tags = set(cluster.tags)
+                brief_hotspots = set(brief.get("geographic_hotspots", []))
+                if cluster_tags.intersection(brief_hotspots):
+                    return [brief]
+        except Exception as e:
+            logger.debug(f"Agent intel fetch failed: {e}")
+        return []

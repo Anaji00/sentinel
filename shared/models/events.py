@@ -69,6 +69,8 @@ class EventType(str, Enum):
     CUSTOM = "custom"
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
+    VULNERABILITY = "vulnerability"
+
 class EntityType(str, Enum):
     VESSEL = "vessel"
     AIRCRAFT = "aircraft"

@@ -336,7 +336,24 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    
+  agent-swarm:
+    build: .
+    container_name: sentinel-agent_swarm
+    command: python services/agents/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - sentinel-network
+    environment:
+      AGENT_MODEL: llama3
+      OLLAMA_URL: http://sentinel-ollama:11434
+
+
 
 
 # Volumes save data even when the containers are stopped and started

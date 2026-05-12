@@ -72,4 +72,87 @@ class OllamaClient:
       route to DLQ rather than silently producing garbage data.
     """
 
-    def __init(self)
+    def __init__(self, session: aiohttp.ClientSession, model: str = OLLAMA_MODEL):
+        self.session = session
+        self.model = model
+
+    async def infer(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: Type[BaseModel],
+        temperature: float = 0.1,
+        max_retries: int = 3
+    ) -> BaseModel:
+        """
+        Call Ollama and parse response into a Pydantic schema instance.
+        Retries on schema violations with an increasingly explicit correction prompt.
+        """
+        last_error = Optional[str] = None
+
+        for attempt in range(max_retries):
+            correction_suffix = ""
+            if attempt > 0:
+                # Progressive correction: be more explicit on retry
+                correction_suffix = (
+                    f"\n\n⚠️ CORRECTION REQUIRED: Your previous response failed validation: {last_error}\n"
+                    "You MUST return ONLY a raw JSON object. No markdown. No explanation. No ```json fences.\n"
+                    "Start your response with {{ and end with }}"
+                )
+            
+            full_prompt = f"{system_prompt}\n\n{user_prompt}{correction_suffix}"
+
+            async with _OLLAMA_SEMAPHORE:
+                raw_text = await self._call_ollama(full_prompt, temperature)
+
+            parsed = self._extract_json(raw_text)
+            if parsed is None:
+                last_error = f"No valid JSON found in response {raw_text[:50]}"
+                logger.warning(f"OLLAMA ATTEMPT: {attempt+1} NO JSON EXTRACTED")
+                continue
+
+            try:
+                return schema(**parsed)
+            except (ValidationError, TypeError) as e:
+                last_error = str(e)[:300]
+                logger.warning(f"OLLAMA ATTEMPT: {attempt+1} VAL/SCHENA ERROR: {last_error}")
+
+        raise SchemaViolationError(
+            f"Schema enforcement failed after {max_retries} attempts. Last error: {last_error}"
+        )
+    
+    async def infer_raw(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            temperature: float = 0.1,
+    ):
+        """Inference without schema enforcement. Use for open-ended research tasks."""
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        async with _OLLAMA_SEMAPHORE:
+            return await self._call_ollama(full_prompt, temperature)
+        
+    async def _call_ollama(self, prompt: str, temperature: float) -> str:
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": 2048,
+                "stop": ["</json, Human:", "User:"],
+
+            },
+
+        }
+        try:
+            async with self.session.post(
+                f"{OLLAMA_URL}/api/generate", 
+                json=payload,
+                timeout=OLLAMA_TIMEOUT,
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise InferenceError(f"Ollama HTTP {resp.status}: {text}")
+                    data = await resp.json()
+

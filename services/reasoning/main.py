@@ -114,7 +114,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
     consumer = SentinelConsumer(
-        topics=[Topics.CORRELATIONS],
+        topics=[Topics.CORRELATIONS, "agents.intel.briefs"],
         group_id="reasoning-service-group",
         auto_offset_reset="latest",
     )
@@ -129,6 +129,16 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
             
             for tp, msgs in messages.items():
                 for message in msgs:
+                    if tp.topic == "agents.intel.briefs":
+                        # Store high-severity intel briefs in Redis for context injection
+                        brief = message.value.get("brief")
+                        if brief.get("severity", 0) >= 4:
+                            redis_client.set(
+                                f"sentinel:intel:briefs:latest",
+                                json.dumps(brief),
+                                ttl=3600,  
+                            )
+                        continue
                     # Passed directly via kwargs since message.value is already a parsed dictionary
                     cluster = CorrelationCluster(**message.value)
                     

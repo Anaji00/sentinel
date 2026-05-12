@@ -37,7 +37,10 @@ class Topics:
     RAW_AVIATION = "events.raw.aviation"
     RAW_CYBER = "events.raw.cyber"
     SCENARIOS_GENERATED = "scenarios.generated"
-
+    INTEL_BRIEFS         = "agents.intel.briefs"         # NewsIntelAgent output
+    QUANT_DISCOVERIES    = "agents.quant.discoveries"    # QuantResearcherAgent output
+    ONTOLOGY_UPDATES     = "agents.ontology.updates"     # OntologyMasterAgent output
+    UNKNOWN_ENTITIES     = "agents.ontology.unknown_entities"  # Classification requests
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
     # into 'NormalizedEvent' so the database can understand it easily.
