@@ -162,8 +162,7 @@ class ScenarioGenerator:
         # The OllamaClient also acquires the global semaphore, but we keep this
         # as a generator-level guard for clarity and to prevent scenario tasks
         # from stacking up if the reasoning loop is processing fast bursts.
-        # CONCEPT: asyncio.Semaphore
-        # Think of this as a strict queue. If 5 anomaly clusters arrive at the same time,
+        # If 5 anomaly clusters arrive at the same time,
         # only 1 gets to enter the `generate()` method. The other 4 wait their turn.
         # This prevents our local Llama3 instance from running out of memory.
         self._limiter = asyncio.Semaphore(1)
