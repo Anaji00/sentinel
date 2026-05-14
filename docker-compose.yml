@@ -192,6 +192,11 @@ services:
         condition: service_healthy
       timescaledb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
   correlation:
     build: .
     container_name: sentinel-correlation
@@ -219,6 +224,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
 
   collector-crypto:
     build: .
@@ -229,6 +237,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
 
 
   collector-prediction:
@@ -240,6 +251,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+  
 
   ollama:
     image: ollama/ollama:latest
@@ -264,19 +278,22 @@ services:
     env_file: .env
     restart: always
     depends_on:
+      redis:
+        condition: service_healthy
       kafka:
         condition: service_healthy
   
   collector-radar:
-    build: 
-      context: .
-      dockerfile: ./DockerFile
-    command: ["python", "services/collector-radar/main.py"]
+    build: .
+    command: "python services/collector-radar/main.py"
     container_name: sentinel-radar
     env_file: .env
+    restart: always
     depends_on:
-      - redis
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
   
   collector-ais:
     build: .
@@ -287,6 +304,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
   collector-adsb:
     build: .
     container_name: sentinel-adsb
@@ -296,6 +316,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
   collector-news:
     build: .
     container_name: sentinel-news
@@ -305,6 +328,10 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
   api-gateway:
     build: .
     container_name: sentinel-api_gateway
@@ -333,6 +360,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
 
 
 # Volumes save data even when the containers are stopped and started
