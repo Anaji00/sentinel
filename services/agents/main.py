@@ -6,7 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 # BEST PRACTICE: Dynamically adding the project root to sys.path ensures 
 # that absolute imports (like 'from shared.db import...') work consistently from anywhere.
 sys.path.insert(0, str(ROOT))

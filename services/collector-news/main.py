@@ -50,34 +50,60 @@ DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestibl
 
 
 FEEDS = [
-    # Wire services
-   # ("reuters_world",   "https://feeds.reuters.com/reuters/worldnews",        "wire",       0.95),
-   # ("reuters_markets", "https://feeds.reuters.com/reuters/businessnews",     "wire",       0.95),
+    # ─── WIRE SERVICES ───
+# ─── WIRE SERVICES (Reuters Replacements) ───
+    ("bbc_world",       "http://feeds.bbci.co.uk/news/world/rss.xml",         "wire",       0.95),
+    ("bbc_business",    "http://feeds.bbci.co.uk/news/business/rss.xml",      "financial",  0.95),
+    ("france24",        "https://www.france24.com/en/rss",                    "wire",       0.92),
+    ("npr_world",       "https://feeds.npr.org/1004/rss.xml",                 "wire",       0.95),
+    ("guardian_world",  "https://www.theguardian.com/world/rss",              "wire",       0.92),
     ("ap_world",        "https://apnews.com/rss",                             "wire",       0.95),
     ("aljazeera",       "https://www.aljazeera.com/xml/rss/all.xml",          "wire",       0.95),
-    # Maritime
+    ("nyt_world",       "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "wire",   0.90),
+
+    # ─── MARITIME & LOGISTICS ───
     ("maritime_exec",   "https://maritime-executive.com/rss-feed",            "maritime",   0.90),
-    ("tanker_trackers", "https://tankertrackers.com/feed",                 "maritime",   0.88),
+    ("tanker_trackers", "https://tankertrackers.com/feed",                    "maritime",   0.88),
     ("seatrade",        "https://www.seatrade-maritime.com/rss/all",          "maritime",   0.85),
     ("lloyds_list",     "https://lloydslist.com/rss",                         "maritime",   0.92),
     ("gcaptain",        "https://gcaptain.com/feed",                          "maritime",   0.85),
-    # Geopolitical / OSINT
+
+    # ─── GEOPOLITICS & DEFENSE ───
     ("bellingcat",      "https://www.bellingcat.com/feed",                    "osint",      0.88),
     ("rferl",           "https://www.rferl.org/api/zpqopmjpoe",               "geopolitic", 0.82),
     ("al_monitor",      "https://www.al-monitor.com/rss",                     "geopolitic", 0.82),
     ("war_on_rocks",    "https://warontherocks.com/feed",                     "defense",    0.85),
     ("defense_news",    "https://www.defensenews.com/arc/outboundfeeds/rss/", "defense",    0.88),
-    # Financial
-    ("ft_markets",      "https://www.ft.com/rss/home/uk",                     "financial",  0.92),
+
+    # ─── MACRO FINANCE & MARKETS ───
+    ("ft_markets",      "https://www.ft.com/?format=rss",                     "financial",  0.92),
+    ("wsj_markets",     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",      "financial",  0.92),
     ("cnbc_world",      "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "financial", 0.85),
+    ("cnbc_finance",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "financial", 0.88),
+    ("yahoo_finance",   "https://finance.yahoo.com/news/rssindex",            "financial",  0.85),
+    ("unusual_whales",  "https://unusualwhales.com/feed/",                    "financial",  0.80),
     ("zerohedge",       "https://feeds.feedburner.com/zerohedge/feed",        "financial",  0.60),
-    ("unusual_whales",  "https://unusualwhales.com/feed/",                   "financial",  0.80),
-    # Official
+
+    # ─── APAC FINANCIAL WIRES ───
+    ("nikkei_asia",     "https://asia.nikkei.com/rss/feed/category/53",       "financial",  0.95),
+    ("scmp_markets",    "https://www.scmp.com/rss/91/feed",                   "financial",  0.90),
+
+    # ─── CYBERSECURITY & INFRASTRUCTURE ───
+    ("bleeping_comp",   "https://www.bleepingcomputer.com/feed/",             "cyber",      0.90),
+    ("krebs_security",  "https://krebsonsecurity.com/feed/",                  "cyber",      0.95),
+    ("hacker_news",     "https://feeds.feedburner.com/TheHackersNews",        "cyber",      0.85),
+
+    # ─── CRYPTO & PREDICTION CATALYSTS ───
+    ("coindesk",        "https://www.coindesk.com/arc/outboundfeeds/rss/",    "crypto",     0.85),
+    ("cointelegraph",   "https://cointelegraph.com/rss",                      "crypto",     0.80),
+    ("decrypt",         "https://decrypt.co/feed",                            "crypto",     0.80),
+
+    # ─── OFFICIAL GOVERNMENT / REGULATORY ───
     ("us_state_dept",   "https://www.state.gov/rss-feeds/press-releases/",    "official",   0.98),
     ("un_news",         "https://news.un.org/feed/subscribe/en/news/all/rss.xml", "official", 0.95),
     ("ofac_news",       "https://home.treasury.gov/system/files/126/ofac.xml","official",   0.99),
+    ("cisa_alerts",     "https://www.cisa.gov/uscert/ncas/current-activity.xml", "official", 0.99),
 ]
-
 # ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 class URLDeduplicator:
     """
