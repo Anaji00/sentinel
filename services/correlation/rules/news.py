@@ -1,70 +1,115 @@
 """
 services/correlation/rules/news.py
 
-NEWS_001 — Sanctions or military headline co-incident with
-           flagged vessel activity in the last 24h.
+NEWS_002 — Dynamic Catalyst Detection
+Triggers when a headline matches the AI-curated keyword list (from the Ontology Master)
+and temporally correlates with high-anomaly events across ANY domain (TradFi, Cyber, Maritime).
 """
 
+import logging
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
+from shared.db import get_redis
 
-# 1. TRIGGER KEYWORDS
-# We aren't interested in every maritime news story (e.g., "Port earnings up").
-# We only care about headlines that suggest conflict, enforcement, or seizures.
-TRIGGER_KEYWORDS = [
-    "sanction", "irgc", "seized", "detained vessel",
-    "blockade", "naval", "strait", "tanker attack",
-    "missile strike", "maritime", "warship",
+logger = logging.getLogger("correlation.rules.news")
+
+# 1. CORE FALLBACK KEYWORDS
+# We keep a foundational list for cold-starts, expanded to cover all domains.
+CORE_KEYWORDS = [
+    # Geopolitics/Maritime
+    "sanction", "irgc", "seized", "blockade", "missile strike", "warship",
+    # Finance/Macro
+    "margin call", "liquidation", "chapter 11", "indictment", "sec probe",
+    # Cyber
+    "cyberattack", "ransomware", "data breach", "zero-day",
 ]
 
-
-def rule_sanctions_headline(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
+def _get_dynamic_keywords() -> set:
     """
-    NEWS_001: Triggered by a news headline.
-    Checks if any high-risk vessels (sanctioned/flagged) have been active
-    recently, which might explain or relate to the news.
+    Pulls the live, AI-curated keyword watchlist from Redis.
+    This list is actively maintained by the OntologyMasterAgent.
+    """
+    keywords = set(CORE_KEYWORDS)
+    try:
+        redis_client = get_redis()
+        if redis_client:
+            # Fetch the dynamic set created by the Ontology Master
+            dynamic = redis_client.raw.smembers("sentinel:news:keywords")
+            if dynamic:
+                # Decode bytes to string and normalize
+                keywords.update({k.decode('utf-8').lower().strip() for k in dynamic})
+    except Exception as e:
+        logger.debug(f"Failed to fetch dynamic news keywords, using fallback: {e}")
+    
+    return keywords
+
+def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
+    """
+    NEWS_002: Dynamic Catalyst Detection
+    Checks if a headline contains tracked keywords and searches for corresponding 
+    anomalies across ALL domains based on shared Ontology tags.
     """
     # 1. GATEKEEPING: Only process Headline events.
     if event.type != EventType.HEADLINE:
         return None
 
-    # 2. KEYWORD FILTER
-    # "Is this a scary headline?"
     headline = (event.headline or "").lower()
-    if not any(kw in headline for kw in TRIGGER_KEYWORDS):
+    live_keywords = _get_dynamic_keywords()
+
+    # 2. DYNAMIC KEYWORD FILTER
+    # Does this headline contain any core OR AI-generated threat words?
+    matched_keywords = [kw for kw in live_keywords if kw in headline]
+    if not matched_keywords:
         return None
 
-    # 3. CONTEXT QUERY
-    # "Are the bad guys active right now?"
-    # We query the Event Store for any vessel activity in the last 24h
-    # that explicitly has the 'sanctions_risk' tag (applied by the Enricher).
-    flagged = store.get_recent(
-        ["vessel_position", "vessel_dark"],
-        hours=24, min_anomaly=0.4,
-        tags=["sanctions_risk"],
+    # 3. CROSS-DOMAIN CONTEXT QUERY
+    # We don't just look for ships anymore. We look for ANY anomalous event 
+    # (Equity Block, BGP Hijack, Crypto Transfer) in the last 24h that shares
+    # an Ontology tag with this news story.
+    if not event.tags:
+        return None
+
+    # Note: 'event.tags' have already been expanded by the SoftCorrelator via ontology.py
+    correlated_events = store.get_recent(
+        types=None,        # Search across ALL event types
+        hours=24, 
+        min_anomaly=0.30,  # Only look at significant anomalies
+        tags=event.tags    # Must share at least one tag with the news event
     )
 
-    # If no high-risk vessels are active, this is just a news story. Ignore.
-    if not flagged:
+    # Filter out the news event itself
+    valid_correlations = [e for e in correlated_events if e.event_id != event.event_id]
+
+    if not valid_correlations:
         return None
 
     # 4. BUILD RESULT
-    # Create a cluster linking the News Event to the specific Vessel Events.
     desc = (
-        f"Sanctions/military headline: '{event.headline[:80]}'. "
-        f"{len(flagged)} flagged vessels active in last 24h."
+        f"Dynamic Catalyst Detected: '{event.headline[:80]}'. "
+        f"Matched AI keywords: {matched_keywords[:3]}. "
+        f"Correlated with {len(valid_correlations)} anomalous events across domains."
     )
 
+    # Safely extract entity IDs, dropping Nones (Fixes previous KeyError/AttributeError bugs)
+    safe_entities = []
+    if getattr(event, "primary_entity", None):
+        safe_entities.append(event.primary_entity.id)
+    
+    safe_entities.extend([
+        e.primary_entity.id for e in valid_correlations[:5] 
+        if getattr(e, "primary_entity", None)
+    ])
+
+    # Tiering: If the news catalyst maps to 3 or more distinct anomalies, elevate to CRITICAL
+    tier = AlertTier.CRITICAL if len(valid_correlations) >= 3 else AlertTier.ALERT
+
     return CorrelationCluster(
-        rule_id="NEWS_001",
-        rule_name="Sanctions Headline + Flagged Vessel Activity",
-        alert_tier=AlertTier.ALERT,
+        rule_id="NEWS_002",
+        rule_name="Dynamic News Catalyst Correlation",
+        alert_tier=tier,
         trigger_event_id=event.event_id,
-        supporting_event_ids=[e["event_id"] for e in flagged[:5]],
-        entity_ids=(
-            [event.primary_entity.id] +
-            [e["primary_entity_id"] for e in flagged[:3]]
-        ),
+        supporting_event_ids=[e.event_id for e in valid_correlations[:5]],
+        entity_ids=list(set(safe_entities)), # Deduplicate entity IDs
         description=desc,
-        tags=["sanctions", "news", "maritime", "flagged_entity"],
+        tags=list(set(["dynamic_catalyst", "news"] + event.tags[:3])),
     )

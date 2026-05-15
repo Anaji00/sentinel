@@ -133,27 +133,30 @@ class PatternLibrary:
         except Exception as e:
             logger.error(f"Error recording pattern outcome for scenario {scenario_id}: {e}")
     
-    def _format_pattern(self, row: Dict) -> Dict:
-        if isinstance(row, dict):
+    def _format_pattern(self, row) -> Dict:
+        """Safely formats the row regardless of cursor type."""
+        try:
+            # Explicitly cast DictRow to standard dict to bypass isinstance failures
+            row_dict = dict(row)
             return {
-                "scenario_id":  str(row.get("scenario_id", "")),
-                "headline":     row.get("headline", ""),
-                "outcome":      row.get("status", ""),
-                "confidence":   row.get("confidence_overall"),
-                "rule":         row.get("rule_id", ""),
-                "tags":         row.get("correlation_tags", []),
-                "description":  row.get("description", ""),
-                "date":         row["created_at"].isoformat() if row.get("created_at") else "",
+                "scenario_id":  str(row_dict.get("scenario_id", "")),
+                "headline":     row_dict.get("headline", ""),
+                "outcome":      row_dict.get("status", ""),
+                "confidence":   row_dict.get("confidence_overall"),
+                "rule":         row_dict.get("rule_id", ""),
+                "tags":         row_dict.get("correlation_tags", []),
+                "description":  row_dict.get("description", ""),
+                "date":         row_dict["created_at"].isoformat() if row_dict.get("created_at") else "",
             }
-        # If using a standard Tuple Cursor (Fallback)
-        # Indexes must perfectly match the SELECT statement order
-        return {
-            "scenario_id":  str(row[0]) if row[0] else "",
-            "headline":     row[1] or "",
-            "outcome":      row[2] or "",
-            "confidence":   row[3],
-            "date":         row[4].isoformat() if row[4] else "",
-            "rule":         row[5] or "",
-            "tags":         row[6] or [],
-            "description":  row[7] or ""
-        }
+        except (TypeError, ValueError):
+            # Fallback for strict tuple cursors
+            return {
+                "scenario_id":  str(row[0]) if row[0] else "",
+                "headline":     row[1] or "",
+                "outcome":      row[2] or "",
+                "confidence":   row[3],
+                "date":         row[4].isoformat() if row[4] else "",
+                "rule":         row[5] or "",
+                "tags":         row[6] or [],
+                "description":  row[7] or ""
+            }

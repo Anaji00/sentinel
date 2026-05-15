@@ -43,7 +43,7 @@ logger = logging.getLogger("sentinel.ollama")
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "llama3")
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=120)  # Scenario synthesis can be verbose
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=300.0)  # Scenario synthesis can be verbose
 
 # Per-process semaphore. Import this and use it as a context manager in any
 # code that calls Ollama to prevent parallel requests within one process.
