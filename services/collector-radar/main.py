@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import websockets
+from websockets.exceptions import ConnectionClosed
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -33,10 +34,10 @@ async def stream_all_equities(redis_client):
 
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                await ws.send(json.dumps({"action": "authenticate", "key": ALPACA_KEY, "secret": ALPACA_SECRET}))
-                auth = await ws.recv()
-                logger.info(f"Authenticated with Alpaca: {auth}")
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+                await ws.send(json.dumps({"action": "auth", "key": ALPACA_KEY, "secret": ALPACA_SECRET}))
+                auth_resp = await ws.recv()
+                logger.info(f"Authenticated with Alpaca: {auth_resp}")
 
                 await ws.send(json.dumps({"action": "subscribe", "trades": ["*"]}))
                 sub_resp = await ws.recv()
@@ -47,9 +48,9 @@ async def stream_all_equities(redis_client):
                     payload = (json.loads(await ws.recv()))
                     for event in payload:
                         if event.get("T") == "t":  # Trade event
-                            sym = event.get("S")
-                            price = float(event.get("p"))
-                            size = float(event.get("s"))
+                            sym = event.get("S", "")
+                            price = float(event.get("p", 0))
+                            size = float(event.get("s", 0))
                             notional = price * size
                             msg_count += 1
                             if msg_count % 10000 == 0:
@@ -58,6 +59,9 @@ async def stream_all_equities(redis_client):
                                 logger.warning(f"🚨 RADAR DETECTED BLOCK: {sym} | ${notional/1e6:.2f}M. Routing to Finnhub.")
                                 # Store in Redis for Finnhub to pick up (with a TTL of 1 hour)
                                 redis_client.raw.sadd("sentinel:watched:equities", sym)
+        except ConnectionClosed:
+            logger.warning("Radar WS disconnected by Alpaca. Reconnecting smoothly...")
+            await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"RADAR STREAM ERROR: {e}", exc_info=True)
             await asyncio.sleep(5)  # Backoff before reconnecting
