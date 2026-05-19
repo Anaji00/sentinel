@@ -1,6 +1,8 @@
 -- SENTINEL — TimescaleDB Schema
 -- Runs automatically on first container start via docker-entrypoint-initdb.d
- 
+
+-- VECTOR: Enables storing and querying high-dimensional ML embeddings (pgvector).
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- POSTGIS: Adds geospatial types and functions (e.g., ST_Distance, ST_DWithin).
 CREATE EXTENSION IF NOT EXISTS postgis;
@@ -146,6 +148,8 @@ CREATE TABLE IF NOT EXISTS scenarios (
     updated_at             TIMESTAMPTZ DEFAULT NOW(),
     status                 VARCHAR(20) DEFAULT 'hypothesis',
     headline               TEXT,
+    narrative_summary      TEXT,
+    embedding              vector(768),
     significance           TEXT,
     hypotheses             JSONB,
     recommended_monitoring TEXT[],
@@ -155,6 +159,11 @@ CREATE TABLE IF NOT EXISTS scenarios (
     supporting_event_ids   UUID[]
 );
  
+CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
+
+-- HNSW INDEX: This is the "Tier 1" secret. It builds a graph-based index for vectors.
+-- vector_cosine_ops tells it to optimize specifically for Cosine Similarity (<->).
+CREATE INDEX IF NOT EXISTS scenario_embedding_idx ON scenarios USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
 -- ── ENTITY WATCHLIST ──────────────────────────────────────────────────────────
