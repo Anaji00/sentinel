@@ -87,8 +87,8 @@ def _consume_loop(consumer, db, async_loop, session):
                     """, (original_topic, error_msg, json.dumps(raw_data)))
                     logger.info(f"Saved failed event from {original_topic} to DB.")
                 except Exception as e:
-                    logger.error(f"FATAL: Could not save to DLQ database: {e}")
-                    continue # Skip alerting if we couldn't even save it
+                    logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
+                    sys.exit(1)
 
                 # 2. Rate-Limited Admin Alert
                 now = time.time()

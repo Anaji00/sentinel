@@ -134,6 +134,20 @@ def main():
                     except Exception as e:
                         logger.error(f"Correlation loop error: {e}", exc_info=True)
 
+                        raw_val = message.value if message else {}
+                        try:
+                            producer.send(
+                                Topics.DLQ,
+                                data = {
+                                    "topic": Topics.ENRICHED_EVENTS,
+                                    "error": str(e),
+                                    "raw": raw_val,
+                                }
+                            )
+                        except Exception as dlq_e:
+                            logger.error(f"FATAL: Failed to route to DLQ: {dlq_e}. Shutting down to preserve offset.")
+                            sys.exit(1) # Crash the container. Do not let auto-commit advance!
+
             except StopIteration:
                 logger.debug("Consumer iterator exhausted — restarting")
                 continue
