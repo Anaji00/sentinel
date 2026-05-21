@@ -34,7 +34,7 @@ import logging
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
-
+import re
 from pydantic import BaseModel, Field
 
 from .base import SentinelAgent, SchemaViolationError
@@ -184,7 +184,7 @@ class OntologyMasterAgent(SentinelAgent):
             return None
 
         # ── WRITE TO REDIS ONTOLOGY ────────────────────────────────────────────
-        self._write_to_redis_ontology(entity_name, classification)
+        await self._write_to_redis_ontology(entity_name, classification)
 
         # ── CONDITIONALLY WRITE TO NEO4J ──────────────────────────────────────
         if frequency >= PROMOTE_FREQUENCY or classification.confidence >= 0.85:
@@ -193,7 +193,7 @@ class OntologyMasterAgent(SentinelAgent):
             )
 
         # ── TRIGGER DOWNSTREAM WATCHLISTS ─────────────────────────────────────
-        self._trigger_watchlists(classification)
+        await self._trigger_watchlists(classification)
 
         self._classified_this_cycle += 1
 
@@ -207,7 +207,7 @@ class OntologyMasterAgent(SentinelAgent):
 
     # ── REDIS ONTOLOGY WRITES ─────────────────────────────────────────────────
 
-    def _write_to_redis_ontology(
+    async def _write_to_redis_ontology(
         self,
         entity_name:    str,
         classification: EntityClassification,
@@ -220,54 +220,51 @@ class OntologyMasterAgent(SentinelAgent):
           sentinel:ontology:entity:{name} → JSON classification record
           sentinel:ontology:freq:{name} → integer frequency counter
         """
-        try:
-            normalized = entity_name.lower().strip()
+        loop = asyncio.get_running_loop()
+        normalized = entity_name.lower().strip()
+        record = classification.dict()
+        record["classified_at"] = datetime.now(timezone.utc).isoformat()
 
-            # 1. Add entity to each of its concept buckets
-            # UNDER THE HOOD: Redis Sets
-            # `sadd` adds to a mathematical "Set". Sets guarantee uniqueness.
-            # If "apple" is already in the "technology" bucket, this does nothing (which is good!).
+        def _sync_redis_write():
+            pipeline = self.redis.raw.pipeline()
             for concept in classification.macro_concepts:
-                self.redis.sadd(f"sentinel:ontology:{concept}", normalized)
-
-            # 2. Store full classification record (for fast lookup by name)
-            # BEST PRACTICE: TTL (Time To Live)
-            # We set `ttl=STALENESS_DAYS * 86400`. Redis will automatically delete
-            # this record after 14 days. This is how the "immune system" naturally cleans itself!
-            record = classification.dict()
-            record["classified_at"] = datetime.now(timezone.utc).isoformat()
-            self.redis.set(
+                pipeline.sadd(f"sentinel:ontology:{concept}", normalized)
+            pipeline.set(
                 f"sentinel:ontology:entity:{normalized}",
                 json.dumps(record),
-                ttl=STALENESS_DAYS * 86400,
+                ex=STALENESS_DAYS * 86400
             )
-
-            # 3. Update the domain index
-            self.redis.sadd(
-                f"sentinel:ontology:domain:{classification.primary_domain}",
-                normalized,
-            )
-
+            pipeline.sadd(f"sentinel:ontology:domain:{classification.primary_domain}", normalized)
+            pipeline.execute()
+        try:
+            # Execute the blocking pipeline on the ThreadPoolExecutor
+            await loop.run_in_executor(None, _sync_redis_write)
             logger.info(
                 f"  Ontology: '{normalized}' → "
                 f"{classification.primary_domain} / {classification.macro_concepts}"
             )
-
         except Exception as e:
             logger.error(f"Redis ontology write failed for '{entity_name}': {e}")
+           
 
-    def _increment_entity_frequency(self, entity_name: str):
-        """Increment the seen-frequency counter for an entity."""
+    async def _increment_entity_frequency(self, entity_name: str):
+        """Increment the seen-frequency counter for an entity non-blockingly."""
+        loop = asyncio.get_running_loop()
         key = f"sentinel:ontology:freq:{entity_name.lower()}"
-        try:
+        
+        # Execute the counter increment on the background thread
+        def _sync_incr():
             count = self.redis.raw.incr(key)
             self.redis.raw.expire(key, 7 * 86400)  # Reset weekly
             return count
+            
+        try:
+            return await loop.run_in_executor(None, _sync_incr)
         except Exception:
             return 0
 
     # ── NEO4J PROMOTION ───────────────────────────────────────────────────────
-
+    
     async def _promote_to_neo4j(
         self,
         entity_name:    str,
@@ -278,7 +275,12 @@ class OntologyMasterAgent(SentinelAgent):
         This makes it queryable in graph traversals and path finding.
         """
         loop = asyncio.get_running_loop()
-        label = classification.entity_type.title().replace(" ", "").replace("_", "")
+        raw_label = classification.entity_type.title().replace(" ", "").replace("_", "")
+        if not re.match(r"^[A-Za-z0-9]+$", raw_label):
+            logger.warning(f"Cypher Injection attempt or hallucination detected in label: '{raw_label}'. Defaulting to 'UnknownEntity'.")
+            label = "UnknownEntity"
+        else:
+            label = raw_label
 
         try:
             await loop.run_in_executor(
@@ -340,6 +342,9 @@ class OntologyMasterAgent(SentinelAgent):
         we instantly instruct other microservices (like the News Collector or AIS Collector)
         to start paying attention to these specific entities without needing direct API calls.
         """
+        loop = asyncio.get_running_loop()
+        def pipeline = self.redis.raw.pipline()
+        
         try:
             # Equity watchlist
             if classification.should_watch_equities:
