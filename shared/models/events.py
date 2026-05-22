@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, validator
+import json
 
 """
 shared/models/events.py — The lingua franca of SENTINEL.
@@ -27,8 +28,12 @@ All datetime fields now use timezone.utc explicitly.
 """
 
 def _utcnow() -> datetime:
+    # HELPER: Ensures all default timestamps are UTC-aware. 
+    # Mixing timezone-aware and naive datetimes causes comparison bugs in Python.
     return datetime.now(timezone.utc)
 
+# ENUMERATIONS: These restrict values to a specific, predefined set of choices.
+# This prevents typos across the codebase (e.g., accidentally typing 'vesel' instead of 'vessel').
 class EventType(str, Enum):
     # Maritime
     VESSEL_POSITION = "vessel_position"
@@ -96,6 +101,8 @@ class ScenarioStatus(Enum):
     CONFIRMED = "CONFIRMED"
     DENIED = "DENIED"
 
+# PYDANTIC MODELS: These act as strict data blueprints. 
+# If incoming data doesn't match these exact types, Pydantic throws a helpful error immediately.
 class ScenarioHypothesis(BaseModel):
     label: str
     probability: int
@@ -122,7 +129,9 @@ class Entity(BaseModel):
     id: str
     type: EntityType = EntityType.UNKNOWN
     name: Optional[str] = None
-    flags: List[str] = Field(default_factory=list)
+    # BEST PRACTICE: Always use `default_factory=list` for lists and dicts in Pydantic/Dataclasses.
+    # If you just used `flags: List[str] = []`, all Entities would share the exact same list in memory!
+    flags: List[str] = Field(default_factory=list) 
     country_code: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
  
@@ -237,12 +246,13 @@ class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: str
     collected_at: datetime = Field(default_factory=_utcnow)
+    # Optional types mean this field can be None.
     occurred_at: Optional[datetime] = None
     raw_payload: Dict[str, Any]
 
 # DB TABLE: events (Hypertable)
 class NormalizedEvent(BaseModel):
-    # UUID Primary Key (distributed generation)
+    # UUID Primary Key: Dynamically generates a unique string ID if one isn't provided.
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4())) 
     type: EventType
     # Partition Key for TimescaleDB Hypertable
@@ -281,12 +291,48 @@ class NormalizedEvent(BaseModel):
     # Links to 'correlations' table, but stored here to allow reverse lookups.
     correlation_ids: List[str] = Field(default_factory=list)
 
+    # VALIDATOR: A hook that runs automatically when this object is created.
+    # This safely "clamps" the anomaly score so it mathematically cannot drop below 0.0 or exceed 1.0.
     @validator("anomaly_score")
     def clamp_anomaly_score(cls, v):
         return max(0.0, min(1.0, v))
-    def has_locatuion(self) -> bool:
-        return self.latitude is not None and self.longitude is not None
-    
+
+    def to_tuple(self) -> tuple:
+        """
+        Hardened serialization: 
+        1. Ensures strict type alignment for Postgres.
+        2. Handles optional nested objects safely.
+        3. Pre-serializes JSON to avoid overhead in the writer loop.
+        """
+        pe = self.primary_entity
+        return (
+            self.event_id, 
+            self.type.value, 
+            self.occurred_at, 
+            self.collected_at,
+            self.source, 
+            float(self.source_reliability),
+            pe.id if pe else None, 
+            pe.type.value if pe else EntityType.UNKNOWN.value,
+            pe.name if pe else None, 
+            json.dumps(pe.flags) if pe and pe.flags else "[]",
+            self.longitude, 
+            self.latitude,
+            self.region, 
+            self.country_code, 
+            self.headline, 
+            self.summary, 
+            self.url,
+            self.vessel_data.json() if self.vessel_data else None,
+            self.flight_data.json() if self.flight_data else None,
+            self.financial_data.json() if self.financial_data else None,
+            self.security_data.json() if self.security_data else None,
+            self.tags, 
+            self.named_entities, 
+            float(self.sentiment) if self.sentiment is not None else None, 
+            float(self.anomaly_score),
+            self.correlation_ids 
+        )
     def is_physical(self) -> bool:
         return self.type in [
             EventType.VESSEL_POSITION,
