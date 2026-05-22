@@ -154,7 +154,7 @@ class AsyncTimescaleClient:
                     port=int(os.getenv("POSTGRES_PORT", 5432)),
                     database=os.getenv("POSTGRES_DB", "sentinel"),
                     user=os.getenv("POSTGRES_USER", "sentinel"),
-                    password=os.getenv("POSTGRES_PASSWORD", "sentinel_local_dev"),
+                    password=os.getenv("POSTGRES_PASSWORD", "sentinel"),
                     min_size=2,
                     max_size=20,
                     command_timeout=60

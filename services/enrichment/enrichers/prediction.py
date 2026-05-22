@@ -77,15 +77,33 @@ class PredictionEnricher:
     def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = p.get("ticker", "UNKNOWN")
         title = p.get("title", "Unknown Market")
-        delta = float(p.get("volume_delta", 0))
-        price = float(p.get("yes_bid") or p.get("no_bid") or 0.0)
-        notional_usd = float(p.get("notional_usd", 0))
+        price = float(p.get("yes_bid") or p.get("no_bid") or p.get("price") or 0.0)
+        current_vol = float(p.get("total_volume", 0))
+
+        # r Stateful delta calculation using Redis
+        try:
+            redis_key = f"sentinel:kalshi:vol:{ticker}"
+            last_vol_str = self.redis.get(redis_key)
+            last_vol = float(last_vol_str) if last_vol_str else current_vol
+            self.redis.set(redis_key, current_vol, ttl=86400) # 24h expiry
+        except Exception:
+            last_vol = current_vol
+
+        delta = current_vol - last_vol
+        notional_usd = delta * price
+
+        # GATEKEEPER: Ignore if there was no new volume
+        if delta <= 0:
+            return None
         
         # BRAIN CHECK: Ask the AnomalyScorer if this volume spike is unusual
-        anomaly = self.scorer.score_prediction_spike(ticker, notional_usd)
+        anomaly = self.scorer.score_event("prediction_market_trade", [notional_usd, delta, price, 0, 0])
+        
+        # We check the dict returned by DynamicAnomalyScorer
+        anomaly_score = anomaly.get("score", 0.0)
 
         # GATEKEEPER: Drop normal volume variance.
-        if anomaly < 0.6:
+        if anomaly_score < 0.6:
             return None
 
         tags = ["kalshi_prediction", "volume_spike", ticker.lower()]

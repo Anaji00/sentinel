@@ -8,7 +8,7 @@ from shared.db import get_redis
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
 class DynamicAnomalyScorer:
-    def __init__(self):
+    def __init__(self, redis_client):
         self.redis = get_redis()
         self.sessions = {}
         self.alpha = 0.1

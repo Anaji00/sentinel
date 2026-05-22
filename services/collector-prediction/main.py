@@ -173,6 +173,9 @@ async def poll_kalshi(producer: SentinelProducer):
                         for market in markets:
                             ticker = market.get("ticker")
                             vol = market.get("volume", 0)
+                            if vol == 0:
+                                continue
+                            
                             yes_bid = market.get("yes_bid", 50)
                             price_usd = yes_bid / 100 
                             

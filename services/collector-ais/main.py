@@ -22,6 +22,7 @@ FIX (code review): AISstream timestamp parsing now handles both millisecond
 
 import asyncio
 import json
+import ssl
 import logging
 import os
 import sys
@@ -165,11 +166,16 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
     while True:
         try:
             logger.info(f"Connecting to AISStream at {AISSTREAM_URL}...")
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
             async with websockets.connect(
                 AISSTREAM_URL,
                 ping_interval=20,
                 ping_timeout=10,
                 max_size=10_000_000,
+                ssl_context = ssl_context
                 ) as ws:
                 await ws.send(json.dumps(build_subscription()))
                 logger.info(f"Subscribed — {len(WATCH_ZONES)} zones, types: {MESSAGE_TYPES}")

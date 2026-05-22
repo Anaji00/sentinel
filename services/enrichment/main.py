@@ -23,7 +23,7 @@ from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent
 from shared.db import get_timescale, get_neo4j, get_redis
 
-from services.enrichment.anomaly_scorer import AnomalyScorer
+from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
 from services.enrichment.db_writer import DBWriter
 from services.enrichment.graph_writer import GraphWriter
 from services.enrichment.entity_resolver import EntityResolver
@@ -108,7 +108,7 @@ async def main():
     neo4j     = get_neo4j()
     redis     = get_redis()
     
-    scorer = AnomalyScorer(redis)
+    scorer = DynamicAnomalyScorer(redis)
     db = DBWriter(timescale)
     graph = GraphWriter(neo4j)
     resolver = EntityResolver(redis, neo4j)
