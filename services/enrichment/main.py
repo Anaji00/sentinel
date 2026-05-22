@@ -22,6 +22,7 @@ logger = logging.getLogger("enrichment")
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent
 from shared.db import get_timescale, get_neo4j, get_redis
+from shared.db.bootstrap import bootstrap_database
 
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
 from services.enrichment.db_writer import DBWriter
@@ -105,6 +106,7 @@ async def main():
     logger.info("=" * 60)
 
     timescale = get_timescale()
+    bootstrap_database()
     neo4j     = get_neo4j()
     redis     = get_redis()
     
