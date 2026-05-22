@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from shared.db import get_timescale
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("db.migrate")
 

@@ -175,7 +175,7 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                 ping_interval=20,
                 ping_timeout=10,
                 max_size=10_000_000,
-                ssl_context = ssl_context
+                ssl = ssl_context
                 ) as ws:
                 await ws.send(json.dumps(build_subscription()))
                 logger.info(f"Subscribed — {len(WATCH_ZONES)} zones, types: {MESSAGE_TYPES}")

@@ -6,7 +6,8 @@ FROM python:3.11-slim
 # PYTHONDONTWRITEBYTECODE: Stops Python from cluttering the container with .pyc files
 # PYTHONUNBUFFERED: Forces Python to stream logs instantly to the terminal instead of buffering them
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -15,6 +16,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
+    libgeos-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy your requirements file first.

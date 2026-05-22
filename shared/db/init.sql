@@ -166,6 +166,7 @@ CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at D
 CREATE INDEX IF NOT EXISTS scenario_embedding_idx ON scenarios USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
+
 -- ── ENTITY WATCHLIST ──────────────────────────────────────────────────────────
 -- PURPOSE: Configuration table for high-interest entities (Sanctioned vessels, VIPs).
 -- USAGE: Ingestion logic checks this table to elevate priority/severity of incoming events.
