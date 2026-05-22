@@ -179,22 +179,25 @@ services:
       # Checks if the Redis server is running by sending a PING command.
       retries: 15
   
-    
+  migrator:
+    build: .
+    command: python shared/db/migrate.py
+    env_file: .env
+    restart: always
+    depends_on:
+      timescaledb:
+        condition: service_healthy
   
   enrichment:
     build: .
     container_name: sentinel-enrichment
-    command: python services/enrichment/main.py
+    command: sh -c "python shared/db/migrate.py && python services/enrichment/main.py
     env_file: .env
     restart: always
     depends_on:
-      kafka:
+      migrator:
         condition: service_healthy
       timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      neo4j:
         condition: service_healthy
 
   correlation:

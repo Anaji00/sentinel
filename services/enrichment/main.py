@@ -106,7 +106,6 @@ async def main():
     logger.info("=" * 60)
 
     timescale = get_timescale()
-    bootstrap_database()
     neo4j     = get_neo4j()
     redis     = get_redis()
     
