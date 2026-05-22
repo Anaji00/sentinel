@@ -97,7 +97,9 @@ services:
   timescaledb:
     # TimescaleDB: A time-series database built on PostgreSQL. It's designed for storing and analyzing data that changes over time, like sensor readings or stock prices.
     # TimescaleDB is a time-series database built on PostgreSQL.
-    image: timescale/timescaledb:latest-pg15
+    build:
+      context: .
+      dockerfile: Dockerfile.timescale
     container_name: sentinel-timescaledb
     restart: unless-stopped
     ports:
@@ -191,7 +193,9 @@ services:
         condition: service_healthy
   
   enrichment:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: sentinel-enrichment
     command: python services/enrichment/main.py
     env_file: .env
