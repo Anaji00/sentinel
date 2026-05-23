@@ -1,24 +1,24 @@
 # Dockerfile.timescale
 FROM timescale/timescaledb:latest-pg15
 
-# Elevate privileges to modify Alpine packages
+# Elevate to root for system-level installation
 USER root
 
-# FIX 1: Add llvm15-dev for required C-headers
-RUN apk add --no-cache \
-    git \
-    build-base \
-    clang15 \
-    llvm15-dev \
-    postgresql15-dev
+# ENTERPRISE PATCH: Single-layer build-and-purge
+# 1. '--virtual .build-deps' groups the compilers into a temporary alias
+# 2. 'NO_LLVM=1' explicitly overrides the PGXS clang-19 requirement
+# 3. 'apk del .build-deps' completely uninstalls compilers to harden the final image
+RUN apk add --no-cache --virtual .build-deps \
+        git \
+        build-base \
+        postgresql15-dev \
+    && git clone https://github.com/pgvector/pgvector.git \
+    && cd pgvector \
+    && make OPTFLAGS="" NO_LLVM=1 \
+    && make install NO_LLVM=1 \
+    && cd .. \
+    && rm -rf pgvector \
+    && apk del .build-deps
 
-# FIX 2: Pass OPTFLAGS="" to bypass incompatible Alpine compiler optimizations
-RUN git clone https://github.com/pgvector/pgvector.git && \
-    cd pgvector && \
-    make OPTFLAGS="" && \
-    make install && \
-    cd .. && \
-    rm -rf pgvector
-
-# Downgrade privileges back to the standard postgres user for security compliance
+# Restore restricted database user
 USER postgres
