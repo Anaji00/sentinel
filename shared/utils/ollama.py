@@ -124,27 +124,27 @@ class OllamaClient:
                     "Your entire response must start with { and end with }" 
                 )
 
-                full_prompt = f"{system_prompt}\n\n{user_prompt}{correction}"
+            full_prompt = f"{system_prompt}\n\n{user_prompt}{correction}"
 
-                # Wait in line until the GPU is free (using the semaphore we defined earlier)
-                async with _OLLAMA_SEMAPHORE:
-                    raw_text = await self._call_ollama(full_prompt, temperature)
+            # Wait in line until the GPU is free (using the semaphore we defined earlier)
+            async with _OLLAMA_SEMAPHORE:
+                raw_text = await self._call_ollama(full_prompt, temperature)
 
-                # Try to pull the JSON out of the AI's raw text response
-                parsed = self._extract_json(raw_text)
-                if parsed is None:
-                    last_error = f"No valid JSON found in: {raw_text[:300]}"
-                    logger.warning(f"Ollama attempt {attempt+1}: no JSON — {last_error[:100]}")
-                    continue
+            # Try to pull the JSON out of the AI's raw text response
+            parsed = self._extract_json(raw_text)
+            if parsed is None:
+                last_error = f"No valid JSON found in: {raw_text[:300]}"
+                logger.warning(f"Ollama attempt {attempt+1}: no JSON — {last_error[:100]}")
+                continue
 
-                try:
-                    # Pydantic Magic: Unpack the dictionary (`**parsed`) into the strictly typed Pydantic schema.
-                    # If keys are missing or data types are wrong (e.g., got a string instead of an int),
-                    # Pydantic will raise a `ValidationError`, kicking us into the `except` block to retry.
-                    return schema(**parsed)
-                except ValidationError as e:
-                    last_error = str(e)
-                    logger.warning(f"Ollama attempt {attempt+1}: invalid JSON — {last_error[:100]}")
+            try:
+                # Pydantic Magic: Unpack the dictionary (`**parsed`) into the strictly typed Pydantic schema.
+                # If keys are missing or data types are wrong (e.g., got a string instead of an int),
+                # Pydantic will raise a `ValidationError`, kicking us into the `except` block to retry.
+                return schema(**parsed)
+            except ValidationError as e:
+                last_error = str(e)
+                logger.warning(f"Ollama attempt {attempt+1}: invalid JSON — {last_error[:100]}")
 
             
         raise SchemaViolationError(

@@ -78,7 +78,7 @@ def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[Correl
     )
 
     # Filter out the news event itself
-    valid_correlations = [e for e in correlated_events if e.event_id != event.event_id]
+    valid_correlations = [e for e in correlated_events if e.get("event_id") != event.event_id]
 
     if not valid_correlations:
         return None
@@ -96,8 +96,8 @@ def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[Correl
         safe_entities.append(event.primary_entity.id)
     
     safe_entities.extend([
-        e.primary_entity.id for e in valid_correlations[:5] 
-        if getattr(e, "primary_entity", None)
+        e.get("primary_entity", {}).get("id") for e in valid_correlations[:5] 
+        if e.get("primary_entity", {}).get("id")
     ])
 
     # Tiering: If the news catalyst maps to 3 or more distinct anomalies, elevate to CRITICAL

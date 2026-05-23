@@ -321,8 +321,15 @@ class QuantResearcherAgent(SentinelAgent):
                     )
 
                     self.redis.raw.set(
-                        self.state_key(discovery, ticker)
-
+                        self.state_key(discovery, ticker),
+                        json.dumps({
+                            "trigger":    trigger_ticker,
+                            "event_type": event_type,
+                            "confidence": confidence,
+                            "analysis":   discovery.trigger_analysis[:200],
+                            "added_at":   datetime.now(timezone.utc).isoformat(),
+                        }),
+                        ttl=86400,  # 24h audit trail
                     )
                     # Store the discovery rationale in Redis for transparency
                     self.redis.set(

@@ -108,6 +108,7 @@ services:
       POSTGRES_USER: sentinel
       POSTGRES_PASSWORD: sentinel
       POSTGRES_DB: sentinel
+    command: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
     volumes:
       - timescaledb_data:/home/postgres/pgdata/data
       # timescaledb_data:  A named volume for storing TimescaleDB data, ensuring data persistence.

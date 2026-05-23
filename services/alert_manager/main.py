@@ -115,7 +115,7 @@ class AlertManager:
             loop = asyncio.get_running_loop()
             scenario = await loop.run_in_executor(
                 None,
-                self._fetch_scenario(),
+                self._fetch_scenario,
                 cluster.correlation_id,
             )
         

@@ -131,5 +131,5 @@ class PredictionEnricher:
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=anomaly,
+            anomaly_score=anomaly_score,
         )
