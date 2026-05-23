@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS events (
     -- Calculations (ST_Distance) return meters on a curved earth, unlike GEOMETRY which uses planar degrees.
     coordinates GEOGRAPHY(POINT, 4326),
     region TEXT,
-    country_code CHAR(2),
+    country_code TEXT,
     headline TEXT,
     summary TEXT,
     url TEXT,
@@ -84,14 +84,14 @@ CREATE INDEX IF NOT EXISTS events_region_time_idx ON events(region, occurred_at 
 -- OPTIMIZATION: Uses heavy compression because we rarely query individual historical pings, usually just aggregates or tracks.
 -- LOGICAL JOIN: mmsi -> events.primary_entity_id
 CREATE TABLE IF NOT EXISTS vessel_positions (
-    mmsi VARCHAR(20) NOT NULL, -- Maritime Mobile Service Identity. The unique ID for AIS.
+    mmsi TEXT NOT NULL, -- Maritime Mobile Service Identity. The unique ID for AIS.
     occurred_at TIMESTAMPTZ NOT NULL,
     lat FLOAT NOT NULL,
     lon FLOAT NOT NULL,
     speed_knots FLOAT,
     heading INT, 
-    nav_status VARCHAR(50),
-    source VARCHAR(50) DEFAULT 'AIS',
+    nav_status TEXT,
+    source TEXT DEFAULT 'AIS',
     -- COMPOSITE PRIMARY KEY (id + time):
     -- NECESSITY: TimescaleDB requires the partitioning column ('occurred_at') to be part of the Primary Key.
     -- This allows the database to instantly know which "chunk" (file) a specific row lives in.
@@ -115,8 +115,8 @@ CREATE INDEX IF NOT EXISTS vpo_mmsi_time_idx ON vessel_positions(mmsi, occurred_
 -- INTERACTION: Acts as a "Wrapper" around multiple Event rows.
 CREATE TABLE IF NOT EXISTS correlations (
     correlation_id       UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    rule_id              VARCHAR(50),
-    rule_name            VARCHAR(200),
+    rule_id              TEXT,
+    rule_name            TEXT,
     alert_tier           INT,
     detected_at          TIMESTAMPTZ DEFAULT NOW(),
     -- LOGICAL KEYS: These point back to events.event_id.
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS correlations (
     description          TEXT,
     tags                 TEXT[],
     scenario             JSONB,
-    status               VARCHAR(20) DEFAULT 'active'
+    status               TEXT DEFAULT 'active'
 );
 
 CREATE INDEX IF NOT EXISTS corr_tier_time_idx ON correlations(alert_tier, detected_at DESC);
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     correlation_id         UUID        REFERENCES correlations(correlation_id),
     created_at             TIMESTAMPTZ DEFAULT NOW(),
     updated_at             TIMESTAMPTZ DEFAULT NOW(),
-    status                 VARCHAR(20) DEFAULT 'hypothesis',
+    status                 TEXT DEFAULT 'hypothesis',
     headline               TEXT,
     narrative_summary      TEXT,
     embedding              vector(768),
@@ -172,9 +172,9 @@ CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at D
 -- USAGE: Ingestion logic checks this table to elevate priority/severity of incoming events.
 CREATE TABLE IF NOT EXISTS entity_watchlist (
     id            SERIAL       PRIMARY KEY,
-    entity_id     VARCHAR(100) NOT NULL UNIQUE,
-    entity_type   VARCHAR(50),
-    entity_name   VARCHAR(200),
+    entity_id     TEXT NOT NULL UNIQUE,
+    entity_type   TEXT,
+    entity_name   TEXT,
     added_at      TIMESTAMPTZ  DEFAULT NOW(),
     notes         TEXT,
     alert_tier_min INT         DEFAULT 1,
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS entity_watchlist (
 CREATE TABLE IF NOT EXISTS failed_events (
     id SERIAL PRIMARY KEY,
     failed_at TIMESTAMPTZ DEFAULT NOW(),
-    original_topic VARCHAR(255) NOT NULL,
+    original_topic TEXT NOT NULL,
     error_message TEXT NOT NULL,
     raw_payload JSONB NOT NULL,
     resolved BOOLEAN DEFAULT FALSE

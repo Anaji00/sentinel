@@ -102,13 +102,16 @@ class TimescaleClient:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
-    def execute(self, sql: str, params: tuple = ()):
+    def execute(self, sql: str, params: tuple = None):
         # WRITE OPERATION (INSERT, UPDATE, DELETE)
         # Similar to query(), but we must COMMIT (Save) the transaction.
         conn = self._pool.getconn()
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                if params:
+                    cur.execute(sql, params)
+                else:
+                    cur.execute(sql)
             # COMMIT: The "Save Game" button.
             # Until we run this, the data is only temporary. If the power goes out, it's lost.
             conn.commit()
