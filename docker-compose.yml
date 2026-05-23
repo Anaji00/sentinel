@@ -108,9 +108,9 @@ services:
       POSTGRES_USER: sentinel
       POSTGRES_PASSWORD: sentinel
       POSTGRES_DB: sentinel
-    command: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+    command: postgres -c shared_preload_libraries=timescaledb
     volumes:
-      - timescaledb_data:/home/postgres/pgdata/data
+      - timescaledb_data:/var/lib/postgresql/data
       # timescaledb_data:  A named volume for storing TimescaleDB data, ensuring data persistence.
       - ./shared/db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql # Executes this SQL file when TimescaleDB starts, setting up the database schema.
       # ./shared/db/init.sql: Initializes the database schema when the container starts.
