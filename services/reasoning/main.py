@@ -91,11 +91,10 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
         
         if scenario:
             # 1. Save to DB (For frontend viewing)
-            await asyncio.to_thread(_save_scenario, db, scenario)
-            
-            # 2. Broadcast to Kafka (For Alert Manager / Webhooks / Telegram)
-            # Make sure Topics.SCENARIOS_GENERATED exists in your shared/kafka/topics definition
-            producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
+            await asyncio.gather(
+                asyncio.to_thread(_save_scenario, db, scenario),
+                asyncio.to_thread(producer.send, "scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
+            )
             logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
 
             # 3. Close the loop (Machine Learning pivot)

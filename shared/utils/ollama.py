@@ -56,7 +56,11 @@ _OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
  
 
 def get_ollama_semaphore():
+    global _OLLAMA_SEMAPHORE
+    if _OLLAMA_SEMAPHORE is None:
+        _OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
     return _OLLAMA_SEMAPHORE
+
 
 # Custom Exception classes to handle specific failure types cleanly.
 class InferenceError(Exception):
@@ -107,6 +111,7 @@ class OllamaClient:
         """
 
         last_error: Optional[str] = None
+        semaphore = get_ollama_semaphore()
 
         # Retry Loop: Give the AI multiple chances to fix its mistakes.
         for attempt in range(max_retries):
@@ -127,7 +132,7 @@ class OllamaClient:
             full_prompt = f"{system_prompt}\n\n{user_prompt}{correction}"
 
             # Wait in line until the GPU is free (using the semaphore we defined earlier)
-            async with _OLLAMA_SEMAPHORE:
+            async with semaphore:
                 raw_text = await self._call_ollama(full_prompt, temperature)
 
             # Try to pull the JSON out of the AI's raw text response
@@ -157,9 +162,10 @@ class OllamaClient:
         user_prompt: str,
         temperature: float = 0.2,
     ) -> str:
+        semaphore = get_ollama_semaphore()
         """Raw inference without schema enforcement."""
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        async with _OLLAMA_SEMAPHORE:
+        async with semaphore:
             return await self._call_ollama(full_prompt, temperature)
         
     

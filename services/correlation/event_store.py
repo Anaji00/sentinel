@@ -98,14 +98,12 @@ class EventStore:
                 
                 results.append(e)
                 
-                # Enforce the row limit
-                if len(results) >= limit:
-                    break
+            
                     
             # The SQL query ordered by anomaly_score DESC, then occurred_at DESC.
             # Redis sorted them by occurred_at DESC natively. Now we just sort by anomaly.
             results.sort(key=lambda x: x["anomaly_score"], reverse=True)
-            return results
+            return results[:limit]
             
         except Exception as e:
             logger.error(f"Redis cache fetch failed: {e}")
