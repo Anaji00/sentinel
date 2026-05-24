@@ -1,28 +1,17 @@
-"""
-services/enrichment/db_writer.py
- 
-Writes normalized events and vessel positions to TimescaleDB.
- 
-FIX (code review): write_event() and write_vessel_position() now re-raise
-  exceptions after logging. Previously exceptions were silently swallowed —
-  the Kafka offset committed, the event was lost permanently, and the only
-  evidence was a log line. Now the enrichment main loop catches the exception
-  and sends the raw event to the dead-letter queue (DLQ) so nothing is lost.
-"""
- 
+# services/enrichment/db_writer.py (AFTER)
 import json
 import logging 
 from datetime import datetime
 import numpy as np
 from psycopg2.extensions import register_adapter, AsIs
-
-def  adapt_numpy_array(arr):
-    return AsIs(tuple(arr))
-
-register_adapter(np.ndarray, adapt_numpy_array)
 from psycopg2.extras import execute_values
 from shared.models import NormalizedEvent
 
+# Adapt numpy arrays to standard Postgres tuples natively
+def adapt_numpy_array(arr):
+    return AsIs(tuple(arr))
+
+register_adapter(np.ndarray, adapt_numpy_array)
 logger = logging.getLogger("enrichment.db")
 
 class DBWriter:
@@ -32,38 +21,66 @@ class DBWriter:
     def write_event(self, event: NormalizedEvent):
         data = event.to_tuple()
         try:
+            # FIX: Explicit column-to-variable mapping.
             sql = """
-            INSERT INTO events (...) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-            ON CONFLICT (event_id, occurred_at) DO NOTHING
-        """
+                INSERT INTO events (
+                    event_id, type, occurred_at, collected_at, source, source_reliability,
+                    primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags,
+                    coordinates, region, country_code, headline, summary, url,
+                    vessel_data, flight_data, financial_data, security_data,
+                    tags, named_entities, sentiment, anomaly_score, correlation_ids
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (event_id, occurred_at) DO NOTHING
+            """
             self.db.execute(sql, data)
         except Exception as e:
             logger.error(f"Failed to write event {event.event_id} to DB: {e}", exc_info=True)
             raise
     
     def write_events_batch(self, events: list[NormalizedEvent]):
-        """
-        Dramatically improves write throughput by batching INSERTs.
-        1,000 events takes ~50ms instead of 2,000ms.
-        """
         if not events:
             return
+            
         values = [e.to_tuple() for e in events]
 
-        query = "INSERT INTO events (...) VALUES %s ON CONFLICT DO NOTHING"
+        # FIX: The target schema is strictly defined.
+        query = """
+            INSERT INTO events (
+                event_id, type, occurred_at, collected_at, source, source_reliability,
+                primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags,
+                coordinates, region, country_code, headline, summary, url,
+                vessel_data, flight_data, financial_data, security_data,
+                tags, named_entities, sentiment, anomaly_score, correlation_ids
+            ) VALUES %s 
+            ON CONFLICT (event_id, occurred_at) DO NOTHING
+        """
+
+        # FIX: The custom template safely wraps the %s tuple iteration 
+        # around the ST_MakePoint function for every single row in the matrix.
+        template = """(
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
+        )"""
 
         conn = self.db._pool.getconn()
         try:
             with conn.cursor() as cur:
-                execute_values(cur, query, values, page_size=1000)
+                execute_values(cur, query, values, template=template, page_size=1000)
             conn.commit()
         except Exception as e:
             conn.rollback()
-            logger.error(f"Failed to write batch of {len(events)} events to DB: {e}", exc_info=True)
+            logger.error(f"Failed to batch write {len(events)} events: {e}", exc_info=True)
             raise
         finally:
             self.db._pool.putconn(conn)
