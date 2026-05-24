@@ -7,23 +7,8 @@ Triggered by anomalous market events (block trades, ML-flagged candles,
 large liquidations). Autonomously researches WHY the instrument is moving
 and discovers correlated peers that should be monitored immediately.
 
-The core feedback loop:
-  Anomalous NVDA block trade
-    → "Why is NVDA moving?"
-    → Query recent news + graph context
-    → Llama3: "AI data center demand surge. Watch SMCI, ARM, AVGO, TSM"
-    → Inject SMCI, ARM, AVGO, TSM into sentinel:watched:equities
-    → Finnhub collector immediately subscribes to those tickers
-    → Future anomalies on those tickers are now captured
-
-This is the primary mechanism by which SENTINEL expands its market surveillance
-coverage autonomously without human intervention.
-
-Deduplication strategy:
-  We deduplicate on (ticker, event_type) with a 30-minute window.
-  A single block trade triggers one research cycle. Subsequent trades
-  on the same ticker within 30 minutes are grouped (volume accumulation)
-  rather than triggering repeated LLM calls.
+Refactored for strict Redis key determinism, asynchronous IO offloading,
+and memory safety to prevent Event Loop blocking.
 """
 
 import asyncio
@@ -44,10 +29,10 @@ logger = logging.getLogger("agent.quant_researcher")
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 
-# CONCEPT: Structured LLM Outputs via Pydantic
-# We use Pydantic models to strictly define the JSON shape we want the LLM to return.
-# This transitions the LLM from a "text generator" to a "reliable data extractor".
-# If the LLM misses a field or provides the wrong type, Pydantic throws an error.
+# CONCEPT: Pydantic Data Validation
+# We define strict structures here. When the AI (Llama3) generates a response,
+# Pydantic ensures it perfectly matches this format, preventing downstream crashes.
+
 class PeerTicker(BaseModel):
     ticker: str
     rationale: str
@@ -62,7 +47,6 @@ class MacroInstrument(BaseModel):
     expected_direction: str = "uncertain"
     discovery_confidence: float = 0.5
 
-
 class PeerDiscovery(BaseModel):
     trigger_analysis: str
     catalyst_category: str
@@ -74,11 +58,10 @@ class PeerDiscovery(BaseModel):
 
 # ── THRESHOLDS ────────────────────────────────────────────────────────────────
 
-# Minimum anomaly score to trigger LLM research
 RESEARCH_TRIGGER_SCORE = 0.65
-
-# Only add peers with confidence above this to the live watchlist
 WATCHLIST_CONFIDENCE_THRESHOLD = 0.70
+DEDUP_WINDOW_SECONDS = 1800  # 30 minutes
+MAX_WATCHLIST_ADDITIONS = 8
 
 TRIGGER_EVENT_TYPES = {
     "equity_block",
@@ -88,13 +71,6 @@ TRIGGER_EVENT_TYPES = {
     "options_flow",
     "insider_trade",
 }
-
-# Deduplication window per ticker (seconds)
-DEDUP_WINDOW_SECONDS = 1800  # 30 minutes
-
-# Maximum peers to add to watchlist per research cycle
-MAX_WATCHLIST_ADDITIONS = 8
-
 
 class QuantResearcherAgent(SentinelAgent):
     """
@@ -106,11 +82,21 @@ class QuantResearcherAgent(SentinelAgent):
     def output_topic(self) -> str:
         return "agents.quant.discoveries"
     
+    def _state_key(self, prefix: str, ticker: str) -> str:
+        """
+        Explicitly defined, strictly typed deterministic key generator.
+        """
+        # BEST PRACTICE: Cache Key Normalization
+        # We force lowercase/uppercase and strip spaces to prevent creating
+        # multiple duplicate keys like "AAPL ", "aapl", and "AAPL" in Redis.
+        clean_prefix = str(prefix).strip().lower()
+        clean_ticker = str(ticker).strip().upper()
+        return f"sentinel:quant:{clean_prefix}:{clean_ticker}"
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        
-        # BEST PRACTICE: Guard Clauses (Early Returns)
-        # We check failure conditions immediately and return `None`. This prevents deeply nested
-        # `if` statements and saves expensive LLM compute time if the event is irrelevant.
+        # BEST PRACTICE: Guard Clauses / Early Returns
+        # Check for invalid conditions first and exit immediately (`return None`). 
+        # This keeps the main logic clean (less indentation) and saves expensive LLM compute.
         event_type = message.get("type", "")
         if event_type not in TRIGGER_EVENT_TYPES:
             return None
@@ -123,14 +109,9 @@ class QuantResearcherAgent(SentinelAgent):
         if not ticker:
             return None
         
-        # CONCEPT: Deduplication & Idempotency
-        # Market data streams often have highly repetitive events (e.g., 5 trades in 1 second). 
-        # We use a Redis key with a 30-minute expiration (TTL) to ensure we 
-        # only research a specific ticker's anomaly once per half hour.
         dedup_key = f"{ticker}:{event_type}"
         if self.is_recently_processed(dedup_key, DEDUP_WINDOW_SECONDS):
-            # Even if we skip the LLM call, we still track the volume for analytics!
-            self._accumulate_volume(ticker, message)
+            await self._accumulate_volume(ticker, message)
             return None
         
         self.mark_processed(dedup_key, DEDUP_WINDOW_SECONDS)
@@ -141,11 +122,14 @@ class QuantResearcherAgent(SentinelAgent):
             f"notional=${notional/1e6:.1f}M anomaly={anomaly_score:.2f}"
         )
 
-
         # ── STEP 1: Gather research context ───────────────────────────────────
-        news_context    = await self._fetch_news_context(ticker)
-        graph_context   = await self._fetch_graph_context(ticker)
-        current_watchlist = self._get_current_watchlist()
+        # PERFORMANCE: asyncio.gather runs these network/database requests at the 
+        # exact same time (concurrently), rather than waiting for them one by one.
+        news_context, graph_context, current_watchlist = await asyncio.gather(
+            self._fetch_news_context(ticker),
+            self._fetch_graph_context(ticker),
+            self._get_current_watchlist()
+        )
 
         # ── STEP 2: LLM peer discovery ────────────────────────────────────────
         user_prompt = QUANT_PEER_DISCOVERY_USER_TEMPLATE.format(
@@ -170,15 +154,18 @@ class QuantResearcherAgent(SentinelAgent):
             logger.error(f"Peer discovery failed: {e}")
             return None
         
-        added = self._inject_peers(ticker, discovery, event_type)
+        # ── STEP 3: Inject peers (Now Async) ──────────────────────────────────
+        added = await self._inject_peers(ticker, discovery, event_type)
 
         # ── STEP 4: Write discovery to Neo4j ──────────────────────────────────
         asyncio.create_task(self._write_graph_relationships(ticker, discovery))
 
-        # ── STEP 5: Update accumulator ────────────────────────────────────────
-        self._accumulate_volume(ticker, message)
+        # ── STEP 5: Update accumulator (Now Async) ────────────────────────────
+        await self._accumulate_volume(ticker, message)
 
         # ── STEP 6: Publish discovery ─────────────────────────────────────────
+        # Handle Pydantic v1 vs v2 compatibility gracefully
+        discovery_dict = discovery.model_dump() if hasattr(discovery, "model_dump") else discovery.dict()
 
         return {
             "agent":            self.name,
@@ -190,23 +177,15 @@ class QuantResearcherAgent(SentinelAgent):
                 "anomaly_score":    anomaly_score,
                 "source_event_id":  message.get("event_id"),   
             },
-            "discovery":         discovery.dict(),
+            "discovery":         discovery_dict,
             "peers_added_to_watchlist": added,
             "created_at":       datetime.now(timezone.utc).isoformat(),
         }
+
     # ── CONTEXT FETCHERS ──────────────────────────────────────────────────────
 
     async def _fetch_news_context(self, ticker: str) -> List[Dict]:
-        """
-        Fetch recent news headlines related to this ticker and its sector.
-        Searches both the ticker symbol directly and common synonyms.
-        """
         loop = asyncio.get_running_loop()
-        # UNDER THE HOOD: Non-blocking DB Queries (Thread Pools)
-        # The Postgres database library (`psycopg2`) is synchronous. If we just ran `self.db.query()`,
-        # it would freeze the entire asyncio event loop while waiting for the network.
-        # `run_in_executor` pushes this blocking network call into a background thread.
-        # We wrap it in a `lambda:` so the function execution is deferred until the thread runs it.
         try:
             rows = await loop.run_in_executor(
                 None,
@@ -224,19 +203,12 @@ class QuantResearcherAgent(SentinelAgent):
                     LIMIT 8
                 """, (f"%{ticker.lower()}%", ticker.lower())),
             )
-            return [
-                {"headline": r["headline"], "score": r["anomaly_score"]}
-                for r in rows
-            ]
+            return [{"headline": r["headline"], "score": r["anomaly_score"]} for r in rows]
         except Exception as e:
             logger.debug(f"News context fetch error: {e}")
             return []
 
     async def _fetch_graph_context(self, ticker: str) -> List[Dict]:
-        """
-        Pull known relationships for this ticker from Neo4j.
-        Returns supplier/customer/competitor relationships for the LLM.
-        """
         loop = asyncio.get_running_loop()
         try:
             rows = await loop.run_in_executor(
@@ -260,20 +232,21 @@ class QuantResearcherAgent(SentinelAgent):
             logger.debug(f"Graph context fetch error: {e}")
             return []
 
-    def _get_current_watchlist(self) -> set:
-        """Return the current equity watchlist from Redis."""
+    async def _get_current_watchlist(self) -> set:
+        """Asynchronously returns the current equity watchlist from Redis."""
         try:
-            raw = self.redis.raw.smembers("sentinel:watched:equities")
-            return {
-                t.decode("utf-8") if isinstance(t, bytes) else t
-                for t in raw
-            }
+            # CONCEPT: asyncio.to_thread
+            # Redis commands like `smembers` are synchronous (they block the thread).
+            # `to_thread` safely pushes this work to a background thread so the 
+            # main asyncio loop doesn't freeze up while waiting for the network.
+            raw = await asyncio.to_thread(self.redis.smembers, "sentinel:watched:equities")
+            return {t.decode("utf-8") if isinstance(t, bytes) else t for t in raw}
         except Exception:
             return set()
         
     # ── INJECTION LOGIC ───────────────────────────────────────────────────────
-
-    def _inject_peers(
+    
+    async def _inject_peers(
             self, 
             trigger_ticker: str, 
             discovery: PeerDiscovery, 
@@ -281,7 +254,7 @@ class QuantResearcherAgent(SentinelAgent):
     ) -> List[str]:
         """
         Add high-confidence peers to the Redis watchlist.
-        Returns list of newly added tickers.
+        Returns list of newly added tickers. IO is safely offloaded.
         """
         added = []
         candidates = []
@@ -301,47 +274,37 @@ class QuantResearcherAgent(SentinelAgent):
                 and self._is_valid_ticker(macro.ticker)
             ):
                 candidates.append((macro.ticker, "within_4h", macro.discovery_confidence))
+                
         # Sort by confidence, cap total additions
         candidates.sort(key=lambda x: x[2], reverse=True)
         candidates = candidates[:MAX_WATCHLIST_ADDITIONS]
 
         for ticker, urgency, confidence in candidates:
             try:
-                # UNDER THE HOOD: Redis Sets (SADD)
-                # `sadd` adds an item to a mathematical "Set" in Redis. Sets automatically 
-                # prevent duplicates. If the ticker is already being watched, `is_new` 
-                # will be False, and we won't accidentally log a duplicate pivot alert.
-                is_new = self.redis.raw.sadd("sentinel:watched:equities", ticker)
+                # 1. IO Offloaded Set Addition
+                is_new = await asyncio.to_thread(self.redis.sadd, "sentinel:watched:equities", ticker)
+                
                 if is_new:
                     added.append(ticker)
+                    
+                    # 2. Fully Hydrated, Serializable JSON Payload
+                    # Truncates LLM output to 200 chars to prevent Redis RAM exhaustion
+                    payload = json.dumps({
+                        "trigger":    trigger_ticker,
+                        "event_type": event_type,
+                        "confidence": confidence,
+                        "analysis":   discovery.trigger_analysis[:200], 
+                        "added_at":   datetime.now(timezone.utc).isoformat(),
+                    })
+                    
+                    # 3. Deterministic key generation and atomic write
+                    target_key = self._state_key("discovery", ticker)
+                    await asyncio.to_thread(self.redis.set, target_key, payload, ex=3600)
+                    
                     log_level = logger.warning if urgency == "immediate" else logger.info
                     log_level(
                         f"  🤖 AUTONOMOUS PIVOT: {trigger_ticker} → "
                         f"{ticker} (confidence={confidence:.2f} urgency={urgency})"
-                    )
-
-                    self.redis.raw.set(
-                        self.state_key(discovery, ticker),
-                        json.dumps({
-                            "trigger":    trigger_ticker,
-                            "event_type": event_type,
-                            "confidence": confidence,
-                            "analysis":   discovery.trigger_analysis[:200],
-                            "added_at":   datetime.now(timezone.utc).isoformat(),
-                        }),
-                        ttl=86400,  # 24h audit trail
-                    )
-                    # Store the discovery rationale in Redis for transparency
-                    self.redis.set(
-                        self.state_key("discovery", ticker),
-                        json.dumps({
-                            "trigger":    trigger_ticker,
-                            "event_type": event_type,
-                            "confidence": confidence,
-                            "analysis":   discovery.trigger_analysis[:200],
-                            "added_at":   datetime.now(timezone.utc).isoformat(),
-                        }),
-                        ttl=86400,  # 24h audit trail
                     )
             except Exception as e:
                 logger.warning(f"Watchlist injection failed for {ticker}: {e}")
@@ -351,14 +314,7 @@ class QuantResearcherAgent(SentinelAgent):
 
         return added
 
-    async def _write_graph_relationships(
-        self, trigger_ticker: str, discovery: PeerDiscovery
-    ):
-        """
-        Write peer relationships discovered to Neo4j.
-        This enriches the knowledge graph for future correlation.
-        Non-fatal: failures do not block result publication.
-        """
+    async def _write_graph_relationships(self, trigger_ticker: str, discovery: PeerDiscovery):
         loop = asyncio.get_running_loop()
         for peer in discovery.peer_tickers:
             if peer.discovery_confidence < 0.7:
@@ -367,12 +323,10 @@ class QuantResearcherAgent(SentinelAgent):
                 rel_type = self._map_relationship_type(peer.relationship_type)
                 await loop.run_in_executor(
                     None,
-                    # CONCEPT: Graph Database Idempotency (Cypher MERGE)
-                    # In Neo4j, `MERGE` behaves like an "upsert" (Insert or Update).
-                    # It ensures that even if we discover this peer relationship multiple times,
-                    # we only ever create a single connection between these two nodes,
-                    # simply updating the `updated_at` timestamp.
                     lambda: self.neo4j.execute("""
+                        // CONCEPT: Idempotency with MERGE
+                        // MERGE creates nodes/relationships ONLY if they don't already exist.
+                        // This prevents creating duplicate graph data if the script runs twice.
                         MERGE (a:Instrument {name: $source})
                         MERGE (b:Instrument {name: $target})
                         MERGE (a)-[r:CORRELATED_WITH]->(b)
@@ -393,18 +347,14 @@ class QuantResearcherAgent(SentinelAgent):
     # ── HELPERS ───────────────────────────────────────────────────────────────
 
     def _extract_ticker(self, message: Dict) -> Optional[str]:
-        """Extract ticker symbol from various event payload formats."""
-        # Direct financial_data path
         fd = message.get("financial_data") or {}
         if isinstance(fd, dict) and fd.get("ticker"):
             return fd["ticker"].upper()
 
-        # Crypto path
         cd = message.get("crypto_data") or {}
         if isinstance(cd, dict) and cd.get("pair"):
             return cd["pair"].upper()
 
-        # Entity path (fallback)
         entity = message.get("primary_entity") or {}
         if isinstance(entity, dict) and entity.get("id"):
             return entity["id"].upper()
@@ -426,24 +376,22 @@ class QuantResearcherAgent(SentinelAgent):
             return fd.get("side") or "unknown"
         return "unknown"
 
-    def _accumulate_volume(self, ticker: str, message: Dict):
-        """
-        Track cumulative notional volume per ticker in Redis.
-        Used for volume surge detection across multiple events.
-        """
+    async def _accumulate_volume(self, ticker: str, message: Dict):
+        """Asynchronously tracks cumulative notional volume per ticker in Redis."""
         notional = self._extract_notional(message)
         if notional <= 0:
             return
-        key = self.state_key("volume", ticker)
+            
+        key = self._state_key("volume", ticker)
         try:
-            self.redis.raw.incrbyfloat(key, notional)
-            self.redis.raw.expire(key, 3600)  # Reset hourly
+            # Safely offload IO bound Redis increment commands
+            await asyncio.to_thread(self.redis.incrbyfloat, key, notional)
+            await asyncio.to_thread(self.redis.expire, key, 3600)  # Reset hourly
         except Exception:
             pass
 
     @staticmethod
     def _is_valid_ticker(ticker: str) -> bool:
-        """Basic validation: real US equity tickers are 1-5 uppercase letters."""
         return (
             ticker
             and ticker.isalpha()
