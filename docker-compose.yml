@@ -188,7 +188,7 @@ services:
     environment:
       - PYTHONPATH=/app
     env_file: .env
-    restart: always
+    restart: "no"
     depends_on:
       timescaledb:
         condition: service_healthy
