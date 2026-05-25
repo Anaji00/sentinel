@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
@@ -7,64 +6,34 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, validator
 import json
 
-"""
-shared/models/events.py — The lingua franca of SENTINEL.
- 
-Every service produces or consumes one of two models:
-  RawEvent:        Collectors produce this. Source-native, untouched.
-  NormalizedEvent: Everything downstream consumes this. Structured, enriched.
- 
-All datetime fields now use timezone.utc explicitly.
-
-  DB SCHEMA MAPPING:
-  This file strictly adheres to the schema defined in 'sentinel_schema.sql'.
-  - NormalizedEvent  -> 'events' table (Hypertable)
-  - CorrelationCluster -> 'correlations' table
-  - Scenario         -> 'scenarios' table
-
-  datetime.utcnow() returns a naive datetime — mixing naive and aware datetimes
-  raises TypeError in comparisons (gap detector, correlation queries).
-  All defaults now use datetime.now(timezone.utc) for tz-aware datetimes.
-"""
-
 def _utcnow() -> datetime:
-    # HELPER: Ensures all default timestamps are UTC-aware. 
-    # Mixing timezone-aware and naive datetimes causes comparison bugs in Python.
     return datetime.now(timezone.utc)
 
-# ENUMERATIONS: These restrict values to a specific, predefined set of choices.
-# This prevents typos across the codebase (e.g., accidentally typing 'vesel' instead of 'vessel').
 class EventType(str, Enum):
-    # Maritime
     VESSEL_POSITION = "vessel_position"
     VESSEL_DARK = "vessel_dark"
     VESSEL_STS = "vessel_sts"
     VESSEL_SPOOF = "vessel_spoof"
     VESSEL_STATIC = "vessel_static"
-    # Aviation
     FLIGHT_POSITION = "flight_position"
     FLIGHT_DARK = "flight_dark"
     FLIGHT_ANOMALY = "flight_anomaly"
-    # Financial
     OPTIONS_FLOW = "options_flow"
     DARK_POOL = "dark_pool"
     FUTURES_COT = "futures_cot"
     PRICE_ANOMALY = "price_anomaly"
     INSIDER_TRADE = "insider_trade"
-    EQUITY_BLOCK = "equity_block"          # ALREADY EXISTS: Use for TradFi spot trades
-    CRYPTO_TRADE = "crypto_trade"          # NEW: Use for Crypto spot trades
-    MARKET_CANDLE = "market_candle"        # NEW: Standard 1m OHLCV bar
-    MARKET_ANOMALY = "market_anomaly"      # NEW: ML-flagged structural anomaly (High Volatility/Delta)
-    # Information
+    EQUITY_BLOCK = "equity_block"          
+    CRYPTO_TRADE = "crypto_trade"          
+    MARKET_CANDLE = "market_candle"        
+    MARKET_ANOMALY = "market_anomaly"      
     HEADLINE = "headline"
     SOCIAL_SIGNAL = "social_signal"
     NARRATIVE_CLUSTER = "narrative_cluster"
-    # cyber
     BREACH_DETECTED = "breach_detected"
     INFRA_EXPOSED = "infra_exposed"
     BGP_ANOMALY = "bgp_anomaly"
     RANSOMWARE = "ransomware"
-    # POlitical/economic
     CLIMATE_STRESS = "climate_stress"
     INFASTRUCTURE = "infrastructure"
     SPORTS_LINE_MOVEMENT = "sports_line_movement"
@@ -91,18 +60,15 @@ class AlertTier(int, Enum):
     WATCH = 1
     ALERT = 2
     INTELLIGENCE = 3
+    CRITICAL = 4  # Adding missing mapping tier
 
-from enum import Enum
-from pydantic import BaseModel
-from typing import List
+class ScenarioStatus(str, Enum):
+    # FIXED: Lowercase values to strictly match PostgreSQL definitions.
+    HYPOTHESIS = "hypothesis"
+    CONFIRMED = "confirmed"
+    DENIED = "denied"
+    DEVELOPING = "developing"
 
-class ScenarioStatus(Enum):
-    HYPOTHESIS = "HYPOTHESIS"
-    CONFIRMED = "CONFIRMED"
-    DENIED = "DENIED"
-
-# PYDANTIC MODELS: These act as strict data blueprints. 
-# If incoming data doesn't match these exact types, Pydantic throws a helpful error immediately.
 class ScenarioHypothesis(BaseModel):
     label: str
     probability: int
@@ -112,25 +78,10 @@ class ScenarioHypothesis(BaseModel):
     deny_signals: List[str]
     time_horizon: str
 
-class Scenario(BaseModel):
-    correlation_id: str
-    status: ScenarioStatus
-    headline: str
-    significance: str
-    hypotheses: List[ScenarioHypothesis]
-    recommended_monitoring: List[str]
-    confidence_overall: int
-    confidence_rationale: str
-
-    
 class Entity(BaseModel):
-    # Mapped to 'events' table columns via flattening:
-    # primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags
     id: str
     type: EntityType = EntityType.UNKNOWN
     name: Optional[str] = None
-    # BEST PRACTICE: Always use `default_factory=list` for lists and dicts in Pydantic/Dataclasses.
-    # If you just used `flags: List[str] = []`, all Entities would share the exact same list in memory!
     flags: List[str] = Field(default_factory=list) 
     country_code: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -141,7 +92,6 @@ class Entity(BaseModel):
         return flag in self.flags
     
 class VesselData(BaseModel):
-    # Stored in 'events.vessel_data' as JSONB (Polymorphism)
     mmsi: Optional[str] = None
     imo: Optional[str] = None
     speed_knots: Optional[float] = None
@@ -158,9 +108,7 @@ class VesselData(BaseModel):
     gap_hours: Optional[float] = None
     last_seen_region: Optional[str] = None
 
-
 class FlightData(BaseModel):
-    # Stored in 'events.flight_data' as JSONB
     icao24: Optional[str] = None
     callsign: Optional[str] = None
     origin_country: Optional[str] = None
@@ -176,7 +124,6 @@ class FlightData(BaseModel):
     registration: Optional[str] = None
 
 class BettingData(BaseModel):
-    # draftkins/fandue;/pinnnacle
     mactchup: str
     market_type: str
     selection: str
@@ -193,12 +140,11 @@ class PredictionMarketData(BaseModel):
    liquidity_pool_size: Optional[float] = None
    notional_usd: Optional[float] = None
 
-
 class CryptoData(BaseModel):
     pair: str
     trade_type: str
     side: str
-    price: float  # Used for single spot trades/liquidations
+    price: float 
     open_price: Optional[float] = None
     high_price: Optional[float] = None
     low_price: Optional[float] = None
@@ -207,7 +153,6 @@ class CryptoData(BaseModel):
     leverage: Optional[float] = None
 
 class FinancialData(BaseModel):
-    # Stored in 'events.financial_data' as JSONB
     ticker: Optional[str] = None
     instrument_type: Optional[str] = None
     side: Optional[str] = None
@@ -228,7 +173,6 @@ class FinancialData(BaseModel):
     otm_percentage: Optional[float] = None
 
 class SecurityData(BaseModel):
-    # Stored in 'events.security_data' as JSONB
     breach_type: Optional[str] = None
     affected_org: Optional[str] = None
     record_count: Optional[int] = None
@@ -240,31 +184,22 @@ class SecurityData(BaseModel):
     ip_address: Optional[str] = None
     port: Optional[int] = None
 
-# INTERMEDIATE MODEL: Not directly persisted in this form.
-# Used by collectors before normalization.
 class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: str
     collected_at: datetime = Field(default_factory=_utcnow)
-    # Optional types mean this field can be None.
     occurred_at: Optional[datetime] = None
     raw_payload: Dict[str, Any]
 
-# DB TABLE: events (Hypertable)
 class NormalizedEvent(BaseModel):
-    # UUID Primary Key: Dynamically generates a unique string ID if one isn't provided.
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4())) 
     type: EventType
-    # Partition Key for TimescaleDB Hypertable
     occurred_at: datetime 
     collected_at: datetime = Field(default_factory=_utcnow)
     source: str
     source_reliability: float = 1.0
-    # "Soft Foreign Key": Maps to primary_entity_id/type/name columns.
-    # We do not use hard DB constraints here to allow high-speed ingestion of unknown entities.
     primary_entity: Entity
     related_entities: List[Entity] = Field(default_factory=list)
-    # Maps to GEOGRAPHY(POINT, 4326) column 'coordinates' via PostGIS
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     altitude_ft: Optional[float] = None
@@ -274,8 +209,6 @@ class NormalizedEvent(BaseModel):
     summary: Optional[str] = None
     url: Optional[str] = None
     language: Optional[str] = "en"
-    # POLYMORPHIC JSONB COLUMNS:
-    # Allows storing domain-specific data without strict schema migrations.
     vessel_data: Optional[VesselData] = None
     flight_data: Optional[FlightData] = None
     financial_data: Optional[FinancialData] = None
@@ -284,27 +217,19 @@ class NormalizedEvent(BaseModel):
     prediction_market_data: Optional[PredictionMarketData] = None
     crypto_data: Optional[CryptoData] = None
 
-    tags: List[str] = Field(default_factory=list) # Maps to TEXT[] via GIN Index
-    named_entities: List[str] = Field(default_factory=list) # Maps to TEXT[]
+    tags: List[str] = Field(default_factory=list) 
+    named_entities: List[str] = Field(default_factory=list) 
     sentiment: Optional[float] = None
     anomaly_score: float = 0.0
-    # Links to 'correlations' table, but stored here to allow reverse lookups.
     correlation_ids: List[str] = Field(default_factory=list)
 
-    # VALIDATOR: A hook that runs automatically when this object is created.
-    # This safely "clamps" the anomaly score so it mathematically cannot drop below 0.0 or exceed 1.0.
     @validator("anomaly_score")
     def clamp_anomaly_score(cls, v):
         return max(0.0, min(1.0, v))
 
     def to_tuple(self) -> tuple:
-        """
-        Hardened serialization: 
-        1. Ensures strict type alignment for Postgres.
-        2. Handles optional nested objects safely.
-        3. Pre-serializes JSON to avoid overhead in the writer loop.
-        """
         pe = self.primary_entity
+        # FIXED: Enforce Pydantic V2 compatability `.model_dump_json()` over `.json()`
         return (
             self.event_id, 
             self.type.value, 
@@ -323,64 +248,45 @@ class NormalizedEvent(BaseModel):
             self.headline, 
             self.summary, 
             self.url,
-            self.vessel_data.json() if self.vessel_data else None,
-            self.flight_data.json() if self.flight_data else None,
-            self.financial_data.json() if self.financial_data else None,
-            self.security_data.json() if self.security_data else None,
+            self.vessel_data.model_dump_json() if self.vessel_data else None,
+            self.flight_data.model_dump_json() if self.flight_data else None,
+            self.financial_data.model_dump_json() if self.financial_data else None,
+            self.security_data.model_dump_json() if self.security_data else None,
             self.tags, 
             self.named_entities, 
             float(self.sentiment) if self.sentiment is not None else None, 
             float(self.anomaly_score),
             self.correlation_ids 
         )
+
     def is_physical(self) -> bool:
         return self.type in [
-            EventType.VESSEL_POSITION,
-            EventType.VESSEL_DARK,
-            EventType.VESSEL_STS,
-            EventType.FLIGHT_POSITION,
-            EventType.FLIGHT_DARK,
-            EventType.FLIGHT_ANOMALY,
-        
+            EventType.VESSEL_POSITION, EventType.VESSEL_DARK, EventType.VESSEL_STS,
+            EventType.FLIGHT_POSITION, EventType.FLIGHT_DARK, EventType.FLIGHT_ANOMALY,
         ]
+
     def is_financial(self) -> bool:
         return self.type in [
-            EventType.OPTIONS_FLOW,
-            EventType.DARK_POOL,
-            EventType.FUTURES_COT,
-            EventType.PRICE_ANOMALY,
-            EventType.INSIDER_TRADE,
-            EventType.EQUITY_BLOCK,             # ADDED
-            EventType.CRYPTO_TRADE,             # ADDED
-            EventType.MARKET_CANDLE,            # ADDED
-            EventType.MARKET_ANOMALY,           # ADDED
-            EventType.CRYPTO_LIQUIDATION,       # ADDED
-            EventType.PREDICTION_MARKET_TRADE,  # ADDED
-            EventType.CRYPTO_TRANSFER,
+            EventType.OPTIONS_FLOW, EventType.DARK_POOL, EventType.FUTURES_COT,
+            EventType.PRICE_ANOMALY, EventType.INSIDER_TRADE, EventType.EQUITY_BLOCK,             
+            EventType.CRYPTO_TRADE, EventType.MARKET_CANDLE, EventType.MARKET_ANOMALY,           
+            EventType.CRYPTO_LIQUIDATION, EventType.PREDICTION_MARKET_TRADE, EventType.CRYPTO_TRANSFER,
         ]
     
     def to_summary(self) -> str:
         parts = [f"[{self.type.value}]", f"src: {self.source}"]
-        if self.primary_entity.name:
-            parts.append(f"entity:{self.primary_entity.name}")
-        if self.region:
-            parts.append(f"region:{self.region}")
-        if self.headline:
-            parts.append(f"headline:{self.headline[:80]}")
-        if self.anomaly_score > 0.5:
-            parts.append(f"ANOMALY:{self.anomaly_score:.2f}")
+        if self.primary_entity.name: parts.append(f"entity:{self.primary_entity.name}")
+        if self.region: parts.append(f"region:{self.region}")
+        if self.headline: parts.append(f"headline:{self.headline[:80]}")
+        if self.anomaly_score > 0.5: parts.append(f"ANOMALY:{self.anomaly_score:.2f}")
         return " | ".join(parts)
 
-# DB TABLE: correlations
-# The "Alert" layer grouping multiple events.
 class CorrelationCluster(BaseModel):
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     rule_id: str
     rule_name: str
     alert_tier: AlertTier
     detected_at: datetime = Field(default_factory=_utcnow)
-    # Logical Link to events.event_id.
-    # Note: DB does not enforce FK constraint to Hypertable 'events' for performance.
     trigger_event_id: str
     supporting_event_ids: List[str] = Field(default_factory=list)
     entity_ids: List[str] = Field(default_factory=list)
@@ -388,19 +294,16 @@ class CorrelationCluster(BaseModel):
     tags: List[str] = Field(default_factory=list)
     scenario: Optional[Dict[str, Any]] = None
 
-# DB TABLE: scenarios
-# The "Investigation" layer (Human-in-the-loop).
+# FIXED: Removed the shadowed class definition block. Combined the DB model with Hypotheses array.
 class Scenario(BaseModel):
     scenario_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    # HARD Foreign Key in DB: REFERENCES correlations(correlation_id)
-    # Integrity is enforced here as volume is low and consistency is critical.
     correlation_id: str
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     status: ScenarioStatus = ScenarioStatus.HYPOTHESIS
     headline: str
     significance: str
-    hypotheses: List[Dict[str, Any]]
+    hypotheses: List[ScenarioHypothesis]
     recommended_monitoring: List[str]
     confidence_overall: int
     confidence_rationale: str

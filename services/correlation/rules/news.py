@@ -107,7 +107,91 @@ def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[Correl
         rule_id="NEWS_002",
         rule_name="Dynamic News Catalyst Correlation",
         alert_tier=tier,
+        trigger_event_id=event.event_id,"""
+        services/correlation/rules/news.py
+        """
+
+import logging
+from typing import Optional
+from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
+from shared.db import get_redis
+
+logger = logging.getLogger("correlation.rules.news")
+
+CORE_KEYWORDS = [
+    "sanction", "irgc", "seized", "blockade", "missile strike", "warship",
+    "margin call", "liquidation", "chapter 11", "indictment", "sec probe",
+    "cyberattack", "ransomware", "data breach", "zero-day",
+]
+
+def _get_dynamic_keywords() -> set:
+    keywords = set(CORE_KEYWORDS)
+    try:
+        redis_client = get_redis()
+        if redis_client:
+            dynamic = redis_client.raw.smembers("sentinel:news:keywords")
+            if dynamic:
+                keywords.update({k.decode('utf-8').lower().strip() for k in dynamic})
+    except Exception as e:
+        logger.debug(f"Failed to fetch dynamic news keywords, using fallback: {e}")
+    return keywords
+
+def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
+    if event.type != EventType.HEADLINE:
+        return None
+
+    headline = (event.headline or "").lower()
+    live_keywords = _get_dynamic_keywords()
+
+    matched_keywords = [kw for kw in live_keywords if kw in headline]
+    if not matched_keywords:
+        return None
+
+    if not event.tags:
+        return None
+
+    # FIXED: event_types=[] keyword mapping
+    correlated_events = store.get_recent(
+        event_types=[], 
+        hours=24, 
+        min_anomaly=0.30,  
+        tags=event.tags    
+    )
+
+    # FIXED: Dict lookups replacing class property access
+    valid_correlations = [e for e in correlated_events if e.get("event_id") != event.event_id]
+
+    if not valid_correlations:
+        return None
+
+    desc = (
+        f"Dynamic Catalyst Detected: '{event.headline[:80]}'. "
+        f"Matched AI keywords: {matched_keywords[:3]}. "
+        f"Correlated with {len(valid_correlations)} anomalous events across domains."
+    )
+
+    safe_entities = []
+    if getattr(event, "primary_entity", None):
+        safe_entities.append(event.primary_entity.id)
+    
+    safe_entities.extend([
+        e.get("primary_entity", {}).get("id") for e in valid_correlations[:5] 
+        if e.get("primary_entity", {}).get("id")
+    ])
+
+    # Valid Tier Assignment (Mapped to Intelligence if high correlation counts)
+    tier = AlertTier.INTELLIGENCE if len(valid_correlations) >= 3 else AlertTier.ALERT
+
+    return CorrelationCluster(
+        rule_id="NEWS_002",
+        rule_name="Dynamic News Catalyst Correlation",
+        alert_tier=tier,
         trigger_event_id=event.event_id,
+        supporting_event_ids=[e.get("event_id") for e in valid_correlations[:5]], # FIXED: Dict key access
+        entity_ids=list(set(safe_entities)), 
+        description=desc,
+        tags=list(set(["dynamic_catalyst", "news"] + event.tags[:3])),
+    )
         supporting_event_ids=[e.event_id for e in valid_correlations[:5]],
         entity_ids=list(set(safe_entities)), # Deduplicate entity IDs
         description=desc,

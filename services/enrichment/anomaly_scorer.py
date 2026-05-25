@@ -9,7 +9,7 @@ logger = logging.getLogger("enrichment.anomaly_scorer")
 
 class DynamicAnomalyScorer:
     def __init__(self, redis_client):
-        self.redis = get_redis()
+        self.redis = redis_client or get_redis()
         self.sessions = {}
         self.alpha = 0.1
         self.z_score_threshold = 2.5
@@ -18,13 +18,10 @@ class DynamicAnomalyScorer:
 
     def _load_onnx_models(self):
         model_dir = "/app/models"
-        
-        # Explicitly map domains to their specific artifact filenames
         model_files = {
             "spatial": "spatial_iforest.onnx",
             "temporal": "temporal_lstm.onnx"
         }
-        
         for domain, filename in model_files.items():
             model_path = os.path.join(model_dir, filename)
             try:
@@ -136,3 +133,34 @@ class DynamicAnomalyScorer:
         except Exception as e:
             logger.error(f"ONNX Scoring failed for {event_type}: {e}")
             return {"score": 0.0, "is_significant": False, "domain": domain}
+    def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
+        sensitivity = 1.0 if region in ["Strait of Hormuz", "Red Sea"] else 0.5
+        base = min(1.0, gap_hours / 48.0)
+        if "sanctioned" in " ".join(flags).lower():
+            base = min(1.0, base * 1.5)
+        return round(min(1.0, base * sensitivity / 3.0 + base * 0.5), 3)
+
+    def score_news(self, named_entities: list, sentiment: float, reliability: float) -> float:
+        base = abs(sentiment) * reliability
+        entity_boost = min(0.3, len(named_entities) * 0.02)
+        return round(min(1.0, base + entity_boost), 3)
+
+    def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
+        features = [notional / 1_000_000, qty / 1000, 0.0, 0.0, 0.0]
+        return self.score_event("crypto_trade", features)["score"]
+
+    def score_crypto_candle(self, asset: str, features: list) -> float:
+        padded = (features + [0.0] * 5)[:5]
+        return self.score_event("crypto_trade", padded)["score"]
+
+    def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
+        features = [notional / 1_000_000, volume / 100_000, 0.0, 0.0, 0.0]
+        return self.score_event("tradfi_trade", features)["score"]
+
+    def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
+        padded = (features + [0.0] * 5)[:5]
+        return self.score_event("tradfi_trade", padded)["score"]
+
+    def score_prediction_trade(self, asset_id: str, notional: float) -> float:
+        features = [notional / 100_000, 0.0, 0.0, 0.0, 0.0]
+        return self.score_event("prediction_market_trade", features)["score"]
