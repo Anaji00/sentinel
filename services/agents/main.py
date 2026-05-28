@@ -21,7 +21,7 @@ logger = logging.getLogger("agents.orchestrator")
 
 from shared.db import get_timescale, get_neo4j, get_redis
 from shared.kafka import SentinelProducer, SentinelConsumer
-
+from services.correlation.soft_correlator import SoftCorrelator
 from services.agents.news_intel import NewsIntelAgent
 from services.agents.quant_researcher import QuantResearcherAgent
 from services.agents.ontology_master import OntologyMasterAgent

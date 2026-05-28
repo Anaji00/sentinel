@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, FinancialData
+import re 
 
 logger = logging.getLogger("enrichment.tradfi")
 
@@ -148,7 +149,18 @@ class TradFiEnricher:
 
     def _enrich_insider(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
-        if not ticker: return None
+        if not ticker:
+            link = p.get("link", "")
+            # SEC EDGAR URLs typically follow: https://www.sec.gov/Archives/edgar/data/[CIK]/[ACCESSION]/xslF345X03/primary_doc.xml
+            # Or Ownership search links: https://www.sec.gov/cgi-bin/own-disp?action=getissuer&CIK=0000320193
+            # We parse the title which format is: "Form 4 - [Company Name] ( [TICKER] ) (Reporting)"
+            title = p.get("title", "")
+            match = re.search(r'\(\s*([A-Za-z]+)\s*\)', title)
+            if match:
+                ticker = match.group(1).upper()
+            else:
+                logger.debug(f"Failed to extract ticker from Form 4 payload: {title}")
+                return None
         
         value = float(p.get("transaction_value_usd", 0))
         code = p.get("transaction_code", "J")

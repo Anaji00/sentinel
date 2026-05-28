@@ -340,6 +340,7 @@ _async_timescale: Optional[AsyncTimescaleClient] = None
 _neo4j:     Optional[Neo4jClient]     = None
 _redis_cli: Optional[RedisClient]     = None
 
+_async_db_lock = asyncio.Lock()  # Ensures only one async TimescaleClient is created in concurrent scenarios.
 
 def get_timescale() -> TimescaleClient:
     global _timescale
@@ -351,9 +352,15 @@ def get_timescale() -> TimescaleClient:
 async def get_async_timescale() -> AsyncTimescaleClient:
     # Because establishing the pool requires 'await', this getter must be async.
     global _async_timescale
-    if _async_timescale is None:
-        _async_timescale = AsyncTimescaleClient()
-        await _async_timescale.connect()
+    # First check (fast path)
+    if _async_timescale is not None:
+        return _async_timescale
+
+    async with _async_db_lock:
+        if _async_timescale is None:
+            client = AsyncTimescaleClient()
+            await client.connect()
+            _async_timescale = client
     return _async_timescale
 
 def get_neo4j() -> Neo4jClient:

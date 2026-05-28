@@ -13,6 +13,15 @@ from services.api_gateway.dependencies import get_db
 logger = logging.getLogger("api-gateway.events")
 router = APIRouter(prefix="/api/v1/events", tags=["Domain Events"])
 
+# ARCHITECTURAL FIX: Explicitly map API Domain routes to strict DB Schema Columns
+DOMAIN_TO_COLUMN = {
+    "maritime": "vessel_data",
+    "aviation": "flight_data",
+    "financial": "financial_data",
+    "cyber": "security_data",
+    "news": "headline" # News doesn't have a JSONB column, it uses the headline/summary natively
+}
+
 @router.get("/{domain}")
 async def get_domain_events(
     # PATH PARAMETER: FastAPI extracts `domain` from the URL path (e.g., /api/v1/events/maritime)
@@ -26,38 +35,33 @@ async def get_domain_events(
 ):
     """Dynamic endpoint to fetch events for a specific domain."""
     
-    # SECURITY BEST PRACTICE: The Allowlist (Strict Validation)
-    valid_domains = ["maritime", "aviation", "financial", "cyber", "news"]
-    domain = domain.lower()
-    if domain not in valid_domains:
-        raise HTTPException(status_code=400, detail=f"Invalid domain. Must be one of {valid_domains}")
 
+    domain = domain.lower()
+    target_column = DOMAIN_TO_COLUMN.get(domain)
+    
+    if not target_column:
+        raise HTTPException(status_code=400, detail=f"Invalid domain. Must be one of {list(DOMAIN_TO_COLUMN.keys())}")
     try:
-        # DYNAMIC SQL BUILDING: 
-        # Wait, didn't we say "Never use f-strings in SQL"? 
-        # We use an f-string for the column name `{domain}_data` because standard `%s` 
-        # placeholders CANNOT be used for column or table names, only for data values.
-        # This is strictly safe ONLY because we mathematically guaranteed `domain` is 
-        # one of our 5 hardcoded safe strings in the allowlist check above.
-        
-        # QUERY ANATOMY:
-        # 1. SELECT: Grabs common fields + the specific JSONB column for this domain (e.g., `maritime_data`).
-        # 2. WHERE type ILIKE %s: `ILIKE` is PostgreSQL's command for a Case-Insensitive match.
-        # 3. ORDER & LIMIT: Sorts by newest first, cutting off at the user's requested limit.
-        query = f"""
-            SELECT event_id, type, occurred_at, primary_entity_name, region, anomaly_score, {domain}_data as domain_data
-            FROM events 
-            WHERE type ILIKE %s AND anomaly_score >= %s
-            ORDER BY occurred_at DESC LIMIT %s
-        """
-        # SQL WILDCARD: The `%` symbol in SQL means "anything can go here".
-        # So `maritime_%` matches "maritime_vessel_dark" or "maritime_position".
+        # If the domain is news, we don't need a specific JSONB projection
+        if domain == "news":
+            query = """
+                SELECT event_id, type, occurred_at, primary_entity_name, region, anomaly_score, summary as domain_data
+                FROM events WHERE type ILIKE %s AND anomaly_score >= %s
+                ORDER BY occurred_at DESC LIMIT %s
+            """
+        else:
+            query = f"""
+                SELECT event_id, type, occurred_at, primary_entity_name, region, anomaly_score, {target_column} as domain_data
+                FROM events WHERE type ILIKE %s AND anomaly_score >= %s
+                ORDER BY occurred_at DESC LIMIT %s
+            """
+            
         like_pattern = f"{domain}_%"
         return db.query(query, (like_pattern, min_anomaly, limit))
     except Exception as e:
-        logger.error(f"Failed to fetch {domain} events: {e}")
+        logger.error(f"Failed to fetch {domain} events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database query failed")
-
+    
 @router.get("/detail/{event_id}")
 async def get_event_detail(event_id: str, db = Depends(get_db)):
     """Fetch the complete JSON payload for a single specific event."""
