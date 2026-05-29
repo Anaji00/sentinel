@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import aiohttp
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,10 +18,12 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("agents.orchestrator")
+logger = logging.getLogger("agents.main")
 
 from shared.db import get_timescale, get_neo4j, get_redis
 from shared.kafka import SentinelProducer, SentinelConsumer
+from shared.utils.ollama import OllamaClient
+from services.agents.radar_agent import RadarAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from services.agents.news_intel import NewsIntelAgent
 from services.agents.quant_researcher import QuantResearcherAgent
@@ -35,6 +38,7 @@ TOPIC_QUANT_DISCOVERIES  = "agents.quant.discoveries"
 TOPIC_ONTOLOGY_UPDATES   = "agents.ontology.updates"
 TOPIC_UNKNOWN_ENTITIES   = "agents.ontology.unknown_entities"
 TOPIC_DLQ                = "dead.letter"
+TOPIC_RAW_RADAR          = "events.raw.radar"
 
 
 # ── TASK QUEUE WORKER ────────────────────────────────────────────────────────
@@ -105,6 +109,7 @@ def build_agent(
     input_topics:  list,
     group_id:      str,
     shared_infra:  dict,
+    **extra_kwargs
 ) -> object:
     """
     Factory function: instantiates an agent with all shared infrastructure.
@@ -140,6 +145,7 @@ def build_agent(
         kafka_consumer=consumer,
         dlq_producer=dlq,
         model=os.getenv("AGENT_MODEL", "llama3"),
+        **extra_kwargs
     )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -159,6 +165,12 @@ async def main():
     }
     logger.info("Shared infrastructure connected")
 
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        ollama_client = OllamaClient(session)
+        logger.info("Loading Semantic Soft Correlator into RAM...")
+        soft_correlator = SoftCorrelator(ollama_client)
+        await soft_correlator._load()
     # ── AGENT INSTANTIATION ────────────────────────────────────────────────────
     news_agent = build_agent(
         NewsIntelAgent,
@@ -182,12 +194,23 @@ async def main():
         input_topics=[TOPIC_UNKNOWN_ENTITIES],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
+        soft_correlator=soft_correlator,
     )
+
+    radar_agent = build_agent(
+        RadarAgent,
+        agent_name="radar_agent",
+        input_topics=[TOPIC_RAW_RADAR],
+        group_id="agent-radar-orchestrator",
+        shared_infra=shared_infra,
+    )
+
 
     agents_by_name = {
         "news_intel":      news_agent,
         "quant_researcher": quant_agent,
         "ontology_master": ontology_agent,
+        "radar_agent": radar_agent,
     }
 
     logger.info(f"Agents built: {list(agents_by_name.keys())}")
@@ -199,6 +222,7 @@ async def main():
         asyncio.create_task(news_agent.run(),      name="news_intel"),
         asyncio.create_task(quant_agent.run(),     name="quant_researcher"),
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
+        asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",

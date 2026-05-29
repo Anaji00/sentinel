@@ -132,29 +132,32 @@ class ScenarioTracker:
         # exhaust database resources. We slice `signals[:10]` to strictly limit the 
         # maximum number of database queries executed per scenario.
         for signal in signals[:10]:  # Check up to 10 signals to limit DB load
-            keywords = [w.lower() for w in signal.split() if len(w) > 4]  # keywords extracted by splitting signal text
+            keywords = [w.lower() for w in signal.split() if len(w) > 4][:3]  # keywords extracted by splitting signal text
             if not keywords:
                 continue    
 
             try:
-                # CRITICAL THINKING: Existence checks over Counting.
-                # We only need to know IF a signal happened, not HOW MANY times.
-                # Using `LIMIT 1` tells the database to stop searching the moment it 
-                # finds a single match, making this query significantly faster.
-                for keyword in keywords[:3]: # Limit to top 3 keywords per signal for efficiency
-                    rows = self._db.query("""
-                        SELECT COUNT(*) as cnt FROM events
-                        WHERE occurred_at > %s
-                          AND (
-                            LOWER(headline) LIKE %s
-                            OR %s = ANY(ARRAY(SELECT LOWER(e) FROM unnest(named_entities) e))
-                          )
-                        LIMIT 1
-                    """, (cutoff, f"%{keyword}%", keyword)) # Match keyword in headline (using LIKE) or exact match in named_entities (using ANY)
-                    
-                    if rows and rows[0].get("cnt", 0) > 0: # If we found any event matching this keyword, consider the signal "hit"
-                        matched.append(signal) # Record the original signal text, not just the keyword, for better traceability
-                        break
+                # ARCHITECTURAL FIX: Native Postgres Array overlap operator (&&)
+                # Replaced expensive unnest() scans with optimized index-friendly arrays.
+                # Passed the keywords as a native tuple to leverage psycopg2 array adaptation.
+                rows = self._db.query("""
+                    SELECT 1 FROM events
+                    WHERE occurred_at > %s
+                      AND (
+                        headline ILIKE ANY(%s)
+                        OR tags && %s::varchar[]
+                        OR named_entities && %s::varchar[]
+                      )
+                    LIMIT 1
+                """, (
+                    cutoff, 
+                    [f"%{k}%" for k in keywords], # ILIKE ANY mapping
+                    keywords,                     # tags && array
+                    keywords                      # named_entities && array
+                ))
+                
+                if rows: 
+                    matched.append(signal) 
             except Exception as e:
                 logger.debug(f"Signal match error: {e}")
  

@@ -19,7 +19,9 @@ the embedding space captures the semantic connection.
  
 Not running yet — wired in but disabled until Phase 2 infra is ready.
 """
-# Import standard logging for debugging and information output.
+import asyncio
+import uuid
+import os
 import logging
 # Import datetime for handling time-based logic.
 from datetime import datetime, timezone
@@ -28,7 +30,7 @@ from typing import List, Optional, Dict
  
 # Import the NormalizedEvent model, which is the standard data format we use across Sentinel.
 from shared.models import NormalizedEvent
- 
+from shared.utils.ollama import OllamaClient
 # Initialize the logger specific to this soft correlation module.
 logger = logging.getLogger("correlation.soft")
  
@@ -50,77 +52,73 @@ class SoftCorrelator:
       qdrant-client            (pip install qdrant-client)
       Running Qdrant instance  (add to docker-compose in Phase 2)
     """
-    def __init__(self):
+    def __init__(self, ollama_client: OllamaClient):
         # BEST PRACTICE: Lazy Loading. 
         # We don't load the heavy ML model or DB client right away. 
         # This keeps the app lightweight if Soft Correlation is turned off.
         self._model = None  # Lazy load the embedding model
         self._client = None  # Lazy load the Qdrant client
         self._enabled = False  # Set to True when ready to activate'
-    
-    def _load(self):
+        self._llm = ollama_client
+        self._embed_semaphore = asyncio.Semaphore(5)  # Limit concurrent embeddings to avoid overload
+        self._load_lock = asyncio.Lock()  # Ensure only one load happens if multiple events come in at startup
+    async def _load(self):
         """Lazy-load heavy dependencies. Called on first use."""
+        if self._enabled: return
+        async with self._load_lock:
+            if self._enabled: return  # Double-check locking
         try:
-            # Import the ML library INSIDE the function so it only loads into memory when called.
-            from sentence_transformers import SentenceTransformer
-            # Load a pre-trained model capable of turning text into high-quality vector arrays.
-            self._model = SentenceTransformer("all-mpnet-base-v2")
-            logger.info("SentenceTransformer model loaded")
-
-            # Import the client for Qdrant (our Vector Database).
-            from qdrant_client import QdrantClient
-            # Connect to the local Qdrant instance on its default port.
-            self._client = QdrantClient(host="localhost", port=6333)
-            # Mark the correlator as fully active and ready to process events.
-            self._enabled = True
-            logger.info(r"Qdrant client initialized and SoftCorrelator enabled")
+            import sentence_transformers
+            from qdrant_client import AsyncQdrantClient
+            from qdrant_client.http import models
+            loop = asyncio.get_running_loop()
+            self._model = await loop.run_in_executor(
+                    None, 
+                    lambda: sentence_transformers.SentenceTransformer("all-mpnet-base-v2")
+                )
             
-        except ImportError as e:
-            # If the required pip packages aren't installed, fail gracefully.
-            logger.warning(f"Failed to load SoftCorrelator dependencies: {e}. Soft correlation disabled.")
+            logger.info("SentenceTransformer model loaded")
+            qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+            # Connect to the local Qdrant instance on its default port.
+            self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
+            # Mark the correlator as fully active and ready to process events.
+            for collection in ["sentinel_events", "sentinel_concepts"]:
+                exists = await self._client.collection_exists(collection)
+                if not exists:
+                    await self._client.create_collection(
+                        collection_name=collection,
+                        vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
+                    )
+            self._enabled = True
+            logger.info(f"Async Qdrant client connected to {qdrant_host} and SoftCorrelator enabled.")
         except Exception as e:
             # Catch any other errors (like Qdrant being unreachable) so the main app doesn't crash.
             logger.error(f"Error initializing SoftCorrelator: {e}. Soft correlation disabled.", exc_info=True)
         
-    def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
+    async def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
         """Convert event to embedding vector for similarity search."""
-        # If the ML model isn't loaded or active, skip processing.
-        if not self._enabled: 
-            return None
+        """Convert event to embedding vector without freezing the event loop."""
+        if not self._enabled: return None
         
-        # We code similarity search by embedding the headline + tags + primary entity name
-        # Start building a list of text strings that describe this event.
-        parts = [f"type:{event.type.value}"]
-        
-        # If the event has a physical location, add it to our descriptive text.
-        if event.region:
-            parts.append(f"region:{event.region}")
+        async with self._embed_semaphore:
+            # 1. LLM Semantic Translation
+            prompt = f"Convert this telemetry into a single, highly descriptive natural language sentence for semantic embedding. Focus on the geopolitical or financial action/connections. Telemetry: Type={event.type.value}, Entity={event.primary_entity.name}, Region={event.region}, Flags={event.primary_entity.flags}, Headline={event.headline}"
             
-        if event.primary_entity.name:
-            parts.append(f"entity:{event.primary_entity.name}") # Primary entity (e.g., a company or country) is often the most important signal, so we keep it as a separate section
-            
-        if event.primary_entity.flags:
-            parts.append(f"flags:{' '.join(event.primary_entity.flags)}") # Include flags in embedding to capture important context (e.g., "sanctioned", "critical_infrastructure")
-            
-        if event.headline:
-            parts.append(f"headline:{event.headline}") # Headline is often the most semantically rich part, so we keep it as a separate section
-            
-        if event.named_entities:
-            entities_str = " ".join(event.named_entities[:50])
-            parts.append(f"entities:{entities_str}")  # Limit to first 50 for embedding size
+            try:
+                # Fast inference call. We don't need JSON schema here, just raw text.
+                natural_language_desc = await self._llm.infer_raw(system_prompt="You are a data translator.", user_prompt=prompt)
+            except Exception as e:
+                logger.error(f"LLM Translation failed: {e}")
+                return None
+            loop = asyncio.get_running_loop()
+            try:
+                embedding_array = await loop.run_in_executor(None, self._model.encode, natural_language_desc)
+                return embedding_array.tolist()  
+            except Exception as e:
+                logger.error(f"Error embedding event {event.event_id}: {e}")
+                return None
         
-        # Combine all the descriptive parts into one single sentence/string separated by ' | '.
-        text = " | ".join(parts) # Simple concatenation — can experiment with more sophisticated templates
-        
-        try:
-            # Pass the text to the ML model, which returns an array of floats (the "embedding").
-            # We convert it to a standard Python list so it can be saved in the database.
-            return self._model.encode(text).tolist()  # Convert numpy array to list for storage
-        except Exception as e:
-            logger.error(f"Error embedding event {event.event_id}: {e}", exc_info=True)
-            return None
-        
-    def store(self, event: NormalizedEvent, embedding: List[float]):
+    async def store(self, event: NormalizedEvent, embedding: List[float]):
         """Store event embedding in Qdrant with metadata for later retrieval."""
         # Safety check: Do nothing if the system isn't enabled or connected.
         if not self._enabled or not self._client:
@@ -149,7 +147,7 @@ class SoftCorrelator:
             # Log the error. (Note: 'debug44' appears to be a typo for 'debug' or 'error' in the original code).
             logger.debug(f"Qdrant store failed for event{event.event_id}: {e}", exc_info=True)
     
-    def find_similar(
+    async def find_similar(
             self, 
             embedding: List[float],
             exclude_domain: str,
@@ -164,18 +162,21 @@ class SoftCorrelator:
         if not self._enabled or not self._client:
             return []
         try:
+            from qdrant_client.http import models
             # Ask the vector database for points that are closest in semantic meaning.
-            results = self._client.search(
+            results = await self._client.search(
                 collection_name="sentinel_events",
                 query_vector=embedding,
                 # We fetch extra results because the filter step (must_not) might remove some.
                 limit=limit + 20,   # fetch extra to filter by domain
-                query_filter={
-                    "must_not": [
-                        # Core Logic: Only return events that belong to a DIFFERENT domain.
-                        {"key": "domain", "match": {"value": exclude_domain}} # Exclude events from the same domain as the trigger event to focus on cross-domain correlations
+                query_filter=models.Filter(
+                    must_not=[
+                        models.FieldCondition(
+                            key="domain", 
+                            match=models.MatchValue(value=exclude_domain)
+                        )
                     ]
-                },
+                ),
                 score_threshold=SIMILARITY_THRESHOLD, # Only return results above the similarity threshold to reduce noise
             )
             # Map the raw Qdrant results back into a list of our custom 'payload' dictionaries.
@@ -183,4 +184,57 @@ class SoftCorrelator:
         except Exception as e:
             logger.debug(f"Qdrant search failed: {e}")
             return []
+        
+    # ─── AGENTIC ONTOLOGY METHODS ──────────────────────────────────────────
+
+    async def embed_text(self, text: str) -> List[float]:
+        """Embeds raw concept strings efficiently on the background thread."""
+        if not self._enabled: return []
+        
+        loop = asyncio.get_running_loop()
+        try:
+            embedding_array = await loop.run_in_executor(None, self._model.encode, text)
+            return embedding_array.tolist()
+        except Exception as e:
+            logger.error(f"Text embedding failed for '{text}': {e}")
+            return []
+
+    async def register_concept(self, concept_name: str, embedding: List[float]):
+        """Stores a newly discovered ontology concept asynchronously."""
+        if not self._enabled or not self._client: return
+        
+        try:
+            concept_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, concept_name))
+            
+            await self._client.upsert(
+                collection_name="sentinel_concepts",
+                points=[{
+                    "id": concept_uuid, 
+                    "vector": embedding, 
+                    "payload": {
+                        "concept_name": concept_name,
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    },
+                }]
+            )
+        except Exception as e:
+            logger.error(f"Qdrant async concept registration failed: {e}")
+
+    async def find_similar_concepts(self, embedding: List[float], limit: int = 1) -> List[Dict]:
+        """Checks if a proposed concept is semantically identical to an existing one."""
+        if not self._enabled or not self._client: return []
+        
+        try:
+            results = await self._client.search(
+                collection_name="sentinel_concepts",
+                query_vector=embedding,
+                limit=limit,
+                score_threshold=0.85, 
+            )
+            return [{"concept_name": r.payload["concept_name"], "score": r.score} for r in results]
+        except Exception as e:
+            logger.debug(f"Qdrant concept search empty or failed: {e}")
+            return []
+        
+    
  

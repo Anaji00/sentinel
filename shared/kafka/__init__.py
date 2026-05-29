@@ -150,7 +150,7 @@ class SentinelConsumer:
             # Every 1 second, the code tells Kafka "I've finished reading up to Page 50".
             # If the code crashes and restarts, it looks up the bookmark and starts at Page 51.
             # (It's simpler than doing it manually, though slightly less precise).
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             auto_commit_interval_ms=1000,
             api_version=(3, 5, 0),
         )

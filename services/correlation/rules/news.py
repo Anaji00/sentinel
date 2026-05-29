@@ -101,15 +101,18 @@ def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[Correl
     ])
 
     # Tiering: If the news catalyst maps to 3 or more distinct anomalies, elevate to CRITICAL
-    tier = AlertTier.CRITICAL if len(valid_correlations) >= 3 else AlertTier.ALERT
+    tier = AlertTier.INTELLIGENCE if len(valid_correlations) >= 3 else AlertTier.ALERT
 
     return CorrelationCluster(
         rule_id="NEWS_002",
         rule_name="Dynamic News Catalyst Correlation",
         alert_tier=tier,
-        trigger_event_id=event.event_id,"""
-        services/correlation/rules/news.py
-        """
+        trigger_event_id=event.event_id,
+        supporting_event_ids=[e.get("event_id") for e in valid_correlations[:5]],
+        entity_ids=list(set(safe_entities)), # Deduplicate entity IDs
+        description=desc,
+        tags=list(set(["dynamic_catalyst", "news"] + event.tags[:3])),
+    )
 
 import logging
 from typing import Optional
@@ -189,11 +192,6 @@ def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[Correl
         trigger_event_id=event.event_id,
         supporting_event_ids=[e.get("event_id") for e in valid_correlations[:5]], # FIXED: Dict key access
         entity_ids=list(set(safe_entities)), 
-        description=desc,
-        tags=list(set(["dynamic_catalyst", "news"] + event.tags[:3])),
-    )
-        supporting_event_ids=[e.event_id for e in valid_correlations[:5]],
-        entity_ids=list(set(safe_entities)), # Deduplicate entity IDs
         description=desc,
         tags=list(set(["dynamic_catalyst", "news"] + event.tags[:3])),
     )

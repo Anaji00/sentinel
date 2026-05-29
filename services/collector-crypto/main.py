@@ -33,7 +33,7 @@ logger = logging.getLogger("collector.crypto")
 
 ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL")
 # Lowered threshold to act as a noise-filter. ML Enrichment handles true anomaly detection.
-WHALE_THRESHOLD_USD = 50_000
+WHALE_THRESHOLD_USD = 250_000
 
 # ── 1. SPOT MARKET TAPE READER (LARGE TRADES) ─────────────────────────────────
 
@@ -43,13 +43,13 @@ async def stream_binance_large_trades(producer: SentinelProducer):
         "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt"
     ]
     stream_params = "/".join([f"{pair}@aggTrade" for pair in TOP_10_PAIRS])
-    url = f"wss://stream.binance.us:9443/stream?streams={stream_params}"
+    url = f"wss://stream.binance.com:9443/stream?streams={stream_params}"
     
     msg_count = 0
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                logger.info("Connected to Binance Large Trade Stream")
+                logger.info("Connected to Binance-GLOBAL Large Trade Stream")
                 while True:
                     payload = json.loads(await ws.recv())
                     data = payload.get("data", {})
@@ -88,12 +88,12 @@ async def stream_binance_candles(producer: SentinelProducer):
         "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt"
     ]
     stream_params = "/".join([f"{pair}@kline_1m" for pair in TOP_10_PAIRS])
-    url = f"wss://stream.binance.us:9443/stream?streams={stream_params}"
+    url = f"wss://stream.binance.com:9443/stream?streams={stream_params}"
     
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                logger.info("Connected to Binance 1m Candle Stream")
+                logger.info("Connected to GLOBAL Binance 1m Candle Stream")
                 while True:
                     payload = json.loads(await ws.recv())
                     data = payload.get("data", {})
@@ -173,11 +173,16 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
                         receiver = "0x" + log["topics"][2][26:]
                         amount_usd = int(log["data"], 16) / (10 ** 6)
                         
-                        raw_suspects = await loop.run_in_executor(None, redis_client.smembers, "sentinel:watched:wallets")
-                        # BUG FIX: Safely decode bytes into utf-8 strings for strict matching
-                        suspects = {s.decode('utf-8') if isinstance(s, bytes) else s for s in raw_suspects} if raw_suspects else set()
+                        # ARCHITECTURAL FIX: O(1) Pipelined `sismember` execution.
+                        # Do NOT pull the entire set across the network. Ask Redis to check the specific keys.
+                        def _check_suspects():
+                            pipe = redis_client.raw.pipeline()
+                            pipe.sismember("sentinel:watched:wallets", sender)
+                            pipe.sismember("sentinel:watched:wallets", receiver)
+                            return pipe.execute()
                         
-                        is_suspect = sender in suspects or receiver in suspects
+                        s_res = await loop.run_in_executor(None, _check_suspects)
+                        is_suspect = s_res[0] or s_res[1]
 
                         msg_count += 1
                         if msg_count % 500 == 0:
