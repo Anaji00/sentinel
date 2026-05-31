@@ -60,14 +60,14 @@ The data journey through Sentinel follows a staged pipeline:
 The platform is composed of the following services:
 
 *   **Collectors**:
-    *   `collector-adsb`: Collects aviation data (ADS-B).
-    *   `collector-ais`: Collects maritime data (AIS).
-    *   `collector-crypto`: Collects cryptocurrency and wallet tracking data.
-    *   `collector-cyber`: Collects cybersecurity-related data.
-    *   `collector-news`: Collects news articles from 19 active RSS feeds concurrently using `asyncio`. Employs a Redis Sorted Set sliding window (30-day retention) for memory-efficient URL deduplication and to allow re-ingestion of updated content.
-    *   `collector-prediction`: Collects prediction market data.
-    *   `collector-radar`: Collects radar and satellite imagery intel.
-    *   `collector-tradfi`: Collects traditional financial data (stocks, bonds).
+    *   `collector-adsb`: Collects live aviation telemetry data (ADS-B).
+    *   `collector-ais`: Collects real-time maritime vessel tracking data (AIS).
+    *   `collector-crypto`: Monitors cryptocurrency networks and tracks key wallet activities.
+    *   `collector-cyber`: Gathers cybersecurity threat intelligence and vulnerability data.
+    *   `collector-news`: Concurrently scrapes and deduplicates global news articles from RSS feeds.
+    *   `collector-prediction`: Ingests data from prediction markets to gauge event sentiment and probabilities.
+    *   `collector-radar`: A quantitative engine that dynamically scans the US Equities market for volume and volatility anomalies.
+    *   `collector-tradfi`: Collects traditional financial market data, including stocks and bonds.
 *   **Correlation**: Correlates events from different sources based on a set of rules.
 *   **Enrichment**: Enriches the collected data with additional information, such as anomaly scores and entity resolution.
 *   **Reasoning (Enterprise)**: Powered by local Llama3 via Ollama, this service performs higher-level analysis by synthesizing tactical scenarios from correlated data. It features an autonomous feedback loop that dynamically updates collector watchlists based on AI-derived recommendations.
@@ -110,33 +110,24 @@ Before you begin, ensure you have the following tools installed:
 
 ### Running the Application
 
-Running the Sentinel platform is a straightforward process. You can choose to run everything via Docker or run the python services locally.
+The Sentinel platform is fully containerized for a seamless developer experience. The `docker-compose.yml` file is configured to spin up all necessary infrastructure (Kafka, Zookeeper, Redis, PostgreSQL, Neo4j) alongside the backend microservices.
 
-**Option 1: Full Docker Deployment**
-
-This is the easiest way to start the entire backend and infrastructure stack. The `docker-compose.yml` file is configured to spin up Kafka, Zookeeper, Redis, PostgreSQL, Neo4j, and all the backend microservices (Collectors, Correlation, Enrichment, Reasoning, API).
+To start the entire backend and infrastructure stack, run:
 
 ```bash
 docker-compose up --build -d
 ```
-You can monitor the health and logs of the services using `docker-compose logs -f`.
 
-**Option 2: Local Python Services (Development)**
+To monitor the health and view real-time logs of the services:
 
-If you are developing the Python microservices, you can start only the infrastructure in Docker, and run the Python apps using `honcho`.
-
-1. Start infrastructure only (Kafka, DBs, Redis):
 ```bash
-docker-compose up -d zookeeper kafka kafka-ui timescaledb neo4j redis
+docker-compose logs -f
 ```
 
-2. Start the application services via `Procfile`:
+To gracefully stop the platform:
+
 ```bash
-honcho start
-```
-Alternatively, you can run a specific service. For example, to run only the AIS collector:
-```bash
-honcho start ais
+docker-compose down
 ```
 
 ### Starting the Frontend
