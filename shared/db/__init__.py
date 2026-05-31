@@ -12,19 +12,65 @@ FIX (code review): TimescaleClient.query() now rolls back and re-raises on
 
 import logging
 import os
-import time
-from typing import Optional, Dict, List, Any
 import asyncio
+from typing import Optional
 
-import psycopg2  # The PostgreSQL database driver (the "phone line" to the DB)
-from psycopg2.extras import RealDictCursor, execute_values  # Helpers for dictionary rows and fast inserts
-from psycopg2 import pool as pgpool  # Manages the "Connection Pool" (explained below)
-
+# Using the native async client in modern redis-py
+import redis.asyncio as aioredis
+from psycopg2 import pool as pgpool
+from psycopg2.extras import RealDictCursor
 import asyncpg
-import redis as _redis  # The official Python client for Redis
-from neo4j import GraphDatabase as _Neo4j  # The official Python driver for Neo4j
+from neo4j import GraphDatabase as _Neo4j
 
 logger = logging.getLogger(__name__)
+
+# --- Redis Async Client ---
+class AsyncRedisClient:
+    def __init__(self):
+        # Decodes responses to strings natively, uses connection pooling automatically
+        self._client = aioredis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"), 
+            decode_responses=True,
+            max_connections=100
+        )
+    @property
+    def raw(self): 
+        return self._client
+
+# --- Neo4j Synchronous Client (For Supervisor ONLY) ---
+class Neo4jClient:
+    def __init__(self):
+        self._driver = _Neo4j.driver(
+            os.getenv("NEO4J_URI", "bolt://localhost:7687"), 
+            auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "sentinel_graph"))
+        )
+        self._driver.verify_connectivity()
+
+    def execute(self, cypher: str, params: dict = None):
+        with self._driver.session() as s:
+            s.run(cypher, **(params or {}))
+
+# --- Singletons & Locks ---
+_async_redis: Optional[AsyncRedisClient] = None
+_neo4j: Optional[Neo4jClient] = None
+_db_lock = asyncio.Lock()
+
+async def get_async_redis() -> AsyncRedisClient:
+    """Thread-safe async singleton for Redis."""
+    global _async_redis
+    if _async_redis is not None:
+        return _async_redis
+    async with _db_lock:
+        if _async_redis is None:
+            _async_redis = AsyncRedisClient()
+    return _async_redis
+
+def get_neo4j() -> Neo4jClient:
+    """Synchronous Neo4j client. Should only be used by the GraphSupervisor."""
+    global _neo4j
+    if _neo4j is None:
+        _neo4j = Neo4jClient()
+    return _neo4j
 
 
 # ── TIMESCALEDB ───────────────────────────────────────────────────────────────
@@ -203,18 +249,6 @@ class AsyncTimescaleClient:
 
                     
 
-# ── NEO4J ─────────────────────────────────────────────────────────────────────
-
-class Neo4jClient:
-    # CONCEPT: The "Detective's Wall".
-    # ROLE: Stores relationships. Nodes (dots) and Edges (lines).
-    # Example: (Vessel)-[OWNS]->(Company)-[SANCTIONED]->(Country).
-    # WHY NEO4J? SQL is terrible at "friend of a friend of a friend" queries (too many JOINs).
-
-    def __init__(self):
-        # The driver manages its own connection pool internally, so we don't need a separate Pool object.
-        self._driver = None
-        self._connect()
 
     def _connect(self, retries: int = 12):
         uri      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
@@ -257,50 +291,6 @@ class Neo4jClient:
             self._driver.close()
 
 
-# ── REDIS ─────────────────────────────────────────────────────────────────────
-
-class RedisClient:
-    # CONCEPT: The "Scratchpad" (RAM).
-    # ROLE: Caching, Deduplication, and fast checks.
-    # WHY REDIS? It stores data in RAM (Memory), not on Hard Disk.
-    # Access time is in microseconds (0.000001s). SQL is milliseconds (0.001s).
-    # We use it to check "Did we just alert on this vessel?" instantly.
-
-    def __init__(self):
-        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        # decode_responses=True means we get Strings back, not raw Bytes.
-        self._client = _redis.from_url(url, decode_responses=True)
-        self._client.ping()
-        logger.info("Redis connected")
-
-    def get(self, key: str) -> Optional[str]:
-        # Retrieve a value. Returns None if the key doesn't exist.
-        return self._client.get(key)
-
-    def set(self, key: str, value: str, ttl: int = None):
-        if ttl:
-            # TTL (Time To Live):
-            # "Remember this for X seconds, then automatically self-destruct."
-            # Useful for: "Don't alert on this vessel again for 1 hour."
-            self._client.setex(key, ttl, value)
-        else:
-            self._client.set(key, value)
-
-    def delete(self, key: str):
-        self._client.delete(key)
-
-    def exists(self, key: str) -> bool:
-        return bool(self._client.exists(key))
-
-    def sadd(self, key: str, *values):
-        # SET ADD: Adds items to a list where duplicates are automatically ignored.
-        self._client.sadd(key, *values)
-
-    def sismember(self, key: str, value: str) -> bool:
-        # SET IS MEMBER: Efficiently checks "Is X in the list?"
-        return bool(self._client.sismember(key, value))
-
-
 
 # --- NEW SORTED SET (Z-INDEX) METHODS ---
 
@@ -322,10 +312,6 @@ class RedisClient:
     def incr(self, key: str) -> int:
         return self._client.incr(key)
 
-    @property
-    def raw(self):
-        return self._client
-
 
 # ── SINGLETONS ────────────────────────────────────────────────────────────────
 
@@ -338,7 +324,7 @@ class RedisClient:
 _timescale: Optional[TimescaleClient] = None
 _async_timescale: Optional[AsyncTimescaleClient] = None
 _neo4j:     Optional[Neo4jClient]     = None
-_redis_cli: Optional[RedisClient]     = None
+_redis_cli: Optional[AsyncRedisClient]     = None
 
 _async_db_lock = asyncio.Lock()  # Ensures only one async TimescaleClient is created in concurrent scenarios.
 

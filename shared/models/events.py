@@ -63,7 +63,6 @@ class AlertTier(int, Enum):
     CRITICAL = 4  # Adding missing mapping tier
 
 class ScenarioStatus(str, Enum):
-    # FIXED: Lowercase values to strictly match PostgreSQL definitions.
     HYPOTHESIS = "hypothesis"
     CONFIRMED = "confirmed"
     DENIED = "denied"

@@ -13,8 +13,8 @@ import aiohttp
 from pydantic import BaseModel
 
 from shared.utils.ollama import (
-    OllamaClient, InferenceError, SchemaViolationError,
-    OLLAMA_MODEL, OLLAMA_URL, _OLLAMA_SEMAPHORE,
+    OllamaClient, SchemaViolationError,
+    OLLAMA_MODEL, OLLAMA_URL
 )
 
 logger = logging.getLogger(__name__)
@@ -25,24 +25,29 @@ TASK_QUEUE_LOW    = "sentinel:agents:tasks:low"
 HEARTBEAT_INTERVAL = 30
 
 class SentinelAgent(ABC):
-    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, kafka_producer, kafka_consumer, dlq_producer, model: str = OLLAMA_MODEL):
-        self.name           = agent_name
-        self.input_topics   = input_topics
-        self.redis          = redis_client
-        self.db             = db_client
-        self.neo4j          = neo4j_client
-        self._producer      = kafka_producer
-        self._consumer      = kafka_consumer
-        self._dlq           = dlq_producer
-        self.model          = model
-        self.logger         = logging.getLogger(f"agent.{agent_name}")
-        self._processed     = 0
-        self._errors        = 0
-        self._started_at    = datetime.now(timezone.utc)
+    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3"):
+        self.name = agent_name
+        self.input_topics = input_topics
+        self.redis = redis_client 
+        self.db = db_client
+        self.neo4j = neo4j_client
+        self._producer = producer
+        self._consumer = consumer
+        self._dlq = dlq
+        self.model = model
+        self.logger = logging.getLogger(f"agent.{agent_name}")
+        self._processed = 0
+        self._errors = 0
+        self._started_at = datetime.now(timezone.utc)
+        
+        # ── BEST PRACTICE: Declare Class Shape in __init__ ──
+        # We declare them here so IDEs and Type Checkers know they exist,
+        # but we wait to instantiate them until we are inside the async event loop.
         self._session: Optional[aiohttp.ClientSession] = None
-        self._llm:     Optional[OllamaClient]           = None
+        self._llm: Optional[OllamaClient] = None
+        
+        # Concurrency bound: Limit inflight tasks to prevent memory explosion
         self._dispatch_semaphore = asyncio.Semaphore(10)
-
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pass
@@ -69,19 +74,29 @@ class SentinelAgent(ABC):
             self.logger.info(f"{self.name} cancelled — shutting down")
         finally:
             heartbeat_task.cancel()
-            await self._session.close()
+            if self._session:
+                await self._session.close()
             self._consumer.close()
 
     async def _consume_loop(self):
         loop = asyncio.get_running_loop()
         while True:
             try:
+                # poll is a blocking C-extension call, keep it in executor
                 messages = await loop.run_in_executor(None, self._consumer.raw.poll, 1.0)
                 if not messages:
                     continue
-                for _, msg_list in messages.items():
+                for tp, msg_list in messages.items():
+                    tasks = []
                     for msg in msg_list:
-                        asyncio.create_task(self._dispatch(msg.value))
+                        # Schedule all messages in this partition batch
+                        tasks.append(asyncio.create_task(self._dispatch(msg.value)))
+                    # Wait for all scheduled tasks to complete
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Only commit AFTER the async tasks have resolved safely
+                await loop.run_in_executor(None, self._consumer.commit)
+                    
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -100,6 +115,7 @@ class SentinelAgent(ABC):
                         key=result.get("agent_run_id", str(uuid.uuid4())),
                     )
                 self._processed += 1
+
                 elapsed = time.monotonic() - t0
                 if elapsed > 10:
                     self.logger.warning(f"Slow dispatch: {elapsed:.1f}s")
@@ -140,16 +156,16 @@ class SentinelAgent(ABC):
     def state_key(self, *parts: str) -> str:
         return f"sentinel:agents:{self.name}:{':'.join(parts)}"
 
-    def is_recently_processed(self, entity_id: str, window_seconds: int = 3600) -> bool:
-        return self.redis.raw.exists(self.state_key("seen", entity_id))
+    async def is_recently_processed(self, entity_id: str, window_seconds: int = 3600) -> bool:
+        return await self.redis.raw.exists(self.state_key("seen", entity_id))
 
-    def mark_processed(self, entity_id: str, window_seconds: int = 3600):
-        self.redis.raw.set(self.state_key("seen", entity_id), "1", ex=window_seconds)
+    async def mark_processed(self, entity_id: str, window_seconds: int = 3600):
+        await self.redis.raw.set(self.state_key("seen", entity_id), "1", ex=window_seconds)
 
-    def enqueue_task(self, task_type: str, payload: Dict, priority: str = "normal"):
+    async def enqueue_task(self, task_type: str, payload: Dict, priority: str = "normal"):
         queue = {"high": TASK_QUEUE_HIGH, "normal": TASK_QUEUE_NORMAL, "low": TASK_QUEUE_LOW}.get(priority, TASK_QUEUE_NORMAL)
         task = {
             "task_id": str(uuid.uuid4()), "task_type": task_type, "agent": self.name,
             "payload": payload, "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.redis.raw.rpush(queue, json.dumps(task))
+        await self.redis.raw.rpush(queue, json.dumps(task))

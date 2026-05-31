@@ -269,18 +269,19 @@ class OntologyMasterAgent(SentinelAgent):
             return 0
 
     # ── NEO4J PROMOTION ───────────────────────────────────────────────────────
-    
+    @property
+    def output_topic(self):
+        return "sentinel:ontology:proposals"
+
     async def _promote_to_neo4j(
         self,
         entity_name:    str,
         classification: EntityClassification,
     ):
         """
-        Promote a high-confidence or high-frequency entity to a Neo4j node.
-        This makes it queryable in graph traversals and path finding.
-        """
-        loop = asyncio.get_running_loop()
-        
+        The Agent no longer writes to Neo4j directly.
+        It generates a structured proposal and pushes it to Kafka for the Supervisor.
+        """        
         # Cypher Injection Validation (Already applied properly)
         raw_label = classification.entity_type.title().replace(" ", "").replace("_", "")
         if not re.match(r"^[A-Za-z0-9]+$", raw_label):
@@ -289,43 +290,35 @@ class OntologyMasterAgent(SentinelAgent):
         else:
             label = raw_label
 
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: self.neo4j.execute(f"""
-                    MERGE (e:{label} {{name: $name}})
-                    SET e.primary_domain    = $domain,
-                        e.macro_concepts    = $concepts,
-                        e.sanctions_risk    = $sanctions,
-                        e.confidence        = $confidence,
-                        e.classified_at     = datetime(),
-                        e.classifier        = 'ontology_agent'
-                """, {
-                    "name":       entity_name,
-                    "domain":     classification.primary_domain,
-                    "concepts":   classification.macro_concepts,
-                    "sanctions":  classification.sanctions_risk,
-                    "confidence": classification.confidence,
-                }),
-            )
+        proposal = {
+            "entity_id": entity_name,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {
+                "label": label,
+                "primary_domain": classification.primary_domain,
+                "macro_concepts": classification.macro_concepts,
+                "sanctions_risk": classification.sanctions_risk,
+                "confidence": classification.confidence
 
-            # Write geographic exposure relationships
-            for country in classification.geographic_exposure[:5]:
-                if len(country) == 2:  # ISO code
-                    await loop.run_in_executor(
-                        None,
-                        lambda c=country: self.neo4j.execute("""
-                            MERGE (e {name: $name})
-                            MERGE (country:Country {code: $code})
-                            MERGE (e)-[:HAS_EXPOSURE_IN]->(country)
-                        """, {"name": entity_name, "code": c}),
-                    )
+            }
+        }
+        self._producer.send("sentinel.ontology.proposals", proposal, key=entity_name)
 
-            logger.info(f"  Neo4j: promoted '{entity_name}' as {label}")
+        # Geographic exposures are sent as a separate relational proposal
+        for country in classification.geographic_exposure[:5]:
+            if len(country) == 2:  
+                rel_proposal = {
+                    "entity_id": entity_name,
+                    "action": "LINK_ENTITY",
+                    "data": {
+                        "target_id": country,
+                        "target_label": "Country",
+                        "relation_type": "HAS_EXPOSURE_IN"
+                    }
+                }
+                self._producer.send("sentinel.ontology.proposals", rel_proposal, key=entity_name)
 
-        except Exception as e:
-            logger.warning(f"Neo4j promotion failed for '{entity_name}': {e}")
-
+        logger.info(f"Proposed Neo4j promotion for '{entity_name}' with label '{label}' and domain '{classification.primary_domain}'")
     # ── DOWNSTREAM WATCHLIST TRIGGERS ─────────────────────────────────────────
 
     async def _trigger_watchlists(self, classification: EntityClassification):

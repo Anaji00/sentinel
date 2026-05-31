@@ -36,6 +36,7 @@ class Topics:
     RAW_NEWS = "events.raw.news"
     RAW_AVIATION = "events.raw.aviation"
     RAW_CYBER = "events.raw.cyber"
+    RAW_RADAR            = "events.raw.radar"
     SCENARIOS_GENERATED = "scenarios.generated"
     INTEL_BRIEFS         = "agents.intel.briefs"         # NewsIntelAgent output
     QUANT_DISCOVERIES    = "agents.quant.discoveries"    # QuantResearcherAgent output
@@ -60,7 +61,7 @@ class Topics:
     # get stuck in a loop trying to process it forever.
     DLQ = "dead.letter"
 
-    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, SCENARIOS_GENERATED]
+    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, RAW_RADAR, SCENARIOS_GENERATED]
 
 
 # ── SERIALIZATION ─────────────────────────────────────────────────────────────
@@ -105,15 +106,22 @@ class SentinelProducer:
         logger.info(f"Kafka Producer -> {servers}")
 
     
-    def send(self, topic: str, data: Dict[str, Any], key: str = None):
+    def send(self, topic: str, data: Dict[str, Any], key: str = None, headers: list = None):
+        """
+        Emits events to Kafka.
+        Headers support OpenTelemetry span injection across distributed boundaries.
+        Key enforces partition-hashing for strict chronological ordering per entity.
+        """
         try:
+            k_bytes = key.encode("utf-8") if key else None
             self._p.send(
                 topic,
                 value=data,
                 # KEY: The "Sorting Hat".
                 # Kafka guarantees that messages with the SAME key always go to the SAME partition.
                 # This ensures Event 1, 2, and 3 for "Vessel_A" are processed in order (1->2->3).
-                key=key.encode("utf-8") if key else None,
+                key=k_bytes,
+                headers=headers
             )
         except KafkaError as e:
             logger.error(f"Failed to send message to Kafka: {e}")
@@ -151,7 +159,6 @@ class SentinelConsumer:
             # If the code crashes and restarts, it looks up the bookmark and starts at Page 51.
             # (It's simpler than doing it manually, though slightly less precise).
             enable_auto_commit=False,
-            auto_commit_interval_ms=1000,
             api_version=(3, 5, 0),
         )
         self.raw = self._c
@@ -160,6 +167,12 @@ class SentinelConsumer:
     def __iter__(self):
         return iter(self._c)
 
+    def commit(self):
+        """
+        Explicitly advance the partition offset. 
+        Must be called ONLY after the processing pipeline safely completes all writes.
+        """
+        self._c.commit()
         
     def close(self):
         self._c.close()
