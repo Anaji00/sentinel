@@ -17,8 +17,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from kafka import KafkaConsumer as _Consumer
-from kafka import KafkaProducer as _Producer
+from aiokafka import AIOKafkaConsumer as _Consumer
+from aiokafka import AIOKafkaProducer as _Producer
 from kafka.errors import KafkaError
 
 logger = logging.getLogger(__name__)
@@ -76,8 +76,6 @@ def _serialize(obj: Any) -> bytes:
         raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
     return json.dumps(obj, default=default).encode("utf-8")
 
-def _deserialize(data: bytes) -> Any:
-    return json.loads(data.decode("utf-8"))
 
 # ── PRODUCER ────────────────────────────────────────────────────────────────
 
@@ -103,10 +101,16 @@ class SentinelProducer:
             compression_type="gzip",
             api_version=(3, 5, 0),
         )
+        self._started = False
         logger.info(f"Kafka Producer -> {servers}")
 
-    
-    def send(self, topic: str, data: Dict[str, Any], key: str = None, headers: list = None):
+    async def start(self):
+        """Must be called inside the async event loop to initialize network sockets."""
+        if not self._started:
+            await self._p.start()
+            self._started = True
+
+    async def send(self, topic: str, data: Dict[str, Any], key: str = None, headers: list = None):
         """
         Emits events to Kafka.
         Headers support OpenTelemetry span injection across distributed boundaries.
@@ -114,7 +118,7 @@ class SentinelProducer:
         """
         try:
             k_bytes = key.encode("utf-8") if key else None
-            self._p.send(
+            await self._p.send(
                 topic,
                 value=data,
                 # KEY: The "Sorting Hat".
@@ -126,9 +130,9 @@ class SentinelProducer:
         except KafkaError as e:
             logger.error(f"Failed to send message to Kafka: {e}")
             raise
-    def close(self):
-        self._p.flush()
-        self._p.close()
+    async def close(self):
+        if self._started:
+            await self._p.stop()
 
 # ── CONSUMER ────────────────────────────────────────────────────────────────
 
@@ -149,7 +153,6 @@ class SentinelConsumer:
             # Instance 1 gets 20% of the messages, Instance 2 gets 20%, etc.
             # If one crashes, the others pick up the slack.
             group_id=group_id,
-            value_deserializer=_deserialize,
             # AUTO_OFFSET_RESET: What to do if we have no bookmark?
             # 'latest'   = Start reading only NEW messages arriving now. (Ignore history)
             # 'earliest' = Start from the beginning of time. (Reprocess everything)
@@ -159,23 +162,35 @@ class SentinelConsumer:
             # If the code crashes and restarts, it looks up the bookmark and starts at Page 51.
             # (It's simpler than doing it manually, though slightly less precise).
             enable_auto_commit=False,
+            max_poll_records=100,
             api_version=(3, 5, 0),
         )
-        self.raw = self._c
+        self._started = False
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
         
-    def __iter__(self):
-        return iter(self._c)
+    async def start(self):
+        """Must be called inside the async event loop to initialize network sockets."""
+        if not self._started:
+            await self._c.start()
+            self._started = True
 
-    def commit(self):
+    async def get_batch(self, timeout_ms=1000):
+        """
+        Native async polling. Replaces the old loop.run_in_executor hack.
+        Returns a dictionary of {TopicPartition: [ConsumerRecord]}
+        """
+        return await self._c.getmany(timeout_ms=timeout_ms)
+
+    async def commit(self):
         """
         Explicitly advance the partition offset. 
         Must be called ONLY after the processing pipeline safely completes all writes.
         """
-        self._c.commit()
+        await self._c.commit()
         
-    def close(self):
-        self._c.close()
+    async def close(self):
+        if self._started:
+            await self._c.stop()
 
     
 

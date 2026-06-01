@@ -20,7 +20,7 @@ import redis.asyncio as aioredis
 from psycopg2 import pool as pgpool
 from psycopg2.extras import RealDictCursor
 import asyncpg
-from neo4j import GraphDatabase as _Neo4j
+from neo4j import AsyncGraphDatabase as _Neo4j
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +44,19 @@ class Neo4jClient:
             os.getenv("NEO4J_URI", "bolt://localhost:7687"), 
             auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "sentinel_graph"))
         )
-        self._driver.verify_connectivity()
+    async def connect(self):
+        if not self._driver:
+            self._driver = _Neo4j.driver(self._url, auth=self.auth)
+            await  self._driver.verify_connectivity()
 
-    def execute(self, cypher: str, params: dict = None):
-        with self._driver.session() as s:
-            s.run(cypher, **(params or {}))
+    async def execute(self, cypher: str, params: dict = None):
+        async with self._driver.session() as s:
+            await s.run(cypher, **(params or {}))
+    
+    async def close(self):
+        if self._driver:
+            await self._driver.close()
+
 
 # --- Singletons & Locks ---
 _async_redis: Optional[AsyncRedisClient] = None
@@ -65,11 +73,15 @@ async def get_async_redis() -> AsyncRedisClient:
             _async_redis = AsyncRedisClient()
     return _async_redis
 
-def get_neo4j() -> Neo4jClient:
-    """Synchronous Neo4j client. Should only be used by the GraphSupervisor."""
+async def get_neo4j() -> Neo4jClient:
+    """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
     global _neo4j
-    if _neo4j is None:
-        _neo4j = Neo4jClient()
+    if _neo4j is not None: return _neo4j
+    async with _db_lock:
+        if _neo4j is None:
+            client = Neo4jClient()
+            await client.connect()
+            _neo4j = client
     return _neo4j
 
 
