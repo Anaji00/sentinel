@@ -67,7 +67,7 @@ class MaritimeEnricher:
     
     # ── Position ──────────────────────────────────────────────────────────────
 
-    def _position(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
+    async def _position(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
         # 1. PARSE RAW DATA
         # Extract speed, heading, location from the raw JSON.
         pos = payload.get("Message", {}).get("PositionReport", {})
@@ -84,17 +84,17 @@ class MaritimeEnricher:
         # 2. RESOLVE IDENTITY (Who is this?)
         # We ask the resolver: "Who owns MMSI 123456789?"
         # Returns a dict with name, type, flags, etc.
-        vessel = self._get_vessel(mmsi, meta)
+        vessel = await self._get_vessel(mmsi, meta)
         flags = vessel.get("flags", [])
         vtype = vessel.get("vessel_type", "Unknown")
         
         # 3. SCORE ANOMALY (Is this weird?)
         # "Is a Tanker moving at 20 knots in the Strait of Hormuz suspicious?"
-        anomaly = self.scorer.score_vessel_position(mmsi, speed, region, flags, nav_status, vtype)
+        anomaly = await self.scorer.score_vessel_position(mmsi, speed, region, flags, nav_status, vtype)
 
         # 4. UPDATE BASELINE
         # "Remember that this ship usually moves at X speed."
-        self.scorer.update_vessel_baseline(mmsi, vtype, speed)
+        await self.scorer.update_vessel_baseline(mmsi, vtype, speed)
 
         # 5. WRITE TO DB (The Archive)
         # Store the raw ping in the massive TimescaleDB table.
@@ -106,18 +106,18 @@ class MaritimeEnricher:
         # 6. UPDATE CACHE (The Hot Path)
         # Save "Last Seen" to Redis. This is used by the Gap Detector to find
         # ships that suddenly go dark.
-        self.redis.set(
+        await self.redis.set(
             f"vessel:last_seen:{mmsi}",
             json.dumps({
                 "lat": lat, "lon": lon, "heading": heading,
                 "region": region, "speed": speed, "ts": (raw.occurred_at or datetime.now(timezone.utc)).isoformat(),
             }),
-            ttl = 172800 # 48 hours (if we don't see it for 2 days, the key expires)
+            ex = 172800 # 48 hours (if we don't see it for 2 days, the key expires)
         )
         
         # 7. UPDATE GRAPH (The Knowledge Base)
         # Update the Node in Neo4j. This is "upsert" - creates it if missing.
-        self.graph.upsert_vessel(mmsi, {
+        await self.graph.upsert_vessel(mmsi, {
             "name": vessel.get("name", ""),
             "vessel_type": vtype,
             "flag_state": vessel.get("flag_state", ""),

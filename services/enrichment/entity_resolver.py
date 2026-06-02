@@ -45,14 +45,14 @@ class EntityResolver:
 
     # ── Vessel ────────────────────────────────────────────────────────────────
 
-    def resolve_vessel(self, mmsi: str, ais_meta: dict = None) -> Dict:
+    async def resolve_vessel(self, mmsi: str, ais_meta: dict = None) -> Dict:
         """
         Finds out who a vessel is based on its MMSI number.
         """
         # ── LEVEL 1: REDIS (Hot Cache) ────────────────────────────────────────
         # Check if we looked this up in the last 24 hours.
         # If yes, return immediately. This handles 99% of traffic.
-        cached = self.redis.get(f"vessel:info:{mmsi}")
+        cached = await self.redis.get(f"vessel:info:{mmsi}")
         if cached:
             return json.loads(cached)
 
@@ -60,19 +60,14 @@ class EntityResolver:
         # If not in cache, ask the Graph Database.
         # This is where we store "Permanent" knowledge (Ownership, past sanctions).
         try:
-            result = self.neo4j.query_one(
-                "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v", {"mmsi": mmsi}
-            )
-            if result and result.get("v"):
-                data = dict(result["v"])
-                
-                # CACHE UPDATE:
-                # We found it in the graph! Save it to Redis for 24 hours so we
-                # don't have to ask Neo4j again soon.
-                self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ttl=86400)
+            # Assumes async_neo4j client implements a query/execute method returning records
+            cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state"
+            records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi}) # Assuming fetch implementation
+            if records:
+                data = dict(records[0])
+                await self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
                 return data
         except Exception as e:
-            # If the database fails, log it but don't crash. Fall back to inference.
             logger.debug(f"Neo4j vessel lookup failed ({mmsi}): {e}")
 
         # ── LEVEL 3: INFERENCE (Fallback) ─────────────────────────────────────
@@ -92,32 +87,35 @@ class EntityResolver:
         # Save this "Best Guess" profile for 1 hour.
         # Why only 1 hour? Because a real analyst might add the ship to Neo4j soon,
         # and we want to pick up the "Real" data when it becomes available.
-        self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ttl=3600)
+        await self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ttl=3600)
         return data
 
     # ── Aircraft ──────────────────────────────────────────────────────────────
 
-    def resolve_aircraft(self, icao24: str) -> Dict:
-        # Same 3-step logic as vessels, but for planes.
+    async def resolve_aircraft(self, icao24: str) -> Dict:
+        """Asynchronously resolves aircraft identity using cascading cache strategies."""
         
-        # 1. Redis
-        cached = self.redis.get(f"aircraft:info:{icao24}")
+        # 1. REDIS (Hot Cache)
+        cached = await self.redis.get(f"aircraft:info:{icao24}")
         if cached:
             return json.loads(cached)
             
-        # 2. Neo4j
+        # 2. NEO4J (The Graph)
         try:
-            result = self.neo4j.query_one(
-                "MATCH (a:Aircraft {icao24: $id}) RETURN a", {"id": icao24}
-            )
-            if result and result.get("a"):
-                data = dict(result["a"])
-                self.redis.set(f"aircraft:info:{icao24}", json.dumps(data), ttl=86400)
+            cypher = """
+                MATCH (a:Aircraft {icao24: $id}) 
+                RETURN a.callsign as callsign, a.origin_country as origin_country
+            """
+            records = await self.neo4j.execute_and_fetch(cypher, {"id": icao24})
+            
+            if records:
+                data = dict(records[0])
+                # Await the write to cache, mapping 'ex' for seconds
+                await self.redis.set(f"aircraft:info:{icao24}", json.dumps(data), ex=86400)
                 return data
         except Exception as e:
-            logger.debug(f"Neo4j aircraft lookup failed ({icao24}): {e}")
+            logger.debug(f"Neo4j async aircraft lookup failed ({icao24}): {e}")
             
-        # 3. No Fallback?
-        # Unlike AIS, ADS-B (aviation) signals often don't contain the airline name
-        # or model in every packet. If we don't know the plane, we return empty.
+        # 3. No Fallback
+        # ADS-B vectors often lack contextual static payload data. Fail cleanly.
         return {}

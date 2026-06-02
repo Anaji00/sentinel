@@ -26,25 +26,17 @@ class CryptoEnricher:
         self.redis = redis_client
     
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         # Extract the raw dictionary payload and the source identifier
-        p = raw.raw_payload
-        source = raw.source
-
-        # ROUTER: Decide which private processing method to use based on the source
-        if source == "ethereum_rpc":
-            return self._enrich_whale_transfer(raw, p)
-        elif source == "binance_futures":
-            return self._enrich_liquidation(raw, p)
-        elif source == "binance_spot":
-            return self._enrich_spot_trade(raw, p)
-        elif source == "binance_candles":
-            return self._enrich_candle(raw, p)
-        
-        # If the source is unknown, we drop the event by returning None
+        p, source = raw.raw_payload, raw.source
+        if source == "ethereum_rpc": return await self._enrich_whale_transfer(raw, p)
+        elif source == "binance_futures": return await self._enrich_liquidation(raw, p)
+        elif source == "binance_spot": return await self._enrich_spot_trade(raw, p)
+        elif source == "binance_candles": return await self._enrich_candle(raw, p)
         return None
+
     
-    def _enrich_spot_trade(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_spot_trade(self, raw, p) -> Optional[NormalizedEvent]:
         asset = p.get("asset", "UNKNOWN").upper()
         side = p.get("side", "UNKNOWN").upper()
 
@@ -58,7 +50,7 @@ class CryptoEnricher:
 # ISOLATION FOREST SCORING: 
         # Compare this trade's notional value against the recent historical distribution for THIS specific asset.
 
-        anomaly = self.scorer.score_crypto_trade(asset, notional, qty)
+        anomaly = await self.scorer.score_crypto_trade(asset, notional, qty)
         logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
         if anomaly < 0.6:
             return None
@@ -84,7 +76,7 @@ class CryptoEnricher:
             anomaly_score=round(anomaly, 3),
         )
     
-    def _enrich_candle(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_candle(self, raw, p) -> Optional[NormalizedEvent]:
         asset = p.get("asset", "UNKNOWN").upper()
         try:
             open_p = float(p.get("open", 0))
@@ -102,7 +94,7 @@ class CryptoEnricher:
         notional_volume = close_p * volume
         
         features = [price_change_pct, volatility_pct, notional_volume]
-        anomaly = self.scorer.score_crypto_candle(asset, features)
+        anomaly = await self.scorer.score_crypto_candle(asset, features)
         logger.info(f"🧠 ML INFERENCE | {asset} 1-min Candle | Score: {anomaly:.3f} | Price Change: {price_change_pct*100:.2f}% | Volatility: {volatility_pct*100:.2f}% | Notional Volume: ${notional_volume/1e6:.2f}M")
         if anomaly < 0.6:
             return None
@@ -134,7 +126,7 @@ class CryptoEnricher:
             anomaly_score=round(anomaly, 3),
         )
 
-    def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes large on-chain token/coin movements (whale transfers)."""
         wallet = p.get("receiver_wallet", "UNKNOWN")
         asset = p.get("asset", "UNKNOWN").upper()
@@ -167,7 +159,7 @@ class CryptoEnricher:
 
             if notional > 5_000_00:
                 try:
-                    self.redis.sadd("sentinel:watched:wallets", wallet)
+                    await self.redis.sadd("sentinel:watched:wallets", wallet)
                 except Exception as e:
                     logger.error(f"Redis connection failed while saving wallet {wallet[:6]}: {e}")
 

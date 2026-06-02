@@ -6,6 +6,7 @@ Runs spaCy NER to extract named entities.
 Scores sentiment and anomaly.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -68,7 +69,7 @@ class NewsEnricher:
                 self._nlp = False
         return self._nlp if self._nlp else None
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         p     = raw.raw_payload
         title = (p.get("title") or "").strip()
         if not title:
@@ -81,15 +82,16 @@ class NewsEnricher:
         named_entities: List[str] = []
         nlp = self._get_nlp()
         if nlp:
-            doc = nlp(f"{title}. {summary[:400]}")
+            loop = asyncio.get_running_loop()
+            # FIX: SpaCy NLP is heavy CPU Math! Offload to ThreadPool to save the event loop.
+            doc = await loop.run_in_executor(None, nlp, f"{title}. {summary[:400]}")
             named_entities = list(set(
                 ent.text for ent in doc.ents
-                if ent.label_ in ("GPE", "ORG", "PERSON", "NORP", "FAC", "LOC")
-                and len(ent.text) > 2
+                if ent.label_ in ("GPE", "ORG", "PERSON", "NORP", "FAC", "LOC") and len(ent.text) > 2
             ))[:20]
 
         sentiment = _sentiment(title + " " + summary[:200])
-        anomaly   = self.scorer.score_news(named_entities, sentiment, reliability)
+        anomaly   = await self.scorer.score_news(named_entities, sentiment, reliability)
 
         tags = list(p.get("tags", []))
         tags.append(p.get("category", "news"))

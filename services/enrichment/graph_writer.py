@@ -14,57 +14,55 @@ Phase 2 additions:
 """
 
 import logging
+from shared.kafka import SentinelProducer, Topics
 
 logger = logging.getLogger("enrichment.graph")
 
 
 class GraphWriter:
 
-    def __init__(self, neo4j_client):
-        self.neo4j = neo4j_client
+    def __init__(self, producer: SentinelProducer):
+        self.producer = producer
 
-    def upsert_vessel(self, mmsi: str, data: dict):
-        """
-        Create or update a Vessel node.
-        MERGE on mmsi so re-running on the same vessel updates in place.
-        Adds FLAGGED_AS edges for each flag string.
-        """
+    async def upsert_vessel(self, mmsi: str, data: dict):
+        """Routes structural creation to the GraphSupervisor via Kafka."""
         try:
-            self.neo4j.execute("""
-                MERGE (v:Vessel {mmsi: $mmsi})
-                SET v.name        = $name,
-                    v.vessel_type = $vessel_type,
-                    v.flag_state  = $flag_state,
-                    v.updated_at  = datetime()
-            """, {
-                "mmsi":        mmsi,
-                "name":        data.get("name", ""),
-                "vessel_type": data.get("vessel_type", ""),
-                "flag_state":  data.get("flag_state", ""),
-            })
+            # 1. Create the primary Node Proposal
+            proposal = {
+                "entity_id": mmsi,
+                "action": "MERGE_ONTOLOGY_NODE",
+                "data": {
+                    "label": "Vessel",
+                    "primary_domain": "maritime",
+                    "macro_concepts": [],
+                }
+            }
+            await self.producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=mmsi)
 
-            for flag in data.get("flags", []):
-                self.neo4j.execute("""
-                    MERGE (v:Vessel {mmsi: $mmsi})
-                    MERGE (f:Flag {type: $flag})
-                    MERGE (v)-[:FLAGGED_AS]->(f)
-                """, {"mmsi": mmsi, "flag": flag})
+            # 2. Append Flags as Tags dynamically
+            flags = data.get("flags", [])
+            if flags:
+                tag_proposal = {
+                    "entity_id": mmsi,
+                    "action": "ADD_TAGS",
+                    "data": {"tags": flags}
+                }
+                await self.producer.send(Topics.ONTOLOGY_PROPOSALS, tag_proposal, key=mmsi)
 
         except Exception as e:
-            logger.error(f"Neo4j vessel upsert failed ({mmsi}): {e}")
+            logger.error(f"Failed to route vessel {mmsi} to Supervisor: {e}")
 
-    def upsert_aircraft(self, icao24: str, data: dict):
-        """Create or update an Aircraft node."""
+    async def upsert_aircraft(self, icao24: str, data: dict):
         try:
-            self.neo4j.execute("""
-                MERGE (a:Aircraft {icao24: $icao24})
-                SET a.callsign       = $callsign,
-                    a.origin_country = $origin_country,
-                    a.updated_at     = datetime()
-            """, {
-                "icao24":         icao24,
-                "callsign":       data.get("callsign"),
-                "origin_country": data.get("origin_country"),
-            })
+            proposal = {
+                "entity_id": icao24,
+                "action": "MERGE_ONTOLOGY_NODE",
+                "data": {
+                    "label": "Aircraft",
+                    "primary_domain": "aviation",
+                    "macro_concepts": [],
+                }
+            }
+            await self.producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=icao24)
         except Exception as e:
-            logger.error(f"Neo4j aircraft upsert failed ({icao24}): {e}")
+            logger.error(f"Failed to route aircraft {icao24} to Supervisor: {e}")

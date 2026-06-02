@@ -22,6 +22,7 @@ import logging
 import os
 import sys
 import time
+import json
 from pathlib import Path
  
 # ── 2. THIRD-PARTY LIBRARY IMPORTS ────────────────────────────────────────────
@@ -46,7 +47,7 @@ logger = logging.getLogger("alert-manager")
 # These modules are shared across all Sentinel microservices.
 from shared.kafka import SentinelConsumer, Topics
 from shared.models import CorrelationCluster, AlertTier
-from shared.db import get_timescale, get_redis
+from shared.db import get_timescale, get_async_redis
  
 # ── 4. LOCAL RELATIVE IMPORTS ─────────────────────────────────────────────────
 # BEGINNER EXPLANATION: The dot (.) before formatters means "look in the current 
@@ -79,7 +80,7 @@ class AlertManager:
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._db      = get_timescale()
-        self._redis   = get_redis()
+        self._redis   = get_async_redis()
         self._sent = []
 
     async def handle(self, cluster: CorrelationCluster):
@@ -226,8 +227,8 @@ async def main():
     consumer = SentinelConsumer(
         topics=[Topics.CORRELATIONS],
         group_id="alert-manager",
-        auto_offset_reset="latest",
     )
+    await consumer.start()
     connector = aiohttp.TCPConnector(limit=5)
 
     # We use aiohttp.ClientSession so we can reuse the same network connection 
@@ -239,28 +240,26 @@ async def main():
             # --- THE OUTER LOOP ---
             # The 'while True' loop keeps the program running forever.
             while True:
-                try:
-                    # --- THE INNER LOOP (The Event Pump) ---
-                    # The consumer acts as a generator. This line will PAUSE the code here 
-                    # until a new message arrives from Kafka. 
-                    for message in consumer:
+                batches = await consumer.get_batch(timeout_ms=1000)
+                if not batches: continue
+                
+                for tp, messages in batches.items():
+                    for msg in messages:
                         try:
-                            # When a message arrives, it is fed in as a raw dictionary (`message.value`).
-                            # We unpack it (**) into our strongly-typed `CorrelationCluster` object.
-                            cluster = CorrelationCluster(**message.value)
-                            # Hand the data off to our processing pipeline (the `handle` method above).
+                            # FIX: Decode bytes securely
+                            payload = json.loads(msg.value.decode('utf-8'))
+                            cluster = CorrelationCluster(**payload)
                             await manager.handle(cluster)
-                            
                         except Exception as e:
-                            logger.error(f"Alert loop error: {e}", exc_info=True)
-                except StopIteration:
-                    continue
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-        
+                            logger.error(f"Alert processing error: {e}", exc_info=True)
+                
+                # FIX: Checkpoint completion
+                await consumer.commit()
+                
+        except asyncio.CancelledError:
+            pass
         finally:
-            consumer.close()
-
+            await consumer.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

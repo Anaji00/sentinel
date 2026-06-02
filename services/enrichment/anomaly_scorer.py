@@ -1,15 +1,16 @@
+import asyncio
 import os
 import json
 import numpy as np
 import onnxruntime as ort
 import logging
-from shared.db import get_redis
+from shared.db import get_async_redis
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
 class DynamicAnomalyScorer:
-    def __init__(self, redis_client):
-        self.redis = redis_client or get_redis()
+    def __init__(self, async_redis):
+        self.redis = async_redis or get_async_redis()
         self.sessions = {}
         self.alpha = 0.1
         self.z_score_threshold = 2.5
@@ -33,7 +34,7 @@ class DynamicAnomalyScorer:
     def _get_domain(self, event_type: str) -> str:
         return "spatial" if event_type in ["vessel_position", "vessel_dark", "bgp_hijack"] else "temporal"
 
-    def _get_temporal_sequence(self, event_type: str, new_features: list, seq_len: int = 10) -> list:
+    async def _get_temporal_sequence(self, event_type: str, new_features: list, seq_len: int = 10) -> list:
         """
         Maintains a rolling window of the last N ticks in Redis.
         Crucial for feeding the LSTM a continuous time-series sequence.
@@ -44,26 +45,26 @@ class DynamicAnomalyScorer:
 
         key = f"sentinel:ml:sequence:{event_type}"
         
-        # 1. Push newest tick to the left
-        self.redis.raw.lpush(key, json.dumps(new_features))
-        # 2. Trim so we only ever store the exact sequence length
-        self.redis.raw.ltrim(key, 0, seq_len - 1)
-        
-        # 3. Retrieve the sequence
-        raw_items = self.redis.raw.lrange(key, 0, -1)
-        sequence = [json.loads(item) for item in raw_items]
-        
-        # 4. Reverse it to chronological order (oldest -> newest)
-        sequence.reverse()
+        # PIPELINE ASYNC REDIS
+
+        pipe = self.redis.raw.pipeline()
+        pipe.lpush(key, json.dumps(new_features))
+        pipe.ltrim(key, 0, seq_len - 1)
+        pipe.lrange(key, 0, -1)
+        results = await pipe.execute()
+
+        raw_items = results[2]  # The result of lrange
+        sequence = [json.loads(item) for item in raw_items if item]
+        sequence.reverse()  # Oldest first
         return sequence
 
-    def _check_ema_gatekeeper(self, domain: str, raw_score: float) -> bool:
+    async def _check_ema_gatekeeper(self, domain: str, raw_score: float) -> bool:
         if not self.redis: return raw_score > 0.60
 
         mean_key = f"sentinel:ml:ema_mean:{domain}"
         var_key = f"sentinel:ml:ema_var:{domain}"  
-        current_mean = float(self.redis.raw.get(mean_key) or 0.5)
-        current_var = float(self.redis.raw.get(var_key) or 0.05)
+        current_mean = float(await self.redis.raw.get(mean_key) or 0.5)
+        current_var = float(await self.redis.raw.get(var_key) or 0.05)
         current_std = np.sqrt(current_var)
 
         dynamic_threshold = current_mean + (self.z_score_threshold * current_std)
@@ -73,12 +74,14 @@ class DynamicAnomalyScorer:
         new_mean = (self.alpha * raw_score) + ((1 - self.alpha) * current_mean)
         new_var = (self.alpha * (raw_score - current_mean)**2) + ((1 - self.alpha) * current_var)
 
-        self.redis.raw.set(mean_key, new_mean)
-        self.redis.raw.set(var_key, new_var)
+        pipe = self.redis.raw.pipeline()
+        pipe.set(mean_key, new_mean)
+        pipe.set(var_key, new_var)
+        await pipe.execute()
 
         return is_anomaly
     
-    def score_event(self, event_type: str, features: list) -> dict:
+    async def score_event(self, event_type: str, features: list) -> dict:
         """
         The Master Router: Shapes the data and executes the appropriate ONNX graph.
         """
@@ -89,21 +92,21 @@ class DynamicAnomalyScorer:
             return {"score": 0.0, "is_significant": False, "domain": domain}
         
         try:
+            loop = asyncio.get_running_loop()
             input_name = session.get_inputs()[0].name
-
             if domain == "spatial":
                 # ─── ISOLATION FOREST INFERENCE ───
                 # Shape: [1, N_features]
                 X = np.array(features, dtype=np.float32).reshape(1, -1)
                 
-                predictions = session.run(None, {input_name: X})
+                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
                 prob_dict = predictions[1][0] 
                 risk_score = float(prob_dict.get(-1, 0.5))
 
             else:
                 # ─── LSTM AUTOENCODER INFERENCE ───
                 seq_len = 10
-                sequence = self._get_temporal_sequence(event_type, features, seq_len)
+                sequence = await self._get_temporal_sequence(event_type, features, seq_len)
                 
                 if len(sequence) < seq_len:
                     # Cold start: Not enough data yet to form a full time-series sequence
@@ -112,17 +115,13 @@ class DynamicAnomalyScorer:
                 # Shape: [1, seq_len, N_features]
                 X = np.array(sequence, dtype=np.float32).reshape(1, seq_len, -1)
                 
-                predictions = session.run(None, {input_name: X})
+                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
                 reconstructed_X = predictions[0]
-
-                # Math: Mean Squared Error (Reconstruction Loss)
                 reconstruction_error = np.mean(np.square(X - reconstructed_X))
-
-                # Normalize the MSE to a standard 0.0 -> 1.0 Risk Score
                 risk_score = float(1.0 - np.exp(-reconstruction_error))
 
             # Pass the normalized risk score to the EMA Gatekeeper
-            is_significant = self._check_ema_gatekeeper(domain, risk_score)
+            is_significant = await self._check_ema_gatekeeper(domain, risk_score)
 
             return {
                 "score": round(risk_score, 4),
@@ -133,6 +132,7 @@ class DynamicAnomalyScorer:
         except Exception as e:
             logger.error(f"ONNX Scoring failed for {event_type}: {e}")
             return {"score": 0.0, "is_significant": False, "domain": domain}
+        
     def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
         sensitivity = 1.0 if region in ["Strait of Hormuz", "Red Sea"] else 0.5
         base = min(1.0, gap_hours / 48.0)
@@ -140,27 +140,28 @@ class DynamicAnomalyScorer:
             base = min(1.0, base * 1.5)
         return round(min(1.0, base * sensitivity / 3.0 + base * 0.5), 3)
 
-    def score_news(self, named_entities: list, sentiment: float, reliability: float) -> float:
+    # Note: All helper methods must now be async and use `await self.score_event(...)`
+    async def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
+        res = await self.score_event("crypto_trade", [notional / 1_000_000, qty / 1000, 0.0, 0.0, 0.0])
+        return res["score"]
+
+    async def score_crypto_candle(self, asset: str, features: list) -> float:
+        res = await self.score_event("crypto_trade", (features + [0.0] * 5)[:5])
+        return res["score"]
+
+    async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
+        res = await self.score_event("tradfi_trade", [notional / 1_000_000, volume / 100_000, 0.0, 0.0, 0.0])
+        return res["score"]
+
+    async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
+        res = await self.score_event("tradfi_trade", (features + [0.0] * 5)[:5])
+        return res["score"]
+
+    async def score_prediction_trade(self, asset_id: str, notional: float) -> float:
+        res = await self.score_event("prediction_market_trade", [notional / 100_000, 0.0, 0.0, 0.0, 0.0])
+        return res["score"]
+        
+    async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> float:
         base = abs(sentiment) * reliability
         entity_boost = min(0.3, len(named_entities) * 0.02)
         return round(min(1.0, base + entity_boost), 3)
-
-    def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
-        features = [notional / 1_000_000, qty / 1000, 0.0, 0.0, 0.0]
-        return self.score_event("crypto_trade", features)["score"]
-
-    def score_crypto_candle(self, asset: str, features: list) -> float:
-        padded = (features + [0.0] * 5)[:5]
-        return self.score_event("crypto_trade", padded)["score"]
-
-    def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
-        features = [notional / 1_000_000, volume / 100_000, 0.0, 0.0, 0.0]
-        return self.score_event("tradfi_trade", features)["score"]
-
-    def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
-        padded = (features + [0.0] * 5)[:5]
-        return self.score_event("tradfi_trade", padded)["score"]
-
-    def score_prediction_trade(self, asset_id: str, notional: float) -> float:
-        features = [notional / 100_000, 0.0, 0.0, 0.0, 0.0]
-        return self.score_event("prediction_market_trade", features)["score"]

@@ -25,7 +25,7 @@ load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
-from shared.db import get_redis
+from shared.db import get_async_redis
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
@@ -44,32 +44,34 @@ MAG_7 = ["MSFT", "AVGO", "GOOG", "AMZN", "TSLA", "AAPL", "NVDA", "MU"]
 
 class QuantRadar:
     def __init__(self, redis_client):
-        self.redis = redis_client or get_redis()
+        self.redis = redis_client
     
-    def _get_baseline(self, ticker: str) -> Tuple[float, float]:
+    async def _get_baseline(self, ticker: str) -> Tuple[float, float]:
         mean_key = f"sentinel:radar:mean:{ticker}"
         var_key = f"sentinel:radar:var:{ticker}"
 
-        mean = float(self.redis.raw.get(mean_key) or 0.0)
-        var = float(self.redis.raw.get(var_key) or 0.0)
+        mean = float(await self.redis.raw.get(mean_key) or 0.0)
+        var = float(await self.redis.raw.get(var_key) or 0.0)
 
         return mean, var
     
-    def _update_baseline(self, ticker: str, current_vol: float, mean: float, var: float):
+    async def _update_baseline(self, ticker: str, current_vol: float, mean: float, var: float):
         new_mean = (ALPHA * current_vol) + ((1 - ALPHA) * mean)
         new_var = (ALPHA * (current_vol - mean)**2) + ((1 - ALPHA) * var)
 
-        self.redis.raw.set(f"sentinel:radar:mean:{ticker}", new_mean)
-        self.redis.raw.set(f"sentinel:radar:var:{ticker}", new_var)
+        pipe = self.redis.raw.pipeline()
+        pipe.set(f"sentinel:radar:mean:{ticker}", new_mean)
+        pipe.set(f"sentinel:radar:var:{ticker}", new_var)
+        await pipe.execute()
 
-    def evaluate_volume(self, ticker:str, current_vol: float) -> Tuple[bool, float]:
-        mean, var = self._get_baseline(ticker)
+    async def evaluate_volume(self, ticker:str, current_vol: float) -> Tuple[bool, float]:
+        mean, var = await self._get_baseline(ticker)
         std_dev = np.sqrt(var)
         if mean == 0.0:
-            self._update_baseline(ticker, current_vol, current_vol, 1.0)
+            await self._update_baseline(ticker, current_vol, current_vol, 1.0)
             return False, 0.0
         z_score = (current_vol - mean) / std_dev
-        self._update_baseline(ticker, current_vol, mean, var)
+        await self._update_baseline(ticker, current_vol, mean, var)
         return z_score > Z_SCORE_THRESHOLD, z_score
 
 async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
@@ -115,20 +117,26 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
                     "occurred_at": datetime.now(timezone.utc).isoformat(),
                     "raw_payload": {"ticker": ticker, "z_score": round(z_score, 3), "volume": volume, "price": price, "notional_usd": notional, "trigger": "structural_volume_spike"}
                 }
-                producer.send(Topics.RAW_RADAR, event, key=ticker)
+                await producer.send(Topics.RAW_RADAR, event, key=ticker)
 
 async def main():
     if not ALPACA_API_KEY: sys.exit(1)
     producer = SentinelProducer()
-    radar = QuantRadar(get_redis())
+    await producer.start()
+    redis_client = get_async_redis()
+
+    radar = QuantRadar(redis_client)
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         universe = await fetch_tradable_universe(session)
-        while True:
-            t0 = asyncio.get_event_loop().time()
-            await poll_alpaca_snapshots(session, producer, radar, universe)
-            elapsed = asyncio.get_event_loop().time() - t0
-            await asyncio.sleep(max(0, 60.0 - elapsed))
+        try:
+            while True:
+                t0 = asyncio.get_event_loop().time()
+                await poll_alpaca_snapshots(session, producer, radar, universe)
+                elapsed = asyncio.get_event_loop().time() - t0
+                await asyncio.sleep(max(0, 60.0 - elapsed))
+        finally:
+            await producer.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
