@@ -82,21 +82,22 @@ class SentinelAgent(ABC):
         loop = asyncio.get_running_loop()
         while True:
             try:
-                # poll is a blocking C-extension call, keep it in executor
-                messages = await loop.run_in_executor(None, self._consumer.raw.poll, 1.0)
-                if not messages:
+                batches = await self._consumer.get_batch(timeout_ms=1000)
+                if not batches:
                     continue
-                for tp, msg_list in messages.items():
+                for tp, msg_list in batches.items():
                     tasks = []
                     for msg in msg_list:
-                        # Schedule all messages in this partition batch
-                        tasks.append(asyncio.create_task(self._dispatch(msg.value)))
-                    # Wait for all scheduled tasks to complete
+                        try:
+                            payload = json.loads(msg.value.decode('utf-8'))
+                            tasks.append(asyncio.create_task(self._dispatch(payload)))
+                        except json.JSONDecodeError as e:
+                            self.logger.error(f"POISON PILL dropped: {e}")
+                            await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
+
                     await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Only commit AFTER the async tasks have resolved safely
-                await loop.run_in_executor(None, self._consumer.commit)
-                    
+                await self._consumer.commit()
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:

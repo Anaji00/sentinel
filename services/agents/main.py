@@ -71,10 +71,7 @@ async def run_task_queue_worker(redis_client, agents: dict):
             # Since Redis `blpop` is synchronous and blocking, running it directly would freeze the entire asyncio event loop.
             # `run_in_executor(None, ...)` safely offloads this blocking call to a background thread pool.
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: redis_client.raw.blpop(queues, timeout=1),
-            )
+            result = await redis_client.raw.blpop(*queues, timeout=1.0)
 
             if not result:
                 continue

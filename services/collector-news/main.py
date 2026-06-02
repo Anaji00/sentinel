@@ -43,7 +43,7 @@ logger = logging.getLogger("collector.news")
  
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
-from shared.db import get_redis
+from shared.db import get_async_redis
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -122,22 +122,10 @@ class URLDeduplicator:
       Score < Cutoff" in O(log(N)). This creates a highly efficient "Sliding Window".
     """
     REDIS_KEY = "news:seen_urls"
-    def __init__(self):
-        self._redis = None
+    def __init__(self, redis_client):
+        self._redis = redis_client
         self._local_cache = {}
         self._last_prune = 0.0
-    
-    def _get_redis(self):
-        if self._redis is None:
-            try:
-                self._redis = get_redis()
-            except Exception:
-                # FAIL-SAFE:
-                # If Redis is down, we fallback to in-memory caching.
-                # This ensures the collector keeps running, though deduplication
-                # will reset if the service restarts.
-                logger.warning("Could not connect to Redis - using local dedup cache.")
-        return self._redis
     
     @staticmethod
     def _hash(url:str) -> str:
@@ -145,26 +133,26 @@ class URLDeduplicator:
         # A 16-char hex digest is sufficiently collision-resistant for news feed urls.
         return hashlib.sha256(url.encode()).hexdigest()[:16]
     
-    def is_seen(self, url:str) -> bool:
+    async def is_seen(self, url:str) -> bool:
         h = self._hash(url)
-        r = self._get_redis()
+        r = self._redis
         if r:
             # ZSCORE returns the score (timestamp) if exists, or None.
             # This acts as our existence check.
-            return r.raw.zscore(self.REDIS_KEY, h) is not None
+            return await r.raw.zscore(self.REDIS_KEY, h) is not None
         cutoff = time.time() - DEDUP_WINDOW_DAYS * 86400
         return self._local_cache.get(h, 0) > cutoff
     
-    def mark_seen(self, url:str) -> None:
+    async def mark_seen(self, url:str) -> None:
         h = self._hash(url)
-        r = self._get_redis()
+        r = self._redis
         now = time.time()
         if r:
-            r.raw.zadd(self.REDIS_KEY, {h: now})
+            await r.raw.zadd(self.REDIS_KEY, {h: now})
         else:
             self._local_cache[h] = now
 
-    def prune(self) -> None:
+    async def prune(self) -> None:
         """Remove entries older than DEDUP_WINDOW_DAYS. Called once per cycle."""
         now = time.time()
         # Throttling: Pruning is expensive (O(log N + M)), so we only run it once per hour.
@@ -172,11 +160,11 @@ class URLDeduplicator:
             return
         self._last_prune = now
         cutoff = now - DEDUP_WINDOW_DAYS * 86400
-        r = self._get_redis()
+        r = self._redis
         if r:
             # ZREMRANGEBYSCORE: The magic command. Instantly drops all hashes
             # where the score (timestamp) is between 0 and cutoff.
-            removed = r.raw.zremrangebyscore(self.REDIS_KEY, 0, cutoff)
+            removed = await r.raw.zremrangebyscore(self.REDIS_KEY, 0, cutoff)
             if removed:
                 logger.debug(f"Dedup pruned {removed} stale URL hashes")
         else:
@@ -221,7 +209,7 @@ async def poll_feed(
                 logger.debug(f"{feed_name}: HTTP {resp.status}")
                 return 0
 
-            content = await resp.read()
+            content = await resp.text(errors='ignore')
 
         # ── KEY CONCEPT: Blocking vs Async ────────────────────────────────────
         # feedparser is a "blocking" (CPU-bound) library. It does extensive regex
@@ -237,7 +225,7 @@ async def poll_feed(
         for entry in feed.entries[:50]:
             url = entry.get("link", "")
             # Filter: If URL has been seen in the last 30 days, skip entirely.
-            if not url or dedup.is_seen(url):
+            if not url or await dedup.is_seen(url):
                 continue
 
             title = str(entry.get("title", "")).strip()
@@ -265,8 +253,14 @@ async def poll_feed(
             # Kafka Producer: The 'key' determines the partition.
             # Using 'feed_name' ensures all news from 'Reuters' lands in the same
             # Kafka partition, preserving partial ordering if needed.
-            producer.send(Topics.RAW_NEWS, event.model_dump(mode="json"), key=feed_name)
-            dedup.mark_seen(url)
+            try:
+                await producer.send(Topics.RAW_NEWS, event.model_dump(mode="json"), key=feed_name)
+            except Exception as e:
+                logger.error(f"{feed_name}: Failed to send event — {e}")
+                continue
+            finally:
+                await producer.close()
+            await dedup.mark_seen(url)
             new_count += 1
 
     except asyncio.TimeoutError:
@@ -307,7 +301,7 @@ async def collect(producer: SentinelProducer):
                 else:
                     total_new += result
                 
-            dedup.prune()
+            await dedup.prune()
             elapsed = time.time() - t0
 
             logger.info(
@@ -322,13 +316,18 @@ async def main():
     logger.info(f"Feeds: {len(FEEDS)}  |  Poll interval: {POLL_INTERVAL}s")
     logger.info("=" * 60)
     producer = SentinelProducer()
+    await producer.start()
 
+    redis_client = get_async_redis()
+    
     try:
-        await collect(producer)
+        await collect(producer, redis_client)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        producer.close()
+        await producer.close()
         
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
