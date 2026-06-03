@@ -11,15 +11,15 @@ logger = logging.getLogger("agent.supervisor")
 ALLOWED_RELATIONS = {"RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", "HAS_EXPOSURE_IN", "CORRELATED_WITH"}
 
 class GraphSupervisor:
-    def __init__(self):
-        self.redis = get_redis()
-        self.neo4j = get_neo4j()
-        
+    def __init__(self, redis_client, neo4j_client):
+        self.redis = redis_client
+        self.neo4j = neo4j_client
+
     async def acquire_lock(self, entity_id: str, timeout: int = 5) -> bool:
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
         end_time = time.time() + timeout
         while time.time() < end_time:
-            if await self.redis.raw.set(lock_key, "locked", nx=True, ex=5):
+            if await self.redis.raw.set(lock_key, "locked", nx=True, ex=15):
                 return True
             await asyncio.sleep(0.1)
         return False
@@ -53,7 +53,7 @@ class GraphSupervisor:
                     e.confidence = $confidence,
                     e.updated_at = datetime()
                 """
-                self.neo4j.execute(cypher, {
+                await self.neo4j.execute(cypher, {
                     "name": entity_id, "domain": data.get("primary_domain"),
                     "concepts": data.get("macro_concepts"), "sanctions": data.get("sanctions_risk"),
                     "confidence": data.get("confidence")
@@ -75,7 +75,7 @@ class GraphSupervisor:
                 MERGE (a)-[r:{relation}]->(b)
                 SET r.weight = $weight, r.updated_at = datetime()
                 """
-                self.neo4j.execute(cypher, {"id": entity_id, "target_id": target_id, "weight": data.get("weight", 1.0)})
+                await self.neo4j.execute(cypher, {"id": entity_id, "target_id": target_id, "weight": data.get("weight", 1.0)})
                 logger.info(f"✅ Created Edge: {entity_id} -[{relation}]-> {target_id}")
 
             elif action == "ADD_TAGS":
@@ -105,7 +105,7 @@ async def start_supervisor():
     import os
     logger.info("🛡️ Graph Supervisor Online. Protecting Neo4j state.")
     redis_client = await get_async_redis()
-    neo4j_client = get_neo4j()
+    neo4j_client = await get_neo4j()
     supervisor = GraphSupervisor(redis_client, neo4j_client)
     
     servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -113,15 +113,34 @@ async def start_supervisor():
         "sentinel.ontology.proposals",
         bootstrap_servers=servers,
         group_id="supervisor-group",
-        enable_auto_commit=False
+        enable_auto_commit=False,
+        max_poll_records=100,
     )
     await consumer.start()
     
     try:
-        async for msg in consumer:
-            payload = json.loads(msg.value.decode('utf-8'))
-            await supervisor.execute_proposal(payload)
-            await consumer.commit()
+        while True:
+            # CRITICAL FIX: Batch polling eliminates "Kafka Coordinator Hammering"
+            batches = await consumer.getmany(timeout_ms=1000)
+            if not batches:
+                continue
+
+            for tp, messages in batches.items():
+                for msg in messages:
+                    try:
+                        # CRITICAL FIX: Poison Pill catch block
+                        payload = json.loads(msg.value.decode('utf-8'))
+                        await supervisor.execute_proposal(payload)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"POISON PILL JSON dropped on partition {tp.partition}: {e}")
+                    except Exception as e:
+                        logger.error(f"Unexpected error executing proposal: {e}")
+                
+                # CRITICAL FIX: Commit once per partition batch, NOT per message!
+                await consumer.commit()
+                
+    except asyncio.CancelledError:
+        logger.info("Graph Supervisor shutting down cleanly.")
     finally:
         await consumer.stop()
 

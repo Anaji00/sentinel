@@ -54,8 +54,9 @@ def _sentiment(text: str) -> float:
 
 class NewsEnricher:
 
-    def __init__(self, scorer):
+    def __init__(self, scorer, graph_writer):
         self.scorer = scorer
+        self.graph = graph_writer
         self._nlp   = None   # lazy-loaded on first use
 
     def _get_nlp(self):
@@ -92,6 +93,19 @@ class NewsEnricher:
 
         sentiment = _sentiment(title + " " + summary[:200])
         anomaly   = await self.scorer.score_news(named_entities, sentiment, reliability)
+        
+        if named_entities and self.graph:
+            graph_tasks = []
+            for ent in named_entities:
+                graph_tasks.append(
+                    self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                        "entity_id": ent,
+                        "action": "MERGE_ONTOLOGY_NODE",
+                        "data": {"label": "Concept", "primary_domain": "geopolitical"}
+                    }, key=ent)
+                )
+            # Gather prevents sequential network blocking
+            await asyncio.gather(*graph_tasks, return_exceptions=True)
 
         tags = list(p.get("tags", []))
         tags.append(p.get("category", "news"))

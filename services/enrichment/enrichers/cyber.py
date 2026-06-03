@@ -20,7 +20,9 @@ from datetime import datetime, timezone
 from typing import Optional
 from shared.db import get_redis
 # Import the standard models (Data Schemas) shared across the SENTINEL platform.
+from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, SecurityData
+from shared.models.events import RawEvent
 
 # Initialize the logger specific to this cyber module.
 logger = logging.getLogger("enrichment.cyber")
@@ -51,21 +53,30 @@ class CyberEnricher:
     Translates raw cyber security alerts into standardized NormalizedEvents.
     Routes on raw.source to the correct private handler.
     """
-    def __init__(self, scorer):
-        # Save the anomaly scorer instance passed into this class so we can use it later.
+    def __init__(self, scorer, graph_writer, db_writer, redis_client):
         self.scorer = scorer
-        self.redis = get_redis()
+        self.graph = graph_writer
+        self.db = db_writer
+        self.redis = redis_client
     
-    def _calculate_velocity_score(self, entity_id: str, event_category: str, threshold: int = 100) -> float:
+    async def _calculate_velocity_score(self, entity_id: str, event_category: str, threshold: int = 100) -> float:
         key = f"sentinel:velocity:{event_category}:{entity_id}"
 
         try:
-            count = self.redis.incr(key)
-            if count == 1:
-                self.redis.raw.expire(key, 60)
+            # FIX: Await Async Redis I/O
+            # Note: Depending on your redis wrapper, this might be self.redis.raw.incr
+            if hasattr(self.redis, "raw"):
+                count = await self.redis.raw.incr(key)
+                if count == 1:
+                    await self.redis.raw.expire(key, 60)
+            else:
+                count = await self.redis.incr(key)
+                if count == 1:
+                    await self.redis.expire(key, 60)
             
             if count < threshold:
                 return 0.0
+                
             base_score = 0.5
             scale_factor = (count - threshold) / 1000.0
             return min(1.0, base_score + scale_factor)
@@ -74,7 +85,7 @@ class CyberEnricher:
             return 0.0
 
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw: RawEvent) -> Optional[NormalizedEvent]:
         """
         Main entry point. Routes the raw event to the correct parser method based on
         the source of the data.
@@ -85,21 +96,21 @@ class CyberEnricher:
 
         # Route to specific handlers.
         if source in ("censys", "censys_monitor", "shadowserver_feed"):
-            return self._enrich_exposure(raw, p)
+            return await self._enrich_exposure(raw, p)
         elif source in ("cisa_kev", "cisa_kev_feed"):
-            return self._enrich_cisa_kev(raw, p)
+            return await self._enrich_cisa_kev(raw, p)
         elif source in ("bgp_monitor", "ripe_ris"):
-            return self._enrich_bgp(raw, p)
+            return await self._enrich_bgp(raw, p)
         elif source in ("ransomware_feed", "ransomware_live", "darkfeed"):
-            return self._enrich_ransomware(raw, p)
+            return await self._enrich_ransomware(raw, p)
         elif source == "breach_monitor":
-            return self._enrich_breach(raw, p)
+            return await self._enrich_breach(raw, p)
             
         return None
     
     # ── Exposed Infrastructure ────────────────────────────────────────────────
 
-    def _enrich_exposure(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_exposure(self, raw: RawEvent, p: dict) -> Optional[NormalizedEvent]:
         """
         Parses events from Censys Search API or Shadowserver daily feeds.
         Looks for critical industrial control systems (e.g., ports 502, 102) 
@@ -167,7 +178,7 @@ class CyberEnricher:
         
     # ── BGP Anomaly ───────────────────────────────────────────────────────────
 
-    def _enrich_cisa_kev(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_cisa_kev(self, raw, p) -> Optional[NormalizedEvent]:
         """
         Parses events from CISA KEV (Known Exploited Vulnerabilities) feed.
         These are critical vulnerabilities that have been observed being actively exploited in the wild.
@@ -211,6 +222,13 @@ class CyberEnricher:
             country_code= "US" if vendor else None,  # Assume US-based if vendor is known, else None
         )
         
+        # FIX: Asynchronously propose graph structural updates
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": cve_id,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Vulnerability", "primary_domain": "cyber", "confidence": anomaly}
+        }, key=cve_id)
+        
         event_type = getattr(EventType, "VULNERABILITY", EventType.INFRA_EXPOSED)
         return NormalizedEvent(
             event_id=raw.event_id,
@@ -228,7 +246,7 @@ class CyberEnricher:
             tags=tags,
             anomaly_score=anomaly,
         )
-    def _enrich_bgp(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_bgp(self, raw, p) -> Optional[NormalizedEvent]:
         """
         Parses Border Gateway Protocol (BGP) alerts. BGP is how internet traffic is routed.
         A "Hijack" means an unauthorized entity is stealing or rerouting internet traffic.
@@ -252,19 +270,25 @@ class CyberEnricher:
         if hijack:
             anomaly = 0.90
         else:
-            anomaly = self._calculate_velocity_score(f"AS{origin}", "bgp", threshold=50)
+            anomaly = await self._calculate_velocity_score(f"AS{origin}", "bgp", threshold=50)
             if anomaly == 0.0: return None
 
         tags = ["bgp_anomaly", "routing"]
         if hijack:
             tags.append("bgp_hijack")
 
-        # Represent the Autonomous System as the primary entity.
-        # (FIX: Corrected a typo here where 'INFASTRUCTURE' was used instead of 'INFRASTRUCTURE')
+        entity_id = f"AS{origin}"
         entity = Entity(
-            id=f"AS{origin}", type = EntityType.INFRASTRUCTURE,
+            id=entity_id, type=EntityType.INFRASTRUCTURE,
             name=as_name, country_code=country or None,
         )
+
+        # FIX: Asynchronously propose graph structural updates
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": entity_id,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Infrastructure", "primary_domain": "cyber", "confidence": anomaly}
+        }, key=entity_id)
 
         # Build and return the standardized event.
         return NormalizedEvent(
@@ -285,7 +309,7 @@ class CyberEnricher:
         )
         
     # ── Ransomware Victim Post ───────────────────────────────────────────────
-    def _enrich_ransomware(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_ransomware(self, raw, p) -> Optional[NormalizedEvent]:
         """
         Parses events from dark web monitors that scrape ransomware leak sites 
         (e.g., LockBit or LockBit posting a new victim).
@@ -322,6 +346,13 @@ class CyberEnricher:
             id=victim, type=EntityType.COMPANY,
             name=victim, country_code=country or None,
         )
+
+        # FIX: Asynchronously propose graph structural updates
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": victim,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "cyber"}
+        }, key=victim)
  
         return NormalizedEvent(
             event_id=raw.event_id,
@@ -341,7 +372,7 @@ class CyberEnricher:
         )
      
     # ── Credential Breach ─────────────────────────────────────────────────────
-    def _enrich_breach(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_breach(self, raw, p) -> Optional[NormalizedEvent]:
         """
         Parses massive database leaks (e.g., a SQL database dumped on a forum).
         """
@@ -367,6 +398,12 @@ class CyberEnricher:
             id=org, type=EntityType.COMPANY,
             name=org, country_code=country or None,
         )
+
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": org,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "cyber"}
+        }, key=org)
         
         return NormalizedEvent(
             event_id=raw.event_id,

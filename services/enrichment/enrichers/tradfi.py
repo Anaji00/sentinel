@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, FinancialData
 import re 
 
@@ -27,26 +28,28 @@ FORM4_CODES = {
 
 class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
-    def __init__(self, scorer, redis_client):
+    def __init__(self, scorer, redis_client, db_writer, graph_writer):
         self.scorer = scorer
         self.redis_client = redis_client
+        self.db = db_writer
+        self.graph = graph_writer
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         p = raw.raw_payload
         source = raw.source
 
         if source == "finnhub_equities":
             trade_type = p.get("trade_type", "RAW_TRADE")
             if trade_type == "OHLCV_MINUTE_BAR":
-                return self._enrich_equity_candle(raw, p)
+                return await self._enrich_equity_candle(raw, p)
             else:   
-                return self._enrich_equity_trade(raw, p)
+                return await self._enrich_equity_trade(raw, p)
         elif source == "sec_form4":
-            return self._enrich_insider(raw, p)
+            return await self._enrich_insider(raw, p)
             
         return None
 
-    def _enrich_equity_trade(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_equity_trade(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
         if not ticker or ticker == "UNKNOWN": return None
         
@@ -55,12 +58,19 @@ class TradFiEnricher:
         notional = float(p.get("notional_usd") or (price * volume))
         
         # Send to Anomaly Scorer for ML isolation forest & volume ratio check
-        anomaly = self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
+        anomaly = await self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
         logger.info(f"🧠 ML INFERENCE | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
         if anomaly < 0.6:  # Strict floor. Ignore non-anomalous trades.
             return None
         tags = ["tradfi", "equity_block", ticker.lower()]
-        self._sync_geo_watchlist(ticker, tags)
+        await self._sync_geo_watchlist(ticker, tags)
+        await self._update_volume_baseline(ticker, volume)
+
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": ticker,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "financial", "confidence": anomaly}
+        }, key=ticker)
 
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
@@ -85,7 +95,7 @@ class TradFiEnricher:
             anomaly_score=anomaly,
         )
 
-    def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
         # 1 minute ohcvl bars for volume spike detection
         ticker = (p.get("ticker") or "").upper()
         if not ticker: return None
@@ -106,12 +116,20 @@ class TradFiEnricher:
 
         # ML SCORING: Compare this minute's structure against historical 1-minute structures
         features = [price_change_pct, volatility_pct, notional]
-        anomaly = self.scorer.score_market_candle("tradfi", ticker, features)
+        anomaly = await self.scorer.score_market_candle("tradfi", ticker, features)
         logger.info(f"🧠 ML 1-MINUTE CANDLE INFERENCE | {ticker} Candle | Score: {anomaly:.3f} | Price Change: {price_change_pct*100:.2f}% | Volatility: {volatility_pct*100:.2f}% | Notional: ${notional/1e6:.2f}M")
         if anomaly < 0.6:
             return None
         tags = ["tradfi", "market_structure", "volatile_candle", ticker.lower()]
-        self._sync_geo_watchlist(ticker, tags)
+        await self._sync_geo_watchlist(ticker, tags)
+        await self._update_volume_baseline(ticker, volume)
+
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": ticker,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "financial", "confidence": anomaly}
+        }, key=ticker)
+        
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
         direction = "🟢 Bullish" if close_p >= open_p else "🔴 Bearish"
 
@@ -138,22 +156,28 @@ class TradFiEnricher:
             anomaly_score=anomaly,
         )
 
-    def _sync_geo_watchlist(self, ticker, tags):
+    async def _sync_geo_watchlist(self, ticker, tags):
         if ticker in GEO_INSTRUMENTS:
             tags.append("geo_linked_asset")
             tags.append(GEO_INSTRUMENTS[ticker])
             try:
-                self.redis_client.sadd("sentinel:watched:equities", ticker)
+                await self.redis_client.sadd("sentinel:watched:equities", ticker)
             except Exception as e:
                 logger.error(f"Failed to update geo watchlist for {ticker}: {e}", exc_info=True)
+                
+    async def _update_volume_baseline(self, ticker: str, volume: float):
+        """EMA baselining (α=0.05) to detect accumulation sweeps in thin markets."""
+        try:
+            key = f"baseline:volume:{ticker}"
+            current = await self.redis_client.get(key)
+            updated = (0.95 * float(current) + 0.05 * volume) if current else volume
+            await self.redis_client.set(key, str(round(updated, 3)), ex=604800)
+        except Exception as e:
+            logger.error(f"Failed to update volume baseline for {ticker}: {e}")
 
-    def _enrich_insider(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_insider(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
         if not ticker:
-            link = p.get("link", "")
-            # SEC EDGAR URLs typically follow: https://www.sec.gov/Archives/edgar/data/[CIK]/[ACCESSION]/xslF345X03/primary_doc.xml
-            # Or Ownership search links: https://www.sec.gov/cgi-bin/own-disp?action=getissuer&CIK=0000320193
-            # We parse the title which format is: "Form 4 - [Company Name] ( [TICKER] ) (Reporting)"
             title = p.get("title", "")
             match = re.search(r'\(\s*([A-Za-z]+)\s*\)', title)
             if match:
@@ -184,6 +208,12 @@ class TradFiEnricher:
         if code == "P":
             anomaly = min(1.0, anomaly * 1.2)
 
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": ticker,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "financial"}
+        }, key=ticker)
+
         return NormalizedEvent(
             event_id=raw.event_id,
             type=EventType.INSIDER_TRADE,
@@ -197,13 +227,3 @@ class TradFiEnricher:
             tags=["tradfi", "insider_trade", ticker.lower(), code_label.lower().replace(" ", "_")],
             anomaly_score=round(anomaly, 3),
         )
-
-    def _update_volume_baseline(self, ticker: str, volume: float):
-        """EMA baselining (α=0.05) to detect accumulation sweeps in thin markets."""
-        try:
-            key = f"baseline:volume:{ticker}"
-            current = self.redis_client.get(key)
-            updated = (0.95 * float(current) + 0.05 * volume) if current else volume
-            self.redis_client.set(key, str(round(updated, 3)), ttl=604800)
-        except Exception:
-            pass # Failsafe against cache drops

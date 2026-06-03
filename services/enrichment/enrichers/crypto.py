@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData
-
+from shared.kafka import Topics
 
 logger = logging.getLogger("enrichment.crypto")
 
@@ -19,12 +19,13 @@ class CryptoEnricher:
     Standardizes cryptocurrency events. It uses a routing mechanism to handle 
     different types of crypto data sources (e.g., on-chain RPCs vs. CEX WebSockets).
     """
-    def __init__(self, scorer, redis_client):
+    def __init__(self, scorer, redis_client, graph_writer):
         # The scorer is used to determine how "unusual" an event is.
         # This class calculates baseline anomaly scores mathematically.
         self.scorer = scorer
         self.redis = redis_client
-    
+        self.graph = graph_writer
+
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
         # Extract the raw dictionary payload and the source identifier
@@ -47,7 +48,7 @@ class CryptoEnricher:
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to parse price/qty for spot trade: {e}")
             return None
-# ISOLATION FOREST SCORING: 
+        # ISOLATION FOREST SCORING: 
         # Compare this trade's notional value against the recent historical distribution for THIS specific asset.
 
         anomaly = await self.scorer.score_crypto_trade(asset, notional, qty)
@@ -58,6 +59,13 @@ class CryptoEnricher:
         tags = ["crypto", "spot_trade", asset.lower(), side.lower()]
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
         headline = f"🐋 ML Outlier CRYPTO Trade ({side}): ${notional/1e6:.2f}M {asset} at ${price:,.2f}"
+
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": asset,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
+        }, key=asset)
+
         return NormalizedEvent(
             event_id=raw.event_id,
             type = EventType.CRYPTO_TRADE,
@@ -104,6 +112,12 @@ class CryptoEnricher:
         headline = f"{direction} Crypto Anomaly: {asset} moved {price_change_pct*100:.2f}% on ${notional_volume/1e6:.1f}M vol"
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": asset,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
+        }, key=asset)
+
         return NormalizedEvent(
             event_id=raw.event_id,
             type=EventType.MARKET_ANOMALY,
@@ -129,6 +143,7 @@ class CryptoEnricher:
     async def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes large on-chain token/coin movements (whale transfers)."""
         wallet = p.get("receiver_wallet", "UNKNOWN")
+        sender = p.get("sender_wallet", "UNKNOWN")
         asset = p.get("asset", "UNKNOWN").upper()
         is_suspect = p.get("is_suspect_wallet", False)
 
@@ -163,6 +178,13 @@ class CryptoEnricher:
                 except Exception as e:
                     logger.error(f"Redis connection failed while saving wallet {wallet[:6]}: {e}")
 
+            if sender != "UNKNOWN" and wallet != "UNKNOWN":
+                await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                    "entity_id": sender,
+                    "action": "LINK_ENTITY",
+                    "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "RELATED_TO", "weight": anomaly}
+                }, key=sender)
+
         # Create a unified Entity object to represent the wallet in our graph database
         entity = Entity(id=wallet, type=EntityType.ORGANIZATION, name=f"Wallet_{wallet[:6]}")
 
@@ -186,7 +208,7 @@ class CryptoEnricher:
             anomaly_score=round(anomaly, 3),
         )
 
-    def _enrich_liquidation(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_liquidation(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes forced closures of leveraged positions on centralized exchanges."""
         asset = p.get("asset", "UNKNOWN")
         side = p.get("side", "UNKNOWN")
@@ -213,6 +235,11 @@ class CryptoEnricher:
             tags = ["crypto", "liquidation", asset.lower(), side.lower()]
             headline = f"Massive Liquidation ({side}): ${notional/1e6:.1f}M {asset}"
 
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": asset,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
+        }, key=asset)
         # The primary entity here is the asset itself (e.g., BTC, ETH)
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 

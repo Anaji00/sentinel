@@ -10,10 +10,12 @@ Process:
   4. Enriches with geographic context (Is this plane over a conflict zone?).
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from shared.kafka import Topics
 from shared.models import (
     NormalizedEvent, EventType, Entity, EntityType, FlightData,
 )
@@ -32,13 +34,14 @@ SQUAWK_LABELS = {
 
 class AviationEnricher:
 
-    def __init__(self, scorer, graph_writer):
-        # Scorer: Calculates risk (0.0 - 1.0)
-        # Graph: Updates the Neo4j database (Aircraft nodes)
+    def __init__(self, scorer, graph_writer, db_writer, redis_client, resolver=None):
         self.scorer = scorer
         self.graph  = graph_writer
+        self.db = db_writer
+        self.redis = redis_client
+        self.resolver = resolver
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         """
         Main processing loop for aviation data.
         Returns None if the event is irrelevant (e.g., ground traffic).
@@ -94,6 +97,32 @@ class AviationEnricher:
         alt_m  = p.get("baro_altitude") or p.get("geo_altitude")
         alt_ft = round(alt_m * 3.28084) if alt_m else None
 
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": icao24,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {
+                "label": "Aircraft", 
+                "primary_domain": "aviation",
+                "confidence": min(1.0, score + 0.5)
+            }
+        }, key=icao24)
+
+        # FIX: Update hot-cache state for downstream trackers (Native Async)
+        if lat and lon:
+            try:
+                await self.redis.set(
+                    f"aircraft:last_seen:{icao24}",
+                    json.dumps({
+                        "lat": lat, 
+                        "lon": lon, 
+                        "alt": alt_ft,
+                        "ts": datetime.now(timezone.utc).isoformat()
+                    }),
+                    ex=86400 # 24 hours
+                )
+            except Exception as e:
+                logger.debug(f"Failed to cache aircraft position for {icao24}: {e}")
+                
         # 4. TAGGING
         tags = []
         if region:

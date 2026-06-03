@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
  
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
@@ -54,15 +54,14 @@ class VesselGapDetector:
                 await self._check()
             except Exception as e:
                 logger.error(f"Error in gap detector: {e}", exc_info=True)
+            await asyncio.sleep(300) # Additional sleep to prevent tight loop on errors
     async def _check(self):
-        keys = list(self.redis.raw.scan_iter("vessel:last_seen:*"))
-        if not keys:
-            logger.info("Gap Detector: No vessels tracked in Redis, skipping check")
-            return
         now = datetime.now(timezone.utc)
         fired = 0
-
-        for key in keys:
+        has_keys = False
+        batch_events_to_write = List[NormalizedEvent] = []
+        async for key in self.redis.raw.scan_iter("vessel:last_seen:*"):
+            has_keys = True
             try:
                 key_str = key.decode("utf-8") if isinstance(key, bytes) else key
                 mmsi = key_str.replace("vessel:last_seen:", "")
@@ -85,7 +84,7 @@ class VesselGapDetector:
 
                 if not isinstance(val, dict):
                     logger.debug(f"Deleting corrupted cache key: {key}")
-                    self.redis.delete(key)
+                    await self.redis.delete(key)
                     continue
 
                 ts_str = val.get("ts", "")
@@ -113,7 +112,7 @@ class VesselGapDetector:
                 if len(self._seen_gaps) > 10_000:
                     self._seen_gaps.clear()
                 
-                info_raw = self.redis.get(f"vessel:info:{mmsi}")
+                info_raw = await self.redis.get(f"vessel:info:{mmsi}")
                 info = json.loads(info_raw) if info_raw else {}
                 flags = info.get("flags", []) if isinstance(info, dict) else []
                 vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"
@@ -121,7 +120,7 @@ class VesselGapDetector:
                 if not isinstance(heading, (int, float)):
                     heading = 0
                 
-                score = self.scorer.score_vessel_dark(
+                score = await self.scorer.score_vessel_dark(
                     mmsi, gap_hours, region, flags, heading
                 )
                 event = NormalizedEvent(
@@ -152,8 +151,8 @@ class VesselGapDetector:
                     anomaly_score=score,
                 )
 
-                self.db_writer.write_event(event)
-                self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)
+                batch_events_to_write.append(event)
+                await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)
                 fired += 1
 
                 if score >= 0.6:
@@ -161,12 +160,19 @@ class VesselGapDetector:
                         f"🚢 VESSEL DARK  {event.primary_entity.name} "
                         f"gap={gap_hours:.1f}h  region={region}  score={score:.2f}"
                     )
+                    
             
             except Exception as e:
                 logger.error(f"Gap check error for key {key}; {e})")
+        if not has_keys:
+            logger.info("Gap Detector: No vessels tracked in Redis, skipping check")
 
- 
+        # FIX: Offload the entire synchronous TimescaleDB insert batch to a background thread
+        # This prevents the Python GIL from freezing the Enrichment consumers during DB latency.
+        if batch_events_to_write:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.db_writer.write_events_batch, batch_events_to_write)
+
         if fired:
-            logger.info(f"Gap detector: {fired} VESSEL_DARK events emitted")
-        
+            logger.info(f"Gap detector: {fired} VESSEL_DARK events safely emitted & persisted.")
         
