@@ -137,7 +137,7 @@ async def start_supervisor():
                         logger.error(f"Unexpected error executing proposal: {e}")
                 
                 # CRITICAL FIX: Commit once per partition batch, NOT per message!
-                await consumer.commit()
+            await consumer.commit()
                 
     except asyncio.CancelledError:
         logger.info("Graph Supervisor shutting down cleanly.")

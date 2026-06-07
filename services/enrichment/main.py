@@ -202,7 +202,7 @@ async def main():
                 # 8. THE AT-LEAST-ONCE CHECKPOINT
                 # Only explicitly commit offsets for this partition AFTER the database 
                 # write succeeds and all network sends are awaited.
-                await consumer.commit()
+            await consumer.commit()
         
     except asyncio.CancelledError:
         logger.info("Shutdown signal received. Closing consumer...")

@@ -258,8 +258,6 @@ async def poll_feed(
             except Exception as e:
                 logger.error(f"{feed_name}: Failed to send event — {e}")
                 continue
-            finally:
-                await producer.close()
             await dedup.mark_seen(url)
             new_count += 1
 
