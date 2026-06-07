@@ -10,6 +10,7 @@ import logging
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
 from shared.db import get_redis
+import asyncio
 
 logger = logging.getLogger("correlation.rules.news")
 
@@ -31,7 +32,7 @@ def _get_dynamic_keywords() -> set:
     """
     keywords = set(CORE_KEYWORDS)
     try:
-        redis_client = get_redis()
+        redis_client =  get_redis()
         if redis_client:
             # Fetch the dynamic set created by the Ontology Master
             dynamic = redis_client.raw.smembers("sentinel:news:keywords")

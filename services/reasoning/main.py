@@ -170,7 +170,7 @@ async def main():
     logger.info("=" * 60)
  
     db              = get_timescale()
-    redis_client    = await get_async_redis()
+    redis_client    = await get_redis()
     context_builder = ContextBuilder()
     generator       = ScenarioGenerator(db) 
     tracker         = ScenarioTracker()

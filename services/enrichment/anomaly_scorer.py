@@ -4,6 +4,7 @@ import json
 import numpy as np
 import onnxruntime as ort
 import logging
+from typing import Optional
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
 

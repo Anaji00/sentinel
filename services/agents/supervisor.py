@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from aiokafka import AIOKafkaConsumer
-from shared.db import get_async_redis, get_neo4j
+from shared.db import get_redis, get_neo4j
 from shared.kafka import Topics
 
 logger = logging.getLogger("agent.supervisor")
@@ -104,7 +104,7 @@ class GraphSupervisor:
 async def start_supervisor():
     import os
     logger.info("🛡️ Graph Supervisor Online. Protecting Neo4j state.")
-    redis_client = await get_async_redis()
+    redis_client = await get_redis()
     neo4j_client = await get_neo4j()
     supervisor = GraphSupervisor(redis_client, neo4j_client)
     

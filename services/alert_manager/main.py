@@ -47,7 +47,7 @@ logger = logging.getLogger("alert-manager")
 # These modules are shared across all Sentinel microservices.
 from shared.kafka import SentinelConsumer, Topics
 from shared.models import CorrelationCluster, AlertTier
-from shared.db import get_timescale, get_async_redis
+from shared.db import get_timescale, get_redis
  
 # ── 4. LOCAL RELATIVE IMPORTS ─────────────────────────────────────────────────
 # BEGINNER EXPLANATION: The dot (.) before formatters means "look in the current 
@@ -80,7 +80,7 @@ class AlertManager:
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._db      = get_timescale()
-        self._redis   = get_async_redis()
+        self._redis   = get_redis()
         self._sent = []
 
     async def handle(self, cluster: CorrelationCluster):

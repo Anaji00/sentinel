@@ -25,7 +25,7 @@ from neo4j import AsyncGraphDatabase as _Neo4j
 logger = logging.getLogger(__name__)
 
 # --- Redis Async Client ---
-class AsyncRedisClient:
+class RedisClient:
     def __init__(self):
         # Decodes responses to strings natively, uses connection pooling automatically
         self._client = aioredis.from_url(
@@ -60,18 +60,18 @@ class Neo4jClient:
 
 
 # --- Singletons & Locks ---
-_async_redis: Optional[AsyncRedisClient] = None
+_async_redis: Optional[RedisClient] = None
 _neo4j: Optional[Neo4jClient] = None
 _db_lock = asyncio.Lock()
 
-async def get_async_redis() -> AsyncRedisClient:
+async def get_redis() -> RedisClient:
     """Thread-safe async singleton for Redis."""
     global _async_redis
     if _async_redis is not None:
         return _async_redis
     async with _db_lock:
         if _async_redis is None:
-            _async_redis = AsyncRedisClient()
+            _async_redis = RedisClient()
     return _async_redis
 
 async def get_neo4j() -> Neo4jClient:
@@ -337,7 +337,7 @@ class AsyncTimescaleClient:
 _timescale: Optional[TimescaleClient] = None
 _async_timescale: Optional[AsyncTimescaleClient] = None
 _neo4j:     Optional[Neo4jClient]     = None
-_redis_cli: Optional[AsyncRedisClient]     = None
+_redis_cli: Optional[RedisClient]     = None
 
 _async_db_lock = asyncio.Lock()  # Ensures only one async TimescaleClient is created in concurrent scenarios.
 
@@ -368,9 +368,3 @@ def get_neo4j() -> Neo4jClient:
         _neo4j = Neo4jClient()
     return _neo4j
 
-
-def get_redis() -> RedisClient:
-    global _redis_cli
-    if _redis_cli is None:
-        _redis_cli = RedisClient()
-    return _redis_cli

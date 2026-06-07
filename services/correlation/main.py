@@ -29,7 +29,7 @@ load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster
-from shared.db import get_async_redis
+from shared.db import get_redis
 from services.correlation.event_store import EventStore
 from services.correlation.rules import ALL_RULES
 
@@ -48,7 +48,7 @@ async def main():
     logger.info("=" * 60)
 
     # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
-    redis_client = await get_async_redis()
+    redis_client = await get_redis()
     store    = EventStore(redis_client)
     producer = SentinelProducer()
     consumer = SentinelConsumer(

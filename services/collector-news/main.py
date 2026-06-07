@@ -43,7 +43,7 @@ logger = logging.getLogger("collector.news")
  
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
-from shared.db import get_async_redis
+from shared.db import get_redis
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -316,7 +316,7 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
 
-    redis_client = await get_async_redis()
+    redis_client = await get_redis()
     
     try:
         await collect(producer, redis_client)
