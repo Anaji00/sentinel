@@ -13,12 +13,12 @@ FIX (code review): TimescaleClient.query() now rolls back and re-raises on
 import logging
 import os
 import asyncio
-from typing import Optional
-
+from typing import Optional, List, Dict
+import time
 # Using the native async client in modern redis-py
 import redis.asyncio as aioredis
 from psycopg2 import pool as pgpool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 import asyncpg
 from neo4j import AsyncGraphDatabase as _Neo4j
 
@@ -31,7 +31,7 @@ class AsyncRedisClient:
         self._client = aioredis.from_url(
             os.getenv("REDIS_URL", "redis://localhost:6379/0"), 
             decode_responses=True,
-            max_connections=100
+            max_connections=300
         )
     @property
     def raw(self): 
@@ -112,7 +112,7 @@ class TimescaleClient:
                 # We "borrow" a connection, use it, and give it back to the pool immediately.
                 # ThreadedConnectionPool is thread-safe, allowing multiple web requests to run in parallel.
                 self._pool = pgpool.ThreadedConnectionPool(
-                    minconn=2, maxconn=20,
+                    minconn=2, maxconn=40,
                     host=os.getenv("POSTGRES_HOST", "localhost"),
                     port=int(os.getenv("POSTGRES_PORT", 5432)),
                     dbname=os.getenv("POSTGRES_DB", "sentinel"),

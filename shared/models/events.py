@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, validator
 import json
+from psycopg2.extras import Json
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -239,7 +240,7 @@ class NormalizedEvent(BaseModel):
             pe.id if pe else None, 
             pe.type.value if pe else EntityType.UNKNOWN.value,
             pe.name if pe else None, 
-            json.dumps(pe.flags) if pe and pe.flags else "[]",
+            Json(pe.flags) if pe and pe.flags else Json([]),
             self.longitude, 
             self.latitude,
             self.region, 
@@ -247,10 +248,13 @@ class NormalizedEvent(BaseModel):
             self.headline, 
             self.summary, 
             self.url,
-            self.vessel_data.model_dump_json() if self.vessel_data else None,
-            self.flight_data.model_dump_json() if self.flight_data else None,
-            self.financial_data.model_dump_json() if self.financial_data else None,
-            self.security_data.model_dump_json() if self.security_data else None,
+            Json(self.vessel_data.model_dump(mode='json')) if self.vessel_data else None,
+            Json(self.flight_data.model_dump(mode='json')) if self.flight_data else None,
+            Json(self.financial_data.model_dump(mode='json')) if self.financial_data else None,
+            Json(self.security_data.model_dump(mode='json')) if self.security_data else None,
+            Json(self.betting_data.model_dump(mode='json')) if self.betting_data else None,
+            Json(self.prediction_market_data.model_dump(mode='json')) if self.prediction_market_data else None,
+            Json(self.crypto_data.model_dump(mode='json')) if self.crypto_data else None,
             self.tags, 
             self.named_entities, 
             float(self.sentiment) if self.sentiment is not None else None, 

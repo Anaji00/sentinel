@@ -70,13 +70,12 @@ async def apply_autonomous_feedback(scenario, redis_client):
     (Equity tickers are now handled deterministically by the QuantResearcherAgent).
     """
     wallets = set(re.findall(r'(0x[a-fA-F0-9]{40})', scenario.recommended_monitoring))
-    loop = asyncio.get_event_loop()
-
     for wallet in wallets:
-        is_new = await loop.run_in_executor(None, redis_client.sadd, "sentinel:watched:wallets", wallet)
+        is_new = await redis_client.raw.sadd("sentinel:watched:wallets", wallet)
         if is_new:
+            # Expire the watch command after 30 days automatically
+            await redis_client.raw.expire("sentinel:watched:wallets", 2592000)
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
-
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
     """The core synthesis pipeline."""
     try:
@@ -111,38 +110,51 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         auto_offset_reset="latest",
     )
     producer = SentinelProducer()
+    await consumer.start()
+    await producer.start()
+
     
     logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
     
     try:
-        loop = asyncio.get_running_loop()
         while True:
-            messages = await loop.run_in_executor(None, consumer.raw.poll, 1.0)
-            
-            for tp, msgs in messages.items():
+            batches = await consumer.get_batch(timeout_ms=1000)
+            if not batches:
+                continue
+            for tp, msgs in batches.items():
                 for message in msgs:
-                    if tp.topic == "agents.intel.briefs":
-                        # Store high-severity intel briefs in Redis for context injection
-                        brief = message.value.get("brief")
-                        if brief.get("severity", 0) >= 4:
-                            redis_client.set(
-                                f"sentinel:intel:briefs:latest",
-                                json.dumps(brief),
-                                ttl=3600,  
-                            )
-                        continue
-                    # Passed directly via kwargs since message.value is already a parsed dictionary
-                    cluster = CorrelationCluster(**message.value)
-                    
-                    asyncio.create_task(process_cluster(cluster, db, redis_client, producer, context_builder, generator, library))
+                    try:
+                        raw_data = json.loads(message.value.decode('utf-8'))
+                        
+                        if tp.topic == "agents.intel.briefs":
+                            brief = raw_data.get("brief", {})
+                            if brief.get("severity", 0) >= 4:
+                                await redis_client.raw.set(
+                                    "sentinel:intel:briefs:latest",
+                                    json.dumps(brief),
+                                    ex=3600,  # [CRITICAL FIX]: Use native expire assignment
+                                )
+                            continue
+                            
+                        cluster = CorrelationCluster(**raw_data)
+                        
+                        # Dispatch cluster processing to background task without blocking the consume loop
+                        asyncio.create_task(
+                            process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed parsing reasoning message: {e}", exc_info=True)
+                
+                # [CRITICAL FIX]: Commit offsets securely
+                await consumer.commit()
                     
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.error("Reasoning consumer crashed: %s", e, exc_info=True)
     finally:
-        consumer.close()
-        producer.close()
+        await consumer.close()
+        await producer.close()
 
 async def _tracker_loop(tracker: ScenarioTracker):
     while True:
@@ -154,11 +166,11 @@ async def _tracker_loop(tracker: ScenarioTracker):
  
 async def main():
     logger.info("=" * 60)
-    logger.info("SENTINEL AI REASONING SERVICE (GEMINI)")
+    logger.info("SENTINEL AI REASONING SERVICE")
     logger.info("=" * 60)
  
     db              = get_timescale()
-    redis_client    = get_redis()
+    redis_client    = await get_async_redis()
     context_builder = ContextBuilder()
     generator       = ScenarioGenerator(db) 
     tracker         = ScenarioTracker()
