@@ -1,5 +1,5 @@
 """
-services/correlation/main.py  —  run loop only.
+services/correlation/main.py
 
 Consumes enriched.events.
 Runs every rule against every event.
@@ -13,27 +13,24 @@ Rules live in rules/:
   cross_domain.py — CROSS_001
 """
 
+import asyncio
+import json
 import logging
 import os
 import sys
 from pathlib import Path
 
 # ── 1. ENVIRONMENT & PATH SETUP ───────────────────────────────────────────────
-# BEST PRACTICE: We dynamically calculate the project root directory and add it 
-# to the system path. This ensures that Python can find our custom 'shared' modules 
-# (like shared.kafka or shared.models) no matter which directory we run this script from.
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster
-from shared.db import get_redis
+from shared.db import get_async_redis
 from services.correlation.event_store import EventStore
-
 from services.correlation.rules import ALL_RULES
 
 logging.basicConfig(
@@ -44,25 +41,14 @@ logging.basicConfig(
 logger = logging.getLogger("correlation")
 
 
-def fetch_messages(consumer):
-    """Synchronous fetch to run in a background thread."""
-    msg_pack = consumer.poll(timeout_ms=2000)
-    messages = []
-    for _, msgs in msg_pack.items():
-        messages.extend(msgs)
-    return messages
-
-def main():
+async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Correlation Engine")
     logger.info(f"Rules loaded: {len(ALL_RULES)}")
     logger.info("=" * 60)
 
     # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
-    # EventStore: Connects to PostgreSQL (TimescaleDB) to allow rules to query past events.
-    # Producer: The "Mailman" that sends generated alerts to the next microservice.
-    # Consumer: The "Inbox" that receives standardized events from the Enrichment service.
-    redis_client = get_redis()
+    redis_client = await get_async_redis()
     store    = EventStore(redis_client)
     producer = SentinelProducer()
     consumer = SentinelConsumer(
@@ -74,49 +60,47 @@ def main():
     processed  = 0
     corr_fired = 0
 
+    await producer.start()
+    await consumer.start()
+
     try:
         # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
-        # The 'while True' keeps the application running forever.
         while True:
-            try:
-                # The consumer pauses (blocks) here until a new message arrives from Kafka.
-                for message in consumer:
+            # CORRECTED: Use native async batch fetching to prevent event-loop blocking
+            batches = await consumer.get_batch(timeout_ms=1000)
+            
+            if not batches:
+                continue
+
+            for tp, messages in batches.items():
+                for message in messages:
                     try:
-                        # Unpack the raw JSON message into our strictly-typed Python object.
-                        event = NormalizedEvent(**message.value)
+                        # Parse the JSON payload safely before feeding to Pydantic
+                        raw_data = json.loads(message.value.decode('utf-8'))
+                        event = NormalizedEvent(**raw_data)
 
                         try:
                             store.add_event(event)
                         except Exception as e:
-                            logger.error(f"Failed to store event {event.id}: {e}", exc_info=True)
+                            logger.error(f"Failed to store event {event.event_id}: {e}", exc_info=True)
                             continue
 
                         # ── 4. RULE ENGINE (PLUGIN PATTERN) ───────────────────
-                        # ARCHITECTURE TIP: The Strategy/Plugin Pattern.
-                        # Instead of writing massive, hard-to-read "if/else" blocks, we loop 
-                        # through a list of independent rule functions (`ALL_RULES`). 
-                        # Each rule evaluates the event and decides if an alert should be triggered.
                         for rule_fn in ALL_RULES:
                             try:
                                 cluster: CorrelationCluster = rule_fn(event, store)
                             except Exception as e:
-                                # TARGETED ERROR HANDLING: If one specific rule crashes (e.g., 
-                                # due to a bad data lookup), we log the error and `continue`. 
-                                # This prevents a single buggy rule from taking down the whole engine.
                                 logger.error(f"Rule {rule_fn.__name__} error: {e}", exc_info=True)
                                 continue
 
-                            # If the rule returns None, it means "Nothing suspicious found."
                             if cluster is None:
                                 continue
 
                             # ── 5. PERSIST & FORWARD ALERTS ───────────────────
-                            # If a rule returned a cluster, an anomaly pattern was detected!
-                            # First, save a permanent record to our database.
                             store.save_correlation(cluster)
-                            # Second, send it to Kafka so the Alert Manager and Reasoning 
-                            # engine can notify analysts or generate AI briefings.
-                            producer.send(
+                            
+                            # CORRECTED: Await the Kafka producer network call
+                            await producer.send(
                                 Topics.CORRELATIONS,
                                 cluster.model_dump(),
                                 key=cluster.correlation_id,
@@ -129,38 +113,39 @@ def main():
 
                         processed += 1
                         if processed % 100 == 0:
-                            logger.info(f"Heartbeat | Processed {processed} events (last: {event.type.name}) | Total correlations: {corr_fired}")
+                            logger.info(f"Heartbeat | Processed {processed} events | Total correlations: {corr_fired}")
 
                     except Exception as e:
                         logger.error(f"Correlation loop error: {e}", exc_info=True)
-
-                        raw_val = message.value if message else {}
                         try:
-                            producer.send(
+                            # CORRECTED: Await the DLQ network call
+                            await producer.send(
                                 Topics.DLQ,
-                                data = {
+                                data={
                                     "topic": Topics.ENRICHED_EVENTS,
-                                    "error": str(e),
-                                    "raw": raw_val,
+                                    "error": str(e)
                                 }
                             )
                         except Exception as dlq_e:
-                            logger.error(f"FATAL: Failed to route to DLQ: {dlq_e}. Shutting down to preserve offset.")
-                            sys.exit(1) # Crash the container. Do not let auto-commit advance!
+                            logger.error(f"FATAL: Failed to route to DLQ: {dlq_e}. Shutting down.")
+                            sys.exit(1)
+                
+                # CORRECTED: Commit offsets after batch is fully processed to prevent infinite replay
+                await consumer.commit()
 
-            except StopIteration:
-                logger.debug("Consumer iterator exhausted — restarting")
-                continue
-
+    except asyncio.CancelledError:
+        logger.info("Shutting down correlation engine...")
     except KeyboardInterrupt:
-        # Graceful shutdown when the user presses Ctrl+C
         logger.info("Shutting down...")
     finally:
-        # CLEANUP: Always close network connections to prevent memory/socket leaks.
-        producer.close()
-        consumer.close()
+        # CORRECTED: Await graceful closure of TCP sockets
+        await producer.close()
+        await consumer.close()
         logger.info(f"Final — processed: {processed}  correlations: {corr_fired}")
 
 
 if __name__ == "__main__":
-    main()
+    # CORRECTED: OS-level event loop policy enforcement and proper coroutine execution
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())

@@ -4,7 +4,7 @@ services/reasoning/main.py
 ENTERPRISE REASONING ORCHESTRATOR (GEMINI EDITION)
 ==================================================
 Consumes Tier 2+ correlated clusters from Kafka.
-Feeds raw data + Graph DB context + ML Scores into Gemini 2.5 Pro.
+Feeds raw data + Graph DB context + ML Scores into Ollama.
 Synthesizes tactical scenarios, stores them, broadcasts to Kafka, 
 and CLOSES THE LOOP by autonomously updating Redis watchlists.
 """
