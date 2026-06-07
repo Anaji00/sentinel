@@ -118,7 +118,7 @@ class SentinelProducer:
         """
         try:
             k_bytes = key.encode("utf-8") if key else None
-            await self._p.send(
+            await self._p.send_and_wait(
                 topic,
                 value=data,
                 # KEY: The "Sorting Hat".

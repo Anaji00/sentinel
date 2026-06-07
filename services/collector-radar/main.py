@@ -108,7 +108,7 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             price = float(min_bar.get("c", 0.0))
             if volume == 0.0: continue
 
-            is_anomaly, z_score = radar.evaluate_volume(ticker, volume)
+            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume)
             if is_anomaly:
                 notional = volume * price
                 logger.warning(f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} | 1m Vol: {volume} (${notional/1e6:.2f}M)")
@@ -123,7 +123,7 @@ async def main():
     if not ALPACA_API_KEY: sys.exit(1)
     producer = SentinelProducer()
     await producer.start()
-    redis_client = get_async_redis()
+    redis_client = await get_async_redis()
 
     radar = QuantRadar(redis_client)
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)

@@ -90,7 +90,7 @@ class GraphSupervisor:
                 WITH e, collect(distinct tag) AS unique_tags
                 SET e.tags = unique_tags, e.updated_at = datetime()
                 """
-                self.neo4j.execute(cypher, {"id": entity_id, "new_tags": tags})
+                await self.neo4j.execute(cypher, {"id": entity_id, "new_tags": tags})
                 logger.info(f"✅ Added tags to {entity_id}: {tags}")
 
             else:

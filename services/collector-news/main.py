@@ -318,7 +318,7 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
 
-    redis_client = get_async_redis()
+    redis_client = await get_async_redis()
     
     try:
         await collect(producer, redis_client)

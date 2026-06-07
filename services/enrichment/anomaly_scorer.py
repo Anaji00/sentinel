@@ -4,13 +4,14 @@ import json
 import numpy as np
 import onnxruntime as ort
 import logging
-from shared.db import get_async_redis
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
 class DynamicAnomalyScorer:
-    def __init__(self, async_redis):
-        self.redis = async_redis or get_async_redis()
+    def __init__(self, redis_client):
+        if redis_client is None:
+            raise ValueError("Redis client is required for DynamicAnomalyScorer to function properly.")
+        self.redis = redis_client
         self.sessions = {}
         self.alpha = 0.1
         self.z_score_threshold = 2.5

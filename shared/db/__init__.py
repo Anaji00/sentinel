@@ -40,14 +40,15 @@ class AsyncRedisClient:
 # --- Neo4j Synchronous Client (For Supervisor ONLY) ---
 class Neo4jClient:
     def __init__(self):
-        self._driver = _Neo4j.driver(
-            os.getenv("NEO4J_URI", "bolt://localhost:7687"), 
-            auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "sentinel_graph"))
-        )
+        self._driver = None
+        self._uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self._auth = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "sentinel_graph"))
+
     async def connect(self):
         if not self._driver:
-            self._driver = _Neo4j.driver(self._url, auth=self.auth)
-            await  self._driver.verify_connectivity()
+            self._driver = _Neo4j.driver(self._uri, auth=self._auth)
+            await self._driver.verify_connectivity()
+            logger.info("Neo4j connected")
 
     async def execute(self, cypher: str, params: dict = None):
         async with self._driver.session() as s:
