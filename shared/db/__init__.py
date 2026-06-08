@@ -209,7 +209,7 @@ def get_timescale() -> TimescaleClient:
 
 async def get_redis() -> RedisClient:
     """Thread-safe async singleton for Redis."""
-    global _async_redis
+    global _async_redis, _db_lock
     if _async_redis is not None:
         return _async_redis
     
@@ -222,7 +222,7 @@ async def get_redis() -> RedisClient:
 
 async def get_neo4j() -> Neo4jClient:
     """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
-    global _neo4j
+    global _neo4j, _db_lock
     if _neo4j is not None: return _neo4j
 
     if _db_lock is None:

@@ -118,48 +118,55 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     
     try:
         while True:
-            batches = await consumer.get_batch(timeout_ms=1000)
-            if not batches:
-                continue
-            batch_tasks = []
-            for tp, msgs in batches.items():
-                for message in msgs:
-                    try:
-                        raw_data = json.loads(message.value.decode('utf-8'))
-                        
-                        if tp.topic == "agents.intel.briefs":
-                            brief = raw_data.get("brief", {})
-                            if brief.get("severity", 0) >= 4:
-                                await redis_client.raw.set(
-                                    "sentinel:intel:briefs:latest",
-                                    json.dumps(brief),
-                                    ex=3600,  # [CRITICAL FIX]: Use native expire assignment
-                                )
-                            continue
+            try:
+                batches = await consumer.get_batch(timeout_ms=1000)
+                if not batches:
+                    continue
+                batch_tasks = []
+                dlq_payloads = []
+                for tp, msgs in batches.items():
+                    for message in msgs:
+                        try:
+                            raw_data = json.loads(message.value.decode('utf-8'))
                             
-                        cluster = CorrelationCluster(**raw_data)
-                        
-                        # Dispatch cluster processing to background task without blocking the consume loop
-                        task = asyncio.create_task(
-                            process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
-                        )
-                        batch_tasks.append(task)
+                            if tp.topic == "agents.intel.briefs":
+                                brief = raw_data.get("brief", {})
+                                if brief.get("severity", 0) >= 4:
+                                    await redis_client.raw.set(
+                                        "sentinel:intel:briefs:latest",
+                                        json.dumps(brief),
+                                        ex=3600,  # [CRITICAL FIX]: Use native expire assignment
+                                    )
+                                continue
+                                
+                            cluster = CorrelationCluster(**raw_data)
+                            
+                            # Dispatch cluster processing to background task without blocking the consume loop
+                            task = asyncio.create_task(
+                                process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
+                            )
+                            batch_tasks.append(task)
+                            dlq_payloads.append(raw_data)
 
-                    except Exception as e:
-                        logger.error(f"Failed parsing reasoning message: {e}", exc_info=True)
-            if batch_tasks:
-                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                for original_msg, result in zip(msgs, results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Error in processing task: {result}", exc_info=True)
-                        await producer.send(Topics.DLQ, {"error": str(result), "payload": str(original_msg.value)})
-                # [CRITICAL FIX]: Commit offsets securely
+                        except Exception as parse_e:
+                            logger.error(f"Failed parsing reasoning message: {parse_e}", exc_info=True)
+                            await producer.send(Topics.DLQ, {"error": str(parse_e), "raw": str(message.value)})
+                if batch_tasks:
+                    results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    for task_result, original_payload in zip(results, dlq_payloads):
+                            if isinstance(task_result, Exception):
+                                logger.error(f"Synthesis task failed silently: {task_result}", exc_info=True)
+                                await producer.send(Topics.DLQ, {"error": str(task_result), "payload": original_payload})
+                    # [CRITICAL FIX]: Commit offsets securely
                 await consumer.commit()
+        
+            except Exception as batch_error:
+                    # Keep the service alive during transient network partitions
+                    logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}", exc_info=True)
+                    await asyncio.sleep(5)
                     
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        logger.error("Reasoning consumer crashed: %s", e, exc_info=True)
     finally:
         await consumer.close()
         await producer.close()
