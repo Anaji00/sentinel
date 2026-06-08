@@ -135,17 +135,18 @@ async def main():
                         await dlq.send(Topics.DLQ, {"error": str(e), "topic": topic})
                     
                 if batch_to_write:
-                    await loop.run_in_executor(None, db.write_events_batch, batch_to_write)
-                
-                # 8. THE AT-LEAST-ONCE CHECKPOINT
-                # Only explicitly commit offsets for this partition AFTER the database 
-                # write succeeds and all network sends are awaited.
-            await consumer.commit()
-        
+                # Add inline retry logic for transient DB failures
+                    for attempt in range(3):
+                        try:
+                            await loop.run_in_executor(None, db.write_events_batch, batch_to_write)
+                            break # Success
+                        except Exception as write_err:
+                            if attempt == 2: raise # Max retries hit, bubble up to DLQ logic
+                            await asyncio.sleep(2 ** attempt) 
+
+                await consumer.commit()
     except asyncio.CancelledError:
         logger.info("Shutdown signal received. Closing consumer...")
-    except Exception as e:
-        logger.critical(f"Fatal error in main loop: {e}", exc_info=True)
     finally:
         gap_task.cancel()
         try:

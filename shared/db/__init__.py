@@ -196,7 +196,7 @@ class TimescaleClient:
 _timescale: Optional[TimescaleClient] = None
 _async_redis: Optional[RedisClient] = None
 _neo4j: Optional[Neo4jClient] = None
-_db_lock = Optional[asyncio.Lock()] = None
+_db_lock: Optional[asyncio.Lock] = None
 
 
 def get_timescale() -> TimescaleClient:
@@ -227,7 +227,7 @@ async def get_neo4j() -> Neo4jClient:
 
     if _db_lock is None:
         _db_lock = asyncio.Lock()
-        
+
     async with _db_lock:
         if _neo4j is None:
             client = Neo4jClient()

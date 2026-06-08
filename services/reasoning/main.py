@@ -148,9 +148,13 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                     except Exception as e:
                         logger.error(f"Failed parsing reasoning message: {e}", exc_info=True)
             if batch_tasks:
-                await asyncio.gather(*batch_tasks, return_exceptions=True)
+                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                for original_msg, result in zip(msgs, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Error in processing task: {result}", exc_info=True)
+                        await producer.send(Topics.DLQ, {"error": str(result), "payload": str(original_msg.value)})
                 # [CRITICAL FIX]: Commit offsets securely
-            await consumer.commit()
+                await consumer.commit()
                     
     except asyncio.CancelledError:
         pass
