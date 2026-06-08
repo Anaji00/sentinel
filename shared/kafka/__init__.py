@@ -12,6 +12,7 @@ NOTE ON CONSUMER TIMEOUTS:
 """
 
 import json
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -19,7 +20,7 @@ from typing import Any, Dict, Optional
 
 from aiokafka import AIOKafkaConsumer as _Consumer
 from aiokafka import AIOKafkaProducer as _Producer
-from kafka.errors import KafkaError
+from kafka.errors import KafkaError, KafkaConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +102,25 @@ class SentinelProducer:
         self._started = False
         logger.info(f"Kafka Producer -> {servers}")
 
-    async def start(self):
+    async def start(self, max_retries: int = 15):
         """Must be called inside the async event loop to initialize network sockets."""
-        if not self._started:
-            await self._p.start()
-            self._started = True
+        if self._started:
+            return
+        for attempt in range(max_retries):
+            try:
+                await self._p.start()
+                self._started = True
+                logger.info("✅ Kafka Producer successfully connected and bootstrapped.")
+                return
+            except KafkaConnectionError as e:
+                wait_time = min(2 ** attempt, 30)
+                logger.warning(f"⏳ Kafka broker not ready. Producer retrying in {wait_time}s... ({e})")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Unexpected error starting Kafka Producer: {e}")
+                raise
+                
+        raise ConnectionError(f"Fatal: Could not connect to Kafka Producer at {self.servers} after {max_retries} attempts.")
 
     async def send(self, topic: str, data: Dict[str, Any], key: str = None, headers: list = None):
         """
@@ -113,6 +128,8 @@ class SentinelProducer:
         Headers support OpenTelemetry span injection across distributed boundaries.
         Key enforces partition-hashing for strict chronological ordering per entity.
         """
+        if not self._started:
+            raise RuntimeError("Cannot send: SentinelProducer is not started.")
         try:
             k_bytes = key.encode("utf-8") if key else None
             await self._p.send_and_wait(
@@ -130,6 +147,7 @@ class SentinelProducer:
     async def close(self):
         if self._started:
             await self._p.stop()
+            self._started = False
 
 # ── CONSUMER ────────────────────────────────────────────────────────────────
 
@@ -164,17 +182,34 @@ class SentinelConsumer:
         self._started = False
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
         
-    async def start(self):
-        """Must be called inside the async event loop to initialize network sockets."""
-        if not self._started:
-            await self._c.start()
-            self._started = True
+    async def start(self, max_retries: int = 15):
+        """Starts the consumer with exponential backoff for broker readiness."""
+        if self._started:
+            return
+            
+        for attempt in range(max_retries):
+            try:
+                await self._c.start()
+                self._started = True
+                logger.info(f"✅ Kafka Consumer successfully connected and subscribed to {self.topics}.")
+                return
+            except KafkaConnectionError as e:
+                wait_time = min(2 ** attempt, 30)
+                logger.warning(f"⏳ Kafka broker not ready. Consumer retrying in {wait_time}s... ({e})")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Unexpected error starting Kafka Consumer: {e}")
+                raise
+                
+        raise ConnectionError(f"Fatal: Could not connect to Kafka Consumer at {self.servers} after {max_retries} attempts.")
 
     async def get_batch(self, timeout_ms=1000):
         """
         Native async polling. Replaces the old loop.run_in_executor hack.
         Returns a dictionary of {TopicPartition: [ConsumerRecord]}
         """
+        if not self._started:
+            raise RuntimeError("CANNOT FETCH MESSAGES -- Consumer not started.")
         return await self._c.getmany(timeout_ms=timeout_ms)
 
     async def commit(self):
@@ -182,11 +217,14 @@ class SentinelConsumer:
         Explicitly advance the partition offset. 
         Must be called ONLY after the processing pipeline safely completes all writes.
         """
+        if not self._started:
+            raise RuntimeError("Cannot commit: SentinelConsumer is not started.")
         await self._c.commit()
         
     async def close(self):
         if self._started:
             await self._c.stop()
+            self._started = False
 
     
 

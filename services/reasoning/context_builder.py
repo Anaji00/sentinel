@@ -13,6 +13,7 @@ Output is a structured dict that scenario_generator.py passes to Claude.
 """
 
 import json
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
