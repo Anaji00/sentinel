@@ -86,8 +86,6 @@ class SentinelProducer:
             bootstrap_servers=servers,
             value_serializer=_serialize,
             # RETRIES: The "Redial" button.
-            # If the internet blips or the server is busy, try 5 times before giving up.
-            retries=5,
             # ACKS='all': The "Registered Mail" setting.
             # We don't consider a message "Sent" until the Leader AND all Backups confirm receipt.
             # This is slower but guarantees we never lose data if a server crashes.
@@ -99,7 +97,6 @@ class SentinelProducer:
             # COMPRESSION: Zip it up.
             # Makes the payload smaller. Saves network bandwidth and disk space.
             compression_type="gzip",
-            api_version=(3, 5, 0),
         )
         self._started = False
         logger.info(f"Kafka Producer -> {servers}")
@@ -163,7 +160,6 @@ class SentinelConsumer:
             # (It's simpler than doing it manually, though slightly less precise).
             enable_auto_commit=False,
             max_poll_records=100,
-            api_version=(3, 5, 0),
         )
         self._started = False
         logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")

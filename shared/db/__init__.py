@@ -65,6 +65,11 @@ class Neo4jClient:
     async def execute(self, cypher: str, params: dict = None):
         async with self._driver.session() as s:
             await s.run(cypher, **(params or {}))
+
+    async def query(self, cypher: str, params: dict = None) -> List[Dict]:
+        async with self._driver.session() as s:
+            result = await s.run(cypher, **(params or {}))
+            return await result.data()
     
     async def close(self):
         if self._driver:

@@ -84,7 +84,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
             
         logger.info("🧠 Synthesizing [%s] %s via Gemini...", cluster.alert_tier.name, cluster.rule_name)
 
-        context = context_builder.build(cluster)
+        context = await context_builder.build(cluster)
         patterns = library.find_similar(cluster.tags, cluster.rule_id)
         scenario = await generator.generate(cluster, context, patterns)
         

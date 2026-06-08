@@ -24,26 +24,23 @@ logger = logging.getLogger("reasoning.context")
 
 class ContextBuilder:
     def __init__(self):
+        # Timescale is a thread-pooled sync client
         self._db = get_timescale()
-        self._neo4j = get_neo4j()
 
-    def build(self, cluster: CorrelationCluster) -> Dict[str, Any]:
-        """
-        Build the full context dict for a correlation cluster.
-        This is what gets passed to Gemini.
-
-        CODING CONVICTION: Aggregator Pattern.
-        An aggregator pattern is a design approach where a single class or function 
-        is responsible for gathering and assembling data from multiple sources into a cohesive structure.
-        This class acts as a central aggregator so the LLM generation logic doesn't 
-        need to know *how* to query PostgreSQL or Neo4j. It just asks for the "context package".
-        """
-        trigger = self._fetch_event(cluster.trigger_event_id) # Fetch the trigger event details
-        supporting = self._fetch_events(cluster.supporting_event_ids) # Fetch details for all supporting events
-        entity_graph = self._fetch_entity_graph(cluster.entity_ids) # Fetch ownership chains for all involved entities
-        pattern_matches = self._fetch_pattern_matches(cluster) # Fetch historical pattern matches relevant to this
-        recent_news = self._fetch_recent_news(cluster) # Fetch recent headlines related to the entities/events in this cluster
-        agent_intel = self._fetch_agent_intel(cluster)
+    # [CRITICAL FIX]: Converted core build orchestrator to async
+    async def build(self, cluster: CorrelationCluster) -> Dict[str, Any]:
+        """Build the full context dict for a correlation cluster."""
+        # Wrap blocking Psycopg2 PostgreSQL calls in thread executors
+        trigger = await asyncio.to_thread(self._fetch_event, cluster.trigger_event_id)
+        supporting = await asyncio.to_thread(self._fetch_events, cluster.supporting_event_ids)
+        recent_news = await asyncio.to_thread(self._fetch_recent_news, cluster)
+        
+        # Natively await asynchronous Redis/Neo4j graph calls
+        entity_graph = await self._fetch_entity_graph(cluster.entity_ids)
+        agent_intel = await self._fetch_agent_intel(cluster)
+        
+        pattern_matches = self._fetch_pattern_matches(cluster) 
+        
         return {
             "correlation": {
                 "id": cluster.correlation_id,
@@ -56,9 +53,8 @@ class ContextBuilder:
             "trigger_event": trigger,
             "supporting_events": supporting,
             "entity_graph": entity_graph,
-            "historical_patterns": pattern_matches, # Passed the missing fetched patterns into the final dict
+            "historical_patterns": pattern_matches, 
             "recent_headlines": recent_news,
-            # FIXED: Typo 'analysis_timestammp' changed to 'analysis_timestamp'.
             "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_intel_briefs": agent_intel,
         }
@@ -104,13 +100,15 @@ class ContextBuilder:
             logger.error(f"Error fetching events {event_ids}: {e}")
             return []
         
-    def _fetch_entity_graph(self, entity_ids: List[str]) -> List[Dict]:
+    async def _fetch_entity_graph(self, entity_ids: List[str]) -> List[Dict]:
         """
         For each entity, get up to 3 hops of relationships from Neo4j.
         Returns ownership chains, flag connections, etc.
         """
         if not entity_ids:
             return []
+        
+        neo4j_client = await get_neo4j()
         results = []
         
         # CRITICAL THINKING: Token Limit & Performance Protection.
@@ -122,7 +120,7 @@ class ContextBuilder:
                 # Query breakdown: `-[r*1..3]-` tells Neo4j to find paths between 1 and 3 hops away.
                 # This reveals hidden links (e.g., Vessel -> owned_by -> Shell Company -> owns -> Other Vessel).
                 # `LIMIT 20` prevents a massive network of thousands of nodes from returning.
-                rows = self._neo4j.query("""
+                rows = await neo4j_client.query("""
                     MATCH (v:Vessel {mmsi: $id})-[r*1..3]-(n)
                     RETURN v.name as entity, type(r[0]) as rel, n.name as connected,
                            labels(n) as labels
@@ -131,7 +129,7 @@ class ContextBuilder:
                 if rows:
                     results.append({"entity_id": entity_id, "relationships": rows})
 
-                flags = self._neo4j.query("""
+                flags = await neo4j_client.query("""
                     MATCH (v:Vessel {mmsi: $id})-[:FLAGGED_AS]->(f:Flag)
                     RETURN f.type as flag
                 """, {"id": entity_id})
@@ -199,19 +197,18 @@ class ContextBuilder:
                 out[k] = v
         return out
 
-    def _fetch_agent_intel(self, cluster: CorrelationCluster) -> list:
+    async def _fetch_agent_intel(self, cluster: CorrelationCluster) -> list:
         """
         Fetch recent agent-generated intel briefs from Redis.
         These are richer than raw news — already structured by the Intel Agent.
         """
         try:
             from shared.db import get_redis
-            redis = get_redis()
+            redis = await get_redis()
             
             # Fetch recent high-severity briefs
-            raw = redis.get("sentinel:intel:briefs:latest")
+            raw = await redis.raw.get("sentinel:intel:briefs:latest")
             if raw:
-                import json
                 brief = json.loads(raw)
                 # Check if thematically related to this cluster
                 cluster_tags = set(cluster.tags)
