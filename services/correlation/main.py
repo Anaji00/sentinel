@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+import inspect
 
 # ── 1. ENVIRONMENT & PATH SETUP ───────────────────────────────────────────────
 from dotenv import load_dotenv
@@ -88,7 +89,11 @@ async def main():
                         # ── 4. RULE ENGINE (PLUGIN PATTERN) ───────────────────
                         for rule_fn in ALL_RULES:
                             try:
-                                cluster: CorrelationCluster = rule_fn(event, store)
+                                # Dynamically support both synchronous math rules AND asynchronous I/O rules
+                                if inspect.iscoroutinefunction(rule_fn):
+                                    cluster: CorrelationCluster = await rule_fn(event, store)
+                                else:
+                                    cluster: CorrelationCluster = rule_fn(event, store)
                             except Exception as e:
                                 logger.error(f"Rule {rule_fn.__name__} error: {e}", exc_info=True)
                                 continue

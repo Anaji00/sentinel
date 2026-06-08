@@ -92,7 +92,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
             # 1. Save to DB (For frontend viewing)
             await asyncio.gather(
                 asyncio.to_thread(_save_scenario, db, scenario),
-                asyncio.to_thread(producer.send, "scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
+                producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
             )
             logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
 
@@ -121,6 +121,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
             batches = await consumer.get_batch(timeout_ms=1000)
             if not batches:
                 continue
+            batch_tasks = []
             for tp, msgs in batches.items():
                 for message in msgs:
                     try:
@@ -139,14 +140,17 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                         cluster = CorrelationCluster(**raw_data)
                         
                         # Dispatch cluster processing to background task without blocking the consume loop
-                        asyncio.create_task(
+                        task = asyncio.create_task(
                             process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
                         )
+                        batch_tasks.append(task)
+
                     except Exception as e:
                         logger.error(f"Failed parsing reasoning message: {e}", exc_info=True)
-                
+            if batch_tasks:
+                await asyncio.gather(*batch_tasks, return_exceptions=True)
                 # [CRITICAL FIX]: Commit offsets securely
-                await consumer.commit()
+            await consumer.commit()
                     
     except asyncio.CancelledError:
         pass

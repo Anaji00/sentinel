@@ -36,6 +36,18 @@ class RedisClient:
     @property
     def raw(self): 
         return self._client
+    
+    async def zadd(self, key: str, mapping: dict):
+        await self._client.zadd(key, mapping)
+
+    async def zremrangebyscore(self, key: str, min_val, max_val):
+        return await self._client.zremrangebyscore(key, min_val, max_val)
+
+    async def zrange(self, key: str, start, end, desc=False, byscore=False):
+        return await self._client.zrange(key, start, end, desc=desc, byscore=byscore)
+
+    async def incr(self, key: str) -> int:
+        return await self._client.incr(key)
 
 # --- Neo4j Synchronous Client (For Supervisor ONLY) ---
 class Neo4jClient:
@@ -57,33 +69,6 @@ class Neo4jClient:
     async def close(self):
         if self._driver:
             await self._driver.close()
-
-
-# --- Singletons & Locks ---
-_async_redis: Optional[RedisClient] = None
-_neo4j: Optional[Neo4jClient] = None
-_db_lock = asyncio.Lock()
-
-async def get_redis() -> RedisClient:
-    """Thread-safe async singleton for Redis."""
-    global _async_redis
-    if _async_redis is not None:
-        return _async_redis
-    async with _db_lock:
-        if _async_redis is None:
-            _async_redis = RedisClient()
-    return _async_redis
-
-async def get_neo4j() -> Neo4jClient:
-    """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
-    global _neo4j
-    if _neo4j is not None: return _neo4j
-    async with _db_lock:
-        if _neo4j is None:
-            client = Neo4jClient()
-            await client.connect()
-            _neo4j = client
-    return _neo4j
 
 
 # ── TIMESCALEDB ───────────────────────────────────────────────────────────────
@@ -199,132 +184,6 @@ class TimescaleClient:
         finally:
             self._pool.putconn(conn)
 
-class AsyncTimescaleClient:
-    # CONCEPT: The "Non-Blocking Ledger"
-    # Same destination as TimescaleClient, but uses an asynchronous network path.
-    # Crucial for services using asyncio (like collector-financial) so they can 
-    # check historical data without freezing the websocket/HTTP polling loops.
-    def __init__(self):
-        self._pool = None
-    
-    async def connect(self, retries: int = 12):
-        for attempt in range(retries):
-            try:
-            # asyncpg handles connection pooling natively.
-                self._pool = await asyncpg.create_pool(
-                    host=os.getenv("POSTGRES_HOST", "localhost"),
-                    port=int(os.getenv("POSTGRES_PORT", 5432)),
-                    database=os.getenv("POSTGRES_DB", "sentinel"),
-                    user=os.getenv("POSTGRES_USER", "sentinel"),
-                    password=os.getenv("POSTGRES_PASSWORD", "sentinel"),
-                    min_size=2,
-                    max_size=20,
-                    command_timeout=60
-                )
-                logger.info("AsyncTimescaleDB connected")
-                return
-            except Exception as e:
-                wait = min(2 ** attempt, 30)
-                logger.warning(f"AsynceTimescaleDB attempt {attempt+1}/{retries} — retry in {wait}s")
-                if attempt < retries - 1:
-                    await asyncio.sleep(wait)
-                else:
-                    raise
-    
-    async def query(self, sql: str, *args) -> List[Dict]:
-        # READ OPERATION (SELECT)
-        async with self._pool.acquire() as conn:
-            records = await conn.fetch(sql, *args)
-            return [dict(r) for r in records]
-        
-    async def query_one(self, sql: str, *args) -> Optional[Dict]:
-        # READ OPERATION (SELECT)
-        # asyncpg natively returns 'Record' objects. We convert them to standard Dicts.
-        # Note: asyncpg uses $1, $2 for parameters, unlike psycopg2 which uses %s.
-        async with self._pool.acquire() as conn:
-            record = await conn.fetchrow(sql, *args)
-            return dict(record) if record else None
-        
-    async def execute(self, sql: str, *args):
-        # WRITE OPERATION
-        # asyncpg has built-in context managers for transactions.
-        # If an error is thrown inside the 'async with conn.transaction()' block,
-        # asyncpg automatically rolls it back.
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(sql, *args)
-
-    async def execute_many(self, sql: str, rows: List[tuple]):
-        # BATCH INSERT
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.executemany(sql, rows)
-
-                    
-
-
-    def _connect(self, retries: int = 12):
-        uri      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-        user     = os.getenv("NEO4J_USER",     "neo4j")
-        password = os.getenv("NEO4J_PASSWORD", "sentinel_graph")
-        # Retry logic same as TimescaleClient.
-        for attempt in range(retries):
-            try:
-                self._driver = _Neo4j.driver(uri, auth=(user, password))
-                self._driver.verify_connectivity()
-                logger.info("Neo4j connected")
-                return
-            except Exception as e:
-                wait = min(2 ** attempt, 30)
-                logger.warning(f"Neo4j attempt {attempt+1}/{retries} — retry in {wait}s: {e}")
-                if attempt < retries - 1:
-                    time.sleep(wait)
-                else:
-                    raise
-
-    def query(self, cypher: str, params: Dict = None) -> List[Dict]:
-        # CYPHER: The "SQL" language for Graphs.
-        # Example: MATCH (v:Vessel)-[:NEAR]->(p:Port) RETURN v.name
-        # Session: A lightweight container for the transaction.
-        with self._driver.session() as s:
-            # run() executes the Cypher. data() converts the result to a Python Dictionary.
-            return [r.data() for r in s.run(cypher, **(params or {}))]
-
-    def query_one(self, cypher: str, params: Dict = None) -> Optional[Dict]:
-        rows = self.query(cypher, params)
-        return rows[0] if rows else None
-
-    def execute(self, cypher: str, params: Dict = None):
-        # Used for creating/updating nodes (WRITE operations).
-        with self._driver.session() as s:
-            s.run(cypher, **(params or {}))
-
-    def close(self):
-        if self._driver:
-            self._driver.close()
-
-
-
-# --- NEW SORTED SET (Z-INDEX) METHODS ---
-
-    def zadd(self, key: str, mapping: dict):
-        # SORTED SET ADD: Adds items with a score (e.g., a timestamp)
-        # mapping format: {value: score}
-        self._client.zadd(key, mapping)
-
-    def zremrangebyscore(self, key: str, min_val, max_val):
-        # SORTED SET REMOVE: Drops items outside our sliding window
-        self._client.zremrangebyscore(key, min_val, max_val)
-
-    def zrange(self, key: str, start, end, desc=False, byscore=False):
-        # SORTED SET FETCH: Retrieves a range of elements.
-        # If byscore=True, start and end refer to the scores (timestamps).
-        # If desc=True and byscore=True, start must be the max score, and end the min score.
-        return self._client.zrange(key, start, end, desc=desc, byscore=byscore)
-
-    def incr(self, key: str) -> int:
-        return self._client.incr(key)
-
 
 # ── SINGLETONS ────────────────────────────────────────────────────────────────
 
@@ -335,11 +194,10 @@ class AsyncTimescaleClient:
 # The `get_timescale()` function checks: "Do we have one? If yes, use it. If no, make one."
 
 _timescale: Optional[TimescaleClient] = None
-_async_timescale: Optional[AsyncTimescaleClient] = None
-_neo4j:     Optional[Neo4jClient]     = None
-_redis_cli: Optional[RedisClient]     = None
+_async_redis: Optional[RedisClient] = None
+_neo4j: Optional[Neo4jClient] = None
+_db_lock = Optional[asyncio.Lock()] = None
 
-_async_db_lock = asyncio.Lock()  # Ensures only one async TimescaleClient is created in concurrent scenarios.
 
 def get_timescale() -> TimescaleClient:
     global _timescale
@@ -348,23 +206,33 @@ def get_timescale() -> TimescaleClient:
         _timescale = TimescaleClient()
     return _timescale
 
-async def get_async_timescale() -> AsyncTimescaleClient:
-    # Because establishing the pool requires 'await', this getter must be async.
-    global _async_timescale
-    # First check (fast path)
-    if _async_timescale is not None:
-        return _async_timescale
 
-    async with _async_db_lock:
-        if _async_timescale is None:
-            client = AsyncTimescaleClient()
-            await client.connect()
-            _async_timescale = client
-    return _async_timescale
+async def get_redis() -> RedisClient:
+    """Thread-safe async singleton for Redis."""
+    global _async_redis
+    if _async_redis is not None:
+        return _async_redis
+    
+    if _db_lock is None:
+        _db_lock = asyncio.Lock()
+    async with _db_lock:
+        if _async_redis is None:
+            _async_redis = RedisClient()
+    return _async_redis
 
-def get_neo4j() -> Neo4jClient:
+async def get_neo4j() -> Neo4jClient:
+    """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
     global _neo4j
-    if _neo4j is None:
-        _neo4j = Neo4jClient()
+    if _neo4j is not None: return _neo4j
+
+    if _db_lock is None:
+        _db_lock = asyncio.Lock()
+        
+    async with _db_lock:
+        if _neo4j is None:
+            client = Neo4jClient()
+            await client.connect()
+            _neo4j = client
     return _neo4j
+
 

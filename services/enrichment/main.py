@@ -22,7 +22,7 @@ logger = logging.getLogger("enrichment")
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent
-from shared.db import get_redis, get_timescale, get_neo4j
+from shared.db import get_redis, get_timescale
 from shared.db.bootstrap import bootstrap_database
 
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
@@ -40,74 +40,12 @@ from services.enrichment.enrichers.tradfi import TradFiEnricher
 from services.enrichment.enrichers.crypto import CryptoEnricher
 from services.enrichment.enrichers.prediction import PredictionEnricher
 
-def _consume_loop(consumer, maritime, aviation, news, cyber, 
-                  tradfi, crypto, prediction, db, producer, dlq):
-    """Blocking Kafka consume loop."""
-    processed = 0
-    errors  = 0
-
-    while True:
-        try:
-            for message in consumer:
-                topic = message.topic
-                raw_data = message.value
-                
-                enriched: Optional[NormalizedEvent] = None
-                try:
-                    raw = RawEvent(**raw_data)
-                    
-                    # ── THE UPDATED ROUTER ───────────────────────────────────
-                    if topic == Topics.RAW_MARITIME:
-                        enriched = maritime.enrich(raw)
-                    elif topic == Topics.RAW_AVIATION:
-                        enriched = aviation.enrich(raw)
-                    elif topic == Topics.RAW_NEWS:
-                        enriched = news.enrich(raw)
-                    elif topic == Topics.RAW_CYBER:
-                        enriched = cyber.enrich(raw)
-                    elif topic == Topics.RAW_TRADFI:
-                        enriched = tradfi.enrich(raw)
-                    elif topic == Topics.RAW_CRYPTO:
-                        enriched = crypto.enrich(raw)
-                    elif topic == Topics.RAW_PREDICTION:
-                        enriched = prediction.enrich(raw)
-                    
-                    
-                    if enriched:
-                        db.write_event(enriched)
-                        producer.send(
-                            Topics.ENRICHED_EVENTS,
-                            enriched.model_dump(),
-                            key=enriched.primary_entity.id,
-                        )
-                        processed += 1
-                        if processed % 500 == 0:
-                            logger.info(f"Processed {processed} | Errors {errors}")
-
-                except Exception as e:
-                    errors += 1
-                    logger.error(f"[{topic}] {e}", exc_info=True)
-                    try:
-                        dlq.send(Topics.DLQ, {"error": str(e), "topic": topic, "raw": raw_data})
-                    except:
-                        pass
-        except KeyboardInterrupt:
-            break
-        except StopIteration:
-            continue
-        except Exception as e:
-            logger.error(f"Consumer error: {e}", exc_info=True)
-            break
-
-    return processed, errors
-
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
     logger.info("=" * 60)
 
     timescale = get_timescale()
-    neo4j     = await get_neo4j()
     redis     = await get_redis()
     producer = SentinelProducer()
     dlq = SentinelProducer()
