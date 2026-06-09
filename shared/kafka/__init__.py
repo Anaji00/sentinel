@@ -159,6 +159,7 @@ class SentinelConsumer:
             bootstrap_servers: str = None,
             auto_offset_reset: str = "latest",
     ):
+        self.topics = topics
         servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self._c = _Consumer(
             *topics,

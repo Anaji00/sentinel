@@ -272,8 +272,8 @@ async def poll_feed(
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
-async def collect(producer: SentinelProducer):
-    dedup = URLDeduplicator()
+async def collect(producer: SentinelProducer, redis_client):
+    dedup = URLDeduplicator(redis_client)
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(connector=connector) as session:

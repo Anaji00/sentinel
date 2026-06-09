@@ -138,9 +138,9 @@ def build_agent(
         redis_client=redis,
         db_client=db,
         neo4j_client=neo4j,
-        kafka_producer=producer,
-        kafka_consumer=consumer,
-        dlq_producer=dlq,
+        producer=producer,
+        consumer=consumer,
+        dlq=dlq,
         model=os.getenv("AGENT_MODEL", "llama3"),
         **extra_kwargs
     )
@@ -156,9 +156,9 @@ async def main():
     # All agents share DB connections (connection-pooled — thread safe).
     # They do NOT share Kafka producers/consumers (not thread safe).
     shared_infra = {
-        "redis": get_redis(),
+        "redis": await get_redis(),
         "db":    get_timescale(),
-        "neo4j": get_neo4j(),
+        "neo4j": await get_neo4j(),
     }
     logger.info("Shared infrastructure connected")
 

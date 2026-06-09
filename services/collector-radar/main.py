@@ -25,7 +25,7 @@ load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
-from shared.db import get_async_redis
+from shared.db import get_redis
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
@@ -123,7 +123,7 @@ async def main():
     if not ALPACA_API_KEY: sys.exit(1)
     producer = SentinelProducer()
     await producer.start()
-    redis_client = await get_async_redis()
+    redis_client = await get_redis()
 
     radar = QuantRadar(redis_client)
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
