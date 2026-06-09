@@ -54,9 +54,10 @@ def _sentiment(text: str) -> float:
 
 class NewsEnricher:
 
-    def __init__(self, scorer, graph_writer):
+    def __init__(self, scorer, graph_writer, redis_client):
         self.scorer = scorer
         self.graph = graph_writer
+        self.redis = redis_client
         self._nlp   = None   # lazy-loaded on first use
 
     def _get_nlp(self):

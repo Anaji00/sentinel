@@ -56,7 +56,6 @@ class CyberEnricher:
     def __init__(self, scorer, graph_writer, db_writer, redis_client):
         self.scorer = scorer
         self.graph = graph_writer
-        self.db = db_writer
         self.redis = redis_client
     
     async def _calculate_velocity_score(self, entity_id: str, event_category: str, threshold: int = 100) -> float:

@@ -112,13 +112,10 @@ class SentinelProducer:
                 self._started = True
                 logger.info("✅ Kafka Producer successfully connected and bootstrapped.")
                 return
-            except KafkaConnectionError as e:
+            except Exception as e:
                 wait_time = min(2 ** attempt, 30)
                 logger.warning(f"⏳ Kafka broker not ready. Producer retrying in {wait_time}s... ({e})")
                 await asyncio.sleep(wait_time)
-            except Exception as e:
-                logger.error(f"Unexpected error starting Kafka Producer: {e}")
-                raise
                 
         raise ConnectionError(f"Fatal: Could not connect to Kafka Producer at {self._servers} after {max_retries} attempts.")
 
@@ -131,7 +128,7 @@ class SentinelProducer:
         if not self._started:
             raise RuntimeError("Cannot send: SentinelProducer is not started.")
         try:
-            k_bytes = key.encode("utf-8") if key else None
+            k_bytes = str(key).encode("utf-8") if key is not None else None
             await self._p.send_and_wait(
                 topic,
                 value=data,
@@ -194,13 +191,10 @@ class SentinelConsumer:
                 self._started = True
                 logger.info(f"✅ Kafka Consumer successfully connected and subscribed to {self.topics}.")
                 return
-            except KafkaConnectionError as e:
+            except Exception as e:
                 wait_time = min(2 ** attempt, 30)
                 logger.warning(f"⏳ Kafka broker not ready. Consumer retrying in {wait_time}s... ({e})")
                 await asyncio.sleep(wait_time)
-            except Exception as e:
-                logger.error(f"Unexpected error starting Kafka Consumer: {e}")
-                raise
                 
         raise ConnectionError(f"Fatal: Could not connect to Kafka Consumer at {self._servers} after {max_retries} attempts.")
 

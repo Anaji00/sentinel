@@ -11,9 +11,10 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType, Predic
 logger = logging.getLogger("enrichment.prediction")
 
 class PredictionEnricher:
-    def __init__(self, scorer, redis_client):
+    def __init__(self, scorer, redis_client, graph_writer):
         self.scorer = scorer
         self.redis = redis_client
+        self.graph = graph_writer
 
     def enrich(self, raw) -> Optional[NormalizedEvent]:
         p = raw.raw_payload

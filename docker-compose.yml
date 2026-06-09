@@ -142,7 +142,7 @@ services:
   enrichment:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ml.Dockerfile
     container_name: sentinel-enrichment
     command: python services/enrichment/main.py
     env_file: .env
@@ -154,7 +154,9 @@ services:
         condition: service_healthy
 
   correlation:
-    build: .
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
     container_name: sentinel-correlation
     command: python services/correlation/main.py
     env_file: .env
@@ -163,7 +165,9 @@ services:
       - enrichment
 
   reasoning:
-    build: .
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
     container_name: sentinel-reasoning
     command: python services/reasoning/main.py
     env_file: .env
@@ -304,7 +308,9 @@ services:
         condition: service_healthy
 
   agents:
-    build: .
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
     container_name: sentinel-agents
     command: python services/agents/main.py
     env_file: .env

@@ -81,8 +81,8 @@ class OntologyMasterAgent(SentinelAgent):
     """
 
     def __init__(self, *args, **kwargs):
+        self._soft_correlator = kwargs.pop("soft_correlator", None)
         super().__init__(*args, **kwargs)
-        self._soft_correlator = soft_correlator
         self._last_prune = 0.0
         self._classified_this_cycle = 0
 

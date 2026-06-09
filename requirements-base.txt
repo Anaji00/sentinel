@@ -1,0 +1,14 @@
+kafka-python==2.0.2
+aiokafka==0.14.0
+pydantic==2.9.0
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+neo4j==5.14.1
+redis==5.0.1
+aiohttp==3.9.1
+websockets==13.0
+feedparser==6.0.11
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+postgis==1.0.4

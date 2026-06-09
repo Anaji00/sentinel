@@ -36,12 +36,10 @@ class MaritimeEnricher:
         # We pass in all the tools this class needs so it doesn't create them itself.
         # scorer:       Calculates anomaly scores (The Judge).
         # graph_writer: Updates Neo4j (The Graph).
-        # db_writer:    Updates TimescaleDB (The Archive).
         # redis:        Fast caching.
         # resolver:    Finds vessel details (The Detective).
         self.scorer = scorer
         self.graph = graph_writer
-        self.db_writer = db_writer
         self.redis = redis_client
         self.resolver = resolver # Used for vessel lookup
 

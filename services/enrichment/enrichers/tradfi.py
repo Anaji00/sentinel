@@ -31,7 +31,6 @@ class TradFiEnricher:
     def __init__(self, scorer, redis_client, db_writer, graph_writer):
         self.scorer = scorer
         self.redis_client = redis_client
-        self.db = db_writer
         self.graph = graph_writer
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:

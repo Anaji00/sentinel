@@ -37,7 +37,6 @@ class AviationEnricher:
     def __init__(self, scorer, graph_writer, db_writer, redis_client, resolver=None):
         self.scorer = scorer
         self.graph  = graph_writer
-        self.db = db_writer
         self.redis = redis_client
         self.resolver = resolver
 
