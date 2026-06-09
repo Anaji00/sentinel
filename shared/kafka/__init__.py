@@ -82,9 +82,9 @@ def _serialize(obj: Any) -> bytes:
 
 class SentinelProducer:
     def __init__(self, bootstrap_servers: str = None):
-        servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        self._servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self._p = _Producer(
-            bootstrap_servers=servers,
+            bootstrap_servers=self._servers,
             value_serializer=_serialize,
             # RETRIES: The "Redial" button.
             # ACKS='all': The "Registered Mail" setting.
@@ -100,7 +100,7 @@ class SentinelProducer:
             compression_type="gzip",
         )
         self._started = False
-        logger.info(f"Kafka Producer -> {servers}")
+        logger.info(f"Kafka Producer -> {self._servers}")
 
     async def start(self, max_retries: int = 15):
         """Must be called inside the async event loop to initialize network sockets."""
@@ -120,7 +120,7 @@ class SentinelProducer:
                 logger.error(f"Unexpected error starting Kafka Producer: {e}")
                 raise
                 
-        raise ConnectionError(f"Fatal: Could not connect to Kafka Producer at {self.servers} after {max_retries} attempts.")
+        raise ConnectionError(f"Fatal: Could not connect to Kafka Producer at {self._servers} after {max_retries} attempts.")
 
     async def send(self, topic: str, data: Dict[str, Any], key: str = None, headers: list = None):
         """
@@ -160,10 +160,10 @@ class SentinelConsumer:
             auto_offset_reset: str = "latest",
     ):
         self.topics = topics
-        servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        self._servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self._c = _Consumer(
             *topics,
-            bootstrap_servers=servers,
+            bootstrap_servers=self._servers,
             # GROUP_ID: The "Team Name".
             # If you run 5 instances of this code with the SAME group_id, Kafka divides the work.
             # Instance 1 gets 20% of the messages, Instance 2 gets 20%, etc.
@@ -181,7 +181,7 @@ class SentinelConsumer:
             max_poll_records=100,
         )
         self._started = False
-        logger.info(f"Kafka Consumer: {servers} | Group: {group_id} --> Topics: {topics}")
+        logger.info(f"Kafka Consumer: {self._servers} | Group: {group_id} --> Topics: {topics}")
         
     async def start(self, max_retries: int = 15):
         """Starts the consumer with exponential backoff for broker readiness."""
@@ -202,7 +202,7 @@ class SentinelConsumer:
                 logger.error(f"Unexpected error starting Kafka Consumer: {e}")
                 raise
                 
-        raise ConnectionError(f"Fatal: Could not connect to Kafka Consumer at {self.servers} after {max_retries} attempts.")
+        raise ConnectionError(f"Fatal: Could not connect to Kafka Consumer at {self._servers} after {max_retries} attempts.")
 
     async def get_batch(self, timeout_ms=1000):
         """
