@@ -59,13 +59,13 @@ class VesselGapDetector:
         now = datetime.now(timezone.utc)
         fired = 0
         has_keys = False
-        batch_events_to_write = List[NormalizedEvent] = []
+        batch_events_to_write: List[NormalizedEvent] = []
         async for key in self.redis.raw.scan_iter("vessel:last_seen:*"):
             has_keys = True
             try:
                 key_str = key.decode("utf-8") if isinstance(key, bytes) else key
                 mmsi = key_str.replace("vessel:last_seen:", "")
-                raw_val = self.redis.get(key)
+                raw_val = await self.redis.raw.get(key)
                 if not raw_val:
                     continue
                 if isinstance(raw_val, dict):
@@ -112,7 +112,7 @@ class VesselGapDetector:
                 if len(self._seen_gaps) > 10_000:
                     self._seen_gaps.clear()
                 
-                info_raw = await self.redis.get(f"vessel:info:{mmsi}")
+                info_raw = await self.redis.raw.get(f"vessel:info:{mmsi}")
                 info = json.loads(info_raw) if info_raw else {}
                 flags = info.get("flags", []) if isinstance(info, dict) else []
                 vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"

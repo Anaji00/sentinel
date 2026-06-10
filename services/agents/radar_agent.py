@@ -36,7 +36,7 @@ class RadarAgent(SentinelAgent):
         """
 
         try:
-            response = await self._llm.generate(
+            response = await self._llm.infer(
                 prompt = prompt, 
                 schema = {"type": "object", "properties": {"investigate": {"type": "boolean"}, "rationale": {"type": "string"}}}
             )
@@ -48,9 +48,9 @@ class RadarAgent(SentinelAgent):
                 # ─── DYNAMIC INFRASTRUCTURE INJECTION ───
                 # This explicitly commands the services/collector-tradfi/main.py WebSocket 
                 # to subscribe to this ticker on its next sync loop.
-                self.redis.raw.sadd("sentinel:watched:equities", ticker)
+                await self.redis.raw.sadd("sentinel:watched:equities", ticker)
                 
-                self.mark_processed(ticker, self.cooldown_seconds)
+                await self.mark_processed(ticker, self.cooldown_seconds)
 
                 return {
                     "event_type": "dynamic_allocation",

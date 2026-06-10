@@ -19,6 +19,6 @@ RUN pip install --no-cache-dir -r requirements-base.txt
 # Install Heavy ML requirements
 COPY requirements-ml.txt .
 RUN pip install --no-cache-dir -r requirements-ml.txt
-RUN python -m spacy download en_core_web_sm
+RUN pip install --no-cache-dir https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz
 
 COPY . .

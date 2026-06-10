@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
+from shared.kafka import Topics
 
 logger = logging.getLogger("enrichment.news")
 

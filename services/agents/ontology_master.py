@@ -302,7 +302,7 @@ class OntologyMasterAgent(SentinelAgent):
 
             }
         }
-        self._producer.send("sentinel.ontology.proposals", proposal, key=entity_name)
+        await self._producer.send("sentinel.ontology.proposals", proposal, key=entity_name)
 
         # Geographic exposures are sent as a separate relational proposal
         for country in classification.geographic_exposure[:5]:
@@ -316,7 +316,7 @@ class OntologyMasterAgent(SentinelAgent):
                         "relation_type": "HAS_EXPOSURE_IN"
                     }
                 }
-                self._producer.send("sentinel.ontology.proposals", rel_proposal, key=entity_name)
+                await self._producer.send("sentinel.ontology.proposals", rel_proposal, key=entity_name)
 
         logger.info(f"Proposed Neo4j promotion for '{entity_name}' with label '{label}' and domain '{classification.primary_domain}'")
     # ── DOWNSTREAM WATCHLIST TRIGGERS ─────────────────────────────────────────

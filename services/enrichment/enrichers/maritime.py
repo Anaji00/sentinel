@@ -31,7 +31,7 @@ from shared.utils.sanctions import check_sanctions
 logger = logging.getLogger("enrichment.maritime")
  
 class MaritimeEnricher:
-    def __init__(self, scorer, graph_writer, db_writer, redis_client, resolver=None):
+    def __init__(self, scorer, graph_writer, redis_client, resolver=None):
         # DEPENDENCY INJECTION:
         # We pass in all the tools this class needs so it doesn't create them itself.
         # scorer:       Calculates anomaly scores (The Judge).
@@ -43,7 +43,7 @@ class MaritimeEnricher:
         self.redis = redis_client
         self.resolver = resolver # Used for vessel lookup
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         """
         Main entry point.
         Decides if the message is a Moving Report or a Static Info Report.
@@ -58,9 +58,9 @@ class MaritimeEnricher:
             return None  # Invalid MMSI, skip
         
         if msg_type == "PositionReport":
-            return self._position(raw, payload, meta, mmsi)
+            return await self._position(raw, payload, meta, mmsi)
         elif msg_type == "ShipStaticData":
-            return self._static(raw, payload, meta, mmsi)
+            return await self._static(raw, payload, meta, mmsi)
         return None
     
     # ── Position ──────────────────────────────────────────────────────────────
@@ -93,13 +93,6 @@ class MaritimeEnricher:
         # 4. UPDATE BASELINE
         # "Remember that this ship usually moves at X speed."
         await self.scorer.update_vessel_baseline(mmsi, vtype, speed)
-
-        # 5. WRITE TO DB (The Archive)
-        # Store the raw ping in the massive TimescaleDB table.
-        self.db_writer.write_vessel_position(
-            mmsi, lat, lon, speed, heading, nav_status,
-            raw.occurred_at or datetime.now(timezone.utc),
-        )
 
         # 6. UPDATE CACHE (The Hot Path)
         # Save "Last Seen" to Redis. This is used by the Gap Detector to find
@@ -152,7 +145,7 @@ class MaritimeEnricher:
         )
     
         # ── Static ────────────────────────────────────────────────────────────────
-    def _static(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
+    async def _static(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
         # Static messages contain the Ship Name, Destination, Dimensions, etc.
         # They don't update position, but they update Identity.
         s = payload.get("Message", {}).get("ShipStaticData", {})
@@ -165,14 +158,14 @@ class MaritimeEnricher:
         flags = check_sanctions(name, mmsi)
 
         # Update Redis Cache with new identity info.
-        self.redis.set(
+        await self.redis.set(
             f"vessel:info:{mmsi}",
             json.dumps({ "name": name, "destination": dest,
                         "vessel_type": vtype, "flags": flags }),
             ttl = 864000 # 24 hours
         )
         # Update Graph with new identity info.
-        self.graph.upsert_vessel(mmsi, {"name": name, "vessel_type": vtype, "flags": flags})
+        await self.graph.upsert_vessel(mmsi, {"name": name, "vessel_type": vtype, "flags": flags})
 
         return NormalizedEvent(
             event_id = raw.event_id,
@@ -186,7 +179,7 @@ class MaritimeEnricher:
         )
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _get_vessel(self, mmsi: str, meta: dict) -> dict:
+    async def _get_vessel(self, mmsi: str, meta: dict) -> dict:
         """
         Determines who a vessel is.
         Strategy:
@@ -195,11 +188,11 @@ class MaritimeEnricher:
         """
         if self.resolver:
             try:
-                return self.resolver.resolve_vessel(mmsi, ais_meta=meta)
+                return await self.resolver.resolve_vessel(mmsi, ais_meta=meta)
             except Exception as e:
                 logger.debug(f"Resolver failed for {mmsi}: {e}")
         # Inline fallback — same logic as before
-        cached = self.redis.get(f"vessel:info:{mmsi}")
+        cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
         if cached:
             return json.loads(cached)
         name = meta.get("ShipName", "")

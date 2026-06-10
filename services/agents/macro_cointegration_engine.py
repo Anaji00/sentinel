@@ -211,7 +211,7 @@ async def main_stream():
                     macro_asset = payload.get("ticker")
                     macro_price = payload.get("price")
 
-                    if not macro_asset or macro_price: continue
+                    if not macro_asset or not macro_price: continue
 
                     exposed_equities = await engine._get_exposed_instrument(macro_asset)
                     if not exposed_equities: continue
