@@ -50,9 +50,9 @@ class PredictionEnricher:
         tags = ["prediction_market", "whale_bet", slug.lower()]
         headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
 
-        loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, self.redis.sadd, "sentinel:polymarket:watched_slugs", slug)
+            # ASYNC REDIS RAW API - Dropped executor wrapper
+            await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
         except Exception:
             pass
         
@@ -86,9 +86,9 @@ class PredictionEnricher:
         # r Stateful delta calculation using Redis
         try:
             redis_key = f"sentinel:kalshi:vol:{ticker}"
-            last_vol_str = await loop.run_in_executor(None, self.redis.get, redis_key)
+            last_vol_str = await self.redis.raw.get(redis_key)
             last_vol = float(last_vol_str) if last_vol_str else current_vol
-            await loop.run_in_executor(None, lambda: self.redis.set(redis_key, current_vol, ex=86400))# 24h expiry
+            await self.redis.raw.set(redis_key, str(current_vol), ex=86400)  # 24h expiry
         except Exception:
             last_vol = current_vol
 
@@ -112,7 +112,7 @@ class PredictionEnricher:
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         try:
-            await loop.run_in_executor(None, self.redis.sadd, "sentinel:kalshi:watched_tickers", ticker)
+            await self.redis.raw.sadd("sentinel:kalshi:watched_tickers", ticker)
         except Exception:
             pass
             

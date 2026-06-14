@@ -39,8 +39,8 @@ class MaritimeEnricher:
         # redis:        Fast caching.
         # resolver:    Finds vessel details (The Detective).
         self.scorer = scorer
-        self.graph = graph_writer
         self.redis = redis_client
+        self.graph = graph_writer
         self.resolver = resolver # Used for vessel lookup
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:

@@ -90,13 +90,14 @@ async def main():
     graph = GraphWriter(producer)
     resolver = EntityResolver(redis, timescale)
 
-    maritime = MaritimeEnricher(scorer, graph, redis, resolver)
-    aviation = AviationEnricher(scorer, graph, redis, resolver)
-    news = NewsEnricher(scorer, graph, redis)
-    cyber = CyberEnricher(scorer, graph, redis)
-    tradfi = TradFiEnricher(scorer, graph, redis)
-    crypto = CryptoEnricher(scorer, graph, redis)
-    prediction = PredictionEnricher(scorer, graph, redis)
+# STRICT DEPENDENCY INJECTION ALIGNMENT: (scorer, redis, graph, [resolver])
+    maritime = MaritimeEnricher(scorer, redis, graph, resolver)
+    aviation = AviationEnricher(scorer, redis, graph, resolver)
+    news = NewsEnricher(scorer, redis, graph)
+    cyber = CyberEnricher(scorer, redis, graph)
+    tradfi = TradFiEnricher(scorer, redis, graph)
+    crypto = CryptoEnricher(scorer, redis, graph)
+    prediction = PredictionEnricher(scorer, redis, graph)
     
     enrichers_tuple = (maritime, aviation, news, cyber, tradfi, crypto, prediction)
 

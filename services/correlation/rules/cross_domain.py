@@ -55,7 +55,7 @@ THEMATIC_LINKS = {
     "macro_sentiment": ["consumer_confidence", "business_confidence", "gdp", "unemployment", "retail_sales", "durable_goods", "initial_claims"]
 }
 
-def get_expanded_tags(tags: set) -> set:
+async def get_expanded_tags(tags: set) -> set:
     """
     Takes standard tags and explodes them using BOTH the static Ontology Map 
     and the dynamic AI-curated Redis Ontology.
@@ -71,12 +71,12 @@ def get_expanded_tags(tags: set) -> set:
                 
     # 2. Dynamic MAS Ontology (Llama 3 Curated)
     try:
-        redis_client = get_redis()
+        redis_client = await get_redis()
         if redis_client:
             for tag in tags:
                 normalized_tag = tag.lower().strip()
                 # Check if the AI Agent has classified this entity
-                record_raw = redis_client.raw.get(f"sentinel:ontology:entity:{normalized_tag}")
+                record_raw = await redis_client.raw.get(f"sentinel:ontology:entity:{normalized_tag}")
                 if record_raw:
                     record = json.loads(record_raw)
                     concepts = record.get("macro_concepts", [])
@@ -91,7 +91,7 @@ def _domain_of(event_type: str) -> str:
         if event_type in types: return domain
     return "other"
 
-def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
+async def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
     """
     CROSS_001: Thematic Cross-Domain Cluster.
     Uses the Ontology Map to bind completely different data streams (e.g. ADSB and Stock Flow)
@@ -113,7 +113,7 @@ def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[Correla
     
     # 2. ONTOLOGY EXPANSION
     # Expand the trigger event's tags (e.g. "lmt" expands to include "defense", "taiwan", "war", "rtx")
-    my_expanded_tags = get_expanded_tags(set(event.tags))
+    my_expanded_tags = await get_expanded_tags(set(event.tags))
     valid_others = []
 
     # 3. INTERSECTION SEARCH
@@ -121,7 +121,7 @@ def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[Correla
         if other_event["event_id"] == event.event_id: continue
         
         # Expand the historical event's tags
-        their_expanded_tags = get_expanded_tags(set(other_event.get("tags", [])))
+        their_expanded_tags = await get_expanded_tags(set(other_event.get("tags", [])))
         
         # If the expanded sets intersect, we have a confirmed geopolitical/thematic correlation!
         overlap = my_expanded_tags.intersection(their_expanded_tags)

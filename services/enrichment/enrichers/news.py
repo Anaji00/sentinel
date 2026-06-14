@@ -57,8 +57,8 @@ class NewsEnricher:
 
     def __init__(self, scorer, graph_writer, redis_client):
         self.scorer = scorer
-        self.graph = graph_writer
         self.redis = redis_client
+        self.graph = graph_writer
         self._nlp   = None   # lazy-loaded on first use
 
     def _get_nlp(self):

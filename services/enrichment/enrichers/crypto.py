@@ -32,8 +32,8 @@ class CryptoEnricher:
         p, source = raw.raw_payload, raw.source
         if source == "ethereum_rpc": return await self._enrich_whale_transfer(raw, p)
         elif source == "binance_futures": return await self._enrich_liquidation(raw, p)
-        elif source == "binance_spot": return await self._enrich_spot_trade(raw, p)
-        elif source == "binance_candles": return await self._enrich_candle(raw, p)
+        elif source == "coinbase_spot": return await self._enrich_spot_trade(raw, p)
+        elif source == "coinbase_candles": return await self._enrich_candle(raw, p)
         return None
 
     
@@ -172,9 +172,9 @@ class CryptoEnricher:
             if is_suspect: tags.append("suspect_wallet")
             headline = f"{'🚨 SUSPECT ' if is_suspect else ''}Whale Transfer: ${notional/1e6:.1f}M {asset}"
 
-            if notional > 5_000_00:
+            if notional > 5_000_000:
                 try:
-                    await self.redis.sadd("sentinel:watched:wallets", wallet)
+                    await self.redis.raw.sadd("sentinel:watched:wallets", wallet)
                 except Exception as e:
                     logger.error(f"Redis connection failed while saving wallet {wallet[:6]}: {e}")
 
