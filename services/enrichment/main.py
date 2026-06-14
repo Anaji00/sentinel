@@ -76,6 +76,8 @@ async def main():
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
     logger.info("=" * 60)
 
+    bootstrap_database()  # Ensure DB schema is ready before processing
+
     timescale = get_timescale()
     redis     = await get_redis()
     producer = SentinelProducer()
@@ -86,15 +88,15 @@ async def main():
     scorer = DynamicAnomalyScorer(redis)
     db = DBWriter(timescale)
     graph = GraphWriter(producer)
-    resolver = EntityResolver(redis, None)
+    resolver = EntityResolver(redis, timescale)
 
-    maritime = MaritimeEnricher(scorer, graph, db, redis, resolver)
-    aviation = AviationEnricher(scorer, graph, db, redis)
-    news = NewsEnricher(scorer, redis)
-    cyber = CyberEnricher(scorer, redis)
-    tradfi = TradFiEnricher(scorer, redis)
-    crypto = CryptoEnricher(scorer, redis)
-    prediction = PredictionEnricher(scorer, redis)
+    maritime = MaritimeEnricher(scorer, graph, redis, resolver)
+    aviation = AviationEnricher(scorer, graph, redis, resolver)
+    news = NewsEnricher(scorer, graph, redis)
+    cyber = CyberEnricher(scorer, graph, redis)
+    tradfi = TradFiEnricher(scorer, graph, redis)
+    crypto = CryptoEnricher(scorer, graph, redis)
+    prediction = PredictionEnricher(scorer, graph, redis)
     
     enrichers_tuple = (maritime, aviation, news, cyber, tradfi, crypto, prediction)
 

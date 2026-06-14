@@ -53,7 +53,7 @@ class CyberEnricher:
     Translates raw cyber security alerts into standardized NormalizedEvents.
     Routes on raw.source to the correct private handler.
     """
-    def __init__(self, scorer, graph_writer, db_writer, redis_client):
+    def __init__(self, scorer, graph_writer, redis_client):
         self.scorer = scorer
         self.graph = graph_writer
         self.redis = redis_client

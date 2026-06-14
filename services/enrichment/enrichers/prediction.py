@@ -2,6 +2,7 @@
 services/enrichment/enrichers/prediction.py
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,18 +17,18 @@ class PredictionEnricher:
         self.redis = redis_client
         self.graph = graph_writer
 
-    def enrich(self, raw) -> Optional[NormalizedEvent]:
+    async def enrich(self, raw) -> Optional[NormalizedEvent]:
         p = raw.raw_payload
         source = raw.source
 
         if source == "polymarket":
-            return self._enrich_polymarket(raw, p)
+            return await self._enrich_polymarket(raw, p)
         elif source == "kalshi":
-            return self._enrich_kalshi(raw, p)
+            return await self._enrich_kalshi(raw, p)
         
         return None
 
-    def _enrich_polymarket(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_polymarket(self, raw, p) -> Optional[NormalizedEvent]:
         label = p.get("asset_label", "UNKNOWN | UNKNOWN | UNKNOWN")
         parts = label.split(" | ")
         slug = parts[0] if len(parts) > 0 else label
@@ -40,7 +41,7 @@ class PredictionEnricher:
         asset_id = p.get("asset_id", slug)
 
         # BRAIN CHECK: Ask the AnomalyScorer if this is unusual
-        anomaly = self.scorer.score_prediction_trade(asset_id, notional)
+        anomaly = await self.scorer.score_prediction_trade(asset_id, notional)
 
         # GATEKEEPER: Drop normal trades. We only care about anomalies > 0.6
         if anomaly < 0.6:
@@ -49,9 +50,10 @@ class PredictionEnricher:
         tags = ["prediction_market", "whale_bet", slug.lower()]
         headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
 
+        loop = asyncio.get_running_loop()
         try:
-            self.redis.sadd("sentinel:polymarket:watched_slugs", slug)
-        except Exception as e:
+            await loop.run_in_executor(None, self.redis.sadd, "sentinel:polymarket:watched_slugs", slug)
+        except Exception:
             pass
         
         entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
@@ -75,18 +77,18 @@ class PredictionEnricher:
             anomaly_score=anomaly,
         )
     
-    def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = p.get("ticker", "UNKNOWN")
         title = p.get("title", "Unknown Market")
         price = float(p.get("yes_bid") or p.get("no_bid") or p.get("price") or 0.0)
         current_vol = float(p.get("total_volume", 0))
-
+        loop = asyncio.get_running_loop()
         # r Stateful delta calculation using Redis
         try:
             redis_key = f"sentinel:kalshi:vol:{ticker}"
-            last_vol_str = self.redis.get(redis_key)
+            last_vol_str = await loop.run_in_executor(None, self.redis.get, redis_key)
             last_vol = float(last_vol_str) if last_vol_str else current_vol
-            self.redis.set(redis_key, current_vol, ttl=86400) # 24h expiry
+            await loop.run_in_executor(None, lambda: self.redis.set(redis_key, current_vol, ex=86400))# 24h expiry
         except Exception:
             last_vol = current_vol
 
@@ -97,11 +99,9 @@ class PredictionEnricher:
         if delta <= 0:
             return None
         
-        # BRAIN CHECK: Ask the AnomalyScorer if this volume spike is unusual
-        anomaly = self.scorer.score_event("prediction_market_trade", [notional_usd, delta, price, 0, 0])
-        
-        # We check the dict returned by DynamicAnomalyScorer
-        anomaly_score = anomaly.get("score", 0.0)
+        # BRAIN CHECK: Await the AnomalyScorer
+        anomaly_dict = await self.scorer.score_event("prediction_market_trade", [notional_usd, delta, price, 0, 0])
+        anomaly_score = anomaly_dict.get("score", 0.0)
 
         # GATEKEEPER: Drop normal volume variance.
         if anomaly_score < 0.6:
@@ -112,8 +112,8 @@ class PredictionEnricher:
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         try:
-            self.redis.sadd("sentinel:kalshi:watched_tickers", ticker)
-        except Exception as e:
+            await loop.run_in_executor(None, self.redis.sadd, "sentinel:kalshi:watched_tickers", ticker)
+        except Exception:
             pass
             
         return NormalizedEvent(
