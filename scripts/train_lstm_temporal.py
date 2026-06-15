@@ -9,18 +9,26 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
+IN_DOCKER = os.path.exists('/.dockerenv')
+
+if not IN_DOCKER:
+    if os.getenv("POSTGRES_HOST") == "timescaledb":
+        os.environ["POSTGRES_HOST"] = "localhost"
+        
+    if os.getenv("REDIS_URL") and "redis://" in os.getenv("REDIS_URL"):
+        os.environ["REDIS_URL"] = os.getenv("REDIS_URL").replace("redis:6379", "localhost:6379")
+
 import torch
 import torch.nn as nn
 import numpy as np
 import logging
 from shared.db import get_timescale
-# Import our unified event definitions to prevent string desynchronization
 from shared.models.events import EventType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ml.lstm_training")
 
-MODEL_DIR = "/app/models"
+MODEL_DIR = "/app/models" if IN_DOCKER else str(ROOT / "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 class TemporalLSTMAutoEncoder(nn.Module):
@@ -56,7 +64,6 @@ def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
     """
     db = get_timescale()
     
-    # PATCH: Programmatically gather all financial target categories from models/events.py
     financial_types = [
         EventType.OPTIONS_FLOW.value,
         EventType.DARK_POOL.value,
@@ -72,17 +79,27 @@ def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
         EventType.CRYPTO_TRANSFER.value,
     ]
     
-    # Format list into a safe SQL tuple matching format: ('type1', 'type2', ...)
     types_placeholder = ", ".join(f"'{t}'" for t in financial_types)
     
+    # ─── SPRINT 1 REMEDIATION: PUSH-DOWN FEATURE ENGINEERING ────────────────────
+    # PostgreSQL dynamically constructs the 5-dimensional feature vector at read-time
+    # using COALESCE to handle nulls and standardizing the output into a float array.
     query = f"""
-        SELECT ml_features FROM events 
+        SELECT 
+            ARRAY[
+                COALESCE(anomaly_score, 0.0),
+                COALESCE(sentiment, 0.0),
+                COALESCE(source_reliability, 0.5),
+                COALESCE((financial_data->>'premium_usd')::numeric, 0.0),
+                COALESCE((financial_data->>'volume')::numeric, 0.0)
+            ]::float[] AS ml_features
+        FROM events 
         WHERE type IN ({types_placeholder}) 
-          AND ml_features IS NOT NULL
         ORDER BY occurred_at ASC 
         LIMIT 50000
     """
-    
+    # ────────────────────────────────────────────────────────────────────────────
+
     logger.info(f"Querying macro-financial features for types: {financial_types}")
     rows = db.query(query)
 
@@ -91,7 +108,7 @@ def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
         synthetic = np.random.normal(0, 1, (1000, seq_len, 5)).astype(np.float32)
         return torch.tensor(synthetic)
     
-    raw_data = np.array([row['ml_features'] if 'ml_features' in row else row[0] for row in rows], dtype=np.float32)
+    raw_data = np.array([row['ml_features'] for row in rows], dtype=np.float32)
     sequences = []
     
     for i in range(len(raw_data) - seq_len):
