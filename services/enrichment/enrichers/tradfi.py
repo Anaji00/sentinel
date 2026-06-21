@@ -28,7 +28,7 @@ FORM4_CODES = {
 
 class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
-    def __init__(self, scorer, redis_client, db_writer, graph_writer):
+    def __init__(self, scorer, redis_client, graph_writer):
         self.scorer = scorer
         self.redis_client = redis_client
         self.graph = graph_writer
