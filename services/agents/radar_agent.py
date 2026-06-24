@@ -5,7 +5,7 @@ from shared.kafka import Topics
 
 class RadarAgent(SentinelAgent):
     def __init__(self, *args, **kwargs):
-        super().__init__(agent_name="radar_agent", input_topics=[Topics.RAW_RADAR], *args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.cooldown_seconds = 86400
     
     @property
@@ -21,7 +21,7 @@ class RadarAgent(SentinelAgent):
             return None
         
         # Idempotency: Do not re-evaluate a ticker we already escalated today
-        if self.is_recently_processed(ticker, self.cooldown_seconds):
+        if await self.is_recently_processed(ticker, self.cooldown_seconds):
             return None
         
         # ─── AGENTIC REASONING ───
