@@ -66,6 +66,9 @@ class SentinelAgent(ABC):
         self.logger.info(f"SENTINEL Agent: {self.name} | Model: {self.model} @ {OLLAMA_URL}")
         self.logger.info("=" * 60)
 
+        await self._consumer.start()
+        await self._producer.start()
+        await self._dlq.start()
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         try:
@@ -76,7 +79,10 @@ class SentinelAgent(ABC):
             heartbeat_task.cancel()
             if self._session:
                 await self._session.close()
-            self._consumer.close()
+            await self._consumer.close()
+            await self._producer.close()
+            await self._dlq.close()
+
 
     async def _consume_loop(self):
         loop = asyncio.get_running_loop()
@@ -110,7 +116,7 @@ class SentinelAgent(ABC):
             try:
                 result = await self.handle(raw)
                 if result is not None:
-                    self._producer.send(
+                    await self._producer.send(
                         self.output_topic,
                         result,
                         key=result.get("agent_run_id", str(uuid.uuid4())),
@@ -126,9 +132,9 @@ class SentinelAgent(ABC):
             except Exception as e:
                 self._errors += 1
                 self.logger.error(f"Dispatch error: {e}", exc_info=True)
-                self._send_dlq(raw, str(e), self.input_topics[0])
+                await self._send_dlq(raw, str(e), self.input_topics[0])
 
-    def _send_dlq(self, raw: Dict, error: str, topic: str):
+    async def _send_dlq(self, raw: Dict, error: str, topic: str):
         try:
             self._dlq.send("dead.letter", {"error": error, "topic": topic, "raw": raw, "agent": self.name})
         except Exception as e:

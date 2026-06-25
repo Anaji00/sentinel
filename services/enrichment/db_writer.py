@@ -18,6 +18,46 @@ class DBWriter:
     def __init__(self, timescale_client):
         self.db = timescale_client
 
+    def _extract_tuple(self, e: NormalizedEvent) -> tuple:
+        """Extracts a tuple of values from a NormalizedEvent for DB insertion."""
+        def _dump(attr):
+            val = getattr(e, attr, None)
+            return json.dumps(val.model_dump()) if val else None
+        
+        pe = e.primary_entity
+
+        return (
+            e.event_id,
+            e.type.value if hasattr(e.type, 'value') else e.type,
+            e.occurred_at,
+            getattr(e, 'collected_at', datetime.now()),
+            e.source,
+            getattr(e, 'source_reliability', 1.0),
+            pe.id,
+            pe.type.value if hasattr(pe.type, 'value') else pe.type,
+            pe.name,
+            getattr(pe, 'flags', []),
+            getattr(e, 'longitude', None),
+            getattr(e, 'latitude', None),
+            getattr(e, 'region', None),
+            getattr(e, 'country_code', None),
+            getattr(e, 'headline', None),
+            getattr(e, 'summary', None),
+            getattr(e, 'url', None),
+            _dump('vessel_data'),
+            _dump('flight_data'),
+            _dump('financial_data'),
+            _dump('security_data'),
+            _dump('prediction_market_data'),
+            _dump('crypto_data'),
+            _dump('cyber_data'),
+            getattr(e, 'tags', []),
+            getattr(e, 'named_entities', []),
+            getattr(e, 'sentiment', None),
+            getattr(e, 'anomaly_score', 0.0),
+            getattr(e, 'correlation_ids', [])
+        )
+
     def write_event(self, event: NormalizedEvent):
         data = event.to_tuple()
         try:
@@ -28,13 +68,15 @@ class DBWriter:
                     primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags,
                     coordinates, region, country_code, headline, summary, url,
                     vessel_data, flight_data, financial_data, security_data,
+                    prediction_market_data, crypto_data, cyber_data,
                     tags, named_entities, sentiment, anomaly_score, correlation_ids
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                    ST_SetSRID(ST_MakePoint(%s::float, %s::float), 4326),
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s::jsonb, %s::jsonb,
                     %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (event_id, occurred_at) DO NOTHING
@@ -48,7 +90,7 @@ class DBWriter:
         if not events:
             return
             
-        values = [e.to_tuple() for e in events]
+        values = [self._extract_tuple(e) for e in events]
 
         # FIX: The target schema is strictly defined.
         query = """
@@ -67,9 +109,10 @@ class DBWriter:
         template = """(
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+            ST_SetSRID(ST_MakePoint(%s::float, %s::float), 4326),
             %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
+            %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+            %s::jsonb, %s::jsonb, %s::jsonb,
             %s, %s, %s, %s, %s
         )"""
 
