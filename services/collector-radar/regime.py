@@ -7,14 +7,15 @@ class MarketRegime:
     def __init__(self, redis_client):
         self.redis = redis_client
 
-    def get_dynamic_thresholds(self) -> tuple[float, float]:
+    async def get_dynamic_thresholds(self) -> tuple[float, float]:
         """
         Calculates dynamic alpha and Z-Score threshold based on VIX state.
         Default standard: Alpha 0.1, Z-Threshold 3.0
         """
         try:
             # Assume a macro collector continuously updates this key
-            vix_current = float(self.redis.raw.get("sentinel:macro:vix") or 15.0)
+            raw_vix = await self.redis.raw.get("sentinel:macro:vix")
+            vix_current = float(raw_vix) if raw_vix else 15.0
         except Exception:
             vix_current = 15.0
 

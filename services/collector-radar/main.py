@@ -13,7 +13,7 @@ import aiohttp
 import logging
 import os
 import sys
-import numpy as np
+import math
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict
 from pathlib import Path
@@ -27,6 +27,8 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 
+from regime import MarketRegime
+
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 logger = logging.getLogger("collector.radar")
@@ -35,10 +37,7 @@ ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
 ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
-# Decay factor for EMA. Lower alpha = longer memory. 
-# At 1-minute intervals, 0.1 gives ~20 minute half-life smoothing.
-ALPHA = 0.1  
-Z_SCORE_THRESHOLD = 3.0
+
 
 MAG_7 = ["MSFT", "AVGO", "GOOG", "AMZN", "TSLA", "AAPL", "NVDA", "MU"]
 
@@ -55,24 +54,25 @@ class QuantRadar:
 
         return mean, var
     
-    async def _update_baseline(self, ticker: str, current_vol: float, mean: float, var: float):
-        new_mean = (ALPHA * current_vol) + ((1 - ALPHA) * mean)
-        new_var = (ALPHA * (current_vol - mean)**2) + ((1 - ALPHA) * var)
+    async def _update_baseline(self, ticker: str, current_vol: float, mean: float, var: float, alpha: float):
+        new_mean = (alpha * current_vol) + ((1 - alpha) * mean)
+        new_var = (alpha * (current_vol - mean)**2) + ((1 - alpha) * var)
 
         pipe = self.redis.raw.pipeline()
         pipe.set(f"sentinel:radar:mean:{ticker}", new_mean)
         pipe.set(f"sentinel:radar:var:{ticker}", new_var)
         await pipe.execute()
 
-    async def evaluate_volume(self, ticker:str, current_vol: float) -> Tuple[bool, float]:
+    async def evaluate_volume(self, ticker:str, current_vol: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
         mean, var = await self._get_baseline(ticker)
-        std_dev = np.sqrt(var)
+        std_dev = math.sqrt(var)
         if mean == 0.0:
-            await self._update_baseline(ticker, current_vol, current_vol, 1.0)
+            await self._update_baseline(ticker, current_vol, current_vol, 1.0, alpha)
             return False, 0.0
+        
         z_score = (current_vol - mean) / std_dev
-        await self._update_baseline(ticker, current_vol, mean, var)
-        return z_score > Z_SCORE_THRESHOLD, z_score
+        await self._update_baseline(ticker, current_vol, mean, var, alpha)
+        return z_score > z_threshold, z_score
 
 async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
@@ -90,7 +90,7 @@ async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
 def chunk_list(data: List[str], chunk_size: int):
     for i in range(0, len(data), chunk_size): yield data [i:i + chunk_size]
 
-async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str]):
+async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float):
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
     chunks = list(chunk_list(universe, 1000))
     tasks = [session.get(f"{ALPACA_DATA_URL}?symbols={','.join(c)}", headers=headers) for c in chunks]
@@ -108,7 +108,7 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             price = float(min_bar.get("c", 0.0))
             if volume == 0.0: continue
 
-            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume)
+            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, alpha, z_threshold)
             if is_anomaly:
                 notional = volume * price
                 logger.warning(f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} | 1m Vol: {volume} (${notional/1e6:.2f}M)")
@@ -126,17 +126,22 @@ async def main():
     redis_client = await get_redis()
 
     radar = QuantRadar(redis_client)
+    regime = MarketRegime(redis_client)
+
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         universe = await fetch_tradable_universe(session)
         try:
             while True:
                 t0 = asyncio.get_event_loop().time()
-                await poll_alpaca_snapshots(session, producer, radar, universe)
+                alpha, z_threshold = await regime.get_dynamic_thresholds()
+                await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold)
                 elapsed = asyncio.get_event_loop().time() - t0
                 await asyncio.sleep(max(0, 60.0 - elapsed))
         finally:
             await producer.close()
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
