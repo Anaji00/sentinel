@@ -109,7 +109,7 @@ async def rule_cross_domain_anomaly(event: NormalizedEvent, store) -> Optional[C
     other_types = [t for d, types in DOMAIN_GROUPS.items() if d != my_domain for t in types]
 
     # Query the last 48 hours of anomalous events from the database
-    recent_events = store.get_recent(other_types, hours=48, min_anomaly=0.65)
+    recent_events = await store.get_recent(other_types, hours=48, min_anomaly=0.65)
     
     # 2. ONTOLOGY EXPANSION
     # Expand the trigger event's tags (e.g. "lmt" expands to include "defense", "taiwan", "war", "rtx")

@@ -27,7 +27,7 @@ class EventStore:
         self.cache_key = "events:recent_window"
         self.window_seconds = 48 * 3600
           
-    def add_event(self, event: Any):
+    async def add_event(self, event: Any):
         """Add a normalized event to the Redis Sliding Window cache."""
         try:
             timestamp = event.occurred_at.timestamp()
@@ -43,16 +43,16 @@ class EventStore:
                 "headline": event.headline,
                 "named_entities": event.named_entities,
             })
-            self._redis.zadd(self.cache_key, {payload: timestamp})
+            await self._redis.zadd(self.cache_key, {payload: timestamp})
 
             # Sliding Window Maintenance
             cutoff = time.time() - self.window_seconds
-            self._redis.raw.zremrangebyscore(self.cache_key, "-inf", cutoff)
+            await self._redis.raw.zremrangebyscore(self.cache_key, "-inf", cutoff)
         except Exception as e:
             logger.error(f"EventStore.add_event to redis cache failed: {e}")
             
 
-    def get_recent(
+    async def get_recent(
         self,
         event_types: List[str],
         exclude_event_id: str = None,
@@ -68,7 +68,7 @@ class EventStore:
             cutoff = time.time() - (hours * 3600)
             
             # Fetch events from 'now' down to the 'cutoff' timestamp, ordered newest to oldest
-            raw_results = self._redis.zrange(
+            raw_results = await self._redis.raw.zrange(
                 self.cache_key, 
                 "+inf", 
                 cutoff,
@@ -126,7 +126,7 @@ class EventStore:
                 cluster.correlation_id,
                 cluster.rule_id,
                 cluster.rule_name,
-                cluster.alert_tier.value,
+                cluster.alert_tier.value if hasattr(cluster.alert_tier, 'value') else cluster.alert_tier,
                 cluster.detected_at,
                 cluster.trigger_event_id,
                 cluster.supporting_event_ids,
