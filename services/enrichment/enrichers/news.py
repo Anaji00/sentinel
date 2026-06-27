@@ -42,6 +42,12 @@ _POS = {
     "outperform", "buyback", "uptrend", "skyrocket", "lucrative", "undervalued", "bull-run", "soar",
 }
 
+FINANCIAL_KEYWORDS = {
+    "fed": "macro", "rates": "macro", "inflation": "macro", 
+    "earnings": "corporate", "sec": "regulatory", "crypto": "crypto",
+    "treasury": "macro", "opec": "energy", "fomc": "macro",
+    "supply chain": "logistics", "semiconductor": "tech"
+}
 
 def _sentiment(text: str) -> float:
     t     = text.lower()
@@ -55,22 +61,10 @@ def _sentiment(text: str) -> float:
 
 class NewsEnricher:
 
-    def __init__(self, scorer, graph_writer, redis_client):
+    def __init__(self, scorer, redis_client, graph_writer):
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
-        self._nlp   = None   # lazy-loaded on first use
-
-    def _get_nlp(self):
-        if self._nlp is None:
-            try:
-                import spacy
-                self._nlp = spacy.load("en_core_web_sm")
-                logger.info("spaCy model loaded")
-            except Exception as e:
-                logger.warning(f"spaCy unavailable ({e}) — NER disabled")
-                self._nlp = False
-        return self._nlp if self._nlp else None
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
         p     = raw.raw_payload
@@ -83,51 +77,60 @@ class NewsEnricher:
         reliability = float(p.get("reliability", 0.8))
 
         named_entities: List[str] = []
-        nlp = self._get_nlp()
-        if nlp:
-            loop = asyncio.get_running_loop()
-            # FIX: SpaCy NLP is heavy CPU Math! Offload to ThreadPool to save the event loop.
-            doc = await loop.run_in_executor(None, nlp, f"{title}. {summary[:400]}")
-            named_entities = list(set(
-                ent.text for ent in doc.ents
-                if ent.label_ in ("GPE", "ORG", "PERSON", "NORP", "FAC", "LOC") and len(ent.text) > 2
-            ))[:20]
+        combined_text = f"{title} {summary}"
+        lower_text = combined_text.lower()
 
-        sentiment = _sentiment(title + " " + summary[:200])
-        anomaly   = await self.scorer.score_news(named_entities, sentiment, reliability)
-        
-        if named_entities and self.graph:
-            graph_tasks = []
-            for ent in named_entities:
-                graph_tasks.append(
-                    self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                        "entity_id": ent,
-                        "action": "MERGE_ONTOLOGY_NODE",
-                        "data": {"label": "Concept", "primary_domain": "geopolitical"}
-                    }, key=ent)
-                )
-            # Gather prevents sequential network blocking
-            await asyncio.gather(*graph_tasks, return_exceptions=True)
+
+        sentiment = _sentiment(combined_text[:200])
 
         tags = list(p.get("tags", []))
         tags.append(p.get("category", "news"))
+
+        for kw, category in FINANCIAL_KEYWORDS.items():
+            if kw in lower_text:
+                if category not in tags:
+                    tags.append(category)
+        
+        features = [abs(sentiment), len(tags)]
+        anomaly = await self.scorer.score_event("news_headline", features)
+
+        if anomaly < 0.3:
+            return None
         
         logger.info(f"Enriched News | Anomaly: {anomaly} | Sentiment: {sentiment} | {title[:60]}...")
 
+        if anomaly >=0.5 and self.graph:
+            topic_str = "High_Impact_News"
+
+            # Using try/except to prevent network timeouts from crashing the loop
+            try:
+                await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                    "entity_id": topic_str,
+                    "action": "MERGE_ONTOLOGY_NODE",
+                    "data": {
+                        "label": "NewsEvent",
+                        "primary_domain": "global",
+                        "confidence": anomaly,
+                        "sentiment": sentiment
+                    }
+                }, key=topic_str)
+            except Exception as e:
+                logger.debug(f"Failed to push to ontology proposals: {e}")
+
+        entity = Entity(id=raw.source, type=EntityType.MEDIA_SOURCE, name=raw.source)
+    
         return NormalizedEvent(
             event_id=raw.event_id,
             type=EventType.HEADLINE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             source_reliability=reliability,
-            primary_entity=Entity(
-                id=raw.source, type=EntityType.MEDIA_SOURCE, name=raw.source,
-            ),
+            primary_entity=entity,
             headline=title,
             summary=summary,
             url=url,
             tags=tags,
-            named_entities=named_entities,
+            named_entities=[],
             sentiment=sentiment,
             anomaly_score=anomaly,
         )

@@ -142,12 +142,11 @@ async def stream_equities(producer: SentinelProducer, redis_client):
     
     async def sync_subscriptions(ws):
         """Watches Redis and dynamically subscribes/unsubscribes using Finnhub JSON formats."""
-        loop = asyncio.get_event_loop()
         current_subs = set()
 
         while True:
             try:
-                raw_tickers = await loop.run_in_executor(None, redis_client.raw.smembers, REDIS_EQUITIES_KEY)
+                raw_tickers = await redis_client.raw.smembers(REDIS_EQUITIES_KEY)
                 decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
                 desired_subs = {t.upper() for t in decoded_tickers} if decoded_tickers else {"SPY", "QQQ"}
                 
@@ -241,7 +240,7 @@ async def main():
     logger.info("SENTINEL TradFi Service")
     logger.info("=" * 60)
     producer = SentinelProducer()
-    redis_client = get_redis()
+    redis_client = await get_redis()
     logger.info("Starting TradFi Collector (Finnhub & SEC Only)")
     try:
         await asyncio.gather(

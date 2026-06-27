@@ -1,7 +1,6 @@
 """
 services/collector-radar/regime.py
 """
-import numpy as np
 
 class MarketRegime:
     def __init__(self, redis_client):
