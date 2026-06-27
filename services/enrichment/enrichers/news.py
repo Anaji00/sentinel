@@ -43,10 +43,52 @@ _POS = {
 }
 
 FINANCIAL_KEYWORDS = {
-    "fed": "macro", "rates": "macro", "inflation": "macro", 
-    "earnings": "corporate", "sec": "regulatory", "crypto": "crypto",
-    "treasury": "macro", "opec": "energy", "fomc": "macro",
-    "supply chain": "logistics", "semiconductor": "tech"
+    # ── MACRO & MONETARY POLICY ──
+    "fed": "macro", "fomc": "macro", "powell": "macro", "interest rates": "macro",
+    "inflation": "macro", "cpi": "macro", "ppi": "macro", "gdp": "macro",
+    "treasury": "macro", "yield curve": "macro", "recession": "macro", 
+    "payrolls": "macro", "unemployment": "macro", "ecb": "macro", "boj": "macro",
+    "liquidity": "macro", "stimulus": "macro", "quantitative tightening": "macro",
+
+    # ── CORPORATE & EQUITIES ──
+    "earnings": "corporate", "guidance": "corporate", "ipo": "corporate",
+    "merger": "corporate", "acquisition": "corporate", "buyback": "corporate",
+    "dividend": "corporate", "bankruptcy": "corporate", "chapter 11": "corporate",
+    "sec": "regulatory", "insider trading": "regulatory", "antitrust": "regulatory",
+    "subpoena": "regulatory", "ftc": "regulatory", "doj": "regulatory",
+
+    # ── ENERGY & COMMODITIES ──
+    "opec": "energy", "crude oil": "energy", "brent": "energy", "wti": "energy",
+    "natgas": "energy", "lng": "energy", "aramco": "energy", "refinery": "energy",
+    "spr": "energy", "strategic petroleum reserve": "energy", "gold": "metals",
+    "copper": "metals", "uranium": "metals", "agriculture": "commodities",
+
+    # ── GEOPOLITICAL & DEFENSE ──
+    "pentagon": "defense", "nato": "geopolitical", "sanctions": "geopolitical",
+    "embargo": "geopolitical", "tariff": "macro", "taiwan strait": "geopolitical",
+    "south china sea": "geopolitical", "kremlin": "geopolitical", "idf": "defense",
+    "houthis": "geopolitical", "red sea": "geopolitical", "defense contract": "defense",
+    "missile": "defense", "drone strike": "defense", "dod": "defense", "hormuz": "geopolitical", 
+    "iran nuclear": "geopolitical", "nuclear test": "geopolitical",
+
+    # ── TECH & SEMICONDUCTORS ──
+    "semiconductor": "tech", "artificial intelligence": "tech", "ai": "tech",
+    "chip foundry": "tech", "gpu": "tech", "data center": "tech", 
+    "export controls": "geopolitical", "tsmc": "tech", "asml": "tech",
+
+    # ── LOGISTICS, MARITIME & AVIATION ──
+    "supply chain": "logistics", "suez": "maritime", "panama canal": "maritime",
+    "baltic dry": "logistics", "freight": "logistics", "port strike": "logistics",
+    "faa": "aviation", "grounding": "aviation", "airspace": "aviation",
+
+    # ── CRYPTO & DEFI ──
+    "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto", "etf": "crypto",
+    "binance": "crypto", "coinbase": "crypto", "stablecoin": "crypto", 
+    "tether": "crypto", "defi": "crypto", "halving": "crypto", "airdrop": "crypto",
+
+    # ── CYBERSECURITY ──
+    "ransomware": "cyber", "data breach": "cyber", "ddos": "cyber", 
+    "zero-day": "cyber", "cisa": "cyber", "apt": "cyber", "malware": "cyber"
 }
 
 def _sentiment(text: str) -> float:
@@ -75,8 +117,6 @@ class NewsEnricher:
         summary     = (p.get("summary") or "")[:1000]
         url         = p.get("url", "")
         reliability = float(p.get("reliability", 0.8))
-
-        named_entities: List[str] = []
         combined_text = f"{title} {summary}"
         lower_text = combined_text.lower()
 
@@ -91,8 +131,7 @@ class NewsEnricher:
                 if category not in tags:
                     tags.append(category)
         
-        features = [abs(sentiment), len(tags)]
-        anomaly = await self.scorer.score_event("news_headline", features)
+        anomaly = await self.scorer.score_news(named_entities = tags, sentiment = sentiment, reliability = reliability)
 
         if anomaly < 0.3:
             return None
