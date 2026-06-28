@@ -34,7 +34,7 @@ SQUAWK_LABELS = {
 
 class AviationEnricher:
 
-    def __init__(self, scorer, graph_writer, redis_client, resolver=None):
+    def __init__(self, scorer, redis_client, graph_writer, resolver=None):
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
