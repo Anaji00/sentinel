@@ -31,7 +31,7 @@ from shared.utils.sanctions import check_sanctions
 logger = logging.getLogger("enrichment.maritime")
  
 class MaritimeEnricher:
-    def __init__(self, scorer, graph_writer, redis_client, resolver=None):
+    def __init__(self, scorer, redis_client, graph_writer, resolver=None):
         # DEPENDENCY INJECTION:
         # We pass in all the tools this class needs so it doesn't create them itself.
         # scorer:       Calculates anomaly scores (The Judge).
