@@ -34,7 +34,7 @@ SQUAWK_LABELS = {
 
 class AviationEnricher:
 
-    def __init__(self, scorer, graph_writer, db_writer, redis_client, resolver=None):
+    def __init__(self, scorer, graph_writer, redis_client, resolver=None):
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
@@ -88,7 +88,7 @@ class AviationEnricher:
 
         # 3. UPDATE GRAPH (Knowledge Base)
         # Upsert the Aircraft node in Neo4j so we track its history.
-        self.graph.upsert_aircraft(icao24, {
+        await self.graph.upsert_aircraft(icao24, {
             "callsign":       callsign,
             "origin_country": p.get("origin_country"),
         })
