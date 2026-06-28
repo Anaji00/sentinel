@@ -391,7 +391,7 @@ async def poll_ransomware(
             new_count += 1
 
             if any(kw in sector for kw in CRITICAL_SECTORS):
-                logger.warning(
+                logger.info(
                     f"🔴 RANSOMWARE (critical sector): "
                     f"{victim.get('victim')} — {victim.get('group_name')} [{sector}]"
                 )
@@ -455,7 +455,7 @@ async def stream_bgp(producer: SentinelProducer):
                                         "country_code": "",
                                     },
                                 )
-                                producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
+                                await producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
 
                     except json.JSONDecodeError:
                         pass
@@ -525,12 +525,13 @@ async def main():
     logger.info("=" * 60)
 
     producer = SentinelProducer()
+    await producer.start()
     try:
         await collect(producer)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        producer.close()
+        await producer.close()
 
 
 if __name__ == "__main__":

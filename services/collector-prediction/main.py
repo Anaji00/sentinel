@@ -45,11 +45,11 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
     async def update_subscriptions(ws, session):
         base_url = "https://gamma-api.polymarket.com/markets"
-        loop = asyncio.get_event_loop()
+       
         
         while True:
             try:
-                raw_slugs = await loop.run_in_executor(None, redis_client.raw.smembers, redis_key)
+                raw_slugs = await redis_client.raw.smembers(redis_key)
                 watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else [
                     "us-x-iran-permanent-peace-deal-by"
                 ]
@@ -143,7 +143,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                             "notional_usd": notional_usd
                                         }
                                     )
-                                    producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
+                                    await producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
                     finally:
                         injector_task.cancel()
 
@@ -189,7 +189,7 @@ async def poll_kalshi(producer: SentinelProducer):
                                     "price": price_usd
                                 }
                             )
-                            producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
+                            await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
                             
                     else:
                         text = await resp.text()
@@ -207,7 +207,8 @@ async def main():
     logger.info("=" * 60)
 
     producer = SentinelProducer()
-    redis_client = get_redis()
+    await producer.start()
+    redis_client = await get_redis()
     try:
         await asyncio.gather(
             stream_polymarket(producer, redis_client),
@@ -217,7 +218,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down prediction collector...")
     finally:
-        producer.close()
+        await producer.close()
 
 if __name__ == "__main__":
     if sys.platform == "win32":

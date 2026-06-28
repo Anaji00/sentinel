@@ -221,7 +221,7 @@ async def poll_zone(
                             }.get(squawk) if is_emergency else None,
                         }
                     )
-                    producer.send(
+                    await producer.send(
                         topic = Topics.RAW_AVIATION,
                         data = event.model_dump(),
                         key = parsed["icao24"] or "unknown",
@@ -276,12 +276,13 @@ async def main():
     logger.info("=" * 60)
  
     producer = SentinelProducer()
+    await producer.start()
     try:
         await collect(producer)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        producer.close()
+        await producer.close()
  
  
 if __name__ == "__main__":

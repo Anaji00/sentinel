@@ -68,7 +68,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     "summary": entry.get("summary", "")
                 }
             )
-            producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
+            await producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
     except Exception as e:
         logger.error("SEC Form 4 error: %s", e, exc_info=True)
 
@@ -93,7 +93,7 @@ class OHLCVAggregator:
             d["L"] = min(d["L"], price)
             d["C"] = price
             d["V"] = d["V"] + volume
-    def flush(self):
+    async def flush(self):
         now = datetime.now(timezone.utc)
         count = 0
 
@@ -115,16 +115,16 @@ class OHLCVAggregator:
                     occurred_at=now,
                     raw_payload=candle
                 )
-                self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
                 count += 1
                 try:
                 
                     redis_list_key= f"sentinel:candles:1m:{ticker}"
                     candle_json = json.dumps({"ts": now.isoformat(), **candle})
                     
-                    self.redis_client.raw.lpush(redis_list_key, candle_json)
+                    await self.redis_client.raw.lpush(redis_list_key, candle_json)
                     # Keep only the last 1440 minutes (24 hours) of candles
-                    self.redis_client.raw.ltrim(redis_list_key, 0, 1439)
+                    await self.redis_client.raw.ltrim(redis_list_key, 0, 1439)
                 except Exception as e:
                     logger.debug(f"Redis cache warning for {ticker}: {e}")
         self.buffer.clear()
@@ -215,7 +215,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                                             "price": price, "size_shares": volume, "notional_usd": notional
                                         }
                                     )
-                                    producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
                 finally:
                     sync_task.cancel()
                     flush_task.cancel()
@@ -240,6 +240,7 @@ async def main():
     logger.info("SENTINEL TradFi Service")
     logger.info("=" * 60)
     producer = SentinelProducer()
+    await producer.start()
     redis_client = await get_redis()
     logger.info("Starting TradFi Collector (Finnhub & SEC Only)")
     try:

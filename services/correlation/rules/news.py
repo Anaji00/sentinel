@@ -40,7 +40,7 @@ async def _get_dynamic_keywords() -> set:
 
     keywords = set(CORE_KEYWORDS)
     try:
-        redis_client = get_redis()
+        redis_client = await get_redis()
         if redis_client:
             # [CRITICAL FIX 1]: Await the asynchronous Redis network call
             dynamic = await redis_client.raw.smembers("sentinel:news:keywords")
@@ -80,7 +80,7 @@ async def rule_dynamic_news_catalyst(event: NormalizedEvent, store) -> Optional[
     if not event.tags:
         return None
 
-    correlated_events = store.get_recent(
+    correlated_events = await store.get_recent(
         event_types=[], 
         hours=24, 
         min_anomaly=0.30,  

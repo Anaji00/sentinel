@@ -33,8 +33,8 @@ from regime import MarketRegime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 logger = logging.getLogger("collector.radar")
 
-ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET")
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
 ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
 
