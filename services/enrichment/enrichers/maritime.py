@@ -5,18 +5,6 @@ THE TRANSLATOR
 ==============
 Converts raw AIS (Automatic Identification System) messages into rich,
 structured events that the rest of the system can understand.
-
-Handles AIS PositionReport and ShipStaticData messages.
- 
-FIX (code review): MaritimeEnricher now accepts and uses EntityResolver.
-  Previously resolver was instantiated in main.py but never passed anywhere —
-  the vessel lookup went directly to Redis, skipping the Neo4j ownership chain
-  and the full MMSI→country mapping in entity_resolver.py.
-  Now: resolver.resolve_vessel() → Redis → Neo4j → inline fallback.
- 
-FIX (code review): check_sanctions() and MMSI_COUNTRY moved to shared/utils/
-  to eliminate the duplicate definition between this file and entity_resolver.
-  Both files now import from shared.utils.sanctions.
 """
  
 import json
@@ -31,31 +19,21 @@ from shared.utils.sanctions import check_sanctions
 logger = logging.getLogger("enrichment.maritime")
  
 class MaritimeEnricher:
+    # ── STRICT DI ALIGNMENT ──
     def __init__(self, scorer, redis_client, graph_writer, resolver=None):
-        # DEPENDENCY INJECTION:
-        # We pass in all the tools this class needs so it doesn't create them itself.
-        # scorer:       Calculates anomaly scores (The Judge).
-        # graph_writer: Updates Neo4j (The Graph).
-        # redis:        Fast caching.
-        # resolver:    Finds vessel details (The Detective).
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
-        self.resolver = resolver # Used for vessel lookup
+        self.resolver = resolver
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
-        """
-        Main entry point.
-        Decides if the message is a Moving Report or a Static Info Report.
-        """
         payload = raw.raw_payload
         msg_type = payload.get("MessageType", "")
         meta = payload.get("MetaData", {})
         mmsi = str(meta.get("MMSI", "")).strip()
 
-        # Filter: Garbage data often has MMSI 0 or empty.
         if not mmsi or mmsi == "0":
-            return None  # Invalid MMSI, skip
+            return None 
         
         if msg_type == "PositionReport":
             return await self._position(raw, payload, meta, mmsi)
@@ -66,48 +44,39 @@ class MaritimeEnricher:
     # ── Position ──────────────────────────────────────────────────────────────
 
     async def _position(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
-        # 1. PARSE RAW DATA
-        # Extract speed, heading, location from the raw JSON.
         pos = payload.get("Message", {}).get("PositionReport", {})
         lat = pos.get("Latitude")
         lon = pos.get("Longitude")
         if lat is None or lon is None:
-            return None  # Invalid position, skip
+            return None
         
         speed = float(pos.get("Sog") or 0)
         heading = int(pos.get("TrueHeading") or 0)
         nav_status = decode_nav_status(pos.get("NavigationalStatus") or 0)
         region = classify_region(lat, lon)
 
-        # 2. RESOLVE IDENTITY (Who is this?)
-        # We ask the resolver: "Who owns MMSI 123456789?"
-        # Returns a dict with name, type, flags, etc.
         vessel = await self._get_vessel(mmsi, meta)
         flags = vessel.get("flags", [])
         vtype = vessel.get("vessel_type", "Unknown")
         
-        # 3. SCORE ANOMALY (Is this weird?)
-        # "Is a Tanker moving at 20 knots in the Strait of Hormuz suspicious?"
-        anomaly = await self.scorer.score_vessel_position(mmsi, speed, region, flags, nav_status, vtype)
+        # ── CRITICAL FIX: ROUTE THROUGH MASTER SCORER ──
+        is_sanctioned = 1.0 if any("sanctioned" in f.lower() for f in flags) else 0.0
+        features = [speed, is_sanctioned, 0.5, 0.0, 0.0]
+        
+        # Call score_event and extract the score from the returned dictionary
+        scoring_result = await self.scorer.score_event("vessel_position", features)
+        anomaly = scoring_result.get("score", 0.0)
+        # ───────────────────────────────────────────────
 
-        # 4. UPDATE BASELINE
-        # "Remember that this ship usually moves at X speed."
-        await self.scorer.update_vessel_baseline(mmsi, vtype, speed)
-
-        # 6. UPDATE CACHE (The Hot Path)
-        # Save "Last Seen" to Redis. This is used by the Gap Detector to find
-        # ships that suddenly go dark.
-        await self.redis.set(
+        await self.redis.raw.set(
             f"vessel:last_seen:{mmsi}",
             json.dumps({
                 "lat": lat, "lon": lon, "heading": heading,
                 "region": region, "speed": speed, "ts": (raw.occurred_at or datetime.now(timezone.utc)).isoformat(),
             }),
-            ex = 172800 # 48 hours (if we don't see it for 2 days, the key expires)
+            ex = 172800 
         )
         
-        # 7. UPDATE GRAPH (The Knowledge Base)
-        # Update the Node in Neo4j. This is "upsert" - creates it if missing.
         await self.graph.upsert_vessel(mmsi, {
             "name": vessel.get("name", ""),
             "vessel_type": vtype,
@@ -115,9 +84,6 @@ class MaritimeEnricher:
             "flags": flags,
         })
 
-        # 8. PRODUCE EVENT
-        # Create the standardized "NormalizedEvent" to send down the pipeline.
-        # This is what the Correlation Engine will look at.
         return NormalizedEvent(
             event_id = raw.event_id,
             type = EventType.VESSEL_POSITION,
@@ -144,27 +110,22 @@ class MaritimeEnricher:
             anomaly_score = anomaly,
         )
     
-        # ── Static ────────────────────────────────────────────────────────────────
+    # ── Static ────────────────────────────────────────────────────────────────
     async def _static(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
-        # Static messages contain the Ship Name, Destination, Dimensions, etc.
-        # They don't update position, but they update Identity.
         s = payload.get("Message", {}).get("ShipStaticData", {})
         name = str(s.get("Name", meta.get("ShipName", ""))).strip()
         dest = str(s.get("Destination", "")).strip()
         code = int(s.get("Type") or 0)
         vtype = decode_vessel_type(code)
         
-        # Check if the new name is on a sanctions list (e.g., ship changed name).
         flags = check_sanctions(name, mmsi)
 
-        # Update Redis Cache with new identity info.
-        await self.redis.set(
+        await self.redis.raw.set(
             f"vessel:info:{mmsi}",
             json.dumps({ "name": name, "destination": dest,
                         "vessel_type": vtype, "flags": flags }),
-            ttl = 864000 # 24 hours
+            ex = 864000 
         )
-        # Update Graph with new identity info.
         await self.graph.upsert_vessel(mmsi, {"name": name, "vessel_type": vtype, "flags": flags})
 
         return NormalizedEvent(
@@ -177,21 +138,15 @@ class MaritimeEnricher:
             tags = [vtype.lower(), "static_data"],
             anomaly_score = 0.0,
         )
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
     async def _get_vessel(self, mmsi: str, meta: dict) -> dict:
-        """
-        Determines who a vessel is.
-        Strategy:
-          1. Ask EntityResolver (Redis Cache -> Neo4j Graph).
-          2. If that fails, build a temporary profile from the raw AIS data.
-        """
         if self.resolver:
             try:
                 return await self.resolver.resolve_vessel(mmsi, ais_meta=meta)
             except Exception as e:
                 logger.debug(f"Resolver failed for {mmsi}: {e}")
-        # Inline fallback — same logic as before
+        
         cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
         if cached:
             return json.loads(cached)

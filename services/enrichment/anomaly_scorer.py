@@ -102,8 +102,20 @@ class DynamicAnomalyScorer:
                 X = np.array(features, dtype=np.float32).reshape(1, -1)
                 
                 predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                prob_dict = predictions[1][0] 
-                risk_score = float(prob_dict.get(-1, 0.5))
+                
+                # ── CRITICAL FIX: DYNAMIC OUTPUT PARSING ──
+                # ONNX IsolationForest can output either a ZipMap (dict) or a raw ndarray.
+                raw_output = predictions[1][0] 
+                
+                if isinstance(raw_output, dict):
+                    risk_score = float(raw_output.get(-1, 0.5))
+                else:
+                    # Extract raw float. Use abs() because sklearn's decision_function 
+                    # returns negative values for outliers, but our EMA gatekeeper 
+                    # requires a positive scale where higher = more anomalous.
+                    val = float(np.atleast_1d(raw_output)[0])
+                    risk_score = abs(val)
+                # ──────────────────────────────────────────
 
             else:
                 # ─── LSTM AUTOENCODER INFERENCE ───
@@ -111,10 +123,8 @@ class DynamicAnomalyScorer:
                 sequence = await self._get_temporal_sequence(event_type, features, seq_len)
                 
                 if len(sequence) < seq_len:
-                    # Cold start: Not enough data yet to form a full time-series sequence
                     return {"score": 0.0, "is_significant": False, "domain": domain}
 
-                # Shape: [1, seq_len, N_features]
                 X = np.array(sequence, dtype=np.float32).reshape(1, seq_len, -1)
                 
                 predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
@@ -132,7 +142,7 @@ class DynamicAnomalyScorer:
             }
             
         except Exception as e:
-            logger.error(f"ONNX Scoring failed for {event_type}: {e}")
+            logger.error(f"ONNX Scoring failed for {event_type}: {e}", exc_info=True)
             return {"score": 0.0, "is_significant": False, "domain": domain}
         
     def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
