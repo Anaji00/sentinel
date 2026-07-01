@@ -12,7 +12,7 @@ Rules live in rules/:
   news.py         — NEWS_001
   cross_domain.py — CROSS_001
 """
-
+import aiohttp
 import asyncio
 import json
 import logging
@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+from shared.utils.ollama import OllamaClient
+from services.correlation.soft_correlator import SoftCorrelator
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster
 from shared.db import get_redis
@@ -64,6 +66,12 @@ async def main():
     await producer.start()
     await consumer.start()
 
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        ollama_client = OllamaClient(session)
+        soft_correlator = SoftCorrelator(ollama_client)
+        await soft_correlator._load()
+
     try:
         # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
         while True:
@@ -83,39 +91,46 @@ async def main():
 
                             try:
                                 store.add_event(event)
-                            except Exception as e:
-                                logger.error(f"Failed to store event {event.event_id}: {e}", exc_info=True)
-                                continue
-
-                            # ── 4. RULE ENGINE (PLUGIN PATTERN) ───────────────────
-                            for rule_fn in ALL_RULES:
-                                try:
-                                    # Dynamically support both synchronous math rules AND asynchronous I/O rules
-                                    if inspect.iscoroutinefunction(rule_fn):
-                                        cluster: CorrelationCluster = await rule_fn(event, store)
-                                    else:
-                                        cluster: CorrelationCluster = rule_fn(event, store)
-                                except Exception as e:
-                                    logger.error(f"Rule {rule_fn.__name__} error: {e}", exc_info=True)
-                                    continue
-
-                                if cluster is None:
-                                    continue
-
-                                # ── 5. PERSIST & FORWARD ALERTS ───────────────────
-                                store.save_correlation(cluster)
                                 
-                                # CORRECTED: Await the Kafka producer network call
-                                await producer.send(
-                                    Topics.CORRELATIONS,
-                                    cluster.model_dump(),
-                                    key=cluster.correlation_id,
-                                )
-                                corr_fired += 1
-                                logger.info(
-                                    f"🔗 [{cluster.alert_tier.name}] {cluster.rule_name} — "
-                                    f"{cluster.description[:120]}"
-                                )
+                                # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
+                                embedding = await soft_correlator.embed_event(event)
+                                if embedding:
+                                    await soft_correlator.store(event, embedding)
+                                    
+                                    # Cross-domain similarity search
+                                    similar_events = await soft_correlator.find_similar(
+                                        embedding, 
+                                        exclude_domain=event.type.value.split("_")[0]
+                                    )
+                                    
+                                    if similar_events:
+                                        logger.info(f"🧠 Semantic Match Found for {event.event_id}")
+                                        
+                                        # Synthesize the CorrelationCluster dynamically
+                                        supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
+                                        
+                                        cluster = CorrelationCluster(
+                                            rule_id="SEMANTIC_001",
+                                            rule_name="Cross-Domain Semantic Convergence",
+                                            alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
+                                            trigger_event_id=event.event_id,
+                                            supporting_event_ids=supporting_ids,
+                                            entity_ids=[event.primary_entity.id] if event.primary_entity else [],
+                                            description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events. Anomalous semantic convergence detected.",
+                                            tags=["semantic_match", "cross_domain", "ai_cluster"]
+                                        )
+                                        
+                                        store.save_correlation(cluster)
+                                        await producer.send(
+                                            Topics.CORRELATIONS,
+                                            cluster.model_dump(),
+                                            key=cluster.correlation_id,
+                                        )
+                                        corr_fired += 1
+                                        
+                            except Exception as e:
+                                logger.error(f"Failed to store or embed event {event.event_id}: {e}", exc_info=True)
+                                continue
 
                             processed += 1
                             if processed % 100 == 0:

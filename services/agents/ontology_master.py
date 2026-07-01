@@ -313,6 +313,7 @@ class OntologyMasterAgent(SentinelAgent):
                     "data": {
                         "target_id": country,
                         "target_label": "Country",
+                        "source_label": label,
                         "relation_type": "HAS_EXPOSURE_IN"
                     }
                 }

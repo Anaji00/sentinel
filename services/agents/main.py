@@ -172,7 +172,7 @@ async def main():
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[TOPIC_ENRICHED_EVENTS],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_RAW_RADAR],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
     )
@@ -180,7 +180,7 @@ async def main():
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[TOPIC_ENRICHED_EVENTS],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, TOPIC_ONTOLOGY_UPDATES],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
     )
@@ -188,7 +188,7 @@ async def main():
     ontology_agent = build_agent(
         OntologyMasterAgent,
         agent_name="ontology_master",
-        input_topics=[TOPIC_UNKNOWN_ENTITIES],
+        input_topics=[TOPIC_UNKNOWN_ENTITIES, TOPIC_ENRICHED_EVENTS],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
         soft_correlator=soft_correlator,
@@ -197,7 +197,7 @@ async def main():
     radar_agent = build_agent(
         RadarAgent,
         agent_name="radar_agent",
-        input_topics=[TOPIC_RAW_RADAR],
+        input_topics=[TOPIC_RAW_RADAR, TOPIC_QUANT_DISCOVERIES, TOPIC_ENRICHED_EVENTS],
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
     )

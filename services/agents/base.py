@@ -176,3 +176,27 @@ class SentinelAgent(ABC):
             "payload": payload, "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await self.redis.raw.rpush(queue, json.dumps(task))
+
+    async def _execute_with_telemetry(self, message: dict, prompt: str):
+        start_time = time.monotonic()
+        
+        # 1. Emit Thought Process Started
+        await self._producer.send(
+            "agents.telemetry", 
+            {"agent": self.name, "status": "THINKING", "prompt": prompt}
+        )
+        
+        # 2. Execute LLM
+        response = await self._llm.infer(prompt=prompt)
+        
+        # 3. Emit Completion
+        await self._producer.send(
+            "agents.telemetry", 
+            {
+                "agent": self.name, 
+                "status": "COMPLETE", 
+                "raw_output": response,
+                "latency_ms": (time.monotonic() - start_time) * 1000
+            }
+        )
+        return response

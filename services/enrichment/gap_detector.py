@@ -24,9 +24,9 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType, Vessel
 logger = logging.getLogger("enrichment.gap_detector")
  
 DARK_THRESHOLDS = {
-    "Strait of Hormuz":    4,
-    "Iranian Territorial": 4,
-    "Bab-el-Mandeb":       4,
+    "Strait of Hormuz":    1,
+    "Iranian Territorial": 1,
+    "Bab-el-Mandeb":       1,
     "Suez Canal":          4,
     "Taiwan Strait":       4,
     "North Korean Waters": 4,
@@ -34,7 +34,7 @@ DARK_THRESHOLDS = {
     "Black Sea":           6,
     "Ukrainian Waters":    6,
     "Red Sea":             8,
-    "South China Sea":     8,
+    "South China Sea":     2,
     "Default":             24,
 }
 
@@ -60,119 +60,138 @@ class VesselGapDetector:
         fired = 0
         has_keys = False
         batch_events_to_write: List[NormalizedEvent] = []
-        async for key in self.redis.raw.scan_iter("vessel:last_seen:*"):
+        
+        # 1. Gather keys in batches to prevent event loop starvation
+        batch_size = 500
+        current_keys = []
+        
+        # Pull larger chunks from Redis to reduce round-trips
+        async for key in self.redis.raw.scan_iter("vessel:last_seen:*", count=1000):
             has_keys = True
-            try:
-                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
-                mmsi = key_str.replace("vessel:last_seen:", "")
-                raw_val = await self.redis.raw.get(key)
-                if not raw_val:
-                    continue
-                if isinstance(raw_val, dict):
-                    val = raw_val
-                # Check if it's a string or bytes before loading
-                elif isinstance(raw_val, (str, bytes)):
-                    try:
-                        val = json.loads(raw_val)
-                    except json.JSONDecodeError:
-                        logger.debug(f"Could not parse JSON for {key}")
-                        continue
-                else:
-                    # If it's an int, float, or something else, skip it.
-                    logger.debug(f"Skipping non-string/dict value for {key}")
-                    continue
-
-                if not isinstance(val, dict):
-                    logger.debug(f"Deleting corrupted cache key: {key}")
-                    await self.redis.delete(key)
-                    continue
-
-                ts_str = val.get("ts", "")
-                region = val.get("region")
-                try:
-                    last_seen = datetime.fromisoformat(ts_str)
-                    if last_seen.tzinfo is None:
-                        last_seen = last_seen.replace(tzinfo=timezone.utc)
-                    gap_hours = (now - last_seen).total_seconds() / 3600
-                except ValueError:
-                    continue
-
-                threshold = DARK_THRESHOLDS.get(region, DARK_THRESHOLDS["Default"])
-                if gap_hours < threshold:
-                    continue  # Not dark yet
-
-                # Deduplicate: bucket by integer hour — fire at most once per hour
-                bucket = int(gap_hours)
-                dedup_key = f"{mmsi}:{region}:{bucket}"
-                if dedup_key in self._seen_gaps:
-                    continue  # Already fired for this vessel-region-hour
-                self._seen_gaps.add(dedup_key)
-
-                # trim the set to prevent unbounded growth (keep last 1000 entries)
-                if len(self._seen_gaps) > 10_000:
-                    self._seen_gaps.clear()
-                
-                info_raw = await self.redis.raw.get(f"vessel:info:{mmsi}")
-                info = json.loads(info_raw) if info_raw else {}
-                flags = info.get("flags", []) if isinstance(info, dict) else []
-                vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"
-                heading = val.get("heading", 0)
-                if not isinstance(heading, (int, float)):
-                    heading = 0
-                
-                score = await self.scorer.score_vessel_dark(
-                    mmsi, gap_hours, region, flags, heading
-                )
-                event = NormalizedEvent(
-                    type=EventType.VESSEL_DARK, 
-                    occurred_at=now, 
-                    source="gap_detector", 
-                    primary_entity=Entity(
-                        id=mmsi, 
-                        type=EntityType.VESSEL, 
-                        name=info.get("name", f"MMSI:{mmsi}"),
-                        flags=flags,
-                    ),
-                    latitude = val.get("lat"),
-                    longitude = val.get("lon"),
-                    region = region,
-                    vessel_data = VesselData(
-                        mmsi=mmsi, 
-                        gap_hours = round(gap_hours, 1), 
-                        last_seen_region = region, 
-                        heading=val.get("heading"), 
-                        vessel_type = vtype,
-                    ),
-                    tags = list(filter(None, [
-                        "dark_vessel",
-                        "ais_gap", 
-                        region.lower().replace(" ", "_") if region else None,
-                    ])),
-                    anomaly_score=score,
-                )
-
-                batch_events_to_write.append(event)
-                await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)
-                fired += 1
-
-                if score >= 0.6:
-                    logger.warning(
-                        f"🚢 VESSEL DARK  {event.primary_entity.name} "
-                        f"gap={gap_hours:.1f}h  region={region}  score={score:.2f}"
-                    )
-                    
+            current_keys.append(key)
             
-            except Exception as e:
-                logger.error(f"Gap check error for key {key}; {e})")
-        if not has_keys:
-            logger.info("Gap Detector: No vessels tracked in Redis, skipping check")
+            if len(current_keys) >= batch_size:
+                fired_in_batch, events = await self._process_batch(current_keys, now)
+                fired += fired_in_batch
+                batch_events_to_write.extend(events)
+                current_keys = []
+                
+        # Process remainder
+        if current_keys:
+            fired_in_batch, events = await self._process_batch(current_keys, now)
+            fired += fired_in_batch
+            batch_events_to_write.extend(events)
 
-        # FIX: Offload the entire synchronous TimescaleDB insert batch to a background thread
-        # This prevents the Python GIL from freezing the Enrichment consumers during DB latency.
         if batch_events_to_write:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.db_writer.write_events_batch, batch_events_to_write)
 
         if fired:
             logger.info(f"Gap detector: {fired} VESSEL_DARK events safely emitted & persisted.")
+        elif not has_keys:
+            logger.info("Gap Detector: No vessels tracked in Redis, skipping check")
+    
+    async def _process_batch(self, keys: List[str], now: datetime):
+        fired = 0
+        events_to_write = []
         
+        # 2. Redis Pipeline: Fetch ALL last_seen payloads in 1 round trip
+        pipe = self.redis.raw.pipeline()
+        for k in keys:
+            pipe.get(k)
+        last_seen_results = await pipe.execute()
+        
+        anomalous_mmsis = []
+        parsed_data = {}
+        
+        for key, raw_val in zip(keys, last_seen_results):
+            if not raw_val: continue
+            
+            try:
+                val = json.loads(raw_val) if isinstance(raw_val, (str, bytes)) else raw_val
+                if not isinstance(val, dict): continue
+                
+                mmsi = key.replace("vessel:last_seen:", "")
+                ts_str = val.get("ts", "")
+                region = val.get("region")
+                
+                last_seen = datetime.fromisoformat(ts_str)
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+                    
+                gap_hours = (now - last_seen).total_seconds() / 3600
+                threshold = DARK_THRESHOLDS.get(region, DARK_THRESHOLDS["Default"])
+                
+                # 3. FIXED DEDUPLICATION LOGIC: Self-Healing
+                dedup_key = f"{mmsi}:{region}"
+                if gap_hours < threshold:
+                    # Ship is active. Remove from seen_gaps if it was previously dark.
+                    self._seen_gaps.discard(dedup_key)
+                    continue
+                    
+                if dedup_key in self._seen_gaps:
+                    continue # Ship is STILL dark. Do not fire a duplicate alert.
+                    
+                self._seen_gaps.add(dedup_key)
+                
+                # Queue for enrichment
+                anomalous_mmsis.append(mmsi)
+                parsed_data[mmsi] = {"val": val, "gap": gap_hours, "region": region}
+                
+            except Exception as e:
+                logger.debug(f"Failed parsing key {key}: {e}")
+
+        if not anomalous_mmsis:
+            return 0, []
+
+        # 4. Redis Pipeline: Fetch ALL info payloads for anomalous ships in 1 round trip
+        pipe = self.redis.raw.pipeline()
+        for mmsi in anomalous_mmsis:
+            pipe.get(f"vessel:info:{mmsi}")
+        info_results = await pipe.execute()
+        
+        # 5. Process and Emit
+        for mmsi, info_raw in zip(anomalous_mmsis, info_results):
+            data = parsed_data[mmsi]
+            val = data["val"]
+            info = json.loads(info_raw) if info_raw else {}
+            
+            flags = info.get("flags", []) if isinstance(info, dict) else []
+            vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"
+            
+            score = await self.scorer.score_vessel_dark(
+                mmsi, data["gap"], data["region"], flags, val.get("heading", 0)
+            )
+            event = NormalizedEvent(
+                type=EventType.VESSEL_DARK, 
+                occurred_at=now, 
+                source="gap_detector", 
+                primary_entity=Entity(
+                    id=mmsi, 
+                    type=EntityType.VESSEL, 
+                    name=info.get("name", f"MMSI:{mmsi}"),
+                    flags=flags,
+                ),
+                latitude = val.get("lat"),
+                longitude = val.get("lon"),
+                region = region,
+                vessel_data = VesselData(
+                    mmsi=mmsi, 
+                    gap_hours = round(gap_hours, 1), 
+                    last_seen_region = region, 
+                    heading=val.get("heading"), 
+                    vessel_type = vtype,
+                ),
+                tags = list(filter(None, [
+                    "dark_vessel",
+                    "ais_gap", 
+                    region.lower().replace(" ", "_") if region else None,
+                ])),
+                anomaly_score=score,
+            )
+
+            events_to_write.append(event)
+            await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)
+            fired += 1
+
+        return fired, events_to_write

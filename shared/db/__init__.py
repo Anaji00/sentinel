@@ -201,7 +201,6 @@ class TimescaleClient:
 _timescale: Optional[TimescaleClient] = None
 _async_redis: Optional[RedisClient] = None
 _neo4j: Optional[Neo4jClient] = None
-_db_lock: Optional[asyncio.Lock] = None
 
 
 def get_timescale() -> TimescaleClient:
@@ -214,30 +213,20 @@ def get_timescale() -> TimescaleClient:
 
 async def get_redis() -> RedisClient:
     """Thread-safe async singleton for Redis."""
-    global _async_redis, _db_lock
+    global _async_redis
     if _async_redis is not None:
-        return _async_redis
-    
-    if _db_lock is None:
-        _db_lock = asyncio.Lock()
-    async with _db_lock:
-        if _async_redis is None:
-            _async_redis = RedisClient()
+        _async_redis = RedisClient()
     return _async_redis
+
+
 
 async def get_neo4j() -> Neo4jClient:
     """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
-    global _neo4j, _db_lock
-    if _neo4j is not None: return _neo4j
-
-    if _db_lock is None:
-        _db_lock = asyncio.Lock()
-
-    async with _db_lock:
-        if _neo4j is None:
-            client = Neo4jClient()
-            await client.connect()
-            _neo4j = client
+    global _neo4j
+    if _neo4j is None:
+        client = Neo4jClient()
+        await client.connect()
+        _neo4j = client
     return _neo4j
 
 

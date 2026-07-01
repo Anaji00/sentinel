@@ -62,6 +62,7 @@ class GraphSupervisor:
 
             elif action == "LINK_ENTITY":
                 target_id = data.get("target_id")
+                source_label = data.get("source_label", "Entity")
                 target_label = data.get("target_label", "Entity")
                 relation = data.get("relation_type", "RELATED_TO").upper()
                 
@@ -70,7 +71,7 @@ class GraphSupervisor:
                     return
 
                 cypher = f"""
-                MERGE (a {{name: $id}})
+                MERGE (a:{source_label} {{name: $id}})
                 MERGE (b:{target_label} {{name: $target_id}})
                 MERGE (a)-[r:{relation}]->(b)
                 SET r.weight = $weight, r.updated_at = datetime()
