@@ -13,6 +13,12 @@ from streamlit import json
 from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
 from shared.db import get_redis
 
+THEATER_TO_REGIONS = {
+    "theater_middle_east": ["Strait of Hormuz", "Persian Gulf", "Red Sea", "Bab-el-Mandeb", "Iranian Territorial", "Eastern Mediterranean"],
+    "theater_apac": ["Taiwan Strait", "South China Sea", "Philippine Sea", "Sea of Japan"],
+    "theater_eeur": ["Black Sea", "Ukrainian Waters", "Baltic Sea", "Gulf of Finland"],
+    "theater_latam": ["Panama Canal", "Venezuelan Waters", "Essequibo"]
+}
 
 async def rule_options_geo(event: NormalizedEvent, store) -> Optional[CorrelationCluster]:
     """
@@ -20,20 +26,20 @@ async def rule_options_geo(event: NormalizedEvent, store) -> Optional[Correlatio
     Cross-checks vessel anomalies in relevant regions and geopolitical headlines
     in last 48h. Fires only when financial signal has cross-domain support.
     """
-    # 1. FILTER: Only look at Options Flow events.
-    if event.type != EventType.OPTIONS_FLOW or not event.financial_data:
+    # 1. GATEKEEPER: Expand to all major institutional flow types
+    valid_types = {EventType.OPTIONS_FLOW, EventType.DARK_POOL, EventType.EQUITY_BLOCK}
+    if event.type not in valid_types or not event.financial_data:
         return None
     
-    # 2. THRESHOLD: Ignore small retail trades.
-    # We only care if 'Smart Money' moves > $500k in a single sweep.
-    premium = event.financial_data.premium_usd or 0
-    if premium < 100_000:  # Threshold for "large" sweep (adjustable)
+    # 2. QUANTITATIVE THRESHOLD
+    notional = event.financial_data.premium_usd or getattr(event.financial_data, 'notional_usd', 0)
+    if notional < 150_000:  # Calibrated for institutional sweeps, filtering retail noise
         return None
     
     # 3. CATEGORY CHECK: Is this a sensitive instrument?
     # If it's Apple (AAPL), we ignore it (not in our GEO_INSTRUMENTS list).
-    ticker = event.financial_data.ticker or ""
-    side = event.financial_data.side or "UNKOWN"
+    ticker = event.financial_data.ticker or "UNKNOWN"
+    side = event.financial_data.side or "UNKNOWN"
     redis = await get_redis()
     record_raw = await redis.raw.get(f"sentinel:ontology:entity:{ticker.lower()}")
     if not record_raw:
@@ -45,59 +51,89 @@ async def rule_options_geo(event: NormalizedEvent, store) -> Optional[Correlatio
     if not geo_linked:
         return None  # Not a geopolitically sensitive instrument
     
+    target_regions = set()
+    for concept in geo_linked:
+        if concept in THEATER_TO_REGIONS:
+            target_regions.update(THEATER_TO_REGIONS[concept])
+    
+    target_regions = list(target_regions)
+
+    supporting_events = []
+    domains_triggered = set()
+
 
     
-    # 4. MARITIME CORRELATION
-    vessel_anomalies = []
-    if "theater_middle_east" in concepts:
-        vessel_anomalies += store.get_recent(
-            ["vessel_dark", "vessel_position"],
-            hours=96, region="Strait of Hormuz", min_anomaly=0.6, # Lowered from 0.7
+    # A. Spatial Domain: Maritime
+    if target_regions:
+        for region in target_regions:
+            maritime_hits = store.get_recent(
+                ["vessel_dark", "vessel_position", "vessel_sts"],
+                hours=96, region=region, min_anomaly=0.4
+            )
+            if maritime_hits:
+                supporting_events.extend(maritime_hits)
+                domains_triggered.add("maritime")
+        
+    # B. Spatial Domain: Aviation (e.g., emergency squawks in the theater)
+    if target_regions:
+        for region in target_regions:
+            aviation_hits = store.get_recent(
+                ["aircraft_squawk", "flight_anomaly", "flight_dark"],
+                hours=96, region=region, min_anomaly=0.6
+            )
+            if aviation_hits:
+                supporting_events.extend(aviation_hits)
+                domains_triggered.add("aviation")
+
+    # C. Informational Domain: Cyber & News
+    for concept in geo_linked:
+        # Cyber attacks (BGP hijacks, infra exposure) linked to the macro concept
+        cyber_hits = store.get_recent(
+            ["bgp_anomaly", "breach_detected", "infra_exposed"],
+            hours=72, min_anomaly=0.6, tags=[concept]
         )
-    
-    # 5. NEWS CORRELATION
-    # "Is there any war news in the last 48 hours?"
-    all_news = store.get_recent(["headline"], hours = 48)
-    # Filter news locally for our specific keywords
-    geo_news = [
-        n for n in all_news
-        if any(c in (n.get("tags") or []) for c in concepts)
-    ]
+        if cyber_hits:
+            supporting_events.extend(cyber_hits)
+            domains_triggered.add("cyber")
+            
+        # Geopolitical News
+        news_hits = store.get_recent(
+            ["headline", "social_signal"], 
+            hours=48, tags=[concept]
+        )
+        if news_hits:
+            supporting_events.extend(news_hits)
+            domains_triggered.add("news")
 
-    # 6. DECISION LOGIC
-    # If we found NO supporting evidence (no weird ships, no war news),
-    # then this is just a normal financial trade. Ignore it.
-    if not vessel_anomalies and not geo_news:
+    if not supporting_events:
         return None  # No cross-domain support, don't fire
     
-    # Tier the alert:
-    # - INTELLIGENCE (High Priority): If we have BOTH maritime anomalies AND news.
-    # - ALERT (Medium Priority): If we only have one source of evidence.
-    tier = AlertTier.INTELLIGENCE if (vessel_anomalies and geo_news) else AlertTier.ALERT
-    premium_m = premium / 1_000_000
-    side = event.financial_data.side or "?"
-    ttype = event.financial_data.trade_type or "?"
+    # Tiering based on cross-domain convergence density
+    if len(domains_triggered) >= 3:
+        tier = AlertTier.CRITICAL
+    elif len(domains_triggered) == 2:
+        tier = AlertTier.INTELLIGENCE
+    else:
+        tier = AlertTier.ALERT
+
+    # 7. METADATA CONSTRUCTION
+    notional_m = notional / 1_000_000
+    trade_type = getattr(event.financial_data, 'trade_type', 'SWEEP')
 
     desc = (
-        f"${premium_m:.1f}M {side} {ttype} on {ticker} ({category}). "
-        f"{len(vessel_anomalies)} vessel anomalies in relevant regions. "
-        f"{len(geo_news)} geopolitical headlines."
-    )
- 
-    # Collect IDs of supporting events (top 3 of each) to link in the graph UI
-    ids = (
-        [e["event_id"] for e in vessel_anomalies[:3]] +
-        [e["event_id"] for e in geo_news[:3]]
+        f"Anomalous {side} {trade_type} (${notional_m:.1f}M) on {ticker}. "
+        f"Ontology links asset to {geo_linked[:3]}. "
+        f"Correlated with {len(supporting_events)} events across {len(domains_triggered)} external domains ({', '.join(domains_triggered)})."
     )
  
     return CorrelationCluster(
         rule_id="FINANCIAL_001",
-        rule_name="Large Options Sweep + Geopolitical Signals",
+        rule_name="Macro-Geopolitical Capital Flight",
         alert_tier=tier,
         trigger_event_id=event.event_id,
-        supporting_event_ids=ids,
-        entity_ids=[event.primary_entity.id],
+        supporting_event_ids=[e["event_id"] for e in supporting_events[:10]], # Limit payload size
+        entity_ids=[event.primary_entity.id] if event.primary_entity else [],
         description=desc,
-        tags=["financial", "options_sweep", category, "geopolitical"],
+        tags=["financial", "cross_domain", trade_type.lower()] + geo_linked,
     )
  

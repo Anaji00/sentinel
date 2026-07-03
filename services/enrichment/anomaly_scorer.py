@@ -15,7 +15,7 @@ class DynamicAnomalyScorer:
         self.redis = redis_client
         self.sessions = {}
         self.alpha = 0.1
-        self.z_score_threshold = 2.5
+        self.z_score_threshold = 1.5
 
         self._load_onnx_models()
 
@@ -59,6 +59,36 @@ class DynamicAnomalyScorer:
         sequence = [json.loads(item) for item in raw_items if item]
         sequence.reverse()  # Oldest first
         return sequence
+
+    async def _dynamic_normalize(self, ticker: str, feature_name: str, raw_value: float) -> float:
+        """
+        Calculates a live Z-score for a specific asset's feature.
+        Ensures the ONNX model receives normalized inputs ~ N(0,1), preventing magnitude blindness.
+        """
+        if not self.redis: return raw_value / 1000.0 
+
+        mean_key = f"sentinel:stats:{ticker}:{feature_name}:mean"
+        var_key = f"sentinel:stats:{ticker}:{feature_name}:var"
+        
+        pipe = self.redis.raw.pipeline()
+        pipe.get(mean_key)
+        pipe.get(var_key)
+        res = await pipe.execute()
+        
+        mean = float(res[0] or raw_value)
+        var = float(res[1] or 1.0)
+        std_dev = np.sqrt(var) + 1e-5 # Epsilon to prevent division by zero on illiquid assets
+        
+        # Smoothly update the baseline (Online Variance Approximation)
+        new_mean = (self.alpha * raw_value) + ((1 - self.alpha) * mean)
+        new_var = (self.alpha * (raw_value - mean)**2) + ((1 - self.alpha) * var)
+        
+        pipe = self.redis.raw.pipeline()
+        pipe.set(mean_key, new_mean)
+        pipe.set(var_key, new_var)
+        await pipe.execute()
+        
+        return (raw_value - mean) / std_dev
 
     async def _check_ema_gatekeeper(self, domain: str, raw_score: float) -> bool:
         if not self.redis: return raw_score > 0.60
@@ -154,7 +184,10 @@ class DynamicAnomalyScorer:
 
     # Note: All helper methods must now be async and use `await self.score_event(...)`
     async def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
-        res = await self.score_event("crypto_trade", [notional / 1_000_000, qty / 1000, 0.0, 0.0, 0.0])
+        norm_notional = await self._dynamic_normalize(f"crypto:{asset}", "notional", notional)
+        norm_qty = await self._dynamic_normalize(f"crypto:{asset}", "qty", qty)
+
+        res = await self.score_event("crypto_trade", [norm_notional, norm_qty, 0.0, 0.0, 0.0])
         return res["score"]
 
     async def score_crypto_candle(self, asset: str, features: list) -> float:
@@ -162,7 +195,10 @@ class DynamicAnomalyScorer:
         return res["score"]
 
     async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
-        res = await self.score_event("tradfi_trade", [notional / 1_000_000, volume / 100_000, 0.0, 0.0, 0.0])
+        norm_notional = await self._dynamic_normalize(f"tradfi:{ticker}", "notional", notional)
+        norm_volume = await self._dynamic_normalize(f"tradfi:{ticker}", "volume", volume)
+        
+        res = await self.score_event("tradfi_trade", [norm_notional, norm_volume, 0.0, 0.0, 0.0])
         return res["score"]
 
     async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
