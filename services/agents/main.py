@@ -28,8 +28,9 @@ from services.correlation.soft_correlator import SoftCorrelator
 from services.agents.news_intel import NewsIntelAgent
 from services.agents.quant_researcher import QuantResearcherAgent
 from services.agents.ontology_master import OntologyMasterAgent
-
-
+from services.agents.macro_cointegration_engine import MacroAssetCointegrationEngine
+from services.agents.supervisor import GraphSupervisor
+from services.agents.macro_strategist import MacroStrategistAgent
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # New topics added by the agent swarm (add to shared/kafka/__init__.py Topics class)
 TOPIC_ENRICHED_EVENTS    = "enriched.events"
@@ -201,6 +202,22 @@ async def main():
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
     )
+    macro_cointegration_agent = build_agent(
+        MacroAssetCointegrationEngine,
+        agent_name="macro_cointegration_engine",
+        input_topics=[TOPIC_ENRICHED_EVENTS],
+        group_id="agent-macro-cointegration-engine",
+        shared_infra=shared_infra,
+    )
+    supervisor_agent = build_agent(
+        GraphSupervisor,
+        agent_name="supervisor",
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_ONTOLOGY_UPDATES, TOPIC_UNKNOWN_ENTITIES],
+        group_id="agent-supervisor",
+        shared_infra=shared_infra,
+    )
+
+
 
 
     agents_by_name = {
@@ -208,6 +225,8 @@ async def main():
         "quant_researcher": quant_agent,
         "ontology_master": ontology_agent,
         "radar_agent": radar_agent,
+        "macro_cointegration_engine": macro_cointegration_agent,
+        "graph_supervisor": supervisor_agent,
     }
 
     logger.info(f"Agents built: {list(agents_by_name.keys())}")
@@ -220,6 +239,8 @@ async def main():
         asyncio.create_task(quant_agent.run(),     name="quant_researcher"),
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
+        asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
+        asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",

@@ -63,9 +63,14 @@ class QuantRadar:
         pipe.set(f"sentinel:radar:var:{ticker}", new_var)
         await pipe.execute()
 
-    async def evaluate_volume(self, ticker:str, current_vol: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
+    async def evaluate_volume(self, ticker:str, current_vol: float, current_price: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
+        # 1. NOTIONAL GATEKEEPER: Ignore retail noise entirely.
+        # Only evaluate if > $50,000 is moving in a single 1-minute bar.
+        notional_flow = current_vol * current_price
+        if notional_flow < 50_000:
+            return False, 0.0
         mean, var = await self._get_baseline(ticker)
-        std_dev = math.sqrt(var)
+        std_dev = math.sqrt(var) + 1e-8  # Avoid division by zero
         if mean == 0.0:
             await self._update_baseline(ticker, current_vol, current_vol, 1.0, alpha)
             return False, 0.0
@@ -108,7 +113,7 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             price = float(min_bar.get("c", 0.0))
             if volume == 0.0: continue
 
-            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, alpha, z_threshold)
+            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, price, alpha, z_threshold)
             if is_anomaly:
                 notional = volume * price
                 logger.warning(f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} | 1m Vol: {volume} (${notional/1e6:.2f}M)")

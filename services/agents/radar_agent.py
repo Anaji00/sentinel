@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any, Dict, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
@@ -16,8 +17,9 @@ class RadarAgent(SentinelAgent):
         payload = message.get("raw_payload", {})
         ticker = payload.get("ticker")
         z_score = payload.get("z_score")
+        notional_usd = payload.get("notional_usd", 0.0)
         
-        if not ticker:
+        if not ticker or notional_usd < 50_000:
             return None
         
         # Idempotency: Do not re-evaluate a ticker we already escalated today
@@ -27,10 +29,14 @@ class RadarAgent(SentinelAgent):
         # ─── AGENTIC REASONING ───
         prompt = f"""
         You are a quantitative trading systems engineer.
-        A background radar has detected a mathematical volume anomaly for ticker: {ticker}.
-        Z-Score: {z_score:.2f} (This means volume is {z_score:.2f} standard deviations above the EMA).
+        A background radar has detected an institutional volume anomaly for ticker: {ticker}.
         
-        Determine if this ticker warrants active high-frequency tracking by the primary surveillance system.
+        Metrics:
+        - Z-Score: {z_score:.2f} (standard deviations above the EMA)
+        - Notional 1-Minute Flow: ${notional_usd / 1_000_000:.2f} Million
+        
+        Determine if this ${notional_usd / 1_000_000:.2f}M anomaly warrants active high-frequency tracking. 
+        Focus on identifying 'smart money' sweeps.
         Return ONLY valid JSON.
         Schema: {{"investigate": boolean, "rationale": "string"}}
         """
@@ -48,7 +54,7 @@ class RadarAgent(SentinelAgent):
                 # ─── DYNAMIC INFRASTRUCTURE INJECTION ───
                 # This explicitly commands the services/collector-tradfi/main.py WebSocket 
                 # to subscribe to this ticker on its next sync loop.
-                await self.redis.raw.sadd("sentinel:watched:equities", ticker)
+                await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
                 
                 await self.mark_processed(ticker, self.cooldown_seconds)
 

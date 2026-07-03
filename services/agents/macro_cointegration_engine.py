@@ -183,7 +183,7 @@ class MacroAssetCointegrationEngine:
 
 async def main_stream():
     # Instantiate long-lived connections
-    redis_client = get_redis()
+    redis_client = await get_redis()
     neo4j_client = get_neo4j()
     db_client = get_timescale()
     producer = SentinelProducer()

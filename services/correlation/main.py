@@ -36,6 +36,7 @@ from shared.db import get_redis
 from services.correlation.event_store import EventStore
 from services.correlation.rules import ALL_RULES
 
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
