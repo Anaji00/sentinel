@@ -2,7 +2,7 @@
 import os
 import sys 
 from pathlib import Path
-
+import asyncio
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -57,12 +57,12 @@ class TemporalLSTMAutoEncoder(nn.Module):
         reconstructed, _ = self.decoder_lstm(hidden_n)
         return reconstructed
     
-def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
+async def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
     """
     Fetches time-ordered historical features from TimescaleDB across ALL 
     schema-defined financial and block trading event categories.
     """
-    db = get_timescale()
+    db = await get_timescale()
     
     financial_types = [
         EventType.OPTIONS_FLOW.value,
@@ -101,7 +101,7 @@ def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
     # ────────────────────────────────────────────────────────────────────────────
 
     logger.info(f"Querying macro-financial features for types: {financial_types}")
-    rows = db.query(query)
+    rows = await db.query(query)
 
     if not rows:
         logger.warning(f"No data found for financial parameters {financial_types}. Generating synthetic LSTM baseline.")
@@ -116,7 +116,7 @@ def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
     
     return torch.tensor(np.array(sequences))
 
-def train_and_export_lstm():
+async def train_and_export_lstm():
     seq_len = 10
     n_features = 5
     epochs = 20
@@ -126,7 +126,7 @@ def train_and_export_lstm():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss() 
 
-    X_train = fetch_sequential_data(seq_len=seq_len)
+    X_train = await fetch_sequential_data(seq_len=seq_len)
     
     logger.info(f"Training LSTM on {X_train.shape[0]} windows across multi-asset data matrices...")
     model.train()
@@ -160,4 +160,7 @@ def train_and_export_lstm():
     logger.info(f"✅ LSTM ONNX artifact saved to {onnx_path}")
 
 if __name__ == "__main__":
-    train_and_export_lstm()
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(train_and_export_lstm())

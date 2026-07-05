@@ -9,7 +9,7 @@ FINANCIAL_001 — Large options sweep on a geopolitically-sensitive instrument.
 
 from typing import Optional
 
-from streamlit import json
+import json
 from shared.models import NormalizedEvent, EventType, CorrelationCluster, AlertTier
 from shared.db import get_redis
 
