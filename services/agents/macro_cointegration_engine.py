@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
-from shared.models.events import NormalizedEvent, EventType, Entity, EntityType, EventDomain
+from shared.models.events import NormalizedEvent, EventType, Entity, EntityType
 from shared.db import get_redis, get_neo4j, get_timescale
 
 # Standardized logging
