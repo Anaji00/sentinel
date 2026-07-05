@@ -144,7 +144,20 @@ class NewsIntelAgent(SentinelAgent):
         # BEST PRACTICE: Guard Clauses (Early Returns)
         # Instead of wrapping the whole function in a giant `if` statement, we check
         # conditions and immediately `return None` to save compute power and indentation.
-        # ── GATE 1: Event type filter ──────────────────────────────────────────
+        agent_source = message.get("agent")
+        if not agent_source:
+            raise ValueError("Missing 'agent' field in message")
+
+        if agent_source == "quant_researcher":
+            discovery = message.get("discovery", {})
+            new_keywords = [p.get("ticker") for p in discovery.get("peer_tickers", [])]
+            if new_keywords:
+                # Dynamically start looking for news about the newly discovered correlated peers
+                await asyncio.to_thread(self.redis.raw.sadd, "sentinel:news:keywords", *new_keywords)
+                logger.info(f"Swarm Sync: News Agent now tracking quant peers {new_keywords}")
+            return None
+
+        # B. Handle Standard Enriched News
         event_type = message.get("type", "")
         if event_type not in ("headline", "news_article"):
             return None
@@ -194,7 +207,8 @@ class NewsIntelAgent(SentinelAgent):
             # CONCEPT: Deterministic AI
             # temperature=0.1 means the AI will be highly factual and logical. 
             # It will pick the most statistically likely words rather than being "creative".
-            brief: IntelBrief = await self._llm.infer(
+            brief: IntelBrief = await self._execute_with_telemetry(
+                message=message,
                 system_prompt=NEWS_INTEL_SYSTEM,
                 user_prompt=user_prompt,
                 schema=IntelBrief,
@@ -203,6 +217,18 @@ class NewsIntelAgent(SentinelAgent):
         except SchemaViolationError as e:
             logger.error(f"Intel brief extraction failed: {e}")
             return None
+
+        for entity in brief.entities:
+            await self._producer.send(
+                "agents.ontology.unknown_entities",
+                {
+                    "name": entity.name,
+                    "context": (summary or title)[:500],
+                    "source_domain": source,
+                    "frequency": 1,
+                },
+                key = entity.name
+            )
 
         # ── STEP 3: Secondary LLM call — Graph relationship extraction ─────────
         if brief.entities and len(brief.entities) >= 2:
@@ -279,11 +305,12 @@ class NewsIntelAgent(SentinelAgent):
         )
 
         try:
-            triples: GraphTriples = await self._llm.infer(
+            triples: GraphTriples = await self._execute_with_telemetry(
+                message={"event_id": f"graph_{title[:10]}"}, # Mock ID for sub-task telemetry
                 system_prompt=GRAPH_EXTRACTION_SYSTEM,
                 user_prompt=user_prompt,
                 schema=GraphTriples,
-                temperature=0.05,  # Lowest temp for factual extraction
+                temperature=0.05,
             )
         except SchemaViolationError as e:
             logger.warning(f"Graph extraction skipped: {e}")
@@ -332,34 +359,23 @@ class NewsIntelAgent(SentinelAgent):
         MERGE on (name) ensures idempotency — re-running on the same article
         does not create duplicate nodes or relationships.
         """
-        import asyncio
-        loop = asyncio.get_running_loop()
 
         # Sanitize: Neo4j labels cannot contain spaces
         subj_label = triple.subject_type.title().replace(" ", "")
         obj_label  = triple.object_type.title().replace(" ", "")
 
-        # CONCEPT: Cypher MERGE (Idempotency)
-        # MERGE means "Find this node, or create it if it doesn't exist".
-        # Idempotency means no matter how many times you run this exact code on 
-        # the exact same article, you will never create duplicate nodes in your graph.
-        cypher = f"""
-            MERGE (a:{subj_label} {{name: $subject}})
-            MERGE (b:{obj_label}  {{name: $object}})
-            MERGE (a)-[r:{triple.predicate}]->(b)
-            SET r.confidence = $confidence,
-                r.temporal   = $temporal,
-                r.updated_at = datetime()
-        """
-        await loop.run_in_executor(
-            None,
-            lambda: self.neo4j.execute(cypher, {
-                "subject":    triple.subject,
-                "object":     triple.object,
-                "confidence": triple.confidence,
-                "temporal":   triple.temporal,
-            }),
-        )
+        proposal = {
+            "subject": triple.subject,
+            "action": "LINK_ENTITY",
+            "data": {
+                "target_id": triple.object,
+                "source_label": subj_label,
+                "target_label": obj_label,
+                "relation_type": triple.predicate,
+                "weight": triple.confidence
+            }
+        }
+        await self._producer.send("sentinel.ontology.proposals", proposal, key=triple.subject)
 
     def _update_instrument_watchlist(self, brief: IntelBrief, title_lower: str):
         """

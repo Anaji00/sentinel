@@ -109,12 +109,17 @@ class QuantResearcherAgent(SentinelAgent):
         if not ticker:
             return None
         
-        dedup_key = f"{ticker}:{event_type}"
-        if self.is_recently_processed(dedup_key, DEDUP_WINDOW_SECONDS):
+        dedup_key = self._state_key("seen", f"{ticker}:{event_type}")
+        raw_prev_score = await self.redis.raw.get(dedup_key)
+        prev_score = float(raw_prev_score) if raw_prev_score else 0.0
+
+        # Ignore if we've seen it recently AND the new event isn't a massive escalation (+0.15 delta)
+        if prev_score > 0 and anomaly_score < (prev_score + 0.15):
             await self._accumulate_volume(ticker, message)
             return None
         
-        self.mark_processed(dedup_key, DEDUP_WINDOW_SECONDS)
+        # Lock the ticker with the NEW high score
+        await self.redis.raw.set(dedup_key, str(anomaly_score), ex=DEDUP_WINDOW_SECONDS)
 
         notional = self._extract_notional(message)
         logger.info(
@@ -144,7 +149,8 @@ class QuantResearcherAgent(SentinelAgent):
         )
 
         try:
-            discovery: PeerDiscovery = await self._llm.infer(
+            discovery: PeerDiscovery = await self._execute_with_telemetry(
+                message=message,
                 system_prompt=QUANT_PEER_DISCOVERY_SYSTEM,
                 user_prompt=user_prompt,
                 schema=PeerDiscovery,
@@ -153,6 +159,19 @@ class QuantResearcherAgent(SentinelAgent):
         except SchemaViolationError as e:
             logger.error(f"Peer discovery failed: {e}")
             return None
+        
+        unknowns = discovery.peer_tickers + discovery.macro_instruments
+        for item in unknowns:
+            await self._producer.send(
+                "agents.ontology.unknown_entities",
+                {
+                    "entity_name": item.ticker,
+                    "context": discovery.trigger_analysis[:500],
+                    "source_domain": "quant_researcher",
+                    "frequency": 1
+                },
+                key=item.ticker
+            )
         
         # ── STEP 3: Inject peers (Now Async) ──────────────────────────────────
         added = await self._inject_peers(ticker, discovery, event_type)
@@ -315,34 +334,30 @@ class QuantResearcherAgent(SentinelAgent):
         return added
 
     async def _write_graph_relationships(self, trigger_ticker: str, discovery: PeerDiscovery):
-        loop = asyncio.get_running_loop()
+        """
+        Delegates Neo4j writes to the Graph Supervisor via Kafka.
+        Prevents concurrent transaction deadlocks.
+        """
         for peer in discovery.peer_tickers:
             if peer.discovery_confidence < 0.7:
                 continue
+            
+            rel_type = self._map_relationship_type(peer.relationship_type)
+            proposal = {
+                "entity_id": trigger_ticker,
+                "action": "LINK_ENTITY",
+                "data": {
+                    "target_id": peer.ticker,
+                    "source_label": "Instrument",
+                    "target_label": "Instrument",
+                    "relation_type": rel_type,
+                    "weight": peer.discovery_confidence
+                }
+            }
             try:
-                rel_type = self._map_relationship_type(peer.relationship_type)
-                await loop.run_in_executor(
-                    None,
-                    lambda: self.neo4j.execute("""
-                        // CONCEPT: Idempotency with MERGE
-                        // MERGE creates nodes/relationships ONLY if they don't already exist.
-                        // This prevents creating duplicate graph data if the script runs twice.
-                        MERGE (a:Instrument {name: $source})
-                        MERGE (b:Instrument {name: $target})
-                        MERGE (a)-[r:CORRELATED_WITH]->(b)
-                        SET r.relationship_type = $rel_type,
-                            r.confidence        = $confidence,
-                            r.discovered_by     = 'quant_agent',
-                            r.updated_at        = datetime()
-                    """, {
-                        "source":     trigger_ticker,
-                        "target":     peer.ticker,
-                        "rel_type":   rel_type,
-                        "confidence": peer.discovery_confidence,
-                    }),
-                )
+                await self._producer.send("sentinel.ontology.proposals", proposal, key=trigger_ticker)
             except Exception as e:
-                logger.debug(f"Graph write failed {trigger_ticker}→{peer.ticker}: {e}")
+                logger.error(f"Failed to propose graph relationship {trigger_ticker}→{peer.ticker}: {e}")
 
     # ── HELPERS ───────────────────────────────────────────────────────────────
 

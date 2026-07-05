@@ -71,7 +71,6 @@ async def run_task_queue_worker(redis_client, agents: dict):
             # CONCEPT: Event Loop Non-Blocking IO
             # Since Redis `blpop` is synchronous and blocking, running it directly would freeze the entire asyncio event loop.
             # `run_in_executor(None, ...)` safely offloads this blocking call to a background thread pool.
-            loop = asyncio.get_running_loop()
             result = await redis_client.raw.blpop(queues, timeout=1.0)
 
             if not result:
@@ -86,11 +85,11 @@ async def run_task_queue_worker(redis_client, agents: dict):
             logger.debug(f"Task dequeued: {task_type} → {agent_name}")
 
             agent = agents.get(agent_name)
-            if agent and hasattr(agent, "handle"):
+            if agent and hasattr(agent, "_dispatch"):
                 # FIRE AND FORGET: create_task schedules the coroutine to run in the background.
                 # We don't `await` it here because we want the worker loop to immediately 
                 # go back to listening for new tasks from Redis without waiting for the handler to finish.
-                asyncio.create_task(agent.handle(payload))
+                asyncio.create_task(agent._dispatch(payload))
             else:
                 logger.warning(f"Unknown agent in task queue: {agent_name}")
         
@@ -164,11 +163,11 @@ async def main():
     logger.info("Shared infrastructure connected")
 
     connector = aiohttp.TCPConnector(limit=20)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ollama_client = OllamaClient(session)
-        logger.info("Loading Semantic Soft Correlator into RAM...")
-        soft_correlator = SoftCorrelator(ollama_client)
-        await soft_correlator._load()
+    main_session = aiohttp.ClientSession(connector=connector)
+    ollama_client = OllamaClient(main_session)
+    
+    soft_correlator = SoftCorrelator(ollama_client)
+    await soft_correlator._load()
     # ── AGENT INSTANTIATION ────────────────────────────────────────────────────
     news_agent = build_agent(
         NewsIntelAgent,
@@ -216,6 +215,14 @@ async def main():
         group_id="agent-supervisor",
         shared_infra=shared_infra,
     )
+    macro_strategist_agent = build_agent(
+        MacroStrategistAgent,
+        agent_name="macro_strategist",
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_ONTOLOGY_UPDATES, TOPIC_UNKNOWN_ENTITIES],
+        group_id="agent-macro-strategist",
+        shared_infra=shared_infra,
+    )
+
 
 
 
@@ -227,6 +234,7 @@ async def main():
         "radar_agent": radar_agent,
         "macro_cointegration_engine": macro_cointegration_agent,
         "graph_supervisor": supervisor_agent,
+        "macro_strategist": macro_strategist_agent,
     }
 
     logger.info(f"Agents built: {list(agents_by_name.keys())}")
@@ -240,6 +248,7 @@ async def main():
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
+        asyncio.create_task(macro_strategist_agent.run_schedueled_review(), name="macro_strategist"),
         asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
@@ -248,6 +257,13 @@ async def main():
     ]
 
     logger.info("All agents launched. Swarm is LIVE.")
+    logger.info(f"Agent: {news_agent.name} | Topics: {len(news_agent.input_topics)}")
+    logger.info(f"Agent: {quant_agent.name} | Topics: {len(quant_agent.input_topics)}")
+    logger.info(f"Agent: {ontology_agent.name} | Topics: {len(ontology_agent.input_topics)}")
+    logger.info(f"Agent: {radar_agent.name} | Topics: {len(radar_agent.input_topics)}")
+    logger.info(f"Agent: {macro_cointegration_agent.name} | Topics: {len(macro_cointegration_agent.input_topics)}")
+    logger.info(f"Agent: {supervisor_agent.name} | Topics: {len(supervisor_agent.input_topics)}")
+    logger.info(f"Agent: {macro_strategist_agent.name} | Topics: {len(macro_strategist_agent.input_topics)}")
 
     try:
         # Wait for all tasks. If any crashes, re-raise to restart via supervisor.
@@ -266,6 +282,8 @@ async def main():
         # Give tasks 5s to clean up
         # return_exceptions=True prevents CancelledError from bubbling up and interrupting the shutdown sequence.
         await asyncio.gather(*tasks, return_exceptions=True)
+        if not main_session.closed:
+            await main_session.close()
         logger.info("Agent swarm shut down cleanly")
 
 

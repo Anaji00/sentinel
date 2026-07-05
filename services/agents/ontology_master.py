@@ -132,7 +132,8 @@ class OntologyMasterAgent(SentinelAgent):
         )
 
         try:
-            classification: EntityClassification = await self._llm.infer(
+            classification: EntityClassification = await self._execute_with_telemetry(
+                message=message,
                 system_prompt=ONTOLOGY_CATEGORIZE_SYSTEM,
                 user_prompt=user_prompt,
                 schema=EntityClassification,

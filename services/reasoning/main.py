@@ -101,6 +101,8 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
 
     except Exception as e:
         logger.error("Failed to process cluster %s: %s", cluster.correlation_id, e, exc_info=True)
+        raise e  # Let the caller handle DLQ and logging
+
 
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""

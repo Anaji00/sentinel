@@ -177,26 +177,46 @@ class SentinelAgent(ABC):
         }
         await self.redis.raw.rpush(queue, json.dumps(task))
 
-    async def _execute_with_telemetry(self, message: dict, prompt: str):
-        start_time = time.monotonic()
+    async def _execute_with_telemetry(self, message: dict, system_prompt: str, user_prompt: str, schema: Optional[Type[BaseModel]] = None, temperature: float = 0.1) -> Any:
         
-        # 1. Emit Thought Process Started
+        start_time = time.monotonic()
+        # Fallback to a UUID if no event_id is present (e.g., scheduled tasks)
+        run_id = message.get("event_id", str(uuid.uuid4())[:8])
+        
         await self._producer.send(
             "agents.telemetry", 
-            {"agent": self.name, "status": "THINKING", "prompt": prompt}
+            {
+                "agent": self.name, 
+                "status": "THINKING", 
+                "task_id": run_id,
+                "system_prompt_length": len(system_prompt),
+                "user_prompt_length": len(user_prompt)
+            }
         )
         
-        # 2. Execute LLM
-        response = await self._llm.infer(prompt=prompt)
+        # 2. Execute LLM with Pydantic Enforcement
+        response = await self._llm.infer(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            temperature=temperature
+        )
         
+        if hasattr(response, "model_dump"):
+            output_payload = response.model_dump()
+        elif hasattr(response, "dict"):
+            output_payload = response.dict()
+        else:
+            output_payload = {"raw_text": str(response)}
         # 3. Emit Completion
         await self._producer.send(
             "agents.telemetry", 
             {
                 "agent": self.name, 
-                "status": "COMPLETE", 
-                "raw_output": response,
-                "latency_ms": (time.monotonic() - start_time) * 1000
+                "status": "COMPLETE",
+                "task_id": run_id,
+                "latency_ms": round((time.monotonic() - start_time) * 1000, 2),
+                "output_payload": output_payload
             }
         )
         return response
