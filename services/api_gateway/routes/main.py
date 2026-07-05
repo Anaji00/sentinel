@@ -37,9 +37,9 @@ async def lifespan(app: FastAPI):
     """
     # We create our database connection pools once, and store them in `app.state`.
     # `app.state` acts as a global storage box that any route can reach into later.
-    app.state.db = get_timescale()
-    app.state.neo4j = get_neo4j()
-    app.state.redis = get_redis()
+    app.state.db = await get_timescale()
+    app.state.neo4j = await get_neo4j()
+    app.state.redis = await get_redis()
     yield
     # CLEANUP: Code placed here would close the database connections gracefully.
     logger.info("Shutting down...")

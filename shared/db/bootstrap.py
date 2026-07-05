@@ -7,12 +7,12 @@ from shared.db import get_timescale
 
 logger = logging.getLogger("db.bootstrap")
 
-def bootstrap_database():
+async def bootstrap_database():
     """
     Idempotent Application-Level Schema Migration.
     Reads init.sql and executes it directly against the DB.
     """
-    db = get_timescale()
+    db = await get_timescale()
     
     # Locate the init.sql file relative to this script
     sql_path = Path(__file__).resolve().parent / "init.sql"
@@ -27,7 +27,7 @@ def bootstrap_database():
 
     try:
         # Execute the entire SQL block
-        db.execute(sql)
+        await db.execute(sql)
         logger.info("✅ Database schema successfully verified and initialized.")
     except Exception as e:
         logger.error(f"🚨 Schema initialization failed: {e}")

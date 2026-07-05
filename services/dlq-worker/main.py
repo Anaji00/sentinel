@@ -65,41 +65,46 @@ async def _send_telegram_alert(session: aiohttp.ClientSession, topic: str, error
     except Exception as e:
         logger.error(f"Failed to reach Telegram API: {e}")
 
-def _consume_loop(consumer, db, async_loop, session):
+async def _consume_loop(consumer, db, async_loop, session):
     """Blocking loop that reads from Kafka and writes to Postgres."""
     last_alert_time = 0
 
     while True:
         try:
-            for message in consumer:
-                # payload is a dict formatted in enrichment/main.py
-                payload = message.value
-                
-                original_topic = payload.get("topic", "unknown")
-                error_msg = payload.get("error", "No error provided")
-                raw_data = payload.get("raw", {})
+            batches = await consumer.get_batch(timeout_ms=1000)
+            if not batches:
+                continue
+            
+            for tp, messages in batches.items():
 
-                # 1. Save to PostgreSQL
-                try:
-                    db.execute("""
-                        INSERT INTO failed_events (original_topic, error_message, raw_payload)
-                        VALUES (%s, %s, %s)
-                    """, (original_topic, error_msg, json.dumps(raw_data)))
-                    logger.info(f"Saved failed event from {original_topic} to DB.")
-                except Exception as e:
-                    logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
-                    sys.exit(1)
+                for message in messages:
+                    # payload is a dict formatted in enrichment/main.py
+                    payload = message.value
+                    
+                    original_topic = payload.get("topic", "unknown")
+                    error_msg = payload.get("error", "No error provided")
+                    raw_data = payload.get("raw", {})
 
-                # 2. Rate-Limited Admin Alert
-                now = time.time()
-                if now - last_alert_time >= ALERT_COOLDOWN_SECONDS:
-                    last_alert_time = now
-                    # We are in a sync thread, so we schedule the async HTTP request 
-                    # safely back onto the main asyncio loop.
-                    asyncio.run_coroutine_threadsafe(
-                        _send_telegram_alert(session, original_topic, error_msg),
-                        async_loop
-                    )
+                    # 1. Save to PostgreSQL
+                    try:
+                        await db.execute("""
+                            INSERT INTO failed_events (original_topic, error_message, raw_payload)
+                            VALUES ($1, $2, $3)
+                        """, (original_topic, error_msg, json.dumps(raw_data)))
+                        logger.info(f"Saved failed event from {original_topic} to DB.")
+                    except Exception as e:
+                        logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
+                        sys.exit(1)
+
+                    # 2. Rate-Limited Admin Alert
+                    now = time.time()
+                    if now - last_alert_time >= ALERT_COOLDOWN_SECONDS:
+                        last_alert_time = now
+                        # We are in a sync thread, so we schedule the async HTTP request 
+                        # safely back onto the main asyncio loop.
+                        asyncio.create_task(_send_telegram_alert(session, original_topic, error_msg))
+                    
+            await consumer.commit()  # Commit offsets after processing the batch
 
         except KeyboardInterrupt:
             break
@@ -114,26 +119,24 @@ async def main():
     logger.info("SENTINEL  DLQ Worker Service")
     logger.info("=" * 60)
 
-    db = get_timescale()
+    db = await get_timescale()
     
     consumer = SentinelConsumer(
         topics=[Topics.DLQ],
         group_id="dlq-worker",
         auto_offset_reset="earliest", # Always process from the beginning of failures
     )
-
-    loop = asyncio.get_running_loop()
+    await consumer.start()
+    
     connector = aiohttp.TCPConnector(limit=5)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlq_consume") as pool:
-            await loop.run_in_executor(
-                pool,
-                _consume_loop,
-                consumer, db, loop, session
-            )
+        await _consume_loop(consumer, db, session)
 
-    consumer.close()
+    await consumer.close()
 
 if __name__ == "__main__":
+    # OS-level event loop policy enforcement to prevent Windows Proactor loop crashes
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

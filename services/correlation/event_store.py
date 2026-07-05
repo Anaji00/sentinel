@@ -109,20 +109,20 @@ class EventStore:
             logger.error(f"Redis cache fetch failed: {e}")
             return []
 
-    def save_correlation(self, cluster) -> None:
+    async def save_correlation(self, cluster) -> None:
         """
         Persist a CorrelationCluster to the correlations table.
         Errors are logged but not re-raised — a failed save doesn't block
         the correlation engine from processing the next event.
         """
         try:
-            self._db.execute("""
+            await self._db.execute("""
                 INSERT INTO correlations (
                     correlation_id, rule_id, rule_name, alert_tier,
                     detected_at, trigger_event_id, supporting_event_ids,
                     entity_ids, description, tags
-                ) VALUES (%s::uuid,%s,%s,%s,%s,%s::uuid,%s::uuid[],%s,%s,%s)
-            """, (
+                ) VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7::uuid[], $8, $9, $10)
+            """, 
                 cluster.correlation_id,
                 cluster.rule_id,
                 cluster.rule_name,
@@ -132,8 +132,8 @@ class EventStore:
                 cluster.supporting_event_ids,
                 cluster.entity_ids,
                 cluster.description,
-                cluster.tags,
-            ))
+                cluster.tags
+            )
             logger.info(f"💾 Persisted correlation {cluster.correlation_id} to TimescaleDB.")
         except Exception as e:
             logger.error(f"save_correlation failed ({cluster.correlation_id}): {e}")

@@ -32,7 +32,7 @@ DOMAIN_TO_COLUMN = {
 }
 
 @router.get("/{domain}")
-def get_domain_events(  # <--- CRITICAL FIX: Removed `async` to utilize FastAPI native thread-pooling
+async def get_domain_events(  # <--- CRITICAL FIX: Removed `async` to utilize FastAPI native thread-pooling
     # PATH PARAMETER: FastAPI extracts `domain` from the URL path
     domain: str, 
     # QUERY PARAMETERS: Extracted from the URL after the '?'
@@ -50,30 +50,31 @@ def get_domain_events(  # <--- CRITICAL FIX: Removed `async` to utilize FastAPI 
         raise HTTPException(status_code=400, detail=f"Invalid domain. Must be one of {list(DOMAIN_TO_COLUMN.keys())}")
     
     try:
-        # If the domain is news, we don't need a specific JSONB projection
+        # CRITICAL FIX: Positional $1, $2, $3 arguments
         if domain == "news":
             query = """
                 SELECT event_id, type, occurred_at, primary_entity_name, region, anomaly_score, summary as domain_data
-                FROM events WHERE type ILIKE %s AND anomaly_score >= %s
-                ORDER BY occurred_at DESC LIMIT %s
+                FROM events WHERE type ILIKE $1 AND anomaly_score >= $2
+                ORDER BY occurred_at DESC LIMIT $3
             """
         else:
             query = f"""
                 SELECT event_id, type, occurred_at, primary_entity_name, region, anomaly_score, {target_column} as domain_data
-                FROM events WHERE type ILIKE %s AND anomaly_score >= %s
-                ORDER BY occurred_at DESC LIMIT %s
+                FROM events WHERE type ILIKE $1 AND anomaly_score >= $2
+                ORDER BY occurred_at DESC LIMIT $3
             """
             
         like_pattern = f"{domain}_%"
-        # Executing synchronously, but safely protected by FastAPI's background thread pool
-        return db.query(query, (like_pattern, min_anomaly, limit))
+        
+        # CRITICAL FIX: Await the query and pass arguments as *args (no tuple required)
+        return await db.query(query, like_pattern, min_anomaly, limit)
         
     except Exception as e:
         logger.error(f"Failed to fetch {domain} events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database query failed")
     
 @router.get("/detail/{event_id}")
-def get_event_detail(event_id: str, db = Depends(get_db)): # <--- CRITICAL FIX: Removed `async`
+async def get_event_detail(event_id: str, db = Depends(get_db)): # <--- CRITICAL FIX: Removed `async`
     """Fetch the complete JSON payload for a single specific event."""
     try:
         # Simple, secure parameterized query to fetch one specific record by its UUID.
@@ -81,7 +82,7 @@ def get_event_detail(event_id: str, db = Depends(get_db)): # <--- CRITICAL FIX: 
         # THE PYTHON TUPLE GOTCHA:
         # Notice the comma in `(event_id,)`? In Python, `("text")` is just a string in parentheses. 
         # To create a tuple with exactly ONE item, you MUST include a trailing comma. 
-        result = db.query("SELECT * FROM events WHERE event_id = %s", (event_id,))
+        result = await db.query("SELECT * FROM events WHERE event_id = $1", (event_id,))
         if not result:
             # Standard REST practice: Return a 404 Not Found if the ID doesn't exist.
             raise HTTPException(status_code=404, detail="Event not found")

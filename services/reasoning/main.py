@@ -39,17 +39,19 @@ from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 
-def _save_scenario(db, scenario):
+async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
     try:
-        db.execute("""
+        # 2. CRITICAL FIX: Await the execution natively
+        await db.execute("""
             INSERT INTO scenarios (
                 scenario_id, correlation_id, status,
                 headline, significance, hypotheses,
                 recommended_monitoring, confidence_overall,
                 confidence_rationale
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) 
+            -- NOTE: Remember to change %s to positional $1 for asyncpg!
+        """, 
             scenario.scenario_id,
             scenario.correlation_id,
             scenario.status.value,
@@ -58,8 +60,8 @@ def _save_scenario(db, scenario):
             json.dumps(scenario.hypotheses),
             scenario.recommended_monitoring,
             scenario.confidence_overall,
-            scenario.confidence_rationale,
-        ))
+            scenario.confidence_rationale
+        )
         logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
     except Exception as e:
         logger.error("Error saving scenario %s to DB: %s", scenario.scenario_id, e, exc_info=True)
@@ -91,7 +93,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
         if scenario:
             # 1. Save to DB (For frontend viewing)
             await asyncio.gather(
-                asyncio.to_thread(_save_scenario, db, scenario),
+                _save_scenario(db, scenario),
                 producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
             )
             logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
@@ -186,7 +188,7 @@ async def main():
     logger.info("SENTINEL AI REASONING SERVICE")
     logger.info("=" * 60)
  
-    db              = get_timescale()
+    db              = await get_timescale()
     redis_client    = await get_redis()
     context_builder = ContextBuilder()
     generator       = ScenarioGenerator(db) 

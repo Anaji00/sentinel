@@ -76,9 +76,9 @@ async def main():
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
     logger.info("=" * 60)
 
-    bootstrap_database()  # Ensure DB schema is ready before processing
+    await bootstrap_database()  # Ensure DB schema is ready before processing
 
-    timescale = get_timescale()
+    timescale = await get_timescale()
     redis     = await get_redis()
     producer = SentinelProducer()
     dlq = SentinelProducer()

@@ -12,13 +12,12 @@ FIX (code review): TimescaleClient.query() now rolls back and re-raises on
 
 import logging
 import os
+import json
 import asyncio
 from typing import Optional, List, Dict
 import time
 # Using the native async client in modern redis-py
 import redis.asyncio as aioredis
-from psycopg2 import pool as pgpool
-from psycopg2.extras import RealDictCursor, execute_values
 import asyncpg
 from neo4j import AsyncGraphDatabase as _Neo4j
 
@@ -86,108 +85,61 @@ class TimescaleClient:
     # Timescale chops data into "chunks" (by day/week) so it stays fast even with billions of rows.
 
     def __init__(self):
-        self._pool = None
-        # On initialization, we immediately try to establish the connection pool.
-        self._connect()
+        self._pool: Optional[asyncpg.Pool] = None
+    async def _connect(self, retries: int = 12):
+        dsn = os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel")
+        async def init_connection(conn):
+            # BEST PRACTICE: Natively encode/decode JSONB at the driver level
+            await conn.set_type_codec(
+                'jsonb',
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema='pg_catalog'
+            )
 
-    def _connect(self, retries: int = 12):
-        # LOOP: Try to connect 'retries' times (default 12).
-        # If the database is restarting, we don't want to crash immediately.
         for attempt in range(retries):
             try:
-                # CONNECTION POOLING:
-                # Opening a connection to a DB is "expensive" (takes time, like dialing a phone).
-                # If we dialed, spoke for 1 second, and hung up for every single query, the app would be slow.
-                # A POOL is like a taxi rank with 2-20 taxis waiting with engines running.
-                # We "borrow" a connection, use it, and give it back to the pool immediately.
-                # ThreadedConnectionPool is thread-safe, allowing multiple web requests to run in parallel.
-                self._pool = pgpool.ThreadedConnectionPool(
-                    minconn=2, maxconn=40,
-                    host=os.getenv("POSTGRES_HOST", "localhost"),
-                    port=int(os.getenv("POSTGRES_PORT", 5432)),
-                    dbname=os.getenv("POSTGRES_DB", "sentinel"),
-                    user=os.getenv("POSTGRES_USER", "sentinel"),
-                    password=os.getenv("POSTGRES_PASSWORD", "sentinel_local_dev"),
+                self._pool = await asyncpg.create_pool(
+                    dsn,
+                    min_size=2,
+                    max_size=40,
+                    command_timeout=60,
+                    init=init_connection # Register the JSONB codec
                 )
-                logger.info("TimescaleDB connected")
+                logger.info("⚡ TimescaleDB (asyncpg) pool established.")
                 return
             except Exception as e:
-                # EXPONENTIAL BACKOFF: Wait 1s, then 2s, 4s... up to 30s. Don't hammer a dead DB.
-                # If the DB is down, spamming it with requests every millisecond makes it harder to recover.
                 wait = min(2 ** attempt, 30)
                 logger.warning(f"TimescaleDB attempt {attempt+1}/{retries} — retry in {wait}s: {e}")
                 if attempt < retries - 1:
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                 else:
                     raise
 
-    def query(self, sql: str, params: tuple = ()) -> List[Dict]:
+    async def query(self, sql: str, *params) -> List[Dict]:
         # READ OPERATION (SELECT)
         # 1. Borrow a connection from the pool. This blocks if all 20 connections are busy.
         conn = self._pool.getconn()
-        try:
-            # RealDictCursor:
-            # Standard SQL drivers return tuples: ('Vessel A', 10.5).
-            # This forces Python Dicts: {'name': 'Vessel A', 'speed': 10.5}.
-            # It's much easier to read and prevents bugs where you mix up column order.
-            # The 'with' block ensures the cursor is closed even if the code crashes inside.
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params) # Send the SQL to the server
-                return [dict(r) for r in cur.fetchall()] # Convert all results to a list of dicts
-        except Exception:
-            # TRANSACTION SAFETY (Rollback):
-            # If a query fails (e.g., syntax error), the connection gets "confused" (Aborted state).
-            # If we simply put it back in the pool, the NEXT person to use it will instantly fail.
-            # conn.rollback() is the "Undo" button. It resets the connection to a clean state.
-            conn.rollback()
-            raise # We re-raise the error so the calling function knows something went wrong.
-        finally:
-            # CRITICAL: Always give the connection back to the pool.
-            # If we forget this, the pool eventually runs out of connections (Leak) and the app freezes.
-            self._pool.putconn(conn)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
 
-    def query_one(self, sql: str, params: tuple = ()) -> Optional[Dict]:
+    async def query_one(self, sql: str, *params) -> Optional[Dict]:
         # Helper function: Just return the first result (or None if empty).
-        rows = self.query(sql, params)
-        return rows[0] if rows else None
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+            return dict(row) if row else None
+    
+    async def execute(self, sql: str, *params):
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(sql, *params)
 
-    def execute(self, sql: str, params: tuple = None):
-        # WRITE OPERATION (INSERT, UPDATE, DELETE)
-        # Similar to query(), but we must COMMIT (Save) the transaction.
-        conn = self._pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                if params:
-                    cur.execute(sql, params)
-                else:
-                    cur.execute(sql)
-            # COMMIT: The "Save Game" button.
-            # Until we run this, the data is only temporary. If the power goes out, it's lost.
-            conn.commit()
-        except Exception:
-            # If any part fails, Rollback (Undo) everything since the last commit.
-            conn.rollback()
-            raise
-        finally:
-            self._pool.putconn(conn)
-
-    def execute_many(self, sql: str, rows: List[tuple]):
-        # BATCH INSERT:
-        # Imagine you have 1,000 letters to mail.
-        # BAD:  Drive to the post office 1,000 times (1 letter per trip).
-        # GOOD: Put all 1,000 letters in one bag and drive once.
-        # execute_values packs thousands of rows into ONE SQL statement.
-        # This is 100x faster for bulk data (like vessel positions).
-        conn = self._pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                execute_values(cur, sql, rows)
-            conn.commit() # Save the whole batch at once.
-        except Exception:
-            conn.rollback() # If even one row fails, undo the whole batch (Atomic).
-            raise
-        finally:
-            self._pool.putconn(conn)
+    async def execute_many(self, sql: str, rows: List[tuple]):
+        """High-performance batch execution."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(sql, rows)
 
 
 # ── SINGLETONS ────────────────────────────────────────────────────────────────
@@ -203,21 +155,21 @@ _async_redis: Optional[RedisClient] = None
 _neo4j: Optional[Neo4jClient] = None
 
 
-def get_timescale() -> TimescaleClient:
+async def get_timescale() -> TimescaleClient:
     global _timescale
     if _timescale is None:
         # Only happens the very first time the app calls this.
         _timescale = TimescaleClient()
+        await _timescale._connect()
     return _timescale
 
 
 async def get_redis() -> RedisClient:
     """Thread-safe async singleton for Redis."""
     global _async_redis
-    if _async_redis is not None:
+    if _async_redis is None:
         _async_redis = RedisClient()
     return _async_redis
-
 
 
 async def get_neo4j() -> Neo4jClient:

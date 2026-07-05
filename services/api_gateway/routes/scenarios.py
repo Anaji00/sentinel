@@ -33,11 +33,11 @@ async def get_active_scenarios(
         # Notice we STILL use `%s` and append to a `params` list to maintain security 
         # against SQL injection, rather than doing `query += f" WHERE status = '{status}'"`
         if status:
-            query += " WHERE status = %s"
             params.append(status)
-        query += " ORDER BY created_at DESC LIMIT %s"
+            query += f" WHERE status = ${len(params)}"
         params.append(limit)
-        return db.query(query, tuple(params))
+        query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
+        return await db.query(query, tuple(params))
     except Exception as e:
         logger.error(f"Error fetching scenarios: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")
@@ -57,12 +57,12 @@ async def get_correlations(
         # The database driver sees the first `%s` and grabs the first item in the 
         # tuple (min_tier). It sees the second `%s` and grabs the second item (limit).
         # Never use Python f-strings for SQL queries to avoid SQL Injection!
-        return db.query("""
+        return await db.query("""
             SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags 
             FROM correlations 
-            WHERE alert_tier >= %s 
-            ORDER BY detected_at DESC LIMIT %s
-        """, (min_tier, limit))
+            WHERE alert_tier >= $1 
+            ORDER BY detected_at DESC LIMIT $2
+        """, min_tier, limit)
     except Exception as e:
         logger.error(f"Failed to fetch correlations: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")
