@@ -26,7 +26,7 @@ Deduplication:
   We skip articles we've already processed (Redis 1h TTL keyed on URL hash).
   This handles duplicate RSS entries without database overhead.
 """
-
+import asyncio
 import hashlib
 import json
 import logging

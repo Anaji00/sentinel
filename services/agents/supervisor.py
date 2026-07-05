@@ -81,11 +81,12 @@ class GraphSupervisor:
 
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
+                label = data.get("label", "Entity")
                 if not tags: return
 
                 # Pure Cypher array deduplication: combines existing tags with new tags, unrolls them, and collects only unique ones.
-                cypher = """
-                MERGE (e {name: $id})
+                cypher = f"""
+                MERGE (e:{label} {{name: $id}})
                 WITH e, coalesce(e.tags, []) + $new_tags AS all_tags
                 UNWIND all_tags AS tag
                 WITH e, collect(distinct tag) AS unique_tags
