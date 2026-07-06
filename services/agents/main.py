@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("agents.main")
 
 from shared.db import get_timescale, get_neo4j, get_redis
-from shared.kafka import SentinelProducer, SentinelConsumer
+from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.utils.ollama import OllamaClient
 from services.agents.radar_agent import RadarAgent
 from services.correlation.soft_correlator import SoftCorrelator
@@ -157,7 +157,7 @@ async def main():
     # They do NOT share Kafka producers/consumers (not thread safe).
     shared_infra = {
         "redis": await get_redis(),
-        "db":    get_timescale(),
+        "db":    await get_timescale(),
         "neo4j": await get_neo4j(),
     }
     logger.info("Shared infrastructure connected")
@@ -167,7 +167,8 @@ async def main():
     ollama_client = OllamaClient(main_session)
     
     soft_correlator = SoftCorrelator(ollama_client)
-    await soft_correlator._load()
+    # Load soft correlator in the background to prevent blocking service startup
+    asyncio.create_task(soft_correlator._load())
     # ── AGENT INSTANTIATION ────────────────────────────────────────────────────
     news_agent = build_agent(
         NewsIntelAgent,
@@ -201,20 +202,23 @@ async def main():
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
     )
+
     macro_cointegration_agent = build_agent(
         MacroAssetCointegrationEngine,
         agent_name="macro_cointegration_engine",
-        input_topics=[TOPIC_ENRICHED_EVENTS],
+        input_topics=[Topics.RAW_TRADFI, "raw.macro"],
         group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
     )
+
     supervisor_agent = build_agent(
         GraphSupervisor,
         agent_name="supervisor",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_ONTOLOGY_UPDATES, TOPIC_UNKNOWN_ENTITIES],
-        group_id="agent-supervisor",
+        input_topics=["sentinel.ontology.proposals"],
+        group_id="supervisor-group",
         shared_infra=shared_infra,
     )
+
     macro_strategist_agent = build_agent(
         MacroStrategistAgent,
         agent_name="macro_strategist",
@@ -222,10 +226,6 @@ async def main():
         group_id="agent-macro-strategist",
         shared_infra=shared_infra,
     )
-
-
-
-
 
     agents_by_name = {
         "news_intel":      news_agent,
@@ -248,8 +248,8 @@ async def main():
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
-        asyncio.create_task(macro_strategist_agent.run_schedueled_review(), name="macro_strategist"),
         asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
+        asyncio.create_task(macro_strategist_agent.run_scheduled_review(), name="macro_strategist"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",

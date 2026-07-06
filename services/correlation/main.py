@@ -31,7 +31,7 @@ load_dotenv(ROOT / ".env")
 from shared.utils.ollama import OllamaClient
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
-from shared.models import NormalizedEvent, CorrelationCluster
+from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
 from shared.db import get_redis
 from services.correlation.event_store import EventStore
 from services.correlation.rules import ALL_RULES
@@ -63,6 +63,7 @@ async def main():
 
     processed  = 0
     corr_fired = 0
+    errors     = 0
 
     await producer.start()
     await consumer.start()
@@ -71,7 +72,28 @@ async def main():
     async with aiohttp.ClientSession(connector=connector) as session:
         ollama_client = OllamaClient(session)
         soft_correlator = SoftCorrelator(ollama_client)
-        await soft_correlator._load()
+        # Load soft correlator in the background to prevent blocking service startup
+        asyncio.create_task(soft_correlator._load())
+
+    import time as _time
+    _start_time = _time.monotonic()
+
+    async def _heartbeat():
+        nonlocal processed, corr_fired, errors
+        while True:
+            await asyncio.sleep(60)
+            elapsed = _time.monotonic() - _start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"⏱ HEARTBEAT | processed={processed} "
+                f"correlations={corr_fired} errors={errors} "
+                f"rate={rate:.1f}/s uptime={int(elapsed)}s"
+            )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+
+    total_received = 0
+    last_logged_received = 0
 
     try:
         # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
@@ -84,6 +106,10 @@ async def main():
                     continue
 
                 for tp, messages in batches.items():
+                    total_received += len(messages)
+                    if total_received - last_logged_received >= 250:
+                        logger.info(f"Received batch of {len(messages)} events to correlate on partition {tp.topic}:{tp.partition}")
+                        last_logged_received = total_received
                     for message in messages:
                         try:
                             # Parse the JSON payload safely before feeding to Pydantic
@@ -91,7 +117,7 @@ async def main():
                             event = NormalizedEvent(**raw_data)
 
                             try:
-                                store.add_event(event)
+                                await store.add_event(event)
                                 
                                 # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
                                 embedding = await soft_correlator.embed_event(event)
@@ -105,7 +131,7 @@ async def main():
                                     )
                                     
                                     if similar_events:
-                                        logger.info(f"🧠 Semantic Match Found for {event.event_id}")
+                                        logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
                                         
                                         # Synthesize the CorrelationCluster dynamically
                                         supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
@@ -121,7 +147,7 @@ async def main():
                                             tags=["semantic_match", "cross_domain", "ai_cluster"]
                                         )
                                         
-                                        store.save_correlation(cluster)
+                                        await store.save_correlation(cluster)
                                         await producer.send(
                                             Topics.CORRELATIONS,
                                             cluster.model_dump(),
@@ -138,6 +164,7 @@ async def main():
                                 logger.info(f"Heartbeat | Processed {processed} events | Total correlations: {corr_fired}")
 
                         except Exception as e:
+                            errors += 1
                             logger.error(f"Correlation loop error: {e}", exc_info=True)
                             try:
                                 # CORRECTED: Await the DLQ network call
@@ -166,10 +193,11 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        heartbeat_task.cancel()
         # CORRECTED: Await graceful closure of TCP sockets
         await producer.close()
         await consumer.close()
-        logger.info(f"Final — processed: {processed}  correlations: {corr_fired}")
+        logger.info(f"Final — processed: {processed}  correlations: {corr_fired}  errors: {errors}")
 
 
 if __name__ == "__main__":

@@ -92,6 +92,7 @@ class SentinelAgent(ABC):
                 if not batches:
                     continue
                 for tp, msg_list in batches.items():
+                    self.logger.info(f"Received batch of {len(msg_list)} messages from topic partition {tp.topic}:{tp.partition}")
                     tasks = []
                     for msg in msg_list:
                         try:
@@ -128,7 +129,7 @@ class SentinelAgent(ABC):
                     self.logger.warning(f"Slow dispatch: {elapsed:.1f}s")
             except SchemaViolationError as e:
                 self._errors += 1
-                self._send_dlq(raw, str(e), self.input_topics[0])
+                await self._send_dlq(raw, str(e), self.input_topics[0])
             except Exception as e:
                 self._errors += 1
                 self.logger.error(f"Dispatch error: {e}", exc_info=True)
@@ -136,7 +137,7 @@ class SentinelAgent(ABC):
 
     async def _send_dlq(self, raw: Dict, error: str, topic: str):
         try:
-            self._dlq.send("dead.letter", {"error": error, "topic": topic, "raw": raw, "agent": self.name})
+            await self._dlq.send("dead.letter", {"error": error, "topic": topic, "raw": raw, "agent": self.name})
         except Exception as e:
             self.logger.error(f"DLQ send failed: {e}")
 
@@ -147,7 +148,7 @@ class SentinelAgent(ABC):
             rate = self._processed / elapsed if elapsed > 0 else 0
             self.logger.info(f"♥ {self.name} | processed={self._processed} errors={self._errors} rate={rate:.2f}/s")
             try:
-                self.redis.raw.set(
+                await self.redis.raw.set(
                     f"sentinel:agents:health:{self.name}",
                     json.dumps({
                         "processed": self._processed,

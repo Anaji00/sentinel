@@ -61,14 +61,14 @@ class DBWriter:
             INSERT INTO events (
                 event_id, type, occurred_at, collected_at, source, source_reliability,
                 primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags,
-                longitude, latitude, region, country_code, headline, summary, url,
+                region, country_code, headline, summary, url,
                 vessel_data, flight_data, financial_data, security_data,
                 prediction_market_data, crypto_data, cyber_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids,
                 coordinates
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17,
+                $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24,
                 $25, $26, $27, $28, $29,
                 ST_SetSRID(ST_MakePoint(COALESCE($11::float, 0.0), COALESCE($12::float, 0.0)), 4326)

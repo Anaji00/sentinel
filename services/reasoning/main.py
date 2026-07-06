@@ -117,6 +117,25 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     await consumer.start()
     await producer.start()
 
+    import time as _time
+    _start_time = _time.monotonic()
+    _processed = 0
+    _scenarios = 0
+    _errors = 0
+
+    async def _heartbeat():
+        nonlocal _processed, _scenarios, _errors
+        while True:
+            await asyncio.sleep(60)
+            elapsed = _time.monotonic() - _start_time
+            rate = _processed / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"⏱ HEARTBEAT | clusters_processed={_processed} "
+                f"scenarios_generated={_scenarios} errors={_errors} "
+                f"rate={rate:.1f}/s uptime={int(elapsed)}s"
+            )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     
     logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
     
@@ -129,12 +148,15 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                 batch_tasks = []
                 dlq_payloads = []
                 for tp, msgs in batches.items():
+                    logger.info(f"Received batch of {len(msgs)} messages to reason on partition {tp.topic}:{tp.partition}")
                     for message in msgs:
                         try:
                             raw_data = json.loads(message.value.decode('utf-8'))
                             
                             if tp.topic == "agents.intel.briefs":
                                 brief = raw_data.get("brief", {})
+                                headline = brief.get("headline", "No headline")
+                                logger.info(f"Received intel brief on agents.intel.briefs: {headline} (severity: {brief.get('severity')})")
                                 if brief.get("severity", 0) >= 4:
                                     await redis_client.raw.set(
                                         "sentinel:intel:briefs:latest",
@@ -144,6 +166,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                 continue
                                 
                             cluster = CorrelationCluster(**raw_data)
+                            logger.info(f"Received correlation cluster {cluster.correlation_id} (rule: {cluster.rule_name}, tier: {cluster.alert_tier.name}) for reasoning analysis")
                             
                             # Dispatch cluster processing to background task without blocking the consume loop
                             task = asyncio.create_task(
@@ -159,8 +182,13 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                     results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                     for task_result, original_payload in zip(results, dlq_payloads):
                             if isinstance(task_result, Exception):
+                                _errors += 1
                                 logger.error(f"Synthesis task failed silently: {task_result}", exc_info=True)
                                 await producer.send(Topics.DLQ, {"error": str(task_result), "payload": original_payload})
+                            else:
+                                _processed += 1
+                                if task_result is not None:
+                                    _scenarios += 1
                     # [CRITICAL FIX]: Commit offsets securely
                 await consumer.commit()
         
@@ -172,8 +200,10 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     except asyncio.CancelledError:
         pass
     finally:
+        heartbeat_task.cancel()
         await consumer.close()
         await producer.close()
+        logger.info(f"Final — clusters: {_processed}  scenarios: {_scenarios}  errors: {_errors}")
 
 async def _tracker_loop(tracker: ScenarioTracker):
     while True:

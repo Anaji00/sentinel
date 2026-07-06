@@ -21,8 +21,31 @@ from typing import Any, Dict, Optional
 from aiokafka import AIOKafkaConsumer as _Consumer
 from aiokafka import AIOKafkaProducer as _Producer
 from kafka.errors import KafkaError, KafkaConnectionError
+import sys
 
 logger = logging.getLogger(__name__)
+
+# Configure Kafka libraries to log at WARNING level across all services to prevent flooding
+aiokafka_logger = logging.getLogger("aiokafka")
+aiokafka_logger.setLevel(logging.WARNING)
+logging.getLogger("aiokafka.producer").setLevel(logging.WARNING)
+logging.getLogger("aiokafka.consumer").setLevel(logging.WARNING)
+
+kafka_logger = logging.getLogger("kafka")
+kafka_logger.setLevel(logging.WARNING)
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setLevel(logging.WARNING)
+_formatter = logging.Formatter(
+    "%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+_handler.setFormatter(_formatter)
+
+for _log in (aiokafka_logger, kafka_logger, logging.getLogger("aiokafka.producer"), logging.getLogger("aiokafka.consumer")):
+    if not _log.handlers:
+        _log.addHandler(_handler)
+        _log.propagate = False
 
 # ── TOPIC REGISTRY ────────────────────────────────────────────────────────────
 

@@ -71,6 +71,18 @@ async def process_single_message(msg, enrichers, dlq):
         return {"status": "error", "error": e}
 
 
+async def _heartbeat_loop(state: dict):
+    """Periodic heartbeat for operational visibility."""
+    while True:
+        await asyncio.sleep(60)
+        elapsed = state["elapsed"]()
+        rate = state["processed"] / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"⏱ HEARTBEAT | processed={state['processed']} "
+            f"errors={state['errors']} rate={rate:.1f}/s "
+            f"uptime={int(elapsed)}s"
+        )
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
@@ -113,8 +125,16 @@ async def main():
     gap = VesselGapDetector(producer, scorer, db, redis)
     gap_task = asyncio.create_task(gap.run())
 
-    loop = asyncio.get_running_loop()
+    import time as _time
+    _start_time = _time.monotonic()
     processed = 0
+    errors = 0
+    heartbeat_state = {
+        "processed": 0,
+        "errors": 0,
+        "elapsed": lambda: _time.monotonic() - _start_time,
+    }
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(heartbeat_state))
 
     logger.info("Enrichment Pipeline LIVE. Listening for raw telemetry...")
     
@@ -153,17 +173,22 @@ async def main():
                 if produce_tasks:
                     await asyncio.gather(*produce_tasks, return_exceptions=True)
                     processed += len(produce_tasks)
-                    if processed % 500 == 0:
+                    heartbeat_state["processed"] = processed
+                    if processed % 250 == 0:
                         logger.info(f"Processed {processed} successfully")
 
                 # ── 3. FAULT-TOLERANT DB WRITES ──────────────────────────────
                 if batch_to_write:
                     for attempt in range(3):
                         try:
-                            await loop.run_in_executor(None, db.write_events_batch, batch_to_write)
+                            # FIX: write_events_batch is async — call it directly,
+                            # not via run_in_executor (which is for sync functions).
+                            await db.write_events_batch(batch_to_write)
                             break # Success
                         except Exception as write_err:
                             if attempt == 2: 
+                                errors += len(batch_to_write)
+                                heartbeat_state["errors"] = errors
                                 logger.error(f"FATAL DB WRITE ERROR: {write_err}. Routing batch to DLQ to prevent data loss.", exc_info=True)
                                 # CRITICAL FIX: Send the failed DB batch to DLQ rather than crashing the service
                                 dlq_tasks = [dlq.send(Topics.DLQ, {"error": "DB_WRITE_FAILED", "event_id": e.event_id}) for e in batch_to_write]
@@ -179,11 +204,13 @@ async def main():
     except Exception as e:
         logger.critical(f"Fatal error in main loop: {e}", exc_info=True)
     finally:
+        heartbeat_task.cancel()
         gap_task.cancel()
         try:
-            await gap_task
+            await asyncio.gather(gap_task, heartbeat_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
+        logger.info(f"Final — processed: {processed}  errors: {errors}")
 
         await producer.close()
         await dlq.close()

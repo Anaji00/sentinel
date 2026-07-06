@@ -83,7 +83,10 @@ async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
     try:
         async with session.get(f"{ALPACA_ASSETS_URL}?status=active&asset_class=us_equity", headers=headers) as resp:
-            if resp.status != 200: return MAG_7
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error(f"Alpaca API error fetching universe (HTTP {resp.status}): {body[:200]}. Falling back to MAG_7.")
+                return MAG_7
             assets = await resp.json()
             tickers = [a["symbol"] for a in assets if a["tradable"] and a["exchange"] != "OTC"]
             logger.info(f"🌐 Dynamic Universe Acquired: Tracking {len(tickers)} equities.")
@@ -95,14 +98,37 @@ async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
 def chunk_list(data: List[str], chunk_size: int):
     for i in range(0, len(data), chunk_size): yield data [i:i + chunk_size]
 
-async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float):
+async def heartbeat_loop(state: dict):
+    start_time = asyncio.get_event_loop().time()
+    while True:
+        await asyncio.sleep(60)
+        elapsed = asyncio.get_event_loop().time() - start_time
+        logger.info(
+            f"⏱ RADAR HEARTBEAT | uptime={int(elapsed)}s "
+            f"| total_evaluated={state.get('total_evaluated', 0)} "
+            f"| total_anomalies={state.get('total_anomalies', 0)} "
+            f"| polls={state.get('polls', 0)}"
+        )
+
+async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict):
+    state["polls"] += 1
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
     chunks = list(chunk_list(universe, 1000))
     tasks = [session.get(f"{ALPACA_DATA_URL}?symbols={','.join(c)}", headers=headers) for c in chunks]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for resp in responses:
-        if isinstance(resp, Exception) or resp.status != 200: continue
+    total_evaluated = 0
+    anomalies_detected = 0
+
+    for i, resp in enumerate(responses):
+        if isinstance(resp, Exception):
+            logger.error(f"Failed to fetch snapshots for chunk {i}: {resp}")
+            continue
+        if resp.status != 200:
+            body = await resp.text()
+            logger.error(f"Alpaca snapshot API error for chunk {i} (HTTP {resp.status}): {body[:200]}")
+            continue
+            
         data = await resp.json()
 
         for ticker, snapshot in data.items():
@@ -114,24 +140,59 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             if volume == 0.0: continue
 
             is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, price, alpha, z_threshold)
+            total_evaluated += 1
             if is_anomaly:
+                anomalies_detected += 1
                 notional = volume * price
-                logger.warning(f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} | 1m Vol: {volume} (${notional/1e6:.2f}M)")
+                
+                latest_trade = snapshot.get("latestTrade")
+                trade_details = ""
+                trade_price = price
+                trade_size = volume
+                if latest_trade:
+                    trade_price = float(latest_trade.get("p", price))
+                    trade_size = float(latest_trade.get("s", volume))
+                    trade_details = f" | Latest Trade: {trade_size} shares @ ${trade_price:,.2f}"
+
+                logger.warning(
+                    f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} (threshold: {z_threshold:.1f}) "
+                    f"| 1m Vol: {volume} (${notional/1e6:.2f}M){trade_details}"
+                )
                 event = {
                     "source": "alpaca_quant_radar",
                     "occurred_at": datetime.now(timezone.utc).isoformat(),
-                    "raw_payload": {"ticker": ticker, "z_score": round(z_score, 3), "volume": volume, "price": price, "notional_usd": notional, "trigger": "structural_volume_spike"}
+                    "raw_payload": {
+                        "ticker": ticker,
+                        "z_score": round(z_score, 3),
+                        "volume": volume,
+                        "price": price,
+                        "notional_usd": notional,
+                        "trigger": "structural_volume_spike",
+                        "latest_trade_price": trade_price,
+                        "latest_trade_size": trade_size
+                    }
                 }
                 await producer.send(Topics.RAW_RADAR, event, key=ticker)
 
+    state["total_evaluated"] += total_evaluated
+    state["total_anomalies"] += anomalies_detected
+
+    if total_evaluated > 0:
+        logger.info(f"Radar evaluation complete: evaluated {total_evaluated} symbols | detected {anomalies_detected} anomalies | regime alpha={alpha:.3f}, z_threshold={z_threshold:.1f}")
+
 async def main():
-    if not ALPACA_API_KEY: sys.exit(1)
+    if not ALPACA_API_KEY:
+        logger.error("ALPACA_API_KEY is not set in environment. Radar collector exiting.")
+        sys.exit(1)
     producer = SentinelProducer()
     await producer.start()
     redis_client = await get_redis()
 
     radar = QuantRadar(redis_client)
     regime = MarketRegime(redis_client)
+
+    state = {"total_evaluated": 0, "total_anomalies": 0, "polls": 0}
+    heartbeat_task = asyncio.create_task(heartbeat_loop(state))
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -140,10 +201,11 @@ async def main():
             while True:
                 t0 = asyncio.get_event_loop().time()
                 alpha, z_threshold = await regime.get_dynamic_thresholds()
-                await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold)
+                await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state)
                 elapsed = asyncio.get_event_loop().time() - t0
                 await asyncio.sleep(max(0, 60.0 - elapsed))
         finally:
+            heartbeat_task.cancel()
             await producer.close()
 
 if __name__ == "__main__":

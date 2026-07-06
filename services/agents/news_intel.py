@@ -145,8 +145,6 @@ class NewsIntelAgent(SentinelAgent):
         # Instead of wrapping the whole function in a giant `if` statement, we check
         # conditions and immediately `return None` to save compute power and indentation.
         agent_source = message.get("agent")
-        if not agent_source:
-            raise ValueError("Missing 'agent' field in message")
 
         if agent_source == "quant_researcher":
             discovery = message.get("discovery", {})

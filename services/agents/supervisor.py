@@ -2,18 +2,23 @@ import asyncio
 import json
 import logging
 import time
-from aiokafka import AIOKafkaConsumer
-from shared.db import get_redis, get_neo4j
+from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 
 logger = logging.getLogger("agent.supervisor")
 
 ALLOWED_RELATIONS = {"RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", "HAS_EXPOSURE_IN", "CORRELATED_WITH"}
 
-class GraphSupervisor:
-    def __init__(self, redis_client, neo4j_client):
-        self.redis = redis_client
-        self.neo4j = neo4j_client
+class GraphSupervisor(SentinelAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @property
+    def output_topic(self) -> str:
+        return "sentinel.ontology.supervisor.noop"
+
+    async def handle(self, message: dict) -> None:
+        await self.execute_proposal(message)
 
     async def acquire_lock(self, entity_id: str, timeout: int = 5) -> bool:
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
@@ -104,47 +109,33 @@ class GraphSupervisor:
             await self.release_lock(entity_id)
 
 async def start_supervisor():
-    import os
     logger.info("🛡️ Graph Supervisor Online. Protecting Neo4j state.")
-    redis_client = await get_redis()
-    neo4j_client = await get_neo4j()
-    supervisor = GraphSupervisor(redis_client, neo4j_client)
-    
-    servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    consumer = AIOKafkaConsumer(
-        "sentinel.ontology.proposals",
-        bootstrap_servers=servers,
-        group_id="supervisor-group",
-        enable_auto_commit=False,
-        max_poll_records=100,
-    )
-    await consumer.start()
-    
-    try:
-        while True:
-            # CRITICAL FIX: Batch polling eliminates "Kafka Coordinator Hammering"
-            batches = await consumer.getmany(timeout_ms=1000)
-            if not batches:
-                continue
+    from shared.db import get_redis, get_neo4j, get_timescale
+    from shared.kafka import SentinelProducer, SentinelConsumer
 
-            for tp, messages in batches.items():
-                for msg in messages:
-                    try:
-                        # CRITICAL FIX: Poison Pill catch block
-                        payload = json.loads(msg.value.decode('utf-8'))
-                        await supervisor.execute_proposal(payload)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"POISON PILL JSON dropped on partition {tp.partition}: {e}")
-                    except Exception as e:
-                        logger.error(f"Unexpected error executing proposal: {e}")
-                
-                # CRITICAL FIX: Commit once per partition batch, NOT per message!
-            await consumer.commit()
-                
-    except asyncio.CancelledError:
-        logger.info("Graph Supervisor shutting down cleanly.")
-    finally:
-        await consumer.stop()
+    redis_client = await get_redis()
+    db_client = await get_timescale()
+    neo4j_client = await get_neo4j()
+
+    producer = SentinelProducer()
+    dlq = SentinelProducer()
+    consumer = SentinelConsumer(
+        topics=["sentinel.ontology.proposals"],
+        group_id="supervisor-group",
+        auto_offset_reset="latest",
+    )
+
+    supervisor = GraphSupervisor(
+        agent_name="supervisor",
+        input_topics=["sentinel.ontology.proposals"],
+        redis_client=redis_client,
+        db_client=db_client,
+        neo4j_client=neo4j_client,
+        producer=producer,
+        consumer=consumer,
+        dlq=dlq,
+    )
+    await supervisor.run()
 
 if __name__ == "__main__":
     asyncio.run(start_supervisor())
