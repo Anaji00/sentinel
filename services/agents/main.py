@@ -249,7 +249,7 @@ async def main():
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
         asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
-        asyncio.create_task(macro_strategist_agent.run_scheduled_review(), name="macro_strategist"),
+        asyncio.create_task(macro_strategist_agent.run(), name="macro_strategist"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",

@@ -113,6 +113,13 @@ class OllamaClient:
         last_error: Optional[str] = None
         semaphore = get_ollama_semaphore()
 
+        schema_json = json.dumps(schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema.schema(), indent=2)
+        schema_instruction = (
+            f"\n\nYou MUST return a JSON object that strictly adheres to the following JSON schema:\n"
+            f"```json\n{schema_json}\n```\n"
+            "Do not include any explanation or markdown formatting outside of the JSON object. Output raw JSON only."
+        )
+
         # Retry Loop: Give the AI multiple chances to fix its mistakes.
         for attempt in range(max_retries):
             correction = ""
@@ -129,11 +136,11 @@ class OllamaClient:
                     "Your entire response must start with { and end with }" 
                 )
 
-            full_prompt = f"{system_prompt}\n\n{user_prompt}{correction}"
+            full_prompt = f"{system_prompt}\n\n{user_prompt}{schema_instruction}{correction}"
 
             # Wait in line until the GPU is free (using the semaphore we defined earlier)
             async with semaphore:
-                raw_text = await self._call_ollama(full_prompt, temperature)
+                raw_text = await self._call_ollama(full_prompt, temperature, format="json")
 
             # Try to pull the JSON out of the AI's raw text response
             parsed = self._extract_json(raw_text)
@@ -169,7 +176,7 @@ class OllamaClient:
             return await self._call_ollama(full_prompt, temperature)
         
     
-    async def _call_ollama(self, prompt: str, temperature: float) -> str:
+    async def _call_ollama(self, prompt: str, temperature: float, format: Optional[str] = None) -> str:
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -178,9 +185,10 @@ class OllamaClient:
                 "temperature": temperature,
                 "num_predict": 3000,
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
-            },
-
+            }
         }
+        if format:
+            payload["format"] = format
         try:
             async with self._session.post(
                 f"{OLLAMA_URL}/api/generate",

@@ -63,7 +63,7 @@ class GraphSupervisor(SentinelAgent):
                     "concepts": data.get("macro_concepts"), "sanctions": data.get("sanctions_risk"),
                     "confidence": data.get("confidence")
                 })
-                logger.info(f"✅ Created/Updated Node: {entity_id}")
+                logger.debug(f"✅ Created/Updated Node: {entity_id}")
 
             elif action == "LINK_ENTITY":
                 target_id = data.get("target_id")
@@ -82,7 +82,7 @@ class GraphSupervisor(SentinelAgent):
                 SET r.weight = $weight, r.updated_at = datetime()
                 """
                 await self.neo4j.execute(cypher, {"id": entity_id, "target_id": target_id, "weight": data.get("weight", 1.0)})
-                logger.info(f"✅ Created Edge: {entity_id} -[{relation}]-> {target_id}")
+                logger.debug(f"✅ Created Edge: {entity_id} -[{relation}]-> {target_id}")
 
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
@@ -98,7 +98,7 @@ class GraphSupervisor(SentinelAgent):
                 SET e.tags = unique_tags, e.updated_at = datetime()
                 """
                 await self.neo4j.execute(cypher, {"id": entity_id, "new_tags": tags})
-                logger.info(f"✅ Added tags to {entity_id}: {tags}")
+                logger.debug(f"✅ Added {len(tags)} tags to {entity_id}")
 
             else:
                 logger.warning(f"Unknown proposal action: {action}")

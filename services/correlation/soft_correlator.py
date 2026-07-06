@@ -85,15 +85,21 @@ class SoftCorrelator:
             for collection in ["sentinel_events", "sentinel_concepts"]:
                 exists = await self._client.collection_exists(collection)
                 if not exists:
-                    await self._client.create_collection(
-                        collection_name=collection,
-                        vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
-                    )
+                    try:
+                        await self._client.create_collection(
+                            collection_name=collection,
+                            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
+                        )
+                    except Exception as ce:
+                        if "already exists" in str(ce).lower() or "409" in str(ce):
+                            logger.info(f"Collection '{collection}' was created concurrently.")
+                        else:
+                            raise
             self._enabled = True
             logger.info(f"Async Qdrant client connected to {qdrant_host} and SoftCorrelator enabled.")
         except Exception as e:
             # Catch any other errors (like Qdrant being unreachable) so the main app doesn't crash.
-            logger.error(f"Error initializing SoftCorrelator: {e}. Soft correlation disabled.", exc_info=True)
+            logger.warning(f"Qdrant unreachable (Phase 2 feature): {e}. Soft correlation disabled.")
         
     async def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
         """Convert event to embedding vector for similarity search."""

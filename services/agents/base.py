@@ -25,6 +25,7 @@ TASK_QUEUE_LOW    = "sentinel:agents:tasks:low"
 HEARTBEAT_INTERVAL = 30
 
 class SentinelAgent(ABC):
+    _global_received_count = 0
     def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3"):
         self.name = agent_name
         self.input_topics = input_topics
@@ -92,7 +93,11 @@ class SentinelAgent(ABC):
                 if not batches:
                     continue
                 for tp, msg_list in batches.items():
-                    self.logger.info(f"Received batch of {len(msg_list)} messages from topic partition {tp.topic}:{tp.partition}")
+                    batch_size = len(msg_list)
+                    SentinelAgent._global_received_count += batch_size
+                    if SentinelAgent._global_received_count >= 500:
+                        logging.getLogger("agents.swarm").info(f"Swarm processed 500 messages across all agent services.")
+                        SentinelAgent._global_received_count = 0
                     tasks = []
                     for msg in msg_list:
                         try:

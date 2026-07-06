@@ -69,11 +69,11 @@ async def main():
     await consumer.start()
 
     connector = aiohttp.TCPConnector(limit=20)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ollama_client = OllamaClient(session)
-        soft_correlator = SoftCorrelator(ollama_client)
-        # Load soft correlator in the background to prevent blocking service startup
-        asyncio.create_task(soft_correlator._load())
+    session = aiohttp.ClientSession(connector=connector)
+    ollama_client = OllamaClient(session)
+    soft_correlator = SoftCorrelator(ollama_client)
+    # Load soft correlator in the background to prevent blocking service startup
+    asyncio.create_task(soft_correlator._load())
 
     import time as _time
     _start_time = _time.monotonic()
@@ -197,6 +197,7 @@ async def main():
         # CORRECTED: Await graceful closure of TCP sockets
         await producer.close()
         await consumer.close()
+        await session.close()
         logger.info(f"Final — processed: {processed}  correlations: {corr_fired}  errors: {errors}")
 
 

@@ -301,7 +301,7 @@ class QuantResearcherAgent(SentinelAgent):
         for ticker, urgency, confidence in candidates:
             try:
                 # 1. IO Offloaded Set Addition
-                is_new = await asyncio.to_thread(self.redis.sadd, "sentinel:watched:equities", ticker)
+                is_new = await asyncio.to_thread(self.redis.raw.sadd, "sentinel:watched:equities", ticker)
                 
                 if is_new:
                     added.append(ticker)
