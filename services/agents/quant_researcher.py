@@ -13,6 +13,7 @@ and memory safety to prevent Event Loop blocking.
 
 import asyncio
 import json
+import time
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -204,24 +205,20 @@ class QuantResearcherAgent(SentinelAgent):
     # ── CONTEXT FETCHERS ──────────────────────────────────────────────────────
 
     async def _fetch_news_context(self, ticker: str) -> List[Dict]:
-        loop = asyncio.get_running_loop()
         try:
-            rows = await loop.run_in_executor(
-                None,
-                lambda: self.db.query("""
-                    SELECT headline, anomaly_score, occurred_at, named_entities, tags
-                    FROM events
-                    WHERE type = 'headline'
-                      AND occurred_at > NOW() - INTERVAL '2 hours'
-                      AND anomaly_score >= 0.3
-                      AND (
-                        LOWER(headline) LIKE %s
-                        OR %s = ANY(tags)
-                      )
-                    ORDER BY anomaly_score DESC
-                    LIMIT 8
-                """, (f"%{ticker.lower()}%", ticker.lower())),
-            )
+            rows = await self.db.query("""
+                SELECT headline, anomaly_score, occurred_at, named_entities, tags
+                FROM events
+                WHERE type = 'headline'
+                  AND occurred_at > NOW() - INTERVAL '2 hours'
+                  AND anomaly_score >= 0.3
+                  AND (
+                    LOWER(headline) LIKE %s
+                    OR %s = ANY(tags)
+                  )
+                ORDER BY anomaly_score DESC
+                LIMIT 8
+            """, (f"%{ticker.lower()}%", ticker.lower()))
             return [{"headline": r["headline"], "score": r["anomaly_score"]} for r in rows]
         except Exception as e:
             logger.debug(f"News context fetch error: {e}")
@@ -230,15 +227,12 @@ class QuantResearcherAgent(SentinelAgent):
     async def _fetch_graph_context(self, ticker: str) -> List[Dict]:
         loop = asyncio.get_running_loop()
         try:
-            rows = await loop.run_in_executor(
-                None,
-                lambda: self.neo4j.query("""
-                    MATCH (n {name: $ticker})-[r]-(m)
-                    RETURN type(r) as relationship, m.name as connected,
-                           labels(m) as labels
-                    LIMIT 20
-                """, {"ticker": ticker}),
-            )
+            rows = await self.neo4j.query("""
+                MATCH (n {name: $ticker})-[r]-(m)
+                RETURN type(r) as relationship, m.name as connected,
+                       labels(m) as labels
+                LIMIT 20
+            """, {"ticker": ticker})
             return [
                 {
                     "relationship": r.get("relationship"),
@@ -254,11 +248,9 @@ class QuantResearcherAgent(SentinelAgent):
     async def _get_current_watchlist(self) -> set:
         """Asynchronously returns the current equity watchlist from Redis."""
         try:
-            # CONCEPT: asyncio.to_thread
-            # Redis commands like `smembers` are synchronous (they block the thread).
-            # `to_thread` safely pushes this work to a background thread so the 
-            # main asyncio loop doesn't freeze up while waiting for the network.
-            raw = await asyncio.to_thread(self.redis.smembers, "sentinel:watched:equities")
+            # We use the async raw client directly to avoid thread-blocking.
+            # Using zrange since equities is a sorted set tracking injection time
+            raw = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
             return {t.decode("utf-8") if isinstance(t, bytes) else t for t in raw}
         except Exception:
             return set()
@@ -301,7 +293,7 @@ class QuantResearcherAgent(SentinelAgent):
         for ticker, urgency, confidence in candidates:
             try:
                 # 1. IO Offloaded Set Addition
-                is_new = await asyncio.to_thread(self.redis.raw.sadd, "sentinel:watched:equities", ticker)
+                is_new = await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
                 
                 if is_new:
                     added.append(ticker)
@@ -318,7 +310,7 @@ class QuantResearcherAgent(SentinelAgent):
                     
                     # 3. Deterministic key generation and atomic write
                     target_key = self._state_key("discovery", ticker)
-                    await asyncio.to_thread(self.redis.set, target_key, payload, ex=3600)
+                    await self.redis.raw.set(target_key, payload, ex=3600)
                     
                     log_level = logger.warning if urgency == "immediate" else logger.info
                     log_level(
@@ -400,8 +392,8 @@ class QuantResearcherAgent(SentinelAgent):
         key = self._state_key("volume", ticker)
         try:
             # Safely offload IO bound Redis increment commands
-            await asyncio.to_thread(self.redis.incrbyfloat, key, notional)
-            await asyncio.to_thread(self.redis.expire, key, 3600)  # Reset hourly
+            await self.redis.raw.incrbyfloat(key, notional)
+            await self.redis.raw.expire(key, 3600)  # Reset hourly
         except Exception:
             pass
 

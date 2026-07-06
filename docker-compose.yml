@@ -152,6 +152,10 @@ services:
         condition: service_completed_successfully
       timescaledb:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   correlation:
     build:
@@ -162,7 +166,14 @@ services:
     env_file: .env
     restart: always
     depends_on:
-      - enrichment
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
 
   reasoning:
     build:
@@ -173,7 +184,14 @@ services:
     env_file: .env
     restart: always
     depends_on:
-      - correlation
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
   
   collector-tradefi:
     build: .
@@ -240,11 +258,7 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:6333/readyz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      disable: true
 
   collector-cyber:
     build: .

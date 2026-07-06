@@ -160,7 +160,8 @@ class TradFiEnricher:
             tags.append("geo_linked_asset")
             tags.append(GEO_INSTRUMENTS[ticker])
             try:
-                await self.redis_client.raw.sadd("sentinel:watched:equities", ticker)
+                import time
+                await self.redis_client.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
             except Exception as e:
                 logger.error(f"Failed to update geo watchlist for {ticker}: {e}", exc_info=True)
                 
@@ -170,7 +171,7 @@ class TradFiEnricher:
             key = f"baseline:volume:{ticker}"
             current = await self.redis_client.raw.get(key)
             updated = (0.95 * float(current) + 0.05 * volume) if current else volume
-            await self.redis_client.set(key, str(round(updated, 3)), ex=604800)
+            await self.redis_client.raw.set(key, str(round(updated, 3)), ex=604800)
         except Exception as e:
             logger.error(f"Failed to update volume baseline for {ticker}: {e}")
 

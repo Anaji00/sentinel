@@ -159,7 +159,7 @@ class VesselGapDetector:
             flags = info.get("flags", []) if isinstance(info, dict) else []
             vtype = info.get("vessel_type", "Unknown") if isinstance(info, dict) else "Unknown"
             
-            score = self.scorer.score_vessel_dark(
+            score = await self.scorer.score_vessel_dark(
                 mmsi, data["gap"], data["region"], flags, val.get("heading", 0)
             )
             event = NormalizedEvent(

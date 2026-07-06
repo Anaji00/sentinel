@@ -2,15 +2,8 @@
 services/correlation/main.py
 
 Consumes enriched.events.
-Runs every rule against every event.
+Executes Dynamic JSON Correlation Rules from Redis.
 Emits CorrelationCluster to correlations.detected when a rule fires.
-
-Rules live in rules/:
-  maritime.py     — MARITIME_001
-  financial.py    — FINANCIAL_001
-  aviation.py     — AVIATION_001
-  news.py         — NEWS_001
-  cross_domain.py — CROSS_001
 """
 import aiohttp
 import asyncio
@@ -34,7 +27,55 @@ from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
 from shared.db import get_redis
 from services.correlation.event_store import EventStore
-from services.correlation.rules import ALL_RULES
+
+async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore, redis_client) -> list[CorrelationCluster]:
+    clusters = []
+    try:
+        rules_raw = await redis_client.raw.smembers("sentinel:correlation:dynamic_rules")
+        for raw in rules_raw:
+            try:
+                rule = json.loads(raw)
+                if event.type.value != rule.get("trigger_event_type"):
+                    continue
+                    
+                cond = rule.get("conditions", {})
+                if cond.get("min_anomaly", 0) > event.anomaly_score:
+                    continue
+                if cond.get("region") and event.region not in cond["region"]:
+                    continue
+                    
+                supporting_events = []
+                domains_triggered = set()
+                for corr in rule.get("correlations", []):
+                    hits = await store.get_recent(
+                        corr.get("event_types"),
+                        hours=corr.get("hours", 48),
+                        min_anomaly=corr.get("min_anomaly", 0.0),
+                        tags=corr.get("tags"),
+                        region=corr.get("region")
+                    )
+                    if hits:
+                        supporting_events.extend(hits)
+                        domains_triggered.update([h.get("type", "").split("_")[0] for h in hits])
+                        
+                if len(supporting_events) > 0:
+                    cluster = CorrelationCluster(
+                        rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
+                        rule_name=rule.get("rule_name", "Dynamic AI Rule"),
+                        alert_tier=AlertTier(rule.get("alert_tier", "alert").upper()),
+                        trigger_event_id=event.event_id,
+                        supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
+                        entity_ids=[event.primary_entity.id] if event.primary_entity else [],
+                        description=f"Dynamic rule '{rule.get('rule_name')}' triggered. Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains.",
+                        tags=["dynamic_rule", "ai_generated"] + rule.get("tags", [])
+                    )
+                    clusters.append(cluster)
+            except Exception as e:
+                logger.error(f"Failed to parse or eval dynamic rule: {e}")
+    except Exception as e:
+        logger.error(f"Failed to fetch dynamic rules: {e}")
+    return clusters
+
 
 
 logging.basicConfig(
@@ -47,8 +88,7 @@ logger = logging.getLogger("correlation")
 
 async def main():
     logger.info("=" * 60)
-    logger.info("SENTINEL  Correlation Engine")
-    logger.info(f"Rules loaded: {len(ALL_RULES)}")
+    logger.info("SENTINEL  Correlation Engine (Dynamic AI Rules)")
     logger.info("=" * 60)
 
     # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
@@ -118,6 +158,18 @@ async def main():
 
                             try:
                                 await store.add_event(event)
+
+                                # ── 3.5. DYNAMIC AI RULES ────────────────────────────
+                                dynamic_clusters = await evaluate_dynamic_rules(event, store, redis_client)
+                                for c in dynamic_clusters:
+                                    await store.save_correlation(c)
+                                    await producer.send(
+                                        Topics.CORRELATIONS,
+                                        c.model_dump(),
+                                        key=c.correlation_id,
+                                    )
+                                    corr_fired += 1
+                                    logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
                                 
                                 # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
                                 embedding = await soft_correlator.embed_event(event)

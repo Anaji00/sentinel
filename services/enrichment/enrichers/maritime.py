@@ -64,7 +64,7 @@ class MaritimeEnricher:
         features = [speed, is_sanctioned, 0.5, 0.0, 0.0]
         
         # Call score_event and extract the score from the returned dictionary
-        scoring_result = await self.scorer.score_event("vessel_position", features)
+        scoring_result = await self.scorer.score_event("vessel_position", mmsi, features)
         anomaly = scoring_result.get("score", 0.0)
         # ───────────────────────────────────────────────
 

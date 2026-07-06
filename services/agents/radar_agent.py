@@ -1,8 +1,13 @@
 import json
 import time
 from typing import Any, Dict, Optional
+from pydantic import BaseModel
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
+
+class RadarDecision(BaseModel):
+    investigate: bool
+    rationale: str
 
 class RadarAgent(SentinelAgent):
     def __init__(self, *args, **kwargs):
@@ -42,14 +47,16 @@ class RadarAgent(SentinelAgent):
         """
 
         try:
-            response = await self._llm.infer(
-                prompt = prompt, 
-                schema = {"type": "object", "properties": {"investigate": {"type": "boolean"}, "rationale": {"type": "string"}}}
+            decision = await self._execute_with_telemetry(
+                message=message,
+                system_prompt="You are a quantitative trading systems engineer.",
+                user_prompt=prompt,
+                schema=RadarDecision,
+                temperature=0.1
             )
-            decision = json.loads(response)
 
-            if decision.get("investigate"):
-                self.logger.info(f"🧠 AGENT ESCALATION: {ticker} -> Primary Surveillance. Rationale: {decision.get('rationale')}")
+            if decision.investigate:
+                self.logger.info(f"🧠 AGENT ESCALATION: {ticker} -> Primary Surveillance. Rationale: {decision.rationale}")
 
                 # ─── DYNAMIC INFRASTRUCTURE INJECTION ───
                 # This explicitly commands the services/collector-tradfi/main.py WebSocket 
@@ -61,7 +68,7 @@ class RadarAgent(SentinelAgent):
                 return {
                     "event_type": "dynamic_allocation",
                     "ticker": ticker,
-                    "agent_rationale": decision.get("rationale"),
+                    "agent_rationale": decision.rationale,
                     "z_score_trigger": z_score
                 }
         except Exception as e:

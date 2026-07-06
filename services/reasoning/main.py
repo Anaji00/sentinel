@@ -209,7 +209,7 @@ async def _tracker_loop(tracker: ScenarioTracker):
     while True:
         await asyncio.sleep(1800)
         try:
-            await asyncio.to_thread(tracker.check_all)
+            await tracker.check_all()
         except Exception as e:
             logger.error(f"Scenario Tracker error: {e}")
  
@@ -222,7 +222,7 @@ async def main():
     redis_client    = await get_redis()
     context_builder = ContextBuilder()
     generator       = ScenarioGenerator(db) 
-    tracker         = ScenarioTracker()
+    tracker         = ScenarioTracker(db)
     library         = PatternLibrary()
  
     tracker_task = asyncio.create_task(_tracker_loop(tracker))

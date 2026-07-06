@@ -179,7 +179,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
         while True:
             await asyncio.sleep(60)
             try:
-                aggregator.flush()
+                await aggregator.flush()
             except Exception as e:
                 logger.error(f"FATAL: TradFi Aggregator flush crashed: {e}", exc_info=True)
     while True:
@@ -219,6 +219,9 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                 finally:
                     sync_task.cancel()
                     flush_task.cancel()
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info("Finnhub disconnected (%s). Reconnecting in 5s...", e)
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error("Finnhub error: %s. Reconnecting...", e, exc_info=True)
             await asyncio.sleep(5)

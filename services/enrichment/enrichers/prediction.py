@@ -100,7 +100,7 @@ class PredictionEnricher:
             return None
         
         # BRAIN CHECK: Await the AnomalyScorer
-        anomaly_dict = await self.scorer.score_event("prediction_market_trade", [notional_usd, delta, price, 0, 0])
+        anomaly_dict = await self.scorer.score_event("prediction_market_trade", ticker, [notional_usd, delta, price, 0, 0])
         anomaly_score = anomaly_dict.get("score", 0.0)
 
         # GATEKEEPER: Drop normal volume variance.

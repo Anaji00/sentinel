@@ -31,12 +31,12 @@ CONFIRM_THRESHOLD = 80  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 15     # Confidence % below which we deny a scenario
 
 class ScenarioTracker:
-    def __init__(self):
-        self._db = get_timescale()
+    def __init__(self, db):
+        self._db = db
         self._library = PatternLibrary()
 
-    def check_all(self):
-        active = self._fetch_active_scenarios()
+    async def check_all(self):
+        active = await self._fetch_active_scenarios()
         if not active:
             return
         
@@ -47,14 +47,15 @@ class ScenarioTracker:
             # fails (e.g., due to bad JSON or a weird DB edge case), it doesn't 
             # crash the entire tracker and stop the other scenarios from being checked.
             try:
-                self._check_scenario(scenario)
+                await self._check_scenario(scenario)
             except Exception as e:
                 logger.error(f"Error checking scenario {scenario.scenario_id}: {e}")
                 
-    def _check_scenario(self, scenario: Dict):
+    async def _check_scenario(self, scenario: Dict):
         scenario_id = str(scenario["scenario_id"])
         hypotheses  = scenario.get("hypotheses") or []
-        confidence  = int(scenario.get("confidence_overall") or 50)
+        original_confidence = int(scenario.get("confidence_overall") or 50)
+        confidence = original_confidence
  
         # Collect all watch and deny signals across hypotheses
         watch_signals = []
@@ -64,41 +65,41 @@ class ScenarioTracker:
             watch_signals.extend(h.get("watch_signals") or [])
             deny_signals.extend(h.get("deny_signals") or [])
         
-        watch_hits = self._match_signals(watch_signals)
-        deny_hits  = self._match_signals(deny_signals)
-
-        new_confidence = confidence
         # FIXED: Typo 'statud_change' changed to 'status_change'. 
         # Before, if watch_hits was false but deny_hits was true, it would throw an UnboundLocalError.
         status_change = None
         notes = []
 
-        if watch_hits:
+        if watch_signals:
             # CRITICAL THINKING: Bounded adjustments.
             # We limit the "bump" to a maximum of 30 points regardless of how many 
             # watch signals hit. This prevents a single noisy event from artificially 
             # skyrocketing our confidence to 100% instantly.
-            bump = min(15 * len(watch_hits), 30)  # Cap max bump to prevent overconfidence
-            new_confidence = min(100, confidence + bump) # Increase confidence by 15% per watch hit, up to 30%
-            notes.append(f"Watch signals hit: {watch_hits[:3]}")
-            if new_confidence >= CONFIRM_THRESHOLD:
-                status_change = ScenarioStatus.CONFIRMED
+            watch_hits = await self._match_signals(watch_signals)
+            if watch_hits:
+                bump = min(15 * len(watch_hits), 30)  # Cap max bump to prevent overconfidence
+                confidence = min(100, confidence + bump) # Increase confidence by 15% per watch hit, up to 30%
+                notes.append(f"Watch signals hit: {watch_hits[:3]}")
+                if confidence >= CONFIRM_THRESHOLD:
+                    status_change = ScenarioStatus.CONFIRMED
 
-        if deny_hits:
+        if deny_signals:
             # CRITICAL THINKING: Asymmetric penalization.
             # Notice the drop maxes out at 40, while the bump maxes out at 30. 
             # In intelligence, disproving evidence is often weighted slightly heavier 
             # than confirming evidence to avoid confirmation bias.
-            drop = min(20 * len(deny_hits), 40) # Cap max drop to prevent over-pessimism
-            new_confidence = max(0, new_confidence - drop) # Decrease confidence by 20% per deny hit, up to 40%
-            notes.append(f"Deny signals hit: {deny_hits[:3]}") 
-            if new_confidence <= DENY_THRESHOLD:
-                status_change = ScenarioStatus.DENIED
+            deny_hits = await self._match_signals(deny_signals)
+            if deny_hits:
+                drop = min(20 * len(deny_hits), 40) # Cap max drop to prevent over-pessimism
+                confidence = max(0, confidence - drop) # Decrease confidence by 20% per deny hit, up to 40%
+                notes.append(f"Deny signals hit: {deny_hits[:3]}") 
+                if confidence <= DENY_THRESHOLD:
+                    status_change = ScenarioStatus.DENIED
 
-        if new_confidence != confidence or status_change:
-            self._update_scenario(
+        if confidence != original_confidence or status_change:
+            await self._update_scenario(
                 scenario_id, 
-                new_confidence, 
+                confidence, 
                 status_change, 
                 "; ".join(notes)
             )
@@ -115,7 +116,7 @@ class ScenarioTracker:
                     "; ".join(notes),
                 ) # FIXED: Added missing closing parenthesis
 
-    def _match_signals(self, signals: List[str]) -> List[str]:
+    async def _match_signals(self, signals: List[str]) -> List[str]:
         """
         Check if any signals have appeared in recent events.
         Simple keyword match on headlines and named_entities.
@@ -140,21 +141,21 @@ class ScenarioTracker:
                 # ARCHITECTURAL FIX: Native Postgres Array overlap operator (&&)
                 # Replaced expensive unnest() scans with optimized index-friendly arrays.
                 # Passed the keywords as a native tuple to leverage psycopg2 array adaptation.
-                rows = self._db.query("""
+                rows = await self._db.query("""
                     SELECT 1 FROM events
-                    WHERE occurred_at > %s
+                    WHERE occurred_at > $1
                       AND (
-                        headline ILIKE ANY(%s)
-                        OR tags && %s::varchar[]
-                        OR named_entities && %s::varchar[]
+                        headline ILIKE ANY($2)
+                        OR tags && $3::varchar[]
+                        OR named_entities && $4::varchar[]
                       )
                     LIMIT 1
-                """, (
+                """, 
                     cutoff, 
                     [f"%{k}%" for k in keywords], # ILIKE ANY mapping
                     keywords,                     # tags && array
                     keywords                      # named_entities && array
-                ))
+                )
                 
                 if rows: 
                     matched.append(signal) 
@@ -163,9 +164,9 @@ class ScenarioTracker:
  
         return matched
     
-    def _fetch_active_scenarios(self) -> List[Dict]:
+    async def _fetch_active_scenarios(self) -> List[Dict]:
         try:
-            return self._db.query("""
+            return await self._db.query("""
                 SELECT scenario_id, headline, status, confidence_overall,
                        hypotheses, created_at, updated_at
                 FROM scenarios
@@ -178,7 +179,7 @@ class ScenarioTracker:
             logger.error(f"fetch_active_scenarios failed: {e}")
             return []
  
-    def _update_scenario(
+    async def _update_scenario(
         self,
         scenario_id:    str,
         new_confidence: int,
@@ -191,38 +192,38 @@ class ScenarioTracker:
         # an AI decided to upgrade or downgrade a scenario's likelihood.
         try:
             if new_status:
-                self._db.execute("""
+                await self._db.execute("""
                     UPDATE scenarios
-                    SET confidence_overall = %s,
-                        status            = %s,
+                    SET confidence_overall = $1,
+                        status            = $2,
                         updated_at        = NOW(),
-                        confidence_history = confidence_history || %s::jsonb
-                    WHERE scenario_id = %s
-                """, (
+                        confidence_history = confidence_history || $3::jsonb
+                    WHERE scenario_id = $4
+                """, 
                     new_confidence,
                     new_status.value,
                     f'[{{"ts":"{datetime.now(timezone.utc).isoformat()}",'
                     f'"confidence":{new_confidence},"notes":"{notes}"}}]',
                     scenario_id,
-                ))
+                )
             else:
-                self._db.execute("""
+                await self._db.execute("""
                     UPDATE scenarios
-                    SET confidence_overall = %s,
+                    SET confidence_overall = $1,
                         status            = CASE
-                            WHEN status = 'hypothesis' AND %s >= 60 THEN 'developing'
+                            WHEN status = 'hypothesis' AND $2 >= 60 THEN 'developing'
                             ELSE status
                         END,
                         updated_at        = NOW(),
-                        confidence_history = confidence_history || %s::jsonb
-                    WHERE scenario_id = %s
-                """, (
+                        confidence_history = confidence_history || $3::jsonb
+                    WHERE scenario_id = $4
+                """, 
                     new_confidence,
                     new_confidence,
                     f'[{{"ts":"{datetime.now(timezone.utc).isoformat()}",'
                     f'"confidence":{new_confidence},"notes":"{notes}"}}]',
                     scenario_id,
-                ))
+                )
         except Exception as e:
             logger.error(f"update_scenario failed ({scenario_id}): {e}")
             

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import signal
 import aiohttp
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from services.agents.ontology_master import OntologyMasterAgent
 from services.agents.macro_cointegration_engine import MacroAssetCointegrationEngine
 from services.agents.supervisor import GraphSupervisor
 from services.agents.macro_strategist import MacroStrategistAgent
+from services.agents.rule_agent import RuleSynthesizerAgent
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # New topics added by the agent swarm (add to shared/kafka/__init__.py Topics class)
 TOPIC_ENRICHED_EVENTS    = "enriched.events"
@@ -227,6 +229,14 @@ async def main():
         shared_infra=shared_infra,
     )
 
+    rule_synthesizer_agent = build_agent(
+        RuleSynthesizerAgent,
+        agent_name="rule_synthesizer",
+        input_topics=["agents.intel.briefs"],
+        group_id="agent-rule-synthesizer",
+        shared_infra=shared_infra,
+    )
+
     agents_by_name = {
         "news_intel":      news_agent,
         "quant_researcher": quant_agent,
@@ -235,6 +245,7 @@ async def main():
         "macro_cointegration_engine": macro_cointegration_agent,
         "graph_supervisor": supervisor_agent,
         "macro_strategist": macro_strategist_agent,
+        "rule_synthesizer": rule_synthesizer_agent,
     }
 
     logger.info(f"Agents built: {list(agents_by_name.keys())}")
@@ -250,6 +261,7 @@ async def main():
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
         asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
         asyncio.create_task(macro_strategist_agent.run(), name="macro_strategist"),
+        asyncio.create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",
@@ -264,8 +276,16 @@ async def main():
     logger.info(f"Agent: {macro_cointegration_agent.name} | Topics: {len(macro_cointegration_agent.input_topics)}")
     logger.info(f"Agent: {supervisor_agent.name} | Topics: {len(supervisor_agent.input_topics)}")
     logger.info(f"Agent: {macro_strategist_agent.name} | Topics: {len(macro_strategist_agent.input_topics)}")
+    logger.info(f"Agent: {rule_synthesizer_agent.name} | Topics: {len(rule_synthesizer_agent.input_topics)}")
 
     try:
+        def handle_sigterm(signum, frame):
+            logger.info("SIGTERM received — initiating graceful shutdown")
+            raise KeyboardInterrupt()
+            
+        if sys.platform != "win32":
+            signal.signal(signal.SIGTERM, handle_sigterm)
+
         # Wait for all tasks. If any crashes, re-raise to restart via supervisor.
         # CONCEPT: asyncio.gather runs multiple asynchronous operations concurrently.
         # If any of these agent tasks raise an unhandled exception, gather will immediately throw it here.

@@ -166,9 +166,11 @@ class SentinelProducer:
             logger.error(f"Failed to send message to Kafka: {e}")
             raise
     async def close(self):
-        if self._started:
+        try:
             await self._p.stop()
-            self._started = False
+        except Exception:
+            pass
+        self._started = False
 
 # ── CONSUMER ────────────────────────────────────────────────────────────────
 
@@ -241,9 +243,11 @@ class SentinelConsumer:
         await self._c.commit()
         
     async def close(self):
-        if self._started:
+        try:
             await self._c.stop()
-            self._started = False
+        except Exception:
+            pass
+        self._started = False
 
     
 

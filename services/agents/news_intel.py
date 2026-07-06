@@ -151,7 +151,7 @@ class NewsIntelAgent(SentinelAgent):
             new_keywords = [p.get("ticker") for p in discovery.get("peer_tickers", [])]
             if new_keywords:
                 # Dynamically start looking for news about the newly discovered correlated peers
-                await asyncio.to_thread(self.redis.raw.sadd, "sentinel:news:keywords", *new_keywords)
+                await self.redis.raw.sadd("sentinel:news:keywords", *new_keywords)
                 logger.info(f"Swarm Sync: News Agent now tracking quant peers {new_keywords}")
             return None
 
@@ -172,10 +172,10 @@ class NewsIntelAgent(SentinelAgent):
         # into a short, consistent 16-character string using SHA-256. This makes it
         # a perfect, fast lookup key for Redis to check if we've seen this news before.
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-        if self.is_recently_processed(url_hash, window_seconds=3600):
+        if await self.is_recently_processed(url_hash, window_seconds=3600):
             logger.debug(f"Skipping duplicate: {url_hash}")
             return None
-        self.mark_processed(url_hash)
+        await self.mark_processed(url_hash)
 
         title   = message.get("headline", "")
         summary = message.get("summary", "")
@@ -233,7 +233,7 @@ class NewsIntelAgent(SentinelAgent):
             await self._extract_and_write_graph(title, summary, brief)
 
         # ── STEP 4: Auto-inject financial instruments into watched list ─────────
-        self._update_instrument_watchlist(brief, title.lower())
+        await self._update_instrument_watchlist(brief, title.lower())
 
         # ── STEP 5: Push new news keywords to the collector's filter ──────────
         self._update_news_keywords(brief)
@@ -254,25 +254,18 @@ class NewsIntelAgent(SentinelAgent):
         Fetch recent high-anomaly events from TimescaleDB for context injection.
         Runs in executor to avoid blocking the event loop.
         """
-        import asyncio
-        loop = asyncio.get_running_loop()
-        # UNDER THE HOOD: Thread Executors for Blocking IO
         # psycopg2 (PostgreSQL) is a "blocking" library—it stops the entire Python program
-        # while waiting for the database. By using `run_in_executor`, we push this database
-        # query into a background thread, allowing our async agent to keep processing other things!
+        # while waiting for the database. But we use asyncpg now, so we can await it directly.
         try:
-            rows = await loop.run_in_executor(
-                None,
-                lambda: self.db.query("""
-                    SELECT type, headline, anomaly_score, region, tags, occurred_at
-                    FROM events
-                    WHERE occurred_at > NOW() - INTERVAL '4 hours'
-                      AND anomaly_score >= 0.5
-                      AND type != 'headline'
-                    ORDER BY anomaly_score DESC
-                    LIMIT 10
-                """),
-            )
+            rows = await self.db.query("""
+                SELECT type, headline, anomaly_score, region, tags, occurred_at
+                FROM events
+                WHERE occurred_at > NOW() - INTERVAL '4 hours'
+                  AND anomaly_score >= 0.5
+                  AND type != 'headline'
+                ORDER BY anomaly_score DESC
+                LIMIT 10
+            """)
             return [
                 {
                     "type":    r.get("type"),
@@ -334,18 +327,13 @@ class NewsIntelAgent(SentinelAgent):
 
     async def _fetch_existing_graph_entities(self, brief: IntelBrief) -> List[str]:
         """Pull existing entity names from Neo4j for the entities in this brief."""
-        import asyncio
-        loop = asyncio.get_running_loop()
         names = [e.name for e in brief.entities[:5]]
         if not names:
             return []
         try:
-            rows = await loop.run_in_executor(
-                None,
-                lambda: self.neo4j.query(
-                    "MATCH (n) WHERE n.name IN $names RETURN n.name as name, labels(n) as types LIMIT 20",
-                    {"names": names},
-                ),
+            rows = await self.neo4j.query(
+                "MATCH (n) WHERE n.name IN $names RETURN n.name as name, labels(n) as types LIMIT 20",
+                {"names": names},
             )
             return [f"{r['name']} ({r['types']})" for r in rows]
         except Exception:
@@ -375,7 +363,7 @@ class NewsIntelAgent(SentinelAgent):
         }
         await self._producer.send("sentinel.ontology.proposals", proposal, key=triple.subject)
 
-    def _update_instrument_watchlist(self, brief: IntelBrief, title_lower: str):
+    async def _update_instrument_watchlist(self, brief: IntelBrief, title_lower: str):
         """
         Auto-add geopolitically relevant financial instruments to the Finnhub watchlist.
         This closes the loop: a news event about Iran triggers USO/BNO tracking immediately.
@@ -394,7 +382,8 @@ class NewsIntelAgent(SentinelAgent):
                 # enforce uniqueness. If "USO" is already being watched, this command
                 # does nothing safely. `*instruments_to_add` unpacks the python set 
                 # so they are all added in one single network command.
-                self.redis.sadd("sentinel:watched:equities", *instruments_to_add)
+                import time
+                await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in instruments_to_add})
                 logger.info(
                     f"  Watchlist: added {instruments_to_add} from intel trigger"
                 )

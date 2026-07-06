@@ -228,8 +228,7 @@ class OntologyMasterAgent(SentinelAgent):
         record = classification.model_dump() if hasattr(classification, "model_dump") else classification.dict()
         record["classified_at"] = datetime.now(timezone.utc).isoformat()
 
-        # PATCH: Wrap all synchronous Redis calls inside a single transaction pipeline
-        def _sync_redis_write():
+        try:
             pipeline = self.redis.raw.pipeline()
             for concept in classification.macro_concepts:
                 pipeline.sadd(f"sentinel:ontology:{concept}", normalized)
@@ -241,11 +240,8 @@ class OntologyMasterAgent(SentinelAgent):
                 ex=STALENESS_DAYS * 86400
             )
             pipeline.sadd(f"sentinel:ontology:domain:{classification.primary_domain}", normalized)
-            pipeline.execute()
-
-        try:
-            # Execute the blocking pipeline on the ThreadPoolExecutor
-            await loop.run_in_executor(None, _sync_redis_write)
+            await pipeline.execute()
+            
             logger.info(
                 f"  Ontology: '{normalized}' → "
                 f"{classification.primary_domain} / {classification.macro_concepts}"
@@ -258,14 +254,10 @@ class OntologyMasterAgent(SentinelAgent):
         loop = asyncio.get_running_loop()
         key = f"sentinel:ontology:freq:{entity_name.lower()}"
         
-        # PATCH: Execute the counter increment on the background thread
-        def _sync_incr():
-            count = self.redis.raw.incr(key)
-            self.redis.raw.expire(key, 7 * 86400)  # Reset weekly
-            return count
-            
         try:
-            return await loop.run_in_executor(None, _sync_incr)
+            count = await self.redis.raw.incr(key)
+            await self.redis.raw.expire(key, 7 * 86400)  # Reset weekly
+            return count
         except Exception:
             return 0
 
@@ -340,7 +332,8 @@ class OntologyMasterAgent(SentinelAgent):
                     if t.isalpha() and t.isupper() and 1 <= len(t) <= 5
                 ]
                 if valid_tickers:
-                    pipeline.sadd("sentinel:watched:equities", *valid_tickers)
+                    import time
+                    pipeline.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in valid_tickers})
                     
 
             # Maritime watchlist flag
