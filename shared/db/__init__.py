@@ -119,7 +119,6 @@ class TimescaleClient:
     async def query(self, sql: str, *params) -> List[Dict]:
         # READ OPERATION (SELECT)
         # 1. Borrow a connection from the pool. This blocks if all 20 connections are busy.
-        conn = self._pool.getconn()
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]

@@ -107,15 +107,10 @@ class SoftCorrelator:
         if not self._enabled: return None
         
         async with self._embed_semaphore:
-            # 1. LLM Semantic Translation
-            prompt = f"Convert this telemetry into a single, highly descriptive natural language sentence for semantic embedding. Focus on the geopolitical or financial action/connections. Telemetry: Type={event.type.value}, Entity={event.primary_entity.name}, Region={event.region}, Flags={event.primary_entity.flags}, Headline={event.headline}"
-            
-            try:
-                # Fast inference call. We don't need JSON schema here, just raw text.
-                natural_language_desc = await self._llm.infer_raw(system_prompt="You are a data translator.", user_prompt=prompt)
-            except Exception as e:
-                logger.error(f"LLM Translation failed: {e}")
-                return None
+            # 1. Native Semantic Formatting
+            # LLM translation is too slow for real-time telemetry streaming and causes Ollama timeouts.
+            # We use native f-strings to build a dense semantic representation for the embedding model.
+            natural_language_desc = f"Event of type {event.type.value} involving {event.primary_entity.name} in {event.region}. Flags: {event.primary_entity.flags}. Description: {event.headline}"
             loop = asyncio.get_running_loop()
             try:
                 embedding_array = await loop.run_in_executor(None, self._model.encode, natural_language_desc)
