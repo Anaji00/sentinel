@@ -24,6 +24,8 @@ class DynamicRule(BaseModel):
     correlations: List[CorrelationDef]
     alert_tier: str
     tags: List[str]
+    version: int = 1
+    expires_at: int = Field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()) + 7 * 86400)
 
 class RuleList(BaseModel):
     rules: List[DynamicRule]
@@ -41,8 +43,28 @@ class RuleSynthesizerAgent(SentinelAgent):
 
     async def handle(self, message: dict) -> None:
         """
-        Triggered when the Macro Strategist publishes a new brief.
+        Triggered when the Macro Strategist publishes a new brief OR when a rule fails.
         """
+        # Feedback Loop: Handle Rule Failure
+        if message.get("type") == "rule_failure":
+            rule_id = message.get("rule_id")
+            if rule_id:
+                self.logger.warning(f"Deprecating failed rule: {rule_id}")
+                # Remove from ZSET
+                await self.redis.raw.zrem("sentinel:correlation:dynamic_rules", rule_id)
+                # Publish tombstone for hot-reloading
+                tombstone = json.dumps({"rule_id": rule_id, "deprecated": True})
+                await self.redis.raw.publish("sentinel:correlation:rule_updates", tombstone)
+                # Emit Telemetry
+                if self._producer:
+                    await self._producer.send("agents.telemetry", {
+                        "agent": "rule_synthesizer",
+                        "event": "rule_deprecated",
+                        "rule_id": rule_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+            return
+
         brief = message.get("brief", {})
         summary = brief.get("headline_summary", "")
         entities = brief.get("entities", [])
@@ -78,8 +100,25 @@ class RuleSynthesizerAgent(SentinelAgent):
             if hasattr(response, "rules") and response.rules:
                 for rule in response.rules:
                     rule_json = json.dumps(rule.model_dump())
-                    await self.redis.raw.sadd("sentinel:correlation:dynamic_rules", rule_json)
+                    
+                    # Store in ZSET with score = expires_at
+                    # Redis-py async client ZADD syntax: zadd(name, mapping={value: score})
+                    await self.redis.raw.zadd("sentinel:correlation:dynamic_rules", mapping={rule_json: rule.expires_at})
+                    
+                    # Publish for hot-reloading
+                    await self.redis.raw.publish("sentinel:correlation:rule_updates", rule_json)
+                    
                     self.logger.info(f"Deployed new synthetic rule: {rule.rule_id} - {rule.rule_name}")
+                    
+                    # Emit Telemetry
+                    if self._producer:
+                        await self._producer.send("agents.telemetry", {
+                            "agent": "rule_synthesizer",
+                            "event": "rule_created",
+                            "rule_id": rule.rule_id,
+                            "rule_name": rule.rule_name,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        })
                     
         except Exception as e:
             self.logger.error(f"Failed to synthesize rules: {e}")
