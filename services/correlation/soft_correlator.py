@@ -23,6 +23,7 @@ import asyncio
 import uuid
 import os
 import logging
+from functools import partial
 # Import datetime for handling time-based logic.
 from datetime import datetime, timezone
 # Import type hints for better code readability and IDE support.
@@ -113,7 +114,8 @@ class SoftCorrelator:
             natural_language_desc = f"Event of type {event.type.value} involving {event.primary_entity.name} in {event.region}. Flags: {event.primary_entity.flags}. Description: {event.headline}"
             loop = asyncio.get_running_loop()
             try:
-                embedding_array = await loop.run_in_executor(None, self._model.encode, natural_language_desc)
+                encode_func = partial(self._model.encode, show_progress_bar=False)
+                embedding_array = await loop.run_in_executor(None, encode_func, natural_language_desc)
                 return embedding_array.tolist()  
             except Exception as e:
                 logger.error(f"Error embedding event {event.event_id}: {e}")
@@ -126,7 +128,7 @@ class SoftCorrelator:
             return
         try:
             # 'Upsert' means "Insert if it doesn't exist, Update if it does".
-            self._client.upsert( 
+            await self._client.upsert( 
                 collection_name="sentinel_events",
                 points = [{
                     # Qdrant requires IDs to be specific formats (like a 16-byte UUID or integer).

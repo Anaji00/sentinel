@@ -28,10 +28,10 @@ logger = logging.getLogger("reasoning.patterns")
 SIMILARITY_TAGS_THRESHOLD = 2   # minimum tag overlap to consider a pattern similar
 
 class PatternLibrary:
-    def __init__(self):
-        self._db = get_timescale()
+    def __init__(self, db_client):
+        self._db = db_client
     
-    def find_similar(
+    async def find_similar(
         self, 
         tags: List[str],
         rule_id: str,
@@ -52,7 +52,7 @@ class PatternLibrary:
             # match. If a "Vessel Dark" rule fired today, we want "Vessel Dark" examples from the past.
             
             # First try to find patterns with the same rule_id
-            rows = self._db.query("""
+            rows = await self._db.query("""
                 SELECT
                     s.scenario_id,
                     s.headline,
@@ -65,10 +65,10 @@ class PatternLibrary:
                 FROM scenarios s
                 JOIN correlations c ON s.correlation_id = c.correlation_id
                 WHERE s.status IN ('confirmed', 'denied')
-                  AND c.rule_id = %s
+                  AND c.rule_id = $1
                 ORDER BY s.created_at DESC
-                LIMIT %s
-            """, (rule_id, limit))
+                LIMIT $2
+            """, rule_id, limit)
             
             remaining_limit = limit - len(rows)
             if remaining_limit > 0:
@@ -77,7 +77,7 @@ class PatternLibrary:
                 # Even if the rule_id is different, an event sharing tags like ['strait_of_hormuz', 'tanker'] 
                 # might provide the LLM with valuable geopolitical precedent.
                 
-                extra = self._db.query("""
+                extra = await self._db.query("""
                     SELECT
                         s.scenario_id,
                         s.headline,
@@ -92,12 +92,12 @@ class PatternLibrary:
                     WHERE s.status IN ('confirmed', 'denied')
                       -- BEGINNER EXPLANATION: The '&&' operator in PostgreSQL means "Array Overlap".
                       -- It checks if the array of tags in the database shares ANY elements 
-                      -- with the array of tags we passed in (%s). It's much faster than looping in Python!
-                      AND c.tags && %s::text[]
-                      AND c.rule_id != %s
+                      -- with the array of tags we passed in ($1). It's much faster than looping in Python!
+                      AND c.tags && $1::text[]
+                      AND c.rule_id != $2
                     ORDER BY s.created_at DESC
-                    LIMIT %s
-                """, (list(tags), rule_id, int(remaining_limit)))
+                    LIMIT $3
+                """, list(tags), rule_id, int(remaining_limit))
                 rows += extra
             return [self._format_pattern(r) for r in rows]
         
@@ -105,7 +105,7 @@ class PatternLibrary:
             logger.error(f"Error fetching similar patterns: {e}")
             return []
         
-    def record_outcome(
+    async def record_outcome(
         self,
         scenario_id: str,
         status: str,
@@ -119,12 +119,12 @@ class PatternLibrary:
         try: 
             # This query updates scenarios based on the scenario_id, which is the primary key. 
             # It's a single-row update, so it's efficient and won't cause performance issues.
-            self._db.execute("""
+            await self._db.execute("""
                 UPDATE scenarios
-                SET status     = %s,
+                SET status     = $1,
                     updated_at = NOW()
-                WHERE scenario_id = %s::uuid
-            """, (status, scenario_id))
+                WHERE scenario_id = $2::uuid
+            """, status, scenario_id)
 
             if notes:
                 # We log the notes for debugging and auditability. 

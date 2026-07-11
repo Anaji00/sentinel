@@ -29,6 +29,7 @@ _NEG = {
     # Financial, Crypto & Legal
     "fraud", "scam", "indictment", "lawsuit", "selloff", "penalty", "rugpull",
     "delisted", "slump", "tanked", "underperform", "capitulation", "dilution", "deflation",
+    "dive", "dives", "sink", "sinks", "tumble", "tumbles", "plummet", "plummets", "drop", "drops", "fall", "falls"
 }
 _POS = {
     "deal", "agreement", "peace", "growth", "recovery", "cooperation",
@@ -40,6 +41,7 @@ _POS = {
     "resolved", "rescued", "funding", "adoption", "approved", "breakthrough",
     # Stocks & Markets
     "outperform", "buyback", "uptrend", "skyrocket", "lucrative", "undervalued", "bull-run", "soar",
+    "jump", "jumps", "beat", "beats", "climb", "climbs", "gain", "gains", "record"
 }
 
 FINANCIAL_KEYWORDS = {
@@ -91,10 +93,14 @@ FINANCIAL_KEYWORDS = {
     "zero-day": "cyber", "cisa": "cyber", "apt": "cyber", "malware": "cyber"
 }
 
+import re
+
 def _sentiment(text: str) -> float:
-    t     = text.lower()
-    neg   = sum(1 for w in _NEG if w in t)
-    pos   = sum(1 for w in _POS if w in t)
+    t = text.lower()
+    # Use regex word boundaries so "war" doesn't match "software"
+    words = set(re.findall(r'\b\w+\b', t))
+    neg = sum(1 for w in _NEG if w in words)
+    pos = sum(1 for w in _POS if w in words)
     total = neg + pos
     if total == 0:
         return 0.0

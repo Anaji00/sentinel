@@ -50,8 +50,8 @@ class RuleSynthesizerAgent(SentinelAgent):
             rule_id = message.get("rule_id")
             if rule_id:
                 self.logger.warning(f"Deprecating failed rule: {rule_id}")
-                # Remove from ZSET
-                await self.redis.raw.zrem("sentinel:correlation:dynamic_rules", rule_id)
+                # Remove from HASH
+                await self.redis.raw.hdel("sentinel:correlation:dynamic_rules", rule_id)
                 # Publish tombstone for hot-reloading
                 tombstone = json.dumps({"rule_id": rule_id, "deprecated": True})
                 await self.redis.raw.publish("sentinel:correlation:rule_updates", tombstone)
@@ -65,20 +65,35 @@ class RuleSynthesizerAgent(SentinelAgent):
                     })
             return
 
-        brief = message.get("brief", {})
-        summary = brief.get("headline_summary", "")
-        entities = brief.get("entities", [])
+        summary = ""
+        entities = []
+        prompt_context = ""
         
+        # Branch based on message structure
+        if "scenario_id" in message:
+            summary = message.get("headline", "")
+            hypotheses = message.get("hypotheses", [])
+            sig = message.get("significance", "")
+            self.logger.info(f"Synthesizing rules based on Reasoning Scenario: {summary}")
+            prompt_context = f"A new AI-generated reasoning scenario has been generated:\nSUMMARY: {summary}\nSIGNIFICANCE: {sig}\nHYPOTHESES: {hypotheses}"
+        elif message.get("type") == "quant_discovery":
+            summary = message.get("description", "")
+            entities = message.get("correlated_assets", [])
+            self.logger.info(f"Synthesizing rules based on Quant Discovery: {summary}")
+            prompt_context = f"A new quantitative peer relationship has been discovered:\nSUMMARY: {summary}\nASSETS: {entities}"
+        else:
+            brief = message.get("brief", {})
+            summary = brief.get("headline_summary", "")
+            entities = brief.get("entities", [])
+            self.logger.info(f"Synthesizing rules based on macro shift: {summary}")
+            prompt_context = f"A new macro intelligence brief has been issued:\nSUMMARY: {summary}\nENTITIES: {entities}"
+
         if not summary:
             return
 
-        self.logger.info(f"Synthesizing rules based on macro shift: {summary}")
-        
         prompt = f"""
         You are the Sentinel Rule Engine Architect.
-        A new macro intelligence brief has been issued:
-        SUMMARY: {summary}
-        ENTITIES: {entities}
+        {prompt_context}
         
         Synthesize up to 3 JSON correlation rules that the correlation engine should actively look for.
         For example, if tensions are rising in the Red Sea, create a rule that triggers on "vessel_dark" 
@@ -101,9 +116,8 @@ class RuleSynthesizerAgent(SentinelAgent):
                 for rule in response.rules:
                     rule_json = json.dumps(rule.model_dump())
                     
-                    # Store in ZSET with score = expires_at
-                    # Redis-py async client ZADD syntax: zadd(name, mapping={value: score})
-                    await self.redis.raw.zadd("sentinel:correlation:dynamic_rules", mapping={rule_json: rule.expires_at})
+                    # Store in HASH mapping rule_id -> rule_json
+                    await self.redis.raw.hset("sentinel:correlation:dynamic_rules", rule.rule_id, rule_json)
                     
                     # Publish for hot-reloading
                     await self.redis.raw.publish("sentinel:correlation:rule_updates", rule_json)

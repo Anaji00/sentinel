@@ -24,6 +24,7 @@ from .base import SentinelAgent, SchemaViolationError
 from .prompts import (
     QUANT_PEER_DISCOVERY_SYSTEM,
     QUANT_PEER_DISCOVERY_USER_TEMPLATE,
+    QUANT_CRYPTO_BASKET_USER_TEMPLATE,
 )
 
 logger = logging.getLogger("agent.quant_researcher")
@@ -98,12 +99,42 @@ class QuantResearcherAgent(SentinelAgent):
         # BEST PRACTICE: Guard Clauses / Early Returns
         # Check for invalid conditions first and exit immediately (`return None`). 
         # This keeps the main logic clean (less indentation) and saves expensive LLM compute.
+        
+        # ── SCENARIO HANDLING ───────────────────────────────────────────────
+        if "scenario_id" in message:
+            return await self._handle_scenario(message)
+            
         event_type = message.get("type", "")
         if event_type not in TRIGGER_EVENT_TYPES:
             return None
 
         anomaly_score = float(message.get("anomaly_score", 0))
         if anomaly_score < RESEARCH_TRIGGER_SCORE:
+            return None
+            
+        tags = message.get("tags", [])
+        is_crypto_candle = event_type == "market_anomaly" and "crypto" in tags
+        
+        if is_crypto_candle:
+            # Buffer the crypto candle
+            await self.redis.raw.rpush("sentinel:quant:crypto_candle_buffer", json.dumps(message))
+            
+            # Check if 5 minutes have passed since last batch
+            last_run = await self.redis.raw.get("sentinel:quant:crypto_last_process_time")
+            now = time.time()
+            if not last_run or (now - float(last_run)) > 300:
+                await self.redis.raw.set("sentinel:quant:crypto_last_process_time", str(now))
+                
+                # Fetch all buffered candles and clear buffer atomically using a transaction pipeline
+                async with self.redis.raw.pipeline(transaction=True) as pipe:
+                    pipe.lrange("sentinel:quant:crypto_candle_buffer", 0, -1)
+                    pipe.delete("sentinel:quant:crypto_candle_buffer")
+                    results = await pipe.execute()
+                
+                raw_candles = results[0]
+                if raw_candles:
+                    candles = [json.loads(c) for c in raw_candles]
+                    return await self._handle_crypto_basket(candles)
             return None
         
         ticker = self._extract_ticker(message)
@@ -202,6 +233,62 @@ class QuantResearcherAgent(SentinelAgent):
             "created_at":       datetime.now(timezone.utc).isoformat(),
         }
 
+    async def _handle_crypto_basket(self, candles: List[Dict]) -> Optional[Dict]:
+        """Analyzes a basket of anomalous crypto candles collected over 5 minutes."""
+        if not candles:
+            return None
+            
+        logger.info(f"Researching Crypto Basket with {len(candles)} anomalies")
+        
+        basket_summary = []
+        for c in candles:
+            ticker = self._extract_ticker(c)
+            score = float(c.get("anomaly_score", 0))
+            direction = self._extract_direction(c)
+            notional = self._extract_notional(c)
+            basket_summary.append(f"- {ticker}: {direction} (Anomaly {score:.2f}, Vol: ${notional/1e6:.1f}M)")
+            
+        summary_str = "\n".join(basket_summary)
+        
+        news_context, current_watchlist = await asyncio.gather(
+            self._fetch_news_context("crypto"),
+            self._get_current_watchlist()
+        )
+        
+        user_prompt = QUANT_CRYPTO_BASKET_USER_TEMPLATE.format(
+            basket_summary=summary_str,
+            news_context=json.dumps(news_context[:8], default=str),
+            current_watchlist=json.dumps(list(current_watchlist)[:20]),
+        )
+        
+        try:
+            discovery: PeerDiscovery = await self._execute_with_telemetry(
+                message=candles[0], # telemetry tracing
+                system_prompt=QUANT_PEER_DISCOVERY_SYSTEM,
+                user_prompt=user_prompt,
+                schema=PeerDiscovery,
+                temperature=0.2,
+            )
+        except SchemaViolationError as e:
+            logger.error(f"Crypto basket peer discovery failed: {e}")
+            return None
+            
+        added = await self._inject_peers("CRYPTO_BASKET", discovery, "crypto_basket")
+        asyncio.create_task(self._write_graph_relationships("CRYPTO_BASKET", discovery))
+        
+        discovery_dict = discovery.model_dump() if hasattr(discovery, "model_dump") else discovery.dict()
+
+        return {
+            "agent":            self.name,
+            "agent_run_id":     f"quant_crypto_basket_{int(time.time())}",
+            "trigger": {
+                "basket_size": len(candles),
+            },
+            "discovery":         discovery_dict,
+            "peers_added_to_watchlist": added,
+            "created_at":       datetime.now(timezone.utc).isoformat(),
+        }
+
     # ── CONTEXT FETCHERS ──────────────────────────────────────────────────────
 
     async def _fetch_news_context(self, ticker: str) -> List[Dict]:
@@ -213,12 +300,12 @@ class QuantResearcherAgent(SentinelAgent):
                   AND occurred_at > NOW() - INTERVAL '2 hours'
                   AND anomaly_score >= 0.3
                   AND (
-                    LOWER(headline) LIKE %s
-                    OR %s = ANY(tags)
+                    LOWER(headline) LIKE $1
+                    OR $2 = ANY(tags)
                   )
                 ORDER BY anomaly_score DESC
                 LIMIT 8
-            """, (f"%{ticker.lower()}%", ticker.lower()))
+            """, f"%{ticker.lower()}%", ticker.lower())
             return [{"headline": r["headline"], "score": r["anomaly_score"]} for r in rows]
         except Exception as e:
             logger.debug(f"News context fetch error: {e}")

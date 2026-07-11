@@ -21,9 +21,9 @@ logger = logging.getLogger("correlation.store")
 
 class EventStore:
 
-    def __init__(self, redis_client):
+    def __init__(self, redis_client, db_client):
         self._redis = redis_client
-        self._db = get_timescale()
+        self._db = db_client
         self.cache_key = "events:recent_window"
         self.window_seconds = 48 * 3600
           

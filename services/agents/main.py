@@ -175,7 +175,7 @@ async def main():
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_RAW_RADAR],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_RAW_RADAR, Topics.SCENARIOS_GENERATED],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
     )
@@ -183,7 +183,7 @@ async def main():
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, TOPIC_ONTOLOGY_UPDATES],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, TOPIC_ONTOLOGY_UPDATES, Topics.SCENARIOS_GENERATED],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
     )
@@ -208,7 +208,7 @@ async def main():
     macro_cointegration_agent = build_agent(
         MacroAssetCointegrationEngine,
         agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, "raw.macro"],
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"],
         group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
     )
@@ -232,7 +232,7 @@ async def main():
     rule_synthesizer_agent = build_agent(
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
-        input_topics=["agents.intel.briefs"],
+        input_topics=["agents.intel.briefs", Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, TOPIC_QUANT_DISCOVERIES],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
     )

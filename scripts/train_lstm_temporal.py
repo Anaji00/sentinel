@@ -15,6 +15,9 @@ if not IN_DOCKER:
     if os.getenv("POSTGRES_HOST") == "timescaledb":
         os.environ["POSTGRES_HOST"] = "localhost"
         
+    if os.getenv("DATABASE_URL") and "timescaledb:5432" in os.getenv("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = os.getenv("DATABASE_URL").replace("timescaledb:5432", "localhost:5432")
+
     if os.getenv("REDIS_URL") and "redis://" in os.getenv("REDIS_URL"):
         os.environ["REDIS_URL"] = os.getenv("REDIS_URL").replace("redis:6379", "localhost:6379")
 

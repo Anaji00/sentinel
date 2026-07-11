@@ -367,29 +367,19 @@ Return the JSON assessment now:"""
         if not event_ids:
             return []
         try:
-            loop = asyncio.get_running_loop()
             # BEST PRACTICE: Parameterized SQL Queries
-            # We generate a string of `%s, %s, %s` equal to the number of IDs.
-            # This prevents SQL Injection attacks and safely passes lists to PostgreSQL.
-            placeholders = ",".join(["%s"] * len(event_ids))
-            
-            # CONCEPT: run_in_executor
-            # Database queries are "blocking" (they stop the Python program while waiting
-            # for the database to reply). We run this in a background thread executor 
-            # so our main async event loop can keep running other tasks simultaneously.
-            rows = await loop.run_in_executor(
-                None,
-                lambda: self.db.query(
-                    f"""
-                    SELECT type, source, tags, anomaly_score, occurred_at,
-                           financial_data, vessel_data, flight_data,
-                           crypto_data, cyber_data, headline
-                    FROM events
-                    WHERE event_id IN ({placeholders})
-                    ORDER BY anomaly_score DESC
-                    """,
-                    tuple(event_ids),
-                ),
+            # We use `$1` with the `ANY` operator in PostgreSQL to safely pass arrays
+            # natively via asyncpg, avoiding SQL injection and complex string formatting.
+            rows = await self.db.query(
+                """
+                SELECT type, source, tags, anomaly_score, occurred_at,
+                       financial_data, vessel_data, flight_data,
+                       crypto_data, cyber_data, headline
+                FROM events
+                WHERE event_id = ANY($1::uuid[])
+                ORDER BY anomaly_score DESC
+                """,
+                event_ids
             )
             
             # Datetime objects break `json.dumps()` later on.

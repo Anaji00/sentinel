@@ -77,10 +77,10 @@ class AlertManager:
     # THE 'INIT' METHOD (Constructor)
     # This sets up our AlertManager object with all the tools it needs to do its job.
     # 'self' means "store this tool/data on the object so other methods can use it later."
-    def __init__(self, session: aiohttp.ClientSession):
+    def __init__(self, session: aiohttp.ClientSession, db_client, redis_client):
         self._session = session
-        self._db      = get_timescale()
-        self._redis   = get_redis()
+        self._db      = db_client
+        self._redis   = redis_client
         self._sent = []
 
     async def handle(self, cluster: CorrelationCluster):
@@ -92,7 +92,7 @@ class AlertManager:
         # 2. DEDUPLICATION: Check the Redis cache to see if we already alerted about 
         # this exact anomaly ID in the last 6 hours. If so, skip it to prevent spam.
         dedup_key = f"alert:sent:{cluster.correlation_id}"
-        if self._redis.exists(dedup_key):
+        if await self._redis.raw.exists(dedup_key):
             logger.debug(f"deduplication skip: {cluster.correlation_id}")
             return
         
@@ -113,12 +113,7 @@ class AlertManager:
         # the database to grab the AI-generated context/scenario to attach to the alert.
         scenario = None
         if cluster.alert_tier == AlertTier.INTELLIGENCE:
-            loop = asyncio.get_running_loop()
-            scenario = await loop.run_in_executor(
-                None,
-                self._fetch_scenario,
-                cluster.correlation_id,
-            )
+            scenario = await self._fetch_scenario(cluster.correlation_id)
         
         # 5. FORMATTING: Use our functional formatters to build the message text.
         tg_text = format_correlation(cluster)
@@ -131,7 +126,7 @@ class AlertManager:
         if WEBHOOK_URL:
             await self._send_webhook(format_generic(cluster))
 
-        self._redis.set(dedup_key, "1", ttl=DEDUP_TTL)
+        await self._redis.raw.set(dedup_key, "1", ex=DEDUP_TTL)
         self._sent.append(now)
 
         logger.info(
@@ -180,20 +175,17 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Webhook error: {e}")
 
-    def _fetch_scenario(self, correlation_id: str):
+    async def _fetch_scenario(self, correlation_id: str):
         # BEST PRACTICE TIP: 
-        # This method fetches scenario data synchronously from the PostgreSQL database.
-        # Because this is called from inside an `async def handle`, it might slightly block 
-        # the event loop during heavy loads. In the future, wrapping this in 
-        # `asyncio.get_event_loop().run_in_executor()` would make it fully non-blocking!
+        # This method fetches scenario data asynchronously from the PostgreSQL database.
         try:
             from shared.models import Scenario, ScenarioStatus
-            row = self._db.query_one("""
+            row = await self._db.query_one("""
                 SELECT * FROM scenarios
-                WHERE correlation_id = %s
+                WHERE correlation_id = $1
                   AND status NOT IN ('denied','expired')
                 ORDER BY created_at DESC LIMIT 1
-            """, (correlation_id,))
+            """, correlation_id)
             if not row:
                 return None
             return Scenario(
@@ -231,11 +223,14 @@ async def main():
     await consumer.start()
     connector = aiohttp.TCPConnector(limit=5)
 
+    db_client = await get_timescale()
+    redis_client = await get_redis()
+    
     # We use aiohttp.ClientSession so we can reuse the same network connection 
     # for all our Telegram/Webhook requests. This is much faster than opening a new 
     # connection every single time.
     async with aiohttp.ClientSession(connector=connector) as session:
-        manager = AlertManager(session)
+        manager = AlertManager(session, db_client, redis_client)
         try:
             # --- THE OUTER LOOP ---
             # The 'while True' loop keeps the program running forever.

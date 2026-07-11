@@ -24,17 +24,19 @@ from shared.models import CorrelationCluster
 logger = logging.getLogger("reasoning.context")
 
 class ContextBuilder:
-    def __init__(self):
-        # Timescale is a thread-pooled sync client
-        self._db = get_timescale()
+    def __init__(self, db_client):
+        # Timescale is a thread-pooled async client now
+        self._db = db_client
 
     # [CRITICAL FIX]: Converted core build orchestrator to async
     async def build(self, cluster: CorrelationCluster) -> Dict[str, Any]:
         """Build the full context dict for a correlation cluster."""
-        # Wrap blocking Psycopg2 PostgreSQL calls in thread executors
-        trigger = await asyncio.to_thread(self._fetch_event, cluster.trigger_event_id)
-        supporting = await asyncio.to_thread(self._fetch_events, cluster.supporting_event_ids)
-        recent_news = await asyncio.to_thread(self._fetch_recent_news, cluster)
+        # Await async database calls directly
+        trigger, supporting, recent_news = await asyncio.gather(
+            self._fetch_event(cluster.trigger_event_id),
+            self._fetch_events(cluster.supporting_event_ids),
+            self._fetch_recent_news(cluster)
+        )
         
         # Natively await asynchronous Redis/Neo4j graph calls
         entity_graph = await self._fetch_entity_graph(cluster.entity_ids)
@@ -60,41 +62,41 @@ class ContextBuilder:
             "agent_intel_briefs": agent_intel,
         }
 
-    def _fetch_event(self, event_id: str) -> Optional[Dict]:
+    async def _fetch_event(self, event_id: str) -> Optional[Dict]:
         try:
             # CRITICAL THINKING: Parameterized Queries.
-            # We use `%s` instead of f-strings for SQL queries to prevent SQL Injection 
+            # We use `$1` for asyncpg parameterized SQL queries to prevent SQL Injection 
             # attacks, even though these event_ids are generated internally.
-            row = self._db.query_one(
+            row = await self._db.query_one(
                 """SELECT event_id, type, occurred_at, source, region,
                           primary_entity_id, primary_entity_name, primary_entity_flags,
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
-                   FROM events WHERE event_id = %s""",
-                (event_id,)
+                   FROM events WHERE event_id = $1""",
+                event_id
             )
             return self._serialize_row(row) if row else None
         except Exception as e:
             logger.error(f"Error fetching event {event_id}: {e}")
             return None
         
-    def _fetch_events(self, event_ids: List[str]) -> List[Dict]:
+    async def _fetch_events(self, event_ids: List[str]) -> List[Dict]:
         if not event_ids:
             return []
         try:
             # CRITICAL THINKING: Batch DB Queries.
             # Instead of looping and running `_fetch_event` N times (which creates an N+1 
-            # query bottleneck), we use PostgreSQL's `ANY(%s)` array operator. 
+            # query bottleneck), we use PostgreSQL's `ANY($1)` array operator. 
             # This fetches all supporting events in a single, fast database round-trip.
-            rows = self._db.query(
+            rows = await self._db.query(
                 """SELECT event_id, type, occurred_at, source, region,
                           primary_entity_id, primary_entity_name, primary_entity_flags,
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id = ANY(%s::uuid[])
+                   WHERE event_id = ANY($1::uuid[])
                    ORDER BY occurred_at DESC""",
-                (event_ids,)
+                event_ids
             )
             return [self._serialize_row(r) for r in rows]
         except Exception as e:
@@ -141,21 +143,21 @@ class ContextBuilder:
                 logger.debug(f"Error fetching graph for entity {entity_id}: {e}")
         return results
     
-    def _fetch_recent_news(self, cluster: CorrelationCluster) -> List[str]:
+    async def _fetch_recent_news(self, cluster: CorrelationCluster) -> List[str]:
         """Fetch recent high-anomaly headlines related to the correlation."""
         try:
             # CRITICAL THINKING: Time-Bounding.
             # We only want news from 72 hours *before* the cluster was detected. 
             # Anything older is likely irrelevant noise to the LLM.
             cutoff = cluster.detected_at - timedelta(hours=72)
-            rows = self._db.query(
+            rows = await self._db.query(
                 """SELECT headline FROM events
                    WHERE type = 'headline'
                      AND anomaly_score >= 0.4
-                     AND occurred_at BETWEEN %s AND %s
+                     AND occurred_at BETWEEN $1 AND $2
                    ORDER BY anomaly_score DESC
                    LIMIT 10""",
-                (cutoff, cluster.detected_at)
+                cutoff, cluster.detected_at
             )
             return [r["headline"] for r in rows if r.get("headline")]
         except Exception as e:

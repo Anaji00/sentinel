@@ -145,6 +145,10 @@ class NewsIntelAgent(SentinelAgent):
         # Instead of wrapping the whole function in a giant `if` statement, we check
         # conditions and immediately `return None` to save compute power and indentation.
         agent_source = message.get("agent")
+        
+        # ── SCENARIO HANDLING ───────────────────────────────────────────────
+        if "scenario_id" in message:
+            return await self._handle_scenario(message)
 
         if agent_source == "quant_researcher":
             discovery = message.get("discovery", {})
@@ -213,7 +217,7 @@ class NewsIntelAgent(SentinelAgent):
                 temperature=0.1,
             )
         except SchemaViolationError as e:
-            logger.error(f"Intel brief extraction failed: {e}")
+            logger.error(f"Failed to publish intel brief: {e}", exc_info=True)
             return None
 
         for entity in brief.entities:
@@ -236,7 +240,7 @@ class NewsIntelAgent(SentinelAgent):
         await self._update_instrument_watchlist(brief, title.lower())
 
         # ── STEP 5: Push new news keywords to the collector's filter ──────────
-        self._update_news_keywords(brief)
+        await self._update_news_keywords(brief)
 
         # ── STEP 6: Emit structured Intel Brief ───────────────────────────────
         return {
@@ -390,7 +394,7 @@ class NewsIntelAgent(SentinelAgent):
             except Exception as e:
                 logger.warning(f"Watchlist update failed: {e}")
 
-    def _update_news_keywords(self, brief: IntelBrief):
+    async def _update_news_keywords(self, brief: IntelBrief):
         """
         Add new entity names and monitoring keywords to the news collector's
         Redis keyword set so future articles get detected faster.
@@ -405,6 +409,58 @@ class NewsIntelAgent(SentinelAgent):
 
         if keywords:
             try:
-                self.redis.sadd("sentinel:news:keywords", *keywords)
+                await self.redis.raw.sadd("sentinel:news:keywords", *keywords)
             except Exception as e:
                 logger.debug(f"Keyword update error: {e}")
+
+    async def _handle_scenario(self, scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        headline = scenario.get("headline", "")
+        if not headline:
+            return None
+            
+        logger.info(f"NewsIntelAgent digesting AI-generated scenario: {headline}")
+        
+        user_prompt = f"""
+        A high-level reasoning scenario has emerged from the Sentinel Reasoning Engine:
+        HEADLINE: {headline}
+        SIGNIFICANCE: {scenario.get('significance', '')}
+        HYPOTHESES: {scenario.get('hypotheses', [])}
+        
+        Write a concise, high-priority intelligence brief summarizing this scenario.
+        Focus on geopolitical risk, global supply chain impact, and narrative momentum.
+        """
+        
+        try:
+            brief = await self._execute_with_telemetry(
+                message=scenario,
+                system_prompt=NEWS_INTEL_SYSTEM,
+                user_prompt=user_prompt,
+                schema=IntelBrief,
+                temperature=0.3
+            )
+            
+            if brief:
+                import time
+                run_id = f"scenario_intel_{int(time.time())}"
+                payload = {
+                    "agent": self.name,
+                    "agent_run_id": run_id,
+                    "event_id": scenario.get("scenario_id"),
+                    "brief": brief.model_dump(),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                
+                if self._producer:
+                    await self._producer.send(
+                        self.output_topic,
+                        payload,
+                        key=scenario.get("scenario_id")
+                    )
+                    logger.info(f"Published Scenario Intel Brief: {brief.headline_summary}")
+                    
+                return payload
+                
+        except Exception as e:
+            logger.error(f"Failed to synthesize brief for scenario: {e}")
+            
+        return None

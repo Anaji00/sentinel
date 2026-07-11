@@ -221,14 +221,14 @@ async def main_stream():
     producer = SentinelProducer()
     dlq = SentinelProducer()
     consumer = SentinelConsumer(
-        topics=[Topics.RAW_TRADFI, "raw.macro"], 
+        topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"], 
         group_id="macro-cointegration-group",
         auto_offset_reset="latest"
     )
 
     engine = MacroAssetCointegrationEngine(
         agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, "raw.macro"],
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"],
         redis_client=redis_client,
         db_client=db_client,
         neo4j_client=neo4j_client,

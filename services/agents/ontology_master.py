@@ -199,19 +199,17 @@ class OntologyMasterAgent(SentinelAgent):
         if hasattr(self._soft_correlator, "register_concept"):
             await self._soft_correlator.register_concept(concept_name, embedding)
         
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: self.redis.raw.sadd("sentinel:ontology:active_concepts", concept_name))
+        await self.redis.raw.sadd("sentinel:ontology:active_concepts", concept_name)
     
     async def _get_active_concepts(self) -> List[str]:
         """Fetches the dynamically expanding list of taxonomy concepts."""
-        loop = asyncio.get_running_loop()
-        raw_concepts = await loop.run_in_executor(None, lambda: self.redis.raw.smembers("sentinel:ontology:active_concepts"))
+        raw_concepts = await self.redis.raw.smembers("sentinel:ontology:active_concepts")
         concepts = [c.decode("utf-8") if isinstance(c, bytes) else c for c in (raw_concepts or [])]
         
         # If Redis is completely empty, initialize with bootstrap list
         if not concepts:
             concepts = BOOTSTRAP_CONCEPTS
-            await loop.run_in_executor(None, lambda: self.redis.raw.sadd("sentinel:ontology:active_concepts", *BOOTSTRAP_CONCEPTS))
+            await self.redis.raw.sadd("sentinel:ontology:active_concepts", *BOOTSTRAP_CONCEPTS)
         return concepts
     # ── REDIS ONTOLOGY WRITES ─────────────────────────────────────────────────
 
@@ -319,10 +317,7 @@ class OntologyMasterAgent(SentinelAgent):
         """
         Based on the classification, trigger relevant data collection non-blockingly.
         """
-        loop = asyncio.get_running_loop()
-
-        # PATCH: Use a background thread with a Redis Pipeline to add watchlist entries
-        def _sync_trigger():
+        try:
             pipeline = self.redis.raw.pipeline()
             
             # Equity watchlist
@@ -360,16 +355,13 @@ class OntologyMasterAgent(SentinelAgent):
                     f"  🔴 Sanctions risk flagged: {classification.entity_name}"
                 )
                 
-            pipeline.execute()
+            await pipeline.execute()
             logger.info(
                 f"  Watchlist triggers: equities={classification.should_watch_equities} "
                 f"maritime={classification.should_watch_maritime} "
                 f"news_keywords={classification.should_watch_news_keywords} "
                 f"sanctions={classification.sanctions_risk}"
             )
-
-        try:
-            await loop.run_in_executor(None, _sync_trigger)
         except Exception as e:
             logger.warning(f"Watchlist trigger error: {e}")
 
@@ -403,7 +395,6 @@ class OntologyMasterAgent(SentinelAgent):
             logger.error(f"Maintenance cycle error: {e}", exc_info=True)
 
     async def _prune_stale_entities(self) -> int:
-        loop = asyncio.get_running_loop()
         total_pruned = 0
 
         active_concepts = await self._get_active_concepts()
@@ -411,20 +402,18 @@ class OntologyMasterAgent(SentinelAgent):
         for concept in active_concepts:
             set_key = f"sentinel:ontology:{concept}"
             try:
-                members_raw = await loop.run_in_executor(None, lambda k=set_key: self.redis.raw.smembers(k))
+                members_raw = await self.redis.raw.smembers(set_key)
                 if not members_raw: continue
                 members = [m.decode("utf-8") if isinstance(m, bytes) else m for m in members_raw]
                 to_remove = []
 
                 for entity in members:
-                    still_alive = await loop.run_in_executor(
-                        None, lambda e=entity: self.redis.raw.exists(f"sentinel:ontology:entity:{e}")
-                    )
+                    still_alive = await self.redis.raw.exists(f"sentinel:ontology:entity:{entity}")
                     if not still_alive:
                         to_remove.append(entity)
                 
                 if to_remove:
-                    await loop.run_in_executor(None, lambda k=set_key, r=to_remove: self.redis.raw.srem(k, *r))
+                    await self.redis.raw.srem(set_key, *to_remove)
                     total_pruned += len(to_remove)
             except Exception as e:
                 logger.debug(f"Prune error for concept '{concept}': {e}")
@@ -432,20 +421,14 @@ class OntologyMasterAgent(SentinelAgent):
         return total_pruned
 
     async def _promote_high_frequency_entities(self) -> int:
-        loop = asyncio.get_running_loop()
         promoted = 0
 
         try:
-            freq_keys = await loop.run_in_executor(
-                None,
-                lambda: list(self.redis.raw.scan_iter("sentinel:ontology:freq:*")),
-            )
+            freq_keys = [k async for k in self.redis.raw.scan_iter("sentinel:ontology:freq:*")]
 
             for key in freq_keys[:100]:
                 try:
-                    raw_count = await loop.run_in_executor(
-                        None, lambda k=key: self.redis.raw.get(k)
-                    )
+                    raw_count = await self.redis.raw.get(key)
                     count = int(raw_count) if raw_count else 0
                     if count < PROMOTE_FREQUENCY:
                         continue
@@ -453,10 +436,7 @@ class OntologyMasterAgent(SentinelAgent):
                     key_str   = key.decode("utf-8") if isinstance(key, bytes) else key
                     entity    = key_str.replace("sentinel:ontology:freq:", "")
 
-                    classified = await loop.run_in_executor(
-                        None,
-                        lambda e=entity: self.redis.exists(f"sentinel:ontology:entity:{e}"),
-                    )
+                    classified = await self.redis.raw.exists(f"sentinel:ontology:entity:{entity}")
                     if not classified:
                         self.enqueue_task(
                             "classify_entity",
@@ -473,19 +453,14 @@ class OntologyMasterAgent(SentinelAgent):
         return promoted
 
     async def _rebuild_cooccurrence_index(self):
-        loop = asyncio.get_running_loop()
         cooccurrence: Dict[str, float] = {}
         active_concepts = await self._get_active_concepts()
         try:
             for concept in active_concepts:
-                members_raw = await loop.run_in_executor(
-                    None, lambda c=concept: self.redis.raw.smembers(f"sentinel:ontology:{c}")
-                )
+                members_raw = await self.redis.raw.smembers(f"sentinel:ontology:{concept}")
                 members = [m.decode("utf-8") if isinstance(m, bytes) else m for m in (members_raw or [])]
                 for entity in members[:20]:
-                    record_raw = await loop.run_in_executor(
-                        None, lambda e=entity: self.redis.raw.get(f"sentinel:ontology:entity:{e}")
-                    )
+                    record_raw = await self.redis.raw.get(f"sentinel:ontology:entity:{entity}")
                     if not record_raw: continue
                     try:
                         record = json.loads(record_raw)
@@ -508,7 +483,7 @@ class OntologyMasterAgent(SentinelAgent):
                 for pair, score in top_pairs:
                     pipeline.zadd("sentinel:ontology:cooccurrence", {pair: score})
                 pipeline.expire("sentinel:ontology:cooccurrence", 7 * 86400)
-                await loop.run_in_executor(None, pipeline.execute)
+                await pipeline.execute()
                 logger.debug(f"  Co-occurrence index: {len(top_pairs)} pairs written")
 
         except Exception as e:

@@ -252,6 +252,8 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: sentinel-qdrant
+    environment:
+      QDRANT__LOG_LEVEL: WARN
     ports:
       - "6333:6333"
     volumes:

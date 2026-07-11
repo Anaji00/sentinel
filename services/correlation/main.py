@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 import inspect
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ── 1. ENVIRONMENT & PATH SETUP ───────────────────────────────────────────────
 from dotenv import load_dotenv
 
@@ -25,16 +27,57 @@ from shared.utils.ollama import OllamaClient
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
-from shared.db import get_redis
+from shared.db import get_redis, get_timescale
 from services.correlation.event_store import EventStore
 
-async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore, redis_client) -> list[CorrelationCluster]:
+_dynamic_rules_cache = {}
+
+async def _listen_for_rule_updates(redis_client):
+    """Subscribes to Redis Pub/Sub to instantly hot-reload dynamic rules into memory."""
+    global _dynamic_rules_cache
+    
+    # Initial load from HASH
+    try:
+        rules_raw = await redis_client.raw.hvals("sentinel:correlation:dynamic_rules")
+        for raw in rules_raw:
+            rule = json.loads(raw)
+            if "rule_id" in rule:
+                _dynamic_rules_cache[rule["rule_id"]] = rule
+        logger.info(f"Loaded {len(_dynamic_rules_cache)} dynamic rules into memory.")
+    except Exception as e:
+        logger.error(f"Failed to load dynamic rules on startup: {e}")
+
+    # Listen for hot-reloads
+    pubsub = redis_client.raw.pubsub()
+    await pubsub.subscribe("sentinel:correlation:rule_updates")
+    logger.info("Listening for dynamic rule hot-reloads...")
+    
+    async for message in pubsub.listen():
+        if message["type"] == "message":
+            try:
+                rule_data = json.loads(message["data"])
+                rule_id = rule_data.get("rule_id")
+                
+                if rule_data.get("deprecated"):
+                    if rule_id in _dynamic_rules_cache:
+                        del _dynamic_rules_cache[rule_id]
+                        logger.info(f"Hot-reloaded: Deprecated rule {rule_id}")
+                else:
+                    _dynamic_rules_cache[rule_id] = rule_data
+                    logger.info(f"Hot-reloaded: Updated rule {rule_id}")
+            except Exception as e:
+                logger.error(f"PubSub message parse error: {e}")
+
+async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> list[CorrelationCluster]:
     clusters = []
     try:
-        rules_raw = await redis_client.raw.smembers("sentinel:correlation:dynamic_rules")
-        for raw in rules_raw:
+        import time
+        now = int(time.time())
+        for rule in list(_dynamic_rules_cache.values()):
             try:
-                rule = json.loads(raw)
+                # TTL Check (natively evict expired rules from cache)
+                if rule.get("expires_at", 0) < now:
+                    continue
                 if event.type.value != rule.get("trigger_event_type"):
                     continue
                     
@@ -73,7 +116,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore, redi
             except Exception as e:
                 logger.error(f"Failed to parse or eval dynamic rule: {e}")
     except Exception as e:
-        logger.error(f"Failed to fetch dynamic rules: {e}")
+        logger.error(f"Failed to evaluate dynamic rules: {e}")
     return clusters
 
 
@@ -93,7 +136,12 @@ async def main():
 
     # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
     redis_client = await get_redis()
-    store    = EventStore(redis_client)
+    db_client = await get_timescale()
+    
+    # ── 2b. START HOT-RELOADER ────────────────────────────────────────────────
+    asyncio.create_task(_listen_for_rule_updates(redis_client))
+    
+    store    = EventStore(redis_client, db_client)
     producer = SentinelProducer()
     consumer = SentinelConsumer(
         topics=[Topics.ENRICHED_EVENTS],
@@ -135,6 +183,61 @@ async def main():
     total_received = 0
     last_logged_received = 0
 
+    async def _process_correlation_event(event: NormalizedEvent):
+        nonlocal corr_fired, processed
+        try:
+            # ── 3.5. DYNAMIC AI RULES ────────────────────────────
+            dynamic_clusters = await evaluate_dynamic_rules(event, store)
+            for c in dynamic_clusters:
+                await store.save_correlation(c)
+                await producer.send(
+                    Topics.CORRELATIONS,
+                    c.model_dump(),
+                    key=c.correlation_id,
+                )
+                corr_fired += 1
+                logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
+            
+            # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
+            embedding = await soft_correlator.embed_event(event)
+            if embedding:
+                await soft_correlator.store(event, embedding)
+                
+                # Cross-domain similarity search
+                similar_events = await soft_correlator.find_similar(
+                    embedding, 
+                    exclude_domain=event.type.value.split("_")[0]
+                )
+                
+                if similar_events:
+                    logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
+                    
+                    # Synthesize the CorrelationCluster dynamically
+                    supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
+                    
+                    cluster = CorrelationCluster(
+                        rule_id="SEMANTIC_001",
+                        rule_name="Cross-Domain Semantic Convergence",
+                        alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
+                        trigger_event_id=event.event_id,
+                        supporting_event_ids=supporting_ids,
+                        entity_ids=[event.primary_entity.id] if event.primary_entity else [],
+                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events. Anomalous semantic convergence detected.",
+                        tags=["semantic_match", "cross_domain", "ai_cluster"]
+                    )
+                    
+                    await store.save_correlation(cluster)
+                    await producer.send(
+                        Topics.CORRELATIONS,
+                        cluster.model_dump(),
+                        key=cluster.correlation_id,
+                    )
+                    corr_fired += 1
+                    
+        except Exception as e:
+            logger.error(f"Failed to process correlation for event {event.event_id}: {e}", exc_info=True)
+            return
+
     try:
         # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
         while True:
@@ -150,88 +253,45 @@ async def main():
                     if total_received - last_logged_received >= 250:
                         logger.info(f"Received batch of {len(messages)} events to correlate on partition {tp.topic}:{tp.partition}")
                         last_logged_received = total_received
+                    
+                    # Deduplication Strategy: Group by entity_id + event_type, taking the highest anomaly score
+                    all_events = []
+                    representative_events = {}
+                    
                     for message in messages:
                         try:
                             # Parse the JSON payload safely before feeding to Pydantic
                             raw_data = json.loads(message.value.decode('utf-8'))
                             event = NormalizedEvent(**raw_data)
-
-                            try:
-                                await store.add_event(event)
-
-                                # ── 3.5. DYNAMIC AI RULES ────────────────────────────
-                                dynamic_clusters = await evaluate_dynamic_rules(event, store, redis_client)
-                                for c in dynamic_clusters:
-                                    await store.save_correlation(c)
-                                    await producer.send(
-                                        Topics.CORRELATIONS,
-                                        c.model_dump(),
-                                        key=c.correlation_id,
-                                    )
-                                    corr_fired += 1
-                                    logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
-                                
-                                # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
-                                embedding = await soft_correlator.embed_event(event)
-                                if embedding:
-                                    await soft_correlator.store(event, embedding)
+                            all_events.append(event)
+                            
+                            dedup_key = f"{event.primary_entity.id if event.primary_entity else 'unknown'}_{event.type.value}"
+                            if dedup_key not in representative_events:
+                                representative_events[dedup_key] = event
+                            else:
+                                if event.anomaly_score > representative_events[dedup_key].anomaly_score:
+                                    representative_events[dedup_key] = event
                                     
-                                    # Cross-domain similarity search
-                                    similar_events = await soft_correlator.find_similar(
-                                        embedding, 
-                                        exclude_domain=event.type.value.split("_")[0]
-                                    )
-                                    
-                                    if similar_events:
-                                        logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
-                                        
-                                        # Synthesize the CorrelationCluster dynamically
-                                        supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
-                                        
-                                        cluster = CorrelationCluster(
-                                            rule_id="SEMANTIC_001",
-                                            rule_name="Cross-Domain Semantic Convergence",
-                                            alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
-                                            trigger_event_id=event.event_id,
-                                            supporting_event_ids=supporting_ids,
-                                            entity_ids=[event.primary_entity.id] if event.primary_entity else [],
-                                            description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events. Anomalous semantic convergence detected.",
-                                            tags=["semantic_match", "cross_domain", "ai_cluster"]
-                                        )
-                                        
-                                        await store.save_correlation(cluster)
-                                        await producer.send(
-                                            Topics.CORRELATIONS,
-                                            cluster.model_dump(),
-                                            key=cluster.correlation_id,
-                                        )
-                                        corr_fired += 1
-                                        
-                            except Exception as e:
-                                logger.error(f"Failed to store or embed event {event.event_id}: {e}", exc_info=True)
-                                continue
-
-                            processed += 1
-                            if processed % 100 == 0:
-                                logger.info(f"Heartbeat | Processed {processed} events | Total correlations: {corr_fired}")
-
                         except Exception as e:
                             errors += 1
-                            logger.error(f"Correlation loop error: {e}", exc_info=True)
+                            logger.error(f"Failed to parse event: {e}")
                             try:
-                                # CORRECTED: Await the DLQ network call
-                                await producer.send(
-                                    Topics.DLQ,
-                                    data={
-                                        "topic": Topics.ENRICHED_EVENTS,
-                                        "error": str(e),
-                                        "raw": str(message.value)
-                                    }
-                                )
-                            except Exception as dlq_e:
-                                logger.error(f"FATAL: Failed to route to DLQ: {dlq_e}. Shutting down.")
-                
+                                await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": str(e), "raw": str(message.value)})
+                            except Exception:
+                                pass
                     
+                    if all_events:
+                        # 1. Store ALL events concurrently
+                        await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)
+                        
+                        # 2. Correlate ONLY representative events concurrently
+                        tasks = [_process_correlation_event(e) for e in representative_events.values()]
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        processed += len(all_events)
+                        if processed % 100 < len(all_events): # Roughly logs every 100
+                            logger.info(f"Heartbeat | Processed {processed} events | Total correlations: {corr_fired}")
+                
                     # CORRECTED: Commit offsets after batch is fully processed to prevent infinite replay
                     await consumer.commit()
 

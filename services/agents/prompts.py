@@ -154,6 +154,19 @@ CURRENT SECTOR HOLDINGS IN OUR SYSTEM:
 Discover peer instruments and explain the causal chain:"""
 
 
+QUANT_CRYPTO_BASKET_USER_TEMPLATE = """Analyze this basket of anomalous crypto market events over the last 5 minutes and discover correlated instruments to monitor. Provide discoveries for BOTH the entire basket as a whole AND specific assets that moved the most.
+
+ANOMALOUS CRYPTO CANDLES:
+{basket_summary}
+
+RECENT NEWS CONTEXT (last 2 hours):
+{news_context}
+
+CURRENT SECTOR HOLDINGS IN OUR SYSTEM:
+{current_watchlist}
+
+Discover peer instruments and explain the causal chain for the overall market movement and individual top assets:"""
+
 # ── ONTOLOGY MASTER AGENT ─────────────────────────────────────────────────────
 
 ONTOLOGY_CATEGORIZE_SYSTEM = """You are SENTINEL-ONTOLOGY, the knowledge graph curator for a multi-domain intelligence platform. You maintain a real-time taxonomy of geopolitical, financial, and cyber entities.

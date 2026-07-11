@@ -146,7 +146,7 @@ class DynamicAnomalyScorer:
                     val = float(np.atleast_1d(raw_output)[0])
                     risk_score = max(0.0, 0.5 - val)
                 
-                logger.info(f"ONNX raw outputs for {entity_id}: preds_0={predictions[0]}, preds_1={predictions[1]}, risk_score={risk_score}")
+                logger.debug(f"ONNX raw outputs for {entity_id}: preds_0={predictions[0]}, preds_1={predictions[1]}, risk_score={risk_score}")
                 # ──────────────────────────────────────────
 
             else:

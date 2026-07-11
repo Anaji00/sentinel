@@ -45,14 +45,31 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
     async def update_subscriptions(ws, session):
         base_url = "https://gamma-api.polymarket.com/markets"
-       
+        events_url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20"
         
         while True:
             try:
+                # 1. Fetch manual slugs from Redis
                 raw_slugs = await redis_client.raw.smembers(redis_key)
-                watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else [
-                    "us-x-iran-permanent-peace-deal-by"
-                ]
+                watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else []
+                
+                # 2. Fetch dynamic active slugs from Polymarket
+                try:
+                    async with session.get(events_url, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            dynamic_slugs = [event.get("slug") for event in data if event.get("slug")]
+                            
+                            # Add dynamic slugs to Redis for visibility to other services
+                            if dynamic_slugs:
+                                await redis_client.raw.sadd(redis_key, *dynamic_slugs)
+                                watched_slugs.extend([s for s in dynamic_slugs if s not in watched_slugs])
+                except Exception as e:
+                    logger.error(f"Failed to fetch dynamic slugs from Polymarket: {e!r}")
+                
+                # Fallback if both Redis and API are empty
+                if not watched_slugs:
+                    watched_slugs = ["us-x-iran-permanent-peace-deal-by"]
                 
                 logger.info(f"Heartbeat | Polymarket sync. Tracked slugs ({len(watched_slugs)}): {watched_slugs}")
                 new_assets = []

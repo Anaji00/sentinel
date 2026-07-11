@@ -23,6 +23,7 @@ from typing import List, Dict, Optional
  
 from shared.db import get_timescale
 from shared.models import ScenarioStatus
+from shared.kafka import SentinelProducer, Topics
 from .pattern_library import PatternLibrary
  
 logger = logging.getLogger("reasoning.tracker")
@@ -31,9 +32,10 @@ CONFIRM_THRESHOLD = 80  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 15     # Confidence % below which we deny a scenario
 
 class ScenarioTracker:
-    def __init__(self, db):
+    def __init__(self, db, producer=None):
         self._db = db
-        self._library = PatternLibrary()
+        self._library = PatternLibrary(db)
+        self._producer = producer
 
     async def check_all(self):
         active = await self._fetch_active_scenarios()
@@ -110,11 +112,34 @@ class ScenarioTracker:
             )
  
             if status_change in (ScenarioStatus.CONFIRMED, ScenarioStatus.DENIED):
-                self._library.record_outcome(
+                await self._library.record_outcome(
                     scenario_id,
                     status_change.value,
                     "; ".join(notes),
                 ) # FIXED: Added missing closing parenthesis
+                
+            if status_change == ScenarioStatus.DENIED and self._producer:
+                try:
+                    # Fetch the rule_id that created this scenario's cluster
+                    rows = await self._db.query("""
+                        SELECT c.rule_id 
+                        FROM scenarios s
+                        JOIN correlation_clusters c ON s.correlation_id = c.correlation_id
+                        WHERE s.scenario_id = $1
+                    """, scenario_id)
+                    
+                    if rows and rows[0].get("rule_id"):
+                        rule_id = rows[0]["rule_id"]
+                        if rule_id.startswith("syn_") or rule_id.startswith("rule_"):
+                            await self._producer.send(Topics.RULES_FEEDBACK, {
+                                "type": "rule_failure",
+                                "rule_id": rule_id,
+                                "scenario_id": scenario_id,
+                                "reason": f"Scenario denied. {'; '.join(notes)}"
+                            })
+                            logger.info(f"Published rule_failure feedback for rule {rule_id}")
+                except Exception as e:
+                    logger.error(f"Failed to publish rule feedback: {e}")
 
     async def _match_signals(self, signals: List[str]) -> List[str]:
         """

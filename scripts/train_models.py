@@ -14,11 +14,14 @@ IN_DOCKER = os.path.exists('/.dockerenv')
 if not IN_DOCKER:
     if os.getenv("POSTGRES_HOST") == "timescaledb":
         os.environ["POSTGRES_HOST"] = "localhost"
+    if os.getenv("DATABASE_URL") and "timescaledb:5432" in os.getenv("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = os.getenv("DATABASE_URL").replace("timescaledb:5432", "localhost:5432")
     if os.getenv("REDIS_URL") and "redis://" in os.getenv("REDIS_URL"):
         os.environ["REDIS_URL"] = os.getenv("REDIS_URL").replace("redis:6379", "localhost:6379")
 # ────────────────────────────────────────────────────────────────────────────
 
 import logging
+import asyncio
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from skl2onnx import convert_sklearn
@@ -31,12 +34,12 @@ logger = logging.getLogger("ml.training")
 MODEL_DIR = "/app/models" if IN_DOCKER else str(ROOT / "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
+async def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
     """
     Fetches historical N-dimensional feature arrays from TimescaleDB.
     If no data is found, generates a synthetic baseline so the pipeline doesn't crash.
     """
-    db = get_timescale()
+    db = await get_timescale()
     logger.info(f"Fetching '{domain}' training data for the last {days} days...")
     
     event_types = "('vessel_position', 'bgp_hijack')" if domain == "spatial" else "('tradfi_trade', 'crypto_liquidation')"
@@ -57,7 +60,7 @@ def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
     """
     
     try:
-        rows = db.query(query)
+        rows = await db.query(query)
     except Exception as e:
         logger.warning(f"Database query failed: {e}")
         rows = []
@@ -69,9 +72,9 @@ def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
     logger.info(f"Successfully fetched {len(rows)} valid records from the database.")
     return np.array([row['ml_features'] for row in rows], dtype=np.float32)
     
-def train_and_export_onnx(domain: str):
+async def train_and_export_onnx(domain: str):
     logger.info(f"Training {domain} model...")
-    X_train = fetch_training_data(domain)
+    X_train = await fetch_training_data(domain)
     num_features = X_train.shape[1]
 
     contamination = 0.01 if domain == "spatial" else 0.05
@@ -98,7 +101,12 @@ def train_and_export_onnx(domain: str):
     logger.info(f"✅ ONNX model successfully saved to {model_path}")
     logger.info(f"📊 Training summary: Domain '{domain}' trained on {X_train.shape[0]} samples.")
 
-if __name__ == "__main__":
+async def main():
     logger.info("Starting ML model training pipeline...")
-    train_and_export_onnx("spatial")
-    train_and_export_onnx("temporal")
+    await train_and_export_onnx("spatial")
+    await train_and_export_onnx("temporal")
+
+if __name__ == "__main__":
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())

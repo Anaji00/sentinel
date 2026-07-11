@@ -71,7 +71,8 @@ async def apply_autonomous_feedback(scenario, redis_client):
     Parses Gemini output for crypto wallets. 
     (Equity tickers are now handled deterministically by the QuantResearcherAgent).
     """
-    wallets = set(re.findall(r'(0x[a-fA-F0-9]{40})', scenario.recommended_monitoring))
+    monitoring_text = str(scenario.recommended_monitoring)
+    wallets = set(re.findall(r'(0x[a-fA-F0-9]{40})', monitoring_text))
     for wallet in wallets:
         is_new = await redis_client.raw.sadd("sentinel:watched:wallets", wallet)
         if is_new:
@@ -87,7 +88,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
         logger.info("🧠 Synthesizing [%s] %s via Gemini...", cluster.alert_tier.name, cluster.rule_name)
 
         context = await context_builder.build(cluster)
-        patterns = library.find_similar(cluster.tags, cluster.rule_id)
+        patterns = await library.find_similar(cluster.tags, cluster.rule_id)
         scenario = await generator.generate(cluster, context, patterns)
         
         if scenario:
@@ -220,10 +221,12 @@ async def main():
  
     db              = await get_timescale()
     redis_client    = await get_redis()
-    context_builder = ContextBuilder()
+    context_builder = ContextBuilder(db)
     generator       = ScenarioGenerator(db) 
-    tracker         = ScenarioTracker(db)
-    library         = PatternLibrary()
+    tracker_producer = SentinelProducer()
+    await tracker_producer.start()
+    tracker         = ScenarioTracker(db, tracker_producer)
+    library         = PatternLibrary(db)
  
     tracker_task = asyncio.create_task(_tracker_loop(tracker))
     reasoning_task = asyncio.create_task(run_reasoning_loop(context_builder, generator, library, db, redis_client))
