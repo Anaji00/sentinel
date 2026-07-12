@@ -175,7 +175,7 @@ async def main():
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_RAW_RADAR, Topics.SCENARIOS_GENERATED],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
     )
@@ -183,7 +183,7 @@ async def main():
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, TOPIC_ONTOLOGY_UPDATES, Topics.SCENARIOS_GENERATED],
+        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, Topics.SCENARIOS_GENERATED],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
     )
@@ -191,7 +191,7 @@ async def main():
     ontology_agent = build_agent(
         OntologyMasterAgent,
         agent_name="ontology_master",
-        input_topics=[TOPIC_UNKNOWN_ENTITIES, TOPIC_ENRICHED_EVENTS],
+        input_topics=[TOPIC_UNKNOWN_ENTITIES],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
         soft_correlator=soft_correlator,
@@ -224,7 +224,7 @@ async def main():
     macro_strategist_agent = build_agent(
         MacroStrategistAgent,
         agent_name="macro_strategist",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, TOPIC_ONTOLOGY_UPDATES, TOPIC_UNKNOWN_ENTITIES],
+        input_topics=[Topics.SYSTEM_HEARTBEAT],
         group_id="agent-macro-strategist",
         shared_infra=shared_infra,
     )

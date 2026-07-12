@@ -68,6 +68,7 @@ class Topics:
     UNKNOWN_ENTITIES     = "agents.ontology.unknown_entities"  # Classification requests
     ONTOLOGY_PROPOSALS   = "sentinel.ontology.proposals"
     RULES_FEEDBACK       = "agents.rules.feedback"
+    SYSTEM_HEARTBEAT     = "sentinel.system.heartbeat"
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
     # into 'NormalizedEvent' so the database can understand it easily.

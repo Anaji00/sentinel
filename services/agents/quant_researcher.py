@@ -162,10 +162,12 @@ class QuantResearcherAgent(SentinelAgent):
         # ── STEP 1: Gather research context ───────────────────────────────────
         # PERFORMANCE: asyncio.gather runs these network/database requests at the 
         # exact same time (concurrently), rather than waiting for them one by one.
-        news_context, graph_context, current_watchlist = await asyncio.gather(
+        news_context, graph_context, current_watchlist, macro_context, ontology_context = await asyncio.gather(
             self._fetch_news_context(ticker),
             self._fetch_graph_context(ticker),
-            self._get_current_watchlist()
+            self._get_current_watchlist(),
+            self._fetch_macro_context(),
+            self._fetch_ontology_context(ticker)
         )
 
         # ── STEP 2: LLM peer discovery ────────────────────────────────────────
@@ -175,6 +177,8 @@ class QuantResearcherAgent(SentinelAgent):
             notional_m=notional / 1e6,
             anomaly_score=anomaly_score,
             direction=self._extract_direction(message),
+            ontology_context=json.dumps(ontology_context, default=str) if ontology_context else "None",
+            macro_context=json.dumps(macro_context, default=str) if macro_context else "None",
             news_context=json.dumps(news_context[:8], default=str),
             graph_context=json.dumps(graph_context[:10], default=str),
             current_watchlist=json.dumps(list(current_watchlist)[:20]),
@@ -341,6 +345,28 @@ class QuantResearcherAgent(SentinelAgent):
             return {t.decode("utf-8") if isinstance(t, bytes) else t for t in raw}
         except Exception:
             return set()
+            
+    async def _fetch_macro_context(self) -> Optional[Dict]:
+        """Fetches the latest macro strategist brief from Redis."""
+        try:
+            raw = await self.redis.raw.get("sentinel:macro:latest_brief")
+            if raw:
+                return json.loads(raw)
+            return None
+        except Exception as e:
+            logger.debug(f"Macro context fetch error: {e}")
+            return None
+            
+    async def _fetch_ontology_context(self, ticker: str) -> Optional[Dict]:
+        """Fetches the pre-computed ontology classification from Redis."""
+        try:
+            raw = await self.redis.raw.get(f"sentinel:ontology:entity:{ticker.lower()}")
+            if raw:
+                return json.loads(raw)
+            return None
+        except Exception as e:
+            logger.debug(f"Ontology context fetch error for {ticker}: {e}")
+            return None
         
     # ── INJECTION LOGIC ───────────────────────────────────────────────────────
     

@@ -142,16 +142,22 @@ TRADE SIZE: ${notional_m:.1f}M
 ANOMALY SCORE: {anomaly_score:.2f}
 DIRECTION: {direction}
 
+ONTOLOGY PROFILE FOR {ticker}:
+{ontology_context}
+
+LATEST MACRO STRATEGY BRIEF:
+{macro_context}
+
 RECENT NEWS CONTEXT (last 2 hours):
 {news_context}
 
 EXISTING NEO4J GRAPH RELATIONSHIPS FOR {ticker}:
 {graph_context}
 
-CURRENT SECTOR HOLDINGS IN OUR SYSTEM:
+CURRENT WATCHLIST (Do not suggest these, we are already watching them):
 {current_watchlist}
 
-Discover peer instruments and explain the causal chain:"""
+Based on the above context, generate the peer discovery JSON now:"""
 
 
 QUANT_CRYPTO_BASKET_USER_TEMPLATE = """Analyze this basket of anomalous crypto market events over the last 5 minutes and discover correlated instruments to monitor. Provide discoveries for BOTH the entire basket as a whole AND specific assets that moved the most.

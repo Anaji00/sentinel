@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone, timedelta
@@ -75,6 +76,10 @@ class MacroStrategistAgent(SentinelAgent):
                 
                 # Publish to a new topic for the UI to consume
                 await self._producer.send("agents.intel.briefs", brief_payload, key="macro_review")
+                
+                # Expose to other agents via fast Redis cache
+                await self.redis.raw.set("sentinel:macro:latest_brief", json.dumps(brief_payload), ex=86400)
+                
                 self.logger.info("Macro Trend Review completed and published successfully.")
                 
                 # Sleep for 30 minutes
