@@ -1,4 +1,6 @@
-# Sentinel
+# Sentinel 
+
+**Alessio Naji**
 
 Sentinel is an event-driven data aggregation and analysis engine. It ingests, processes, and correlates streaming data across aviation, maritime, finance, and cyber domains to identify anomalies and track structural shifts.
 
