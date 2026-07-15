@@ -134,11 +134,14 @@ class SentinelAgent(ABC):
                     self.logger.warning(f"Slow dispatch: {elapsed:.1f}s")
             except SchemaViolationError as e:
                 self._errors += 1
-                await self._send_dlq(raw, str(e), self.input_topics[0])
-            except Exception as e:
+                await self._send_dlq(raw, f"SchemaViolationError: {str(e)}", self.input_topics[0])
+            except ValueError as e:
                 self._errors += 1
-                self.logger.error(f"Dispatch error: {e}", exc_info=True)
-                await self._send_dlq(raw, str(e), self.input_topics[0])
+                await self._send_dlq(raw, f"ValueError: {str(e)}", self.input_topics[0])
+            except Exception as e:
+                self.logger.error(f"Transient or unhandled dispatch error: {e}", exc_info=True)
+                # Re-raise to crash the batch, skip commit, and preserve At-Least-Once delivery
+                raise
 
     async def _send_dlq(self, raw: Dict, error: str, topic: str):
         try:
@@ -182,6 +185,77 @@ class SentinelAgent(ABC):
             "payload": payload, "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await self.redis.raw.rpush(queue, json.dumps(task))
+
+    async def fetch_entity_context(self, entity_name: str) -> str:
+        """
+        Surgically fetches recent ML anomalies and news that explicitly mention the entity.
+        Prevents cross-domain context pollution while giving the LLM deep awareness.
+        """
+        try:
+            # We use TimescaleDB directly for the absolute source of truth.
+            query = """
+                SELECT type, headline, anomaly_score, occurred_at
+                FROM events
+                WHERE occurred_at > NOW() - INTERVAL '24 hours'
+                  AND (
+                    primary_entity_id ILIKE $1 
+                    OR headline ILIKE $2
+                  )
+                  AND (anomaly_score >= 0.5 OR type = 'headline')
+                ORDER BY occurred_at DESC
+                LIMIT 5
+            """
+            rows = await self.db.fetch(query, entity_name, f"%{entity_name}%")
+            if not rows:
+                return ""
+                
+            context = f"\n### RECENT ML ANOMALIES & NEWS FOR {entity_name.upper()} ###\n"
+            for r in rows:
+                score = f"(Anomaly Score: {r['anomaly_score']:.2f})" if r.get('anomaly_score') else ""
+                context += f"- [{r['type']}] {r['headline']} {score}\n"
+            return context + "\n"
+        except Exception as e:
+            self.logger.error(f"Failed to fetch entity context for {entity_name}: {e}")
+            return ""
+
+    async def fetch_global_context(self) -> str:
+        """
+        Fetches the top ML anomalies across ALL domains, plus the latest news.
+        Used by strategic macro agents that need a 'World State' view.
+        """
+        try:
+            anomaly_query = """
+                SELECT type, headline, anomaly_score, occurred_at
+                FROM events
+                WHERE occurred_at > NOW() - INTERVAL '24 hours'
+                  AND anomaly_score >= 0.65
+                ORDER BY anomaly_score DESC
+                LIMIT 5
+            """
+            anomalies = await self.db.fetch(anomaly_query)
+            
+            news_query = """
+                SELECT type, headline, occurred_at
+                FROM events
+                WHERE occurred_at > NOW() - INTERVAL '24 hours'
+                  AND type = 'headline'
+                ORDER BY occurred_at DESC
+                LIMIT 5
+            """
+            news = await self.db.fetch(news_query)
+            
+            context = "\n### GLOBAL SENTINEL CONTEXT (LAST 24 HOURS) ###\n"
+            context += "TOP ML ANOMALIES:\n"
+            for r in anomalies:
+                context += f"- [{r['type']}] {r['headline']} (Score: {r['anomaly_score']:.2f})\n"
+                
+            context += "\nLATEST GLOBAL NEWS:\n"
+            for r in news:
+                context += f"- {r['headline']}\n"
+            return context + "\n"
+        except Exception as e:
+            self.logger.error(f"Failed to fetch global context: {e}")
+            return ""
 
     async def _execute_with_telemetry(self, message: dict, system_prompt: str, user_prompt: str, schema: Optional[Type[BaseModel]] = None, temperature: float = 0.1) -> Any:
         

@@ -47,10 +47,10 @@ class AdversarialSimulationEngine:
         extracted_edges = []
         for entity_id in primary_entity_ids:
             try:
-                rows = await loop.run_in_executor(None, lambda eid=entity_id: self.neo4j.query("""
+                rows = await self.neo4j.query("""
                     MATCH (a:Entity {id: $id})-[r*1..3]-(b:Entity)
                     RETURN a.id as src, type(r[-1]) as rel, b.id as tgt LIMIT 15
-                """, {"id": eid}))
+                """, {"id": entity_id})
                 for r in rows: extracted_edges.append(f"({r['src']})-[:{r['rel']}]->({r['tgt']})")
             except Exception as e:
                 logger.error(f"Graph context extraction failed for {entity_id}: {e}")

@@ -12,7 +12,17 @@ Phase 2: replace keyword matching with full OFAC SDN list sync
   and fuzzy name matching.
 """
 
+import logging
+import json
 from typing import List
+
+logger = logging.getLogger("shared.sanctions")
+
+try:
+    import ahocorasick
+    HAS_AHOCORASICK = True
+except ImportError:
+    HAS_AHOCORASICK = False
 
 SANCTIONED_KEYWORDS = [
     # Iran
@@ -75,6 +85,31 @@ MMSI_COUNTRY: dict = {
     "672":"ZM","674":"ZW","675":"ZW",
 }
 
+_automaton = None
+
+def _init_automaton(keywords: List[str] = None):
+    global _automaton
+    if not HAS_AHOCORASICK:
+        return
+        
+    automaton = ahocorasick.Automaton()
+    keywords_to_load = keywords if keywords is not None else SANCTIONED_KEYWORDS
+        
+    for idx, kw in enumerate(keywords_to_load):
+        automaton.add_word(kw.lower(), (idx, kw))
+        
+    automaton.make_automaton()
+    _automaton = automaton  # Atomic pointer swap
+
+if HAS_AHOCORASICK:
+    _init_automaton() # Boot with hardcoded defaults
+
+def rebuild_sanctions_from_list(keywords: List[str]):
+    """Triggered by Enrichment Service when Redis pushes new OFAC payload."""
+    if HAS_AHOCORASICK and keywords:
+        _init_automaton(keywords)
+        logger.info(f"Sanctions automaton successfully rebuilt in memory with {len(keywords)} keywords.")
+
 def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     """
     Return list of flag strings for a vessel.
@@ -86,10 +121,17 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     flags = []
     name_lower = (name or "").lower()
 
-    for kw in SANCTIONED_KEYWORDS:
-        if kw in name_lower:
+    if _automaton is not None:
+        # Aho-Corasick fast path: O(N) where N is length of name_lower
+        for end_index, (insert_order, original_value) in _automaton.iter(name_lower):
             flags.append("sanctioned_ofac")
-            break  # No need to check other keywords if we already found one
+            break  # Stop at first match
+    else:
+        # Fallback slow path
+        for kw in SANCTIONED_KEYWORDS:
+            if kw in name_lower:
+                flags.append("sanctioned_ofac")
+                break  # No need to check other keywords if we already found one
 
     prefix = (mmsi or "")[:3]
     # High risk: Iran (422), DPRK (442, 445, 447, 619), Russia (273), Syria (468), Cuba (323), Venezuela (775)

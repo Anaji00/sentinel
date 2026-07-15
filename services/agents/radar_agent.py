@@ -16,7 +16,7 @@ class RadarAgent(SentinelAgent):
     
     @property
     def output_topic(self) -> str:
-        return Topics.ENRICHED_EVENTS
+        return Topics.RADAR_DECISIONS
     
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         payload = message.get("raw_payload", {})
@@ -32,6 +32,8 @@ class RadarAgent(SentinelAgent):
             return None
         
         # ─── AGENTIC REASONING ───
+        entity_context = await self.fetch_entity_context(ticker)
+        
         prompt = f"""
         You are a quantitative trading systems engineer.
         A background radar has detected an institutional volume anomaly for ticker: {ticker}.
@@ -39,6 +41,8 @@ class RadarAgent(SentinelAgent):
         Metrics:
         - Z-Score: {z_score:.2f} (standard deviations above the EMA)
         - Notional 1-Minute Flow: ${notional_usd / 1_000_000:.2f} Million
+        
+        {entity_context}
         
         Determine if this ${notional_usd / 1_000_000:.2f}M anomaly warrants active high-frequency tracking. 
         Focus on identifying 'smart money' sweeps.

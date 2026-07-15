@@ -54,10 +54,10 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
             link = entry.get("link", "")
             redis_key = f"sentinel:seen:form4:{link}"
 
-            if await loop.run_in_executor(None, redis_client.exists, redis_key): 
+            if await redis_client.raw.exists(redis_key): 
                 continue
                 
-            await loop.run_in_executor(None, redis_client.set, redis_key, "1", 604800)
+            await redis_client.raw.set(redis_key, "1", ex=604800)
 
             event = RawEvent(
                 source="sec_form4", 
@@ -97,36 +97,42 @@ class OHLCVAggregator:
         now = datetime.now(timezone.utc)
         count = 0
 
-        for ticker, data in self.buffer.items():
-            if data["V"] > 0:
-                candle = {
-                    "ticker": ticker,
-                    "trade_type": "OHLCV_MINUTE_BAR",
-                    "open": data["O"],
-                    "high": data["H"],
-                    "low": data["L"],
-                    "close": data["C"],
-                    "volume": data["V"],
-                    "notional_usd": data["C"] * data["V"]
-                
-                }
-                event = RawEvent(
-                    source="finnhub_equities",
-                    occurred_at=now,
-                    raw_payload=candle
-                )
-                await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
-                count += 1
-                try:
-                
-                    redis_list_key= f"sentinel:candles:1m:{ticker}"
-                    candle_json = json.dumps({"ts": now.isoformat(), **candle})
+        async with self.redis_client.raw.pipeline() as pipe:
+            for ticker, data in self.buffer.items():
+                if data["V"] > 0:
+                    candle = {
+                        "ticker": ticker,
+                        "trade_type": "OHLCV_MINUTE_BAR",
+                        "open": data["O"],
+                        "high": data["H"],
+                        "low": data["L"],
+                        "close": data["C"],
+                        "volume": data["V"],
+                        "notional_usd": data["C"] * data["V"]
                     
-                    await self.redis_client.raw.lpush(redis_list_key, candle_json)
-                    # Keep only the last 1440 minutes (24 hours) of candles
-                    await self.redis_client.raw.ltrim(redis_list_key, 0, 1439)
-                except Exception as e:
-                    logger.debug(f"Redis cache warning for {ticker}: {e}")
+                    }
+                    event = RawEvent(
+                        source="finnhub_equities",
+                        occurred_at=now,
+                        raw_payload=candle
+                    )
+                    await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                    count += 1
+                    try:
+                        redis_list_key= f"sentinel:candles:1m:{ticker}"
+                        candle_json = json.dumps({"ts": now.isoformat(), **candle})
+                        
+                        pipe.lpush(redis_list_key, candle_json)
+                        # Keep only the last 1440 minutes (24 hours) of candles
+                        pipe.ltrim(redis_list_key, 0, 1439)
+                    except Exception as e:
+                        logger.debug(f"Redis cache pipeline warning for {ticker}: {e}")
+            
+            try:
+                await pipe.execute()
+            except Exception as e:
+                logger.error(f"Failed to execute Redis pipeline for candles: {e}")
+                
         self.buffer.clear()
         if count > 0:
             logger.info(f"Flushed {count} minute bars to Kafka and Redis.")
@@ -182,6 +188,9 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                 await aggregator.flush()
             except Exception as e:
                 logger.error(f"FATAL: TradFi Aggregator flush crashed: {e}", exc_info=True)
+                
+    last_prices = {}
+    
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
@@ -201,18 +210,35 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                                 volume = float(item.get("v", 0))
                                 notional = price * volume
                                 
+                                # Determine tick direction (Proxy for Buy/Sell Aggressor)
+                                prev_price = last_prices.get(ticker)
+                                if prev_price is None or price == prev_price:
+                                    tick_direction = "ZeroTick"
+                                elif price > prev_price:
+                                    tick_direction = "UpTick"
+                                else:
+                                    tick_direction = "DownTick"
+                                last_prices[ticker] = price
+                                
                                 # 1. Feed the aggregator for downstream ML analysis
                                 aggregator.add_trade(ticker, price, volume)
                                 
                                 # 2. Instant Block Trade Detection (> $500k)
                                 if notional > 50_000:
-                                    logger.warning("🐳 EQUITY BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
+                                    if tick_direction == "DownTick":
+                                        logger.warning("🔴 SELL BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
+                                    elif tick_direction == "UpTick":
+                                        logger.warning("🟢 BUY BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
+                                    else:
+                                        logger.warning("⚪ NEUTRAL BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
+
                                     event = RawEvent(
                                         source="finnhub_equities",
                                         occurred_at=datetime.now(timezone.utc),
                                         raw_payload={
                                             "ticker": ticker, "trade_type": "RAW_TRADE",
-                                            "price": price, "size_shares": volume, "notional_usd": notional
+                                            "price": price, "size_shares": volume, "notional_usd": notional,
+                                            "tick_direction": tick_direction
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)

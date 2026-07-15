@@ -28,14 +28,35 @@ class CryptoEnricher:
 
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
-        # Extract the raw dictionary payload and the source identifier
-        p, source = raw.raw_payload, raw.source
-        if source == "ethereum_rpc": return await self._enrich_whale_transfer(raw, p)
-        elif source == "binance_futures": return await self._enrich_liquidation(raw, p)
-        elif source == "coinbase_spot": return await self._enrich_spot_trade(raw, p)
-        elif source == "coinbase_candles": return await self._enrich_candle(raw, p)
-        return None
+        res = await self.enrich_batch([raw])
+        return res[0] if res else None
 
+    async def enrich_batch(self, events: list) -> list:
+        if not events: return []
+        
+        tasks = []
+        for raw in events:
+            p, source = raw.raw_payload, raw.source
+            if source == "ethereum_rpc": tasks.append(self._enrich_whale_transfer(raw, p))
+            elif source == "binance_futures": tasks.append(self._enrich_liquidation(raw, p))
+            elif source == "coinbase_spot": tasks.append(self._enrich_spot_trade(raw, p))
+            elif source == "coinbase_candles": tasks.append(self._enrich_candle(raw, p))
+            
+        if not tasks: return []
+        
+        import asyncio
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        normalized_events = []
+        for res in results:
+            if isinstance(res, NormalizedEvent):
+                normalized_events.append(res)
+            elif isinstance(res, list):
+                normalized_events.extend(res)
+            elif isinstance(res, Exception):
+                logger.error(f"Error enriching crypto batch item: {res}")
+                
+        return normalized_events
     
     async def _enrich_spot_trade(self, raw, p) -> Optional[NormalizedEvent]:
         asset = p.get("asset", "UNKNOWN").upper()
@@ -84,61 +105,69 @@ class CryptoEnricher:
             anomaly_score=round(anomaly, 3),
         )
     
-    async def _enrich_candle(self, raw, p) -> Optional[NormalizedEvent]:
+    async def _enrich_candle(self, raw, p) -> list:
         asset = p.get("asset", "UNKNOWN").upper()
-        try:
-            open_p = float(p.get("open", 0))
-            close_p = float(p.get("close", 0))
-            high_p = float(p.get("high", 0))
-            low_p = float(p.get("low", 0))
-            volume = float(p.get("volume", 0))
-        except (ValueError, TypeError) as e:
-            logger.error(f"Failed to parse candle data for {asset}: {e}")
-            return None
+        open_p = float(p.get("open", 0))
+        high_p = float(p.get("high", 0))
+        low_p = float(p.get("low", 0))
+        close_p = float(p.get("close", 0))
+        volume = float(p.get("volume", 0))
+        
         if open_p == 0 or close_p == 0:
-            return None
-        price_change_pct = abs((close_p - open_p) / open_p)
-        volatility_pct = (high_p - low_p) / open_p
-        notional_volume = close_p * volume
+            return []
+            
+        ts = raw.occurred_at or datetime.now(timezone.utc)
         
-        features = [price_change_pct, volatility_pct, notional_volume]
-        anomaly = await self.scorer.score_crypto_candle(asset, features)
-        logger.info(f"🧠 ML INFERENCE | {asset} 1-min Candle | Score: {anomaly:.3f} | Price Change: {price_change_pct*100:.2f}% | Volatility: {volatility_pct*100:.2f}% | Notional Volume: ${notional_volume/1e6:.2f}M")
-        if anomaly < 0.6:
-            return None
+        from shared.utils.candles import evaluate_multi_timeframe
         
-        direction = "🟢 Bullish" if close_p >= open_p else "🔴 Bearish"
-        tags = ["crypto", "market_structure", "volatile_candle", direction, asset.lower()]
-        headline = f"{direction} Crypto Anomaly: {asset} moved {price_change_pct*100:.2f}% on ${notional_volume/1e6:.1f}M vol"
-        entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
-
-        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-            "entity_id": asset,
-            "action": "MERGE_ONTOLOGY_NODE",
-            "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
-        }, key=asset)
-
-        return NormalizedEvent(
-            event_id=raw.event_id,
-            type=EventType.MARKET_ANOMALY,
-            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
-            source=raw.source,
-            primary_entity=entity,
-            crypto_data=CryptoData(
-                pair=asset,
-                trade_type="OHLCV_1M",
-                side="MARKET",
-                price=close_p,
-                size_tokens=volume,
-                open_price=open_p,
-                high_price=high_p,
-                low_price=low_p,
-                close_price=close_p
-            ),
-            headline=headline,
-            tags=tags,
-            anomaly_score=round(anomaly, 3),
+        anomalous_frames = await evaluate_multi_timeframe(
+            self.redis, self.scorer, domain="crypto", asset=asset, 
+            ts=ts, open_p=open_p, high_p=high_p, low_p=low_p, close_p=close_p, volume=volume
         )
+        
+        events = []
+        for tf, block, features, anomaly in anomalous_frames:
+            price_change_pct = features[0]
+            volatility_pct = features[1]
+            notional = features[2]
+            
+            tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()]
+            # await self._sync_geo_watchlist(asset, tags)
+            # await self._update_volume_baseline(asset, block["volume"])
+    
+            await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                "entity_id": asset,
+                "action": "MERGE_ONTOLOGY_NODE",
+                "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
+            }, key=asset)
+            
+            entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
+            direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
+            headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
+    
+            events.append(NormalizedEvent(
+                event_id=raw.event_id,
+                type=EventType.MARKET_ANOMALY,
+                occurred_at=datetime.fromisoformat(block["start_ts"]),
+                source=raw.source,
+                primary_entity=entity,
+                crypto_data=CryptoData(
+                    pair=asset, 
+                    trade_type=f"OHLCV_{tf}M_BAR",
+                    side="MARKET",
+                    price=block["close"],
+                    size_tokens=block["volume"],
+                    open_price=block["open"],
+                    high_price=block["high"],
+                    low_price=block["low"],
+                    close_price=block["close"]
+                ),
+                headline=headline,
+                tags=tags,
+                anomaly_score=anomaly,
+            ))
+            
+        return events
 
     async def _enrich_whale_transfer(self, raw, p) -> Optional[NormalizedEvent]:
         """Processes large on-chain token/coin movements (whale transfers)."""

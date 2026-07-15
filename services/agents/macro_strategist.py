@@ -35,20 +35,30 @@ class MacroStrategistAgent(SentinelAgent):
                 # 1. Fetch Top Co-occurring concepts from Redis
                 cooccurrence = await self.redis.raw.zrevrange("sentinel:ontology:cooccurrence", 0, 10, withscores=True)
                 
-                # 2. Fetch sector aggregate data from TimescaleDB (Pseudo-query)
+                # 2. Fetch sector aggregate data from TimescaleDB
                 query = """
-                    SELECT sector_tags, AVG(forward_pe) as avg_fwd_pe, SUM(notional_volume) 
-                    FROM market_aggregates 
-                    WHERE time > NOW() - INTERVAL '24 hours'
-                    GROUP BY sector_tags
+                    SELECT type, COUNT(*) as volume, AVG(anomaly_score) as avg_anomaly
+                    FROM events 
+                    WHERE occurred_at > NOW() - INTERVAL '24 hours'
+                    GROUP BY type
                 """
-                # (Execute via your asyncpg / connection)
+                try:
+                    records = await self.db.fetch(query)
+                    sector_data = [dict(r) for r in records]
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch DB aggregates: {e}")
+                    sector_data = []
+                
+                # 3. Fetch explicit ML/News Global Context
+                global_context = await self.fetch_global_context()
                 
                 prompt = f"""
                 You are a Quantitative Macro Strategist.
                 Review the following systemic shifts over the last 24 hours:
                 Ontology Co-occurrences: {cooccurrence}
-                Sector Data: [Insert DB Data]
+                Sector Data: {json.dumps(sector_data)}
+                
+                {global_context}
                 
                 Identify any subtle aggregate shifts (e.g., accumulation in defense, 
                 valuation multiples compressing in semiconductors). 
@@ -82,8 +92,8 @@ class MacroStrategistAgent(SentinelAgent):
                 
                 self.logger.info("Macro Trend Review completed and published successfully.")
                 
-                # Sleep for 30 minutes
-                await asyncio.sleep(1800)
+                # Sleep for 5 minutes
+                await asyncio.sleep(300)
             except asyncio.CancelledError:
                 break
             except Exception as e:

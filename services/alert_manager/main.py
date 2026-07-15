@@ -46,7 +46,7 @@ logger = logging.getLogger("alert-manager")
 # ── 3. INTERNAL SHARED IMPORTS ────────────────────────────────────────────────
 # These modules are shared across all Sentinel microservices.
 from shared.kafka import SentinelConsumer, Topics
-from shared.models import CorrelationCluster, AlertTier
+from shared.models import CorrelationCluster, AlertTier, Scenario
 from shared.db import get_timescale, get_redis
  
 # ── 4. LOCAL RELATIVE IMPORTS ─────────────────────────────────────────────────
@@ -76,52 +76,37 @@ RATE_LIMIT_MAX    = 10      # max Telegram per hour
 class AlertManager:
     # THE 'INIT' METHOD (Constructor)
     # This sets up our AlertManager object with all the tools it needs to do its job.
-    # 'self' means "store this tool/data on the object so other methods can use it later."
     def __init__(self, session: aiohttp.ClientSession, db_client, redis_client):
         self._session = session
         self._db      = db_client
         self._redis   = redis_client
         self._sent = []
 
-    async def handle(self, cluster: CorrelationCluster):
+    async def handle_correlation(self, cluster: CorrelationCluster):
         # 1. FILTERING: We don't send external notifications for low-tier (WATCH) events.
         if cluster.alert_tier == AlertTier.WATCH:
             logger.info(f"WATCH (no alert): {cluster.rule_name}")
             return
         
-        # 2. DEDUPLICATION: Check the Redis cache to see if we already alerted about 
-        # this exact anomaly ID in the last 6 hours. If so, skip it to prevent spam.
-        dedup_key = f"alert:sent:{cluster.correlation_id}"
+        # 2. DEDUPLICATION: Check the Redis cache using semantic keys (rule + entity).
+        # This prevents alert fatigue even if new correlation IDs are generated.
+        entity_key = cluster.entity_ids[0] if cluster.entity_ids else "system"
+        dedup_key = f"alert:sent:{cluster.rule_name}:{entity_key}"
         if await self._redis.raw.exists(dedup_key):
-            logger.debug(f"deduplication skip: {cluster.correlation_id}")
+            logger.debug(f"deduplication skip: {cluster.rule_name} on {entity_key}")
             return
         
         now = time.time()
-        # FIX: Subtracted the window from 'now'. Previously this was `now = RATE_LIMIT_WINDOW`
-        # which overwrote the current timestamp and broke the rate limiter.
         cutoff = now - RATE_LIMIT_WINDOW
         
-        # 3. RATE LIMITING: Clean up our history array (`self._sent`), keeping 
-        # only the timestamps of alerts sent within the last hour.
+        # 3. RATE LIMITING
         self._sent = [t for t in self._sent if t > cutoff]
-
         if len(self._sent) >= RATE_LIMIT_MAX:
             logger.warning("Rate limit reached — sleeping 60s")
             await asyncio.sleep(60)
  
-        # 4. ENRICHMENT: If this is a critical Tier 3 intelligence event, reach into 
-        # the database to grab the AI-generated context/scenario to attach to the alert.
-        scenario = None
-        if cluster.alert_tier == AlertTier.INTELLIGENCE:
-            scenario = await self._fetch_scenario(cluster.correlation_id)
-        
-        # 5. FORMATTING: Use our functional formatters to build the message text.
+        # 4. FORMATTING & DELIVERY: Send the immediate alert.
         tg_text = format_correlation(cluster)
-        if scenario:
-            # FIX: Corrected newline character from "/n/n" to "\n\n"
-            tg_text += "\n\n" + format_scenario(scenario)
-        
-        # 6. DELIVERY: Send the alert out to our external webhooks and APIs.
         await self._send_telegram(tg_text)
         if WEBHOOK_URL:
             await self._send_webhook(format_generic(cluster))
@@ -129,10 +114,21 @@ class AlertManager:
         await self._redis.raw.set(dedup_key, "1", ex=DEDUP_TTL)
         self._sent.append(now)
 
-        logger.info(
-            f"!! [{cluster.alert_tier.name}] {cluster.rule_name} "
-            f"id:{cluster.correlation_id[:8]}"
-        )
+        logger.info(f"!! [{cluster.alert_tier.name}] {cluster.rule_name} id:{cluster.correlation_id[:8]}")
+
+    async def handle_scenario(self, scenario: Scenario):
+        """Sends a follow-up intelligence briefing when the reasoning service finishes."""
+        now = time.time()
+        cutoff = now - RATE_LIMIT_WINDOW
+        self._sent = [t for t in self._sent if t > cutoff]
+        if len(self._sent) >= RATE_LIMIT_MAX:
+            await asyncio.sleep(60)
+
+        tg_text = format_scenario(scenario)
+        await self._send_telegram(tg_text)
+        self._sent.append(now)
+        logger.info(f"!! [INTELLIGENCE_BRIEFING] Sent for correlation {scenario.correlation_id[:8]}")
+
 
     async def _send_telegram(self, text: str):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -175,36 +171,7 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Webhook error: {e}")
 
-    async def _fetch_scenario(self, correlation_id: str):
-        # BEST PRACTICE TIP: 
-        # This method fetches scenario data asynchronously from the PostgreSQL database.
-        try:
-            from shared.models import Scenario, ScenarioStatus
-            row = await self._db.query_one("""
-                SELECT * FROM scenarios
-                WHERE correlation_id = $1
-                  AND status NOT IN ('denied','expired')
-                ORDER BY created_at DESC LIMIT 1
-            """, correlation_id)
-            if not row:
-                return None
-            return Scenario(
-                scenario_id=str(row["scenario_id"]),
-                correlation_id=str(row["correlation_id"]),
-                headline=row["headline"] or "",
-                significance=row["significance"] or "",
-                hypotheses=row["hypotheses"] or [],
-                recommended_monitoring=row["recommended_monitoring"] or [],
-                confidence_overall=row["confidence_overall"] or 50,
-                confidence_rationale=row["confidence_rationale"] or "",
-                status=ScenarioStatus(row["status"]),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-        except Exception as e:
-            logger.debug(f"fetch_scenario: {e}")
-            return None
-        
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Alert Manager")
@@ -217,7 +184,7 @@ async def main():
     # The 'group_id' means if you run 3 instances of this script, Kafka will share 
     # the load among them rather than sending duplicate messages to all 3.
     consumer = SentinelConsumer(
-        topics=[Topics.CORRELATIONS],
+        topics=[Topics.CORRELATIONS, "scenarios.generated"],
         group_id="alert-manager",
     )
     await consumer.start()
@@ -243,8 +210,12 @@ async def main():
                         try:
                             # FIX: Decode bytes securely
                             payload = json.loads(msg.value.decode('utf-8'))
-                            cluster = CorrelationCluster(**payload)
-                            await manager.handle(cluster)
+                            if tp.topic == "scenarios.generated":
+                                scenario = Scenario(**payload)
+                                await manager.handle_scenario(scenario)
+                            else:
+                                cluster = CorrelationCluster(**payload)
+                                await manager.handle_correlation(cluster)
                         except Exception as e:
                             logger.error(f"Alert processing error: {e}", exc_info=True)
                 

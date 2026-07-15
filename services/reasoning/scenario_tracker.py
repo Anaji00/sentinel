@@ -29,7 +29,7 @@ from .pattern_library import PatternLibrary
 logger = logging.getLogger("reasoning.tracker")
 
 CONFIRM_THRESHOLD = 80  # Confidence % above which we confirm a scenario
-DENY_THRESHOLD = 15     # Confidence % below which we deny a scenario
+DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
 
 class ScenarioTracker:
     def __init__(self, db, producer=None):
@@ -107,7 +107,7 @@ class ScenarioTracker:
             )
             logger.info(
                 f"Scenario {scenario_id[:8]}: "
-                f"confidence {confidence}→{new_confidence} "
+                f"confidence {original_confidence}→{confidence} "
                 f"{'→ ' + status_change.value if status_change else ''}"
             )
  

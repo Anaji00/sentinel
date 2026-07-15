@@ -98,9 +98,10 @@ class RuleSynthesizerAgent(SentinelAgent):
         Synthesize up to 3 JSON correlation rules that the correlation engine should actively look for.
         For example, if tensions are rising in the Red Sea, create a rule that triggers on "vessel_dark" 
         with a condition region "Red Sea" and correlates with "options_flow" tagged "energy" in the last 96 hours.
+        Another example: If a macro divergence occurs (e.g., Oil spikes), create a rule that triggers on "market_anomaly" for the commodity and correlates with "market_anomaly" for inversely exposed equities.
         
         Return a RuleList containing DynamicRule objects.
-        Valid event_types: vessel_dark, options_flow, futures_cot, headline, bgp_anomaly, prediction_market_trade
+        Valid event_types: vessel_dark, options_flow, futures_cot, headline, bgp_anomaly, prediction_market_trade, market_anomaly, equity_block, market_candle
         """
         
         try:

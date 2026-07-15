@@ -43,7 +43,7 @@ logger = logging.getLogger("sentinel.ollama")
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "llama3")
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "600.0")))  # Scenario synthesis can be verbose
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "1200.0")))  # Scenario synthesis can be verbose
 
 # Per-process semaphore. Import this and use it as a context manager in any
 # code that calls Ollama to prevent parallel requests within one process.
@@ -117,7 +117,8 @@ class OllamaClient:
         schema_instruction = (
             f"\n\nYou MUST return a JSON object that strictly adheres to the following JSON schema:\n"
             f"```json\n{schema_json}\n```\n"
-            "Do not include any explanation or markdown formatting outside of the JSON object. Output raw JSON only."
+            "Do not include any explanation or markdown formatting outside of the JSON object. Output raw JSON only.\n"
+            "CRITICAL: Output the actual data values that fit this schema, DO NOT output the schema definition itself."
         )
 
         # Retry Loop: Give the AI multiple chances to fix its mistakes.
@@ -181,9 +182,10 @@ class OllamaClient:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "keep_alive": -1,  # Keep model permanently loaded in GPU memory to prevent slow reload spikes
             "options": {
                 "temperature": temperature,
-                "num_predict": 1500,
+                "num_predict": 1000, # Cap generation length to prevent runaway slow text generation
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }

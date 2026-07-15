@@ -19,116 +19,74 @@ first, because a position can be in both "Strait of Hormuz" AND
 "Persian Gulf". We want the most specific match.
 """
 
+import logging
+import json
 from typing import Optional, Tuple
 
-# ── REGION DEFINITIONS ────────────────────────────────────────────────────────
-# Format: (name, min_lat, max_lat, min_lon, max_lon)
-# Ordered by specificity (smaller areas first)
+logger = logging.getLogger("shared.regions")
 
-MARITIME_CHOKEPOINTS = [
-    # ── HIGH PRIORITY: Strait chokepoints ────────────────────────────────────
-    ("Strait of Hormuz",       24.0, 27.0,  56.0, 60.0),
-    ("Strait of Malacca",       1.0,  6.0, 103.0, 105.0),
-    ("Bab-el-Mandeb",          11.5, 13.5,  43.0, 45.5),   # Yemen/Djibouti
-    ("Suez Canal",             29.8, 31.5,  32.2, 32.8),
-    ("Strait of Gibraltar",    35.5, 36.5,  -5.8, -5.2),
-    ("Danish Straits",         55.0, 58.0,   8.0, 13.0),   # Baltic access
-    ("Turkish Straits",        40.5, 41.5,  26.0, 29.5),   # Bosphorus/Dardanelles
-    ("Taiwan Strait",          22.0, 26.0, 119.0, 122.5),
-    ("Strait of Lombok",       -9.0, -7.5, 115.0, 116.5),  # Indonesia
-    ("Strait of Sicily",       32.0, 37.0,  12.0, 15.0),   # Italy/Sicily
-    ("Strait of Dover",        50.5, 51.5,   0.0,   2.0),   # UK/France
-    ("Panama Canal",           7.5, 10.0, -80.5, -77.0),
- 
-    # ── REGIONAL SEAS ─────────────────────────────────────────────────────────
-    ("Persian Gulf",           22.0, 30.0,  47.0, 57.0),
-    ("Gulf of Oman",           21.0, 26.0,  56.0, 62.0),
-    ("Red Sea",                12.0, 30.0,  31.5, 44.0),
-    ("Gulf of Aden",            9.0, 13.5,  42.0, 52.0),
-    ("South China Sea",         1.0, 23.0, 105.0, 121.0),
-    ("East China Sea",         24.0, 34.0, 119.0, 131.0),
-    ("Yellow Sea",             31.0, 40.0, 119.0, 127.0),
-    ("Black Sea",              40.5, 46.5,  27.5, 41.5),
-    ("Caspian Sea",            36.5, 47.5,  49.0, 55.0),
-    ("Baltic Sea",             53.5, 66.0,   9.5, 30.0),
-    ("North Sea",              50.5, 61.0,  -4.0, 10.0),
-    ("Mediterranean Sea",      30.0, 46.5,  -6.0, 37.0),
-    ("Caribbean Sea",           8.0, 23.5, -86.0, -58.0),
-    ("Gulf of Mexico",         18.0, 30.5, -98.0, -80.0),
-    ("Gulf of Guinea",        -10.0,  8.0,  -8.0, 10.0),
-    ("Mozambique Channel",    -26.0, -10.0, 34.0, 45.0),
-    ("Barents Sea",            68.0, 81.0,  14.0, 60.0),   # Arctic, Russian waters
-    ("Bering Sea",            52.0, 66.0, 170.0, -170.0), # Arctic, US/Russian waters
-    ("Gulf of Alaska",        54.0, 60.0, -170.0, -130.0), # US waters
-    ("Sea of Okhotsk",        45.0, 60.0, 135.0, 160.0),  # Russian waters
-    ("Labrador Sea",          50.0, 65.0, -70.0, -50.0),   # Canada/Greenland
-    ("Norwegian Sea",         62.0, 72.0,   5.0, 20.0),   # Norway/Russia
-    ("Gulf of St. Lawrence",  46.5, 51.5, -66.5, -57.5),   # Canada
-    ("Caspian Sea",            36.5, 47.5,  49.0, 55.0),
- 
-    # ── CONFLICT/WATCH ZONES ──────────────────────────────────────────────────
-    ("Ukrainian Waters",       43.0, 48.0,  29.0, 37.5),
-    ("North Korean Waters",    37.0, 43.0, 124.0, 132.0),
-    ("Iranian Territorial",    25.0, 31.0,  48.0, 57.5),
-    ("Syrian Territorial",     32.0, 37.0,  35.5, 42.0),
-    ("Venezuelan Territorial",  0.0, 12.0, -75.0, -59.0),
-    ("Israeli Territorial",     29.0, 34.0,  34.0, 35.5),
-    ("Libyan Territorial",     30.0, 34.0,  10.0, 25.0),
-    ("Yemeni Territorial",     12.0, 19.0,  42.0, 54.0),
-    ("Somali Territorial",      -3.0, 12.0,  40.0, 52.0),
-    ("Sudanese Territorial",     3.0, 22.0,  32.0, 38.0),
-    ("Gulf of Sidra",          30.0, 35.0,  10.0, 25.0),   # Libya's claimed waters
-    ("Crimean Waters",         44.0, 46.0,  32.0, 36.0),   # Disputed Russia/Ukraine
-    ("Georgian Waters",        41.5, 43.5,  40.0, 42.5),   # Disputed Russia/Georgia
-    ("Taiwan Territorial",     21.5, 25.5, 119.0, 122.5), # Disputed China/Taiwan
-    ("Afghan Territorial",      29.0, 38.0,  60.0, 75.0),   # For maritime events near Afghanistan
-    ("Malian Territorial",     10.0, 25.0, -5.0, 5.0),     # For maritime events near Mali
-    ("Nigerian Territorial",    4.0, 14.0,   2.0, 15.0),   # For maritime events near Nigeria
-    ("Colombian Territorial", -5.0, 15.0, -80.0, -65.0),   # For maritime events near Colombia
-    # ── KEY PORT APPROACHES ───────────────────────────────────────────────────
-    ("Singapore Approach",      1.0,  2.0, 103.5, 104.5),
-    ("Shanghai Approach",      30.0, 32.5, 120.0, 123.0),
-    ("Rotterdam Approach",     51.5, 53.0,   3.0,   6.0),
-    ("Houston Ship Channel",   29.0, 30.0, -95.5, -94.5),
-    ("Panama Canal Approach",  7.0, 11.0, -81.0, -77.0),
-]   
+try:
+    from shapely.geometry import shape, Point, box
+    from shapely.strtree import STRtree
+    HAS_SHAPELY = True
+except ImportError:
+    HAS_SHAPELY = False
 
-AVIATION_REGIONS = [
-    # These overlap maritime where relevant
-    ("Taiwan ADIZ",            22.0, 26.0, 119.0, 126.0),
-    ("Ukraine Airspace",       44.0, 52.5,  22.0,  40.5),
-    ("Belarus Airspace",       51.0, 56.5,  23.5,  32.5),
-    ("North Korea ADIZ",       37.0, 43.0, 124.0, 132.0),
-    ("Iran Airspace",          25.0, 39.5,  44.0,  63.5),
-    ("Syrian Airspace",       32.0, 37.0,  35.5,  42.0),
-    ("Venezuelan Airspace",     0.0, 12.0, -75.0, -59.0),
-    ("Israeli Airspace",       29.0, 34.0,  34.0,  35.5),
-    ("Libyan Airspace",       30.0, 34.0,  10.0,  25.0),
-    ("Yemeni Airspace",       12.0, 19.0,  42.0,  54.0),
-    ("Somali Airspace",        -3.0, 12.0, 40.0,   52.0),
-    ("Sudanese Airspace",       3.0, 22.0, 32.0,   38.0),
-    ("Russian Airspace",       41.0, 82.0, 19.0,   180.0), # Covers all of Russia, including Arctic
-]
 
-# Combine all for general use
-ALL_REGIONS = MARITIME_CHOKEPOINTS + AVIATION_REGIONS
+
+_polygons = []
+_polygon_names = []
+_tree = None
+
+_fallback_boxes = []
+
+def _init_spatial_index():
+    global _tree
+    
+    try:
+        with open("regions.geojson", "r") as f:
+            data = json.load(f)
+            for feature in data.get("features", []):
+                name = feature["properties"].get("name", "Unknown")
+                
+                if HAS_SHAPELY:
+                    geom = shape(feature["geometry"])
+                    _polygons.append(geom)
+                    _polygon_names.append(name)
+                else:
+                    # Manual bounding box fallback from GeoJSON
+                    coords = feature["geometry"]["coordinates"][0]
+                    lons = [c[0] for c in coords]
+                    lats = [c[1] for c in coords]
+                    _fallback_boxes.append((name, min(lats), max(lats), min(lons), max(lons)))
+                    
+        if HAS_SHAPELY and _polygons:
+            _tree = STRtree(_polygons)
+            
+    except Exception as e:
+        logger.error(f"Failed to load spatial data from regions.geojson: {e}")
+
+_init_spatial_index()
 
 def classify_region(lat: float, lon: float) -> Optional[str]:
     """
     Given a lat/lon, return the most specific named region, or None.
  
-    This iterates regions in order — smaller/more specific ones are
-    listed first, so the first match is the most precise.
- 
-    Args:
-        lat: Latitude in decimal degrees
-        lon: Longitude in decimal degrees
- 
-    Returns:
-        Region name string, or None if not in any watch region
+    This uses an in-memory STRtree for O(1) spatial intersection checks if 
+    shapely is installed. Otherwise it falls back to iterative bounding box checks.
     """
+    if _tree is not None:
+        p = Point(lon, lat)
+        # STRtree query is highly optimized and returns indices of matching envelopes
+        indices = _tree.query(p)
+        for idx in indices:
+            # Do the final, exact point-in-polygon math
+            if _polygons[idx].contains(p):
+                return _polygon_names[idx]
+        return None
 
-    for name, min_lat, max_lat, min_lon, max_lon, in ALL_REGIONS:
+    # Fallback to slow Python iterative checks on the geojson boxes
+    for name, min_lat, max_lat, min_lon, max_lon in _fallback_boxes:
         if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
             return name
     return None
@@ -149,6 +107,7 @@ def is_sensitive_region(region: Optional[str]) -> bool:
     "Taiwan Strait",
     "Persian Gulf",
     "Iranian Territorial",
+    "Syrian Territorial",
     "North Korean Waters",
     "Ukrainian Waters",
     "Black Sea",
@@ -158,6 +117,13 @@ def is_sensitive_region(region: Optional[str]) -> bool:
     "Israeli Territorial",
     "Somali Territorial",
     "Caspian Sea",
+    "Ukraine Airspace",
+    "North Korea ADIZ",
+    "Iran Airspace",
+    "Syrian Airspace",
+    "Israeli Airspace",
+    "Yemeni Airspace",
+    "Russian Airspace",
     }
 
     return region in HIGH_SENSITIVITY
@@ -179,13 +145,23 @@ def get_region_sensitivity_multiplier(region: Optional[str]) -> float:
     multipliers = {
         "Strait of Hormuz": 3.0,
         "Iranian Territorial": 3.0,
+        "Iran Airspace": 3.0,
         "North Korean Waters": 3.0,
+        "North Korea ADIZ": 3.0,
         "Ukrainian Waters": 2.5,
+        "Ukraine Airspace": 2.5,
         "Taiwan Strait": 2.5,
         "Taiwan ADIZ": 2.5,
-        "Bab-el-Mandeb": 2.5,
+        "Bab-el-Mandeb": 3.0,  # Elevated due to active conflict
         "Israeli Territorial": 3.0,
-
+        "Israeli Airspace": 3.0,
+        "Red Sea": 2.5,        # Elevated due to active conflict (was 1.5)
+        "Somali Territorial": 2.5, # Added missing multiplier for piracy risk
+        "Somali Airspace": 2.5,
+        "Syrian Territorial": 2.5, # Added missing multiplier
+        "Syrian Airspace": 2.5,
+        "Yemeni Airspace": 3.0,
+        "Russian Airspace": 2.0,
 
         # High
         "Persian Gulf":         2.0,
@@ -196,7 +172,6 @@ def get_region_sensitivity_multiplier(region: Optional[str]) -> float:
         "South China Sea":      1.8,
  
         # Elevated
-        "Red Sea":              1.5,
         "Gulf of Oman":         1.5,
         "Barents Sea":          1.5,
         "East China Sea":       1.5,

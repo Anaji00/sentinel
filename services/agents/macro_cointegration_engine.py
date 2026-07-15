@@ -46,8 +46,9 @@ class MacroAssetCointegrationEngine(SentinelAgent):
         return Topics.ENRICHED_EVENTS
 
     async def handle(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        macro_asset = payload.get("ticker")
-        macro_price = payload.get("price")
+        raw = payload.get("raw_payload", payload)
+        macro_asset = raw.get("ticker")
+        macro_price = raw.get("close") or raw.get("price")
 
         if not macro_asset or not macro_price:
             return None
@@ -91,7 +92,7 @@ class MacroAssetCointegrationEngine(SentinelAgent):
         # O(log N) Graph Traversal (Cache Miss)
         logger.info(f"Graph Cache Miss: Resolving supply chain exposures for {macro_asset} via Neo4j...")
         query = """
-        MATCH (c:Entity {id: $macro_asset})-[:COMMODITY_EXPOSURE|SUPPLIES*1..2]-(e:Entity {type: 'instrument'})
+        MATCH (c:Entity {id: $macro_asset})-[:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO*1..2]-(e:Entity {type: 'instrument'})
         RETURN DISTINCT e.id AS exposed_ticker
         """
         
@@ -182,7 +183,27 @@ class MacroAssetCointegrationEngine(SentinelAgent):
                     primary_entity=Entity(id=micro_ticker, type=EntityType.INSTRUMENT, name=micro_ticker),
                     headline=f"Macroeconomic Decoupling: {micro_ticker} structural correlation to {macro_asset} has broken (Z-Score: {z_score:.2f})",
                     tags=["macro_divergence", "cointegration_break", macro_asset.lower(), micro_ticker.lower()],
-                    anomaly_score=round(min(1.0, abs(z_score) / 6.0), 4) # Normalize z-score to 0.0 - 1.0 boundary
+                    anomaly_score=round(min(1.0, abs(z_score) / 4.0), 4) # Normalize z-score to 0.0 - 1.0 boundary
+                )
+                
+            # ── CORRELATION CONFIRMATION LOGIC ──
+            macro_mean = np.mean(x_vec)
+            macro_std = np.std(x_vec) if np.std(x_vec) > 0 else 1.0
+            macro_z_score = (x_vec[-1] - macro_mean) / macro_std
+            
+            if abs(macro_z_score) > 2.5 and abs(z_score) <= 1.5:
+                direction = "surged" if macro_z_score > 0 else "plummeted"
+                micro_dir = "UP" if (macro_z_score > 0 and beta > 0) or (macro_z_score < 0 and beta < 0) else "DOWN"
+                logger.info(f"✅ MACRO CONFIRMATION: {macro_asset} shocked, {micro_ticker} followed perfectly.")
+                
+                return NormalizedEvent(
+                    type=EventType.MARKET_ANOMALY,
+                    occurred_at=datetime.now(timezone.utc).isoformat(),
+                    source="macro_cointegration_engine",
+                    primary_entity=Entity(id=micro_ticker, type=EntityType.INSTRUMENT, name=micro_ticker),
+                    headline=f"Macro Correlation Confirmed: {macro_asset} {direction}, dragging {micro_ticker} {micro_dir} (Beta: {beta:.2f})",
+                    tags=["macro_confirmation", "cointegration_hold", macro_asset.lower(), micro_ticker.lower()],
+                    anomaly_score=round(min(1.0, abs(macro_z_score) / 4.0), 4)
                 )
             
             return None
@@ -221,14 +242,14 @@ async def main_stream():
     producer = SentinelProducer()
     dlq = SentinelProducer()
     consumer = SentinelConsumer(
-        topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"], 
+        topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO], 
         group_id="macro-cointegration-group",
         auto_offset_reset="latest"
     )
 
     engine = MacroAssetCointegrationEngine(
         agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"],
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO],
         redis_client=redis_client,
         db_client=db_client,
         neo4j_client=neo4j_client,

@@ -65,7 +65,7 @@ async def _send_telegram_alert(session: aiohttp.ClientSession, topic: str, error
     except Exception as e:
         logger.error(f"Failed to reach Telegram API: {e}")
 
-async def _consume_loop(consumer, db, async_loop, session):
+async def _consume_loop(consumer, db, session):
     """Blocking loop that reads from Kafka and writes to Postgres."""
     last_alert_time = 0
 
@@ -79,7 +79,10 @@ async def _consume_loop(consumer, db, async_loop, session):
 
                 for message in messages:
                     # payload is a dict formatted in enrichment/main.py
-                    payload = message.value
+                    try:
+                        payload = json.loads(message.value.decode("utf-8"))
+                    except Exception:
+                        payload = {"raw": str(message.value), "error": "Unparseable bytes"}
                     
                     original_topic = payload.get("topic", "unknown")
                     error_msg = payload.get("error", "No error provided")
@@ -111,8 +114,8 @@ async def _consume_loop(consumer, db, async_loop, session):
         except StopIteration:
             continue
         except Exception as e:
-            logger.error(f"DLQ consume loop error: {e}", exc_info=True)
-            time.sleep(5) # Backoff before retrying
+            logger.error(f"DLQ Processor encountered error: {e}", exc_info=True)
+            await asyncio.sleep(5) # Backoff before retrying
 
 async def main():
     logger.info("=" * 60)

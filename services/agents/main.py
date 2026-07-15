@@ -34,14 +34,7 @@ from services.agents.supervisor import GraphSupervisor
 from services.agents.macro_strategist import MacroStrategistAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
-# New topics added by the agent swarm (add to shared/kafka/__init__.py Topics class)
-TOPIC_ENRICHED_EVENTS    = "enriched.events"
-TOPIC_INTEL_BRIEFS       = "agents.intel.briefs"
-TOPIC_QUANT_DISCOVERIES  = "agents.quant.discoveries"
-TOPIC_ONTOLOGY_UPDATES   = "agents.ontology.updates"
-TOPIC_UNKNOWN_ENTITIES   = "agents.ontology.unknown_entities"
-TOPIC_DLQ                = "dead.letter"
-TOPIC_RAW_RADAR          = "events.raw.radar"
+# All topics are now centrally managed in shared/kafka/__init__.py
 
 
 # ── TASK QUEUE WORKER ────────────────────────────────────────────────────────
@@ -175,7 +168,7 @@ async def main():
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
     )
@@ -183,7 +176,7 @@ async def main():
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[TOPIC_ENRICHED_EVENTS, TOPIC_RAW_RADAR, Topics.SCENARIOS_GENERATED],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
     )
@@ -191,7 +184,7 @@ async def main():
     ontology_agent = build_agent(
         OntologyMasterAgent,
         agent_name="ontology_master",
-        input_topics=[TOPIC_UNKNOWN_ENTITIES],
+        input_topics=[Topics.UNKNOWN_ENTITIES],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
         soft_correlator=soft_correlator,
@@ -200,7 +193,7 @@ async def main():
     radar_agent = build_agent(
         RadarAgent,
         agent_name="radar_agent",
-        input_topics=[TOPIC_RAW_RADAR, TOPIC_QUANT_DISCOVERIES, TOPIC_ENRICHED_EVENTS],
+        input_topics=[Topics.QUANT_DISCOVERIES, Topics.ENRICHED_EVENTS],
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
     )
@@ -208,7 +201,7 @@ async def main():
     macro_cointegration_agent = build_agent(
         MacroAssetCointegrationEngine,
         agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, "raw.macro"],
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO],
         group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
     )
@@ -216,7 +209,7 @@ async def main():
     supervisor_agent = build_agent(
         GraphSupervisor,
         agent_name="supervisor",
-        input_topics=["sentinel.ontology.proposals"],
+        input_topics=[Topics.ONTOLOGY_PROPOSALS],
         group_id="supervisor-group",
         shared_infra=shared_infra,
     )
@@ -232,7 +225,7 @@ async def main():
     rule_synthesizer_agent = build_agent(
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
-        input_topics=["agents.intel.briefs", Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, TOPIC_QUANT_DISCOVERIES],
+        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
     )

@@ -13,6 +13,7 @@ from typing import Optional, List
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
+from shared.utils.sanctions import check_sanctions
 
 logger = logging.getLogger("enrichment.news")
 
@@ -136,8 +137,16 @@ class NewsEnricher:
             if kw in lower_text:
                 if category not in tags:
                     tags.append(category)
+                    
+        # SANCTIONS CHECK via Aho-Corasick Text Search
+        ofac_hits = check_sanctions(combined_text)
+        if ofac_hits:
+            tags.append("sanctioned_ofac_mention")
+            tags.extend(ofac_hits)
         
         anomaly = await self.scorer.score_news(named_entities = tags, sentiment = sentiment, reliability = reliability)
+        if ofac_hits:
+            anomaly = min(1.0, anomaly + 0.4) # Severe bump for sanctions mention
 
         if anomaly < 0.3:
             return None

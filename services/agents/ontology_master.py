@@ -124,9 +124,11 @@ class OntologyMasterAgent(SentinelAgent):
         logger.info(f"Classifying entity: '{entity_name}' (freq={frequency})")
 
         # ── LLM CLASSIFICATION ─────────────────────────────────────────────────
+        entity_context = await self.fetch_entity_context(entity_name)
+        
         user_prompt = ONTOLOGY_CATEGORIZE_USER_TEMPLATE.format(
             entity_name=entity_name,
-            context=context[:500],
+            context=f"{context[:500]}\nAdditional Context: {entity_context}",
             source_domain=source_domain,
             frequency=frequency,
         )
