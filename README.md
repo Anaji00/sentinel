@@ -1,23 +1,25 @@
 # Sentinel
 
-Sentinel is a comprehensive, multi-source intelligence and analysis platform designed to provide situational awareness and decision support. By ingesting, processing, and correlating data from a wide variety of domains—including aviation, maritime, finance, and cyber—Sentinel empowers analysts to uncover hidden connections, identify anomalies, and understand complex, evolving situations.
+Sentinel is an event-driven data aggregation and analysis engine. It ingests, processes, and correlates streaming data across aviation, maritime, finance, and cyber domains to identify anomalies and track structural shifts.
 
-The platform is built for scalability and extensibility, allowing new data sources and analytical capabilities to be integrated with ease. Its primary goal is to transform raw data into actionable intelligence, presenting it through an intuitive interface that facilitates exploration and investigation.
+Built on a microservices architecture, Sentinel routes high-throughput telemetry through Kafka and uses local LLM agents (Llama3) alongside TimescaleDB and Neo4j for automated reasoning and intelligence synthesis.
 
 ## Code Structure
 
 The project is organized into the following directories:
 
--   `services/`: Contains the individual microservices that make up the platform.
--   `shared/`: Holds common code, such as data models and utility functions, shared across the microservices.
--   `frontend/`: Contains the user interface of the platform.
--   `infrastructure/`: Includes infrastructure-as-code configurations, such as Kubernetes deployment files.
--   `docs/`: Contains additional documentation for the project.
--   `sentinel_config.yaml`: A central file for static configuration, such as lists of financial instruments or keywords for monitoring.
+-   `services/`: Contains the individual microservices (e.g., collectors, correlation, reasoning, agents).
+-   `shared/`: Holds common code, such as database handlers (`db/`), Kafka utilities (`kafka/`), and business logic (`utils/`).
+-   `frontend/`: Contains the Next.js web-based user interface.
+-   `infrastructure/`: Includes Kubernetes deployment files and Helm charts.
+-   `models/`: Stores exported ONNX machine learning models (e.g., spatial/temporal Isolation Forests).
+-   `regions.geojson`: A geographic boundary file used to trigger geofencing alerts (e.g., Strait of Hormuz).
+-   `sentinel_config.yaml`: Central file for static configuration (e.g., watchlists, keywords).
+-   `docker-compose.yml`: Primary orchestration file to boot up the entire backend stack (Kafka, Redis, TimescaleDB, Neo4j, Microservices).
 
 ## Architecture
 
-The Sentinel platform is built on a distributed, event-driven microservices architecture. This design promotes loose coupling, scalability, and resilience. Services communicate asynchronously using [Apache Kafka](https://kafka.apache.org/) as a central message bus, ensuring that data flows reliably through the processing pipeline.
+Sentinel uses [Apache Kafka](https://kafka.apache.org/) as a central event bus to decouple data collection from downstream enrichment, correlation, and agent execution.
 
 ### Data Flow
 
@@ -28,9 +30,9 @@ The data journey through Sentinel follows a staged pipeline:
 3.  **Correlation**: The `correlation` service consumes raw events, applies a set of configurable rules to identify relationships between them (e.g., a news event occurring near a maritime vessel's location), and publishes "correlated-events" back to Kafka.
 4.  **Enrichment**: The `enrichment` service consumes correlated events. It augments the data with valuable context, resolving entities, scoring anomalies via localized Isolation Forests, and detecting gaps in data streams. High-throughput feeds (TradFi, Maritime, Cyber) utilize `enrich_batch` pipelines to process massive event arrays concurrently using Python's `asyncio.gather`. The enriched events are then published to a final "enriched-events" topic.
 5.  **Reasoning & Agency**: A decentralized network of services and agents performs higher-level analysis.
-    -   The `reasoning` service acts as the Enterprise Reasoning Orchestrator. It feeds enriched data, historical patterns, and graph context into a local Llama3 model via Ollama to synthesize tactical scenarios.
-    -   The `agents` are specialized, autonomous Python services that react to specific event types. They use local AI to perform deep research, discover new connections, and dynamically steer the platform's focus. For example, the `quant_researcher` agent investigates market anomalies and automatically adds correlated stocks to the watchlist.
-6.  **Storage & Visualization**: Downstream services, including a `db_writer` and `graph_writer`, consume enriched events and persist them in a database (e.g., PostgreSQL) and a graph database, making the data available for querying and analysis via the **API** and **Frontend**.
+    -   The `reasoning` service acts as the orchestrator. It feeds enriched data, historical patterns, and graph context into a local Llama3 model via Ollama to synthesize tactical scenarios.
+    -   The `agents` are specialized, autonomous Python services that react to specific event types. They perform automated research, discover connections, and dynamically update watchlists (e.g., the `quant_researcher` agent investigates market anomalies and adds correlated stocks to the tracked entities list).
+6.  **Storage & Visualization**: Downstream services consume enriched events and persist them in TimescaleDB (PostgreSQL) and Neo4j.
 
 ### Architecture Diagram
 
@@ -55,29 +57,39 @@ The data journey through Sentinel follows a staged pipeline:
 
 *   **Microservices**: Each service is a self-contained Python application, containerized using Docker. This allows for independent development, deployment, and scaling.
 *   **Kafka**: Acts as the central nervous system of the platform, decoupling producers of data from consumers. This enables fault tolerance and allows new services to be added without disrupting the existing flow.
+*   **TimescaleDB (PostgreSQL)**: Serves as the primary timeseries database for fast, concurrent event ingestion, ML anomaly bounding, and context injection queries.
+*   **Redis**: Used for high-speed state management, caching dynamic pub/sub correlation rules, deduplicating live feeds, and pipelined batch operations.
+*   **Neo4j**: Graph database used for mapping ontological entity relationships and running pathfinding queries during adversarial wargaming.
 *   **Shared Libraries**: The `shared/` directory contains common code used across services, including database models (`models/`), Kafka utilities (`kafka/`), and business logic (`utils/`). This promotes code reuse and consistency.
 *   **Containerization**: The entire platform is designed to be run using Docker and `docker-compose`, which simplifies setup and ensures a consistent environment for development and production. For production deployments, the Kubernetes configurations in the `infrastructure/` directory can be used.
 
+### Advanced Capabilities
+
+*   **Geofencing & Spatial Intelligence**: The `regions.geojson` file maps critical geopolitical chokepoints (e.g., Strait of Hormuz, Malacca). The `shared/utils/regions.py` utility uses `shapely` to perform point-in-polygon checks against incoming maritime and aviation telemetry, dynamically tagging events that breach these high-risk zones.
+*   **Machine Learning (Isolation Forest)**: Real-time high-throughput feeds (like Equities or Crypto block trades) bypass simple static thresholds. Instead, they are evaluated against an online `IsolationForest` (see `anomaly_scorer.py`). This detects multiscale, multi-timeframe structural anomalies (e.g., 1m, 5m, 1h window spikes) in live volume or volatility.
+*   **OFAC Sanctions Synchronization**: The `enrichment` layer automatically synchronizes with the US Treasury OFAC Sanctions list, performing Levenshtein distance checks against maritime vessel owners, crypto wallets, and tradfi corporate entities.
+*   **Entity-Aware Context Injection**: To prevent LLM context-window pollution, Sentinel uses a surgical `fetch_entity_context()` method. When an agent needs to evaluate an anomaly, it hits TimescaleDB with a parameterized query to fetch *only* the news and anomalies that co-occurred specifically with that entity over the last 24 hours.
+
 ## Agent Architecture
 
-The Python agents (e.g., `quant_researcher`) are built on a modern, high-performance architecture designed for asynchronous I/O and robust data processing. This allows them to perform complex, long-running tasks—like querying multiple databases and calling LLMs—without blocking and while maintaining data integrity.
+Python agents are entirely `asyncio` native, executing complex tasks (like database queries or LLM calls) without blocking the main event loops.
 
 ### Core Principles & Best Practices
 
 *   **Asynchronous Operations**: Agents are built entirely on Python's `asyncio` framework.
-    *   **Why it matters**: This allows an agent to handle multiple tasks concurrently, such as fetching news from a database, querying a graph, and calling an external API all at the same time. This dramatically reduces idle time and increases throughput.
-    *   **Implementation**: I/O-bound operations that don't natively support `asyncio` (like some database drivers or Redis calls) are safely offloaded to a background thread pool using `asyncio.to_thread` or `loop.run_in_executor`. This prevents a single slow operation from freezing the entire agent.
+    *   This allows an agent to handle multiple tasks concurrently, such as fetching news from a database, querying a graph, and calling an external API all at the same time. This dramatically reduces idle time and increases throughput.
+    *   I/O-bound operations that don't natively support `asyncio` (like some database drivers or Redis calls) are safely offloaded to a background thread pool using `asyncio.to_thread` or `loop.run_in_executor`. This prevents a single slow operation from freezing the entire agent.
 
 *   **Structured & Validated AI Output**: Agents use `Pydantic` to define strict data schemas for the expected output from Large Language Models (LLMs).
-    *   **Why it matters**: LLMs can sometimes produce unpredictable or malformed JSON. By parsing the LLM's response into a Pydantic model, we guarantee that the data structure is 100% correct before it's processed or sent downstream. This eliminates a major source of potential bugs and data corruption.
-    *   **Implementation**: A `PeerDiscovery` schema in the `quant_researcher` defines the exact fields and types (e.g., `ticker: str`, `discovery_confidence: float`). If the LLM's output doesn't match this schema, Pydantic raises an error that can be caught and handled gracefully.
+    *   LLMs can sometimes produce unpredictable or malformed JSON. By parsing the LLM's response into a Pydantic model, we guarantee that the data structure is 100% correct before it's processed or sent downstream. This eliminates a major source of potential bugs and data corruption.
+    *   A `PeerDiscovery` schema in the `quant_researcher` defines the exact fields and types (e.g., `ticker: str`, `discovery_confidence: float`). If the LLM's output doesn't match this schema, Pydantic raises an error that can be caught and handled gracefully.
 
 *   **Deterministic State Management**: Agents use Redis for fast, temporary state management, such as deduplicating events or tracking watchlists.
-    *   **Why it matters**: To prevent processing the same event multiple times or creating fragmented state, Redis keys are generated by a single, deterministic function. This ensures consistency.
-    *   **Implementation**: The `_state_key()` method normalizes inputs (e.g., `str.lower()`, `str.strip()`) to create a standard key format (e.g., `sentinel:quant:volume:AAPL`). State is often set with an expiration time (`EX`) to ensure Redis doesn't fill up with stale data.
+    *   To prevent processing the same event multiple times or creating fragmented state, Redis keys are generated by a single, deterministic function. This ensures consistency.
+    *   The `_state_key()` method normalizes inputs (e.g., `str.lower()`, `str.strip()`) to create a standard key format (e.g., `sentinel:quant:volume:AAPL`). State is often set with an expiration time (`EX`) to ensure Redis doesn't fill up with stale data.
 
 *   **Idempotent Database Writes**: When writing data to the graph database (Neo4j), agents use `MERGE` statements.
-    *   **Why it matters**: `MERGE` ensures that a node or relationship is created *only if it doesn't already exist*. This makes the data writing process idempotent—it can be run multiple times with the same input without creating duplicate data or causing errors. This is critical for a resilient, distributed system where an event might be processed more than once.
+    *   `MERGE` ensures that a node or relationship is created *only if it doesn't already exist*. This makes the data writing process idempotent - it can be run multiple times with the same input without creating duplicate data or causing errors. This is critical for a resilient, distributed system where an event might be processed more than once.
 
 *   **Clean Code & Safety**:
     *   **Guard Clauses**: Agents use "early returns" at the beginning of handlers to check for invalid conditions. This keeps the main logic clean, reduces nested `if` statements, and saves compute resources by exiting before performing expensive work.
@@ -98,16 +110,16 @@ The platform is composed of the following services:
     *   `collector-tradfi`: Collects traditional financial market data via Finnhub Websockets & SEC EDGAR, actively parsing out live up/down-tick block trades.
 *   **Correlation**: Correlates events from different sources based on a set of rules.
 *   **Enrichment**: Enriches the collected data with anomaly scores, ML threshold bounds, and live OFAC sanctions list synchronizations.
-*   **Reasoning**: Powered by local Llama3 via Ollama, this service performs higher-level analysis by synthesizing tactical scenarios from correlated data. It executes deep **Adversarial Wargaming** simulations (e.g., State Saboteurs vs. Financial Short Sellers) and features a closed-loop autonomous feedback system that reads AI-generated reports and dynamically adds cashtags (e.g. `$AAPL`) and crypto wallets directly to the data collectors' live Redis watchlists.
-*   **Agents (Local AI)**: A decentralized multi-agent framework powered by a local **Ollama** LLM (Llama3). These specialized agents perform deep, autonomous research in response to specific triggers:
-    *   **Adversarial Wargamer**: Simulates game-theory attack scenarios against the Neo4j context subgraph using hostile personas to isolate critical systemic vulnerabilities.
-    *   **Ontology Master**: Manages the dynamic Neo4j knowledge graph, expands taxonomy, and routes new entities to collector watchlists.
-    *   **News Intel**: Analyzes raw news to extract structured intelligence briefs and discovers hidden entity relationships for the graph.
-    *   **Quant Researcher**: Investigates market volume anomalies across TradFi and Crypto, discovers correlated peers, and auto-injects them into watchlists.
-    *   **Macro Cointegration Engine**: Tracks structural macroeconomic regime drifts and commodity-to-equity decoupling using online Engle-Granger statistical tracking.
-    *   **Macro Strategist**: Synthesizes cointegration data and macro indicators to publish high-level tactical macro scenarios.
-    *   **Rule Agent**: Processes static correlation rules and handles immediate deterministic alerting.
-    *   **Supervisor**: Acts as a centralized synchronization node, safely managing batch writes to the Neo4j graph database to prevent race conditions.
+*   **Reasoning**: Synthesizes scenarios from correlated data via local Llama3. Executes Adversarial Wargaming simulations and features an autonomous feedback loop that adds extracted entities (e.g., cashtags, crypto wallets) back to collector watchlists in Redis.
+*   **Agents (Local AI)**: Decentralized multi-agent framework powered by Ollama:
+    *   **Adversarial Wargamer**: Simulates game-theory attack scenarios against the Neo4j context subgraph to isolate vulnerabilities.
+    *   **Ontology Master**: Manages the dynamic Neo4j knowledge graph, expands taxonomies, and routes new entities.
+    *   **News Intel**: Analyzes raw news for structured intelligence briefs.
+    *   **Quant Researcher**: Investigates market volume anomalies across TradFi and Crypto.
+    *   **Macro Cointegration Engine**: Tracks structural macroeconomic regime drifts using online Engle-Granger statistical tracking.
+    *   **Macro Strategist**: Synthesizes cointegration data and macro indicators.
+    *   **Rule Agent**: Processes static correlation rules.
+    *   **Supervisor**: Centralized synchronization node managing batch writes to Neo4j to prevent race conditions.
 *   **API**: Provides a RESTful API for interacting with the platform.
 *   **Alert Manager**: Manages alerts generated by the system.
 *   **DLQ Worker**: Processes messages from the Dead Letter Queue for auditing and retries.
@@ -191,7 +203,7 @@ npm run dev
 ### Accessing the Services
 
 *   **Kafka UI:** http://localhost:8080
-*   **Neo4j Browser:** http://localhost:7474 (credentials: `neo4j` / `sentinel_graph`)
+*   **Neo4j Browser:** http://localhost:7474
 *   **Backend API Gateway:** http://localhost:8000
 *   **Frontend Web UI:** http://localhost:3000
 

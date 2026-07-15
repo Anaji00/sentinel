@@ -28,7 +28,7 @@ from .pattern_library import PatternLibrary
  
 logger = logging.getLogger("reasoning.tracker")
 
-CONFIRM_THRESHOLD = 80  # Confidence % above which we confirm a scenario
+CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
 
 class ScenarioTracker:

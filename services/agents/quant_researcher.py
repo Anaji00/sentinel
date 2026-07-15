@@ -381,7 +381,7 @@ class QuantResearcherAgent(SentinelAgent):
         Returns list of newly added tickers. IO is safely offloaded.
         """
         added = []
-        candidates = []
+1        candidates = []
 
         for peer in discovery.peer_tickers:
             if (
