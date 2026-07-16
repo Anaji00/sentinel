@@ -48,7 +48,7 @@ class SentinelAgent(ABC):
         self._llm: Optional[OllamaClient] = None
         
         # Concurrency bound: Limit inflight tasks to prevent memory explosion and LLM timeouts
-        self._dispatch_semaphore = asyncio.Semaphore(3)
+        self._dispatch_semaphore = asyncio.Semaphore(int(os.getenv("AGENT_CONCURRENCY", "5")))
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pass

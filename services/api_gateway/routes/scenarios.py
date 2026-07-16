@@ -52,11 +52,6 @@ async def get_correlations(
 ):
     """Fetch raw correlation clusters before AI scenario generation."""
     try:
-        # SECURITY BEST PRACTICE: Parameterized Queries
-        # HOW IT MAPS: The mapping is strictly POSITIONAL (left-to-right). 
-        # The database driver sees the first `%s` and grabs the first item in the 
-        # tuple (min_tier). It sees the second `%s` and grabs the second item (limit).
-        # Never use Python f-strings for SQL queries to avoid SQL Injection!
         return await db.query("""
             SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags 
             FROM correlations 

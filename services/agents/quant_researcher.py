@@ -31,9 +31,6 @@ logger = logging.getLogger("agent.quant_researcher")
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 
-# CONCEPT: Pydantic Data Validation
-# We define strict structures here. When the AI (Llama3) generates a response,
-# Pydantic ensures it perfectly matches this format, preventing downstream crashes.
 
 class PeerTicker(BaseModel):
     ticker: str
@@ -88,17 +85,11 @@ class QuantResearcherAgent(SentinelAgent):
         """
         Explicitly defined, strictly typed deterministic key generator.
         """
-        # BEST PRACTICE: Cache Key Normalization
-        # We force lowercase/uppercase and strip spaces to prevent creating
-        # multiple duplicate keys like "AAPL ", "aapl", and "AAPL" in Redis.
         clean_prefix = str(prefix).strip().lower()
         clean_ticker = str(ticker).strip().upper()
         return f"sentinel:quant:{clean_prefix}:{clean_ticker}"
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        # BEST PRACTICE: Guard Clauses / Early Returns
-        # Check for invalid conditions first and exit immediately (`return None`). 
-        # This keeps the main logic clean (less indentation) and saves expensive LLM compute.
         
         # ── SCENARIO HANDLING ───────────────────────────────────────────────
         if "scenario_id" in message:
@@ -381,7 +372,7 @@ class QuantResearcherAgent(SentinelAgent):
         Returns list of newly added tickers. IO is safely offloaded.
         """
         added = []
-1        candidates = []
+        candidates = []
 
         for peer in discovery.peer_tickers:
             if (
@@ -512,12 +503,10 @@ class QuantResearcherAgent(SentinelAgent):
 
     @staticmethod
     def _is_valid_ticker(ticker: str) -> bool:
-        return (
-            ticker
-            and ticker.isalpha()
-            and ticker.isupper()
-            and 1 <= len(ticker) <= 5
-        )
+        if not ticker: return False
+        # Allow alphanumeric, hyphens, and dots, up to 10 chars
+        clean = ticker.replace('-', '').replace('.', '')
+        return clean.isalnum() and clean.isupper() and 1 <= len(ticker) <= 10
 
     @staticmethod
     def _map_relationship_type(relationship_type: str) -> str:
@@ -530,3 +519,11 @@ class QuantResearcherAgent(SentinelAgent):
             "macro_correlated":  "MACRO_CORRELATED",
         }
         return mapping.get(relationship_type, "CORRELATED_WITH")
+        
+    async def _handle_scenario(self, scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self.logger.info(f"QuantResearcher processing scenario: {scenario.get('scenario_id')}")
+        hypotheses = scenario.get("hypotheses", [])
+        for hypothesis in hypotheses:
+            self.logger.info(f"QuantResearcher assessing hypothesis: {hypothesis}")
+            # Could trigger specific peer research here based on hypothesis text.
+        return None

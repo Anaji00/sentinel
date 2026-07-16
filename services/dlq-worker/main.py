@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dlq-worker")
 
-from shared.kafka import SentinelConsumer, Topics
+from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale
 
 # --- SECRETS & CONFIG ---
@@ -65,8 +65,8 @@ async def _send_telegram_alert(session: aiohttp.ClientSession, topic: str, error
     except Exception as e:
         logger.error(f"Failed to reach Telegram API: {e}")
 
-async def _consume_loop(consumer, db, session):
-    """Blocking loop that reads from Kafka and writes to Postgres."""
+async def _consume_loop(consumer, db, session, producer):
+    """Blocking loop that reads from Kafka and writes to Postgres with retry logic."""
     last_alert_time = 0
 
     while True:
@@ -87,21 +87,38 @@ async def _consume_loop(consumer, db, session):
                     original_topic = payload.get("topic", "unknown")
                     error_msg = payload.get("error", "No error provided")
                     raw_data = payload.get("raw", {})
+                    retry_count = payload.get("retry_count", 0)
 
-                    # 1. Save to PostgreSQL
+                    # 1. Evaluate Retry vs Permanent Failure
+                    if retry_count < 3 and original_topic != "unknown":
+                        retry_count += 1
+                        logger.info(f"Retrying failed event from {original_topic}, attempt {retry_count}")
+                        # Exponential backoff based on retry count
+                        await asyncio.sleep(2 ** retry_count)
+                        
+                        # Re-publish to original topic with incremented retry count
+                        payload["retry_count"] = retry_count
+                        try:
+                            await producer.send(original_topic, raw_data) # Send raw data back
+                            continue # Skip DB insertion since it was retried
+                        except Exception as e:
+                            logger.error(f"Failed to re-publish to {original_topic}: {e}")
+                    
+                    # 2. Save to PostgreSQL (permanently failed or couldn't retry)
+                    permanently_failed = (retry_count >= 3)
                     try:
                         await db.execute("""
-                            INSERT INTO failed_events (original_topic, error_message, raw_payload)
-                            VALUES ($1, $2, $3)
-                        """, (original_topic, error_msg, json.dumps(raw_data)))
-                        logger.info(f"Saved failed event from {original_topic} to DB.")
+                            INSERT INTO failed_events (original_topic, error_message, raw_payload, retry_count, permanently_failed)
+                            VALUES ($1, $2, $3, $4, $5)
+                        """, original_topic, error_msg, json.dumps(raw_data), retry_count, permanently_failed)
+                        logger.info(f"Saved failed event from {original_topic} to DB (Permanent: {permanently_failed}).")
                     except Exception as e:
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
                         sys.exit(1)
 
-                    # 2. Rate-Limited Admin Alert
+                    # 3. Rate-Limited Admin Alert
                     now = time.time()
-                    if now - last_alert_time >= ALERT_COOLDOWN_SECONDS:
+                    if permanently_failed and (now - last_alert_time >= ALERT_COOLDOWN_SECONDS):
                         last_alert_time = now
                         # We are in a sync thread, so we schedule the async HTTP request 
                         # safely back onto the main asyncio loop.
@@ -119,11 +136,14 @@ async def _consume_loop(consumer, db, session):
 
 async def main():
     logger.info("=" * 60)
-    logger.info("SENTINEL  DLQ Worker Service")
+    logger.info("SENTINEL  DLQ Worker Service (with Retry)")
     logger.info("=" * 60)
 
     db = await get_timescale()
     
+    producer = SentinelProducer()
+    await producer.start()
+
     consumer = SentinelConsumer(
         topics=[Topics.DLQ],
         group_id="dlq-worker",
@@ -134,7 +154,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=5)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        await _consume_loop(consumer, db, session)
+        await _consume_loop(consumer, db, session, producer)
 
     await consumer.close()
 

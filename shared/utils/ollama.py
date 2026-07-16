@@ -47,11 +47,6 @@ OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "
 
 # Per-process semaphore. Import this and use it as a context manager in any
 # code that calls Ollama to prevent parallel requests within one process.
-# CONCEPT: Semaphores
-# Think of a Semaphore like a bouncer at a club with a strict capacity.
-# An `asyncio.Semaphore(1)` means only ONE task can enter the guarded code block at a time.
-# Since local LLM inference uses heavy GPU resources, sending multiple requests 
-# at the exact same time would crash it or slow it down to a halt.
 _OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
  
 
@@ -125,10 +120,6 @@ class OllamaClient:
         for attempt in range(max_retries):
             correction = ""
             if attempt > 0:
-                # BEST PRACTICE: "Correction Prompting"
-                # If the AI failed to generate valid JSON in the first attempt,
-                # we append this aggressive correction text to the prompt.
-                # We even feed the AI the exact Python error (`last_error`) so it knows why it failed!
                 correction = (
                     f"\n\n⚠️ CORRECTION REQUIRED (Attempt {attempt + 1}):\n"
                     f"Your previous response failed validation: {last_error}\n"
@@ -254,10 +245,6 @@ class OllamaClient:
         # 3. `*` -> Means "match the previous character zero or more times". So `.*` means "match a bunch of anything".
         # 4. `\}` -> Matches a literal closing curly brace.
         # 
-        # BEST PRACTICE: `re.DOTALL`
-        # By default, the regex `.` matches anything EXCEPT a newline (`\n`). 
-        # Since JSON is almost always formatted across multiple lines, standard `.*` would fail!
-        # `re.DOTALL` forces the `.` to match newlines too, capturing the entire multiline JSON object.
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:

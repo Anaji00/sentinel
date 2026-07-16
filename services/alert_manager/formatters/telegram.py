@@ -36,9 +36,6 @@ def format_correlation(cluster: CorrelationCluster) -> str:
     emoji = TIER_EMOJI.get(cluster.alert_tier, "❓")
     tier = cluster.alert_tier.name
 
-    # BEST PRACTICE: We build the message as a list of strings first. 
-    # Appending to lists is much faster and cleaner in Python than gluing 
-    # strings together with the '+' operator.
     lines = [
         f"{emoji} *\\[{_escape(tier)}\\] {_escape(cluster.rule_name)}*",
         "",

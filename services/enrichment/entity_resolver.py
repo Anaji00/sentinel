@@ -61,7 +61,7 @@ class EntityResolver:
         # This is where we store "Permanent" knowledge (Ownership, past sanctions).
         try:
             # Assumes async_neo4j client implements a query/execute method returning records
-            cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state"
+            cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state, v.watchlist_tags as watchlist_tags"
             records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi}) # Assuming fetch implementation
             if records:
                 data = dict(records[0])
@@ -89,6 +89,77 @@ class EntityResolver:
         # and we want to pick up the "Real" data when it becomes available.
         await self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ttl=3600)
         return data
+
+    async def resolve_vessel_batch(self, mmsi_list: list, ais_meta_list: list) -> list:
+        """
+        Batch resolves vessel identities using Redis pipelining and Neo4j batch queries.
+        """
+        if not mmsi_list:
+            return []
+            
+        # 1. Redis Pipeline
+        pipe = self.redis.pipeline()
+        for mmsi in mmsi_list:
+            pipe.get(f"vessel:info:{mmsi}")
+        
+        try:
+            cached_results = await pipe.execute()
+        except Exception as e:
+            logger.error(f"Redis pipeline failed in resolve_vessel_batch: {e}")
+            cached_results = [None] * len(mmsi_list)
+        
+        results = [None] * len(mmsi_list)
+        missing_mmsis = []
+        missing_indices = []
+        
+        for i, (mmsi, cached) in enumerate(zip(mmsi_list, cached_results)):
+            if cached:
+                results[i] = json.loads(cached)
+            else:
+                missing_mmsis.append(mmsi)
+                missing_indices.append(i)
+                
+        if not missing_mmsis:
+            return results
+            
+        # 2. Neo4j Batch Lookup
+        found_in_neo4j = {}
+        try:
+            cypher = "MATCH (v:Vessel) WHERE v.mmsi IN $mmsis RETURN v.mmsi as mmsi, v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state, v.watchlist_tags as watchlist_tags"
+            records = await self.neo4j.execute_and_fetch(cypher, {"mmsis": missing_mmsis})
+            
+            if records:
+                for r in records:
+                    found_in_neo4j[r["mmsi"]] = dict(r)
+        except Exception as e:
+            logger.debug(f"Neo4j vessel batch lookup failed: {e}")
+
+        # 3. Process Neo4j hits and Fallbacks
+        set_pipe = self.redis.pipeline()
+        for i, mmsi in zip(missing_indices, missing_mmsis):
+            if mmsi in found_in_neo4j:
+                data = found_in_neo4j[mmsi]
+                results[i] = data
+                set_pipe.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
+            else:
+                meta = ais_meta_list[i] or {}
+                name = str(meta.get("ShipName", "")).strip()
+                data = {
+                    "name":        name,
+                    "vessel_type": "Unknown",
+                    "flag_state":  mmsi_to_country(mmsi),
+                    "flags":       check_sanctions(name, mmsi),
+                }
+                results[i] = data
+                set_pipe.set(f"vessel:info:{mmsi}", json.dumps(data), ex=3600)
+                
+        try:
+            if len(set_pipe.command_stack) > 0:
+                await set_pipe.execute()
+        except Exception as e:
+            logger.error(f"Redis pipeline set failed in resolve_vessel_batch: {e}")
+            
+        return results
 
     # ── Aircraft ──────────────────────────────────────────────────────────────
 

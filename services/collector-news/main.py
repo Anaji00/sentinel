@@ -211,14 +211,6 @@ async def poll_feed(
 
             content = await resp.text(errors='ignore')
 
-        # ── KEY CONCEPT: Blocking vs Async ────────────────────────────────────
-        # feedparser is a "blocking" (CPU-bound) library. It does extensive regex
-        # and string parsing. If we called `feedparser.parse(content)` directly here,
-        # it would freeze the Python Event Loop, pausing ALL other downloads.
-        #
-        # Solution: run_in_executor.
-        # This offloads the heavy parsing work to a separate thread, allowing the
-        # main event loop to continue managing other network requests.
         loop = asyncio.get_event_loop()
         feed = await loop.run_in_executor(None, feedparser.parse, content)
         

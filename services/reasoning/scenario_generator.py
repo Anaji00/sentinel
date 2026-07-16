@@ -367,9 +367,6 @@ Return the JSON assessment now:"""
         if not event_ids:
             return []
         try:
-            # BEST PRACTICE: Parameterized SQL Queries
-            # We use `$1` with the `ANY` operator in PostgreSQL to safely pass arrays
-            # natively via asyncpg, avoiding SQL injection and complex string formatting.
             rows = await self.db.query(
                 """
                 SELECT type, source, tags, anomaly_score, occurred_at,

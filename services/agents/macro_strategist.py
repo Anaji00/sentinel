@@ -10,7 +10,7 @@ logger = logging.getLogger("agent.macro_strategist")
 
 class MacroStrategistAgent(SentinelAgent):
     """
-    Runs periodically (e.g., every 4 hours) rather than reacting to live events.
+    Runs periodically (e.g., every 5 minutes) rather than reacting to live events.
     Analyzes historical TimeScale aggregates and Redis Ontology matrices to detect trends.
     """
     @property

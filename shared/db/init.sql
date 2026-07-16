@@ -167,19 +167,7 @@ CREATE INDEX IF NOT EXISTS scenario_embedding_idx ON scenarios USING hnsw (embed
 CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
 
--- ── ENTITY WATCHLIST ──────────────────────────────────────────────────────────
--- PURPOSE: Configuration table for high-interest entities (Sanctioned vessels, VIPs).
--- USAGE: Ingestion logic checks this table to elevate priority/severity of incoming events.
-CREATE TABLE IF NOT EXISTS entity_watchlist (
-    id            SERIAL       PRIMARY KEY,
-    entity_id     TEXT NOT NULL UNIQUE,
-    entity_type   TEXT,
-    entity_name   TEXT,
-    added_at      TIMESTAMPTZ  DEFAULT NOW(),
-    notes         TEXT,
-    alert_tier_min INT         DEFAULT 1,
-    active        BOOLEAN      DEFAULT TRUE
-);
+
 
 -- shared/db/init.sql (Append this to the bottom)
 
@@ -189,8 +177,13 @@ CREATE TABLE IF NOT EXISTS failed_events (
     original_topic TEXT NOT NULL,
     error_message TEXT NOT NULL,
     raw_payload JSONB NOT NULL,
-    resolved BOOLEAN DEFAULT FALSE
+    resolved BOOLEAN DEFAULT FALSE,
+    retry_count INT DEFAULT 0,
+    permanently_failed BOOLEAN DEFAULT FALSE
 );
+
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS permanently_failed BOOLEAN DEFAULT FALSE;
 
 -- Index for fast querying by topic and resolution status
 CREATE INDEX IF NOT EXISTS idx_failed_events_topic ON failed_events(original_topic, resolved);

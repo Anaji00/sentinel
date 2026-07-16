@@ -83,8 +83,7 @@ class VesselGapDetector:
             batch_events_to_write.extend(events)
 
         if batch_events_to_write:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.db_writer.write_events_batch, batch_events_to_write)
+            await self.db_writer.write_events_batch(batch_events_to_write)
 
         if fired:
             logger.info(f"Gap detector: {fired} VESSEL_DARK events safely emitted & persisted.")

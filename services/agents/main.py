@@ -9,8 +9,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
-# BEST PRACTICE: Dynamically adding the project root to sys.path ensures 
-# that absolute imports (like 'from shared.db import...') work consistently from anywhere.
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
@@ -63,9 +61,6 @@ async def run_task_queue_worker(redis_client, agents: dict):
     while True:
         try:
             # BLPOP blocks for 1s
-            # CONCEPT: Event Loop Non-Blocking IO
-            # Since Redis `blpop` is synchronous and blocking, running it directly would freeze the entire asyncio event loop.
-            # `run_in_executor(None, ...)` safely offloads this blocking call to a background thread pool.
             result = await redis_client.raw.blpop(queues, timeout=1.0)
 
             if not result:
@@ -107,10 +102,6 @@ def build_agent(
     Factory function: instantiates an agent with all shared infrastructure.
     Separates object construction from the async runtime.
     """
-    # CONCEPT: Dependency Injection
-    # Instead of each agent creating its own database connections, we pass them in from the outside.
-    # This saves memory (via connection pooling) and makes testing easier because
-    # we can effortlessly pass mock databases into this factory during unit tests.
     redis   = shared_infra["redis"]
     db      = shared_infra["db"]
     neo4j   = shared_infra["neo4j"]
@@ -280,8 +271,6 @@ async def main():
             signal.signal(signal.SIGTERM, handle_sigterm)
 
         # Wait for all tasks. If any crashes, re-raise to restart via supervisor.
-        # CONCEPT: asyncio.gather runs multiple asynchronous operations concurrently.
-        # If any of these agent tasks raise an unhandled exception, gather will immediately throw it here.
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         logger.info("SIGINT received — graceful shutdown")

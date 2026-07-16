@@ -99,14 +99,20 @@ class AdversarialSimulationEngine:
 
 async def main_pipeline_pump():
     import aiohttp
+    
+    neo4j = await get_neo4j()
+    redis = await get_redis()
+    producer = SentinelProducer()
+    await producer.start()
+    
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=5)) as session:
-        engine = AdversarialSimulationEngine(get_neo4j(), get_redis(), OllamaClient(session), SentinelProducer())
+        engine = AdversarialSimulationEngine(neo4j, redis, OllamaClient(session), producer)
         consumer = SentinelConsumer(topics = [Topics.CORRELATIONS], group_id="simulation-wargamer", auto_offset_reset="latest")
-        loop = asyncio.get_running_loop()
+        await consumer.start()
 
         try:
             while True:
-                messages = await loop.run_in_executor(None, consumer.raw.poll, 1.0)
+                messages = await consumer.get_batch(timeout_ms=1000)
                 if not messages: continue
                 
                 for _, msg_list in messages.items():
@@ -114,9 +120,11 @@ async def main_pipeline_pump():
                         payload = json.loads(msg.value.decode('utf-8')) if isinstance(msg.value, bytes) else msg.value
                         sim_result = await engine.run_predictive_wargame(payload)
                         if sim_result:
-                            engine.producer.send("agents.predictions.output", sim_result, key=sim_result.get("predicted_next_target_entity_id"))
+                            await engine.producer.send("agents.predictions.output", sim_result, key=sim_result.get("predicted_next_target_entity_id"))
+                
+                await consumer.commit()
         finally:
-            consumer.close()
+            await consumer.close()
 
 if __name__ == "__main__":
     asyncio.run(main_pipeline_pump())

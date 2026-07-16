@@ -78,18 +78,12 @@ class Neo4jClient:
 # ── TIMESCALEDB ───────────────────────────────────────────────────────────────
 
 class TimescaleClient:
-    # CONCEPT: The "Archive" & "Ledger".
-    # This connects to PostgreSQL optimized with TimescaleDB.
-    # ROLE: Stores the hard facts (Events, Vessel Positions).
-    # WHY TIMESCALE? Standard Postgres gets slow after 100M rows of time-data.
-    # Timescale chops data into "chunks" (by day/week) so it stays fast even with billions of rows.
 
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
     async def _connect(self, retries: int = 12):
         dsn = os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel")
         async def init_connection(conn):
-            # BEST PRACTICE: Natively encode/decode JSONB at the driver level
             await conn.set_type_codec(
                 'jsonb',
                 encoder=json.dumps,
@@ -143,11 +137,6 @@ class TimescaleClient:
 
 # ── SINGLETONS ────────────────────────────────────────────────────────────────
 
-# CONCEPT: The "Singleton Pattern".
-# Problem: Creating a new DB connection takes time. If every function created its
-# own TimescaleClient(), we'd have thousands of connections and crash the server.
-# Solution: We create ONE global instance. Everyone shares it.
-# The `get_timescale()` function checks: "Do we have one? If yes, use it. If no, make one."
 
 _timescale: Optional[TimescaleClient] = None
 _async_redis: Optional[RedisClient] = None

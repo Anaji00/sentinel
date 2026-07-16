@@ -31,8 +31,23 @@ class TradFiEnricher:
         self.graph = graph_writer
 
     async def enrich_batch(self, events: list) -> list:
-        tasks = [self.enrich(raw) for raw in events]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not events: return []
+        
+        equity_trades = []
+        other_tasks = []
+        
+        for raw in events:
+            source = raw.source
+            if source == "finnhub_equities":
+                trade_type = raw.raw_payload.get("trade_type", "RAW_TRADE")
+                if trade_type != "OHLCV_MINUTE_BAR":
+                    equity_trades.append(raw)
+                else:
+                    other_tasks.append(self.enrich(raw))
+            else:
+                other_tasks.append(self.enrich(raw))
+                
+        results = await asyncio.gather(*other_tasks, return_exceptions=True) if other_tasks else []
         normalized_events = []
         for res in results:
             if isinstance(res, NormalizedEvent):
@@ -42,6 +57,10 @@ class TradFiEnricher:
             elif isinstance(res, Exception):
                 logger.error(f"Error enriching tradfi batch item: {res}")
                 
+        if equity_trades:
+            batched_results = await self._enrich_equity_trade_batch(equity_trades)
+            normalized_events.extend(batched_results)
+            
         return normalized_events
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
@@ -53,71 +72,90 @@ class TradFiEnricher:
             if trade_type == "OHLCV_MINUTE_BAR":
                 return await self._enrich_equity_candle(raw, p)
             else:   
-                return await self._enrich_equity_trade(raw, p)
+                # We don't usually call this anymore since enrich_batch handles it, but just in case
+                res = await self._enrich_equity_trade_batch([raw])
+                return res[0] if res else None
         elif source == "sec_form4":
             return await self._enrich_insider(raw, p)
             
         return None
 
-    async def _enrich_equity_trade(self, raw, p) -> Optional[NormalizedEvent]:
-        ticker = (p.get("ticker") or "").upper()
-        if not ticker or ticker == "UNKNOWN": return None
-        
-        price = float(p.get("close") or p.get("price", 0))
-        volume = float(p.get("volume") or p.get("size_shares", 0))
-        notional = float(p.get("notional_usd") or (price * volume))
-        
-        # Cache the absolute latest price so the Cointegration Engine can reference it
-        if price > 0:
-            try:
-                await self.redis_client.raw.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
-            except Exception as e:
-                logger.error(f"Failed to cache latest quote for {ticker}: {e}")
-        
-        
-        # Send to Anomaly Scorer for ML isolation forest & volume ratio check
-        anomaly = await self.scorer.score_financial_trade("tradfi", ticker, notional, volume)
-        logger.info(f"🧠 ML INFERENCE | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
-        
-        tags = ["tradfi", "equity_block", ticker.lower()]
-        
-        # Determine Aggressor Side (Institutional Distribution vs Accumulation)
-        aggressor_side = p.get("aggressor_side", p.get("side", "UNKNOWN")).upper()
-        if aggressor_side == "UNKNOWN":
-            tick_dir = p.get("tick_direction", "")
-            if tick_dir == "DownTick":
-                aggressor_side = "SELL"
-            elif tick_dir == "UpTick":
-                aggressor_side = "BUY"
-                
-        # Dark pool logic
-        conditions = str(p.get("conditions", "")).lower()
-        is_dark_pool = "out of sequence" in conditions or "average price" in conditions
-        if is_dark_pool:
-            tags.append("dark_pool_print")
+    async def _enrich_equity_trade_batch(self, raw_events: list) -> list:
+        # Phase 1: Extract Features
+        parsed_events = []
+        trades_for_scoring = []
+        for raw in raw_events:
+            p = raw.raw_payload
+            ticker = (p.get("ticker") or "").upper()
+            if not ticker or ticker == "UNKNOWN": continue
             
-        direction_str = "Block Trade"
+            price = float(p.get("close") or p.get("price", 0))
+            volume = float(p.get("volume") or p.get("size_shares", 0))
+            notional = float(p.get("notional_usd") or (price * volume))
+            
+            parsed_events.append((raw, p, ticker, price, volume, notional))
+            trades_for_scoring.append((ticker, notional, volume))
+            
+        if not parsed_events: return []
         
-        if aggressor_side == "SELL":
-            tags.append("aggressor_sell")
-            # Severe urgency if dumped on Lit Market instead of Dark Pool
-            if not is_dark_pool:
-                tags.append("lit_aggressor_sell")
-                anomaly = min(1.0, anomaly * 1.2)
+        # Phase 2: Batch ML Scoring
+        scores = await self.scorer.score_financial_trade_batch("tradfi", trades_for_scoring)
+        
+        # Phase 3: Finalize
+        results = []
+        set_pipe = self.redis_client.raw.pipeline()
+        for i, (raw, p, ticker, price, volume, notional) in enumerate(parsed_events):
+            anomaly = scores[i]
+            
+            if price > 0:
+                set_pipe.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
                 
-            if notional > 5_000_000:
-                tags.append("institutional_distribution")
-                anomaly = min(1.0, anomaly * 1.3)
-                direction_str = "🔴 INSTITUTIONAL DUMP"
+            logger.info(f"🧠 ML INFERENCE | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
+            
+            tags = ["tradfi", "equity_block", ticker.lower()]
+            
+            aggressor_side = p.get("aggressor_side", p.get("side", "UNKNOWN")).upper()
+            if aggressor_side == "UNKNOWN":
+                tick_dir = p.get("tick_direction", "")
+                if tick_dir == "DownTick":
+                    aggressor_side = "SELL"
+                elif tick_dir == "UpTick":
+                    aggressor_side = "BUY"
+                    
+            conditions = str(p.get("conditions", "")).lower()
+            is_dark_pool = "out of sequence" in conditions or "average price" in conditions
+            if is_dark_pool:
+                tags.append("dark_pool_print")
                 
-        elif aggressor_side == "BUY":
-            tags.append("aggressor_buy")
-            if notional > 5_000_000:
-                tags.append("institutional_accumulation")
-                anomaly = min(1.0, anomaly * 1.1)
-                direction_str = "🟢 ACCUMULATION SWEEP"
+            direction_str = "Block Trade"
+            
+            if aggressor_side == "SELL":
+                tags.append("aggressor_sell")
+                if not is_dark_pool:
+                    tags.append("lit_aggressor_sell")
+                    anomaly = min(1.0, anomaly * 1.2)
+                if notional > 5_000_000:
+                    tags.append("institutional_distribution")
+                    anomaly = min(1.0, anomaly * 1.3)
+                    direction_str = "🔴 INSTITUTIONAL DUMP"
+            elif aggressor_side == "BUY":
+                tags.append("aggressor_buy")
+                if notional > 5_000_000:
+                    tags.append("institutional_accumulation")
+                    anomaly = min(1.0, anomaly * 1.1)
+                    direction_str = "🟢 ACCUMULATION SWEEP"
 
-        # Capitulation Check vs Baseline
+            if anomaly < 0.6:  # Strict floor
+                continue
+                
+            results.append(self._finalize_equity_trade(raw, p, ticker, price, volume, notional, tags, direction_str, anomaly))
+            
+        await set_pipe.execute()
+        
+        final_events = await asyncio.gather(*results) if results else []
+        return [e for e in final_events if e]
+
+    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly):
         try:
             baseline = await self.redis_client.raw.get(f"baseline:volume:{ticker}")
             if baseline and float(baseline) > 0 and volume > float(baseline) * 20:
@@ -125,9 +163,6 @@ class TradFiEnricher:
                 anomaly = min(1.0, anomaly * 1.4)
         except Exception as e:
             logger.debug(f"Baseline fetch failed: {e}")
-
-        if anomaly < 0.6:  # Strict floor. Ignore non-anomalous trades.
-            return None
 
         await self._sync_geo_watchlist(ticker, tags)
         await self._update_volume_baseline(ticker, volume)
@@ -143,7 +178,6 @@ class TradFiEnricher:
         return NormalizedEvent(
             event_id=raw.event_id,
             type=EventType.EQUITY_BLOCK,
-             # Emits to financial correlation engine
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
@@ -154,7 +188,7 @@ class TradFiEnricher:
                 premium_usd=notional,
                 underlying_price=price,
                 volume=volume,
-                volume_oi_ratio=p.get("vol_oi_ratio") # BUG 4 FIXED: Maps field
+                volume_oi_ratio=p.get("vol_oi_ratio")
             ),
             headline=f"🐋 {direction_str} | {ticker} ${notional/1e6:.2f}M | Anomaly: {anomaly:.2f}",
             tags=tags,

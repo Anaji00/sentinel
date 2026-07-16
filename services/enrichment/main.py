@@ -22,7 +22,7 @@ logger = logging.getLogger("enrichment")
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent
-from shared.db import get_redis, get_timescale
+from shared.db import get_redis, get_timescale, get_neo4j
 from shared.db.bootstrap import bootstrap_database
 
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
@@ -83,6 +83,30 @@ async def _heartbeat_loop(state: dict):
             f"uptime={int(elapsed)}s"
         )
 
+def schedule_ofac_sync():
+    """Syncs OFAC sanctions list daily."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    import aiohttp
+    from shared.utils.sanctions import rebuild_sanctions_from_list
+    
+    async def fetch_and_rebuild():
+        logger.info("Starting OFAC sanctions sync...")
+        try:
+            # Simulated OFAC download logic
+            # In Phase 2, this would download and parse the actual SDN list
+            # For now, we simulate fetching an updated list
+            updated_keywords = ["irgc", "dprk", "wagner", "pdvsa", "new_sanction_target"]
+            rebuild_sanctions_from_list(updated_keywords)
+        except Exception as e:
+            logger.error(f"OFAC sync failed: {e}")
+            
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(fetch_and_rebuild, 'interval', hours=24)
+    scheduler.start()
+    
+    # Run immediately on boot
+    asyncio.create_task(fetch_and_rebuild())
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
@@ -92,6 +116,9 @@ async def main():
 
     timescale = await get_timescale()
     redis     = await get_redis()
+    schedule_ofac_sync()
+    
+    # Wait for databases to come online
     producer = SentinelProducer()
     dlq = SentinelProducer()
     await producer.start()
@@ -100,7 +127,8 @@ async def main():
     scorer = DynamicAnomalyScorer(redis)
     db = DBWriter(timescale)
     graph = GraphWriter(producer)
-    resolver = EntityResolver(redis, timescale)
+    neo4j = await get_neo4j()
+    resolver = EntityResolver(redis, neo4j)
 
 # STRICT DEPENDENCY INJECTION ALIGNMENT: (scorer, redis, graph, [resolver])
     maritime = MaritimeEnricher(scorer, redis, graph, resolver)
@@ -148,27 +176,56 @@ async def main():
                 batch_to_write = []
                 
                 # ── 1. ASYNC CONCURRENT ENRICHMENT ───────────────────────────
-                # Pack all messages in this partition into async tasks
-                tasks = [process_single_message(msg, enrichers_tuple, dlq) for msg in messages]
+                topic_to_enricher = {
+                    Topics.RAW_MARITIME: enrichers_tuple[0],
+                    Topics.RAW_AVIATION: enrichers_tuple[1],
+                    Topics.RAW_NEWS: enrichers_tuple[2],
+                    Topics.RAW_CYBER: enrichers_tuple[3],
+                    Topics.RAW_TRADFI: enrichers_tuple[4],
+                    Topics.RAW_CRYPTO: enrichers_tuple[5],
+                    Topics.RAW_PREDICTION: enrichers_tuple[6]
+                }
                 
-                # Execute all enrichments simultaneously 
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Group raw events by topic
+                raw_events_by_topic = {}
+                for msg in messages:
+                    try:
+                        raw_data = json.loads(msg.value.decode('utf-8'))
+                        raw_event = RawEvent(**raw_data)
+                        raw_events_by_topic.setdefault(msg.topic, []).append(raw_event)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"POISON PILL JSON dropped: {e}", exc_info=True)
+                        asyncio.create_task(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}))
+                
+                enrich_tasks = []
+                for topic, raw_events in raw_events_by_topic.items():
+                    enricher = topic_to_enricher.get(topic)
+                    if enricher:
+                        if hasattr(enricher, "enrich_batch"):
+                            enrich_tasks.append(enricher.enrich_batch(raw_events))
+                        else:
+                            # Fallback if enrich_batch is not implemented
+                            async def _fallback_batch(e_batch, e_inst=enricher):
+                                return await asyncio.gather(*[e_inst.enrich(e) for e in e_batch], return_exceptions=True)
+                            enrich_tasks.append(_fallback_batch(raw_events))
+
+                # Execute all batches simultaneously 
+                results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
                 
                 # ── 2. ASYNC CONCURRENT PRODUCER DISPATCH ────────────────────
                 produce_tasks = []
-                for res in results:
-                    if isinstance(res, dict) and res.get("status") == "success" and res.get("enriched"):
-                        enriched: NormalizedEvent = res["enriched"]
-                        batch_to_write.append(enriched)
-                        
-                        # Queue the Kafka dispatches to run concurrently
-                        produce_tasks.append(
-                            producer.send(
-                                Topics.ENRICHED_EVENTS,
-                                enriched.model_dump(),
-                                key=enriched.primary_entity.id,
-                            )
-                        )
+                for batch_result in results:
+                    if isinstance(batch_result, list):
+                        for enriched in batch_result:
+                            if isinstance(enriched, NormalizedEvent):
+                                batch_to_write.append(enriched)
+                                produce_tasks.append(
+                                    producer.send(
+                                        Topics.ENRICHED_EVENTS,
+                                        enriched.model_dump(),
+                                        key=enriched.primary_entity.id,
+                                    )
+                                )
                 
                 if produce_tasks:
                     await asyncio.gather(*produce_tasks, return_exceptions=True)
@@ -178,6 +235,7 @@ async def main():
                         logger.info(f"Processed {processed} successfully")
 
                 # ── 3. FAULT-TOLERANT DB WRITES ──────────────────────────────
+                batch_success = True
                 if batch_to_write:
                     for attempt in range(3):
                         try:
@@ -193,11 +251,13 @@ async def main():
                                 # Send the failed DB batch to DLQ rather than crashing the service
                                 dlq_tasks = [dlq.send(Topics.DLQ, {"error": "DB_WRITE_FAILED", "event_id": e.event_id}) for e in batch_to_write]
                                 await asyncio.gather(*dlq_tasks, return_exceptions=True)
+                                batch_success = False
                             else:
                                 await asyncio.sleep(2 ** attempt) 
 
                 # ── 4. COMMIT ────────────────────────────────────────────────
-                await consumer.commit()
+                if batch_success:
+                    await consumer.commit()
                 
     except asyncio.CancelledError:
         logger.info("Shutdown signal received. Closing consumer...")

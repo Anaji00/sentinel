@@ -54,9 +54,6 @@ class SoftCorrelator:
       Running Qdrant instance  (add to docker-compose in Phase 2)
     """
     def __init__(self, ollama_client: OllamaClient):
-        # BEST PRACTICE: Lazy Loading. 
-        # We don't load the heavy ML model or DB client right away. 
-        # This keeps the app lightweight if Soft Correlation is turned off.
         self._model = None  # Lazy load the embedding model
         self._client = None  # Lazy load the Qdrant client
         self._enabled = False  # Set to True when ready to activate'
@@ -68,39 +65,39 @@ class SoftCorrelator:
         if self._enabled: return
         async with self._load_lock:
             if self._enabled: return  # Double-check locking
-        try:
-            import sentence_transformers
-            from qdrant_client import AsyncQdrantClient
-            from qdrant_client.http import models
-            loop = asyncio.get_running_loop()
-            self._model = await loop.run_in_executor(
-                    None, 
-                    lambda: sentence_transformers.SentenceTransformer("all-mpnet-base-v2")
-                )
-            
-            logger.info("SentenceTransformer model loaded")
-            qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-            # Connect to the local Qdrant instance on its default port.
-            self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
-            # Mark the correlator as fully active and ready to process events.
-            for collection in ["sentinel_events", "sentinel_concepts"]:
-                exists = await self._client.collection_exists(collection)
-                if not exists:
-                    try:
-                        await self._client.create_collection(
-                            collection_name=collection,
-                            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
-                        )
-                    except Exception as ce:
-                        if "already exists" in str(ce).lower() or "409" in str(ce):
-                            logger.info(f"Collection '{collection}' was created concurrently.")
-                        else:
-                            raise
-            self._enabled = True
-            logger.info(f"Async Qdrant client connected to {qdrant_host} and SoftCorrelator enabled.")
-        except Exception as e:
-            # Catch any other errors (like Qdrant being unreachable) so the main app doesn't crash.
-            logger.warning(f"Qdrant unreachable (Phase 2 feature): {e}. Soft correlation disabled.")
+            try:
+                import sentence_transformers
+                from qdrant_client import AsyncQdrantClient
+                from qdrant_client.http import models
+                loop = asyncio.get_running_loop()
+                self._model = await loop.run_in_executor(
+                        None, 
+                        lambda: sentence_transformers.SentenceTransformer("all-mpnet-base-v2")
+                    )
+                
+                logger.info("SentenceTransformer model loaded")
+                qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+                # Connect to the local Qdrant instance on its default port.
+                self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
+                # Mark the correlator as fully active and ready to process events.
+                for collection in ["sentinel_events", "sentinel_concepts"]:
+                    exists = await self._client.collection_exists(collection)
+                    if not exists:
+                        try:
+                            await self._client.create_collection(
+                                collection_name=collection,
+                                vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
+                            )
+                        except Exception as ce:
+                            if "already exists" in str(ce).lower() or "409" in str(ce):
+                                logger.info(f"Collection '{collection}' was created concurrently.")
+                            else:
+                                raise
+                self._enabled = True
+                logger.info(f"Async Qdrant client connected to {qdrant_host} and SoftCorrelator enabled.")
+            except Exception as e:
+                # Catch any other errors (like Qdrant being unreachable) so the main app doesn't crash.
+                logger.warning(f"Qdrant unreachable (Phase 2 feature): {e}. Soft correlation disabled.")
         
     async def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
         """Convert event to embedding vector for similarity search."""

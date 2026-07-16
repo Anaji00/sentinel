@@ -37,146 +37,177 @@ class DynamicAnomalyScorer:
         return "spatial" if event_type in ["vessel_position", "vessel_dark", "bgp_hijack"] else "temporal"
 
     async def _get_temporal_sequence(self, event_type: str, entity_id: str, new_features: list, seq_len: int = 10) -> list:
-        """
-        Maintains a rolling window of the last N ticks in Redis.
-        Crucial for feeding the LSTM a continuous time-series sequence.
-        """
         if not self.redis:
-            # Fallback: mock a sequence if Redis is dead
             return [new_features] * seq_len 
 
         key = f"sentinel:ml:sequence:{event_type}:{entity_id}"
-        
-        # PIPELINE ASYNC REDIS
-
         pipe = self.redis.raw.pipeline()
         pipe.lpush(key, json.dumps(new_features))
         pipe.ltrim(key, 0, seq_len - 1)
         pipe.lrange(key, 0, -1)
         results = await pipe.execute()
 
-        raw_items = results[2]  # The result of lrange
+        raw_items = results[2]
         sequence = [json.loads(item) for item in raw_items if item]
-        sequence.reverse()  # Oldest first
+        sequence.reverse()
         return sequence
 
-    async def _dynamic_normalize(self, ticker: str, feature_name: str, raw_value: float) -> float:
-        """
-        Calculates a live Z-score for a specific asset's feature.
-        Ensures the ONNX model receives normalized inputs ~ N(0,1), preventing magnitude blindness.
-        """
-        if not self.redis: return raw_value / 1000.0 
-
-        mean_key = f"sentinel:stats:{ticker}:{feature_name}:mean"
-        var_key = f"sentinel:stats:{ticker}:{feature_name}:var"
-        
+    async def _get_temporal_sequence_batch(self, event_type: str, entities: list, features_list: list, seq_len: int = 10) -> list:
+        if not self.redis:
+            return [[f] * seq_len for f in features_list]
+            
         pipe = self.redis.raw.pipeline()
-        pipe.get(mean_key)
-        pipe.get(var_key)
+        for entity_id, new_features in zip(entities, features_list):
+            key = f"sentinel:ml:sequence:{event_type}:{entity_id}"
+            pipe.lpush(key, json.dumps(new_features))
+            pipe.ltrim(key, 0, seq_len - 1)
+            pipe.lrange(key, 0, -1)
+            
+        results = await pipe.execute()
+        sequences = []
+        for i in range(len(entities)):
+            raw_items = results[i*3 + 2]
+            seq = [json.loads(item) for item in raw_items if item]
+            seq.reverse()
+            sequences.append(seq)
+        return sequences
+
+    async def _dynamic_normalize(self, ticker: str, feature_name: str, raw_value: float) -> float:
+        res = await self._dynamic_normalize_batch([(ticker, feature_name, raw_value)])
+        return res[0]
+        
+    async def _dynamic_normalize_batch(self, requests: list) -> list:
+        # requests = [(ticker, feature_name, raw_value), ...]
+        if not self.redis or not requests:
+            return [r[2] / 1000.0 for r in requests]
+            
+        pipe = self.redis.raw.pipeline()
+        for ticker, feature_name, _ in requests:
+            pipe.get(f"sentinel:stats:{ticker}:{feature_name}:mean")
+            pipe.get(f"sentinel:stats:{ticker}:{feature_name}:var")
+        
         res = await pipe.execute()
         
-        mean = float(res[0] or raw_value)
-        var = float(res[1] or 1.0)
-        std_dev = np.sqrt(var) + 1e-5 # Epsilon to prevent division by zero on illiquid assets
+        results = []
+        set_pipe = self.redis.raw.pipeline()
+        local_cache = {}
         
-        # Smoothly update the baseline (Online Variance Approximation)
-        new_mean = (self.alpha * raw_value) + ((1 - self.alpha) * mean)
-        new_var = (self.alpha * (raw_value - mean)**2) + ((1 - self.alpha) * var)
-        
-        pipe = self.redis.raw.pipeline()
-        pipe.set(mean_key, new_mean)
-        pipe.set(var_key, new_var)
-        await pipe.execute()
-        
-        return (raw_value - mean) / std_dev
+        idx = 0
+        for ticker, feature_name, raw_value in requests:
+            key_base = f"sentinel:stats:{ticker}:{feature_name}"
+            
+            if key_base in local_cache:
+                mean, var = local_cache[key_base]
+            else:
+                mean = float(res[idx] or raw_value)
+                var = float(res[idx+1] or 1.0)
+            
+            idx += 2
+            
+            std_dev = np.sqrt(var) + 1e-5
+            results.append((raw_value - mean) / std_dev)
+            
+            new_mean = (self.alpha * raw_value) + ((1 - self.alpha) * mean)
+            new_var = (self.alpha * (raw_value - mean)**2) + ((1 - self.alpha) * var)
+            
+            local_cache[key_base] = (new_mean, new_var)
+            
+        for key_base, (m, v) in local_cache.items():
+            set_pipe.set(f"{key_base}:mean", m, ex=604800)
+            set_pipe.set(f"{key_base}:var", v, ex=604800)
+            
+        await set_pipe.execute()
+        return results
 
     async def _check_ema_gatekeeper(self, domain: str, raw_score: float) -> bool:
-        if not self.redis: return raw_score > 0.60
+        res = await self._check_ema_gatekeeper_batch(domain, [raw_score])
+        return res[0]
+        
+    async def _check_ema_gatekeeper_batch(self, domain: str, raw_scores: list) -> list:
+        if not self.redis or not raw_scores:
+            return [score > 0.60 for score in raw_scores]
 
         mean_key = f"sentinel:ml:ema_mean:{domain}"
-        var_key = f"sentinel:ml:ema_var:{domain}"  
+        var_key = f"sentinel:ml:ema_var:{domain}"
+        
         current_mean = float(await self.redis.raw.get(mean_key) or 0.5)
         current_var = float(await self.redis.raw.get(var_key) or 0.05)
-        current_std = np.sqrt(current_var)
-
-        dynamic_threshold = current_mean + (self.z_score_threshold * current_std)
-        is_anomaly = raw_score > dynamic_threshold
-
-        # Update rolling baseline smoothly
-        new_mean = (self.alpha * raw_score) + ((1 - self.alpha) * current_mean)
-        new_var = (self.alpha * (raw_score - current_mean)**2) + ((1 - self.alpha) * current_var)
+        
+        results = []
+        for score in raw_scores:
+            current_std = np.sqrt(current_var)
+            dynamic_threshold = current_mean + (self.z_score_threshold * current_std)
+            results.append(score > dynamic_threshold)
+            
+            current_mean = (self.alpha * score) + ((1 - self.alpha) * current_mean)
+            current_var = (self.alpha * (score - current_mean)**2) + ((1 - self.alpha) * current_var)
 
         pipe = self.redis.raw.pipeline()
-        pipe.set(mean_key, new_mean)
-        pipe.set(var_key, new_var)
+        pipe.set(mean_key, current_mean)
+        pipe.set(var_key, current_var)
         await pipe.execute()
-
-        return is_anomaly
+        
+        return results
     
     async def score_event(self, event_type: str, entity_id: str, features: list) -> dict:
-        """
-        The Master Router: Shapes the data and executes the appropriate ONNX graph.
-        """
+        res = await self.score_event_batch(event_type, [entity_id], [features])
+        return res[0]
+        
+    async def score_event_batch(self, event_type: str, entities: list, features_list: list) -> list:
         domain = self._get_domain(event_type)
         session = self.sessions.get(domain)
-
-        if not session:
-            return {"score": 0.0, "is_significant": False, "domain": domain}
         
+        if not session or not features_list:
+            return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
+            
         try:
             loop = asyncio.get_running_loop()
             input_name = session.get_inputs()[0].name
-            if domain == "spatial":
-                # ─── ISOLATION FOREST INFERENCE ───
-                # Shape: [1, N_features]
-                X = np.array(features, dtype=np.float32).reshape(1, -1)
-                
-                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                
-                # ── CRITICAL FIX: DYNAMIC OUTPUT PARSING ──
-                # ONNX IsolationForest can output either a ZipMap (dict) or a raw ndarray.
-                raw_output = predictions[1][0] 
-                
-                if isinstance(raw_output, dict):
-                    risk_score = float(raw_output.get(-1, 0.5))
-                else:
-                    # Extract raw float. sklearn's decision_function returns negative values 
-                    # for outliers and positive for inliers (typically -0.5 to 0.5).
-                    # We map this to a 0-1 scale where higher = more anomalous.
-                    val = float(np.atleast_1d(raw_output)[0])
-                    risk_score = max(0.0, 0.5 - val)
-                
-                logger.debug(f"ONNX raw outputs for {entity_id}: preds_0={predictions[0]}, preds_1={predictions[1]}, risk_score={risk_score}")
-                # ──────────────────────────────────────────
-
-            else:
-                # ─── LSTM AUTOENCODER INFERENCE ───
-                seq_len = 10
-                sequence = await self._get_temporal_sequence(event_type, entity_id, features, seq_len)
-                
-                if len(sequence) < seq_len:
-                    return {"score": 0.0, "is_significant": False, "domain": domain}
-
-                X = np.array(sequence, dtype=np.float32).reshape(1, seq_len, -1)
-                
-                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                reconstructed_X = predictions[0]
-                reconstruction_error = np.mean(np.square(X - reconstructed_X))
-                risk_score = float(1.0 - np.exp(-reconstruction_error))
-
-            # Pass the normalized risk score to the EMA Gatekeeper
-            is_significant = await self._check_ema_gatekeeper(domain, risk_score)
-
-            return {
-                "score": round(risk_score, 4),
-                "is_significant": is_significant,
-                "domain": domain
-            }
             
+            if domain == "spatial":
+                X = np.array(features_list, dtype=np.float32)
+                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
+                
+                raw_outputs = predictions[1]
+                scores = []
+                for out in raw_outputs:
+                    if isinstance(out, dict):
+                        scores.append(float(out.get(-1, 0.5)))
+                    else:
+                        val = float(np.atleast_1d(out)[0])
+                        scores.append(max(0.0, 0.5 - val))
+                        
+                is_significant_list = await self._check_ema_gatekeeper_batch(domain, scores)
+                return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
+                
+            else:
+                seq_len = 10
+                sequences = await self._get_temporal_sequence_batch(event_type, entities, features_list, seq_len)
+                
+                valid_idx = []
+                valid_seqs = []
+                for i, seq in enumerate(sequences):
+                    if len(seq) == seq_len:
+                        valid_idx.append(i)
+                        valid_seqs.append(seq)
+                        
+                scores = [0.0] * len(features_list)
+                if valid_seqs:
+                    X = np.array(valid_seqs, dtype=np.float32)
+                    predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
+                    reconstructed_X = predictions[0]
+                    reconstruction_errors = np.mean(np.square(X - reconstructed_X), axis=(1, 2))
+                    
+                    for i, err in zip(valid_idx, reconstruction_errors):
+                        scores[i] = float(1.0 - np.exp(-err))
+                        
+                is_significant_list = await self._check_ema_gatekeeper_batch(domain, scores)
+                return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
+                
         except Exception as e:
-            logger.error(f"ONNX Scoring failed for {event_type}: {e}", exc_info=True)
-            return {"score": 0.0, "is_significant": False, "domain": domain}
-        
+            logger.error(f"ONNX Batch Scoring failed for {event_type}: {e}", exc_info=True)
+            return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
+
     async def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
         config = {"base_divisor": 48.0, "sanctioned_multiplier": 1.5}
         try:
@@ -193,13 +224,26 @@ class DynamicAnomalyScorer:
             base = min(1.0, base * config["sanctioned_multiplier"])
         return round(min(1.0, base), 3)
 
-    # Note: All helper methods must now be async and use `await self.score_event(...)`
     async def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
-        norm_notional = await self._dynamic_normalize(f"crypto:{asset}", "notional", notional)
-        norm_qty = await self._dynamic_normalize(f"crypto:{asset}", "qty", qty)
+        res = await self.score_crypto_trade_batch([(asset, notional, qty)])
+        return res[0]
 
-        res = await self.score_event("crypto_trade", asset, [norm_notional, norm_qty, 0.0, 0.0, 0.0])
-        return res["score"]
+    async def score_crypto_trade_batch(self, trades: list) -> list:
+        if not trades: return []
+        req_notional = [(f"crypto:{t[0]}", "notional", t[1]) for t in trades]
+        req_qty = [(f"crypto:{t[0]}", "qty", t[2]) for t in trades]
+        
+        norm_notional = await self._dynamic_normalize_batch(req_notional)
+        norm_qty = await self._dynamic_normalize_batch(req_qty)
+        
+        features_list = []
+        entities = []
+        for t, n, q in zip(trades, norm_notional, norm_qty):
+            features_list.append([n, q, 0.0, 0.0, 0.0])
+            entities.append(t[0])
+            
+        res = await self.score_event_batch("crypto_trade", entities, features_list)
+        return [r["score"] for r in res]
 
     async def score_crypto_candle(self, asset: str, features: list) -> float:
         if len(features) >= 3:
@@ -208,11 +252,25 @@ class DynamicAnomalyScorer:
         return res["score"]
 
     async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
-        norm_notional = await self._dynamic_normalize(f"tradfi:{ticker}", "notional", notional)
-        norm_volume = await self._dynamic_normalize(f"tradfi:{ticker}", "volume", volume)
+        res = await self.score_financial_trade_batch(domain, [(ticker, notional, volume)])
+        return res[0]
         
-        res = await self.score_event("tradfi_trade", ticker, [norm_notional, norm_volume, 0.0, 0.0, 0.0])
-        return res["score"]
+    async def score_financial_trade_batch(self, domain: str, trades: list) -> list:
+        if not trades: return []
+        req_notional = [(f"{domain}:{t[0]}", "notional", t[1]) for t in trades]
+        req_volume = [(f"{domain}:{t[0]}", "volume", t[2]) for t in trades]
+        
+        norm_notional = await self._dynamic_normalize_batch(req_notional)
+        norm_volume = await self._dynamic_normalize_batch(req_volume)
+        
+        features_list = []
+        entities = []
+        for t, n, v in zip(trades, norm_notional, norm_volume):
+            features_list.append([n, v, 0.0, 0.0, 0.0])
+            entities.append(t[0])
+            
+        res = await self.score_event_batch("tradfi_trade", entities, features_list)
+        return [r["score"] for r in res]
 
     async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
         if len(features) >= 3:
@@ -233,7 +291,7 @@ class DynamicAnomalyScorer:
         res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
         return res["score"]
         
-    async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> float:
+    async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> tuple:
         config = {"entity_boost": 0.02, "max_boost": 0.3}
         try:
             if self.redis:
@@ -243,6 +301,22 @@ class DynamicAnomalyScorer:
                     config.update(cfg)
         except Exception:
             pass
+            
+        semantic_boost = 0.0
+        semantic_tags = []
+        if self.redis and named_entities:
+            pipe = self.redis.raw.pipeline()
+            for tag in named_entities:
+                pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
+            results = await pipe.execute()
+            for tag, res in zip(named_entities, results):
+                if res:
+                    val = float(res)
+                    semantic_boost += abs(val) * 0.1
+                    sentiment = sentiment * 0.5 + (val * 0.5)
+                    semantic_tags.append(f"semantic:{'positive' if val > 0 else 'negative' if val == -1.0 else 'critical'}")
+                    
         base = abs(sentiment) * reliability
         entity_boost = min(config["max_boost"], len(named_entities) * config["entity_boost"])
-        return round(min(1.0, base + entity_boost), 3)
+        final_score = round(min(1.0, base + entity_boost + semantic_boost), 3)
+        return final_score, semantic_tags

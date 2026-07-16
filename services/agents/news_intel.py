@@ -48,11 +48,6 @@ logger = logging.getLogger("agent.news_intel")
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 
-# CONCEPT: Structured AI Output
-# We use Pydantic models to define exactly what the AI should return.
-# By passing these schemas into our LLM infer method, we force the AI to return
-# a predictable JSON object rather than a conversational text blob. 
-# If the AI hallucinates the wrong format, Pydantic catches it immediately.
 class IntelEntity(BaseModel):
     name: str
     type: str
@@ -65,9 +60,6 @@ class IntelRelationship(BaseModel):
     source: str
     relation: str
     target: str
-    # BEST PRACTICE: Confidence Scores
-    # Always require the AI to assign a confidence score to its extractions. 
-    # This allows downstream systems to ignore "guesses" and only act on sure things.
     confidence: float = 0.5
 
 
@@ -141,9 +133,6 @@ class NewsIntelAgent(SentinelAgent):
         Process one enriched news event.
         Returns None for events below the analysis threshold (no output published).
         """
-        # BEST PRACTICE: Guard Clauses (Early Returns)
-        # Instead of wrapping the whole function in a giant `if` statement, we check
-        # conditions and immediately `return None` to save compute power and indentation.
         agent_source = message.get("agent")
         
         # ── SCENARIO HANDLING ───────────────────────────────────────────────
@@ -171,10 +160,6 @@ class NewsIntelAgent(SentinelAgent):
 
         # ── GATE 3: Deduplication by URL hash ─────────────────────────────────
         url = message.get("url", message.get("event_id", ""))
-        # UNDER THE HOOD: Hashing for Caching
-        # URLs can be extremely long and contain weird characters. We convert the URL
-        # into a short, consistent 16-character string using SHA-256. This makes it
-        # a perfect, fast lookup key for Redis to check if we've seen this news before.
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
         if await self.is_recently_processed(url_hash, window_seconds=3600):
             logger.debug(f"Skipping duplicate: {url_hash}")
@@ -206,9 +191,6 @@ class NewsIntelAgent(SentinelAgent):
         )
 
         try:
-            # CONCEPT: Deterministic AI
-            # temperature=0.1 means the AI will be highly factual and logical. 
-            # It will pick the most statistically likely words rather than being "creative".
             brief: IntelBrief = await self._execute_with_telemetry(
                 message=message,
                 system_prompt=NEWS_INTEL_SYSTEM,
@@ -241,6 +223,9 @@ class NewsIntelAgent(SentinelAgent):
 
         # ── STEP 5: Push new news keywords to the collector's filter ──────────
         await self._update_news_keywords(brief)
+        
+        # ── STEP 5.5: Provide Semantic Feedback to Anomaly Scorer ─────────────
+        await self._update_semantic_sentiment(brief)
 
         # ── STEP 6: Emit structured Intel Brief ───────────────────────────────
         return {
@@ -248,10 +233,24 @@ class NewsIntelAgent(SentinelAgent):
             "agent_run_id":     f"intel_{url_hash}",
             "source_event_id":  message.get("event_id"),
             "created_at":       datetime.now(timezone.utc).isoformat(),
-            "brief":            brief.dict(),
+            "brief":            brief.model_dump(),
             "original_anomaly": anomaly_score,
             "computed_severity": brief.severity,
         }
+
+    async def _update_semantic_sentiment(self, brief: IntelBrief):
+        """Pushes semantic sentiment from the LLM back to Redis for the AnomalyScorer."""
+        try:
+            if not self.redis: return
+            pipe = self.redis.raw.pipeline()
+            # We decay semantic sentiment after 12 hours
+            for entity in brief.entities:
+                if entity.sentiment in ("positive", "negative", "critical"):
+                    score = 1.0 if entity.sentiment == "positive" else -1.0 if entity.sentiment == "negative" else -2.0
+                    pipe.set(f"sentinel:semantic_sentiment:{entity.name.lower()}", score, ex=43200)
+            await pipe.execute()
+        except Exception as e:
+            logger.error(f"Failed to update semantic sentiment: {e}")
 
     async def _fetch_recent_context(self) -> List[Dict]:
         """
@@ -381,11 +380,6 @@ class NewsIntelAgent(SentinelAgent):
 
         if instruments_to_add:
             try:
-                # UNDER THE HOOD: Redis Sets (SADD)
-                # `sadd` adds items to a Redis Set. Just like Python sets, Redis Sets
-                # enforce uniqueness. If "USO" is already being watched, this command
-                # does nothing safely. `*instruments_to_add` unpacks the python set 
-                # so they are all added in one single network command.
                 import time
                 await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in instruments_to_add})
                 logger.info(

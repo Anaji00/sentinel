@@ -37,9 +37,6 @@ def format_correlation_slack(cluster: CorrelationCluster) -> Dict[str, Any]:
                 "title":    f"[{cluster.alert_tier.name}] {cluster.rule_name}",
                 "text":     cluster.description,
                 "fields": [
-                    # BEST PRACTICE: Slicing lists ([:6], [:3]) prevents the Slack 
-                    # message from becoming a massive wall of text if there are dozens 
-                    # of tags or entities attached to this alert.
                     {"title": "Tags",       "value": ", ".join(cluster.tags[:6]),  "short": True},
                     {"title": "Entities",   "value": ", ".join(cluster.entity_ids[:3]), "short": True},
                     {"title": "Detected",   "value": cluster.detected_at.strftime("%Y-%m-%d %H:%M UTC"), "short": True},
@@ -71,9 +68,6 @@ def format_scenario_slack(scenario: Scenario) -> Dict[str, Any]:
     for h in scenario.hypotheses[:3]:
         # During each iteration, 'h' is one hypothesis dictionary.
         # We extract its data and append a new Slack field dictionary to our list.
-        # BEST PRACTICE: We use `h.get('key', 'default')` instead of `h['key']`.
-        # Since the AI generated this data, there's a small chance a key might be missing.
-        # `.get()` prevents the code from crashing with a KeyError if that happens.
         fields.append({
          "title": f"{h.get('label','?')} ({h.get('probability','?')}%)",
             "value": h.get("mechanism", "")[:150],

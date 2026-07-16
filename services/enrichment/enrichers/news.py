@@ -143,8 +143,10 @@ class NewsEnricher:
         if ofac_hits:
             tags.append("sanctioned_ofac_mention")
             tags.extend(ofac_hits)
+            
+        anomaly, semantic_tags = await self.scorer.score_news(named_entities = tags, sentiment = sentiment, reliability = reliability)
+        tags.extend(semantic_tags)
         
-        anomaly = await self.scorer.score_news(named_entities = tags, sentiment = sentiment, reliability = reliability)
         if ofac_hits:
             anomaly = min(1.0, anomaly + 0.4) # Severe bump for sanctions mention
 
