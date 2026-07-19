@@ -201,8 +201,11 @@ async def main():
             while True:
                 t0 = asyncio.get_event_loop().time()
                 alpha, z_threshold = await regime.get_dynamic_thresholds()
+                logger.info(f"Starting radar evaluation cycle | dynamic thresholds: alpha={alpha:.4f}, z_threshold={z_threshold:.2f}")
                 await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state)
                 elapsed = asyncio.get_event_loop().time() - t0
+                if elapsed > 60.0:
+                    logger.warning(f"⚠️ Radar poll cycle exceeded 60.0 seconds! Elapsed: {elapsed:.2f}s")
                 await asyncio.sleep(max(0, 60.0 - elapsed))
         finally:
             heartbeat_task.cancel()

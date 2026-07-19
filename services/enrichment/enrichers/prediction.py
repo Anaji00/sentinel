@@ -75,6 +75,8 @@ class PredictionEnricher:
                 notional_usd = notional,
                 shares_traded = shares,
                 price_usd = price,
+                yes_probability = p.get("yes_probability"),
+                no_probability = p.get("no_probability")
             ),
             headline=headline,
             tags=tags,
@@ -136,7 +138,11 @@ class PredictionEnricher:
                 outcome="Volume Spike",
                 shares_traded=delta,
                 notional_usd=notional_usd,
-                price_usd=price
+                price_usd=price,
+                yes_bid=p.get("yes_bid"),
+                no_bid=p.get("no_bid"),
+                yes_probability=p.get("yes_probability"),
+                no_probability=p.get("no_probability")
             ),
             headline=headline,
             tags=tags,

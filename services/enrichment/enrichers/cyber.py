@@ -39,14 +39,22 @@ class CyberThreatScorer:
     def __init__(self, redis_client):
         self.redis = redis_client
         self.cfg = {}
+        self.last_loaded = 0.0
+        self.ttl = 60.0  # 60 seconds config cache TTL
 
     async def load_thresholds(self):
+        import time
+        now = time.time()
+        if self.cfg and (now - self.last_loaded < self.ttl):
+            return
+            
         try:
             if hasattr(self.redis, "raw"):
                 raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
                 if raw_cfg:
                     loaded = json.loads(raw_cfg)
                     self.cfg = loaded.get("cyber", loaded)
+                    self.last_loaded = now
         except Exception as e:
             logger.debug(f"Could not load custom cyber thresholds: {e}")
 

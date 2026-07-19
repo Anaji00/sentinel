@@ -362,7 +362,10 @@ class NewsIntelAgent(SentinelAgent):
         if instruments_to_add:
             try:
                 import time
-                await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in instruments_to_add})
+                async with self.redis.raw.pipeline(transaction=True) as pipe:
+                    pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in instruments_to_add})
+                    pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                    await pipe.execute()
                 logger.info(
                     f"  Watchlist: added {instruments_to_add} from intel trigger"
                 )

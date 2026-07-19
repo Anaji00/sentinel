@@ -161,6 +161,7 @@ async def poll_censys(
                     data  = await resp.json()
                     hits  = data.get("result", {}).get("hits", [])
                     new_c = 0
+                    send_tasks = []
 
                     for hit in hits:
                         ip  = hit.get("ip", "")
@@ -205,7 +206,7 @@ async def poll_censys(
                         )
                         # Send to the Kafka 'raw.cyber' topic so the Enrichment 
                         # service can process it later.
-                        producer.send(Topics.RAW_CYBER, event.model_dump(), key=ip)
+                        send_tasks.append(producer.send(Topics.RAW_CYBER, event.model_dump(), key=ip))
                         new_c += 1
 
                         if is_critical or is_ics_vendor:
@@ -213,6 +214,9 @@ async def poll_censys(
                                 f"🔴 CENSYS critical: {protocol_name} on {ip} "
                                 f"({org}) [{country}]"
                             )
+
+                    if send_tasks:
+                        await asyncio.gather(*send_tasks)
 
                     if new_c:
                         logger.info(f"Censys {protocol_name}: {new_c} new exposed hosts")
@@ -290,6 +294,7 @@ async def poll_cisa_kev(
 
     vulns     = data.get("vulnerabilities", [])
     new_count = 0
+    send_tasks = []
 
     # Loop through every vulnerability in the catalog
     for vuln in vulns:
@@ -328,8 +333,13 @@ async def poll_cisa_kev(
                 "is_ics_vendor":   any(v in vendor.lower() for v in ICS_VENDORS),
             },
         )
-        producer.send(Topics.RAW_CYBER, event.model_dump(), key=cve_id)
+        send_tasks.append(producer.send(Topics.RAW_CYBER, event.model_dump(), key=cve_id))
         new_count += 1
+
+        # Batch execute in chunks to avoid overwhelming socket
+        if len(send_tasks) >= 100:
+            await asyncio.gather(*send_tasks)
+            send_tasks = []
 
         # High-priority: ransomware-linked CVEs or ICS/OT vendor vulnerabilities
         is_ics = any(v in vendor.lower() for v in ICS_VENDORS)
@@ -338,6 +348,9 @@ async def poll_cisa_kev(
                 f"🔴 CISA KEV (high priority): {cve_id} — {vendor} {product} "
                 f"| ransomware:{ransomware_use} | ics:{is_ics}"
             )
+
+    if send_tasks:
+        await asyncio.gather(*send_tasks)
 
     if new_count:
         logger.info(f"CISA KEV: {new_count} new CVEs (catalog total: {len(vulns)})")
@@ -366,6 +379,7 @@ async def poll_ransomware(
                 return
 
         new_count = 0
+        send_tasks = []
         for victim in victims:
             victim_id = victim.get("id") or victim.get("post_title", "")
             if victim_id in seen_ids:
@@ -387,7 +401,7 @@ async def poll_ransomware(
                     "data_types":   [],
                 },
             )
-            producer.send(Topics.RAW_CYBER, event.model_dump(), key="ransomware")
+            send_tasks.append(producer.send(Topics.RAW_CYBER, event.model_dump(), key="ransomware"))
             new_count += 1
 
             if any(kw in sector for kw in CRITICAL_SECTORS):
@@ -395,6 +409,9 @@ async def poll_ransomware(
                     f"🔴 RANSOMWARE (critical sector): "
                     f"{victim.get('victim')} — {victim.get('group_name')} [{sector}]"
                 )
+
+        if send_tasks:
+            await asyncio.gather(*send_tasks)
 
         if new_count:
             logger.info(f"Ransomware.live: {new_count} new victims")

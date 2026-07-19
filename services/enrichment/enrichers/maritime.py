@@ -90,9 +90,7 @@ class MaritimeEnricher:
         if self.resolver and hasattr(self.resolver, "resolve_vessel_batch"):
             vessels = await self.resolver.resolve_vessel_batch(mmsi_list, meta_list)
         else:
-            vessels = []
-            for m, mt in zip(mmsi_list, meta_list):
-                vessels.append(await self._get_vessel(m, mt))
+            vessels = await asyncio.gather(*[self._get_vessel(m, mt) for m, mt in zip(mmsi_list, meta_list)])
                 
         features_list = []
         entities = []
@@ -104,13 +102,21 @@ class MaritimeEnricher:
             
         scores = await self.scorer.score_event_batch("vessel_position", entities, features_list)
         
+        # Batch watchlist & frequency checks concurrently to avoid sequential awaits blocking
+        check_tasks = []
+        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict in zip(parsed, vessels, scores):
+            check_tasks.append(asyncio.gather(
+                self.scorer.check_watchlist(mmsi, "vessels"),
+                self.scorer.track_frequency(mmsi, "vessel_position")
+            ))
+        check_results = await asyncio.gather(*check_tasks)
+        
         results = []
         pipe = self.redis.raw.pipeline()
-        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict in zip(parsed, vessels, scores):
+        for idx, ((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict) in enumerate(zip(parsed, vessels, scores)):
             anomaly = score_dict.get("score", 0.0)
-            is_watched = await self.scorer.check_watchlist(mmsi, "vessels")
+            is_watched, f_boost = check_results[idx]
             w_boost = 0.15 if is_watched else 0.0
-            f_boost = await self.scorer.track_frequency(mmsi, "vessel_position")
             anomaly = min(1.0, anomaly + w_boost + f_boost)
 
             flags = vessel.get("flags", [])

@@ -71,6 +71,7 @@ class Topics:
     SYSTEM_HEARTBEAT     = "sentinel.system.heartbeat"
     RADAR_DECISIONS      = "agents.radar.decisions"
     TELEMETRY            = "agents.telemetry"
+    FINANCIAL_ADVICE     = "agents.financial.advice"
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
     # into 'NormalizedEvent' so the database can understand it easily.

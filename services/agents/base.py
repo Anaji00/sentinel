@@ -308,7 +308,17 @@ class SentinelAgent(ABC):
             self.logger.error(f"Failed to fetch global context: {e}")
             return ""
 
-    async def _execute_with_telemetry(self, message: dict, system_prompt: str, user_prompt: str, schema: Optional[Type[BaseModel]] = None, temperature: float = 0.1) -> Any:
+    async def _execute_with_telemetry(
+        self,
+        message: dict,
+        system_prompt: str,
+        user_prompt: str,
+        schema: Optional[Type[BaseModel]] = None,
+        temperature: float = 0.1,
+        model: Optional[str] = None,
+        fallback_model: Optional[str] = "qwen",
+        num_predict: Optional[int] = None,
+    ) -> Any:
         
         start_time = time.monotonic()
         # Fallback to a UUID if no event_id is present (e.g., scheduled tasks)
@@ -331,7 +341,10 @@ class SentinelAgent(ABC):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             schema=schema,
-            temperature=temperature
+            temperature=temperature,
+            model=model or self.model,
+            fallback_model=fallback_model,
+            num_predict=num_predict,
         )
         
         if hasattr(response, "model_dump"):

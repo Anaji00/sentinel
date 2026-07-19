@@ -77,6 +77,8 @@ class TradFiEnricher:
                 return res[0] if res else None
         elif source == "sec_form4":
             return await self._enrich_insider(raw, p)
+        elif source == "alpaca_options":
+            return await self._enrich_options_flow(raw, p)
             
         return None
 
@@ -101,16 +103,22 @@ class TradFiEnricher:
         # Phase 2: Batch ML Scoring
         scores = await self.scorer.score_financial_trade_batch("tradfi", trades_for_scoring)
         
+        # Batch watchlist and frequency checks concurrently
+        check_tasks = []
+        for raw, p, ticker, price, volume, notional in parsed_events:
+            check_tasks.append(asyncio.gather(
+                self.scorer.check_watchlist(ticker, "equities"),
+                self.scorer.track_frequency(ticker, "tradfi_block")
+            ))
+        check_results = await asyncio.gather(*check_tasks)
+        
         # Phase 3: Finalize
         results = []
         set_pipe = self.redis_client.raw.pipeline()
         for i, (raw, p, ticker, price, volume, notional) in enumerate(parsed_events):
             anomaly = scores[i]
-            
-            # Watchlist & Frequency boost
-            is_watched = await self.scorer.check_watchlist(ticker, "equities")
+            is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
-            f_boost = await self.scorer.track_frequency(ticker, "tradfi_block")
             anomaly = min(1.0, anomaly + w_boost + f_boost)
             
             if price > 0:
@@ -294,7 +302,10 @@ class TradFiEnricher:
                 if concepts:
                     tags.append("geo_linked_asset")
                     tags.extend(concepts)
-                    await self.redis_client.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                    async with self.redis_client.raw.pipeline(transaction=True) as pipe:
+                        pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                        pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                        await pipe.execute()
         except Exception as e:
             logger.error(f"Failed to update geo watchlist for {ticker}: {e}", exc_info=True)
                 
@@ -397,4 +408,48 @@ class TradFiEnricher:
             headline=f"Insider {code_label}: {ticker} ${value/1e6:.1f}M by {title}",
             tags=["tradfi", "insider_trade", ticker.lower(), code_label.lower().replace(" ", "_")],
             anomaly_score=round(anomaly, 3),
+        )
+
+    async def _enrich_options_flow(self, raw, p) -> Optional[NormalizedEvent]:
+        ticker = (p.get("ticker") or "").upper()
+        if not ticker: return None
+        
+        option_symbol = p.get("option_symbol", "")
+        price = float(p.get("price", 0.0))
+        volume = float(p.get("volume", 0.0))
+        premium = float(p.get("premium_usd", 0.0))
+        
+        # Watchlist & Frequency boost
+        is_watched = await self.scorer.check_watchlist(ticker, "equities")
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(ticker, "options_flow")
+        
+        # Calculate baseline anomaly score based on premium size (e.g. $1M premium -> 0.50 score)
+        base_score = min(1.0, premium / 1_000_000.0 * 0.5)
+        anomaly = min(1.0, base_score + w_boost + f_boost)
+        
+        tags = ["tradfi", "options_flow", ticker.lower()]
+        if premium >= 100000.0:
+            tags.append("options_sweep")
+            
+        entity = Entity(id=ticker, type=EntityType.COMPANY, name=ticker)
+        
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.OPTIONS_FLOW,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            financial_data=FinancialData(
+                ticker=ticker,
+                instrument_type="option",
+                trade_type="OPTIONS_FLOW",
+                premium_usd=premium,
+                underlying_price=price,
+                volume=int(volume)
+            ),
+            headline=f"🐋 OPTIONS FLOW Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
+            tags=tags,
+            anomaly_score=round(anomaly, 3)
         )

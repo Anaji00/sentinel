@@ -42,7 +42,7 @@ async def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
     db = await get_timescale()
     logger.info(f"Fetching '{domain}' training data for the last {days} days...")
     
-    event_types = "('vessel_position', 'bgp_hijack')" if domain == "spatial" else "('tradfi_trade', 'crypto_liquidation')"
+    event_types = "('vessel_position', 'bgp_anomaly')" if domain == "spatial" else "('equity_block', 'crypto_liquidation', 'options_flow')"
 
     # ─── 3. PUSH-DOWN FEATURE ENGINEERING ───────────────────────────────────
     query = f"""

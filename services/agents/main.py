@@ -31,6 +31,7 @@ from services.agents.macro_cointegration_engine import MacroAssetCointegrationEn
 from services.agents.supervisor import GraphSupervisor
 from services.agents.macro_strategist import MacroStrategistAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
+from services.agents.financial_advisor import FinancialAdvisorAgent
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -221,15 +222,24 @@ async def main():
         shared_infra=shared_infra,
     )
 
+    financial_advisor_agent = build_agent(
+        FinancialAdvisorAgent,
+        agent_name="financial_advisor",
+        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES],
+        group_id="agent-financial-advisor",
+        shared_infra=shared_infra,
+    )
+
     agents_by_name = {
         "news_intel":      news_agent,
         "quant_researcher": quant_agent,
         "ontology_master": ontology_agent,
         "radar_agent": radar_agent,
         "macro_cointegration_engine": macro_cointegration_agent,
-        "graph_supervisor": supervisor_agent,
+        "supervisor": supervisor_agent,
         "macro_strategist": macro_strategist_agent,
         "rule_synthesizer": rule_synthesizer_agent,
+        "financial_advisor": financial_advisor_agent,
     }
 
     logger.info(f"Agents built: {list(agents_by_name.keys())}")
@@ -243,9 +253,10 @@ async def main():
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
-        asyncio.create_task(supervisor_agent.run(), name="graph_supervisor"),
+        asyncio.create_task(supervisor_agent.run(), name="supervisor"),
         asyncio.create_task(macro_strategist_agent.run(), name="macro_strategist"),
         asyncio.create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
+        asyncio.create_task(financial_advisor_agent.run(), name="financial_advisor"),
         asyncio.create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",
@@ -261,6 +272,7 @@ async def main():
     logger.info(f"Agent: {supervisor_agent.name} | Topics: {len(supervisor_agent.input_topics)}")
     logger.info(f"Agent: {macro_strategist_agent.name} | Topics: {len(macro_strategist_agent.input_topics)}")
     logger.info(f"Agent: {rule_synthesizer_agent.name} | Topics: {len(rule_synthesizer_agent.input_topics)}")
+    logger.info(f"Agent: {financial_advisor_agent.name} | Topics: {len(financial_advisor_agent.input_topics)}")
 
     try:
         def handle_sigterm(signum, frame):

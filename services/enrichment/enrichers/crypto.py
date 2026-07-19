@@ -80,13 +80,22 @@ class CryptoEnricher:
         
         scores = await self.scorer.score_crypto_trade_batch(trades_for_scoring)
         
+        # Batch watchlist and frequency checks concurrently
+        check_tasks = []
+        for raw, p, asset, side, price, qty, notional in parsed_events:
+            check_tasks.append(asyncio.gather(
+                self.scorer.check_watchlist(asset, "wallets"),
+                self.scorer.check_watchlist(asset, "equities"),
+                self.scorer.track_frequency(asset, "crypto_spot")
+            ))
+        check_results = await asyncio.gather(*check_tasks)
+        
         results = []
         for i, (raw, p, asset, side, price, qty, notional) in enumerate(parsed_events):
             anomaly = scores[i]
-            # Watchlist & Frequency boost
-            is_watched = await self.scorer.check_watchlist(asset, "wallets") or await self.scorer.check_watchlist(asset, "equities")
+            is_watched_wallets, is_watched_equities, f_boost = check_results[i]
+            is_watched = is_watched_wallets or is_watched_equities
             w_boost = 0.15 if is_watched else 0.0
-            f_boost = await self.scorer.track_frequency(asset, "crypto_spot")
             anomaly = min(1.0, anomaly + w_boost + f_boost)
             
             logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")

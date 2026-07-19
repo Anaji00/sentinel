@@ -408,7 +408,11 @@ class QuantResearcherAgent(SentinelAgent):
         for ticker, urgency, confidence in candidates:
             try:
                 # 1. IO Offloaded Set Addition
-                is_new = await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                async with self.redis.raw.pipeline(transaction=True) as pipe:
+                    pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                    pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                    results = await pipe.execute()
+                is_new = results[0] > 0 if results else False
                 
                 if is_new:
                     added.append(ticker)

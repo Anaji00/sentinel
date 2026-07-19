@@ -254,6 +254,83 @@ async def stream_equities(producer: SentinelProducer, redis_client):
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
+async def poll_options(producer: SentinelProducer, redis_client):
+    """
+    Polls Alpaca's options snapshot API for the watched symbols.
+    Filters for large transactions and pipes raw events to Kafka.
+    """
+    ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+    ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET")
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        logger.warning("Alpaca API credentials missing. Options flow collector will be disabled.")
+        return
+
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "accept": "application/json"
+    }
+
+    session_timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=session_timeout, headers=headers) as session:
+        while True:
+            try:
+                # Fetch watched symbols from Redis
+                raw_symbols = await redis_client.raw.zrange("sentinel:watched:equities", 0, -1)
+                symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
+                
+                # Fallback list of major tickers
+                if not symbols:
+                    symbols = ["AAPL", "TSLA", "MSFT", "NVDA", "AMZN"]
+                
+                logger.info(f"Options Poller: Fetching options chains for {len(symbols)} tickers...")
+                
+                for ticker in symbols[:50]:  # Cap to top 50 to honor API rates
+                    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            snapshots = data.get("snapshots", {})
+                            if not snapshots:
+                                continue
+                                
+                            count = 0
+                            for contract, snapshot in snapshots.items():
+                                latest_trade = snapshot.get("latestTrade")
+                                if not latest_trade:
+                                    continue
+                                
+                                price = float(latest_trade.get("price") or 0.0)
+                                size = float(latest_trade.get("size") or 0.0)
+                                premium = price * size * 100.0  # standard options contract multiplier
+                                
+                                # Sweep/large options block filter: premium >= $50,000 or contract size >= 100
+                                if premium >= 50000.0 or size >= 100.0:
+                                    event = RawEvent(
+                                        source="alpaca_options",
+                                        occurred_at=datetime.now(timezone.utc),
+                                        raw_payload={
+                                            "ticker": ticker,
+                                            "option_symbol": contract,
+                                            "price": price,
+                                            "volume": size,
+                                            "premium_usd": premium
+                                        }
+                                    )
+                                    await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    count += 1
+                            
+                            if count > 0:
+                                logger.info(f"Published {count} options flow events for {ticker} to Kafka.")
+                        else:
+                            text = await resp.text()
+                            logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
+                            
+            except Exception as e:
+                logger.error(f"Error in Options flow collector: {e}", exc_info=True)
+                
+            await asyncio.sleep(300)
+
 async def run_polling(producer: SentinelProducer, redis_client):
     connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -271,11 +348,12 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
     redis_client = await get_redis()
-    logger.info("Starting TradFi Collector (Finnhub & SEC Only)")
+    logger.info("Starting TradFi Collector (Finnhub, SEC & Alpaca Options)")
     try:
         await asyncio.gather(
             run_polling(producer, redis_client),
-            stream_equities(producer, redis_client)
+            stream_equities(producer, redis_client),
+            poll_options(producer, redis_client)
         )
     finally:
         producer.close()

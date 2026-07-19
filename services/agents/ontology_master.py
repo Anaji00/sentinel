@@ -328,6 +328,7 @@ class OntologyMasterAgent(SentinelAgent):
                 if valid_tickers:
                     import time
                     pipeline.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in valid_tickers})
+                    pipeline.zremrangebyrank("sentinel:watched:equities", 0, -51)
                     
 
             # Maritime watchlist flag

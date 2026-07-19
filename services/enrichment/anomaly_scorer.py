@@ -16,6 +16,10 @@ class DynamicAnomalyScorer:
         self.sessions = {}
         self.alpha = 0.1
         self.z_score_threshold = 1.5
+        
+        self._thresholds_cache = {}
+        self._thresholds_last_loaded = 0.0
+        self._thresholds_ttl = 60.0  # 60 seconds config cache TTL
 
         self._load_onnx_models()
 
@@ -32,6 +36,23 @@ class DynamicAnomalyScorer:
                 logger.info(f"⚡ Loaded ONNX Engine for {domain}: {filename}")
             except Exception as e:
                 logger.critical(f"🚨 Missing ONNX model: {model_path}. Run train_models.py! Error: {e}")
+
+    async def _get_thresholds_config(self, key: str) -> dict:
+        import time
+        now = time.time()
+        if self._thresholds_cache and (now - self._thresholds_last_loaded < self._thresholds_ttl):
+            return self._thresholds_cache.get(key, {})
+            
+        try:
+            if self.redis:
+                raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
+                if raw_cfg:
+                    self._thresholds_cache = json.loads(raw_cfg)
+                    self._thresholds_last_loaded = now
+        except Exception as e:
+            logger.debug(f"Could not load custom ml thresholds from Redis: {e}")
+            
+        return self._thresholds_cache.get(key, {})
         
     def _get_domain(self, event_type: str) -> str:
         return "spatial" if event_type in ["vessel_position", "vessel_dark", "bgp_hijack"] else "temporal"
@@ -212,11 +233,8 @@ class DynamicAnomalyScorer:
     async def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
         config = {"base_divisor": 48.0, "sanctioned_multiplier": 1.5}
         try:
-            if self.redis:
-                raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
-                if raw_cfg:
-                    cfg = json.loads(raw_cfg).get("vessel_dark", {})
-                    config.update(cfg)
+            cfg = await self._get_thresholds_config("vessel_dark")
+            config.update(cfg)
         except Exception:
             pass
 
@@ -282,11 +300,8 @@ class DynamicAnomalyScorer:
     async def score_prediction_trade(self, asset_id: str, notional: float) -> float:
         config = {"divisor": 100_000.0}
         try:
-            if self.redis:
-                raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
-                if raw_cfg:
-                    cfg = json.loads(raw_cfg).get("prediction_trade", {})
-                    config.update(cfg)
+            cfg = await self._get_thresholds_config("prediction_trade")
+            config.update(cfg)
         except Exception:
             pass
         res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
@@ -332,11 +347,8 @@ class DynamicAnomalyScorer:
     async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> tuple:
         config = {"entity_boost": 0.02, "max_boost": 0.3}
         try:
-            if self.redis:
-                raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
-                if raw_cfg:
-                    cfg = json.loads(raw_cfg).get("news", {})
-                    config.update(cfg)
+            cfg = await self._get_thresholds_config("news")
+            config.update(cfg)
         except Exception:
             pass
             

@@ -267,7 +267,29 @@ async def main():
                         await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)
                         
                         tasks = [_process_correlation_event(e) for e in representative_events.values()]
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        # 1. Pause assigned partitions to prevent new messages and allow heartbeats
+                        assigned = consumer._c.assignment()
+                        if assigned:
+                            consumer._c.pause(*assigned)
+                            
+                        # 2. Run processing in a background task
+                        processing_task = asyncio.create_task(asyncio.gather(*tasks, return_exceptions=True))
+                        
+                        # 3. Yield heartbeats by polling consumer in a loop until done
+                        while not processing_task.done():
+                            try:
+                                # Poll empty (partitions are paused) to send heartbeats
+                                await consumer.get_batch(timeout_ms=1000)
+                            except Exception as pe:
+                                logger.warning(f"Consumer heartbeat poll warning: {pe}")
+                                
+                        # 4. Resume assigned partitions
+                        if assigned:
+                            consumer._c.resume(*assigned)
+                            
+                        # Await the processing task to bubble any cancellation or clean errors
+                        await processing_task
                         
                         processed += len(all_events)
                         if processed % 100 < len(all_events):

@@ -31,15 +31,16 @@ OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "
 # Circuit breaker config
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
 CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "300.0"))  # 5 minutes
+OLLAMA_NUM_PARALLEL       = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
 
-_OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
+_OLLAMA_SEMAPHORES = {}
  
 
-def get_ollama_semaphore():
-    global _OLLAMA_SEMAPHORE
-    if _OLLAMA_SEMAPHORE is None:
-        _OLLAMA_SEMAPHORE = asyncio.Semaphore(1)
-    return _OLLAMA_SEMAPHORE
+def get_ollama_semaphore(model_name: str = "default"):
+    global _OLLAMA_SEMAPHORES
+    if model_name not in _OLLAMA_SEMAPHORES:
+        _OLLAMA_SEMAPHORES[model_name] = asyncio.Semaphore(OLLAMA_NUM_PARALLEL)
+    return _OLLAMA_SEMAPHORES[model_name]
 
 
 class InferenceError(Exception):
@@ -60,9 +61,10 @@ class OllamaClient:
     ):
         self._session = session
         self.model = model
-        # Circuit breaker state
-        self._consecutive_timeouts = 0
-        self._circuit_open_until: float = 0.0
+        # Circuit breaker state (per-model)
+        self._consecutive_timeouts: Dict[str, int] = {}
+        self._circuit_open_until: Dict[str, float] = {}
+        self.failures = self._consecutive_timeouts
 
     async def _resolve_model(self, requested_model: str) -> str:
         """Checks if the requested model exists in Ollama's tags; falls back to the first available model if missing."""
@@ -127,23 +129,44 @@ class OllamaClient:
         schema: Type[BaseModel],
         temperature: float = 0.1,
         max_retries: int = 3,
+        model: Optional[str] = None,
+        fallback_model: Optional[str] = None,
+        num_predict: Optional[int] = None,
     ) -> BaseModel:
         """
         Run inference and validate output against a Pydantic schema.
         Supports dynamic offloading to smaller models on timeout/inference failures.
         """
         last_error: Optional[str] = None
-        semaphore = get_ollama_semaphore()
+        active_model = model or self.model
+        semaphore = get_ollama_semaphore(active_model)
 
         # Circuit breaker check
         import time as _time
-        if self._consecutive_timeouts >= CIRCUIT_BREAKER_THRESHOLD:
-            if _time.monotonic() < self._circuit_open_until:
+        current_time = _time.monotonic()
+        consecutive = self._consecutive_timeouts.get(active_model, 0)
+        open_until = self._circuit_open_until.get(active_model, 0.0)
+
+        if consecutive >= CIRCUIT_BREAKER_THRESHOLD:
+            if current_time < open_until:
+                logger.warning(f"Circuit breaker OPEN for model '{active_model}' ({consecutive} consecutive timeouts).")
+                if fallback_model:
+                    logger.warning(f"Rerouting to fallback model: '{fallback_model}'")
+                    return await self.infer(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        schema=schema,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback_model,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
                 raise InferenceError(
-                    f"Circuit breaker OPEN — Ollama had {self._consecutive_timeouts} "
+                    f"Circuit breaker OPEN for model '{active_model}' — Ollama had {consecutive} "
                     f"consecutive timeouts. Cooling down."
                 )
-            logger.info("Circuit breaker: cooldown expired, probing Ollama...")
+            logger.info(f"Circuit breaker: cooldown expired for model '{active_model}', probing Ollama...")
 
         schema_json = json.dumps(schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema.schema(), indent=2)
         schema_instruction = (
@@ -152,8 +175,6 @@ class OllamaClient:
             "Do not include any explanation or markdown formatting outside of the JSON object. Output raw JSON only.\n"
             "CRITICAL: Output the actual data values that fit this schema, DO NOT output the schema definition itself."
         )
-
-        active_model = self.model
 
         for attempt in range(max_retries):
             correction = ""
@@ -170,7 +191,7 @@ class OllamaClient:
 
             try:
                 async with semaphore:
-                    raw_text = await self._call_ollama(full_prompt, temperature, active_model, format="json")
+                    raw_text = await self._call_ollama(full_prompt, temperature, active_model, format="json", num_predict=num_predict)
 
                 parsed = self._extract_json(raw_text)
                 if parsed is None:
@@ -184,11 +205,34 @@ class OllamaClient:
                 last_error = f"Inference error: {inf_err}"
                 logger.warning(f"Ollama attempt {attempt+1} ({active_model}) failed/timed out: {inf_err}")
                 
-                # Dynamic Offloading: Resolve a fallback model for the next attempt
+                # Recursive fallback
+                if fallback_model:
+                    logger.warning(f"Failed calling '{active_model}'. Recursively falling back to: '{fallback_model}'")
+                    return await self.infer(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        schema=schema,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback_model,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
+                
+                # Dynamic Offloading fallback
                 fallback = await self._get_fallback_model(active_model)
                 if fallback:
                     logger.warning(f"Offloading next attempt to fallback model: '{fallback}'")
-                    active_model = fallback
+                    return await self.infer(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        schema=schema,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
                 else:
                     logger.warning("No fallback models available in local Ollama. Retrying with same model.")
                 
@@ -210,27 +254,78 @@ class OllamaClient:
         user_prompt: str,
         temperature: float = 0.2,
         max_retries: int = 3,
+        model: Optional[str] = None,
+        fallback_model: Optional[str] = None,
+        num_predict: Optional[int] = None,
     ) -> str:
         """Raw inference without schema enforcement, supporting fallback offloading."""
-        semaphore = get_ollama_semaphore()
+        active_model = model or self.model
+        semaphore = get_ollama_semaphore(active_model)
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        active_model = self.model
+        
+        # Circuit breaker check
+        import time as _time
+        current_time = _time.monotonic()
+        consecutive = self._consecutive_timeouts.get(active_model, 0)
+        open_until = self._circuit_open_until.get(active_model, 0.0)
+
+        if consecutive >= CIRCUIT_BREAKER_THRESHOLD:
+            if current_time < open_until:
+                logger.warning(f"Circuit breaker OPEN for model '{active_model}' ({consecutive} consecutive timeouts).")
+                if fallback_model:
+                    logger.warning(f"Rerouting to fallback model: '{fallback_model}'")
+                    return await self.infer_raw(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback_model,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
+                raise InferenceError(
+                    f"Circuit breaker OPEN for model '{active_model}' — Ollama had {consecutive} "
+                    f"consecutive timeouts. Cooling down."
+                )
+            logger.info(f"Circuit breaker: cooldown expired for model '{active_model}', probing Ollama...")
         
         for attempt in range(max_retries):
             try:
                 async with semaphore:
-                    return await self._call_ollama(full_prompt, temperature, active_model)
+                    return await self._call_ollama(full_prompt, temperature, active_model, num_predict=num_predict)
             except (InferenceError, asyncio.TimeoutError) as inf_err:
                 logger.warning(f"Raw Ollama attempt {attempt+1} ({active_model}) failed/timed out: {inf_err}")
+                
+                # Recursive fallback
+                if fallback_model:
+                    logger.warning(f"Failed calling '{active_model}'. Recursively falling back to: '{fallback_model}'")
+                    return await self.infer_raw(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback_model,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
+
                 fallback = await self._get_fallback_model(active_model)
                 if fallback:
                     logger.warning(f"Offloading raw inference to fallback model: '{fallback}'")
-                    active_model = fallback
+                    return await self.infer_raw(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_retries=max_retries,
+                        model=fallback,
+                        fallback_model=None,
+                        num_predict=num_predict,
+                    )
                 await asyncio.sleep(2 ** attempt)
                 
         raise InferenceError(f"Raw inference failed after {max_retries} attempts.")
         
-    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[str] = None) -> str:
+    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[str] = None, num_predict: Optional[int] = None) -> str:
         import time as _time
 
         resolved_model = await self._resolve_model(active_model)
@@ -242,7 +337,7 @@ class OllamaClient:
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
-                "num_predict": 1000,
+                "num_predict": num_predict or 1000,
                 "num_ctx": 4096,  # Performance optimization for local inference
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
@@ -260,15 +355,15 @@ class OllamaClient:
                     body = await resp.text()
                     raise InferenceError(f"Ollama HTTP {resp.status}: {body[:300]}")
                 data = await resp.json()
-                self._consecutive_timeouts = 0
+                self._consecutive_timeouts[active_model] = 0
                 return data.get("response", "")
             
         except asyncio.TimeoutError:
-            self._consecutive_timeouts += 1
-            if self._consecutive_timeouts >= CIRCUIT_BREAKER_THRESHOLD:
-                self._circuit_open_until = _time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+            self._consecutive_timeouts[active_model] = self._consecutive_timeouts.get(active_model, 0) + 1
+            if self._consecutive_timeouts[active_model] >= CIRCUIT_BREAKER_THRESHOLD:
+                self._circuit_open_until[active_model] = _time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
                 logger.warning(
-                    f"Circuit breaker OPENED after {self._consecutive_timeouts} "
+                    f"Circuit breaker OPENED for '{active_model}' after {self._consecutive_timeouts[active_model]} "
                     f"consecutive timeouts. Cooling down for {CIRCUIT_BREAKER_COOLDOWN}s."
                 )
             raise InferenceError(f"Ollama timed out after {OLLAMA_TIMEOUT.total}s")

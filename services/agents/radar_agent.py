@@ -29,9 +29,11 @@ class RadarAgent(SentinelAgent):
         
         # Idempotency: Do not re-evaluate a ticker we already escalated today
         if await self.is_recently_processed(ticker, self.cooldown_seconds):
+            self.logger.info(f"Idempotency: Skipped evaluating ticker '{ticker}' (already evaluated recently).")
             return None
         
         # ─── AGENTIC REASONING ───
+        self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M")
         entity_context = await self.fetch_entity_context(ticker)
         
         prompt = f"""
@@ -56,7 +58,8 @@ class RadarAgent(SentinelAgent):
                 system_prompt="You are a quantitative trading systems engineer.",
                 user_prompt=prompt,
                 schema=RadarDecision,
-                temperature=0.1
+                temperature=0.1,
+                num_predict=256,
             )
 
             if decision.investigate:
@@ -65,7 +68,10 @@ class RadarAgent(SentinelAgent):
                 # ─── DYNAMIC INFRASTRUCTURE INJECTION ───
                 # This explicitly commands the services/collector-tradfi/main.py WebSocket 
                 # to subscribe to this ticker on its next sync loop.
-                await self.redis.raw.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                async with self.redis.raw.pipeline(transaction=True) as pipe:
+                    pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
+                    pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                    await pipe.execute()
                 
                 await self.mark_processed(ticker, self.cooldown_seconds)
 
@@ -75,6 +81,8 @@ class RadarAgent(SentinelAgent):
                     "agent_rationale": decision.rationale,
                     "z_score_trigger": z_score
                 }
+            else:
+                self.logger.info(f"🧠 AGENT BYPASS: {ticker} not escalated. Rationale: {decision.rationale}")
         except Exception as e:
             self.logger.error(f"Agent reasoning failed for {ticker}: {e}")
         

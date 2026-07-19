@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import json
 from psycopg2.extras import Json
 
@@ -139,6 +139,10 @@ class PredictionMarketData(BaseModel):
    price_usd: float
    liquidity_pool_size: Optional[float] = None
    notional_usd: Optional[float] = None
+   yes_bid: Optional[float] = None
+   no_bid: Optional[float] = None
+   yes_probability: Optional[float] = None
+   no_probability: Optional[float] = None
 
 class CryptoData(BaseModel):
     pair: str
@@ -225,9 +229,12 @@ class NormalizedEvent(BaseModel):
     anomaly_score: float = 0.0
     correlation_ids: List[str] = Field(default_factory=list)
 
-    @validator("anomaly_score")
-    def clamp_anomaly_score(cls, v):
-        return max(0.0, min(1.0, v))
+    @field_validator("anomaly_score")
+    @classmethod
+    def validate_anomaly_score(cls, v):
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("anomaly_score must be between 0.0 and 1.0")
+        return v
 
     def to_tuple(self) -> tuple:
         pe = self.primary_entity

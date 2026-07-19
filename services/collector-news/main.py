@@ -103,6 +103,21 @@ FEEDS = [
     ("un_news",         "https://news.un.org/feed/subscribe/en/news/all/rss.xml", "official", 0.95),
     ("ofac_news",       "https://home.treasury.gov/system/files/126/ofac.xml","official",   0.99),
     ("cisa_alerts",     "https://www.cisa.gov/uscert/ncas/current-activity.xml", "official", 0.99),
+
+    # ─── EXPANDED GEOPOLITICS & DEFENSE ───
+    ("geopolitical_futures", "https://geopoliticalfutures.com/feed/", "geopolitic", 0.90),
+    ("long_war_journal", "https://www.longwarjournal.org/feed", "defense", 0.88),
+    ("crisis_group",    "https://www.crisisgroup.org/rss",                     "geopolitic", 0.92),
+    ("chatham_house",   "https://www.chathamhouse.org/rss.xml",                "geopolitic", 0.90),
+    ("realclear_defense", "https://www.realcleardefense.com/index.xml",        "defense",    0.88),
+
+    # ─── EXPANDED CYBERSECURITY ───
+    ("dark_reading",    "https://www.darkreading.com/rss.xml",                 "cyber",      0.90),
+    ("schneier",        "https://www.schneier.com/feed/atom/",                 "cyber",      0.95),
+    ("cyber_defense_mag", "https://www.cyberdefensemagazine.com/feed/",        "cyber",      0.85),
+
+    # ─── EXPANDED OFFICIAL ───
+    ("euro_parliament", "https://www.europarl.europa.eu/rss/doc/top-stories/en.xml", "official", 0.98),
 ]
 # ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 class URLDeduplicator:

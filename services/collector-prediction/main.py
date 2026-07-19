@@ -108,9 +108,17 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                         except:
                                             continue
                                     
+                                    outcomes = market.get("outcomeNames", [])
+                                    if isinstance(outcomes, str):
+                                        try:
+                                            outcomes = json.loads(outcomes)
+                                        except:
+                                            outcomes = []
+                                    
                                     for i, token_id in enumerate(tokens):
                                         if token_id not in id_to_label:
-                                            id_to_label[token_id] = f"{slug} | {question} | Outcome {i}"
+                                            outcome_name = outcomes[i] if (outcomes and i < len(outcomes)) else f"Outcome {i}"
+                                            id_to_label[token_id] = f"{slug} | {question} | {outcome_name}"
                                             new_assets.append(token_id)
                             else:
                                 logger.error(f"Gamma API error for {slug}: HTTP {resp.status}")
@@ -119,7 +127,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                         logger.error(f"Gamma API connection error for {slug}: {e}")
                 
                 if new_assets:
-                    await ws.send(json.dumps({"asset_ids": new_assets, "type": "market"}))
+                    await ws.send(json.dumps({"assets_ids": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
                 
             except Exception as e:
@@ -142,7 +150,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                             events = data if isinstance(data, list) else [data]
 
                             for event in events:
-                                if event.get("event_type") == "trade":
+                                if event.get("event_type") in ("trade", "last_trade_price"):
                                     asset_id = event.get("asset_id")
                                     price = float(event.get("price", 0.0))
                                     size = float(event.get("size", 0.0))
@@ -150,7 +158,18 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
                                     label = id_to_label.get(asset_id, "UNKNOWN")
                                     
-                                    logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label}")
+                                    # Extract outcome name to calculate yes/no probabilities
+                                    outcome_name = label.split(" | ")[-1] if " | " in label else ""
+                                    yes_prob = None
+                                    no_prob = None
+                                    if outcome_name.strip().lower() == "yes":
+                                        yes_prob = price
+                                        no_prob = round(1.0 - price, 4)
+                                    elif outcome_name.strip().lower() == "no":
+                                        no_prob = price
+                                        yes_prob = round(1.0 - price, 4)
+
+                                    logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label} | YesProb: {yes_prob} | NoProb: {no_prob}")
 
                                     # STATELESS: Pipe directly to Kafka. Let Enrichment score anomalies.
                                     raw_event = RawEvent(
@@ -161,7 +180,10 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                             "side": event.get("side", ""),
                                             "price": price,
                                             "size_shares": size,
-                                            "notional_usd": notional_usd
+                                            "notional_usd": notional_usd,
+                                            "yes_probability": yes_prob,
+                                            "no_probability": no_prob,
+                                            "outcome_name": outcome_name
                                         }
                                     )
                                     await producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
@@ -218,8 +240,29 @@ async def poll_kalshi(producer: SentinelProducer):
                         for market in open_markets[:100]:
                             ticker = market.get("ticker")
                             vol = market.get("volume", 0)
-                            yes_bid = market.get("yes_bid", 50)
-                            price_usd = yes_bid / 100 
+                            
+                            # Support both legacy cent-based integers and modern dollar-based fields
+                            yes_bid = market.get("yes_bid")
+                            no_bid = market.get("no_bid")
+                            yes_bid_dollars = market.get("yes_bid_dollars")
+                            no_bid_dollars = market.get("no_bid_dollars")
+                            
+                            # Standardize probability values (0.0 to 1.0)
+                            if yes_bid_dollars is not None:
+                                yes_prob = float(yes_bid_dollars)
+                            elif yes_bid is not None:
+                                yes_prob = yes_bid / 100.0
+                            else:
+                                yes_prob = None
+                                
+                            if no_bid_dollars is not None:
+                                no_prob = float(no_bid_dollars)
+                            elif no_bid is not None:
+                                no_prob = no_bid / 100.0
+                            else:
+                                no_prob = None
+                                
+                            price_usd = yes_prob if yes_prob is not None else 0.50
                             
                             event = RawEvent(
                                 source="kalshi",
@@ -228,7 +271,11 @@ async def poll_kalshi(producer: SentinelProducer):
                                     "ticker": ticker,
                                     "title": market.get("title"),
                                     "total_volume": vol,
-                                    "price": price_usd
+                                    "price": price_usd,
+                                    "yes_bid": yes_bid_dollars if yes_bid_dollars is not None else yes_bid,
+                                    "no_bid": no_bid_dollars if no_bid_dollars is not None else no_bid,
+                                    "yes_probability": yes_prob,
+                                    "no_probability": no_prob
                                 }
                             )
                             await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
