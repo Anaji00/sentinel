@@ -87,16 +87,28 @@ async def _consume_loop(consumer, db, session, producer):
                     original_topic = payload.get("topic", "unknown")
                     error_msg = payload.get("error", "No error provided")
                     raw_data = payload.get("raw", {})
-                    retry_count = payload.get("retry_count", 0)
-
+                    
+                    # Resolve retry count from envelope or nested event payload
+                    retry_count = payload.get("retry_count")
+                    if retry_count is None:
+                        if isinstance(raw_data, dict):
+                            retry_count = raw_data.get("raw_payload", {}).get("_sentinel_retry_count", 0)
+                        else:
+                            retry_count = 0
+                    
                     # 1. Evaluate Retry vs Permanent Failure
-                    if retry_count < 3 and original_topic != "unknown":
+                    is_poison_pill = "JSONDecodeError" in error_msg or "Invalid JSON" in error_msg
+                    
+                    if retry_count < 3 and original_topic != "unknown" and not is_poison_pill:
                         retry_count += 1
                         logger.info(f"Retrying failed event from {original_topic}, attempt {retry_count}")
                         # Exponential backoff based on retry count
                         await asyncio.sleep(2 ** retry_count)
                         
-                        # Re-publish to original topic with incremented retry count
+                        # Propagate retry count in event payload to prevent infinite retry loops
+                        if isinstance(raw_data, dict) and "raw_payload" in raw_data:
+                            raw_data["raw_payload"]["_sentinel_retry_count"] = retry_count
+                        
                         payload["retry_count"] = retry_count
                         try:
                             await producer.send(original_topic, raw_data) # Send raw data back
@@ -105,7 +117,7 @@ async def _consume_loop(consumer, db, session, producer):
                             logger.error(f"Failed to re-publish to {original_topic}: {e}")
                     
                     # 2. Save to PostgreSQL (permanently failed or couldn't retry)
-                    permanently_failed = (retry_count >= 3)
+                    permanently_failed = (retry_count >= 3) or is_poison_pill
                     try:
                         await db.execute("""
                             INSERT INTO failed_events (original_topic, error_message, raw_payload, retry_count, permanently_failed)
@@ -115,13 +127,11 @@ async def _consume_loop(consumer, db, session, producer):
                     except Exception as e:
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
                         sys.exit(1)
-
+ 
                     # 3. Rate-Limited Admin Alert
                     now = time.time()
                     if permanently_failed and (now - last_alert_time >= ALERT_COOLDOWN_SECONDS):
                         last_alert_time = now
-                        # We are in a sync thread, so we schedule the async HTTP request 
-                        # safely back onto the main asyncio loop.
                         asyncio.create_task(_send_telegram_alert(session, original_topic, error_msg))
                     
             await consumer.commit()  # Commit offsets after processing the batch

@@ -90,7 +90,7 @@ class Topics:
     # get stuck in a loop trying to process it forever.
     DLQ = "dead.letter"
 
-    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, RAW_RADAR, SCENARIOS_GENERATED]
+    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, RAW_RADAR]
 
 
 # ── SERIALIZATION ─────────────────────────────────────────────────────────────
@@ -114,17 +114,8 @@ class SentinelProducer:
         self._p = _Producer(
             bootstrap_servers=self._servers,
             value_serializer=_serialize,
-            # RETRIES: The "Redial" button.
-            # ACKS='all': The "Registered Mail" setting.
-            # We don't consider a message "Sent" until the Leader AND all Backups confirm receipt.
-            # This is slower but guarantees we never lose data if a server crashes.
             acks="all",
-            # LINGER_MS: "Wait for the bus to fill".
-            # Instead of sending every message instantly, wait 5ms to see if more messages arrive.
-            # Sending 1 bus with 50 people is faster than 50 buses with 1 person.
-            linger_ms=5,
-            # COMPRESSION: Zip it up.
-            # Makes the payload smaller. Saves network bandwidth and disk space.
+            linger_ms=10,
             compression_type="gzip",
         )
         self._started = False
@@ -191,21 +182,11 @@ class SentinelConsumer:
         self._c = _Consumer(
             *topics,
             bootstrap_servers=self._servers,
-            # GROUP_ID: The "Team Name".
-            # If you run 5 instances of this code with the SAME group_id, Kafka divides the work.
-            # Instance 1 gets 20% of the messages, Instance 2 gets 20%, etc.
-            # If one crashes, the others pick up the slack.
             group_id=group_id,
-            # AUTO_OFFSET_RESET: What to do if we have no bookmark?
-            # 'latest'   = Start reading only NEW messages arriving now. (Ignore history)
-            # 'earliest' = Start from the beginning of time. (Reprocess everything)
             auto_offset_reset=auto_offset_reset,
-            # AUTO_COMMIT: The "Automatic Bookmark".
-            # Every 1 second, the code tells Kafka "I've finished reading up to Page 50".
-            # If the code crashes and restarts, it looks up the bookmark and starts at Page 51.
-            # (It's simpler than doing it manually, though slightly less precise).
             enable_auto_commit=False,
             max_poll_records=100,
+            max_poll_interval_ms=600000,
         )
         self._started = False
         logger.info(f"Kafka Consumer: {self._servers} | Group: {group_id} --> Topics: {topics}")

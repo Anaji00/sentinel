@@ -85,10 +85,11 @@ async def evaluate_multi_timeframe(
         
         if len(closes) > 1:
             diffs = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-            gains = [d for d in diffs if d > 0]
-            losses = [abs(d) for d in diffs if d < 0]
-            avg_gain = sum(gains)/len(gains) if gains else 0.0
-            avg_loss = sum(losses)/len(losses) if losses else 0.0
+            gains = [d if d > 0 else 0.0 for d in diffs]
+            losses = [abs(d) if d < 0 else 0.0 for d in diffs]
+            avg_gain = sum(gains) / len(diffs)
+            avg_loss = sum(losses) / len(diffs)
+            
             if avg_loss == 0.0:
                 rsi_normalized = 1.0 if avg_gain > 0 else 0.5
             else:
@@ -96,8 +97,17 @@ async def evaluate_multi_timeframe(
                 rsi_normalized = (100 - (100 / (1 + rs))) / 100.0
                 
             if len(closes) >= 5:
-                fast_ema = sum(closes[-5:]) / 5
-                slow_ema = sum(closes) / len(closes)
+                def calc_ema(prices: list[float], n: int) -> float:
+                    if len(prices) <= n:
+                        return sum(prices) / len(prices) if prices else 0.0
+                    alpha = 2 / (n + 1)
+                    ema = sum(prices[:n]) / n
+                    for p in prices[n:]:
+                        ema = p * alpha + ema * (1 - alpha)
+                    return ema
+                
+                fast_ema = calc_ema(closes, 5)
+                slow_ema = calc_ema(closes, 14)
                 ema_divergence = (fast_ema - slow_ema) / slow_ema if slow_ema != 0 else 0.0
 
         price_change_pct = (b_close - b_open) / b_open if b_open != 0 else 0.0

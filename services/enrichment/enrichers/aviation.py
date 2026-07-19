@@ -14,17 +14,12 @@ from shared.kafka import Topics
 
 logger = logging.getLogger("enrichment.aviation")
 
-EMERGENCY_SQUAWKS = {
-    "7500": "hijacking",
-    "7600": "radio_failure",
-    "7700": "general_emergency",
-}
-
 SQUAWK_LABELS = {
     "7500": "hijacking",
     "7600": "radio_failure",
     "7700": "general_emergency",
 }
+
 
 
 class AviationEnricher:
@@ -57,7 +52,7 @@ class AviationEnricher:
         squawk   = str(p.get("squawk") or "").strip()
         
         # check if this is a known emergency code OR if the collector flagged it
-        is_emerg = squawk in EMERGENCY_SQUAWKS or p.get("is_emergency", False)
+        is_emerg = squawk in SQUAWK_LABELS or p.get("is_emergency", False)
         
         # Geo-tagging
         region   = classify_region(lat, lon) if (lat and lon) else None
@@ -77,6 +72,11 @@ class AviationEnricher:
         else:
             # Baseline flight behavior (no ML scoring for simple positions)
             score = 0.10
+
+        is_watched = await self.scorer.check_watchlist(icao24, "aircraft") or (callsign and await self.scorer.check_watchlist(callsign, "aircraft"))
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(icao24, "aviation_position")
+        score = min(1.0, score + w_boost + f_boost)
 
         # Only process high priority events to reduce noise
         if score < 0.6:
@@ -124,7 +124,7 @@ class AviationEnricher:
 
         # 5. PRODUCE NORMALIZED EVENT
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,

@@ -324,6 +324,18 @@ services:
       redis:
         condition: service_healthy
 
+  collector-macro:
+    build: .
+    container_name: sentinel-macro
+    command: python services/collector-macro/main.py
+    env_file: .env
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   api-gateway:
     build: .
     container_name: sentinel-api_gateway

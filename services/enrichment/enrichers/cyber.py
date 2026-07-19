@@ -168,7 +168,7 @@ class CyberEnricher:
         await self._propose_ontology({"entity_id": entity_id, "label": "Infrastructure", "confidence": anomaly})
         
         return NormalizedEvent(
-            event_id=raw.event_id, type=EventType.BGP_ANOMALY,
+            event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.BGP_ANOMALY,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"BGP {'hijack' if hijack else 'anomaly'}: {prefix} via AS{origin}",
@@ -209,7 +209,7 @@ class CyberEnricher:
         await self._propose_ontology({"entity_id": ip, "label": "Infrastructure", "confidence": anomaly})
         
         return NormalizedEvent(
-            event_id=raw.event_id, type=EventType.INFRA_EXPOSED,
+            event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.INFRA_EXPOSED,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"Exposed {product} on {ip} (Port: {port}) ({org})",
@@ -247,7 +247,7 @@ class CyberEnricher:
         
         event_type = getattr(EventType, "VULNERABILITY", EventType.INFRA_EXPOSED)
         return NormalizedEvent(
-            event_id=raw.event_id, type=event_type,
+            event_id=raw.event_id, trace_id=raw.trace_id, type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"KEV Added: {cve_id} — {vendor} {product} (ransomware:{ransomware_use})",
@@ -280,7 +280,7 @@ class CyberEnricher:
         await self._propose_ontology({"entity_id": victim, "label": "Company", "confidence": anomaly})
         
         return NormalizedEvent(
-            event_id=raw.event_id, type=EventType.RANSOMWARE,
+            event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.RANSOMWARE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"{group} ransomware: {victim} ({sector})",
@@ -306,7 +306,7 @@ class CyberEnricher:
         await self._propose_ontology({"entity_id": org, "label": "Company", "confidence": anomaly})
         
         return NormalizedEvent(
-            event_id=raw.event_id, type=EventType.BREACH_DETECTED,
+            event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.BREACH_DETECTED,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"Data breach: {org} — {records:,} records",

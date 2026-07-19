@@ -411,66 +411,66 @@ async def poll_ransomware(
 # ── RIPE RIS — BGP STREAM ─────────────────────────────────────────────────────
 
 async def stream_bgp(producer: SentinelProducer):
-    backoff = 1
-    while True:
+    from shared.utils.websocket import ResilientWebSocketClient
+
+    async def on_connect(ws):
+        await ws.send(json.dumps({
+            "type": "ris_subscribe",
+            "data": {"type": "UPDATE", "require": "announcements"},
+        }))
+        logger.info("Sent subscription payload to RIPE RIS BGP stream.")
+
+    async def on_message(raw_msg):
         try:
-            logger.info("Connecting to RIPE RIS BGP stream...")
-            async with websockets.connect(RIPE_RIS_URL, ping_interval=30, ping_timeout=15) as ws:
-                await ws.send(json.dumps({
-                    "type": "ris_subscribe",
-                    "data": {"type": "UPDATE", "require": "announcements"},
-                }))
-                backoff = 1
-                logger.info("RIPE RIS BGP stream connected")
+            msg  = json.loads(raw_msg)
+            data = msg.get("data", {})
+            if msg.get("type") != "ris_message":
+                return
 
-                async for raw_msg in ws:
-                    try:
-                        msg  = json.loads(raw_msg)
-                        data = msg.get("data", {})
-                        if msg.get("type") != "ris_message":
-                            continue
+            announcements = data.get("announcements", [])
+            path          = data.get("path", [])
+            if not announcements or not path:
+                return
 
-                        announcements = data.get("announcements", [])
-                        path          = data.get("path", [])
-                        if not announcements or not path:
-                            continue
+            origin_as = str(path[-1]) if path else ""
+            peer_as   = str(data.get("peer_asn", ""))
 
-                        origin_as = str(path[-1]) if path else ""
-                        peer_as   = str(data.get("peer_asn", ""))
+            for ann in announcements[:5]:
+                for prefix in (ann.get("prefixes") or [])[:3]:
+                    event = RawEvent(
+                        source="ripe_ris",
+                        occurred_at=datetime.fromtimestamp(
+                            data.get("timestamp", time.time()), tz=timezone.utc,
+                        ),
+                        raw_payload={
+                            "prefix":       prefix,
+                            "origin_as":    origin_as,
+                            "peer_as":      peer_as,
+                            "path":         path,
+                            "is_hijack":    False,
+                            "as_name":      "",
+                            "country_code": "",
+                        },
+                    )
+                    await producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
 
-                        for ann in announcements[:5]:
-                            for prefix in (ann.get("prefixes") or [])[:3]:
-                                event = RawEvent(
-                                    source="ripe_ris",
-                                    occurred_at=datetime.fromtimestamp(
-                                        data.get("timestamp", time.time()), tz=timezone.utc,
-                                    ),
-                                    raw_payload={
-                                        "prefix":       prefix,
-                                        "origin_as":    origin_as,
-                                        "peer_as":      peer_as,
-                                        "path":         path,
-                                        "is_hijack":    False,
-                                        "as_name":      "",
-                                        "country_code": "",
-                                    },
-                                )
-                                await producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
-
-                    except json.JSONDecodeError:
-                        pass
-                    except Exception as e:
-                        logger.debug(f"BGP message error: {e}")
-
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"RIPE RIS disconnected: {e} — reconnect in {backoff}s")
+        except json.JSONDecodeError:
+            pass
         except Exception as e:
-            logger.error(f"RIPE RIS error: {e} — reconnect in {backoff}s", exc_info=True)
+            logger.debug(f"BGP message error: {e}")
 
-        # EXPONENTIAL BACKOFF: If the server crashes, we don't want to spam it with 
-        # reconnect attempts. We wait 1s, then 2s, then 4s, up to a max of 60s.
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+    client = ResilientWebSocketClient(
+        url=RIPE_RIS_URL,
+        name="RIPE_RIS_BGP",
+        ping_interval=60.0,
+        ping_timeout=30.0,
+        on_connect=on_connect,
+        on_message=on_message
+    )
+    await client.start()
+
+    while True:
+        await asyncio.sleep(3600)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────

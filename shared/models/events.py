@@ -186,6 +186,7 @@ class SecurityData(BaseModel):
 
 class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: str
     collected_at: datetime = Field(default_factory=_utcnow)
     occurred_at: Optional[datetime] = None
@@ -193,6 +194,7 @@ class RawEvent(BaseModel):
 
 class NormalizedEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4())) 
+    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     type: EventType
     occurred_at: datetime 
     collected_at: datetime = Field(default_factory=_utcnow)
@@ -259,7 +261,8 @@ class NormalizedEvent(BaseModel):
             self.named_entities, 
             float(self.sentiment) if self.sentiment is not None else None, 
             float(self.anomaly_score),
-            self.correlation_ids 
+            self.correlation_ids,
+            self.trace_id
         )
 
     def is_physical(self) -> bool:
@@ -286,6 +289,7 @@ class NormalizedEvent(BaseModel):
 
 class CorrelationCluster(BaseModel):
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     rule_id: str
     rule_name: str
     alert_tier: AlertTier
@@ -300,6 +304,7 @@ class CorrelationCluster(BaseModel):
 # FIXED: Removed the shadowed class definition block. Combined the DB model with Hypotheses array.
 class Scenario(BaseModel):
     scenario_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     correlation_id: str
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)

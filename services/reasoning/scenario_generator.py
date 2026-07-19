@@ -171,13 +171,6 @@ class ScenarioGenerator:
         self._session: Optional[aiohttp.ClientSession] = None
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """
-        Creates or reuses an asynchronous HTTP session.
-        BEST PRACTICE: Connection Pooling
-        Creating a new HTTP connection for every request is slow. By reusing 
-        the same `aiohttp.ClientSession`, we keep the TCP connection to Ollama 
-        open, significantly speeding up back-to-back AI inferences.
-        """
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(limit=3, ttl_dns_cache=300)
             self._session = aiohttp.ClientSession(connector=connector)
@@ -230,12 +223,9 @@ class ScenarioGenerator:
         )
 
         client = OllamaClient(self._get_session(), self.model)
-        max_retries = 3
+        max_retries = 2
         retry_delay = 5.0
 
-        # Retry Loop: AI is non-deterministic (it changes its mind). 
-        # If it fails to return valid JSON, we wait `retry_delay` seconds and try again.
-        # `retry_delay` doubles each time (Exponential Backoff) so we don't spam the server.
         for attempt in range(max_retries):
             try:
                 # Send the prompt to the AI and force it to match our Pydantic schema

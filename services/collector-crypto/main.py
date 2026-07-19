@@ -46,146 +46,149 @@ COINBASE_PRODUCTS = [
 
 async def stream_coinbase_market_data(producer: SentinelProducer):
     """
-    Coinbase API Architecture: 
     Consolidates the Tape Reader (Large Trades) and Market Structure (1m Candles)
     into a single efficient WebSocket connection using the 'market_trades' channel.
     """
+    from shared.utils.websocket import ResilientWebSocketClient
+
     subscribe_msg = {
         "type": "subscribe",
         "product_ids": COINBASE_PRODUCTS,
         "channel": "market_trades"
     }
 
-    # In-memory aggregator for 1-minute candles
     candles = {p: {"o": None, "h": 0, "l": float('inf'), "c": 0, "v": 0} for p in COINBASE_PRODUCTS}
-    last_candle_emit = time.time()
     msg_count = 0
 
-    while True:
+    async def on_connect(ws):
+        await ws.send(json.dumps(subscribe_msg))
+        logger.info(f"Connected to Coinbase Advanced Trade WS -> {len(COINBASE_PRODUCTS)} pairs")
+
+    async def on_message(raw_msg):
+        nonlocal msg_count
         try:
-            async with websockets.connect(COINBASE_WS_URL, ping_interval=20) as ws:
-                await ws.send(json.dumps(subscribe_msg))
-                logger.info(f"Connected to Coinbase Advanced Trade WS -> {len(COINBASE_PRODUCTS)} pairs")
-                
-                while True:
-                    try:
-                        # Use wait_for so the loop continues ticking even if trades are slow,
-                        # ensuring our 60-second candle emitter fires accurately on time.
-                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        data = json.loads(msg)
+            data = json.loads(raw_msg)
+            if data.get("channel") == "market_trades":
+                for event in data.get("events", []):
+                    for trade in event.get("trades", []):
+                        symbol = trade["product_id"]
+                        price = float(trade["price"])
+                        qty = float(trade["size"])
+                        side = trade["side"]
+                        notional = price * qty
 
-                        # Coinbase Schema Routing
-                        if data.get("channel") == "market_trades":
-                            for event in data.get("events", []):
-                                for trade in event.get("trades", []):
-                                    symbol = trade["product_id"]
-                                    price = float(trade["price"])
-                                    qty = float(trade["size"])
-                                    side = trade["side"]
-                                    notional = price * qty
+                        c = candles[symbol]
+                        if c["o"] is None: c["o"] = price
+                        c["h"] = max(c["h"], price)
+                        c["l"] = min(c["l"], price)
+                        c["c"] = price
+                        c["v"] += qty
 
-                                    # 1. Update In-Memory Candle
-                                    c = candles[symbol]
-                                    if c["o"] is None: c["o"] = price
-                                    c["h"] = max(c["h"], price)
-                                    c["l"] = min(c["l"], price)
-                                    c["c"] = price
-                                    c["v"] += qty
+                        msg_count += 1
+                        if msg_count % 5000 == 0:
+                            logger.info(f"💓 Spot Heartbeat: Processed {msg_count} live Coinbase trades.")
 
-                                    # Heartbeat Logging
-                                    msg_count += 1
-                                    if msg_count % 5000 == 0:
-                                        logger.info(f"💓 Spot Heartbeat: Processed {msg_count} live Coinbase trades.")
-
-                                    # 2. Large Trade Check (Tape Reader)
-                                    if notional >= WHALE_THRESHOLD_USD:
-                                        raw_event = RawEvent(
-                                            source="coinbase_spot", occurred_at=datetime.now(timezone.utc),
-                                            raw_payload={
-                                                # Normalize Coinbase "BTC-USD" to standard "btcusdt" format
-                                                "asset": symbol.replace("-USD", "USDT").lower(), 
-                                                "trade_type": "LARGE_SPOT_TRADE",
-                                                "side": side, "price": price, 
-                                                "size_tokens": qty, "notional_usd": notional
-                                            }
-                                        )
-                                        # Await the Kafka producer
-                                        await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=symbol)
-
-                    except asyncio.TimeoutError:
-                        pass # Normal timeout, loop continues to check the candle timer
-
-                    # 3. Emit OHLCV Candles every 60 seconds
-                    now = time.time()
-                    if now - last_candle_emit >= 60.0:
-                        for sym, c in candles.items():
-                            if c["o"] is not None:
-                                raw_event = RawEvent(
-                                    source="coinbase_candles", occurred_at=datetime.now(timezone.utc),
-                                    raw_payload={
-                                        "asset": sym.replace("-USD", "USDT").lower(), 
-                                        "trade_type": "OHLCV",
-                                        "open": c["o"], "high": c["h"],
-                                        "low": c["l"], "close": c["c"],
-                                        "volume": c["v"]
-                                    }
-                                )
-                                # Await the Kafka producer
-                                await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=sym)
-                                
-                                # Reset candle for the next minute
-                                candles[sym] = {"o": None, "h": 0, "l": float('inf'), "c": 0, "v": 0}
-                        
-                        last_candle_emit = now
-
+                        if notional >= WHALE_THRESHOLD_USD:
+                            raw_event = RawEvent(
+                                source="coinbase_spot", occurred_at=datetime.now(timezone.utc),
+                                raw_payload={
+                                    "asset": symbol.replace("-USD", "USDT").lower(), 
+                                    "trade_type": "LARGE_SPOT_TRADE",
+                                    "side": side, "price": price, 
+                                    "size_tokens": qty, "notional_usd": notional
+                                }
+                            )
+                            await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=symbol)
         except Exception as e:
-            logger.error(f"Coinbase WS error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            logger.error(f"Error handling Coinbase WS message: {e}")
+
+    async def candle_emitter():
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                for sym, c in list(candles.items()):
+                    if c["o"] is not None:
+                        raw_event = RawEvent(
+                            source="coinbase_candles", occurred_at=datetime.now(timezone.utc),
+                            raw_payload={
+                                "asset": sym.replace("-USD", "USDT").lower(), 
+                                "trade_type": "OHLCV",
+                                "open": c["o"], "high": c["h"],
+                                "low": c["l"], "close": c["c"],
+                                "volume": c["v"]
+                            }
+                        )
+                        await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=sym)
+                        candles[sym] = {"o": None, "h": 0, "l": float('inf'), "c": 0, "v": 0}
+            except Exception as err:
+                logger.error(f"Coinbase candle emitter error: {err}")
+
+    client = ResilientWebSocketClient(
+        url=COINBASE_WS_URL,
+        name="Coinbase_Spot",
+        ping_interval=20.0,
+        on_connect=on_connect,
+        on_message=on_message
+    )
+    await client.start()
+    asyncio.create_task(candle_emitter())
+
+    while True:
+        await asyncio.sleep(3600)
 
 
 # ── 2. BINANCE FUTURES LIQUIDATIONS ───────────────────────────────────────────
 
 async def stream_binance_liquidations(producer: SentinelProducer):
+    from shared.utils.websocket import ResilientWebSocketClient
     url = "wss://fstream.binance.com/ws/!forceOrder@arr"
     msg_count = 0
-    while True:
+
+    async def on_message(raw_msg):
+        nonlocal msg_count
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                logger.info("Connected to Binance Liquidations (Futures)")
-                while True:
-                    data = json.loads(await ws.recv())
-                    order = data.get("o", {})
-                    if not order:
-                        continue
+            data = json.loads(raw_msg)
+            order = data.get("o", {})
+            if not order:
+                return
 
-                    symbol = order.get("s", "")
-                    side = order.get("S", "")
-                    price = float(order.get("p", 0))
-                    qty = float(order.get("q", 0))
-                    
-                    msg_count += 1
-                    if msg_count % 50 == 0:
-                        logger.info(f"💓 Liq Heartbeat: Processed {msg_count} liquidation events.")
+            symbol = order.get("s", "")
+            side = order.get("S", "")
+            price = float(order.get("p", 0))
+            qty = float(order.get("q", 0))
+            
+            msg_count += 1
+            if msg_count % 50 == 0:
+                logger.info(f"💓 Liq Heartbeat: Processed {msg_count} liquidation events.")
 
-                    event = RawEvent(
-                        source="binance_futures", occurred_at=datetime.now(timezone.utc),
-                        raw_payload={
-                            # Normalize Binance 'BTCUSDT' to match downstream 'btcusdt' correlation models
-                            "asset": symbol.lower(), 
-                            "trade_type": "LIQUIDATION", "side": side, 
-                            "price": price, "size_tokens": qty, "notional_usd": price * qty
-                        }
-                    )
-                    # Await the Kafka producer
-                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+            event = RawEvent(
+                source="binance_futures", occurred_at=datetime.now(timezone.utc),
+                raw_payload={
+                    "asset": symbol.lower(), 
+                    "trade_type": "LIQUIDATION", "side": side, 
+                    "price": price, "size_tokens": qty, "notional_usd": price * qty
+                }
+            )
+            await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
         except Exception as e:
-            logger.error(f"Binance Liq WS error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            logger.error(f"Error handling Binance Liquidation WS message: {e}")
+
+    client = ResilientWebSocketClient(
+        url=url,
+        name="Binance_Liquidations",
+        ping_interval=20.0,
+        on_message=on_message
+    )
+    await client.start()
+
+    while True:
+        await asyncio.sleep(3600)
 
 
 # ── 3. ON-CHAIN WHALE TRACKING ────────────────────────────────────────────────
 
 async def stream_onchain_whales(producer: SentinelProducer, redis_client):
+    from shared.utils.websocket import ResilientWebSocketClient
     if not ETH_WSS_URL: 
         logger.warning("ETH_RPC_WSS_URL missing. On-chain tracking disabled.")
         return
@@ -194,50 +197,57 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
     TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
     msg_count = 0
-    while True:
+
+    async def on_connect(ws):
+        await ws.send(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", 
+            "params": ["logs", {"address": CONTRACTS, "topics": [TRANSFER_TOPIC]}]
+        }))
+        logger.info("Connected to Ethereum RPC Whale Tracker")
+
+    async def on_message(raw_msg):
+        nonlocal msg_count
         try:
-            async with websockets.connect(ETH_WSS_URL, ping_interval=30) as ws:
-                await ws.send(json.dumps({
-                    "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", 
-                    "params": ["logs", {"address": CONTRACTS, "topics": [TRANSFER_TOPIC]}]
-                }))
-                logger.info("Connected to Ethereum RPC Whale Tracker")
+            log = json.loads(raw_msg).get("params", {}).get("result", {})
+            if log and log.get("data") != "0x" and len(log.get("topics", [])) >= 3:
+                sender = "0x" + log["topics"][1][26:]
+                receiver = "0x" + log["topics"][2][26:]
+                amount_usd = int(log["data"], 16) / (10 ** 6)
                 
-                while True:
-                    message = await ws.recv()
-                    log = json.loads(message).get("params", {}).get("result", {})
-                    
-                    if log and log.get("data") != "0x" and len(log.get("topics", [])) >= 3:
-                        sender = "0x" + log["topics"][1][26:]
-                        receiver = "0x" + log["topics"][2][26:]
-                        amount_usd = int(log["data"], 16) / (10 ** 6)
-                        
-                        # Native Async Redis Checking using gather.
-                        is_sender_suspect, is_receiver_suspect = await asyncio.gather(
-                            redis_client.raw.sismember("sentinel:watched:wallets", sender),
-                            redis_client.raw.sismember("sentinel:watched:wallets", receiver)
-                        )
-                        is_suspect = is_sender_suspect or is_receiver_suspect
+                is_sender_suspect, is_receiver_suspect = await asyncio.gather(
+                    redis_client.raw.sismember("sentinel:watched:wallets", sender),
+                    redis_client.raw.sismember("sentinel:watched:wallets", receiver)
+                )
+                is_suspect = is_sender_suspect or is_receiver_suspect
 
-                        msg_count += 1
-                        if msg_count % 500 == 0:
-                            logger.info(f"💓 ETH Heartbeat: Evaluated {msg_count} Stablecoin transfers.")
+                msg_count += 1
+                if msg_count % 500 == 0:
+                    logger.info(f"💓 ETH Heartbeat: Evaluated {msg_count} Stablecoin transfers.")
 
-                        if amount_usd >= WHALE_THRESHOLD_USD or is_suspect:
-                            token = "USDT" if log.get("address").lower() == CONTRACTS[0] else "USDC"
-                            event = RawEvent(
-                                source="ethereum_rpc", occurred_at=datetime.now(timezone.utc),
-                                raw_payload={
-                                    "asset": token, "trade_type": "WHALE_TRANSFER", "notional_usd": amount_usd, 
-                                    "sender_wallet": sender, "receiver_wallet": receiver, "is_suspect_wallet": is_suspect
-                                }
-                            )
-                            # Await the Kafka producer
-                            await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=token)
-                            
+                if amount_usd >= WHALE_THRESHOLD_USD or is_suspect:
+                    token = "USDT" if log.get("address").lower() == CONTRACTS[0] else "USDC"
+                    event = RawEvent(
+                        source="ethereum_rpc", occurred_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "asset": token, "trade_type": "WHALE_TRANSFER", "notional_usd": amount_usd, 
+                            "sender_wallet": sender, "receiver_wallet": receiver, "is_suspect_wallet": is_suspect
+                        }
+                    )
+                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=token)
         except Exception as e:
-            logger.error(f"ETH RPC error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            logger.error(f"Error handling Ethereum logs WS message: {e}")
+
+    client = ResilientWebSocketClient(
+        url=ETH_WSS_URL,
+        name="Ethereum_Whales",
+        ping_interval=30.0,
+        on_connect=on_connect,
+        on_message=on_message
+    )
+    await client.start()
+
+    while True:
+        await asyncio.sleep(3600)
 
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────

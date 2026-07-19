@@ -45,7 +45,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
     async def update_subscriptions(ws, session):
         base_url = "https://gamma-api.polymarket.com/markets"
-        events_url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20"
+        markets_url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=100"
         
         while True:
             try:
@@ -55,15 +55,19 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 
                 # 2. Fetch dynamic active slugs from Polymarket
                 try:
-                    async with session.get(events_url, timeout=10) as resp:
+                    async with session.get(markets_url, timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            dynamic_slugs = [event.get("slug") for event in data if event.get("slug")]
+                            # Extract unique slugs from the active markets list
+                            dynamic_slugs = list(set(m.get("slug") for m in data if m.get("slug")))
                             
                             # Add dynamic slugs to Redis for visibility to other services
                             if dynamic_slugs:
                                 await redis_client.raw.sadd(redis_key, *dynamic_slugs)
                                 watched_slugs.extend([s for s in dynamic_slugs if s not in watched_slugs])
+                        else:
+                            body = await resp.text()
+                            logger.error(f"Polymarket dynamic market lookup returned status {resp.status}: {body[:200]}")
                 except Exception as e:
                     logger.error(f"Failed to fetch dynamic slugs from Polymarket: {e!r}")
                 
@@ -115,7 +119,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                         logger.error(f"Gamma API connection error for {slug}: {e}")
                 
                 if new_assets:
-                    await ws.send(json.dumps({"asset_jds": new_assets, "type": "market"}))
+                    await ws.send(json.dumps({"asset_ids": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")
                 
             except Exception as e:
@@ -180,19 +184,40 @@ async def poll_kalshi(producer: SentinelProducer):
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
         while True:
             try:   
-                # FIX: Removed status=open to prevent 400 Bad Request error
-                url = f"{KALSHI_BASE_URL}/markets?limit=50"
+                # Query up to 1000 markets to ensure we catch most active elections and categories
+                url = f"{KALSHI_BASE_URL}/markets?limit=1000"
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         markets = data.get("markets", [])
                         
+                        # 1. Filter only open, non-expired markets with trading activity
+                        open_markets = []
                         for market in markets:
-                            ticker = market.get("ticker")
-                            vol = market.get("volume", 0)
-                            if vol == 0:
+                            if market.get("status") != "open":
+                                continue
+                                
+                            exp_ts = market.get("expiration_ts")
+                            if exp_ts:
+                                try:
+                                    exp_dt = datetime.fromisoformat(exp_ts.replace('Z', '+00:00'))
+                                    if exp_dt < datetime.now(timezone.utc):
+                                        continue
+                                except Exception:
+                                    pass
+                            
+                            if market.get("volume", 0) <= 0:
                                 continue
                             
+                            open_markets.append(market)
+                            
+                        # 2. Sort open markets by volume descending to dynamically keep top active bets
+                        open_markets.sort(key=lambda m: m.get("volume", 0), reverse=True)
+                        
+                        # 3. Publish the top 100 most active markets
+                        for market in open_markets[:100]:
+                            ticker = market.get("ticker")
+                            vol = market.get("volume", 0)
                             yes_bid = market.get("yes_bid", 50)
                             price_usd = yes_bid / 100 
                             

@@ -41,35 +41,6 @@ from services.enrichment.enrichers.crypto import CryptoEnricher
 from services.enrichment.enrichers.prediction import PredictionEnricher
 
 
-async def process_single_message(msg, enrichers, dlq):
-    """Encapsulates a single message's processing to run concurrently."""
-    maritime, aviation, news, cyber, tradfi, crypto, prediction = enrichers
-    topic = msg.topic
-    
-    try:
-        raw_data = json.loads(msg.value.decode('utf-8'))
-        raw = RawEvent(**raw_data)
-        
-        enriched = None
-        if topic == Topics.RAW_MARITIME:       enriched = await maritime.enrich(raw)
-        elif topic == Topics.RAW_AVIATION:     enriched = await aviation.enrich(raw)
-        elif topic == Topics.RAW_NEWS:         enriched = await news.enrich(raw)
-        elif topic == Topics.RAW_CYBER:        enriched = await cyber.enrich(raw)
-        elif topic == Topics.RAW_TRADFI:       enriched = await tradfi.enrich(raw)
-        elif topic == Topics.RAW_CRYPTO:       enriched = await crypto.enrich(raw)
-        elif topic == Topics.RAW_PREDICTION:   enriched = await prediction.enrich(raw)
-        
-        return {"status": "success", "enriched": enriched, "topic": topic}
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"POISON PILL JSON dropped: {e}", exc_info=True)
-        await dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": topic, "raw": str(msg.value)})
-        return {"status": "error", "error": e}
-    except Exception as e:
-        logger.error(f"[{topic}] Enrichment fault: {e}", exc_info=True)
-        await dlq.send(Topics.DLQ, {"error": str(e), "topic": topic})
-        return {"status": "error", "error": e}
-
 
 async def _heartbeat_loop(state: dict):
     """Periodic heartbeat for operational visibility."""
@@ -83,29 +54,25 @@ async def _heartbeat_loop(state: dict):
             f"uptime={int(elapsed)}s"
         )
 
-def schedule_ofac_sync():
-    """Syncs OFAC sanctions list daily."""
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    import aiohttp
-    from shared.utils.sanctions import rebuild_sanctions_from_list
+async def _ofac_sync_loop():
+    """Syncs OFAC sanctions list on startup then every 24 hours.
     
-    async def fetch_and_rebuild():
-        logger.info("Starting OFAC sanctions sync...")
+    Uses a simple asyncio loop instead of apscheduler — no external
+    dependency needed for a single daily job.
+    """
+    from shared.utils.sanctions import rebuild_sanctions_from_list
+
+    while True:
         try:
-            # Simulated OFAC download logic
-            # In Phase 2, this would download and parse the actual SDN list
-            # For now, we simulate fetching an updated list
+            logger.info("Starting OFAC sanctions sync...")
+            # Phase 2: download and parse the actual SDN list from OFAC.
+            # For now, we rebuild from a static keyword set.
             updated_keywords = ["irgc", "dprk", "wagner", "pdvsa", "new_sanction_target"]
             rebuild_sanctions_from_list(updated_keywords)
+            logger.info("OFAC sanctions sync complete.")
         except Exception as e:
             logger.error(f"OFAC sync failed: {e}")
-            
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(fetch_and_rebuild, 'interval', hours=24)
-    scheduler.start()
-    
-    # Run immediately on boot
-    asyncio.create_task(fetch_and_rebuild())
+        await asyncio.sleep(86_400)  # 24 hours
 
 async def main():
     logger.info("=" * 60)
@@ -116,7 +83,7 @@ async def main():
 
     timescale = await get_timescale()
     redis     = await get_redis()
-    schedule_ofac_sync()
+    asyncio.create_task(_ofac_sync_loop())
     
     # Wait for databases to come online
     producer = SentinelProducer()
@@ -212,11 +179,24 @@ async def main():
                 # Execute all batches simultaneously 
                 results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
                 
-                # ── 2. ASYNC CONCURRENT PRODUCER DISPATCH ────────────────────
+                # ── 2. ASYNC CONCURRENT PRODUCER DISPATCH & ERROR ROUTING ──
                 produce_tasks = []
-                for batch_result in results:
-                    if isinstance(batch_result, list):
-                        for enriched in batch_result:
+                for batch_result, (topic, raw_events) in zip(results, list(raw_events_by_topic.items())):
+                    if isinstance(batch_result, Exception):
+                        logger.error(f"Batch enrichment failed for topic {topic}: {batch_result}", exc_info=batch_result)
+                        for re in raw_events:
+                            asyncio.create_task(
+                                dlq.send(
+                                    Topics.DLQ,
+                                    {
+                                        "error": f"Batch enrichment error: {batch_result}",
+                                        "topic": topic,
+                                        "raw": re.model_dump()
+                                    }
+                                )
+                            )
+                    elif isinstance(batch_result, list):
+                        for enriched, re in zip(batch_result, raw_events):
                             if isinstance(enriched, NormalizedEvent):
                                 batch_to_write.append(enriched)
                                 produce_tasks.append(
@@ -224,6 +204,18 @@ async def main():
                                         Topics.ENRICHED_EVENTS,
                                         enriched.model_dump(),
                                         key=enriched.primary_entity.id,
+                                    )
+                                )
+                            elif isinstance(enriched, Exception):
+                                logger.error(f"Enrichment failed for event from {topic}: {enriched}", exc_info=enriched)
+                                asyncio.create_task(
+                                    dlq.send(
+                                        Topics.DLQ,
+                                        {
+                                            "error": f"Enrichment event error: {enriched}",
+                                            "topic": topic,
+                                            "raw": re.model_dump()
+                                        }
                                     )
                                 )
                 
@@ -248,8 +240,18 @@ async def main():
                                 errors += len(batch_to_write)
                                 heartbeat_state["errors"] = errors
                                 logger.error(f"FATAL DB WRITE ERROR: {write_err}. Routing batch to DLQ to prevent data loss.", exc_info=True)
-                                # Send the failed DB batch to DLQ rather than crashing the service
-                                dlq_tasks = [dlq.send(Topics.DLQ, {"error": "DB_WRITE_FAILED", "event_id": e.event_id}) for e in batch_to_write]
+                                # Send the failed DB batch with full payload to DLQ rather than crashing the service
+                                dlq_tasks = [
+                                    dlq.send(
+                                        Topics.DLQ,
+                                        {
+                                            "error": f"DB_WRITE_FAILED: {write_err}",
+                                            "topic": Topics.ENRICHED_EVENTS,
+                                            "raw": e.model_dump()
+                                        }
+                                    )
+                                    for e in batch_to_write
+                                ]
                                 await asyncio.gather(*dlq_tasks, return_exceptions=True)
                                 batch_success = False
                             else:

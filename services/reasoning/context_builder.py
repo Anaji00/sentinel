@@ -105,43 +105,55 @@ class ContextBuilder:
         
     async def _fetch_entity_graph(self, entity_ids: List[str]) -> List[Dict]:
         """
-        For each entity, get up to 3 hops of relationships from Neo4j.
-        Returns ownership chains, flag connections, etc.
+        Batches and parallelizes Neo4j graph lookup for entities.
+        Fetches up to 3 hops of relationships and active flags in just 2 parallel database round-trips.
         """
         if not entity_ids:
             return []
         
+        targets = list(set(entity_ids[:5]))
         neo4j_client = await get_neo4j()
-        results = []
         
-        # CRITICAL THINKING: Token Limit & Performance Protection.
-        # We slice `entity_ids[:5]` to avoid blowing up the LLM Context Window or 
-        # crushing the Neo4j graph database. Graph traversal grows exponentially 
-        # (1 node -> 10 nodes -> 100 nodes). Limiting to 5 entities ensures stability.
-        for entity_id in entity_ids[:5]:  # Limit to first 5 entities to avoid overload
-            try:
-                # Query breakdown: `-[r*1..3]-` tells Neo4j to find paths between 1 and 3 hops away.
-                # This reveals hidden links (e.g., Vessel -> owned_by -> Shell Company -> owns -> Other Vessel).
-                # `LIMIT 20` prevents a massive network of thousands of nodes from returning.
-                rows = await neo4j_client.query("""
-                    MATCH (v:Vessel {mmsi: $id})-[r*1..3]-(n)
-                    RETURN v.name as entity, type(r[0]) as rel, n.name as connected,
-                           labels(n) as labels
-                    LIMIT 20
-                """, {"id": entity_id})
-                if rows:
-                    results.append({"entity_id": entity_id, "relationships": rows})
-
-                flags = await neo4j_client.query("""
-                    MATCH (v:Vessel {mmsi: $id})-[:FLAGGED_AS]->(f:Flag)
-                    RETURN f.type as flag
-                """, {"id": entity_id})
-                if flags:
-                    flag_list = [r["flag"] for r in flags]
-                    results.append({"entity_id": entity_id, "flags": flag_list})
-            except Exception as e:
-                logger.debug(f"Error fetching graph for entity {entity_id}: {e}")
-        return results
+        try:
+            rel_task = neo4j_client.query("""
+                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids
+                MATCH (v)-[r*1..3]->(n)
+                RETURN coalesce(v.name, v.mmsi) as entity_id, type(r[0]) as rel, coalesce(n.name, n.mmsi) as connected,
+                       labels(n) as labels
+                LIMIT 100
+            """, {"ids": targets})
+            
+            flag_task = neo4j_client.query("""
+                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids
+                MATCH (v)-[:FLAGGED_AS]->(f:Flag)
+                RETURN coalesce(v.name, v.mmsi) as entity_id, f.type as flag
+                LIMIT 50
+            """, {"ids": targets})
+            
+            rel_rows, flag_rows = await asyncio.gather(rel_task, flag_task)
+            
+            results = []
+            
+            rel_by_entity = {}
+            for r in (rel_rows or []):
+                ent = r["entity_id"]
+                rel_by_entity.setdefault(ent, []).append(r)
+                
+            for ent, relationships in rel_by_entity.items():
+                results.append({"entity_id": ent, "relationships": relationships})
+                
+            flags_by_entity = {}
+            for r in (flag_rows or []):
+                ent = r["entity_id"]
+                flags_by_entity.setdefault(ent, []).append(r["flag"])
+                
+            for ent, flags in flags_by_entity.items():
+                results.append({"entity_id": ent, "flags": flags})
+                
+            return results
+        except Exception as e:
+            logger.debug(f"Error fetching batch graph for entities {targets}: {e}")
+            return []
     
     async def _fetch_recent_news(self, cluster: CorrelationCluster) -> List[str]:
         """Fetch recent high-anomaly headlines related to the correlation."""

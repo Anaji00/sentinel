@@ -117,9 +117,9 @@ class OntologyMasterAgent(SentinelAgent):
             return None
 
         dedup_key = f"classify:{entity_name}"
-        if self.is_recently_processed(dedup_key, window_seconds=21600):
+        if await self.is_recently_processed(dedup_key, window_seconds=21600):
             return None
-        self.mark_processed(dedup_key, window_seconds=21600)
+        await self.mark_processed(dedup_key, window_seconds=21600)
 
         logger.info(f"Classifying entity: '{entity_name}' (freq={frequency})")
 
@@ -262,9 +262,6 @@ class OntologyMasterAgent(SentinelAgent):
             return 0
 
     # ── NEO4J PROMOTION ───────────────────────────────────────────────────────
-    @property
-    def output_topic(self):
-        return "sentinel:ontology:proposals"
 
     async def _promote_to_neo4j(
         self,

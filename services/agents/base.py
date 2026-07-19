@@ -41,9 +41,7 @@ class SentinelAgent(ABC):
         self._errors = 0
         self._started_at = datetime.now(timezone.utc)
         
-        # ── BEST PRACTICE: Declare Class Shape in __init__ ──
-        # We declare them here so IDEs and Type Checkers know they exist,
-        # but we wait to instantiate them until we are inside the async event loop.
+        # Declared here for IDE support; instantiated inside the async event loop in run().
         self._session: Optional[aiohttp.ClientSession] = None
         self._llm: Optional[OllamaClient] = None
         
@@ -107,7 +105,10 @@ class SentinelAgent(ABC):
                             self.logger.error(f"POISON PILL dropped: {e}")
                             await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
 
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, Exception):
+                            self.logger.error(f"Dispatch task failed: {r}", exc_info=r)
                 await self._consumer.commit()
 
             except asyncio.CancelledError:
@@ -172,6 +173,56 @@ class SentinelAgent(ABC):
     def state_key(self, *parts: str) -> str:
         return f"sentinel:agents:{self.name}:{':'.join(parts)}"
 
+    async def write_agent_memory(self, memory_text: str, ttl: int = 86400):
+        """
+        Writes a timestamped episodic memory to a shared Redis sorted set.
+        Allows cross-agent asynchronous communication (e.g. Quant -> News).
+        """
+        try:
+            now = time.time()
+            memory_payload = json.dumps({
+                "agent": self.name,
+                "text": memory_text,
+                "ts": datetime.now(timezone.utc).isoformat()
+            })
+            
+            # Use ZADD with current timestamp as score for easy chronological retrieval
+            await self.redis.raw.zadd("sentinel:agents:episodic_memory", mapping={memory_payload: now})
+            
+            # Trim the memory stream to keep only the 100 most recent memories to prevent bloat
+            await self.redis.raw.zremrangebyrank("sentinel:agents:episodic_memory", 0, -101)
+            
+            # Note: We don't set TTL on the ZSET itself because it's a shared stream, 
+            # we just prune old entries by rank. Alternatively could prune by score.
+            
+            self.logger.debug(f"Episodic memory stored: {memory_text[:50]}...")
+        except Exception as e:
+            self.logger.warning(f"Failed to write agent memory: {e}")
+
+    async def read_agent_memories(self, limit: int = 5) -> str:
+        """
+        Reads the most recent cross-agent episodic memories.
+        Returns a formatted string ready for LLM prompt injection.
+        """
+        try:
+            # ZREVRANGE to get most recent first
+            raw_memories = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, limit - 1)
+            
+            if not raw_memories:
+                return "No recent agent memories."
+                
+            context = "\n### RECENT CROSS-AGENT MEMORIES ###\n"
+            for raw in raw_memories:
+                try:
+                    mem = json.loads(raw)
+                    context += f"- [{mem.get('ts', 'unknown')}] {mem.get('agent', 'UnknownAgent')}: {mem.get('text', '')}\n"
+                except Exception:
+                    pass
+            return context + "\n"
+        except Exception as e:
+            self.logger.warning(f"Failed to read agent memories: {e}")
+            return "Failed to fetch memories."
+
     async def is_recently_processed(self, entity_id: str, window_seconds: int = 3600) -> bool:
         return await self.redis.raw.exists(self.state_key("seen", entity_id))
 
@@ -205,7 +256,7 @@ class SentinelAgent(ABC):
                 ORDER BY occurred_at DESC
                 LIMIT 5
             """
-            rows = await self.db.fetch(query, entity_name, f"%{entity_name}%")
+            rows = await self.db.query(query, entity_name, f"%{entity_name}%")
             if not rows:
                 return ""
                 
@@ -232,7 +283,7 @@ class SentinelAgent(ABC):
                 ORDER BY anomaly_score DESC
                 LIMIT 5
             """
-            anomalies = await self.db.fetch(anomaly_query)
+            anomalies = await self.db.query(anomaly_query)
             
             news_query = """
                 SELECT type, headline, occurred_at
@@ -242,7 +293,7 @@ class SentinelAgent(ABC):
                 ORDER BY occurred_at DESC
                 LIMIT 5
             """
-            news = await self.db.fetch(news_query)
+            news = await self.db.query(news_query)
             
             context = "\n### GLOBAL SENTINEL CONTEXT (LAST 24 HOURS) ###\n"
             context += "TOP ML ANOMALIES:\n"
@@ -269,6 +320,7 @@ class SentinelAgent(ABC):
                 "agent": self.name, 
                 "status": "THINKING", 
                 "task_id": run_id,
+                "trace_id": message.get("trace_id", "unknown"),
                 "system_prompt_length": len(system_prompt),
                 "user_prompt_length": len(user_prompt)
             }

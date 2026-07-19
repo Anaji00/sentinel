@@ -153,12 +153,13 @@ class QuantResearcherAgent(SentinelAgent):
         # ── STEP 1: Gather research context ───────────────────────────────────
         # PERFORMANCE: asyncio.gather runs these network/database requests at the 
         # exact same time (concurrently), rather than waiting for them one by one.
-        news_context, graph_context, current_watchlist, macro_context, ontology_context = await asyncio.gather(
+        news_context, graph_context, current_watchlist, macro_context, ontology_context, agent_memories = await asyncio.gather(
             self._fetch_news_context(ticker),
             self._fetch_graph_context(ticker),
             self._get_current_watchlist(),
             self._fetch_macro_context(),
-            self._fetch_ontology_context(ticker)
+            self._fetch_ontology_context(ticker),
+            self.read_agent_memories(limit=8)
         )
 
         # ── STEP 2: LLM peer discovery ────────────────────────────────────────
@@ -171,6 +172,7 @@ class QuantResearcherAgent(SentinelAgent):
             ontology_context=json.dumps(ontology_context, default=str) if ontology_context else "None",
             macro_context=json.dumps(macro_context, default=str) if macro_context else "None",
             news_context=json.dumps(news_context[:8], default=str),
+            agent_memories=agent_memories,
             graph_context=json.dumps(graph_context[:10], default=str),
             current_watchlist=json.dumps(list(current_watchlist)[:20]),
         )
@@ -206,10 +208,18 @@ class QuantResearcherAgent(SentinelAgent):
         # ── STEP 4: Write discovery to Neo4j ──────────────────────────────────
         asyncio.create_task(self._write_graph_relationships(ticker, discovery))
 
-        # ── STEP 5: Update accumulator (Now Async) ────────────────────────────
+        # ── STEP 5: Write Episodic Memory ─────────────────────────────────────
+        if added or anomaly_score >= 0.8:
+            peer_list = [p.ticker for p in discovery.peer_tickers if p.discovery_confidence > 0.6]
+            inverse_peers = [p.ticker for p in discovery.peer_tickers if p.relationship_type == "inverse_exposure_to"]
+            inverse_str = f" Inverse exposure: {inverse_peers}." if inverse_peers else ""
+            mem_text = f"Detected anomalous flow in {ticker} (Score: {anomaly_score:.2f}, ${notional/1e6:.1f}M). Discovered correlated peers: {peer_list}.{inverse_str}"
+            asyncio.create_task(self.write_agent_memory(mem_text))
+
+        # ── STEP 6: Update accumulator (Now Async) ────────────────────────────
         await self._accumulate_volume(ticker, message)
 
-        # ── STEP 6: Publish discovery ─────────────────────────────────────────
+        # ── STEP 7: Publish discovery ─────────────────────────────────────────
         # Handle Pydantic v1 vs v2 compatibility gracefully
         discovery_dict = discovery.model_dump() if hasattr(discovery, "model_dump") else discovery.dict()
 
@@ -221,7 +231,8 @@ class QuantResearcherAgent(SentinelAgent):
                 "event_type":       event_type,
                 "notional_usd":     notional,
                 "anomaly_score":    anomaly_score,
-                "source_event_id":  message.get("event_id"),   
+                "source_event_id":  message.get("event_id"),
+                "trace_id":         message.get("trace_id"),
             },
             "discovery":         discovery_dict,
             "peers_added_to_watchlist": added,
@@ -441,6 +452,7 @@ class QuantResearcherAgent(SentinelAgent):
             rel_type = self._map_relationship_type(peer.relationship_type)
             proposal = {
                 "entity_id": trigger_ticker,
+                "trace_id": message.get("trace_id"),
                 "action": "LINK_ENTITY",
                 "data": {
                     "target_id": peer.ticker,

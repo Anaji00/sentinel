@@ -139,8 +139,9 @@ class DynamicAnomalyScorer:
             dynamic_threshold = current_mean + (self.z_score_threshold * current_std)
             results.append(score > dynamic_threshold)
             
+            old_mean = current_mean
             current_mean = (self.alpha * score) + ((1 - self.alpha) * current_mean)
-            current_var = (self.alpha * (score - current_mean)**2) + ((1 - self.alpha) * current_var)
+            current_var = (self.alpha * (score - old_mean)**2) + ((1 - self.alpha) * current_var)
 
         pipe = self.redis.raw.pipeline()
         pipe.set(mean_key, current_mean)
@@ -291,6 +292,43 @@ class DynamicAnomalyScorer:
         res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
         return res["score"]
         
+    async def check_watchlist(self, entity_id: str, watchlist_type: str) -> bool:
+        """
+        Queries Redis to check if an entity (e.g., ticker, MMSI, callsign, wallet) is on a watchlist.
+        watchlist_type: 'equities', 'vessels', 'aircraft', 'wallets'
+        """
+        if not self.redis or not entity_id:
+            return False
+        try:
+            key = f"sentinel:watched:{watchlist_type}"
+            is_member = await self.redis.raw.sismember(key, entity_id)
+            if is_member:
+                return True
+            score = await self.redis.raw.zscore(key, entity_id)
+            return score is not None
+        except Exception:
+            return False
+
+    async def track_frequency(self, entity_id: str, domain: str, window_seconds: int = 3600) -> float:
+        """
+        Increments a Redis-backed frequency counter for an entity in a given domain over a rolling window.
+        Returns a progressive boost: 0.05 per repeat mention, capped at 0.20.
+        """
+        if not self.redis or not entity_id:
+            return 0.0
+        try:
+            key = f"sentinel:frequency:{domain}:{entity_id.lower()}"
+            pipe = self.redis.raw.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, window_seconds)
+            results = await pipe.execute()
+            count = results[0]
+            if count <= 1:
+                return 0.0
+            return min(0.20, (count - 1) * 0.05)
+        except Exception:
+            return 0.0
+
     async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> tuple:
         config = {"entity_boost": 0.02, "max_boost": 0.3}
         try:
@@ -304,19 +342,64 @@ class DynamicAnomalyScorer:
             
         semantic_boost = 0.0
         semantic_tags = []
+        watchlist_boost = 0.0
+        frequency_boost = 0.0
+
         if self.redis and named_entities:
             pipe = self.redis.raw.pipeline()
             for tag in named_entities:
                 pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
+                # Batch pipeline checks for watchlist members to optimize performance
+                pipe.sismember("sentinel:watched:equities", tag)
+                pipe.zscore("sentinel:watched:equities", tag)
+                pipe.sismember("sentinel:watched:vessels", tag)
+                pipe.zscore("sentinel:watched:vessels", tag)
+                
             results = await pipe.execute()
-            for tag, res in zip(named_entities, results):
+            vals = []
+            
+            for i, tag in enumerate(named_entities):
+                res = results[i*5]
+                is_eq_set = results[i*5 + 1]
+                is_eq_zset = results[i*5 + 2]
+                is_ves_set = results[i*5 + 3]
+                is_ves_zset = results[i*5 + 4]
+
                 if res:
                     val = float(res)
                     semantic_boost += abs(val) * 0.1
-                    sentiment = sentiment * 0.5 + (val * 0.5)
-                    semantic_tags.append(f"semantic:{'positive' if val > 0 else 'negative' if val == -1.0 else 'critical'}")
+                    vals.append(val)
+                    tag_label = "positive" if val > 0 else "critical" if val <= -1.5 else "negative"
+                    semantic_tags.append(f"semantic:{tag_label}")
+
+                if is_eq_set or (is_eq_zset is not None) or is_ves_set or (is_ves_zset is not None):
+                    watchlist_boost = 0.15
+
+                f_boost = await self.track_frequency(tag, "news")
+                frequency_boost = max(frequency_boost, f_boost)
+
+            if vals:
+                blended_val = sum(vals) / len(vals)
+                sentiment = sentiment * 0.5 + blended_val * 0.5
                     
-        base = abs(sentiment) * reliability
+        # Non-linear reliability scaling to allow low-reliability feeds with extreme sentiment to be scored properly
+        scaled_reliability = 0.5 + 0.5 * reliability
+        base = abs(sentiment) * scaled_reliability
+        
         entity_boost = min(config["max_boost"], len(named_entities) * config["entity_boost"])
-        final_score = round(min(1.0, base + entity_boost + semantic_boost), 3)
+        final_score = round(min(1.0, base + entity_boost + semantic_boost + watchlist_boost + frequency_boost), 3)
         return final_score, semantic_tags
+
+    async def score_cyber_event(self, cve_id: str, severity_score: float) -> float:
+        """Dynamic anomaly scorer stub for Cyber CVE events based on severity."""
+        config = {"divisor": 10.0}
+        res = await self.score_event("cyber_anomaly", cve_id, [severity_score / config["divisor"], 0.0, 0.0, 0.0, 0.0])
+        return res["score"]
+
+    async def score_aviation_batch(self, flights: list) -> list:
+        """Dynamic anomaly scorer stub for batched flight events."""
+        if not flights:
+            return []
+        # Return base anomaly scores for simple positions
+        return [0.10 for _ in flights]
+

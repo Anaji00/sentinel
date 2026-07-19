@@ -108,6 +108,11 @@ class MaritimeEnricher:
         pipe = self.redis.raw.pipeline()
         for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict in zip(parsed, vessels, scores):
             anomaly = score_dict.get("score", 0.0)
+            is_watched = await self.scorer.check_watchlist(mmsi, "vessels")
+            w_boost = 0.15 if is_watched else 0.0
+            f_boost = await self.scorer.track_frequency(mmsi, "vessel_position")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+
             flags = vessel.get("flags", [])
             vtype = vessel.get("vessel_type", "Unknown")
             
@@ -140,7 +145,7 @@ class MaritimeEnricher:
         final_events = []
         for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, region, vessel, flags, vtype, anomaly) in results:
             final_events.append(NormalizedEvent(
-                event_id = raw.event_id,
+                event_id = raw.event_id, trace_id = raw.trace_id,
                 type = EventType.VESSEL_POSITION,
                 occurred_at = raw.occurred_at or datetime.now(timezone.utc),
                 source = raw.source,
@@ -187,7 +192,7 @@ class MaritimeEnricher:
         await self.graph.upsert_vessel(mmsi, {"name": name, "vessel_type": vtype, "flags": flags})
 
         return NormalizedEvent(
-            event_id = raw.event_id,
+            event_id = raw.event_id, trace_id = raw.trace_id,
             type = EventType.VESSEL_STATIC,
             occurred_at = raw.occurred_at or datetime.now(timezone.utc),
             source = raw.source,

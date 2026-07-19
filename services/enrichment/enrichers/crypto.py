@@ -83,6 +83,12 @@ class CryptoEnricher:
         results = []
         for i, (raw, p, asset, side, price, qty, notional) in enumerate(parsed_events):
             anomaly = scores[i]
+            # Watchlist & Frequency boost
+            is_watched = await self.scorer.check_watchlist(asset, "wallets") or await self.scorer.check_watchlist(asset, "equities")
+            w_boost = 0.15 if is_watched else 0.0
+            f_boost = await self.scorer.track_frequency(asset, "crypto_spot")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            
             logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
             if anomaly < 0.6: continue
             
@@ -97,7 +103,7 @@ class CryptoEnricher:
             }, key=asset)
 
             results.append(NormalizedEvent(
-                event_id=raw.event_id,
+                event_id=raw.event_id, trace_id=raw.trace_id,
                 type = EventType.CRYPTO_TRADE,
                 occurred_at=raw.occurred_at or datetime.now(timezone.utc),
                 source=raw.source,
@@ -142,6 +148,12 @@ class CryptoEnricher:
             volatility_pct = features[1]
             notional = features[2]
             
+            # Watchlist & Frequency boost
+            is_watched = await self.scorer.check_watchlist(asset, "wallets") or await self.scorer.check_watchlist(asset, "equities")
+            w_boost = 0.15 if is_watched else 0.0
+            f_boost = await self.scorer.track_frequency(asset, f"crypto_candle_{tf}m")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            
             tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()]
 
             await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
@@ -155,7 +167,7 @@ class CryptoEnricher:
             headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
     
             events.append(NormalizedEvent(
-                event_id=raw.event_id,
+                event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
                 occurred_at=datetime.fromisoformat(block["start_ts"]),
                 source=raw.source,
@@ -200,6 +212,13 @@ class CryptoEnricher:
             anomaly = min(1.0, notional / 50_000_000 * 0.5)
             if is_suspect: anomaly = min(1.0, anomaly + 0.4)
             
+            # Watchlist & Frequency boost
+            is_w_sender = await self.scorer.check_watchlist(sender, "wallets") if sender != "UNKNOWN" else False
+            is_w_receiver = await self.scorer.check_watchlist(wallet, "wallets") if wallet != "UNKNOWN" else False
+            w_boost = 0.15 if (is_w_sender or is_w_receiver) else 0.0
+            f_boost = await self.scorer.track_frequency(wallet, "crypto_transfer")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            
             tags = ["crypto", "whale_transfer", asset.lower()]
             if is_suspect: tags.append("suspect_wallet")
             headline = f"{'🚨 SUSPECT ' if is_suspect else ''}Whale Transfer: ${notional/1e6:.1f}M {asset}"
@@ -220,7 +239,7 @@ class CryptoEnricher:
         entity = Entity(id=wallet, type=EntityType.ORGANIZATION, name=f"Wallet_{wallet[:6]}")
 
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=getattr(EventType, "CRYPTO_TRANSFER", EventType.CRYPTO_TRANSFER), 
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
@@ -269,7 +288,7 @@ class CryptoEnricher:
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=getattr(EventType, "CRYPTO_LIQUIDATION", EventType.CRYPTO_LIQUIDATION),
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,

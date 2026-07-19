@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS events (
     sentiment FLOAT,
     anomaly_score FLOAT DEFAULT 0.0,
     correlation_ids UUID[],
+    trace_id UUID,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (event_id, occurred_at) -- Composite PK: UUID + Time. This allows efficient time-range queries while ensuring uniqueness.
 
@@ -115,6 +116,7 @@ CREATE INDEX IF NOT EXISTS vpo_mmsi_time_idx ON vessel_positions(mmsi, occurred_
 -- INTERACTION: Acts as a "Wrapper" around multiple Event rows.
 CREATE TABLE IF NOT EXISTS correlations (
     correlation_id       UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id             UUID,
     rule_id              TEXT,
     rule_name            TEXT,
     alert_tier           INT,
@@ -141,6 +143,7 @@ CREATE INDEX IF NOT EXISTS corr_tags_idx      ON correlations USING GIN(tags);
 -- INTERACTION: This allows analysts to add "State" (Status, Notes) to a read-only Correlation.
 CREATE TABLE IF NOT EXISTS scenarios (
     scenario_id            UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id               UUID,
     -- HARD FOREIGN KEY: This enforces integrity. A Scenario MUST belong to a valid Correlation.
     -- NECESSITY: Unlike the high-speed 'events' table, this is low-volume human data. Integrity is more important than raw speed here.
     correlation_id         UUID        REFERENCES correlations(correlation_id),

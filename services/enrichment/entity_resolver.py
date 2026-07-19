@@ -52,7 +52,7 @@ class EntityResolver:
         # ── LEVEL 1: REDIS (Hot Cache) ────────────────────────────────────────
         # Check if we looked this up in the last 24 hours.
         # If yes, return immediately. This handles 99% of traffic.
-        cached = await self.redis.get(f"vessel:info:{mmsi}")
+        cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
         if cached:
             return json.loads(cached)
 
@@ -65,7 +65,7 @@ class EntityResolver:
             records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi}) # Assuming fetch implementation
             if records:
                 data = dict(records[0])
-                await self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
+                await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
                 return data
         except Exception as e:
             logger.debug(f"Neo4j vessel lookup failed ({mmsi}): {e}")
@@ -87,7 +87,7 @@ class EntityResolver:
         # Save this "Best Guess" profile for 1 hour.
         # Why only 1 hour? Because a real analyst might add the ship to Neo4j soon,
         # and we want to pick up the "Real" data when it becomes available.
-        await self.redis.set(f"vessel:info:{mmsi}", json.dumps(data), ttl=3600)
+        await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=3600)
         return data
 
     async def resolve_vessel_batch(self, mmsi_list: list, ais_meta_list: list) -> list:
@@ -98,7 +98,7 @@ class EntityResolver:
             return []
             
         # 1. Redis Pipeline
-        pipe = self.redis.pipeline()
+        pipe = self.redis.raw.pipeline()
         for mmsi in mmsi_list:
             pipe.get(f"vessel:info:{mmsi}")
         
@@ -135,7 +135,7 @@ class EntityResolver:
             logger.debug(f"Neo4j vessel batch lookup failed: {e}")
 
         # 3. Process Neo4j hits and Fallbacks
-        set_pipe = self.redis.pipeline()
+        set_pipe = self.redis.raw.pipeline()
         for i, mmsi in zip(missing_indices, missing_mmsis):
             if mmsi in found_in_neo4j:
                 data = found_in_neo4j[mmsi]
@@ -167,7 +167,7 @@ class EntityResolver:
         """Asynchronously resolves aircraft identity using cascading cache strategies."""
         
         # 1. REDIS (Hot Cache)
-        cached = await self.redis.get(f"aircraft:info:{icao24}")
+        cached = await self.redis.raw.get(f"aircraft:info:{icao24}")
         if cached:
             return json.loads(cached)
             
@@ -182,7 +182,7 @@ class EntityResolver:
             if records:
                 data = dict(records[0])
                 # Await the write to cache, mapping 'ex' for seconds
-                await self.redis.set(f"aircraft:info:{icao24}", json.dumps(data), ex=86400)
+                await self.redis.raw.set(f"aircraft:info:{icao24}", json.dumps(data), ex=86400)
                 return data
         except Exception as e:
             logger.debug(f"Neo4j async aircraft lookup failed ({icao24}): {e}")

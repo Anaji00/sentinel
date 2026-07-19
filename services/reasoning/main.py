@@ -1,7 +1,7 @@
 """
 services/reasoning/main.py  
 
-ENTERPRISE REASONING ORCHESTRATOR (GEMINI EDITION)
+ENTERPRISE REASONING ORCHESTRATOR (OLLAMA EDITION)
 ==================================================
 Consumes Tier 2+ correlated clusters from Kafka.
 Feeds raw data + Graph DB context + ML Scores into Ollama.
@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import re
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,7 +43,6 @@ from services.reasoning.pattern_library    import PatternLibrary
 async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
     try:
-        # 2. CRITICAL FIX: Await the execution natively
         await db.execute("""
             INSERT INTO scenarios (
                 scenario_id, correlation_id, status,
@@ -50,7 +50,6 @@ async def _save_scenario(db, scenario):
                 recommended_monitoring, confidence_overall,
                 confidence_rationale
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) 
-            -- NOTE: Remember to change %s to positional $1 for asyncpg!
         """, 
             scenario.scenario_id,
             scenario.correlation_id,
@@ -68,7 +67,7 @@ async def _save_scenario(db, scenario):
 
 async def apply_autonomous_feedback(scenario, redis_client):
     """
-    Parses Gemini output for crypto wallets. 
+    Parses output for crypto wallets. 
     (Equity tickers are now handled deterministically by the QuantResearcherAgent).
     """
     monitoring_text = str(scenario.recommended_monitoring)
@@ -76,36 +75,27 @@ async def apply_autonomous_feedback(scenario, redis_client):
     for wallet in wallets:
         is_new = await redis_client.raw.sadd("sentinel:watched:wallets", wallet)
         if is_new:
-            # Expire the watch command after 30 days automatically
             await redis_client.raw.expire("sentinel:watched:wallets", 2592000)
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
+
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
     """The core synthesis pipeline."""
-    try:
-        if cluster.alert_tier == AlertTier.WATCH:
-            return
-            
-        logger.info("🧠 Synthesizing [%s] %s via Gemini...", cluster.alert_tier.name, cluster.rule_name)
-
-        context = await context_builder.build(cluster)
-        patterns = await library.find_similar(cluster.tags, cluster.rule_id)
-        scenario = await generator.generate(cluster, context, patterns)
+    if cluster.alert_tier == AlertTier.WATCH:
+        return
         
-        if scenario:
-            # 1. Save to DB (For frontend viewing)
-            await asyncio.gather(
-                _save_scenario(db, scenario),
-                producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
-            )
-            logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
+    logger.info("🧠 Synthesizing [%s] %s via Ollama...", cluster.alert_tier.name, cluster.rule_name)
 
-            # 3. Close the loop (Machine Learning pivot)
-            await apply_autonomous_feedback(scenario, redis_client)
-
-    except Exception as e:
-        logger.error("Failed to process cluster %s: %s", cluster.correlation_id, e, exc_info=True)
-        raise e  # Let the caller handle DLQ and logging
-
+    context = await context_builder.build(cluster)
+    patterns = await library.find_similar(cluster.tags, cluster.rule_id)
+    scenario = await generator.generate(cluster, context, patterns)
+    
+    if scenario:
+        await asyncio.gather(
+            _save_scenario(db, scenario),
+            producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
+        )
+        logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
+        await apply_autonomous_feedback(scenario, redis_client)
 
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
@@ -118,8 +108,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     await consumer.start()
     await producer.start()
 
-    import time as _time
-    _start_time = _time.monotonic()
+    _start_time = time.monotonic()
     _processed = 0
     _scenarios = 0
     _errors = 0
@@ -128,7 +117,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         nonlocal _processed, _scenarios, _errors
         while True:
             await asyncio.sleep(60)
-            elapsed = _time.monotonic() - _start_time
+            elapsed = time.monotonic() - _start_time
             rate = _processed / elapsed if elapsed > 0 else 0
             logger.info(
                 f"⏱ HEARTBEAT | clusters_processed={_processed} "
@@ -138,6 +127,12 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
 
     heartbeat_task = asyncio.create_task(_heartbeat())
     
+    sem = asyncio.Semaphore(3)
+
+    async def sem_process_cluster(cluster, *args):
+        async with sem:
+            return await process_cluster(cluster, *args)
+
     logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
     
     try:
@@ -158,20 +153,19 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                 brief = raw_data.get("brief", {})
                                 headline = brief.get("headline", "No headline")
                                 logger.info(f"Received intel brief on agents.intel.briefs: {headline} (severity: {brief.get('severity')})")
-                                if brief.get("severity", 0) >= 4:
+                                if brief.get("severity", 0) >= 3:
                                     await redis_client.raw.set(
                                         "sentinel:intel:briefs:latest",
                                         json.dumps(brief),
-                                        ex=3600,  # Use native expire assignment
+                                        ex=3600,
                                     )
                                 continue
                                 
                             cluster = CorrelationCluster(**raw_data)
                             logger.info(f"Received correlation cluster {cluster.correlation_id} (rule: {cluster.rule_name}, tier: {cluster.alert_tier.name}) for reasoning analysis")
                             
-                            # Dispatch cluster processing to background task without blocking the consume loop
                             task = asyncio.create_task(
-                                process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
+                                sem_process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
                             )
                             batch_tasks.append(task)
                             dlq_payloads.append(raw_data)
@@ -182,21 +176,19 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                 if batch_tasks:
                     results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                     for task_result, original_payload in zip(results, dlq_payloads):
-                            if isinstance(task_result, Exception):
-                                _errors += 1
-                                logger.error(f"Synthesis task failed silently: {task_result}", exc_info=True)
-                                await producer.send(Topics.DLQ, {"error": str(task_result), "payload": original_payload})
-                            else:
-                                _processed += 1
-                                if task_result is not None:
-                                    _scenarios += 1
-                    # Commit offsets securely
+                        if isinstance(task_result, Exception):
+                            _errors += 1
+                            logger.error(f"Synthesis task failed: {task_result}", exc_info=True)
+                            await producer.send(Topics.DLQ, {"error": str(task_result), "payload": original_payload})
+                        else:
+                            _processed += 1
+                            if task_result is not None:
+                                _scenarios += 1
                 await consumer.commit()
         
             except Exception as batch_error:
-                    # Keep the service alive during transient network partitions
-                    logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}", exc_info=True)
-                    await asyncio.sleep(5)
+                logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}", exc_info=True)
+                await asyncio.sleep(5)
                     
     except asyncio.CancelledError:
         pass

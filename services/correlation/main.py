@@ -5,6 +5,7 @@ Consumes enriched.events.
 Executes Dynamic JSON Correlation Rules from Redis.
 Emits CorrelationCluster to correlations.detected when a rule fires.
 """
+
 import aiohttp
 import asyncio
 import json
@@ -13,15 +14,21 @@ import os
 import sys
 from pathlib import Path
 import inspect
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# ── 1. ENVIRONMENT & PATH SETUP ───────────────────────────────────────────────
-from dotenv import load_dotenv
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("correlation")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from shared.utils.ollama import OllamaClient
 from services.correlation.soft_correlator import SoftCorrelator
@@ -36,7 +43,6 @@ async def _listen_for_rule_updates(redis_client):
     """Subscribes to Redis Pub/Sub to instantly hot-reload dynamic rules into memory."""
     global _dynamic_rules_cache
     
-    # Initial load from HASH
     try:
         rules_raw = await redis_client.raw.hvals("sentinel:correlation:dynamic_rules")
         for raw in rules_raw:
@@ -47,7 +53,6 @@ async def _listen_for_rule_updates(redis_client):
     except Exception as e:
         logger.error(f"Failed to load dynamic rules on startup: {e}")
 
-    # Listen for hot-reloads
     pubsub = redis_client.raw.pubsub()
     await pubsub.subscribe("sentinel:correlation:rule_updates")
     logger.info("Listening for dynamic rule hot-reloads...")
@@ -71,11 +76,9 @@ async def _listen_for_rule_updates(redis_client):
 async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> list[CorrelationCluster]:
     clusters = []
     try:
-        import time
         now = int(time.time())
         for rule in list(_dynamic_rules_cache.values()):
             try:
-                # TTL Check (natively evict expired rules from cache)
                 if rule.get("expires_at", 0) < now:
                     continue
                 if event.type.value != rule.get("trigger_event_type"):
@@ -103,6 +106,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         
                 if len(supporting_events) > 0:
                     cluster = CorrelationCluster(
+                        trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
                         rule_name=rule.get("rule_name", "Dynamic AI Rule"),
                         alert_tier=AlertTier(rule.get("alert_tier", "alert").upper()),
@@ -110,7 +114,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
                         entity_ids=[event.primary_entity.id] if event.primary_entity else [],
                         description=f"Dynamic rule '{rule.get('rule_name')}' triggered. Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains.",
-                        tags=["dynamic_rule", "ai_generated"] + rule.get("tags", [])
+                        tags=["dynamic_rule", "ai_generated", f"trigger_anomaly_{event.anomaly_score:.2f}"] + rule.get("tags", [])
                     )
                     clusters.append(cluster)
             except Exception as e:
@@ -119,26 +123,14 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
         logger.error(f"Failed to evaluate dynamic rules: {e}")
     return clusters
 
-
-
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("correlation")
-
-
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Correlation Engine (Dynamic AI Rules)")
     logger.info("=" * 60)
 
-    # ── 2. INITIALIZE INFRASTRUCTURE ──────────────────────────────────────────
     redis_client = await get_redis()
     db_client = await get_timescale()
     
-    # ── 2b. START HOT-RELOADER ────────────────────────────────────────────────
     asyncio.create_task(_listen_for_rule_updates(redis_client))
     
     store    = EventStore(redis_client, db_client)
@@ -160,17 +152,15 @@ async def main():
     session = aiohttp.ClientSession(connector=connector)
     ollama_client = OllamaClient(session)
     soft_correlator = SoftCorrelator(ollama_client)
-    # Load soft correlator in the background to prevent blocking service startup
     asyncio.create_task(soft_correlator._load())
 
-    import time as _time
-    _start_time = _time.monotonic()
+    _start_time = time.monotonic()
 
     async def _heartbeat():
         nonlocal processed, corr_fired, errors
         while True:
             await asyncio.sleep(60)
-            elapsed = _time.monotonic() - _start_time
+            elapsed = time.monotonic() - _start_time
             rate = processed / elapsed if elapsed > 0 else 0
             logger.info(
                 f"⏱ HEARTBEAT | processed={processed} "
@@ -186,7 +176,6 @@ async def main():
     async def _process_correlation_event(event: NormalizedEvent):
         nonlocal corr_fired, processed
         try:
-            # ── 3.5. DYNAMIC AI RULES ────────────────────────────
             dynamic_clusters = await evaluate_dynamic_rules(event, store)
             for c in dynamic_clusters:
                 await store.save_correlation(c)
@@ -198,12 +187,10 @@ async def main():
                 corr_fired += 1
                 logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
             
-            # ── 4. SEMANTIC CORRELATION (SOFT) ───────────────────
             embedding = await soft_correlator.embed_event(event)
             if embedding:
                 await soft_correlator.store(event, embedding)
                 
-                # Cross-domain similarity search
                 similar_events = await soft_correlator.find_similar(
                     embedding, 
                     exclude_domain=event.type.value.split("_")[0]
@@ -212,10 +199,10 @@ async def main():
                 if similar_events:
                     logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
                     
-                    # Synthesize the CorrelationCluster dynamically
                     supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
                     
                     cluster = CorrelationCluster(
+                        trace_id=event.trace_id,
                         rule_id="SEMANTIC_001",
                         rule_name="Cross-Domain Semantic Convergence",
                         alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
@@ -223,7 +210,7 @@ async def main():
                         supporting_event_ids=supporting_ids,
                         entity_ids=[event.primary_entity.id] if event.primary_entity else [],
                         description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events. Anomalous semantic convergence detected.",
-                        tags=["semantic_match", "cross_domain", "ai_cluster"]
+                        tags=["semantic_match", "cross_domain", "ai_cluster", f"trigger_anomaly_{event.anomaly_score:.2f}"]
                     )
                     
                     await store.save_correlation(cluster)
@@ -239,10 +226,8 @@ async def main():
             return
 
     try:
-        # ── 3. THE EVENT PUMP (MAIN LOOP) ─────────────────────────────────────
         while True:
             try:
-            # Use native async batch fetching to prevent event-loop blocking
                 batches = await consumer.get_batch(timeout_ms=1000)
                 
                 if not batches:
@@ -254,13 +239,11 @@ async def main():
                         logger.info(f"Received batch of {len(messages)} events to correlate on partition {tp.topic}:{tp.partition}")
                         last_logged_received = total_received
                     
-                    # Deduplication Strategy: Group by entity_id + event_type, taking the highest anomaly score
                     all_events = []
                     representative_events = {}
                     
                     for message in messages:
                         try:
-                            # Parse the JSON payload safely before feeding to Pydantic
                             raw_data = json.loads(message.value.decode('utf-8'))
                             event = NormalizedEvent(**raw_data)
                             all_events.append(event)
@@ -281,22 +264,18 @@ async def main():
                                 pass
                     
                     if all_events:
-                        # 1. Store ALL events concurrently
                         await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)
                         
-                        # 2. Correlate ONLY representative events concurrently
                         tasks = [_process_correlation_event(e) for e in representative_events.values()]
                         await asyncio.gather(*tasks, return_exceptions=True)
                         
                         processed += len(all_events)
-                        if processed % 100 < len(all_events): # Roughly logs every 100
+                        if processed % 100 < len(all_events):
                             logger.info(f"Heartbeat | Processed {processed} events | Total correlations: {corr_fired}")
                 
-                    # Commit offsets after batch is fully processed to prevent infinite replay
                     await consumer.commit()
 
             except Exception as outer_err:
-                # Catch broad event loop/network exceptions without crashing the worker
                 logger.error(f"Kafka consumer network/batch error. Backing off. {outer_err}")
                 await asyncio.sleep(5)
                 
@@ -306,7 +285,6 @@ async def main():
         logger.info("Shutting down...")
     finally:
         heartbeat_task.cancel()
-        # Await graceful closure of TCP sockets
         await producer.close()
         await consumer.close()
         await session.close()
@@ -314,7 +292,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # OS-level event loop policy enforcement and proper coroutine execution
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

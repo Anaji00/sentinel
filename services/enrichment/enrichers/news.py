@@ -10,6 +10,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List
+import re
+import spacy
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
@@ -17,33 +19,89 @@ from shared.utils.sanctions import check_sanctions
 
 logger = logging.getLogger("enrichment.news")
 
-_NEG = {
-    "attack", "war", "kill", "explosion", "sanction", "seizure", "crash",
-    "disaster", "collapse", "crisis", "threat", "missile", "detained",
-    "conflict", "strike", "blockade", "arrested", "hijack", "piracy",
-    "bankruptcy", "default", "liquidation", "plunge", "recession", 
-    "inflation", "margin_call", "downgrade", "bearish",
-    # Cyber & Infrastructure
-    "breach", "ransomware", "hack", "vulnerability", "exploit", "outage", "malware",
-    # Geopolitical & Kinetic
-    "escalation", "invasion", "coup", "riot", "embargo", "tension", "terrorism",
-    # Financial, Crypto & Legal
-    "fraud", "scam", "indictment", "lawsuit", "selloff", "penalty", "rugpull",
-    "delisted", "slump", "tanked", "underperform", "capitulation", "dilution", "deflation",
-    "dive", "dives", "sink", "sinks", "tumble", "tumbles", "plummet", "plummets", "drop", "drops", "fall", "falls"
+try:
+    nlp = spacy.load("en_core_web_sm")
+except Exception as e:
+    logger.warning(f"Could not load spaCy en_core_web_sm: {e}. Named entity extraction will fall back to empty lists.")
+    nlp = None
+
+NEG_PATTERNS = [
+    r"\battack[s|ed|ing]*\b", r"\bwar[s]*\b", r"\bkill[s|ed|ing]*\b", r"\bexplod[e|es|ed|ing]*\b", r"\bexplosion[s]*\b",
+    r"\bsanction[s|ed|ing]*\b", r"\bseiz[e|es|ed|ure|ures|uring]*\b", r"\bcrash[es|ed|ing]*\b", r"\bdisaster[s]*\b",
+    r"\bcollaps[e|es|ed|ing]*\b", r"\bcris[is|es]*\b", r"\bthreat[s|ened|ening]*\b", r"\bmissile[s]*\b", r"\bdetain[ed|s|ing]*\b",
+    r"\bconflict[s]*\b", r"\bstrike[s|ing]*\b", r"\bblockad[e|es|ed|ing]*\b", r"\barrest[ed|s|ing]*\b", r"\bhijack[s|ed|ing]*\b",
+    r"\bpirac[y]*\b", r"\bbankruptc[y]*\b", r"\bdefault[s|ed|ing]*\b", r"\bliquidat[e|es|ed|ion|ions]*\b", r"\bplung[e|es|ed|ing]*\b",
+    r"\brecession[s]*\b", r"\binflation[s]*\b", r"\bmargin_call[s]*\b", r"\bdowngrad[e|es|ed|ing]*\b", r"\bbearish\b",
+    r"\bbreach[es|ed|ing]*\b", r"\bransomware[s]*\b", r"\bhack[s|ed|ing]*\b", r"\bvulnerabilit[y|ies]*\b", r"\bexploit[s|ed|ing]*\b",
+    r"\boutage[s]*\b", r"\bmalware[s]*\b", r"\bescalat[e|es|ed|ion|ions]*\b", r"\binva[de|des|ded|sion|sions]*\b",
+    r"\bcoup[s]*\b", r"\briot[s|ed|ing]*\b", r"\bembargo[es|ed]*\b", r"\btension[s]*\b", r"\bterroris[m|t|ts]*\b",
+    r"\bfraud[s]*\b", r"\bscam[s|med|ming]*\b", r"\bindict[ed|s|ment|ments]*\b", r"\blawsuit[s]*\b", r"\bselloff[s]*\b",
+    r"\bpenalt[y|ies]*\b", r"\brugpull[s]*\b", r"\bdelist[ed|s|ing]*\b", r"\bslump[s|ed|ing]*\b", r"\btank[ed|s|ing]*\b",
+    r"\bunderperform[s|ed|ing]*\b", r"\bcapitulat[e|es|ed|ion]*\b", r"\bdilution\b", r"\bdeflat[e|es|ed|ion]*\b",
+    r"\bdive[s|d|ing]*\b", r"\bsink[s|ing]*\b", r"\btumb[le|les|led|ling]*\b", r"\bplumm[et|ets|eted|eting]*\b",
+    r"\bdrop[s|ped|ping]*\b", r"\bfall[s|ing]*\b"
+]
+
+POS_PATTERNS = [
+    r"\bdeal[s]*\b", r"\bagreement[s]*\b", r"\bpeace\b", r"\bgrowth\b", r"\brecovery\b", r"\bcooperation\b",
+    r"\bceasefire[s]*\b", r"\bdiplomatic\b", r"\balliance[s]*\b", r"\btrade[s]*\b", r"\baccord[s]*\b",
+    r"\bbullish\b", r"\bmerger[s]*\b", r"\bacquisition[s]*\b", r"\bprofit[s|ed|ing]*\b", r"\bdividend[s]*\b",
+    r"\bsurg[e|es|ed|ing]*\b", r"\brall[y|ies|ied|ying]*\b", r"\bstimulus\b", r"\bbreakout[s]*\b", r"\bupgrad[e|es|ed|ing]*\b",
+    r"\btreat[y|ies]*\b", r"\bnegotiat[e|es|ed|ion|ions]*\b", r"\bpartnershi[p|ps]*\b", r"\baid[s]*\b", r"\bpatch[ed|es|ing]*\b",
+    r"\bsecur[e|ed|es|ing]*\b", r"\bresolv[e|ed|es|ing]*\b", r"\brescu[e|ed|es|ing]*\b", r"\bfunding\b", r"\badoption\b",
+    r"\bapprov[e|ed|es|al|ing]*\b", r"\bbreakthrough[s]*\b", r"\bunder-valued\b", r"\bbull-run\b", r"\bsoar[s|ed|ing]*\b",
+    r"\bjump[s|ed|ing]*\b", r"\bbeat[s|ing|en]*\b", r"\bclimb[s|ed|ing]*\b", r"\bgain[s|ed|ing]*\b", r"\brecord[s]*\b"
+]
+
+NEG_REGEXES = [re.compile(p, re.IGNORECASE) for p in NEG_PATTERNS]
+POS_REGEXES = [re.compile(p, re.IGNORECASE) for p in POS_PATTERNS]
+
+NEGATION_WORDS = {"no", "not", "never", "none", "neither", "nor", "prevent", "avoid", "halt", "stop", "fail", "don't", "can't", "won't"}
+
+THREAT_KEYWORDS = {
+    # Kinetic / Warfare
+    r"\bnuclear\b", r"\binva(sion|de|ded)\b", r"\bmissile\s+strike\b", r"\bassassina(ted|tion)\b",
+    r"\bdeclaration\s+of\s+war\b", r"\bweapons?\s+grade\b", r"\bkinetic\s+attack\b",
+    # Financial / Macro
+    r"\bsovereign\s+default\b", r"\bdefault\s+on\s+(debt|bonds)\b", r"\bsystemic\s+collapse\b",
+    # Cyber / Infrastructure
+    r"\bcyber\s*war(fare)?\b", r"\bgrid\s+blackout\b", r"\bcritical\s+infrastructure\s+compromise\b"
 }
-_POS = {
-    "deal", "agreement", "peace", "growth", "recovery", "cooperation",
-    "ceasefire", "diplomatic", "alliance", "trade", "accord",
-    "bullish", "merger", "acquisition", "profit", "dividend",
-    "surge", "rally", "stimulus", "breakout", "upgrade",
-    # Tech, Cyber & Diplomatic
-    "treaty", "negotiation", "partnership", "aid", "patched", "secured",
-    "resolved", "rescued", "funding", "adoption", "approved", "breakthrough",
-    # Stocks & Markets
-    "outperform", "buyback", "uptrend", "skyrocket", "lucrative", "undervalued", "bull-run", "soar",
-    "jump", "jumps", "beat", "beats", "climb", "climbs", "gain", "gains", "record"
-}
+THREAT_REGEXES = [re.compile(p, re.IGNORECASE) for p in THREAT_KEYWORDS]
+
+def _sentiment(text: str) -> float:
+    t = text.lower()
+    tokens = re.findall(r'\b\w+\b', t)
+    
+    neg = 0
+    pos = 0
+    
+    for idx, token in enumerate(tokens):
+        is_neg_match = any(rx.match(token) for rx in NEG_REGEXES)
+        is_pos_match = any(rx.match(token) for rx in POS_REGEXES)
+        
+        negated = False
+        start_lookback = max(0, idx - 3)
+        for j in range(start_lookback, idx):
+            if tokens[j] in NEGATION_WORDS or tokens[j].endswith("n't"):
+                negated = True
+                break
+                
+        if is_neg_match:
+            if negated:
+                pos += 1
+            else:
+                neg += 1
+        elif is_pos_match:
+            if negated:
+                neg += 1
+            else:
+                pos += 1
+                
+    total = neg + pos
+    if total == 0:
+        return 0.0
+    return round((pos - neg) / total, 3)
 
 FINANCIAL_KEYWORDS = {
     # ── MACRO & MONETARY POLICY ──
@@ -94,20 +152,6 @@ FINANCIAL_KEYWORDS = {
     "zero-day": "cyber", "cisa": "cyber", "apt": "cyber", "malware": "cyber"
 }
 
-import re
-
-def _sentiment(text: str) -> float:
-    t = text.lower()
-    # Use regex word boundaries so "war" doesn't match "software"
-    words = set(re.findall(r'\b\w+\b', t))
-    neg = sum(1 for w in _NEG if w in words)
-    pos = sum(1 for w in _POS if w in words)
-    total = neg + pos
-    if total == 0:
-        return 0.0
-    return round((pos - neg) / total, 3)
-
-
 class NewsEnricher:
 
     def __init__(self, scorer, redis_client, graph_writer):
@@ -127,7 +171,6 @@ class NewsEnricher:
         combined_text = f"{title} {summary}"
         lower_text = combined_text.lower()
 
-
         sentiment = _sentiment(combined_text[:200])
 
         tags = list(p.get("tags", []))
@@ -143,12 +186,31 @@ class NewsEnricher:
         if ofac_hits:
             tags.append("sanctioned_ofac_mention")
             tags.extend(ofac_hits)
+
+        # Extract named entities using spaCy
+        named_entities = []
+        if nlp:
+            try:
+                doc = nlp(combined_text[:500])
+                for ent in doc.ents:
+                    if ent.label_ in ("ORG", "GPE", "PERSON", "LOC", "PRODUCT"):
+                        named_entities.append(ent.text)
+            except Exception as e:
+                logger.debug(f"spaCy NER extraction failed: {e}")
+        
+        unique_entities = list(set(named_entities))
+        tags.extend(unique_entities)
             
-        anomaly, semantic_tags = await self.scorer.score_news(named_entities = tags, sentiment = sentiment, reliability = reliability)
+        anomaly, semantic_tags = await self.scorer.score_news(named_entities = unique_entities, sentiment = sentiment, reliability = reliability)
         tags.extend(semantic_tags)
         
         if ofac_hits:
             anomaly = min(1.0, anomaly + 0.4) # Severe bump for sanctions mention
+
+        # Threat keyword boosting
+        is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
+        if is_threat:
+            anomaly = max(0.65, anomaly + 0.35)
 
         if anomaly < 0.3:
             return None
@@ -158,7 +220,6 @@ class NewsEnricher:
         if anomaly >=0.5 and self.graph:
             topic_str = "High_Impact_News"
 
-            # Using try/except to prevent network timeouts from crashing the loop
             try:
                 await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
                     "entity_id": topic_str,
@@ -176,7 +237,7 @@ class NewsEnricher:
         entity = Entity(id=raw.source, type=EntityType.MEDIA_SOURCE, name=raw.source)
     
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=EventType.HEADLINE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
@@ -186,7 +247,7 @@ class NewsEnricher:
             summary=summary,
             url=url,
             tags=tags,
-            named_entities=[],
+            named_entities=unique_entities,
             sentiment=sentiment,
             anomaly_score=anomaly,
         )

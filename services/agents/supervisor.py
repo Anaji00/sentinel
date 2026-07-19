@@ -7,7 +7,15 @@ from shared.kafka import Topics
 
 logger = logging.getLogger("agent.supervisor")
 
-ALLOWED_RELATIONS = {"RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", "HAS_EXPOSURE_IN", "CORRELATED_WITH"}
+ALLOWED_RELATIONS = {
+    "RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", 
+    "HAS_EXPOSURE_IN", "CORRELATED_WITH", "SUPPLIES", "PURCHASES_FROM", 
+    "COMMODITY_EXPOSURE", "MACRO_CORRELATED", "SANCTIONS_TARGET", 
+    "FLAGGED_BY", "SUBSIDIARY_OF", "ADJACENT_TO", "ATTACKED", 
+    "TARGETED_BY", "REGISTERED_IN", "EMPLOYS", "POSITIVE_EXPOSURE_TO", 
+    "INVERSE_EXPOSURE_TO"
+}
+
 
 class GraphSupervisor(SentinelAgent):
     def __init__(self, *args, **kwargs):

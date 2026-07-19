@@ -56,27 +56,6 @@ class IntelEntity(BaseModel):
     is_threat_actor: bool = False
 
 
-class IntelRelationship(BaseModel):
-    source: str
-    relation: str
-    target: str
-    confidence: float = 0.5
-
-
-class IntelBrief(BaseModel):
-    headline_summary: str
-    catalyst_type: str
-    severity: int
-    entities: List[IntelEntity] = Field(default_factory=list)
-    relationships: List[IntelRelationship] = Field(default_factory=list)
-    geographic_hotspots: List[str] = Field(default_factory=list)
-    financial_instruments_affected: List[str] = Field(default_factory=list)
-    intelligence_gaps: Optional[str] = None
-    recommended_monitoring: List[str] = Field(default_factory=list)
-    time_sensitivity: str = "days"
-    geopolitical_theater: str = "unknown"
-
-
 class GraphTriple(BaseModel):
     subject: str
     subject_type: str
@@ -88,9 +67,18 @@ class GraphTriple(BaseModel):
     source_quote: Optional[str] = None
 
 
-class GraphTriples(BaseModel):
-    triples: List[GraphTriple] = Field(default_factory=list)
-    new_entities: List[Dict[str, str]] = Field(default_factory=list)
+class IntelBrief(BaseModel):
+    headline_summary: str
+    catalyst_type: str
+    severity: int
+    entities: List[IntelEntity] = Field(default_factory=list)
+    geographic_hotspots: List[str] = Field(default_factory=list)
+    financial_instruments_affected: List[str] = Field(default_factory=list)
+    intelligence_gaps: Optional[str] = None
+    recommended_monitoring: List[str] = Field(default_factory=list)
+    time_sensitivity: str = "days"
+    geopolitical_theater: str = "unknown"
+    graph_triples: List[GraphTriple] = Field(default_factory=list)
 
 
 # ── VALID RELATIONSHIP TYPES (for Neo4j MERGE safety) ──────────────────────────
@@ -98,8 +86,9 @@ VALID_PREDICATES = {
     "OWNS", "OPERATES", "SUPPLIES", "PURCHASES_FROM", "ALLIED_WITH",
     "SANCTIONS_TARGET", "FLAGGED_BY", "CONTROLS", "SUBSIDIARY_OF",
     "COMPETES_WITH", "ADJACENT_TO", "ATTACKED", "TARGETED_BY",
-    "REGISTERED_IN", "EMPLOYS",
+    "REGISTERED_IN", "EMPLOYS", "POSITIVE_EXPOSURE_TO", "INVERSE_EXPOSURE_TO",
 }
+
 
 # Minimum anomaly score to run full LLM analysis on a news event
 ANALYSIS_THRESHOLD = 0.35
@@ -175,10 +164,14 @@ class NewsIntelAgent(SentinelAgent):
 
         logger.info(f"Analyzing: {title[:80]}... (anomaly={anomaly_score:.2f})")
 
-        # ── STEP 1: Fetch recent context from TimescaleDB ──────────────────────
-        recent_context = await self._fetch_recent_context()
+        # ── STEP 1: Fetch recent context & Neo4j profiles ─────────────────────
+        recent_context, agent_memories, existing_entities = await asyncio.gather(
+            self._fetch_recent_context(),
+            self.read_agent_memories(limit=8),
+            self._fetch_existing_graph_entities_by_names(message.get("named_entities", [])[:10])
+        )
 
-        # ── STEP 2: Primary LLM call — Intel Brief extraction ─────────────────
+        # ── STEP 2: Primary LLM call — Intel Brief & Graph extraction ─────────
         user_prompt = NEWS_INTEL_USER_TEMPLATE.format(
             source=source,
             reliability=message.get("source_reliability", 0.8),
@@ -188,6 +181,8 @@ class NewsIntelAgent(SentinelAgent):
             title=title,
             body=(summary or title)[:1500],
             recent_context=json.dumps(recent_context[:5], default=str),
+            agent_memories=agent_memories,
+            existing_entities=json.dumps(existing_entities),
         )
 
         try:
@@ -207,6 +202,7 @@ class NewsIntelAgent(SentinelAgent):
                 "agents.ontology.unknown_entities",
                 {
                     "name": entity.name,
+                    "trace_id": message.get("trace_id"),
                     "context": (summary or title)[:500],
                     "source_domain": source,
                     "frequency": 1,
@@ -214,9 +210,9 @@ class NewsIntelAgent(SentinelAgent):
                 key = entity.name
             )
 
-        # ── STEP 3: Secondary LLM call — Graph relationship extraction ─────────
-        if brief.entities and len(brief.entities) >= 2:
-            await self._extract_and_write_graph(title, summary, brief)
+        # ── STEP 3: Write pre-extracted Graph relationships to Neo4j ───────────
+        if brief.graph_triples:
+            await self._extract_and_write_graph(brief, message.get("trace_id"))
 
         # ── STEP 4: Auto-inject financial instruments into watched list ─────────
         await self._update_instrument_watchlist(brief, title.lower())
@@ -227,11 +223,18 @@ class NewsIntelAgent(SentinelAgent):
         # ── STEP 5.5: Provide Semantic Feedback to Anomaly Scorer ─────────────
         await self._update_semantic_sentiment(brief)
 
+        # ── STEP 5.6: Write Episodic Memory for High Severity Events ──────────
+        if brief.severity >= 3:
+            impacted = [e.name for e in brief.entities[:3]]
+            mem_text = f"Intel Brief (Severity {brief.severity}): {brief.headline_summary}. Impacted: {impacted}."
+            asyncio.create_task(self.write_agent_memory(mem_text))
+
         # ── STEP 6: Emit structured Intel Brief ───────────────────────────────
         return {
             "agent":            self.name,
             "agent_run_id":     f"intel_{url_hash}",
             "source_event_id":  message.get("event_id"),
+            "trace_id":         message.get("trace_id"),
             "created_at":       datetime.now(timezone.utc).isoformat(),
             "brief":            brief.model_dump(),
             "original_anomaly": anomaly_score,
@@ -283,36 +286,14 @@ class NewsIntelAgent(SentinelAgent):
             return []
 
     async def _extract_and_write_graph(
-        self, title: str, summary: str, brief: IntelBrief
+        self, brief: IntelBrief, trace_id: Optional[str]
     ):
         """
-        Extract entity relationships via Llama3 and write them to Neo4j.
+        Write pre-extracted entity relationships to Neo4j.
         Failures here are non-fatal — the intel brief still gets published.
         """
-        # Fetch existing entities from Neo4j to improve consistency
-        existing = await self._fetch_existing_graph_entities(brief)
-
-        text = f"{title}\n\n{summary or ''}"
-        user_prompt = GRAPH_EXTRACTION_USER_TEMPLATE.format(
-            text=text[:2000],
-            existing_entities=json.dumps(existing[:20]),
-        )
-
-        try:
-            triples: GraphTriples = await self._execute_with_telemetry(
-                message={"event_id": f"graph_{title[:10]}"}, # Mock ID for sub-task telemetry
-                system_prompt=GRAPH_EXTRACTION_SYSTEM,
-                user_prompt=user_prompt,
-                schema=GraphTriples,
-                temperature=0.05,
-            )
-        except SchemaViolationError as e:
-            logger.warning(f"Graph extraction skipped: {e}")
-            return
-
-        # Write validated triples to Neo4j
         written = 0
-        for triple in triples.triples:
+        for triple in brief.graph_triples:
             if triple.predicate not in VALID_PREDICATES:
                 logger.debug(f"Skipping invalid predicate: {triple.predicate}")
                 continue
@@ -320,7 +301,7 @@ class NewsIntelAgent(SentinelAgent):
                 continue  # Only high-confidence relationships enter the graph
 
             try:
-                await self._write_neo4j_triple(triple)
+                await self._write_neo4j_triple(triple, trace_id)
                 written += 1
             except Exception as e:
                 logger.warning(f"Neo4j write failed for {triple.subject}→{triple.object}: {e}")
@@ -328,9 +309,8 @@ class NewsIntelAgent(SentinelAgent):
         if written:
             logger.info(f"  Neo4j: +{written} relationships written")
 
-    async def _fetch_existing_graph_entities(self, brief: IntelBrief) -> List[str]:
-        """Pull existing entity names from Neo4j for the entities in this brief."""
-        names = [e.name for e in brief.entities[:5]]
+    async def _fetch_existing_graph_entities_by_names(self, names: List[str]) -> List[str]:
+        """Pull existing entity names from Neo4j for the given names list."""
         if not names:
             return []
         try:
@@ -342,7 +322,7 @@ class NewsIntelAgent(SentinelAgent):
         except Exception:
             return []
 
-    async def _write_neo4j_triple(self, triple: GraphTriple):
+    async def _write_neo4j_triple(self, triple: GraphTriple, trace_id: Optional[str]):
         """
         MERGE the triple into Neo4j. Uses dynamic labels.
         MERGE on (name) ensures idempotency — re-running on the same article
@@ -354,7 +334,8 @@ class NewsIntelAgent(SentinelAgent):
         obj_label  = triple.object_type.title().replace(" ", "")
 
         proposal = {
-            "subject": triple.subject,
+            "entity_id": triple.subject,
+            "trace_id": trace_id,
             "action": "LINK_ENTITY",
             "data": {
                 "target_id": triple.object,

@@ -43,6 +43,10 @@ class PredictionEnricher:
         # BRAIN CHECK: Ask the AnomalyScorer if this is unusual
         anomaly = await self.scorer.score_prediction_trade(asset_id, notional)
 
+        # Frequency boost for high activity
+        f_boost = await self.scorer.track_frequency(slug, "prediction_market")
+        anomaly = min(1.0, anomaly + f_boost)
+
         # GATEKEEPER: Drop normal trades. We only care about anomalies > 0.6
         if anomaly < 0.6:
             return None
@@ -59,7 +63,7 @@ class PredictionEnricher:
         entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
 
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
@@ -103,6 +107,10 @@ class PredictionEnricher:
         anomaly_dict = await self.scorer.score_event("prediction_market_trade", ticker, [notional_usd, delta, price, 0, 0])
         anomaly_score = anomaly_dict.get("score", 0.0)
 
+        # Frequency boost for high activity
+        f_boost = await self.scorer.track_frequency(ticker, "prediction_market")
+        anomaly_score = min(1.0, anomaly_score + f_boost)
+
         # GATEKEEPER: Drop normal volume variance.
         if anomaly_score < 0.6:
             return None
@@ -117,7 +125,7 @@ class PredictionEnricher:
             pass
             
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,

@@ -107,6 +107,12 @@ class TradFiEnricher:
         for i, (raw, p, ticker, price, volume, notional) in enumerate(parsed_events):
             anomaly = scores[i]
             
+            # Watchlist & Frequency boost
+            is_watched = await self.scorer.check_watchlist(ticker, "equities")
+            w_boost = 0.15 if is_watched else 0.0
+            f_boost = await self.scorer.track_frequency(ticker, "tradfi_block")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            
             if price > 0:
                 set_pipe.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
                 
@@ -176,7 +182,7 @@ class TradFiEnricher:
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=EventType.EQUITY_BLOCK,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
@@ -210,6 +216,8 @@ class TradFiEnricher:
         if close_p > 0:
             try:
                 await self.redis_client.raw.set(f"sentinel:quotes:latest:{ticker}", close_p, ex=3600)
+                if ticker in ("^VIX", "VIX"):
+                    await self.redis_client.raw.set("sentinel:macro:vix", close_p, ex=86400)
             except Exception as e:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
@@ -231,6 +239,12 @@ class TradFiEnricher:
             volatility_pct = features[1]
             notional = features[2]
             
+            # Watchlist & Frequency boost
+            is_watched = await self.scorer.check_watchlist(ticker, "equities")
+            w_boost = 0.15 if is_watched else 0.0
+            f_boost = await self.scorer.track_frequency(ticker, f"tradfi_candle_{tf}m")
+            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            
             tags = ["tradfi", "market_structure", f"volatile_{tf}m_candle", ticker.lower()]
             await self._sync_geo_watchlist(ticker, tags)
             await self._update_volume_baseline(ticker, block["volume"])
@@ -246,7 +260,7 @@ class TradFiEnricher:
             headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
     
             events.append(NormalizedEvent(
-                event_id=raw.event_id,
+                event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
                 occurred_at=datetime.fromisoformat(block["start_ts"]),
                 source=raw.source,
@@ -305,9 +319,35 @@ class TradFiEnricher:
                 logger.debug(f"Failed to extract ticker from Form 4 payload: {title}")
                 return None
         
-        value = float(p.get("transaction_value_usd", 0))
-        code = p.get("transaction_code", "J")
-        title = (p.get("role") or p.get("title") or "").upper()
+        # Robustly parse code, value, and role from summary HTML if absent from raw_payload
+        summary_html = p.get("summary") or ""
+        
+        code = p.get("transaction_code")
+        if not code:
+            code_match = re.search(r'(?:<b>Code:</b>|Code:)\s*([A-Z])', summary_html, re.IGNORECASE)
+            code = code_match.group(1).upper() if code_match else "J"
+            
+        value = p.get("transaction_value_usd")
+        if not value:
+            val_match = re.search(r'(?:<b>Value:</b>|Value:)\s*\$([0-9,]+(?:\.[0-9]+)?)', summary_html, re.IGNORECASE)
+            if val_match:
+                try:
+                    value = float(val_match.group(1).replace(",", ""))
+                except ValueError:
+                    value = 0.0
+            else:
+                value = 0.0
+        else:
+            value = float(value)
+            
+        title = p.get("role") or p.get("title") or ""
+        if not title:
+            rel_match = re.search(r'(?:<b>Relationship:</b>|Relationship:)\s*([^<]+)', summary_html, re.IGNORECASE)
+            if rel_match:
+                title = rel_match.group(1).strip()
+            else:
+                title = p.get("title") or ""
+        title = title.upper()
         
         # Suppress noise: Ignore standard compensation & tax withholding below $500k
         if code in ("A", "F") and value < 500_000:
@@ -320,12 +360,24 @@ class TradFiEnricher:
         anomaly = min(1.0, value / 10_000_000 * 0.3)
         if "CEO" in title:
             anomaly = min(1.0, anomaly * 1.5)
+        elif "CFO" in title:
+            anomaly = min(1.0, anomaly * 1.4)
+        elif "COO" in title or "PRESIDENT" in title:
+            anomaly = min(1.0, anomaly * 1.2)
         elif "DIRECTOR" in title:
             anomaly = min(1.0, anomaly * 1.1)
+        elif any(w in title for w in ("TEN PERCENT OWNER", "10% OWNER", "10 PERCENT")):
+            anomaly = min(1.0, anomaly * 1.3)
 
         # Open market buys are high conviction
         if code == "P":
             anomaly = min(1.0, anomaly * 1.2)
+
+        # Watchlist & Frequency boost
+        is_watched = await self.scorer.check_watchlist(ticker, "equities")
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(ticker, "insider_trade")
+        anomaly = min(1.0, anomaly + w_boost + f_boost)
 
         await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
             "entity_id": ticker,
@@ -334,7 +386,7 @@ class TradFiEnricher:
         }, key=ticker)
 
         return NormalizedEvent(
-            event_id=raw.event_id,
+            event_id=raw.event_id, trace_id=raw.trace_id,
             type=EventType.INSIDER_TRADE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,

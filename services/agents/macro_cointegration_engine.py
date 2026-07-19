@@ -176,6 +176,8 @@ class MacroAssetCointegrationEngine(SentinelAgent):
             if abs(z_score) > Z_THRESH:
                 logger.warning(f"🚨 MACRO DECOUPLING DETECTED: {macro_asset} vs {micro_ticker} | Z-Score: {z_score:.2f}")
 
+                asyncio.create_task(self.write_agent_memory(f"Macro Decoupling Detected: {micro_ticker} broke correlation with {macro_asset} (Z-Score: {z_score:.2f})."))
+
                 return NormalizedEvent(
                     type=EventType.MARKET_ANOMALY,
                     occurred_at=datetime.now(timezone.utc).isoformat(),
@@ -196,6 +198,8 @@ class MacroAssetCointegrationEngine(SentinelAgent):
                 micro_dir = "UP" if (macro_z_score > 0 and beta > 0) or (macro_z_score < 0 and beta < 0) else "DOWN"
                 logger.info(f"✅ MACRO CONFIRMATION: {macro_asset} shocked, {micro_ticker} followed perfectly.")
                 
+                asyncio.create_task(self.write_agent_memory(f"Macro Shock Confirmed: {macro_asset} {direction}, strongly dragging {micro_ticker} {micro_dir}."))
+
                 return NormalizedEvent(
                     type=EventType.MARKET_ANOMALY,
                     occurred_at=datetime.now(timezone.utc).isoformat(),
