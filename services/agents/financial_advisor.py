@@ -249,6 +249,12 @@ class FinancialAdvisorAgent(SentinelAgent):
                 mem_text = f"FinAdvisor Live Play: {play.action} {play.ticker} (Entry: {play.entry_level:.2f}, Target: {play.target_price:.2f}, R:R: {play.risk_reward_ratio:.2f})"
                 asyncio.create_task(self.write_agent_memory(mem_text))
             
+            # Cache the latest advice in Redis for easy API retrieval
+            try:
+                await self.redis.raw.set("sentinel:financial:advice:latest", json.dumps(advice_payload))
+            except Exception as rx:
+                self.logger.warning(f"Failed to cache latest live financial advice to Redis: {rx}")
+
             # Emit to Kafka
             await self._producer.send(self.output_topic, advice_payload, key=run_id)
             self.logger.info(f"📊 Live Financial Advice Brief generated successfully. Plays: {[p.ticker for p in response.highest_conviction_plays]}")
@@ -401,6 +407,12 @@ class FinancialAdvisorAgent(SentinelAgent):
                     mem_text = f"FinAdvisor Play: {play.action} {play.ticker} (Entry: {play.entry_level:.2f}, Target: {play.target_price:.2f}, R:R: {play.risk_reward_ratio:.2f})"
                     asyncio.create_task(self.write_agent_memory(mem_text))
                 
+                # Cache the latest advice in Redis for easy API retrieval
+                try:
+                    await self.redis.raw.set("sentinel:financial:advice:latest", json.dumps(advice_payload))
+                except Exception as rx:
+                    self.logger.warning(f"Failed to cache latest financial advice to Redis: {rx}")
+
                 # Emit to Kafka
                 await self._producer.send(self.output_topic, advice_payload, key=run_id)
                 self.logger.info(f"📊 Financial Advice Brief generated successfully. Plays: {[p.ticker for p in response.highest_conviction_plays]}")

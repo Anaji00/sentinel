@@ -9,7 +9,8 @@ and raw correlation clusters from the TimescaleDB database.
 import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
-from services.api_gateway.dependencies import get_db
+from services.api_gateway.dependencies import get_db, get_redis_client
+import json
 
 logger = logging.getLogger("api-gateway.scenarios")
 router = APIRouter(prefix="/api/v1", tags=["Intelligence"])
@@ -61,3 +62,15 @@ async def get_correlations(
     except Exception as e:
         logger.error(f"Failed to fetch correlations: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")
+        
+@router.get("/financial/advice")
+async def get_financial_advice(redis = Depends(get_redis_client)):
+    """Fetch the latest AI Financial Advisor advice and portfolio sizing recommendations."""
+    try:
+        raw_advice = await redis.raw.get("sentinel:financial:advice:latest")
+        if not raw_advice:
+            return {"message": "No advice generated yet"}
+        return json.loads(raw_advice)
+    except Exception as e:
+        logger.error(f"Failed to fetch financial advice: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch cached advice")

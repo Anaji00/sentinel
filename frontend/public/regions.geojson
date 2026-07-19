@@ -1,0 +1,2315 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Hormuz"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              56.0,
+              24.0
+            ],
+            [
+              60.0,
+              24.0
+            ],
+            [
+              60.0,
+              27.0
+            ],
+            [
+              56.0,
+              27.0
+            ],
+            [
+              56.0,
+              24.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Malacca"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              103.0,
+              1.0
+            ],
+            [
+              105.0,
+              1.0
+            ],
+            [
+              105.0,
+              6.0
+            ],
+            [
+              103.0,
+              6.0
+            ],
+            [
+              103.0,
+              1.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Bab-el-Mandeb"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              43.0,
+              11.5
+            ],
+            [
+              45.5,
+              11.5
+            ],
+            [
+              45.5,
+              13.5
+            ],
+            [
+              43.0,
+              13.5
+            ],
+            [
+              43.0,
+              11.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Suez Canal"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              32.2,
+              29.8
+            ],
+            [
+              32.8,
+              29.8
+            ],
+            [
+              32.8,
+              31.5
+            ],
+            [
+              32.2,
+              31.5
+            ],
+            [
+              32.2,
+              29.8
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Gibraltar"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -5.8,
+              35.5
+            ],
+            [
+              -5.2,
+              35.5
+            ],
+            [
+              -5.2,
+              36.5
+            ],
+            [
+              -5.8,
+              36.5
+            ],
+            [
+              -5.8,
+              35.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Danish Straits"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              8.0,
+              55.0
+            ],
+            [
+              13.0,
+              55.0
+            ],
+            [
+              13.0,
+              58.0
+            ],
+            [
+              8.0,
+              58.0
+            ],
+            [
+              8.0,
+              55.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Turkish Straits"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              26.0,
+              40.5
+            ],
+            [
+              29.5,
+              40.5
+            ],
+            [
+              29.5,
+              41.5
+            ],
+            [
+              26.0,
+              41.5
+            ],
+            [
+              26.0,
+              40.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Taiwan Strait"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              119.0,
+              22.0
+            ],
+            [
+              122.5,
+              22.0
+            ],
+            [
+              122.5,
+              26.0
+            ],
+            [
+              119.0,
+              26.0
+            ],
+            [
+              119.0,
+              22.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Lombok"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              115.0,
+              -9.0
+            ],
+            [
+              116.5,
+              -9.0
+            ],
+            [
+              116.5,
+              -7.5
+            ],
+            [
+              115.0,
+              -7.5
+            ],
+            [
+              115.0,
+              -9.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Sicily"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              12.0,
+              32.0
+            ],
+            [
+              15.0,
+              32.0
+            ],
+            [
+              15.0,
+              37.0
+            ],
+            [
+              12.0,
+              37.0
+            ],
+            [
+              12.0,
+              32.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Strait of Dover"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              0.0,
+              50.5
+            ],
+            [
+              2.0,
+              50.5
+            ],
+            [
+              2.0,
+              51.5
+            ],
+            [
+              0.0,
+              51.5
+            ],
+            [
+              0.0,
+              50.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Panama Canal"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -80.5,
+              7.5
+            ],
+            [
+              -77.0,
+              7.5
+            ],
+            [
+              -77.0,
+              10.0
+            ],
+            [
+              -80.5,
+              10.0
+            ],
+            [
+              -80.5,
+              7.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Persian Gulf"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              47.0,
+              22.0
+            ],
+            [
+              57.0,
+              22.0
+            ],
+            [
+              57.0,
+              30.0
+            ],
+            [
+              47.0,
+              30.0
+            ],
+            [
+              47.0,
+              22.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Oman"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              56.0,
+              21.0
+            ],
+            [
+              62.0,
+              21.0
+            ],
+            [
+              62.0,
+              26.0
+            ],
+            [
+              56.0,
+              26.0
+            ],
+            [
+              56.0,
+              21.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Red Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              31.5,
+              12.0
+            ],
+            [
+              44.0,
+              12.0
+            ],
+            [
+              44.0,
+              30.0
+            ],
+            [
+              31.5,
+              30.0
+            ],
+            [
+              31.5,
+              12.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Aden"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              42.0,
+              9.0
+            ],
+            [
+              52.0,
+              9.0
+            ],
+            [
+              52.0,
+              13.5
+            ],
+            [
+              42.0,
+              13.5
+            ],
+            [
+              42.0,
+              9.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "South China Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              105.0,
+              1.0
+            ],
+            [
+              121.0,
+              1.0
+            ],
+            [
+              121.0,
+              23.0
+            ],
+            [
+              105.0,
+              23.0
+            ],
+            [
+              105.0,
+              1.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "East China Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              119.0,
+              24.0
+            ],
+            [
+              131.0,
+              24.0
+            ],
+            [
+              131.0,
+              34.0
+            ],
+            [
+              119.0,
+              34.0
+            ],
+            [
+              119.0,
+              24.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Yellow Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              119.0,
+              31.0
+            ],
+            [
+              127.0,
+              31.0
+            ],
+            [
+              127.0,
+              40.0
+            ],
+            [
+              119.0,
+              40.0
+            ],
+            [
+              119.0,
+              31.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Black Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              27.5,
+              40.5
+            ],
+            [
+              41.5,
+              40.5
+            ],
+            [
+              41.5,
+              46.5
+            ],
+            [
+              27.5,
+              46.5
+            ],
+            [
+              27.5,
+              40.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Caspian Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              49.0,
+              36.5
+            ],
+            [
+              55.0,
+              36.5
+            ],
+            [
+              55.0,
+              47.5
+            ],
+            [
+              49.0,
+              47.5
+            ],
+            [
+              49.0,
+              36.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Baltic Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              9.5,
+              53.5
+            ],
+            [
+              30.0,
+              53.5
+            ],
+            [
+              30.0,
+              66.0
+            ],
+            [
+              9.5,
+              66.0
+            ],
+            [
+              9.5,
+              53.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "North Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -4.0,
+              50.5
+            ],
+            [
+              10.0,
+              50.5
+            ],
+            [
+              10.0,
+              61.0
+            ],
+            [
+              -4.0,
+              61.0
+            ],
+            [
+              -4.0,
+              50.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Mediterranean Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -6.0,
+              30.0
+            ],
+            [
+              37.0,
+              30.0
+            ],
+            [
+              37.0,
+              46.5
+            ],
+            [
+              -6.0,
+              46.5
+            ],
+            [
+              -6.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Caribbean Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -86.0,
+              8.0
+            ],
+            [
+              -58.0,
+              8.0
+            ],
+            [
+              -58.0,
+              23.5
+            ],
+            [
+              -86.0,
+              23.5
+            ],
+            [
+              -86.0,
+              8.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Mexico"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -98.0,
+              18.0
+            ],
+            [
+              -80.0,
+              18.0
+            ],
+            [
+              -80.0,
+              30.5
+            ],
+            [
+              -98.0,
+              30.5
+            ],
+            [
+              -98.0,
+              18.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Guinea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -8.0,
+              -10.0
+            ],
+            [
+              10.0,
+              -10.0
+            ],
+            [
+              10.0,
+              8.0
+            ],
+            [
+              -8.0,
+              8.0
+            ],
+            [
+              -8.0,
+              -10.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Mozambique Channel"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              34.0,
+              -26.0
+            ],
+            [
+              45.0,
+              -26.0
+            ],
+            [
+              45.0,
+              -10.0
+            ],
+            [
+              34.0,
+              -10.0
+            ],
+            [
+              34.0,
+              -26.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Barents Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              14.0,
+              68.0
+            ],
+            [
+              60.0,
+              68.0
+            ],
+            [
+              60.0,
+              81.0
+            ],
+            [
+              14.0,
+              81.0
+            ],
+            [
+              14.0,
+              68.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Bering Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              170.0,
+              52.0
+            ],
+            [
+              -170.0,
+              52.0
+            ],
+            [
+              -170.0,
+              66.0
+            ],
+            [
+              170.0,
+              66.0
+            ],
+            [
+              170.0,
+              52.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Alaska"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -170.0,
+              54.0
+            ],
+            [
+              -130.0,
+              54.0
+            ],
+            [
+              -130.0,
+              60.0
+            ],
+            [
+              -170.0,
+              60.0
+            ],
+            [
+              -170.0,
+              54.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Sea of Okhotsk"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              135.0,
+              45.0
+            ],
+            [
+              160.0,
+              45.0
+            ],
+            [
+              160.0,
+              60.0
+            ],
+            [
+              135.0,
+              60.0
+            ],
+            [
+              135.0,
+              45.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Labrador Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -70.0,
+              50.0
+            ],
+            [
+              -50.0,
+              50.0
+            ],
+            [
+              -50.0,
+              65.0
+            ],
+            [
+              -70.0,
+              65.0
+            ],
+            [
+              -70.0,
+              50.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Norwegian Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              5.0,
+              62.0
+            ],
+            [
+              20.0,
+              62.0
+            ],
+            [
+              20.0,
+              72.0
+            ],
+            [
+              5.0,
+              72.0
+            ],
+            [
+              5.0,
+              62.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of St. Lawrence"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -66.5,
+              46.5
+            ],
+            [
+              -57.5,
+              46.5
+            ],
+            [
+              -57.5,
+              51.5
+            ],
+            [
+              -66.5,
+              51.5
+            ],
+            [
+              -66.5,
+              46.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Caspian Sea"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              49.0,
+              36.5
+            ],
+            [
+              55.0,
+              36.5
+            ],
+            [
+              55.0,
+              47.5
+            ],
+            [
+              49.0,
+              47.5
+            ],
+            [
+              49.0,
+              36.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Ukrainian Waters"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              29.0,
+              43.0
+            ],
+            [
+              37.5,
+              43.0
+            ],
+            [
+              37.5,
+              48.0
+            ],
+            [
+              29.0,
+              48.0
+            ],
+            [
+              29.0,
+              43.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "North Korean Waters"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              124.0,
+              37.0
+            ],
+            [
+              132.0,
+              37.0
+            ],
+            [
+              132.0,
+              43.0
+            ],
+            [
+              124.0,
+              43.0
+            ],
+            [
+              124.0,
+              37.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Iranian Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              48.0,
+              25.0
+            ],
+            [
+              57.5,
+              25.0
+            ],
+            [
+              57.5,
+              31.0
+            ],
+            [
+              48.0,
+              31.0
+            ],
+            [
+              48.0,
+              25.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Syrian Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              35.5,
+              32.0
+            ],
+            [
+              42.0,
+              32.0
+            ],
+            [
+              42.0,
+              37.0
+            ],
+            [
+              35.5,
+              37.0
+            ],
+            [
+              35.5,
+              32.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Venezuelan Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -75.0,
+              0.0
+            ],
+            [
+              -59.0,
+              0.0
+            ],
+            [
+              -59.0,
+              12.0
+            ],
+            [
+              -75.0,
+              12.0
+            ],
+            [
+              -75.0,
+              0.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Israeli Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              34.0,
+              29.0
+            ],
+            [
+              35.5,
+              29.0
+            ],
+            [
+              35.5,
+              34.0
+            ],
+            [
+              34.0,
+              34.0
+            ],
+            [
+              34.0,
+              29.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Libyan Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              10.0,
+              30.0
+            ],
+            [
+              25.0,
+              30.0
+            ],
+            [
+              25.0,
+              34.0
+            ],
+            [
+              10.0,
+              34.0
+            ],
+            [
+              10.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Yemeni Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              42.0,
+              12.0
+            ],
+            [
+              54.0,
+              12.0
+            ],
+            [
+              54.0,
+              19.0
+            ],
+            [
+              42.0,
+              19.0
+            ],
+            [
+              42.0,
+              12.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Somali Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              40.0,
+              -3.0
+            ],
+            [
+              52.0,
+              -3.0
+            ],
+            [
+              52.0,
+              12.0
+            ],
+            [
+              40.0,
+              12.0
+            ],
+            [
+              40.0,
+              -3.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Sudanese Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              32.0,
+              3.0
+            ],
+            [
+              38.0,
+              3.0
+            ],
+            [
+              38.0,
+              22.0
+            ],
+            [
+              32.0,
+              22.0
+            ],
+            [
+              32.0,
+              3.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gulf of Sidra"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              10.0,
+              30.0
+            ],
+            [
+              25.0,
+              30.0
+            ],
+            [
+              25.0,
+              35.0
+            ],
+            [
+              10.0,
+              35.0
+            ],
+            [
+              10.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Crimean Waters"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              32.0,
+              44.0
+            ],
+            [
+              36.0,
+              44.0
+            ],
+            [
+              36.0,
+              46.0
+            ],
+            [
+              32.0,
+              46.0
+            ],
+            [
+              32.0,
+              44.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Georgian Waters"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              40.0,
+              41.5
+            ],
+            [
+              42.5,
+              41.5
+            ],
+            [
+              42.5,
+              43.5
+            ],
+            [
+              40.0,
+              43.5
+            ],
+            [
+              40.0,
+              41.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Taiwan Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              119.0,
+              21.5
+            ],
+            [
+              122.5,
+              21.5
+            ],
+            [
+              122.5,
+              25.5
+            ],
+            [
+              119.0,
+              25.5
+            ],
+            [
+              119.0,
+              21.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Nigerian Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              2.0,
+              4.0
+            ],
+            [
+              15.0,
+              4.0
+            ],
+            [
+              15.0,
+              14.0
+            ],
+            [
+              2.0,
+              14.0
+            ],
+            [
+              2.0,
+              4.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Colombian Territorial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -80.0,
+              -5.0
+            ],
+            [
+              -65.0,
+              -5.0
+            ],
+            [
+              -65.0,
+              15.0
+            ],
+            [
+              -80.0,
+              15.0
+            ],
+            [
+              -80.0,
+              -5.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Singapore Approach"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              103.5,
+              1.0
+            ],
+            [
+              104.5,
+              1.0
+            ],
+            [
+              104.5,
+              2.0
+            ],
+            [
+              103.5,
+              2.0
+            ],
+            [
+              103.5,
+              1.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Shanghai Approach"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              120.0,
+              30.0
+            ],
+            [
+              123.0,
+              30.0
+            ],
+            [
+              123.0,
+              32.5
+            ],
+            [
+              120.0,
+              32.5
+            ],
+            [
+              120.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Rotterdam Approach"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              3.0,
+              51.5
+            ],
+            [
+              6.0,
+              51.5
+            ],
+            [
+              6.0,
+              53.0
+            ],
+            [
+              3.0,
+              53.0
+            ],
+            [
+              3.0,
+              51.5
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Houston Ship Channel"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -95.5,
+              29.0
+            ],
+            [
+              -94.5,
+              29.0
+            ],
+            [
+              -94.5,
+              30.0
+            ],
+            [
+              -95.5,
+              30.0
+            ],
+            [
+              -95.5,
+              29.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Panama Canal Approach"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -81.0,
+              7.0
+            ],
+            [
+              -77.0,
+              7.0
+            ],
+            [
+              -77.0,
+              11.0
+            ],
+            [
+              -81.0,
+              11.0
+            ],
+            [
+              -81.0,
+              7.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Taiwan ADIZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              119.0,
+              22.0
+            ],
+            [
+              126.0,
+              22.0
+            ],
+            [
+              126.0,
+              26.0
+            ],
+            [
+              119.0,
+              26.0
+            ],
+            [
+              119.0,
+              22.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Ukraine Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              22.0,
+              44.0
+            ],
+            [
+              40.5,
+              44.0
+            ],
+            [
+              40.5,
+              52.5
+            ],
+            [
+              22.0,
+              52.5
+            ],
+            [
+              22.0,
+              44.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Belarus Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              23.5,
+              51.0
+            ],
+            [
+              32.5,
+              51.0
+            ],
+            [
+              32.5,
+              56.5
+            ],
+            [
+              23.5,
+              56.5
+            ],
+            [
+              23.5,
+              51.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "North Korea ADIZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              124.0,
+              37.0
+            ],
+            [
+              132.0,
+              37.0
+            ],
+            [
+              132.0,
+              43.0
+            ],
+            [
+              124.0,
+              43.0
+            ],
+            [
+              124.0,
+              37.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Iran Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              44.0,
+              25.0
+            ],
+            [
+              63.5,
+              25.0
+            ],
+            [
+              63.5,
+              39.5
+            ],
+            [
+              44.0,
+              39.5
+            ],
+            [
+              44.0,
+              25.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Syrian Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              35.5,
+              32.0
+            ],
+            [
+              42.0,
+              32.0
+            ],
+            [
+              42.0,
+              37.0
+            ],
+            [
+              35.5,
+              37.0
+            ],
+            [
+              35.5,
+              32.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Venezuelan Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -75.0,
+              0.0
+            ],
+            [
+              -59.0,
+              0.0
+            ],
+            [
+              -59.0,
+              12.0
+            ],
+            [
+              -75.0,
+              12.0
+            ],
+            [
+              -75.0,
+              0.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Israeli Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              34.0,
+              29.0
+            ],
+            [
+              35.5,
+              29.0
+            ],
+            [
+              35.5,
+              34.0
+            ],
+            [
+              34.0,
+              34.0
+            ],
+            [
+              34.0,
+              29.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Libyan Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              10.0,
+              30.0
+            ],
+            [
+              25.0,
+              30.0
+            ],
+            [
+              25.0,
+              34.0
+            ],
+            [
+              10.0,
+              34.0
+            ],
+            [
+              10.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Yemeni Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              42.0,
+              12.0
+            ],
+            [
+              54.0,
+              12.0
+            ],
+            [
+              54.0,
+              19.0
+            ],
+            [
+              42.0,
+              19.0
+            ],
+            [
+              42.0,
+              12.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Somali Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              40.0,
+              -3.0
+            ],
+            [
+              52.0,
+              -3.0
+            ],
+            [
+              52.0,
+              12.0
+            ],
+            [
+              40.0,
+              12.0
+            ],
+            [
+              40.0,
+              -3.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Sudanese Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              32.0,
+              3.0
+            ],
+            [
+              38.0,
+              3.0
+            ],
+            [
+              38.0,
+              22.0
+            ],
+            [
+              32.0,
+              22.0
+            ],
+            [
+              32.0,
+              3.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Russian Airspace"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              19.0,
+              41.0
+            ],
+            [
+              180.0,
+              41.0
+            ],
+            [
+              180.0,
+              82.0
+            ],
+            [
+              19.0,
+              82.0
+            ],
+            [
+              19.0,
+              41.0
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}
