@@ -14,14 +14,9 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 import warnings
-warnings.filterwarnings("ignore", message=".*Failed to initialize NumPy.*")
+from shared.utils.logging import setup_sentinel_logging
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("agents.main")
+logger = setup_sentinel_logging("agents.main", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 from shared.db import get_timescale, get_neo4j, get_redis
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
@@ -171,83 +166,83 @@ async def main():
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.CORRELATIONS],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="gemma:2b",
+        model="gemma:2b",
+        fallback_model="qwen2.5:7b",
     )
 
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_TRADFI, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_TRADFI, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.CORRELATIONS],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
         model="llama3",
-        fallback_model="gemma:2b",
+        fallback_model="qwen2.5:7b",
     )
 
     financial_advisor_agent = build_agent(
         FinancialAdvisorAgent,
         agent_name="financial_advisor",
-        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-financial-advisor",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="gemma:2b",
+        model="gemma:2b",
+        fallback_model="qwen2.5:7b",
     )
 
     macro_strategist_agent = build_agent(
         MacroStrategistAgent,
         agent_name="macro_strategist",
-        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-macro-strategist",
         shared_infra=shared_infra,
         model="llama3",
-        fallback_model="gemma:2b",
+        fallback_model="qwen2.5:7b",
     )
 
     # Fast Operational Tier
     radar_agent = build_agent(
         RadarAgent,
         agent_name="radar_agent",
-        input_topics=[Topics.QUANT_DISCOVERIES, Topics.RAW_RADAR, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        input_topics=[Topics.QUANT_DISCOVERIES, Topics.RAW_RADAR, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
         model="gemma:2b",
-        fallback_model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     ontology_agent = build_agent(
         OntologyMasterAgent,
         agent_name="ontology_master",
-        input_topics=[Topics.UNKNOWN_ENTITIES, Topics.INTEL_BRIEFS, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        input_topics=[Topics.UNKNOWN_ENTITIES, Topics.INTEL_BRIEFS, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
         soft_correlator=soft_correlator,
         model="gemma:2b",
-        fallback_model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     rule_synthesizer_agent = build_agent(
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
-        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
         model="gemma:2b",
-        fallback_model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     supervisor_agent = build_agent(
         GraphSupervisor,
         agent_name="supervisor",
-        input_topics=[Topics.ONTOLOGY_PROPOSALS],
+        input_topics=[Topics.ONTOLOGY_PROPOSALS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS],
         group_id="supervisor-group",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="llama3",
+        model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     macro_cointegration_agent = build_agent(
@@ -256,8 +251,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS],
         group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="llama3",
+        model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     yield_curve_agent = build_agent(
@@ -266,8 +261,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
         group_id="agent-yield-curve-rates",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="llama3",
+        model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     volatility_surface_agent = build_agent(
@@ -276,8 +271,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
         group_id="agent-volatility-surface",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="llama3",
+        model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     insider_clustering_agent = build_agent(
@@ -287,7 +282,7 @@ async def main():
         group_id="agent-insider-clustering",
         shared_infra=shared_infra,
         model="gemma:2b",
-        fallback_model="llama3",
+        fallback_model="qwen2.5:7b",
     )
 
     agents_by_name = {

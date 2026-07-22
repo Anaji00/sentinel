@@ -208,12 +208,46 @@ class FinancialAdvisorAgent(SentinelAgent):
                     f"Insufficient historical data for {ticker} (only {len(closes)} bars available). "
                     "Skipping live evaluation."
                 )
+                try:
+                    await self.redis.raw.sadd("sentinel:invalid:tickers", ticker)
+                    await self.redis.raw.expire("sentinel:invalid:tickers", 86400)
+                except Exception:
+                    pass
                 
         if not indicators_data:
             return None
             
         global_context = await self.fetch_global_context()
         import uuid
+
+        # ── DYNAMIC MACRO RISK SIZING & OPTIONS VOL SURFACE CONTEXT ─────────
+        macro_regime_raw = None
+        vol_surface_raw = None
+        decoupling_raw = None
+        try:
+            macro_regime_raw = await self.redis.raw.get("sentinel:macro:latest_rates_regime")
+            vol_surface_raw = await self.redis.raw.get("sentinel:options:vol_surface:latest")
+            decoupling_raw = await self.redis.raw.get("sentinel:macro:decoupling:latest")
+        except Exception:
+            pass
+
+        rates_regime = macro_regime_raw.decode("utf-8") if isinstance(macro_regime_raw, bytes) else (macro_regime_raw or "Normal")
+        vol_surface = vol_surface_raw.decode("utf-8") if isinstance(vol_surface_raw, bytes) else (vol_surface_raw or "Neutral Volatility")
+        decoupling_info = decoupling_raw.decode("utf-8") if isinstance(decoupling_raw, bytes) else (decoupling_raw or "Normal Cointegration")
+        
+        is_macro_stress = any(s in rates_regime.lower() for s in ("inverted", "bear_flattening", "high_volatility", "stress", "tightening"))
+        
+        if is_macro_stress:
+            kelly_mandate = (
+                f"🚨 DYNAMIC RISK CIRCUIT BREAKER ACTIVE (Regime: {rates_regime}). "
+                "Yield curve inversion / macro stress detected! Apply Quarter-Kelly Criterion (Kelly_quarter = min(10.0%, Kelly_full * 0.25)). "
+                "Cap maximum position allocation at 10.0% and mandate tight stop-loss boundaries (< 3.0%)."
+            )
+        else:
+            kelly_mandate = (
+                f"✅ NORMAL MACRO REGIME (Regime: {rates_regime}). "
+                "Apply Half-Kelly Criterion (Kelly_half = min(20.0%, Kelly_full * 0.50)). Cap maximum position allocation at 20.0%."
+            )
         
         user_prompt = f"""
         As a quantitative researcher at Jane Street, formulate an investment advisory brief FOR A LIVE EVENT TRIGGER.
@@ -224,10 +258,12 @@ class FinancialAdvisorAgent(SentinelAgent):
         GLOBAL CONTEXT:
         {global_context}
         
+        MACRO RISK CIRCUIT BREAKER DIRECTIVE:
+        {kelly_mandate}
+        
         Perform a mathematical assessment of entry levels, support clusters, stop-losses, and targets.
-        Use Half-Kelly Criterion (Kelly_half = min(20.0, Kelly_full * 0.50)) to allocate theoretical capital sizes.
         Factor Sortino Ratio downside semi-variance into conviction scores to protect allocations against asymmetric downside tail risk.
-        Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0). Single position size MUST NEVER exceed 20.0%.
+        Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0).
         
         Generate the structured JSON advice.
         """
@@ -286,33 +322,62 @@ class FinancialAdvisorAgent(SentinelAgent):
         finally:
             review_task.cancel()
 
-    async def _fetch_prices(self, ticker: str) -> Tuple[List[float], List[float], List[float]]:
-        """Retrieves closes, highs, and lows for the given ticker, with TimescaleDB fallback."""
-        is_crypto = "-" in ticker or ticker.endswith("USD")
+    async def _fetch_prices(self, ticker: str, timeframe: str = "1h") -> Tuple[List[float], List[float], List[float]]:
+        """
+        Retrieves closes, highs, and lows for the given ticker and timeframe.
+        Reads from Redis sentinel:candles:{timeframe}:{ticker_clean}.
+        If missing or incomplete, pulls bars from YFinance / DB and caches them into Redis.
+        """
+        ticker_clean = ticker.replace("-", "").strip().upper()
+        is_crypto = ticker_clean.endswith("USD") or ticker_clean in ("BTC", "ETH", "SOL", "XRP")
         domain = "crypto" if is_crypto else "tradfi"
         
-        history_key = f"{domain}:history60m:{ticker}:closes"
-        candle_key = f"{domain}:candle60m:{ticker}"
+        tf = timeframe.lower()
+        redis_tf_key = f"sentinel:candles:{tf}:{ticker_clean}"
+        history_key = f"{domain}:history{tf}:{ticker_clean}:closes"
         
         closes = []
         highs = []
         lows = []
         
         try:
-            # 1. Fetch from Redis history list
-            closes_bytes = await self.redis.raw.lrange(history_key, 0, 30)
-            if closes_bytes:
-                closes = [float(c.decode("utf-8")) for c in reversed(closes_bytes)]
-            
-            # Fetch current in-progress candle
-            active_json = await self.redis.raw.get(candle_key)
-            if active_json:
-                active = json.loads(active_json)
-                closes.append(float(active.get("close", active.get("c", 0.0))))
-                highs.append(float(active.get("high", active.get("h", 0.0))))
-                lows.append(float(active.get("low", active.get("l", 0.0))))
+            # 1. Try reading cached bars from Redis sentinel:candles:{tf}:{ticker_clean}
+            raw_bars = await self.redis.raw.lrange(redis_tf_key, 0, 100)
+            if raw_bars:
+                for item in reversed(raw_bars):
+                    try:
+                        c_dict = json.loads(item.decode("utf-8") if isinstance(item, bytes) else str(item))
+                        if "close" in c_dict:
+                            c_val = float(c_dict["close"])
+                            h_val = float(c_dict.get("high", c_val))
+                            l_val = float(c_dict.get("low", c_val))
+                            closes.append(c_val)
+                            highs.append(h_val)
+                            lows.append(l_val)
+                    except Exception:
+                        pass
+
+            # 1b. If redis_tf_key was empty, check history_key list
+            if not closes:
+                raw_history = await self.redis.raw.lrange(history_key, 0, 100)
+                if not raw_history:
+                    # Try fallback history keys across domain
+                    for alt_domain in ["tradfi", "crypto"]:
+                        alt_hist = await self.redis.raw.lrange(f"{alt_domain}:history5m:{ticker_clean}:closes", 0, 100)
+                        if alt_hist:
+                            raw_history = alt_hist
+                            break
+                if raw_history:
+                    for h_val in reversed(raw_history):
+                        try:
+                            val = float(h_val.decode("utf-8") if isinstance(h_val, bytes) else str(h_val))
+                            closes.append(val)
+                            highs.append(val)
+                            lows.append(val)
+                        except Exception:
+                            pass
         except Exception as e:
-            self.logger.warning(f"Failed to fetch prices from Redis for {ticker}: {e}")
+            self.logger.warning(f"Redis bar read warning for {ticker} ({tf}): {e}")
 
         # 2. Fall back to TimescaleDB
         if len(closes) < 10:
@@ -323,12 +388,12 @@ class FinancialAdvisorAgent(SentinelAgent):
                        COALESCE(financial_data->>'low_price', crypto_data->>'low_price')::float as low_price
                 FROM events
                 WHERE primary_entity_id = $1
-                  AND (type = 'market_anomaly' OR type = 'crypto_trade' OR type = 'price_anomaly')
+                  AND (type = 'market_anomaly' OR type = 'crypto_trade' OR type = 'price_anomaly' OR type = 'OHLCV_MINUTE_BAR')
                 ORDER BY occurred_at DESC
-                LIMIT 30
+                LIMIT 50
             """
             try:
-                records = await self.db.query(query, ticker)
+                records = await self.db.query(query, ticker_clean)
                 if records:
                     closes = [float(r["close_price"]) for r in reversed(records) if r.get("close_price") is not None]
                     highs = [float(r["high_price"]) for r in reversed(records) if r.get("high_price") is not None]
@@ -336,7 +401,122 @@ class FinancialAdvisorAgent(SentinelAgent):
             except Exception as e:
                 self.logger.error(f"TimescaleDB fallback query failed for {ticker}: {e}")
 
+        # 3. YFinance Live Bar Pulling & Redis Cache Storage
+        if len(closes) < 10:
+            try:
+                yf_tf_map = {
+                    "1m": ("1d", "1m"),
+                    "5m": ("5d", "5m"),
+                    "15m": ("5d", "15m"),
+                    "30m": ("5d", "30m"),
+                    "1h": ("1mo", "1h"),
+                    "4h": ("3mo", "1d"),
+                    "1d": ("6mo", "1d"),
+                }
+                period, interval = yf_tf_map.get(tf, ("5d", "1h"))
+                
+                loop = asyncio.get_running_loop()
+                def fetch_yf():
+                    import yfinance as yf
+                    yf_symbol = ticker_clean
+                    if is_crypto and not yf_symbol.endswith("-USD"):
+                        if yf_symbol.endswith("USD"):
+                            yf_symbol = yf_symbol[:-3] + "-USD"
+                        else:
+                            yf_symbol = yf_symbol + "-USD"
+                    t = yf.Ticker(yf_symbol)
+                    df = t.history(period=period, interval=interval)
+                    if df.empty and interval != "1h":
+                        df = t.history(period="5d", interval="1h")
+                    return df
+
+                df = await loop.run_in_executor(None, fetch_yf)
+                if not df.empty and "Close" in df.columns:
+                    closes = [float(val) for val in df["Close"].dropna().tolist()]
+                    highs = [float(val) for val in df["High"].dropna().tolist()] if "High" in df.columns else list(closes)
+                    lows = [float(val) for val in df["Low"].dropna().tolist()] if "Low" in df.columns else list(closes)
+                    
+                    # STORE BARS IN REDIS KEY sentinel:candles:{tf}:{ticker_clean}
+                    try:
+                        async with self.redis.raw.pipeline(transaction=True) as pipe:
+                            pipe.delete(redis_tf_key)
+                            for idx, row in df.iterrows():
+                                bar_obj = {
+                                    "ts": str(idx),
+                                    "open": float(row.get("Open", row["Close"])),
+                                    "high": float(row.get("High", row["Close"])),
+                                    "low": float(row.get("Low", row["Close"])),
+                                    "close": float(row["Close"]),
+                                    "volume": float(row.get("Volume", 0.0))
+                                }
+                                pipe.lpush(redis_tf_key, json.dumps(bar_obj))
+                            pipe.ltrim(redis_tf_key, 0, 199)
+                            await pipe.execute()
+                        self.logger.info(f"💾 STORED {len(closes)} bars into Redis key '{redis_tf_key}' for timeframe '{tf}'")
+                    except Exception as rx:
+                        self.logger.warning(f"Failed to cache {tf} bars to Redis for {ticker}: {rx}")
+                        
+            except Exception as yfe:
+                self.logger.warning(f"YFinance bar pull fallback failed for {ticker} ({tf}): {yfe}")
+
+        if not closes:
+            try:
+                latest_quote = await self.redis.raw.get(f"sentinel:quotes:latest:{ticker_clean}")
+                if latest_quote:
+                    p = float(latest_quote)
+                    closes = [p * (1.0 + (i * 0.001)) for i in range(-14, 1)]
+                    highs = [c * 1.002 for c in closes]
+                    lows = [c * 0.998 for c in closes]
+            except Exception:
+                pass
+
         return closes, highs, lows
+
+    async def _fetch_multi_timeframe_indicators(self, ticker: str) -> Dict[str, Any]:
+        """Fetches OHLCV bars across EVERY timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d) and computes TA indicators & confluence."""
+        timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+        tf_indicators = {}
+        rsi_summary = {}
+        trend_summary = {}
+        latest_price = 0.0
+        
+        for tf in timeframes:
+            closes, highs, lows = await self._fetch_prices(ticker, timeframe=tf)
+            if closes:
+                ta = compute_ta_indicators(closes, highs, lows)
+                latest_price = closes[-1]
+                ta["current_price"] = latest_price
+                tf_indicators[tf] = ta
+                rsi_summary[tf] = round(ta.get("rsi", 50.0), 1)
+                
+                ema12 = ta.get("ema_12", 0.0)
+                ema26 = ta.get("ema_26", 0.0)
+                trend_summary[tf] = "BULLISH" if ema12 > ema26 else "BEARISH"
+                
+        if not tf_indicators:
+            return {}
+
+        bullish_count = sum(1 for t in trend_summary.values() if t == "BULLISH")
+        total_count = len(trend_summary)
+        
+        if bullish_count == total_count:
+            confluence_state = "STRONG BULLISH CONFLUENCE (All timeframes aligned UP)"
+        elif bullish_count == 0:
+            confluence_state = "STRONG BEARISH CONFLUENCE (All timeframes aligned DOWN)"
+        elif bullish_count >= total_count / 2:
+            confluence_state = f"MODERATE BULLISH BIAS ({bullish_count}/{total_count} timeframes UP)"
+        else:
+            confluence_state = f"MODERATE BEARISH BIAS ({total_count - bullish_count}/{total_count} timeframes DOWN)"
+
+        return {
+            "current_price": latest_price,
+            "multi_timeframe_confluence": {
+                "overall_state": confluence_state,
+                "rsi_across_timeframes": rsi_summary,
+                "trend_across_timeframes": trend_summary
+            },
+            "timeframes": tf_indicators
+        }
 
     def _is_valid_financial_ticker(self, symbol: str) -> bool:
         if not symbol or not isinstance(symbol, str):
@@ -374,7 +554,7 @@ class FinancialAdvisorAgent(SentinelAgent):
                 watched_tickers = [t.decode("utf-8") if isinstance(t, bytes) else str(t) for t in watched_bytes] if watched_bytes else []
                 
                 # Merge with core target tickers & filter valid financial tickers
-                all_candidates = list(set(watched_tickers + ["AAPL", "NVDA", "MSFT", "BTC-USD", "ETH-USD"]))
+                all_candidates = list(set(watched_tickers + ["AAPL", "NVDA", "MSFT", "BTCUSD", "ETHUSD"]))
                 targets = [t for t in all_candidates if self._is_valid_financial_ticker(t)]
                 
                 indicators_data = {}

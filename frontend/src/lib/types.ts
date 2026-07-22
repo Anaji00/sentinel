@@ -1,6 +1,7 @@
 // frontend/src/lib/types.ts
 
 export interface Scenario {
+    scenario_id?: string;
     correlation_id: string;
     status: string;
     headline: string;

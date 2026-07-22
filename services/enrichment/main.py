@@ -16,12 +16,9 @@ load_dotenv(ROOT / ".env")
 import warnings
 warnings.filterwarnings("ignore", message=".*Failed to initialize NumPy.*")
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("enrichment")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("enrichment", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent

@@ -96,3 +96,35 @@ async def get_event_detail(event_id: str, db = Depends(get_db)): # <--- CRITICAL
     except Exception as e:
         logger.error(f"Failed to fetch event details: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")
+
+
+# ── REAL-TIME WEBSOCKET LIVE FEED ─────────────────────────────────────────────
+
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+
+@router.websocket("/ws/live-feed")
+async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0.0)):
+    """Real-time WebSocket event stream for zero-latency dashboard visualization."""
+    await websocket.accept()
+    redis = websocket.app.state.redis
+    pubsub = redis.raw.pubsub()
+    await pubsub.subscribe("sentinel:events:live")
+    logger.info("Client connected to /ws/live-feed streaming endpoint.")
+    
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                try:
+                    data = json.loads(message["data"])
+                    score = float(data.get("anomaly_score", 0.0) or 0.0)
+                    if score >= min_anomaly:
+                        await websocket.send_json(data)
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from /ws/live-feed")
+    except Exception as e:
+        logger.error(f"WebSocket live feed error: {e}")
+    finally:
+        await pubsub.unsubscribe("sentinel:events:live")

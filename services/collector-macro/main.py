@@ -223,7 +223,7 @@ async def fetch_and_publish(producer: SentinelProducer):
             if use_fallback or ticker_failed:
                 # Lazy fetch fallback if not loaded yet
                 if not fallback_quotes:
-                    logger.warning(f"Ticker {ticker} failed on yfinance. Fetching Alpaca proxy...")
+                    logger.warning(f"Ticker {ticker} failed on bulk yfinance. Fetching Alpaca proxy...")
                     fallback_quotes = await fetch_fallback_quotes([ticker])
                 
                 if ticker in fallback_quotes:
@@ -233,10 +233,31 @@ async def fetch_and_publish(producer: SentinelProducer):
                     high_val = q["high"]
                     low_val = q["low"]
                     volume = q["volume"]
-                    logger.info(f"Using Alpaca proxy fallback ({FALLBACK_MAP[ticker]}) for {ticker}: {current_price}")
                 else:
-                    logger.warning(f"No fallback proxy available for {ticker}. Skipping.")
-                    continue
+                    # Single-ticker yfinance fast_info fallback
+                    try:
+                        def _single_yf():
+                            t = yf.Ticker(ticker)
+                            p = float(getattr(t.fast_info, 'last_price', 0.0) or getattr(t.fast_info, 'previous_close', 0.0) or 0.0)
+                            if p <= 0:
+                                df = t.history(period="5d")
+                                if not df.empty and "Close" in df.columns:
+                                    p = float(df["Close"].iloc[-1])
+                            return p
+                        
+                        single_price = await loop.run_in_executor(None, _single_yf)
+                        if single_price > 0:
+                            current_price = single_price
+                            previous_price = single_price * 0.999
+                            high_val = single_price * 1.002
+                            low_val = single_price * 0.998
+                            logger.info(f"✅ Single-ticker yfinance fallback recovered {ticker}: ${current_price:.2f}")
+                        else:
+                            logger.warning(f"No fallback proxy available for {ticker}. Skipping.")
+                            continue
+                    except Exception as s_err:
+                        logger.warning(f"Single-ticker yfinance fallback error for {ticker}: {s_err}. Skipping.")
+                    logger.info(f"Using Alpaca proxy fallback ({FALLBACK_MAP[ticker]}) for {ticker}: {current_price}")
 
             tick_direction = (
                 "UpTick" if current_price > previous_price

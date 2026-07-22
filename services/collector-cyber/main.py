@@ -479,8 +479,8 @@ async def stream_bgp(producer: SentinelProducer):
     client = ResilientWebSocketClient(
         url=RIPE_RIS_URL,
         name="RIPE_RIS_BGP",
-        ping_interval=60.0,
-        ping_timeout=30.0,
+        ping_interval=20.0,
+        ping_timeout=10.0,
         on_connect=on_connect,
         on_message=on_message
     )

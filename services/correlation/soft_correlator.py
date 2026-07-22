@@ -76,7 +76,7 @@ class SoftCorrelator:
                     )
                 
                 logger.info("SentenceTransformer model loaded")
-                qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+                qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
                 # Connect to the local Qdrant instance on its default port.
                 self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
                 # Mark the correlator as fully active and ready to process events.

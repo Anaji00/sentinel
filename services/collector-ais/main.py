@@ -47,12 +47,9 @@ from shared.models import RawEvent
 
 
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("collector.ais")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("collector.ais", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 AISSTREAM_API_KEY = os.getenv("AISSTREAM_API_KEY")
 if not AISSTREAM_API_KEY:

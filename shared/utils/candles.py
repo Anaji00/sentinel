@@ -50,6 +50,11 @@ async def evaluate_multi_timeframe(
                 await redis_client.raw.lpush(history_key, block["close"])
                 await redis_client.raw.ltrim(history_key, 0, 14)
                 
+                # Also store complete OHLCV bar object in sentinel:candles:{tf}m:{asset}
+                candles_tf_key = f"sentinel:candles:{tf}m:{asset}"
+                await redis_client.raw.lpush(candles_tf_key, json.dumps(block))
+                await redis_client.raw.ltrim(candles_tf_key, 0, 199)
+                
                 block = {
                     "bucket_id": bucket_id,
                     "open": open_p,

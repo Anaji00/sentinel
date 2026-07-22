@@ -37,8 +37,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from .base import SentinelAgent, SchemaViolationError, InferenceError
+from shared.utils.equities import is_valid_primary_equity
 from .prompts import (
     NEWS_INTEL_SYSTEM,
+    build_news_intel_prompt,
     NEWS_INTEL_USER_TEMPLATE,
     GRAPH_EXTRACTION_SYSTEM,
     GRAPH_EXTRACTION_USER_TEMPLATE,
@@ -187,9 +189,10 @@ class NewsIntelAgent(SentinelAgent):
         )
 
         try:
+            dynamic_sys_prompt = build_news_intel_prompt(domain=source, severity=3)
             brief: IntelBrief = await self._execute_with_telemetry(
                 message=message,
-                system_prompt=NEWS_INTEL_SYSTEM,
+                system_prompt=dynamic_sys_prompt,
                 user_prompt=user_prompt,
                 schema=IntelBrief,
                 temperature=0.1,
@@ -366,7 +369,7 @@ class NewsIntelAgent(SentinelAgent):
 
         instruments_to_add = {
             t.upper().strip() for t in candidates 
-            if t and isinstance(t, str) and "_" not in t and " " not in t and 1 <= len(t.strip()) <= 10
+            if t and isinstance(t, str) and is_valid_primary_equity(t.strip().upper())
         }
 
         if instruments_to_add:

@@ -203,6 +203,11 @@ class MacroAssetCointegrationEngine(SentinelAgent):
                 logger.warning(f"🚨 MACRO DECOUPLING DETECTED: {macro_asset} vs {micro_ticker} | Z-Score: {z_score:.2f}")
 
                 asyncio.create_task(self.write_agent_memory(f"Macro Decoupling Detected: {micro_ticker} broke correlation with {macro_asset} (Z-Score: {z_score:.2f})."))
+                try:
+                    decoupling_summary = f"Macro Decoupling: {micro_ticker} broke correlation with {macro_asset} (Z-Score: {z_score:.2f}, Beta: {beta:.2f})"
+                    await self.redis.raw.set("sentinel:macro:decoupling:latest", decoupling_summary)
+                except Exception:
+                    pass
 
                 return NormalizedEvent(
                     type=EventType.MARKET_ANOMALY,

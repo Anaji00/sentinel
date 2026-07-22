@@ -304,13 +304,24 @@ class ScenarioGenerator:
           - Instruction:           ~200 tokens
           Total:                   ~2500 tokens — leaves room for hypothesis generation
         """
-        # Cap each section to stay within context window
-        # JSON.dumps converts Python objects into a string format the AI can read.
+        # Cap each section to stay within context window and optimize throughput
         events_section = json.dumps(raw_events[:5], indent=2, default=str)
 
-        graph_section = json.dumps(
-            context.get("entity_graph", [])[:10], indent=2, default=str
-        )
+        # Compact 2-hop graph representation to eliminate token bloat
+        graph_items = context.get("entity_graph", [])[:5]
+        if graph_items:
+            graph_lines = []
+            for g in graph_items:
+                if isinstance(g, dict):
+                    rel = g.get("relationship", "CONNECTED_TO")
+                    subj = g.get("subject") or g.get("source") or "Entity"
+                    obj = g.get("object") or g.get("connected") or "Entity"
+                    graph_lines.append(f"• {subj} --[{rel}]--> {obj}")
+                else:
+                    graph_lines.append(f"• {str(g)[:100]}")
+            graph_section = "\n".join(graph_lines)
+        else:
+            graph_section = "None"
 
         patterns_section = json.dumps(patterns[:3], indent=2, default=str)
 

@@ -22,12 +22,9 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("correlation")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("correlation", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from shared.utils.ollama import OllamaClient
@@ -36,6 +33,7 @@ from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
 from shared.db import get_redis, get_timescale
 from services.correlation.event_store import EventStore
+from services.correlation.cascade import GeopoliticalCascadeEngine
 
 _dynamic_rules_cache = {}
 
@@ -45,10 +43,42 @@ async def _listen_for_rule_updates(redis_client):
     
     try:
         rules_raw = await redis_client.raw.hvals("sentinel:correlation:dynamic_rules")
-        for raw in rules_raw:
-            rule = json.loads(raw)
-            if "rule_id" in rule:
-                _dynamic_rules_cache[rule["rule_id"]] = rule
+        if rules_raw:
+            for raw in rules_raw:
+                rule = json.loads(raw)
+                if "rule_id" in rule:
+                    _dynamic_rules_cache[rule["rule_id"]] = rule
+        else:
+            logger.info("⚡ No dynamic rules in Redis. Seeding default baseline correlation rules...")
+            default_rules = [
+                {
+                    "rule_id": "rule_cyber_aviation_chokepoint",
+                    "trigger_event_type": "cyber_threat",
+                    "conditions": {"min_anomaly": 0.1},
+                    "correlations": [{"event_types": ["flight_position", "vessel_position"], "hours": 48, "min_anomaly": 0.0}],
+                    "alert_tier": "CRITICAL",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_macro_market_volatility",
+                    "trigger_event_type": "macro_indicator",
+                    "conditions": {"min_anomaly": 0.0},
+                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 24, "min_anomaly": 0.0}],
+                    "alert_tier": "ELEVATED",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_news_market_anomaly",
+                    "trigger_event_type": "news_article",
+                    "conditions": {"min_anomaly": 0.0},
+                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 12, "min_anomaly": 0.0}],
+                    "alert_tier": "WATCH",
+                    "expires_at": int(time.time()) + 315360000
+                }
+            ]
+            for d_rule in default_rules:
+                await redis_client.raw.hset("sentinel:correlation:dynamic_rules", d_rule["rule_id"], json.dumps(d_rule))
+                _dynamic_rules_cache[d_rule["rule_id"]] = d_rule
         logger.info(f"Loaded {len(_dynamic_rules_cache)} dynamic rules into memory.")
     except Exception as e:
         logger.error(f"Failed to load dynamic rules on startup: {e}")
@@ -173,9 +203,23 @@ async def main():
     total_received = 0
     last_logged_received = 0
 
+    cascade_engine = GeopoliticalCascadeEngine(window_seconds=3600)
+
     async def _process_correlation_event(event: NormalizedEvent):
         nonlocal corr_fired, processed
         try:
+            # 1. Evaluate Geopolitical Cascade Engine
+            cascade_cluster = cascade_engine.ingest_event(event)
+            if cascade_cluster:
+                await store.save_correlation(cascade_cluster)
+                await producer.send(
+                    Topics.CORRELATIONS,
+                    cascade_cluster.model_dump(),
+                    key=cascade_cluster.correlation_id,
+                )
+                corr_fired += 1
+                logger.info(f"🚨 Geopolitical Cascade Alert Fired: {cascade_cluster.correlation_id}")
+
             dynamic_clusters = await evaluate_dynamic_rules(event, store)
             for c in dynamic_clusters:
                 await store.save_correlation(c)

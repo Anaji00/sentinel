@@ -24,15 +24,19 @@ from pydantic import BaseModel, ValidationError
 logger = logging.getLogger("sentinel.ollama")
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
-OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "llama3")
-OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:7b")
-# Increased default timeout to 180 seconds to allow 7B local models sufficient processing time
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "180.0")))
+OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
+OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b")
+# Dynamic timeout: 25 seconds default allows fast offloading to fallback models
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "25.0")))
 
 # Circuit breaker config
-CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "6"))
-CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "30.0"))  # 30 seconds adaptive cooldown
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
+CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "15.0"))  # 15 seconds adaptive cooldown
 OLLAMA_NUM_PARALLEL       = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
+
+# Model Tier Preference Lists
+MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:7b", "llama3:latest"]
+MODEL_TIER_HEAVY       = ["llama3:latest", "qwen2.5:7b", "gemma:2b"]
 
 _OLLAMA_SEMAPHORES = {}
 
@@ -361,15 +365,20 @@ class OllamaClient:
         except TypeError:
             resolved_model = await self._resolve_model(active_model)
 
+        # Truncate prompt if longer than 3500 chars to fit within 4096 context window
+        clean_prompt = prompt
+        if len(clean_prompt) > 3500:
+            clean_prompt = clean_prompt[:3500] + "\n...[truncated for context size]"
+
         payload = {
             "model": resolved_model,
-            "prompt": prompt,
+            "prompt": clean_prompt,
             "stream": False,
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
                 "num_predict": num_predict or 256,
-                "num_ctx": 2048,  # Performance optimization for fast local LLM inference
+                "num_ctx": 4096,  # Cap at 4096 to handle detailed multi-event contexts without truncation
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }
@@ -427,13 +436,23 @@ class OllamaClient:
             
         except asyncio.TimeoutError:
             self._consecutive_timeouts[active_model] = self._consecutive_timeouts.get(active_model, 0) + 1
-            if self._consecutive_timeouts[active_model] >= CIRCUIT_BREAKER_THRESHOLD:
+            consec = self._consecutive_timeouts[active_model]
+            
+            # Extract first 150 chars of prompt for diagnostic preview
+            prompt_preview = clean_prompt.replace("\n", " ")[:20]
+            logger.error(
+                f"⏱ OLLAMA TIMEOUT ({OLLAMA_TIMEOUT.total}s) | Model: '{active_model}' (resolved: '{resolved_model}') | "
+                f"Prompt Length: {len(clean_prompt)} chars | Consecutive Timeouts: {consec} | "
+                f"Prompt Snippet: '{prompt_preview}...'"
+            )
+            
+            if consec >= CIRCUIT_BREAKER_THRESHOLD:
                 self._circuit_open_until[active_model] = _time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
                 logger.warning(
-                    f"Circuit breaker OPENED for '{active_model}' after {self._consecutive_timeouts[active_model]} "
+                    f"🚨 CIRCUIT BREAKER OPENED for '{active_model}' after {consec} "
                     f"consecutive timeouts. Cooling down for {CIRCUIT_BREAKER_COOLDOWN}s."
                 )
-            raise InferenceError(f"Ollama timed out after {OLLAMA_TIMEOUT.total}s")
+            raise InferenceError(f"Ollama timed out after {OLLAMA_TIMEOUT.total}s for model '{active_model}' (prompt_len={len(clean_prompt)})")
         except aiohttp.ClientError as e:
             raise InferenceError(f"Ollama connection error: {e}")
 

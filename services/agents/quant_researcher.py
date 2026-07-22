@@ -24,6 +24,7 @@ from .base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.utils.equities import is_valid_primary_equity, fast_classify_equity
 from .prompts import (
     QUANT_PEER_DISCOVERY_SYSTEM,
+    build_quant_discovery_prompt,
     QUANT_PEER_DISCOVERY_USER_TEMPLATE,
     QUANT_CRYPTO_BASKET_USER_TEMPLATE,
 )
@@ -237,9 +238,13 @@ class QuantResearcherAgent(SentinelAgent):
         )
 
         try:
+            dynamic_sys = build_quant_discovery_prompt(
+                ticker=ticker,
+                macro_regime=str(macro_context.get("rates_regime", "Normal") if isinstance(macro_context, dict) else "Normal")
+            )
             discovery: PeerDiscovery = await self._execute_with_telemetry(
                 message=message,
-                system_prompt=QUANT_PEER_DISCOVERY_SYSTEM,
+                system_prompt=dynamic_sys,
                 user_prompt=user_prompt,
                 schema=PeerDiscovery,
                 temperature=0.15,

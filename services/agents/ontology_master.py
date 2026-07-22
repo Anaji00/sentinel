@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from .base import SentinelAgent, SchemaViolationError, InferenceError
 from .prompts import (
     ONTOLOGY_CATEGORIZE_SYSTEM,
+    build_ontology_prompt,
     ONTOLOGY_CATEGORIZE_USER_TEMPLATE,
 )
 
@@ -143,9 +144,10 @@ class OntologyMasterAgent(SentinelAgent):
         )
 
         try:
+            dynamic_sys = build_ontology_prompt(source_domain=source_domain)
             classification: EntityClassification = await self._execute_with_telemetry(
                 message=message,
-                system_prompt=ONTOLOGY_CATEGORIZE_SYSTEM,
+                system_prompt=dynamic_sys,
                 user_prompt=user_prompt,
                 schema=EntityClassification,
                 temperature=0.05,
@@ -451,7 +453,7 @@ class OntologyMasterAgent(SentinelAgent):
 
                     classified = await self.redis.raw.exists(f"sentinel:ontology:entity:{entity}")
                     if not classified:
-                        self.enqueue_task(
+                        await self.enqueue_task(
                             "classify_entity",
                             {"entity_name": entity, "frequency": count, "context": ""},
                             priority="low",

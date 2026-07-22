@@ -2,34 +2,46 @@
 
 @layer base {
   :root {
-    --bg-primary: #08090c;
-    --bg-secondary: #0e1117;
-    --bg-glass: rgba(14, 17, 23, 0.75);
-    --border-glass: rgba(102, 252, 241, 0.15);
-    --accent-cyan: #66fcf1;
+    --bg-primary: #06080d;
+    --bg-secondary: #0c0e17;
+    --bg-card: rgba(12, 14, 23, 0.75);
+    --bg-glass: rgba(15, 18, 30, 0.7);
+    --border-glass: rgba(0, 242, 254, 0.15);
+    --border-glow: rgba(0, 242, 254, 0.35);
+    
+    --accent-cyan: #00f2fe;
     --accent-teal: #45f3ec;
-    --accent-green: #00ff9d;
-    --accent-crimson: #ff4757;
-    --accent-amber: #ffa502;
-    --text-primary: #f1f5f9;
-    --text-muted: #94a3b8;
+    --accent-emerald: #10b981;
+    --accent-crimson: #ef4444;
+    --accent-amber: #f59e0b;
+    --accent-violet: #8b5cf6;
+    
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
   }
 
   body {
     background-color: var(--bg-primary);
     color: var(--text-primary);
-    font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     overflow: hidden;
+    background-image: 
+      radial-gradient(circle at 50% 0%, rgba(0, 242, 254, 0.05) 0%, transparent 60%),
+      radial-gradient(circle at 100% 100%, rgba(139, 92, 246, 0.04) 0%, transparent 50%),
+      linear-gradient(to right, rgba(255, 255, 255, 0.01) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.01) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 32px 32px, 32px 32px;
   }
 }
 
-/* Glassmorphic Utilities */
+/* Glassmorphism & Cyber HUD styling */
 .glass-panel {
-  background: rgba(13, 16, 23, 0.75);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(102, 252, 241, 0.12);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  background: var(--bg-card);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-glass);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
 }
 
 .glass-panel-hover {
@@ -37,20 +49,58 @@
 }
 
 .glass-panel-hover:hover {
-  border-color: rgba(102, 252, 241, 0.35);
-  box-shadow: 0 0 20px rgba(102, 252, 241, 0.15);
+  border-color: var(--border-glow);
+  box-shadow: 0 0 24px rgba(0, 242, 254, 0.18);
 }
 
+/* Glow Effects */
 .glow-cyan {
-  box-shadow: 0 0 15px rgba(102, 252, 241, 0.35);
+  box-shadow: 0 0 18px rgba(0, 242, 254, 0.35);
 }
 
-.glow-green {
-  box-shadow: 0 0 15px rgba(0, 255, 157, 0.35);
+.glow-emerald {
+  box-shadow: 0 0 18px rgba(16, 185, 129, 0.35);
 }
 
 .glow-crimson {
-  box-shadow: 0 0 15px rgba(255, 71, 87, 0.35);
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.35);
+}
+
+.glow-amber {
+  box-shadow: 0 0 18px rgba(245, 158, 11, 0.35);
+}
+
+.glow-violet {
+  box-shadow: 0 0 18px rgba(139, 92, 246, 0.35);
+}
+
+/* Radar Scan Line Effect */
+@keyframes radar-sweep {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.radar-sweep {
+  animation: radar-sweep 6s linear infinite;
+  transform-origin: center;
+}
+
+/* Pulse Scanline */
+@keyframes scanline {
+  0% {
+    transform: translateY(-100%);
+  }
+  100% {
+    transform: translateY(1000%);
+  }
+}
+
+.animate-scanline {
+  animation: scanline 8s linear infinite;
 }
 
 /* Custom Scrollbar */
@@ -60,19 +110,19 @@
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(8, 9, 12, 0.5);
+  background: rgba(6, 8, 13, 0.8);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(102, 252, 241, 0.2);
+  background: rgba(0, 242, 254, 0.25);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(102, 252, 241, 0.5);
+  background: rgba(0, 242, 254, 0.55);
 }
 
-/* Shimmer Animation for Skeletons */
+/* Shimmer Loading Animation */
 @keyframes shimmer {
   0% {
     background-position: -200% 0;
@@ -85,9 +135,9 @@
 .animate-shimmer {
   background: linear-gradient(
     90deg,
-    rgba(30, 41, 59, 0.4) 0%,
-    rgba(51, 65, 85, 0.8) 50%,
-    rgba(30, 41, 59, 0.4) 100%
+    rgba(15, 23, 42, 0.4) 0%,
+    rgba(30, 41, 59, 0.8) 50%,
+    rgba(15, 23, 42, 0.4) 100%
   );
   background-size: 200% 100%;
   animation: shimmer 2s infinite ease-in-out;

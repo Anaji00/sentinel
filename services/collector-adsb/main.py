@@ -51,12 +51,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
  
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("collector.adsb")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("collector.adsb", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
@@ -67,8 +64,8 @@ OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-networ
 OPENSKY_API_BASE = "https://opensky-network.org/api"
 
 EMERGENCY_SQUAWKS = {"7500", "7600", "7700"}
- 
-# (name, lamin, lamax, lomin, lomax) — match maritime watch zones for correlation
+
+# Detailed sub-zone definitions for precise event tagging
 WATCH_ZONES = [
     ("Strait of Hormuz",   24.0, 27.0,  56.0,  60.0),
     ("Strait of Malacca",   1.0,  6.0, 103.0, 105.0),
@@ -84,9 +81,14 @@ WATCH_ZONES = [
     ("Saudi Airspace",        16.0, 32.0,  34.0,  56.0),
 ]
 
-# Poll interval between full zone sweeps (seconds)
-# Zone polls are spaced 5s apart inside the sweep.
-POLL_INTERVAL = 30
+# Consolidated Macro-Regions to minimize API call count & credit consumption
+MACRO_REGIONS = [
+    ("Middle East & Red Sea", 11.5, 47.0,  32.0, 63.0),
+    ("Europe & Black Sea",    40.0, 53.0,  22.0, 42.0),
+    ("Asia Pacific",           1.0, 26.0, 103.0, 123.0),
+]
+
+POLL_INTERVAL = 60 if not OPENSKY_CLIENT_ID else 30
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
 class OpenSkyAuth:
@@ -165,6 +167,8 @@ def parse_state_vector(state: list) -> Optional[dict]:
 
 # ── ZONE POLLER ───────────────────────────────────────────────────────────────
 
+OPENSKY_RATE_LIMITED_UNTIL = 0.0
+
 async def poll_zone(
         session: aiohttp.ClientSession,
         auth: OpenSkyAuth,
@@ -175,6 +179,10 @@ async def poll_zone(
         lomin: float,
         lomax: float,
     ):
+    global OPENSKY_RATE_LIMITED_UNTIL
+    if time.time() < OPENSKY_RATE_LIMITED_UNTIL:
+        return
+
     token = await auth.get_token(session)
     url = (
         f"{OPENSKY_API_BASE}/states/all"
@@ -236,13 +244,13 @@ async def poll_zone(
                         ) 
 
             elif resp.status == 429:
-                logger.warning(f"OpenSky rate limited — sleeping 60s (credits: {remaining})")
-                await asyncio.sleep(60)
+                OPENSKY_RATE_LIMITED_UNTIL = time.time() + 180.0
+                logger.warning(f"OpenSky rate limited — cooling down for 180s (credits left: {remaining})")
 
             elif resp.status == 401:
                 logger.warning("OpenSky auth failed — forcing token refresh")
                 auth._expires_at = 0.0
- 
+
             else:
                 logger.warning(f"OpenSky {resp.status} for {zone_name}")
 
@@ -258,14 +266,14 @@ async def collect(producer: SentinelProducer):
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)  # Limit concurrent connections
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
-            for zone_name, lamin, lamax, lomin, lomax in WATCH_ZONES:
+            for zone_name, lamin, lamax, lomin, lomax in MACRO_REGIONS:
                 await poll_zone(
                     session, auth, producer,
                     zone_name, lamin, lamax, lomin, lomax
                 )
                 await asyncio.sleep(5)  # Space out zone polls to respect rate limits
 
-            logger.info(f"Completed sweep of all zones. Sleeping for {POLL_INTERVAL}s...")
+            logger.info(f"Completed sweep of all {len(MACRO_REGIONS)} consolidated regions. Sleeping for {POLL_INTERVAL}s...")
             await asyncio.sleep(POLL_INTERVAL)
 
 async def main():

@@ -112,9 +112,10 @@ class VolatilitySurfaceAgent(SentinelAgent):
                 }
             }
 
-            # Cache latest volatility brief to Redis
+            # Cache latest volatility brief to Redis for shared agent context
             try:
                 await self.redis.raw.set(f"sentinel:options:vol_surface:{ticker}", json.dumps(res_payload["brief"]))
+                await self.redis.raw.set("sentinel:options:vol_surface:latest", json.dumps(res_payload["brief"]))
             except Exception as rx:
                 self.logger.warning(f"Failed to cache vol surface brief to Redis: {rx}")
 

@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
-logger = logging.getLogger("telemetry-worker")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("telemetry-worker", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 from shared.kafka import SentinelConsumer, Topics
 from shared.db import get_timescale

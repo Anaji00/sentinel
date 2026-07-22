@@ -54,9 +54,11 @@ class YieldCurveMacroRatesAgent(SentinelAgent):
 
         y2 = float(await self.redis.raw.get("sentinel:quotes:latest:US2Y") or 4.25)
         y10 = float(await self.redis.raw.get("sentinel:quotes:latest:US10Y") or 4.15)
-        tips_yield = float(await self.redis.raw.get("sentinel:quotes:latest:TIP") or 1.85)
-        hyg = float(await self.redis.raw.get("sentinel:quotes:latest:HYG") or 77.5)
-        lqd = float(await self.redis.raw.get("sentinel:quotes:latest:LQD") or 108.0)
+        
+        # Redis 'TIP' key may store ETF share price (e.g. $107.89). Ensure tips_yield is a real yield percentage.
+        raw_tips = await self.redis.raw.get("sentinel:quotes:latest:TIPS_YIELD") or await self.redis.raw.get("sentinel:quotes:latest:TIP")
+        tips_val = float(raw_tips) if raw_tips else 1.85
+        tips_yield = tips_val if tips_val < 15.0 else 1.85
 
         spread_2y10y_bps = (y10 - y2) * 100.0
         breakeven_inflation_bps = (y10 - tips_yield) * 100.0

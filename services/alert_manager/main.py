@@ -90,11 +90,8 @@ class AlertManager:
         
         rule_name = cluster.rule_name
         if not await self._check_rate_limit(rule_name):
-            logger.warning(f"Rate limit reached for {rule_name} — sleeping 60s")
-            await asyncio.sleep(60)
-            if not await self._check_rate_limit(rule_name):
-                logger.warning(f"Rate limit still exceeded for {rule_name} after backoff. Skipping alert.")
-                return
+            logger.warning(f"Rate limit reached for rule '{rule_name}' ({RATE_LIMIT_MAX}/hr max). Skipping alert delivery non-blockingly.")
+            return
 
         tg_text = format_correlation(cluster)
         success = await self._send_telegram(tg_text)

@@ -25,6 +25,7 @@ Phase 2 additions:
 
 import json
 import logging
+import time
 from typing import Optional, Dict
 
 from shared.utils.sanctions import check_sanctions, mmsi_to_country
@@ -32,16 +33,41 @@ from shared.utils.sanctions import check_sanctions, mmsi_to_country
 logger = logging.getLogger("enrichment.resolver")
 
 
+class AsyncTTLCache:
+    """In-memory Level 0 RAM cache for entity resolution (nanoseconds)."""
+    def __init__(self, maxsize: int = 5000, ttl: int = 300):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._cache: Dict[str, tuple] = {}
+
+    def get(self, key: str) -> Optional[Dict]:
+        if key in self._cache:
+            val, expire = self._cache[key]
+            if time.time() < expire:
+                return val
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value: Dict):
+        if len(self._cache) >= self.maxsize:
+            # Evict 20% oldest entries
+            oldest = sorted(self._cache.items(), key=lambda x: x[1][1])[:self.maxsize // 5]
+            for k, _ in oldest:
+                self._cache.pop(k, None)
+        self._cache[key] = (value, time.time() + self.ttl)
+
+
 class EntityResolver:
     """
     Central dictionary for the system.
-    Input:  ID (MMSI, ICAO24)
+    Input:  ID (MMSI, ICAO24, Ticker, IP)
     Output: Dict (Name, Type, Owner, Flags)
     """
 
     def __init__(self, redis_client, neo4j_client):
         self.redis = redis_client
         self.neo4j = neo4j_client
+        self._mem_cache = AsyncTTLCache(maxsize=5000, ttl=300)
 
     # ── Vessel ────────────────────────────────────────────────────────────────
 
@@ -49,45 +75,41 @@ class EntityResolver:
         """
         Finds out who a vessel is based on its MMSI number.
         """
+        # ── LEVEL 0: RAM CACHE (Nanoseconds) ──────────────────────────────────
+        mem_cached = self._mem_cache.get(f"vessel:{mmsi}")
+        if mem_cached:
+            return mem_cached
         # ── LEVEL 1: REDIS (Hot Cache) ────────────────────────────────────────
-        # Check if we looked this up in the last 24 hours.
-        # If yes, return immediately. This handles 99% of traffic.
         cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
         if cached:
-            return json.loads(cached)
+            data = json.loads(cached)
+            self._mem_cache.set(f"vessel:{mmsi}", data)
+            return data
 
         # ── LEVEL 2: NEO4J (The Graph) ────────────────────────────────────────
-        # If not in cache, ask the Graph Database.
-        # This is where we store "Permanent" knowledge (Ownership, past sanctions).
         try:
-            # Assumes async_neo4j client implements a query/execute method returning records
             cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state, v.watchlist_tags as watchlist_tags"
-            records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi}) # Assuming fetch implementation
+            records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi})
             if records:
                 data = dict(records[0])
                 await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
+                self._mem_cache.set(f"vessel:{mmsi}", data)
                 return data
         except Exception as e:
             logger.debug(f"Neo4j vessel lookup failed ({mmsi}): {e}")
 
         # ── LEVEL 3: INFERENCE (Fallback) ─────────────────────────────────────
-        # We know nothing about this ship in our DB.
-        # But the AIS signal itself contains some raw text (e.g., "SHIPNAME: BOaty McBoatface").
-        # We use that + the MMSI country code to build a temporary profile.
         meta  = ais_meta or {}
         name  = str(meta.get("ShipName", "")).strip()
         data  = {
             "name":        name,
             "vessel_type": "Unknown",
-            "flag_state":  mmsi_to_country(mmsi),       # e.g., "235" -> "GB"
-            "flags":       check_sanctions(name, mmsi), # Check name against blacklist
+            "flag_state":  mmsi_to_country(mmsi),
+            "flags":       check_sanctions(name, mmsi),
         }
         
-        # CACHE UPDATE (Short Term):
-        # Save this "Best Guess" profile for 1 hour.
-        # Why only 1 hour? Because a real analyst might add the ship to Neo4j soon,
-        # and we want to pick up the "Real" data when it becomes available.
         await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=3600)
+        self._mem_cache.set(f"vessel:{mmsi}", data)
         return data
 
     async def resolve_vessel_batch(self, mmsi_list: list, ais_meta_list: list) -> list:
