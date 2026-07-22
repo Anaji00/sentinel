@@ -1,10 +1,12 @@
 import asyncio
 import time
 import pytest
+from typing import Dict, Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 from pydantic import BaseModel
 
 from shared.utils.ollama import OllamaClient, InferenceError, get_ollama_semaphore
+from services.agents.base import SentinelAgent
 
 class DummySchema(BaseModel):
     response: str
@@ -16,13 +18,19 @@ def test_discrete_circuit_breaker():
         client = OllamaClient(session=session, model="llama3")
 
         # Mock tags resolution to return the requested model
-        client._resolve_model = AsyncMock(side_effect=lambda m: m)
+        client._resolve_model = AsyncMock(side_effect=lambda m, exclude_models=None: m)
+        client._get_fallback_model = AsyncMock(return_value=None)
 
-        # Mock _call_ollama to simulate timeout/inference error for llama3
-        client._call_ollama = AsyncMock(side_effect=InferenceError("llama3 timeout"))
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"response": '{"response": "rerouted success"}'})
+        ctx_mock = AsyncMock()
+        ctx_mock.__aenter__.return_value = mock_resp
+        session.post = MagicMock()
+        session.post.return_value = ctx_mock
 
-        # Force consecutive timeouts above threshold (3)
-        client._consecutive_timeouts["llama3"] = 3
+        # Force consecutive timeouts above threshold (6)
+        client._consecutive_timeouts["llama3"] = 10
         client._circuit_open_until["llama3"] = time.monotonic() + 300.0
 
         # Calling llama3 without fallback should raise InferenceError (circuit open)
@@ -34,7 +42,6 @@ def test_discrete_circuit_breaker():
         assert client._consecutive_timeouts.get("qwen", 0) == 0
 
         # If we call llama3 with fallback_model="qwen", it should automatically reroute and succeed
-        client._call_ollama = AsyncMock(return_value='{"response": "rerouted success"}')
         result = await client.infer("sys", "user", DummySchema, model="llama3", fallback_model="qwen")
         assert result.response == "rerouted success"
 
@@ -137,3 +144,85 @@ def test_num_predict_custom_limits():
         assert payload["options"]["num_predict"] == 123
 
     asyncio.run(run_test())
+
+
+def test_fuzzy_model_resolution():
+    """Verify that short model family names like 'qwen' match available tags like 'qwen2.5:7b'."""
+    async def run_test():
+        session = AsyncMock()
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "models": [{"name": "llama3:latest"}, {"name": "qwen2.5:7b"}]
+        })
+        
+        ctx_mock = AsyncMock()
+        ctx_mock.__aenter__.return_value = mock_resp
+        session.get = MagicMock(return_value=ctx_mock)
+
+        client = OllamaClient(session=session, model="llama3")
+
+        # Resolving "qwen" should match "qwen2.5:7b"
+        resolved = await client._resolve_model("qwen")
+        assert resolved == "qwen2.5:7b"
+
+        # Resolving "llama3" should match "llama3:latest"
+        resolved_llama = await client._resolve_model("llama3")
+        assert resolved_llama == "llama3:latest"
+
+    asyncio.run(run_test())
+
+
+def test_recursion_prevention_during_fallback():
+    """Verify that circuit breaker and fallback loop stops gracefully when all candidate models are open/visited."""
+    async def run_test():
+        session = AsyncMock()
+        client = OllamaClient(session=session, model="llama3")
+
+        # Mark circuit open for both llama3 and qwen2.5:7b
+        client._consecutive_timeouts["llama3"] = 10
+        client._circuit_open_until["llama3"] = time.monotonic() + 300.0
+
+        client._consecutive_timeouts["qwen2.5:7b"] = 10
+        client._circuit_open_until["qwen2.5:7b"] = time.monotonic() + 300.0
+
+        client._resolve_model = AsyncMock(side_effect=lambda m, exclude_models=None: m)
+        client._get_fallback_model = AsyncMock(return_value=None)
+
+        with pytest.raises(InferenceError) as exc_info:
+            await client.infer("sys", "user", DummySchema, model="llama3", fallback_model="qwen2.5:7b")
+
+        assert "InferenceError" in str(exc_info.type)
+        assert "Circuit breaker OPEN" in str(exc_info.value)
+
+    asyncio.run(run_test())
+
+
+def test_agent_dispatch_dlq_on_inference_error():
+    """Verify that agent _dispatch catches InferenceError and sends to DLQ without crashing."""
+    async def run_test():
+        mock_redis = AsyncMock()
+        mock_db = AsyncMock()
+        mock_neo4j = AsyncMock()
+        mock_producer = AsyncMock()
+        mock_consumer = AsyncMock()
+        mock_dlq = AsyncMock()
+
+        class DummyAgent(SentinelAgent):
+            @property
+            def output_topic(self) -> str:
+                return "test.topic"
+
+            async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                raise InferenceError("Ollama container timed out")
+
+        agent = DummyAgent("test_agent", ["input.topic"], mock_redis, mock_db, mock_neo4j, mock_producer, mock_consumer, mock_dlq)
+        
+        # Dispatch should catch InferenceError, increment _errors, and call _send_dlq
+        await agent._dispatch({"raw": "data"})
+        
+        assert agent._errors == 1
+        mock_dlq.send.assert_called_once()
+
+    asyncio.run(run_test())
+

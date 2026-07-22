@@ -124,11 +124,11 @@ class FlightData(BaseModel):
     registration: Optional[str] = None
 
 class BettingData(BaseModel):
-    mactchup: str
-    market_type: str
-    selection: str
-    implied_probablity: float
-    american_odds: int
+    matchup: Optional[str] = None
+    market_type: Optional[str] = None
+    selection: Optional[str] = None
+    implied_probablity: Optional[float] = None
+    american_odds: Optional[int] = None
     sharp_book_deviation: Optional[float] = None
 
 class PredictionMarketData(BaseModel):
@@ -192,9 +192,11 @@ class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: str
+    type: Optional[str] = "custom"
     collected_at: datetime = Field(default_factory=_utcnow)
     occurred_at: Optional[datetime] = None
-    raw_payload: Dict[str, Any]
+    financial_data: Optional[Dict[str, Any]] = None
+    raw_payload: Dict[str, Any] = Field(default_factory=dict)
 
 class NormalizedEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4())) 

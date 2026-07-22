@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import time
+import re
+from typing import List, Dict, Any
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 
@@ -16,7 +18,6 @@ ALLOWED_RELATIONS = {
     "INVERSE_EXPOSURE_TO"
 }
 
-
 class GraphSupervisor(SentinelAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -26,7 +27,10 @@ class GraphSupervisor(SentinelAgent):
         return "sentinel.ontology.supervisor.noop"
 
     async def handle(self, message: dict) -> None:
-        await self.execute_proposal(message)
+        if isinstance(message, list):
+            await self.execute_batch_proposals(message)
+        else:
+            await self.execute_proposal(message)
 
     async def acquire_lock(self, entity_id: str, timeout: int = 5) -> bool:
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
@@ -39,6 +43,78 @@ class GraphSupervisor(SentinelAgent):
 
     async def release_lock(self, entity_id: str):
         await self.redis.raw.delete(f"sentinel:lock:neo4j:{entity_id}")
+
+    async def execute_batch_proposals(self, proposals: List[dict]):
+        """
+        Executes Cypher UNWIND $batch AS row queries to commit graph updates in high-throughput ACID batches.
+        """
+        if not proposals:
+            return
+
+        nodes_by_label: Dict[str, List[dict]] = {}
+        links_by_relation: Dict[tuple, List[dict]] = {}
+
+        for p in proposals:
+            action = p.get("action")
+            entity_id = p.get("entity_id")
+            data = p.get("data", {})
+            if not entity_id or not action:
+                continue
+
+            if action == "MERGE_ONTOLOGY_NODE":
+                label = data.get("label", "UnknownEntity")
+                if not re.match(r"^[A-Za-z0-9]+$", label):
+                    label = "UnknownEntity"
+                if label not in nodes_by_label:
+                    nodes_by_label[label] = []
+                nodes_by_label[label].append({
+                    "name": entity_id,
+                    "domain": data.get("primary_domain"),
+                    "concepts": data.get("macro_concepts"),
+                    "sanctions": data.get("sanctions_risk"),
+                    "confidence": data.get("confidence")
+                })
+            elif action == "LINK_ENTITY":
+                relation = data.get("relation_type", "RELATED_TO").upper()
+                if relation in ALLOWED_RELATIONS:
+                    source_label = data.get("source_label", "Entity")
+                    target_label = data.get("target_label", "Entity")
+                    rel_key = (source_label, relation, target_label)
+                    if rel_key not in links_by_relation:
+                        links_by_relation[rel_key] = []
+                    links_by_relation[rel_key].append({
+                        "id": entity_id,
+                        "target_id": data.get("target_id"),
+                        "weight": data.get("weight", 1.0)
+                    })
+
+        try:
+            for label, batch in nodes_by_label.items():
+                cypher = f"""
+                UNWIND $batch AS row
+                MERGE (e:{label} {{name: row.name}})
+                SET e.primary_domain = row.domain,
+                    e.macro_concepts = row.concepts,
+                    e.sanctions_risk = row.sanctions,
+                    e.confidence = row.confidence,
+                    e.updated_at = datetime()
+                """
+                await self.neo4j.execute(cypher, {"batch": batch})
+                logger.info(f"✅ UNWIND Batch Committed: {len(batch)} nodes ({label})")
+
+            for (source_label, relation, target_label), batch in links_by_relation.items():
+                cypher = f"""
+                UNWIND $batch AS row
+                MERGE (a:{source_label} {{name: row.id}})
+                MERGE (b:{target_label} {{name: row.target_id}})
+                MERGE (a)-[r:{relation}]->(b)
+                SET r.weight = row.weight, r.updated_at = datetime()
+                """
+                await self.neo4j.execute(cypher, {"batch": batch})
+                logger.info(f"✅ UNWIND Batch Committed: {len(batch)} relationships (-[{relation}]->)")
+
+        except Exception as e:
+            logger.error(f"UNWIND batch commit failed: {e}")
 
     async def execute_proposal(self, payload: dict):
         """Safely maps trusted JSON structs to parameterized Cypher queries."""
@@ -55,7 +131,6 @@ class GraphSupervisor(SentinelAgent):
         try:
             if action == "MERGE_ONTOLOGY_NODE":
                 label = data.get("label", "UnknownEntity")
-                import re
                 if not re.match(r"^[A-Za-z0-9]+$", label): label = "UnknownEntity"
 
                 cypher = f"""
@@ -97,7 +172,6 @@ class GraphSupervisor(SentinelAgent):
                 label = data.get("label", "Entity")
                 if not tags: return
 
-                # Pure Cypher array deduplication: combines existing tags with new tags, unrolls them, and collects only unique ones.
                 cypher = f"""
                 MERGE (e:{label} {{name: $id}})
                 WITH e, coalesce(e.tags, []) + $new_tags AS all_tags

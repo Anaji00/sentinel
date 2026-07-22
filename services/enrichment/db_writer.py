@@ -1,6 +1,6 @@
 import logging 
+import uuid
 from datetime import datetime
-import json
 from shared.models import NormalizedEvent
 
 logger = logging.getLogger("enrichment.db")
@@ -17,8 +17,14 @@ class DBWriter:
         
         pe = e.primary_entity
 
+        event_id = e.event_id
+        try:
+            uuid.UUID(str(event_id))
+        except (ValueError, TypeError, AttributeError):
+            event_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(event_id)))
+
         return (
-            e.event_id,
+            event_id,
             e.type.value if hasattr(e.type, 'value') else e.type,
             e.occurred_at,
             getattr(e, 'collected_at', datetime.now()),
@@ -91,3 +97,17 @@ class DBWriter:
             """, mmsi, occurred_at, lat, lon, speed, heading, nav_status)
         except Exception as e:
             logger.error(f"Failed to write vessel position for MMSI {mmsi} to DB: {e}")
+
+    async def write_vessel_positions_batch(self, positions: list[tuple]):
+        if not positions:
+            return
+        query = """
+            INSERT INTO vessel_positions
+                (mmsi, occurred_at, lat, lon, speed_knots, heading, nav_status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT DO NOTHING
+        """
+        try:
+            await self.db.execute_many(query, positions)
+        except Exception as e:
+            logger.error(f"Failed to batch write {len(positions)} vessel positions: {e}")

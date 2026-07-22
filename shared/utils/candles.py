@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import List, Tuple, Dict, Any
 from datetime import datetime
 
@@ -110,9 +111,16 @@ async def evaluate_multi_timeframe(
                 slow_ema = calc_ema(closes, 14)
                 ema_divergence = (fast_ema - slow_ema) / slow_ema if slow_ema != 0 else 0.0
 
-        price_change_pct = (b_close - b_open) / b_open if b_open != 0 else 0.0
-        volatility_pct   = (b_high - b_low) / b_open if b_open != 0 else 0.0
-        notional_volume = b_close * b_vol
+        price_change_pct = (b_close - b_open) / b_open if (b_open and b_open != 0) else 0.0
+        volatility_pct   = (b_high - b_low) / b_open if (b_open and b_open != 0) else 0.0
+        notional_volume = (b_close or 0.0) * (b_vol or 0.0)
+        
+        # Sanitize floats against NaN/Inf from bad market feeds
+        price_change_pct = 0.0 if math.isnan(price_change_pct) or math.isinf(price_change_pct) else price_change_pct
+        volatility_pct   = 0.0 if math.isnan(volatility_pct) or math.isinf(volatility_pct) else volatility_pct
+        notional_volume  = 0.0 if math.isnan(notional_volume) or math.isinf(notional_volume) else notional_volume
+        rsi_normalized   = 0.5 if math.isnan(rsi_normalized) or math.isinf(rsi_normalized) else rsi_normalized
+        ema_divergence   = 0.0 if math.isnan(ema_divergence) or math.isinf(ema_divergence) else ema_divergence
         
         features = [price_change_pct, volatility_pct, notional_volume, rsi_normalized, ema_divergence]
         
@@ -120,6 +128,10 @@ async def evaluate_multi_timeframe(
             anomaly = await scorer.score_crypto_candle(asset, features)
         else:
             anomaly = await scorer.score_market_candle(domain, asset, features)
+            
+        # Sanitize ML inference score against NaN
+        if anomaly is None or math.isnan(anomaly) or math.isinf(anomaly):
+            anomaly = 0.0
             
         logger.info(f"🧠 ML INFERENCE | {asset} {tf}-min Structural Candle | Score: {anomaly:.3f} | Change: {price_change_pct*100:.2f}% | Vol: ${notional_volume/1e6:.2f}M | RSI: {rsi_normalized*100:.1f} | Div: {ema_divergence*100:.2f}%")
         

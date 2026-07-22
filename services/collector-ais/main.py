@@ -64,7 +64,7 @@ AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
 
 # GEOGRAPHIC FILTERS (Bounding Boxes)
 # Format: [[min_lat, min_lon], [max_lat, max_lon]]
-# We only request data from these specific high-interest regions to save bandwidth and processing power.
+# High-interest global maritime chokepoints and economic zones.
 WATCH_ZONES = [
     [[24.0, 56.0], [27.0, 60.0]],   # Strait of Hormuz
     [[1.0,  103.0], [6.0,  105.0]], # Strait of Malacca
@@ -173,10 +173,11 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
             async with websockets.connect(
                 AISSTREAM_URL,
                 ping_interval=20,
-                ping_timeout=10,
+                ping_timeout=30,
+                open_timeout=45,
                 max_size=10_000_000,
-                ssl = ssl_context
-                ) as ws:
+                ssl=ssl_context
+            ) as ws:
                 await ws.send(json.dumps(build_subscription()))
                 logger.info(f"Subscribed — {len(WATCH_ZONES)} zones, types: {MESSAGE_TYPES}")
                 backoff = 1  # Reset backoff after successful connection
@@ -192,9 +193,9 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                         mmsi = str(meta.get("MMSI", "unknown"))
                         occurred_at = _parse_aisstream_time(meta.get("time_utc", ""))
                         event = RawEvent(
-                            source = "aisstream",
-                            occurred_at = occurred_at,
-                            raw_payload = data,
+                            source="aisstream",
+                            occurred_at=occurred_at,
+                            raw_payload=data,
                         )
                         await producer.send(Topics.RAW_MARITIME, event.model_dump(), key=mmsi)
                     except json.JSONDecodeError as e:
@@ -206,15 +207,20 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                     if now - last_stats > 30:
                         counter.log_stats()
                         last_stats = now
+        except asyncio.CancelledError:
+            logger.info("AIS collector task cancelled. Exiting loop...")
+            raise
+        except websockets.exceptions.InvalidStatusCode as e:
+            logger.warning(f"AISStream upstream server temporary HTTP {e.status_code} status — reconnecting in {backoff}s...")
         except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"WebSocket closed: {e} — reconnect in {backoff}s")
+            logger.warning(f"WebSocket closed: {e} — reconnecting in {backoff}s")
         except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error: {e} — reconnect in {backoff}s")
+            logger.error(f"WebSocket error: {e} — reconnecting in {backoff}s")
         except Exception as e:
-            logger.error(f"Unexpected error: {e} — reconnect in {backoff}s", exc_info=True)
- 
+            logger.error(f"Unexpected error ({type(e).__name__}): {repr(e)} — reconnecting in {backoff}s")
+
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+        backoff = min(backoff * 2, 15)
 
 async def main():
     logger.info("=" * 60)

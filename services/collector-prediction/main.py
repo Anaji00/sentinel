@@ -160,14 +160,17 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     
                                     # Extract outcome name to calculate yes/no probabilities
                                     outcome_name = label.split(" | ")[-1] if " | " in label else ""
-                                    yes_prob = None
-                                    no_prob = None
-                                    if outcome_name.strip().lower() == "yes":
-                                        yes_prob = price
-                                        no_prob = round(1.0 - price, 4)
-                                    elif outcome_name.strip().lower() == "no":
-                                        no_prob = price
-                                        yes_prob = round(1.0 - price, 4)
+                                    clean_outcome = outcome_name.strip().lower()
+                                    if clean_outcome in ("yes", "y", "true", "1", "outcome 0"):
+                                        yes_prob = round(price, 4)
+                                        no_prob = round(max(0.0, 1.0 - price), 4)
+                                    elif clean_outcome in ("no", "n", "false", "0", "outcome 1"):
+                                        no_prob = round(price, 4)
+                                        yes_prob = round(max(0.0, 1.0 - price), 4)
+                                    else:
+                                        # Default probability derivation from contract price (CLOB token prices equal probability)
+                                        yes_prob = round(price, 4) if price <= 1.0 else round(price / 100.0, 4)
+                                        no_prob = round(max(0.0, 1.0 - yes_prob), 4)
 
                                     logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label} | YesProb: {yes_prob} | NoProb: {no_prob}")
 
@@ -248,19 +251,23 @@ async def poll_kalshi(producer: SentinelProducer):
                             no_bid_dollars = market.get("no_bid_dollars")
                             
                             # Standardize probability values (0.0 to 1.0)
-                            if yes_bid_dollars is not None:
-                                yes_prob = float(yes_bid_dollars)
-                            elif yes_bid is not None:
-                                yes_prob = yes_bid / 100.0
+                            if yes_bid_dollars is not None and float(yes_bid_dollars) > 0:
+                                yes_prob = round(float(yes_bid_dollars), 4)
+                            elif yes_bid is not None and yes_bid > 0:
+                                yes_prob = round(yes_bid / 100.0, 4)
+                            elif market.get("last_price_dollars") is not None:
+                                yes_prob = round(float(market.get("last_price_dollars")), 4)
+                            elif market.get("last_price") is not None:
+                                yes_prob = round(market.get("last_price") / 100.0, 4)
                             else:
-                                yes_prob = None
+                                yes_prob = 0.50
                                 
-                            if no_bid_dollars is not None:
-                                no_prob = float(no_bid_dollars)
-                            elif no_bid is not None:
-                                no_prob = no_bid / 100.0
+                            if no_bid_dollars is not None and float(no_bid_dollars) > 0:
+                                no_prob = round(float(no_bid_dollars), 4)
+                            elif no_bid is not None and no_bid > 0:
+                                no_prob = round(no_bid / 100.0, 4)
                             else:
-                                no_prob = None
+                                no_prob = round(max(0.0, 1.0 - yes_prob), 4)
                                 
                             price_usd = yes_prob if yes_prob is not None else 0.50
                             

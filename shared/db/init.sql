@@ -78,6 +78,7 @@ CREATE INDEX IF NOT EXISTS events_anomaly_idx ON events(anomaly_score DESC, occu
 CREATE INDEX IF NOT EXISTS events_tags_idx ON events USING GIN(tags);
 CREATE INDEX IF NOT EXISTS events_entities_idx ON events USING GIN(named_entities);
 CREATE INDEX IF NOT EXISTS events_region_time_idx ON events(region, occurred_at DESC) WHERE region IS NOT NULL;
+CREATE INDEX IF NOT EXISTS events_source_time_idx ON events(source, occurred_at DESC);
 
 -- ── VESSEL POSITIONS (high-frequency, separate table) ─────────────────────────
 -- PURPOSE: Stores raw AIS telemetry (pings every few seconds).

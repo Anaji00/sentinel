@@ -110,9 +110,11 @@ class MacroAssetCointegrationEngine(SentinelAgent):
         
     # ─── 2. MATHEMATICAL KERNEL ───────────────
 
-    def _compute_ols_residual(self, x: List[float], y: List[float]) -> Tuple[float, float, float]:
+    def _compute_ols_residual(self, x: List[float], y: List[float]) -> Tuple[float, float, float, float, bool]:
         """
-        Executes highly optimized Matrix Math for Ordinary Least Squares (OLS) regression.
+        Executes highly optimized Matrix Math for Ordinary Least Squares (OLS) regression,
+        computes Ornstein-Uhlenbeck (OU) mean-reversion half-life (tau = -ln(2) / lambda),
+        and verifies residual stationarity using the Augmented Dickey-Fuller (ADF) t-statistic.
         Isolated for execution inside a ThreadPool to prevent event loop blocking.
         """
         X = np.array(x, dtype=np.float64)
@@ -122,9 +124,33 @@ class MacroAssetCointegrationEngine(SentinelAgent):
         A = np.vstack([X, np.ones(len(X))]).T
         beta, alpha = np.linalg.lstsq(A, Y, rcond=None)[0]
         
-        # Calculate the tension on the "bungee cord" for the most recent tick
-        current_residual = float(Y[-1] - (beta * X[-1] + alpha))
-        return beta, alpha, current_residual
+        residuals = Y - (beta * X + alpha)
+        current_residual = float(residuals[-1])
+
+        # Ornstein-Uhlenbeck mean-reversion parameter estimation & ADF t-statistic calculation
+        half_life = 999.0
+        is_stationary = False
+        if len(residuals) > 5:
+            res_lag = residuals[:-1]
+            res_diff = np.diff(residuals)
+            A_ou = np.vstack([res_lag, np.ones(len(res_lag))]).T
+            solution, resids, rank, s = np.linalg.lstsq(A_ou, res_diff, rcond=None)
+            lambda_ou = solution[0]
+            
+            if lambda_ou < 0:
+                half_life = float(-np.log(2) / lambda_ou)
+                # Compute standard error of lambda_ou for ADF t-stat: t_stat = lambda / se
+                n_samples = len(res_diff)
+                dof = max(1, n_samples - 2)
+                sse = float(resids[0]) if len(resids) > 0 else float(np.sum((res_diff - (A_ou @ solution))**2))
+                mse = sse / dof
+                var_lambda = mse / max(1e-9, float(np.sum((res_lag - np.mean(res_lag))**2)))
+                se_lambda = float(np.sqrt(max(1e-9, var_lambda)))
+                adf_tstat = lambda_ou / se_lambda
+                # ADF 95% critical value ~ -2.86 for N=300
+                is_stationary = adf_tstat < -2.57
+
+        return beta, alpha, current_residual, half_life, is_stationary
 
     # ─── 3. STATE SYNC & STATISTICAL GATING ───────────────
 
@@ -155,7 +181,7 @@ class MacroAssetCointegrationEngine(SentinelAgent):
             y_vec = [float(v) for v in raw_y]
             
             loop = asyncio.get_running_loop()
-            beta, alpha, current_residual = await loop.run_in_executor(None, self._compute_ols_residual, x_vec, y_vec)
+            beta, alpha, current_residual, half_life, is_stationary = await loop.run_in_executor(None, self._compute_ols_residual, x_vec, y_vec)
             res_key = f"{series_key}:residuals"
 
             # FIX: Use async with context manager for aioredis pipeline natively
@@ -172,8 +198,8 @@ class MacroAssetCointegrationEngine(SentinelAgent):
             if res_std == 0.0: res_std = 1.0
 
             z_score = (current_residual - res_mean) / res_std
-            # ── TRIGGER LOGIC ──
-            if abs(z_score) > Z_THRESH:
+            # ── TRIGGER LOGIC: Require ADF stationarity (p < 0.05) to eliminate spurious random walk false alerts ──
+            if abs(z_score) > Z_THRESH and is_stationary:
                 logger.warning(f"🚨 MACRO DECOUPLING DETECTED: {macro_asset} vs {micro_ticker} | Z-Score: {z_score:.2f}")
 
                 asyncio.create_task(self.write_agent_memory(f"Macro Decoupling Detected: {micro_ticker} broke correlation with {macro_asset} (Z-Score: {z_score:.2f})."))

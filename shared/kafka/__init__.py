@@ -72,6 +72,11 @@ class Topics:
     RADAR_DECISIONS      = "agents.radar.decisions"
     TELEMETRY            = "agents.telemetry"
     FINANCIAL_ADVICE     = "agents.financial.advice"
+    RATES_REGIME         = "agents.macro.rates_regime"
+    VOL_SURFACE          = "agents.options.vol_surface"
+    INSIDER_CLUSTERS     = "agents.insider.clusters"
+    MACRO_ASSESSMENT     = "agents.macro.assessment"
+    MACRO_DECOUPLING     = "agents.macro.decoupling"
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
     # into 'NormalizedEvent' so the database can understand it easily.
@@ -98,12 +103,24 @@ class Topics:
 
 def _serialize(obj: Any) -> bytes:
     # Kafka only understands Bytes (0s and 1s).
-    # We need to translate our Python Objects (Dictionaries, Dates) into JSON text,
-    # and then encode that text into Bytes.
+    # We translate Python Objects (Dictionaries, Pydantic Models, Dates) into JSON text bytes.
     def default(o):
         if isinstance(o, datetime):
             return o.isoformat()
+        if hasattr(o, "model_dump"):
+            return o.model_dump(mode="json")
+        if hasattr(o, "dict") and callable(getattr(o, "dict")):
+            return o.dict()
+        if isinstance(o, set):
+            return list(o)
+        if hasattr(o, "__str__"):
+            return str(o)
         raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+        return json.dumps(obj.model_dump(mode="json"), default=default).encode("utf-8")
+    if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+        return json.dumps(obj.dict(), default=default).encode("utf-8")
     return json.dumps(obj, default=default).encode("utf-8")
 
 

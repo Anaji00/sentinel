@@ -116,10 +116,7 @@ services:
     ports:
       - "6379:6379"
     command: >
-      redis-server
-      --appendonly yes
-      --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
@@ -127,7 +124,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
-  
+
   migrator:
     build: .
     command: python shared/db/migrate.py
@@ -138,7 +135,7 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
-  
+
   enrichment:
     build:
       context: .
@@ -194,8 +191,8 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-  
-  collector-tradefi:
+
+  collector-tradfi:
     build: .
     container_name: sentinel-tradfi
     command: python services/collector-tradfi/main.py
@@ -243,7 +240,7 @@ services:
       - OLLAMA_NUM_PARALLEL=4
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ollama", "list"]
+      test: [ "CMD", "ollama", "list" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -278,7 +275,7 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-  
+
   collector-radar:
     build: .
     command: "python services/collector-radar/main.py"
@@ -290,7 +287,7 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-  
+
   collector-ais:
     build: .
     container_name: sentinel-ais
@@ -362,6 +359,8 @@ services:
     container_name: sentinel-agents
     command: python services/agents/main.py
     env_file: .env
+    environment:
+      PYTHONWARNINGS: "ignore::UserWarning"
     restart: always
     depends_on:
       kafka:
@@ -374,6 +373,19 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sentinel-frontend
+    ports:
+      - "3000:3000"
+    restart: always
+    depends_on:
+      api-gateway:
+        condition: service_started
+
 
 volumes:
   zookeeper_data:

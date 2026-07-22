@@ -4,6 +4,7 @@ import os
 import sys
 import signal
 import aiohttp
+from typing import Optional, Dict, List, Any
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,6 +12,9 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
+
+import warnings
+warnings.filterwarnings("ignore", message=".*Failed to initialize NumPy.*")
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
@@ -32,6 +36,9 @@ from services.agents.supervisor import GraphSupervisor
 from services.agents.macro_strategist import MacroStrategistAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
 from services.agents.financial_advisor import FinancialAdvisorAgent
+from services.agents.yield_curve_agent import YieldCurveMacroRatesAgent
+from services.agents.volatility_surface_agent import VolatilitySurfaceAgent
+from services.agents.insider_clustering_agent import InsiderClusteringAgent
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -97,18 +104,16 @@ def build_agent(
     input_topics:  list,
     group_id:      str,
     shared_infra:  dict,
+    model:         Optional[str] = None,
+    fallback_model: Optional[str] = None,
     **extra_kwargs
 ) -> object:
     """
-    Factory function: instantiates an agent with all shared infrastructure.
-    Separates object construction from the async runtime.
+    Factory function: instantiates an agent with all shared infrastructure and per-agent model configurations.
     """
     redis   = shared_infra["redis"]
     db      = shared_infra["db"]
     neo4j   = shared_infra["neo4j"]
-
-    # Each agent gets its own Kafka consumer (separate group_id → independent offsets)
-    # and its own Kafka producer. Shared producers would require locking.
 
     consumer = SentinelConsumer(
         topics=input_topics,
@@ -119,6 +124,11 @@ def build_agent(
     producer = SentinelProducer()
     dlq      = SentinelProducer()
 
+    # Per-agent environment variable resolution with tiered defaults
+    env_name = agent_name.upper().replace("-", "_")
+    selected_model = model or os.getenv(f"{env_name}_MODEL", os.getenv("AGENT_MODEL", "llama3"))
+    selected_fallback = fallback_model or os.getenv(f"{env_name}_FALLBACK_MODEL", os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b"))
+
     return AgentClass(
         agent_name=agent_name,
         input_topics=input_topics,
@@ -128,7 +138,8 @@ def build_agent(
         producer=producer,
         consumer=consumer,
         dlq=dlq,
-        model=os.getenv("AGENT_MODEL", "llama3"),
+        model=selected_model,
+        fallback_model=selected_fallback,
         **extra_kwargs
     )
 
@@ -139,9 +150,6 @@ async def main():
     logger.info("SENTINEL AGENT SWARM INITIALIZING")
     logger.info("=" * 60)
 
-    # ── SHARED INFRASTRUCTURE ──────────────────────────────────────────────────
-    # All agents share DB connections (connection-pooled — thread safe).
-    # They do NOT share Kafka producers/consumers (not thread safe).
     shared_infra = {
         "redis": await get_redis(),
         "db":    await get_timescale(),
@@ -154,48 +162,82 @@ async def main():
     ollama_client = OllamaClient(main_session)
     
     soft_correlator = SoftCorrelator(ollama_client)
-    # Load soft correlator in the background to prevent blocking service startup
     asyncio.create_task(soft_correlator._load())
-    # ── AGENT INSTANTIATION ────────────────────────────────────────────────────
+
+    # ── TIERED PER-AGENT MODEL ALLOCATION ───────────────────────────────────────
+    # Heavy Analytical Tier: Deep reasoning (llama3 -> gemma:2b fallback)
+    # Fast Operational Tier: High-frequency classification/routing (gemma:2b -> llama3 fallback)
+
     news_agent = build_agent(
         NewsIntelAgent,
         agent_name="news_intel",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED],
         group_id="agent-news-intel",
         shared_infra=shared_infra,
+        model="llama3",
+        fallback_model="gemma:2b",
     )
 
     quant_agent = build_agent(
         QuantResearcherAgent,
         agent_name="quant_researcher",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED],
+        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_TRADFI, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
+        model="llama3",
+        fallback_model="gemma:2b",
+    )
+
+    financial_advisor_agent = build_agent(
+        FinancialAdvisorAgent,
+        agent_name="financial_advisor",
+        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        group_id="agent-financial-advisor",
+        shared_infra=shared_infra,
+        model="llama3",
+        fallback_model="gemma:2b",
+    )
+
+    macro_strategist_agent = build_agent(
+        MacroStrategistAgent,
+        agent_name="macro_strategist",
+        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        group_id="agent-macro-strategist",
+        shared_infra=shared_infra,
+        model="llama3",
+        fallback_model="gemma:2b",
+    )
+
+    # Fast Operational Tier
+    radar_agent = build_agent(
+        RadarAgent,
+        agent_name="radar_agent",
+        input_topics=[Topics.QUANT_DISCOVERIES, Topics.RAW_RADAR, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        group_id="agent-radar-orchestrator",
+        shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
     ontology_agent = build_agent(
         OntologyMasterAgent,
         agent_name="ontology_master",
-        input_topics=[Topics.UNKNOWN_ENTITIES],
+        input_topics=[Topics.UNKNOWN_ENTITIES, Topics.INTEL_BRIEFS, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
         group_id="agent-ontology-master",
         shared_infra=shared_infra,
         soft_correlator=soft_correlator,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
-    radar_agent = build_agent(
-        RadarAgent,
-        agent_name="radar_agent",
-        input_topics=[Topics.QUANT_DISCOVERIES, Topics.ENRICHED_EVENTS],
-        group_id="agent-radar-orchestrator",
+    rule_synthesizer_agent = build_agent(
+        RuleSynthesizerAgent,
+        agent_name="rule_synthesizer",
+        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS],
+        group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
-    )
-
-    macro_cointegration_agent = build_agent(
-        MacroAssetCointegrationEngine,
-        agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO],
-        group_id="agent-macro-cointegration-engine",
-        shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
     supervisor_agent = build_agent(
@@ -204,30 +246,48 @@ async def main():
         input_topics=[Topics.ONTOLOGY_PROPOSALS],
         group_id="supervisor-group",
         shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
-    macro_strategist_agent = build_agent(
-        MacroStrategistAgent,
-        agent_name="macro_strategist",
-        input_topics=[Topics.SYSTEM_HEARTBEAT],
-        group_id="agent-macro-strategist",
+    macro_cointegration_agent = build_agent(
+        MacroAssetCointegrationEngine,
+        agent_name="macro_cointegration_engine",
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS],
+        group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
-    rule_synthesizer_agent = build_agent(
-        RuleSynthesizerAgent,
-        agent_name="rule_synthesizer",
-        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES],
-        group_id="agent-rule-synthesizer",
+    yield_curve_agent = build_agent(
+        YieldCurveMacroRatesAgent,
+        agent_name="yield_curve_agent",
+        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
+        group_id="agent-yield-curve-rates",
         shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
-    financial_advisor_agent = build_agent(
-        FinancialAdvisorAgent,
-        agent_name="financial_advisor",
-        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES],
-        group_id="agent-financial-advisor",
+    volatility_surface_agent = build_agent(
+        VolatilitySurfaceAgent,
+        agent_name="volatility_surface_agent",
+        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
+        group_id="agent-volatility-surface",
         shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
+    )
+
+    insider_clustering_agent = build_agent(
+        InsiderClusteringAgent,
+        agent_name="insider_clustering_agent",
+        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
+        group_id="agent-insider-clustering",
+        shared_infra=shared_infra,
+        model="gemma:2b",
+        fallback_model="llama3",
     )
 
     agents_by_name = {
@@ -236,6 +296,9 @@ async def main():
         "ontology_master": ontology_agent,
         "radar_agent": radar_agent,
         "macro_cointegration_engine": macro_cointegration_agent,
+        "yield_curve_agent": yield_curve_agent,
+        "volatility_surface_agent": volatility_surface_agent,
+        "insider_clustering_agent": insider_clustering_agent,
         "supervisor": supervisor_agent,
         "macro_strategist": macro_strategist_agent,
         "rule_synthesizer": rule_synthesizer_agent,
@@ -253,6 +316,9 @@ async def main():
         asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
         asyncio.create_task(radar_agent.run(),     name="radar_agent"),
         asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
+        asyncio.create_task(yield_curve_agent.run(), name="yield_curve_agent"),
+        asyncio.create_task(volatility_surface_agent.run(), name="volatility_surface_agent"),
+        asyncio.create_task(insider_clustering_agent.run(), name="insider_clustering_agent"),
         asyncio.create_task(supervisor_agent.run(), name="supervisor"),
         asyncio.create_task(macro_strategist_agent.run(), name="macro_strategist"),
         asyncio.create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
@@ -264,15 +330,8 @@ async def main():
     ]
 
     logger.info("All agents launched. Swarm is LIVE.")
-    logger.info(f"Agent: {news_agent.name} | Topics: {len(news_agent.input_topics)}")
-    logger.info(f"Agent: {quant_agent.name} | Topics: {len(quant_agent.input_topics)}")
-    logger.info(f"Agent: {ontology_agent.name} | Topics: {len(ontology_agent.input_topics)}")
-    logger.info(f"Agent: {radar_agent.name} | Topics: {len(radar_agent.input_topics)}")
-    logger.info(f"Agent: {macro_cointegration_agent.name} | Topics: {len(macro_cointegration_agent.input_topics)}")
-    logger.info(f"Agent: {supervisor_agent.name} | Topics: {len(supervisor_agent.input_topics)}")
-    logger.info(f"Agent: {macro_strategist_agent.name} | Topics: {len(macro_strategist_agent.input_topics)}")
-    logger.info(f"Agent: {rule_synthesizer_agent.name} | Topics: {len(rule_synthesizer_agent.input_topics)}")
-    logger.info(f"Agent: {financial_advisor_agent.name} | Topics: {len(financial_advisor_agent.input_topics)}")
+    for ag in agents_by_name.values():
+        logger.info(f"Agent: {ag.name:<26} | Model: {ag.model:<10} | Fallback: {ag.fallback_model:<10} | Topics: {len(ag.input_topics)}")
 
     try:
         def handle_sigterm(signum, frame):
@@ -293,9 +352,12 @@ async def main():
         # CLEANUP: Always ensure background tasks are gracefully canceled before the script exits.
         for task in tasks:
             task.cancel()
-        # Give tasks 5s to clean up
-        # return_exceptions=True prevents CancelledError from bubbling up and interrupting the shutdown sequence.
         await asyncio.gather(*tasks, return_exceptions=True)
+        for ag in agents_by_name.values():
+            try:
+                await ag.close()
+            except Exception:
+                pass
         if not main_session.closed:
             await main_session.close()
         logger.info("Agent swarm shut down cleanly")

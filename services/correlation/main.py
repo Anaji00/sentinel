@@ -274,7 +274,9 @@ async def main():
                             consumer._c.pause(*assigned)
                             
                         # 2. Run processing in a background task
-                        processing_task = asyncio.create_task(asyncio.gather(*tasks, return_exceptions=True))
+                        async def _run_tasks():
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        processing_task = asyncio.create_task(_run_tasks())
                         
                         # 3. Yield heartbeats by polling consumer in a loop until done
                         while not processing_task.done():

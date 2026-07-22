@@ -8,12 +8,14 @@ Maintains rolling volume/volatility baselines via Exponential Moving Average.
 Emits mathematical anomalies (Z-Score > 3.0) to the Agentic tier for LLM arbitration.
 """
 
+import socket
 import asyncio
 import aiohttp
 import logging
 import os
 import sys
 import math
+import time
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict
 from pathlib import Path
@@ -26,6 +28,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.equities import is_valid_primary_equity
 
 from regime import MarketRegime
 
@@ -33,13 +36,9 @@ from regime import MarketRegime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 logger = logging.getLogger("collector.radar")
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
-ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
-
-
-MAG_7 = ["MSFT", "AVGO", "GOOG", "AMZN", "TSLA", "AAPL", "NVDA", "MU"]
 
 class QuantRadar:
     def __init__(self, redis_client):
@@ -64,37 +63,57 @@ class QuantRadar:
         await pipe.execute()
 
     async def evaluate_volume(self, ticker:str, current_vol: float, current_price: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
-        # 1. NOTIONAL GATEKEEPER: Ignore retail noise entirely.
-        # Only evaluate if > $50,000 is moving in a single 1-minute bar.
+        # 1. PRIMARY EQUITY & DERIVATIVE FILTER: Exclude derivative ETFs (NVDY), crypto, and options
+        if not is_valid_primary_equity(ticker):
+            return False, 0.0
+
+        # 2. HEIGHTENED NOTIONAL GATEKEEPER: Ignore retail noise.
+        # Evaluate if >= $150,000 is moving in a single bar.
         notional_flow = current_vol * current_price
-        if notional_flow < 50_000:
+        if notional_flow < 150_000:
             return False, 0.0
+        # 3. INTRADAY VWAP CURVE NORMALIZATION
+        # Standardize volume spikes against intraday U-shaped volume curve profile
+        vwap_mult = MarketRegime.get_intraday_volume_multiplier()
+        normalized_vol = current_vol / vwap_mult
+
         mean, var = await self._get_baseline(ticker)
-        std_dev = math.sqrt(var) + 1e-8  # Avoid division by zero
-        if mean == 0.0:
-            await self._update_baseline(ticker, current_vol, current_vol, 1.0, alpha)
-            return False, 0.0
-        
-        z_score = (current_vol - mean) / std_dev
+        std_dev = math.sqrt(max(1.0, var))
+        z_score = (normalized_vol - mean) / std_dev if mean > 0 else 0.0
         await self._update_baseline(ticker, current_vol, mean, var, alpha)
         return z_score > z_threshold, z_score
 
 async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
-    headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-    try:
-        async with session.get(f"{ALPACA_ASSETS_URL}?status=active&asset_class=us_equity", headers=headers) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logger.error(f"Alpaca API error fetching universe (HTTP {resp.status}): {body[:200]}. Falling back to MAG_7.")
-                return MAG_7
-            assets = await resp.json()
-            tickers = [a["symbol"] for a in assets if a["tradable"] and a["exchange"] != "OTC"]
-            logger.info(f"🌐 Dynamic Universe Acquired: Tracking {len(tickers)} equities.")
-            return tickers
-    except Exception as e:
-        logger.error(f"Universe fetch failed: {e}")
-        return MAG_7
+    api_key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+    headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
     
+    urls = [
+        "https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity",
+        "https://api.alpaca.markets/v2/assets?status=active&asset_class=us_equity"
+    ]
+    
+    for url in urls:
+        try:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    assets = await resp.json()
+                    tickers = [
+                        a["symbol"] for a in assets 
+                        if a.get("tradable") and a.get("exchange") != "OTC" and is_valid_primary_equity(a["symbol"])
+                    ]
+                    if len(tickers) > 100:
+                        logger.info(f"🌐 Dynamic Tradable Universe Acquired: Tracking {len(tickers)} US equities via {url}.")
+                        return tickers
+                else:
+                    body = await resp.text()
+                    logger.warning(f"Universe fetch {url} returned HTTP {resp.status}: {body[:100]}")
+        except Exception as e:
+            logger.warning(f"Universe fetch error for {url}: {e}")
+            
+    logger.error("Could not acquire dynamic Alpaca assets directory.")
+    return []
+
 def chunk_list(data: List[str], chunk_size: int):
     for i in range(0, len(data), chunk_size): yield data [i:i + chunk_size]
 
@@ -113,72 +132,96 @@ async def heartbeat_loop(state: dict):
 async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict):
     state["polls"] += 1
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
+    feed = os.getenv("ALPACA_DATA_FEED", "iex")
     chunks = list(chunk_list(universe, 1000))
-    tasks = [session.get(f"{ALPACA_DATA_URL}?symbols={','.join(c)}", headers=headers) for c in chunks]
-    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    semaphore = asyncio.Semaphore(10)
+
+    async def fetch_chunk(chunk_tickers: List[str]) -> dict:
+        async with semaphore:
+            chunk_url = f"{ALPACA_DATA_URL}?symbols={','.join(chunk_tickers)}&feed={feed}"
+            for attempt in range(3):
+                try:
+                    async with session.get(chunk_url, headers=headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                        elif resp.status == 429:
+                            await asyncio.sleep(1.0 * (attempt + 1))
+                except Exception as ex:
+                    if attempt == 2:
+                        logger.warning(f"Snapshot fetch timeout for chunk after 3 attempts: {ex}")
+                    await asyncio.sleep(0.5)
+            return {}
+
+    snapshot_results = await asyncio.gather(*[fetch_chunk(c) for c in chunks], return_exceptions=True)
 
     total_evaluated = 0
     anomalies_detected = 0
+    top_ticker = None
+    max_z = 0.0
+    top_vol = 0.0
+    top_price = 0.0
 
-    for i, resp in enumerate(responses):
-        if isinstance(resp, Exception):
-            logger.error(f"Failed to fetch snapshots for chunk {i}: {resp}")
+    for snapshots in snapshot_results:
+        if not isinstance(snapshots, dict):
             continue
-        if resp.status != 200:
-            body = await resp.text()
-            logger.error(f"Alpaca snapshot API error for chunk {i} (HTTP {resp.status}): {body[:200]}")
-            continue
-            
-        data = await resp.json()
 
-        for ticker, snapshot in data.items():
-            min_bar = snapshot.get("minuteBar")
-            if not min_bar: continue
+        for ticker, snap in snapshots.items():
+            if not snap or not isinstance(snap, dict):
+                continue
+            daily_bar = snap.get("dailyBar") or {}
+            prev_daily_bar = snap.get("prevDailyBar") or {}
 
-            volume = float(min_bar.get("v", 0.0))
-            price = float(min_bar.get("c", 0.0))
-            if volume == 0.0: continue
+            volume = daily_bar.get("v", 0)
+            close_price = daily_bar.get("c", 0) or prev_daily_bar.get("c", 0)
 
-            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, price, alpha, z_threshold)
+            if volume == 0 or close_price == 0:
+                continue
+
             total_evaluated += 1
+            is_anomaly, z_score = await radar.evaluate_volume(ticker, volume, close_price, alpha, z_threshold)
+
+            if z_score > max_z:
+                max_z = z_score
+                top_ticker = ticker
+                top_vol = volume
+                top_price = close_price
+
             if is_anomaly:
                 anomalies_detected += 1
-                notional = volume * price
-                
-                latest_trade = snapshot.get("latestTrade")
-                trade_details = ""
-                trade_price = price
-                trade_size = volume
-                if latest_trade:
-                    trade_price = float(latest_trade.get("p", price))
-                    trade_size = float(latest_trade.get("s", volume))
-                    trade_details = f" | Latest Trade: {trade_size} shares @ ${trade_price:,.2f}"
+                logger.warning(f"🚨 RADAR ANOMALY DETECTED: {ticker} | Volume: {volume:,.0f} | Z-Score: {z_score:.2f} | Price: ${close_price:.2f}")
 
-                logger.warning(
-                    f"🚨 RADAR ANOMALY: {ticker} | Z-Score: {z_score:.2f} (threshold: {z_threshold:.1f}) "
-                    f"| 1m Vol: {volume} (${notional/1e6:.2f}M){trade_details}"
-                )
-                event = {
-                    "source": "alpaca_quant_radar",
-                    "occurred_at": datetime.now(timezone.utc).isoformat(),
-                    "raw_payload": {
+                event = RawEvent(
+                    source="alpaca_quant_radar",
+                    type="volume_anomaly",
+                    financial_data={
                         "ticker": ticker,
-                        "z_score": round(z_score, 3),
                         "volume": volume,
-                        "price": price,
-                        "notional_usd": notional,
-                        "trigger": "structural_volume_spike",
-                        "latest_trade_price": trade_price,
-                        "latest_trade_size": trade_size
-                    }
-                }
-                await producer.send(Topics.RAW_RADAR, event, key=ticker)
+                        "close_price": close_price,
+                        "z_score": z_score,
+                        "notional_usd": volume * close_price
+                    },
+                    raw_payload={
+                        "ticker": ticker,
+                        "volume": volume,
+                        "close_price": close_price,
+                        "z_score": z_score
+                    },
+                    occurred_at=datetime.now(timezone.utc)
+                )
+
+                event_dict = event.model_dump(mode="json") if hasattr(event, "model_dump") else event.dict()
+                await producer.send(Topics.RAW_RADAR, event_dict, key=ticker)
 
     state["total_evaluated"] += total_evaluated
     state["total_anomalies"] += anomalies_detected
 
     if total_evaluated > 0:
-        logger.info(f"Radar evaluation complete: evaluated {total_evaluated} symbols | detected {anomalies_detected} anomalies | regime alpha={alpha:.3f}, z_threshold={z_threshold:.1f}")
+        top_str = f" | Top Dynamic Mover: {top_ticker} (Z={max_z:.2f}, ${top_price*top_vol/1e6:.2f}M)" if top_ticker else ""
+        logger.info(
+            f"📡 RADAR SCAN COMPLETE: Evaluated {total_evaluated} symbols{top_str} "
+            f"| Anomalies: {anomalies_detected} | Regime (α={alpha:.3f}, Z_th={z_threshold:.1f})"
+        )
 
 async def main():
     if not ALPACA_API_KEY:
@@ -194,7 +237,7 @@ async def main():
     state = {"total_evaluated": 0, "total_anomalies": 0, "polls": 0}
     heartbeat_task = asyncio.create_task(heartbeat_loop(state))
 
-    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         universe = await fetch_tradable_universe(session)
         try:

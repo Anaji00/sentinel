@@ -47,7 +47,9 @@ MACRO_TICKERS = {
     "ZW=F": "Wheat Futures",
     "NQ=F": "Nasdaq 100 Futures",
     "ES=F": "S&P 500 Futures",
-    "^VIX": "Volatility Index"
+    "^VIX": "Volatility Index",
+    "TIP":  "iShares TIPS Bond ETF",
+    "^TNX": "10-Year Treasury Yield"
 }
 
 # Alpaca Fallback Proxies mapping
@@ -241,6 +243,7 @@ async def fetch_and_publish(producer: SentinelProducer):
                 else ("DownTick" if current_price < previous_price else "ZeroTick")
             )
 
+            import uuid
             payload = {
                 "source": "finnhub_equities",
                 "raw_payload": {
@@ -255,7 +258,7 @@ async def fetch_and_publish(producer: SentinelProducer):
                     "tick_direction": tick_direction,
                     "name": MACRO_TICKERS[ticker],
                 },
-                "event_id": f"macro_{ticker}_{int(time.time())}",
+                "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"macro_{ticker}_{int(time.time())}")),
                 "occurred_at": now,
             }
 

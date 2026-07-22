@@ -215,9 +215,18 @@ class DynamicAnomalyScorer:
                         
                 scores = [0.0] * len(features_list)
                 if valid_seqs:
+                    input_name = session.get_inputs()[0].name
+                    reconstructed_list = []
+                    for seq in valid_seqs:
+                        x_single = np.array([seq], dtype=np.float32)
+                        try:
+                            pred_single = await loop.run_in_executor(None, session.run, None, {input_name: x_single})
+                            reconstructed_list.append(pred_single[0][0])
+                        except Exception:
+                            reconstructed_list.append(seq)
+                    
                     X = np.array(valid_seqs, dtype=np.float32)
-                    predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                    reconstructed_X = predictions[0]
+                    reconstructed_X = np.array(reconstructed_list, dtype=np.float32)
                     reconstruction_errors = np.mean(np.square(X - reconstructed_X), axis=(1, 2))
                     
                     for i, err in zip(valid_idx, reconstruction_errors):
@@ -361,21 +370,17 @@ class DynamicAnomalyScorer:
             pipe = self.redis.raw.pipeline()
             for tag in named_entities:
                 pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
-                # Batch pipeline checks for watchlist members to optimize performance
-                pipe.sismember("sentinel:watched:equities", tag)
+                # Query ZSET scores directly (returns score if member, None if not)
                 pipe.zscore("sentinel:watched:equities", tag)
-                pipe.sismember("sentinel:watched:vessels", tag)
                 pipe.zscore("sentinel:watched:vessels", tag)
                 
             results = await pipe.execute()
             vals = []
             
             for i, tag in enumerate(named_entities):
-                res = results[i*5]
-                is_eq_set = results[i*5 + 1]
-                is_eq_zset = results[i*5 + 2]
-                is_ves_set = results[i*5 + 3]
-                is_ves_zset = results[i*5 + 4]
+                res = results[i*3]
+                is_eq_zset = results[i*3 + 1]
+                is_ves_zset = results[i*3 + 2]
 
                 if res:
                     val = float(res)
@@ -384,7 +389,7 @@ class DynamicAnomalyScorer:
                     tag_label = "positive" if val > 0 else "critical" if val <= -1.5 else "negative"
                     semantic_tags.append(f"semantic:{tag_label}")
 
-                if is_eq_set or (is_eq_zset is not None) or is_ves_set or (is_ves_zset is not None):
+                if (is_eq_zset is not None) or (is_ves_zset is not None):
                     watchlist_boost = 0.15
 
                 f_boost = await self.track_frequency(tag, "news")

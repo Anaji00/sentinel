@@ -79,6 +79,8 @@ class TradFiEnricher:
             return await self._enrich_insider(raw, p)
         elif source == "alpaca_options":
             return await self._enrich_options_flow(raw, p)
+        elif source == "alpaca_quant_radar":
+            return await self._enrich_quant_radar(raw, p)
             
         return None
 
@@ -135,6 +137,19 @@ class TradFiEnricher:
                     aggressor_side = "SELL"
                 elif tick_dir == "UpTick":
                     aggressor_side = "BUY"
+
+            # Volume Order Imbalance (VOI) Tagging
+            buy_vol = volume if aggressor_side == "BUY" else 0.0
+            sell_vol = volume if aggressor_side == "SELL" else 0.0
+            voi = buy_vol - sell_vol
+
+            if volume > 0 and abs(voi) / volume >= 0.60:
+                if voi > 0:
+                    tags.append("institutional_accumulation")
+                    anomaly = min(1.0, anomaly * 1.15)
+                else:
+                    tags.append("institutional_distribution")
+                    anomaly = min(1.0, anomaly * 1.15)
                     
             conditions = str(p.get("conditions", "")).lower()
             is_dark_pool = "out of sequence" in conditions or "average price" in conditions
@@ -451,5 +466,47 @@ class TradFiEnricher:
             ),
             headline=f"🐋 OPTIONS FLOW Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
             tags=tags,
-            anomaly_score=round(anomaly, 3)
+            anomaly_score=anomaly
+        )
+
+    async def _enrich_quant_radar(self, raw, p) -> Optional[NormalizedEvent]:
+        ticker = (p.get("ticker") or "").upper()
+        if not ticker: return None
+
+        z_score = float(p.get("z_score", 0.0))
+        volume = float(p.get("volume", 0.0))
+        price = float(p.get("price", 0.0))
+        notional = float(p.get("notional_usd", 0.0))
+
+        import time as _time
+        try:
+            await self.redis_client.raw.zadd("sentinel:watched:equities", mapping={ticker: _time.time()})
+            await self.redis_client.raw.zremrangebyrank("sentinel:watched:equities", 0, -51)
+        except Exception:
+            pass
+
+        base_score = min(1.0, z_score / 5.0)
+        anomaly = min(1.0, base_score + w_boost + f_boost)
+
+        tags = ["tradfi", "radar_anomaly", ticker.lower()]
+        entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.MARKET_ANOMALY,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            financial_data=FinancialData(
+                ticker=ticker,
+                instrument_type="equity",
+                trade_type="RADAR_ANOMALY",
+                premium_usd=notional,
+                underlying_price=price,
+                volume=volume,
+            ),
+            headline=f"⚡ QUANT RADAR VOLUME SPIKE | {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional/1e6:.2f}M",
+            tags=tags,
+            anomaly_score=anomaly,
         )

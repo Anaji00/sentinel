@@ -163,10 +163,12 @@ async def main():
     
     connector = aiohttp.TCPConnector(limit=5)
     
-    async with aiohttp.ClientSession(connector=connector) as session:
-        await _consume_loop(consumer, db, session, producer)
-
-    await consumer.close()
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            await _consume_loop(consumer, db, session, producer)
+    finally:
+        await producer.close()
+        await consumer.close()
 
 if __name__ == "__main__":
     # OS-level event loop policy enforcement to prevent Windows Proactor loop crashes

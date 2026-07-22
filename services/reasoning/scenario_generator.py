@@ -235,6 +235,7 @@ class ScenarioGenerator:
                     schema=ScenarioOutput,
                     temperature=0.25,   # Slightly higher than agents for narrative diversity
                     max_retries=3,      # Inner retry loop inside OllamaClient
+                    num_predict=1024,
                 )
                 break
             except SchemaViolationError as e:

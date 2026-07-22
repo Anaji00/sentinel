@@ -69,8 +69,15 @@ THREAT_KEYWORDS = {
 }
 THREAT_REGEXES = [re.compile(p, re.IGNORECASE) for p in THREAT_KEYWORDS]
 
+INFLATION_COST_BURDEN_KEYWORDS = [
+    r"\bgasoline\b", r"\bgas\s+price[s]*\b", r"\bfuel\s+price[s]*\b", r"\binflation\b",
+    r"\bconsumer\s+price[s]*\b", r"\bcpi\b", r"\bmortgage\s+rate[s]*\b", r"\bcost\s+of\s+living\b"
+]
+INFLATION_COST_REGEXES = [re.compile(p, re.IGNORECASE) for p in INFLATION_COST_BURDEN_KEYWORDS]
+
 def _sentiment(text: str) -> float:
     t = text.lower()
+    is_cost_burden_topic = any(rx.search(t) for rx in INFLATION_COST_REGEXES)
     tokens = re.findall(r'\b\w+\b', t)
     
     neg = 0
@@ -87,7 +94,12 @@ def _sentiment(text: str) -> float:
                 negated = True
                 break
                 
-        if is_neg_match:
+        if is_cost_burden_topic and token in {"climb", "climbs", "climbing", "climbed", "surge", "surges", "surging", "surged", "soar", "soars", "soaring", "soared", "jump", "jumps", "jumped", "jumping", "spike", "spikes", "spiked", "spiking", "rise", "rises", "rising", "rose"}:
+            if negated:
+                pos += 1
+            else:
+                neg += 1
+        elif is_neg_match:
             if negated:
                 pos += 1
             else:

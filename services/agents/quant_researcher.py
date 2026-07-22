@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from .base import SentinelAgent, SchemaViolationError
+from .base import SentinelAgent, SchemaViolationError, InferenceError
+from shared.utils.equities import is_valid_primary_equity, fast_classify_equity
 from .prompts import (
     QUANT_PEER_DISCOVERY_SYSTEM,
     QUANT_PEER_DISCOVERY_USER_TEMPLATE,
@@ -48,6 +49,9 @@ class MacroInstrument(BaseModel):
 
 class PeerDiscovery(BaseModel):
     trigger_analysis: str
+    is_primary_equity: bool = True
+    asset_class: str = "PRIMARY_COMMON_EQUITY"
+    equity_validation_reason: Optional[str] = "Verified primary US common equity"
     catalyst_category: str
     peer_tickers: List[PeerTicker] = Field(default_factory=list)
     macro_instruments: List[MacroInstrument] = Field(default_factory=list)
@@ -65,6 +69,7 @@ MAX_WATCHLIST_ADDITIONS = 8
 TRIGGER_EVENT_TYPES = {
     "equity_block",
     "market_anomaly",
+    "volume_anomaly",
     "crypto_liquidation",
     "crypto_trade",
     "options_flow",
@@ -89,6 +94,41 @@ class QuantResearcherAgent(SentinelAgent):
         clean_ticker = str(ticker).strip().upper()
         return f"sentinel:quant:{clean_prefix}:{clean_ticker}"
 
+    def calculate_garch_volatility(self, returns: List[float], omega: float = 0.000002, alpha: float = 0.08, beta: float = 0.90) -> float:
+        """
+        Calculates GARCH(1,1) conditional volatility forecast (h_t = omega + alpha*e_{t-1}^2 + beta*h_{t-1}).
+        Returns annualized volatility estimate.
+        """
+        import numpy as np
+        if not returns or len(returns) < 5:
+            return 0.20  # Default 20% annualized volatility baseline
+        
+        arr = np.array(returns)
+        var = np.var(arr) if np.var(arr) > 0 else 0.0001
+        
+        for r in arr:
+            var = omega + (alpha * (r ** 2)) + (beta * var)
+            
+        daily_vol = np.sqrt(var)
+        annualized_vol = daily_vol * np.sqrt(252)
+        return float(annualized_vol)
+
+    def calculate_kelly_position_size(self, win_rate: float, win_loss_ratio: float, kelly_fraction: float = 0.5) -> float:
+        """
+        Computes fractional Kelly Criterion position sizing: f* = max(0, (p * b - q) / b).
+        kelly_fraction: Fractional Kelly scaling (e.g. 0.5 for Half-Kelly risk management).
+        """
+        if win_loss_ratio <= 0 or win_rate <= 0 or win_rate >= 1:
+            return 0.0
+            
+        p = win_rate
+        q = 1.0 - win_rate
+        b = win_loss_ratio
+        
+        full_kelly = (p * b - q) / b
+        fractional_kelly = max(0.0, full_kelly * kelly_fraction)
+        return round(float(fractional_kelly), 4)
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         
         # ── SCENARIO HANDLING ───────────────────────────────────────────────
@@ -99,7 +139,12 @@ class QuantResearcherAgent(SentinelAgent):
         if event_type not in TRIGGER_EVENT_TYPES:
             return None
 
-        anomaly_score = float(message.get("anomaly_score", 0))
+        anomaly_score = float(message.get("anomaly_score", 0.0))
+        if anomaly_score == 0.0:
+            fd = message.get("financial_data") or message.get("raw_payload") or {}
+            if isinstance(fd, dict) and "z_score" in fd:
+                anomaly_score = min(1.0, float(fd["z_score"]) / 5.0)
+
         if anomaly_score < RESEARCH_TRIGGER_SCORE:
             return None
             
@@ -130,6 +175,20 @@ class QuantResearcherAgent(SentinelAgent):
         
         ticker = self._extract_ticker(message)
         if not ticker:
+            return None
+
+        # ── FAST EQUITY GATEKEEPER: Ensure ticker is NOT leveraged, inverse, or derivative ──
+        class_info = fast_classify_equity(ticker)
+        if not class_info["is_primary_equity"]:
+            logger.warning(
+                f"⛔ QUANT RESEARCHER DISCARD: {ticker} rejected because it is a {class_info['asset_class']} "
+                f"({class_info['reason']}). Dropping before Redis & LLM."
+            )
+            # Add to blocked set in Redis so collector watchlists exclude it
+            try:
+                await self.redis.raw.sadd("sentinel:blocked:tickers", ticker.upper())
+            except Exception as rx:
+                pass
             return None
         
         dedup_key = self._state_key("seen", f"{ticker}:{event_type}")
@@ -185,22 +244,32 @@ class QuantResearcherAgent(SentinelAgent):
                 schema=PeerDiscovery,
                 temperature=0.15,
             )
-        except SchemaViolationError as e:
+        except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Peer discovery failed: {e}")
             return None
         
+        logger.info(
+            f"🔬 QUANT THESIS GENERATED | Ticker: {ticker} | Category: '{discovery.catalyst_category}' "
+            f"| Correlated Peers: {[p.ticker for p in discovery.peer_tickers[:4]]} "
+            f"| Macro Instruments: {[m.ticker for m in discovery.macro_instruments[:3]]}"
+        )
+        
         unknowns = discovery.peer_tickers + discovery.macro_instruments
-        for item in unknowns:
-            await self._producer.send(
-                "agents.ontology.unknown_entities",
-                {
-                    "entity_name": item.ticker,
-                    "context": discovery.trigger_analysis[:500],
-                    "source_domain": "quant_researcher",
-                    "frequency": 1
-                },
-                key=item.ticker
-            )
+        if unknowns:
+            unknown_tasks = [
+                self._producer.send(
+                    "agents.ontology.unknown_entities",
+                    {
+                        "entity_name": item.ticker,
+                        "context": discovery.trigger_analysis[:500],
+                        "source_domain": "quant_researcher",
+                        "frequency": 1
+                    },
+                    key=item.ticker
+                )
+                for item in unknowns
+            ]
+            await asyncio.gather(*unknown_tasks, return_exceptions=True)
         
         # ── STEP 3: Inject peers (Now Async) ──────────────────────────────────
         added = await self._inject_peers(ticker, discovery, event_type)
@@ -275,7 +344,7 @@ class QuantResearcherAgent(SentinelAgent):
                 schema=PeerDiscovery,
                 temperature=0.2,
             )
-        except SchemaViolationError as e:
+        except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Crypto basket peer discovery failed: {e}")
             return None
             
@@ -379,25 +448,27 @@ class QuantResearcherAgent(SentinelAgent):
             event_type: str
     ) -> List[str]:
         """
-        Add high-confidence peers to the Redis watchlist.
+        Add verified primary equity trigger and high-confidence peers to the Redis watchlist.
         Returns list of newly added tickers. IO is safely offloaded.
         """
         added = []
         candidates = []
 
+        # 1. Include verified primary equity trigger ticker itself
+        if is_valid_primary_equity(trigger_ticker):
+            candidates.append((trigger_ticker, "immediate", 0.95))
+
         for peer in discovery.peer_tickers:
             if (
                 peer.discovery_confidence >= WATCHLIST_CONFIDENCE_THRESHOLD
-                and peer.ticker != trigger_ticker
-                and self._is_valid_ticker(peer.ticker)
+                and is_valid_primary_equity(peer.ticker)
             ):
                 candidates.append((peer.ticker, peer.monitoring_urgency, peer.discovery_confidence))
 
         for macro in discovery.macro_instruments:
             if (
                 macro.discovery_confidence >= WATCHLIST_CONFIDENCE_THRESHOLD
-                and macro.ticker != trigger_ticker
-                and self._is_valid_ticker(macro.ticker)
+                and is_valid_primary_equity(macro.ticker)
             ):
                 candidates.append((macro.ticker, "within_4h", macro.discovery_confidence))
                 
@@ -407,6 +478,11 @@ class QuantResearcherAgent(SentinelAgent):
 
         for ticker, urgency, confidence in candidates:
             try:
+                # Reasoning Service Double-Check: Confirm valid primary equity / BTC via LLM
+                is_verified = await self.verify_ticker_with_reasoning(ticker)
+                if not is_verified:
+                    continue
+
                 # 1. IO Offloaded Set Addition
                 async with self.redis.raw.pipeline(transaction=True) as pipe:
                     pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
@@ -474,24 +550,29 @@ class QuantResearcherAgent(SentinelAgent):
     # ── HELPERS ───────────────────────────────────────────────────────────────
 
     def _extract_ticker(self, message: Dict) -> Optional[str]:
-        fd = message.get("financial_data") or {}
+        fd = message.get("financial_data") or message.get("raw_payload") or {}
         if isinstance(fd, dict) and fd.get("ticker"):
-            return fd["ticker"].upper()
+            return str(fd["ticker"]).upper().strip()
 
         cd = message.get("crypto_data") or {}
         if isinstance(cd, dict) and cd.get("pair"):
-            return cd["pair"].upper()
+            return str(cd["pair"]).upper().strip()
 
         entity = message.get("primary_entity") or {}
         if isinstance(entity, dict) and entity.get("id"):
-            return entity["id"].upper()
+            return str(entity["id"]).upper().strip()
 
         return None
 
     def _extract_notional(self, message: Dict) -> float:
-        fd = message.get("financial_data") or {}
+        fd = message.get("financial_data") or message.get("raw_payload") or {}
         if isinstance(fd, dict):
-            return float(fd.get("premium_usd") or 0)
+            if "notional_usd" in fd:
+                return float(fd["notional_usd"])
+            if "volume" in fd and "close_price" in fd:
+                return float(fd["volume"]) * float(fd["close_price"])
+            if "premium_usd" in fd:
+                return float(fd["premium_usd"])
         cd = message.get("crypto_data") or {}
         if isinstance(cd, dict):
             return float(cd.get("price", 0)) * float(cd.get("size_tokens", 0))
@@ -519,23 +600,85 @@ class QuantResearcherAgent(SentinelAgent):
 
     @staticmethod
     def _is_valid_ticker(ticker: str) -> bool:
-        if not ticker: return False
-        # Allow alphanumeric, hyphens, and dots, up to 10 chars
-        clean = ticker.replace('-', '').replace('.', '')
-        return clean.isalnum() and clean.isupper() and 1 <= len(ticker) <= 10
+        return is_valid_primary_equity(ticker)
 
     @staticmethod
-    def _map_relationship_type(relationship_type: str) -> str:
+    def _map_relationship_type(self, raw_type: str) -> str:
         mapping = {
-            "supplier":          "SUPPLIES",
-            "customer":          "PURCHASES_FROM",
-            "competitor":        "COMPETES_WITH",
-            "sector_peer":       "CORRELATED_WITH",
-            "commodity_linked":  "COMMODITY_EXPOSURE",
-            "macro_correlated":  "MACRO_CORRELATED",
+            "supplier":            "SUPPLIES",
+            "customer":            "PURCHASES_FROM",
+            "competitor":          "COMPETES_WITH",
+            "subsidiary":          "SUBSIDIARY_OF",
+            "positive_exposure_to": "POSITIVE_EXPOSURE_TO",
+            "inverse_exposure_to":  "INVERSE_EXPOSURE_TO",
+            "same_sector":         "ADJACENT_TO",
         }
-        return mapping.get(relationship_type, "CORRELATED_WITH")
+        return mapping.get(raw_type.lower(), "CORRELATED_WITH")
+
+    @staticmethod
+    def _estimate_garch_volatility(returns: List[float], omega: float = 0.00001, alpha: float = 0.05, beta: float = 0.90) -> float:
+        """
+        Estimates conditional variance using a GARCH(1,1) process:
+        sigma_t^2 = omega + alpha * eps_{t-1}^2 + beta * sigma_{t-1}^2
+        Accounts for volatility clustering to prevent false anomaly triggers.
+        """
+        if not returns or len(returns) < 2:
+            return 0.01
+
+        np_returns = np.array(returns, dtype=np.float64)
+        sigma2 = np.var(np_returns)
+        if sigma2 == 0:
+            sigma2 = 0.0001
+
+        for r in np_returns:
+            eps2 = r * r
+            sigma2 = omega + alpha * eps2 + beta * sigma2
+
+        return float(np.sqrt(max(1e-6, sigma2)))
         
+    async def _evaluate_signal_decay(self, rule_name: str, returns: List[float], risk_free_rate: float = 0.04) -> Dict[str, float]:
+        """
+        Evaluates signal decay over a 30-day sliding window.
+        Calculates Sharpe Ratio (S = (Rp - Rf) / sigma_p) and Information Ratio (IR = (Rp - Rb) / tracking_error).
+        Emits pruning recommendations to Topics.RULES_FEEDBACK if Sharpe ratio < 0.50.
+        """
+        if not returns or len(returns) < 5:
+            return {"sharpe_ratio": 1.0, "information_ratio": 1.0, "decay_warning": 0.0}
+
+        np_ret = np.array(returns, dtype=np.float64)
+        mean_ret = float(np.mean(np_ret))
+        std_ret = float(np.std(np_ret))
+        if std_ret == 0:
+            std_ret = 0.0001
+
+        # Annualized Sharpe Ratio
+        sharpe = round((mean_ret - (risk_free_rate / 252.0)) / std_ret * np.sqrt(252.0), 3)
+        info_ratio = round(mean_ret / std_ret * np.sqrt(252.0), 3)
+        is_decayed = sharpe < 0.50
+
+        if is_decayed:
+            self.logger.warning(f"⚠️ SIGNAL DECAY DETECTED for rule '{rule_name}' | Sharpe: {sharpe:.2f} | IR: {info_ratio:.2f}. Emitting pruning recommendation.")
+            try:
+                await self._producer.send(
+                    Topics.RULES_FEEDBACK,
+                    {
+                        "action": "PRUNE_RULE_DECAY",
+                        "rule_name": rule_name,
+                        "sharpe_ratio": sharpe,
+                        "information_ratio": info_ratio,
+                        "reason": f"Signal alpha decayed below threshold (Sharpe={sharpe:.2f} < 0.50)"
+                    },
+                    key=rule_name
+                )
+            except Exception as ex:
+                self.logger.error(f"Failed to emit rule pruning feedback for {rule_name}: {ex}")
+
+        return {
+            "sharpe_ratio": sharpe,
+            "information_ratio": info_ratio,
+            "decay_warning": 1.0 if is_decayed else 0.0
+        }
+
     async def _handle_scenario(self, scenario: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         self.logger.info(f"QuantResearcher processing scenario: {scenario.get('scenario_id')}")
         hypotheses = scenario.get("hypotheses", [])

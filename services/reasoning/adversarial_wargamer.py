@@ -49,6 +49,7 @@ class AdversarialSimulationEngine:
             try:
                 rows = await self.neo4j.query("""
                     MATCH (a:Entity {id: $id})-[r*1..3]-(b:Entity)
+                    WHERE ALL(rel in r WHERE coalesce(rel.weight, 1.0) >= 0.60)
                     RETURN a.id as src, type(r[-1]) as rel, b.id as tgt LIMIT 15
                 """, {"id": entity_id})
                 for r in rows: extracted_edges.append(f"({r['src']})-[:{r['rel']}]->({r['tgt']})")

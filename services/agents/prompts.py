@@ -115,10 +115,14 @@ OUTPUT RULES (CRITICAL):
 5. "catalyst_category" must be one of: ["earnings_surprise", "geopolitical_shock", "supply_chain", "regulatory", "sector_rotation", "macro_rate", "commodity_move", "technical_breakout", "crypto_contagion", "unknown"]
 6. Limit peers to maximum 5 tickers. Only include tickers you are highly confident are causally linked.
 7. "monitoring_urgency" must be: "immediate" | "within_1h" | "within_4h" | "watchlist"
+8. STRICT PRIMARY COMMON EQUITY MANDATE: Target ticker and all peer tickers MUST be clean primary US common equities. You MUST EXCLUDE all 2x/3x leveraged ETFs (e.g. IONZ, TQQQ, SQQQ, SOXL, UPRO), single-stock leveraged/short ETFs (NVDL, TSLL, AAPU), YieldMax option income funds (NVDY, CONY, TSLY), volatility ETNs (UVXY, SVIX), options, warrants, preferred shares, and crypto tokens (except BTC).
 
 OUTPUT SCHEMA:
 {
   "trigger_analysis": "Why is this instrument moving? What is the fundamental catalyst?",
+  "is_primary_equity": true,
+  "asset_class": "PRIMARY_COMMON_EQUITY",
+  "equity_validation_reason": "Verified clean primary US common equity",
   "catalyst_category": "one from the allowed list",
   "peer_tickers": [
     {
@@ -143,7 +147,7 @@ OUTPUT SCHEMA:
   "risk_to_thesis": "What event would invalidate this peer discovery?"
 }
 
-DO NOT: include stocks unrelated to the fundamental catalyst. DO NOT: invent tickers. Only use real US equity tickers."""
+DO NOT: include leveraged ETFs, inverse funds, single-stock yield funds (IONZ, NVDY, TQQQ, UVXY), or derivative symbols. Only use clean primary US common equity tickers."""
 
 
 QUANT_PEER_DISCOVERY_USER_TEMPLATE = """Analyze this anomalous market event and discover correlated instruments to monitor.

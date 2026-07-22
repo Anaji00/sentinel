@@ -166,6 +166,22 @@ class AlertManager:
                     if resp.status == 200:
                         logger.debug("Telegram message sent")
                         return True
+                    elif resp.status == 400:
+                        logger.warning("Telegram MarkdownV2 parse failed (400). Retrying with plain text fallback...")
+                        clean_text = text.replace("\\", "").replace("*", "").replace("_", "").replace("`", "")
+                        async with self._session.post(
+                            f"{TELEGRAM_API}/sendMessage",
+                            json={
+                                "chat_id": TELEGRAM_CHAT_ID,
+                                "text": clean_text[:4096],
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as retry_resp:
+                            if retry_resp.status == 200:
+                                logger.info("✅ Telegram message delivered via plain-text fallback")
+                                return True
+                            logger.error(f"Telegram fallback {retry_resp.status}: {(await retry_resp.text())[:200]}")
+                            return False
                     elif resp.status == 429:
                         retry_after = int((await resp.json()).get("parameters", {}).get("retry_after", 30))
                         logger.warning(f"Telegram rate limit (attempt {attempt+1}/3) - sleeping {retry_after}s")

@@ -112,8 +112,8 @@ export default function GlobalMap() {
                 >
                     {/* World Base Geography */}
                     <Geographies geography={geoUrl}>
-                        {({ geographies }) =>
-                            geographies.map((geo) => (
+                        {({ geographies }: { geographies: any[] }) =>
+                            geographies.map((geo: any) => (
                                 <Geography
                                     key={geo.rsmKey}
                                     geography={geo}
@@ -141,8 +141,8 @@ export default function GlobalMap() {
                                 {/* Since react-simple-maps handles geographies via Projection, 
                                     we project individual polygon points to match Mercator space */}
                                 <Geographies geography={feature}>
-                                    {({ geographies }) =>
-                                        geographies.map((geo) => (
+                                    {({ geographies }: { geographies: any[] }) =>
+                                        geographies.map((geo: any) => (
                                             <Geography
                                                 key={geo.rsmKey}
                                                 geography={geo}

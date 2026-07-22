@@ -13,7 +13,6 @@ Phase 2: replace keyword matching with full OFAC SDN list sync
 """
 
 import logging
-import json
 from typing import List
 
 logger = logging.getLogger("shared.sanctions")
@@ -110,6 +109,37 @@ def rebuild_sanctions_from_list(keywords: List[str]):
         _init_automaton(keywords)
         logger.info(f"Sanctions automaton successfully rebuilt in memory with {len(keywords)} keywords.")
 
+async def fetch_and_sync_ofac_sdn_list():
+    """
+    Downloads and updates OFAC SDN list keywords into memory.
+    """
+    import aiohttp
+    import xml.etree.ElementTree as ET
+    url = "https://sanctionslist.ofac.treas.gov/Home/SdnList"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15.0)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Parse entity names from XML SDN payload
+                    keywords = set(SANCTIONED_KEYWORDS)
+                    try:
+                        root = ET.fromstring(text)
+                        for entry in root.findall(".//sdnEntry"):
+                            last_name = entry.findtext("lastName")
+                            first_name = entry.findtext("firstName")
+                            if last_name:
+                                full_name = f"{first_name} {last_name}".strip() if first_name else last_name.strip()
+                                if len(full_name) >= 3:
+                                    keywords.add(full_name.lower())
+                    except Exception as pe:
+                        logger.warning(f"Could not parse XML SDN stream: {pe}")
+                    
+                    rebuild_sanctions_from_list(list(keywords))
+                    logger.info(f"✅ OFAC SDN list synced successfully. Total entities: {len(keywords)}")
+    except Exception as e:
+        logger.warning(f"OFAC SDN dynamic sync skipped (offline/timeout): {e}")
+
 def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     """
     Return list of flag strings for a vessel.
@@ -125,13 +155,15 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
         # Aho-Corasick fast path: O(N) where N is length of name_lower
         for end_index, (insert_order, original_value) in _automaton.iter(name_lower):
             flags.append("sanctioned_ofac")
-            break  # Stop at first match
+            flags.append(f"sanctioned_kw:{original_value}")
+            break
     else:
         # Fallback slow path
         for kw in SANCTIONED_KEYWORDS:
             if kw in name_lower:
                 flags.append("sanctioned_ofac")
-                break  # No need to check other keywords if we already found one
+                flags.append(f"sanctioned_kw:{kw}")
+                break
 
     prefix = (mmsi or "")[:3]
     # High risk: Iran (422), DPRK (442, 445, 447, 619), Russia (273), Syria (468), Cuba (323), Venezuela (775)

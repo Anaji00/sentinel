@@ -4,8 +4,12 @@ export interface Scenario {
     correlation_id: string;
     status: string;
     headline: string;
+    title?: string;
+    description?: string;
+    summary?: string;
     significance: string;
     confidence_overall: number;
+    probability?: number;
     created_at: string;
 }
 
@@ -72,4 +76,5 @@ export interface NormalizedEvent {
     vessel_data?: VesselData;
     security_data?: SecurityData;
     prediction_market_data?: PredictionMarketData;
+    raw_payload?: Record<string, any>;
 }

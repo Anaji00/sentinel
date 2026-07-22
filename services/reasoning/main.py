@@ -16,6 +16,7 @@ import os
 import sys
 import re
 import time
+import aiohttp
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -33,12 +34,14 @@ logger = logging.getLogger("reasoning.orchestrator")
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.models import CorrelationCluster, AlertTier
-from shared.db import get_timescale, get_redis
+from shared.db import get_timescale, get_redis, get_neo4j
 
 from services.reasoning.context_builder    import ContextBuilder
 from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
+from services.reasoning.adversarial_wargamer import AdversarialSimulationEngine
+from shared.utils.ollama import OllamaClient
 
 async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
@@ -78,7 +81,7 @@ async def apply_autonomous_feedback(scenario, redis_client):
             await redis_client.raw.expire("sentinel:watched:wallets", 2592000)
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
 
-async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
+async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library, wargamer=None):
     """The core synthesis pipeline."""
     if cluster.alert_tier == AlertTier.WATCH:
         return
@@ -97,6 +100,10 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
         logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
         await apply_autonomous_feedback(scenario, redis_client)
 
+    if wargamer and cluster.alert_tier in (AlertTier.ALERT, AlertTier.INTELLIGENCE):
+        logger.info("⚔️ Triggering Adversarial Wargame Simulation for cluster %s...", cluster.correlation_id)
+        asyncio.create_task(wargamer.run_predictive_wargame(cluster.model_dump()))
+
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
     consumer = SentinelConsumer(
@@ -107,6 +114,12 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     producer = SentinelProducer()
     await consumer.start()
     await producer.start()
+
+    connector = aiohttp.TCPConnector(limit=10)
+    session = aiohttp.ClientSession(connector=connector)
+    ollama_client = OllamaClient(session)
+    neo4j_client = await get_neo4j()
+    wargamer = AdversarialSimulationEngine(neo4j_client, redis_client, ollama_client, producer)
 
     _start_time = time.monotonic()
     _processed = 0
@@ -131,7 +144,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
 
     async def sem_process_cluster(cluster, *args):
         async with sem:
-            return await process_cluster(cluster, *args)
+            return await process_cluster(cluster, *args, wargamer=wargamer)
 
     logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
     
@@ -227,6 +240,12 @@ async def main():
         await asyncio.gather(tracker_task, reasoning_task)
     except KeyboardInterrupt:
         logger.info("Shutting down Reasoning Service...")
+    finally:
+        tracker_task.cancel()
+        reasoning_task.cancel()
+        await asyncio.gather(tracker_task, reasoning_task, return_exceptions=True)
+        await tracker_producer.close()
+        logger.info("Reasoning Service shut down cleanly")
  
 if __name__ == "__main__":
     if sys.platform == "win32":

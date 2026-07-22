@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Failed to initialize NumPy.*")
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
@@ -111,7 +114,8 @@ async def main():
     consumer = SentinelConsumer(
         topics=[
             Topics.RAW_MARITIME, Topics.RAW_AVIATION, Topics.RAW_NEWS, 
-            Topics.RAW_CYBER, Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.RAW_PREDICTION
+            Topics.RAW_CYBER, Topics.RAW_TRADFI, Topics.RAW_CRYPTO, 
+            Topics.RAW_PREDICTION, Topics.RAW_RADAR
         ],
         group_id="enrichment-service",
     )
@@ -196,14 +200,37 @@ async def main():
                                 )
                             )
                     elif isinstance(batch_result, list):
-                        for enriched, re in zip(batch_result, raw_events):
+                        def _flatten(items):
+                            flat = []
+                            for item in items:
+                                if isinstance(item, list):
+                                    flat.extend(_flatten(item))
+                                elif item is not None:
+                                    flat.append(item)
+                            return flat
+
+                        vessel_positions_to_write = []
+                        flat_events = _flatten(batch_result)
+                        for enriched in flat_events:
                             if isinstance(enriched, NormalizedEvent):
                                 batch_to_write.append(enriched)
+                                if enriched.vessel_data and getattr(enriched.vessel_data, 'mmsi', None):
+                                    vd = enriched.vessel_data
+                                    vessel_positions_to_write.append((
+                                        vd.mmsi,
+                                        enriched.occurred_at,
+                                        enriched.latitude or 0.0,
+                                        enriched.longitude or 0.0,
+                                        getattr(vd, 'speed_knots', 0.0) or 0.0,
+                                        getattr(vd, 'heading', 0) or 0,
+                                        getattr(vd, 'nav_status', 'underway') or 'underway'
+                                    ))
+                                entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"
                                 produce_tasks.append(
                                     producer.send(
                                         Topics.ENRICHED_EVENTS,
                                         enriched.model_dump(),
-                                        key=enriched.primary_entity.id,
+                                        key=entity_key,
                                     )
                                 )
                             elif isinstance(enriched, Exception):
@@ -214,10 +241,12 @@ async def main():
                                         {
                                             "error": f"Enrichment event error: {enriched}",
                                             "topic": topic,
-                                            "raw": re.model_dump()
                                         }
                                     )
                                 )
+
+                        if vessel_positions_to_write:
+                            asyncio.create_task(db.write_vessel_positions_batch(vessel_positions_to_write))
                 
                 if produce_tasks:
                     await asyncio.gather(*produce_tasks, return_exceptions=True)

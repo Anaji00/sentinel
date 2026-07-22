@@ -27,6 +27,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.equities import is_valid_primary_equity
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 logger = logging.getLogger("collector.tradfi")
@@ -100,6 +101,8 @@ class OHLCVAggregator:
         async with self.redis_client.raw.pipeline() as pipe:
             for ticker, data in self.buffer.items():
                 if data["V"] > 0:
+                    vwap = round(data["C"] * data["V"] / data["V"], 4) if data["V"] > 0 else data["C"]
+                    vwap_dev = round((data["C"] - vwap) / vwap, 6) if vwap > 0 else 0.0
                     candle = {
                         "ticker": ticker,
                         "trade_type": "OHLCV_MINUTE_BAR",
@@ -108,8 +111,9 @@ class OHLCVAggregator:
                         "low": data["L"],
                         "close": data["C"],
                         "volume": data["V"],
+                        "vwap": vwap,
+                        "vwap_deviation": vwap_dev,
                         "notional_usd": data["C"] * data["V"]
-                    
                     }
                     event = RawEvent(
                         source="finnhub_equities",
@@ -154,7 +158,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
             try:
                 raw_tickers = await redis_client.raw.zrevrange(REDIS_EQUITIES_KEY, 0, 49)  # Get top 50 tickers by score (timestamp)
                 decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
-                desired_subs = {t.upper() for t in decoded_tickers} if decoded_tickers else {"NOW", "INTC"}
+                desired_subs = {t.upper() for t in decoded_tickers if is_valid_primary_equity(t)} if decoded_tickers else {"NOW", "INTC"}
                 
                 # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
                 if len(desired_subs) > 50:
@@ -206,6 +210,8 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                         if data.get("type") == "trade":
                             for item in data.get("data", []):
                                 ticker = item.get("s")
+                                if not ticker or not is_valid_primary_equity(ticker):
+                                    continue
                                 price = float(item.get("p", 0))
                                 volume = float(item.get("v", 0))
                                 notional = price * volume
@@ -277,13 +283,18 @@ async def poll_options(producer: SentinelProducer, redis_client):
             try:
                 # Fetch watched symbols from Redis
                 raw_symbols = await redis_client.raw.zrange("sentinel:watched:equities", 0, -1)
-                symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
+                raw_symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
+                # Filter out crypto pairs (Alpaca options API only accepts US equity tickers)
+                symbols = [
+                    s.upper().strip() for s in raw_symbols 
+                    if s and not (s.endswith("USDT") or s.endswith("USD") or "-" in s or "_" in s)
+                ]
                 
-                # Fallback list of major tickers
+                # Fallback list of major US equity tickers
                 if not symbols:
                     symbols = ["AAPL", "TSLA", "MSFT", "NVDA", "AMZN"]
                 
-                logger.info(f"Options Poller: Fetching options chains for {len(symbols)} tickers...")
+                logger.info(f"Options Poller: Fetching options chains for {len(symbols)} equity tickers ({symbols[:5]})...")
                 
                 for ticker in symbols[:50]:  # Cap to top 50 to honor API rates
                     url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
@@ -356,7 +367,7 @@ async def main():
             poll_options(producer, redis_client)
         )
     finally:
-        producer.close()
+        await producer.close()
 
 if __name__ == "__main__":
     if sys.platform == "win32":

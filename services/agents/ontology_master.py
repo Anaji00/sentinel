@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Set
 import re
 from pydantic import BaseModel, Field
 
-from .base import SentinelAgent, SchemaViolationError
+from .base import SentinelAgent, SchemaViolationError, InferenceError
 from .prompts import (
     ONTOLOGY_CATEGORIZE_SYSTEM,
     ONTOLOGY_CATEGORIZE_USER_TEMPLATE,
@@ -108,6 +108,15 @@ class OntologyMasterAgent(SentinelAgent):
         frequency     = int(message.get("frequency", 1))
 
         if not entity_name:
+            pe = message.get("primary_entity", {})
+            if isinstance(pe, dict) and pe.get("name"):
+                entity_name = pe["name"].strip()
+            elif isinstance(pe, dict) and pe.get("id"):
+                entity_name = pe["id"].strip()
+            elif message.get("named_entities"):
+                entity_name = message["named_entities"][0].strip()
+
+        if not entity_name:
             return None
 
         # Skip low-frequency noise — wait until we've seen it a few times
@@ -141,7 +150,7 @@ class OntologyMasterAgent(SentinelAgent):
                 schema=EntityClassification,
                 temperature=0.05,
             )
-        except SchemaViolationError as e:
+        except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Classification failed for '{entity_name}': {e}")
             return None
         
@@ -152,19 +161,23 @@ class OntologyMasterAgent(SentinelAgent):
             return None
 
         valid_concepts = []
-        for proposed_concept in classification.macro_concepts:
-            concept_embedding = await self._soft_correlator.embed_text(proposed_concept)
-
-            similar = await self._soft_correlator.find_similar_concepts(concept_embedding, limit = 1)
-            if similar and similar[0]["score"] > 0.85:
-                # Merge with existing known concept
-                valid_concepts.append(similar[0]["concept_name"])
-                logger.info(f"Ontology Merge: Mapped '{proposed_concept}' to '{similar[0]['concept_name']}'")
-            else:
-                # 3. Autonomous Schema Expansion
-                valid_concepts.append(proposed_concept)
-                await self._register_new_concept(proposed_concept, concept_embedding)
-                logger.warning(f"🌐 AUTONOMOUS EVOLUTION: New macro concept created: '{proposed_concept}'")
+        if self._soft_correlator:
+            for proposed_concept in classification.macro_concepts:
+                try:
+                    concept_embedding = await self._soft_correlator.embed_text(proposed_concept)
+                    similar = await self._soft_correlator.find_similar_concepts(concept_embedding, limit=1)
+                    if similar and similar[0]["score"] > 0.85:
+                        valid_concepts.append(similar[0]["concept_name"])
+                        logger.info(f"Ontology Merge: Mapped '{proposed_concept}' to '{similar[0]['concept_name']}'")
+                    else:
+                        valid_concepts.append(proposed_concept)
+                        await self._register_new_concept(proposed_concept, concept_embedding)
+                        logger.warning(f"🌐 AUTONOMOUS EVOLUTION: New macro concept created: '{proposed_concept}'")
+                except Exception as e:
+                    logger.warning(f"Soft correlator embedding error for '{proposed_concept}': {e}")
+                    valid_concepts.append(proposed_concept)
+        else:
+            valid_concepts = classification.macro_concepts
         
         classification.macro_concepts = list(set(valid_concepts))
 

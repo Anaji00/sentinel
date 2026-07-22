@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData
 from shared.kafka import Topics
+import asyncio
 
 logger = logging.getLogger("enrichment.crypto")
 

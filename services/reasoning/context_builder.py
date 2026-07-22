@@ -94,7 +94,7 @@ class ContextBuilder:
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id = ANY($1::uuid[])
+                   WHERE event_id = ANY($1::text[])
                    ORDER BY occurred_at DESC""",
                 event_ids
             )

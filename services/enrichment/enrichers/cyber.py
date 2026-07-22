@@ -64,8 +64,10 @@ class CyberThreatScorer:
         if is_critical: return c.get("critical_score", 0.60)
         return c.get("base_score", 0.20)
 
-    def score_cve(self, is_critical: bool, is_ics: bool, is_ransomware: bool) -> float:
+    def score_cve(self, is_critical: bool, is_ics: bool, is_ransomware: bool, is_kev: bool = False) -> float:
         c = self.cfg.get("cyber_cve", {"ics_ransomware": 0.95, "ics_score": 0.88, "ransomware": 0.85, "critical": 0.80, "base": 0.70})
+        if is_kev and is_ics: return 0.98
+        if is_kev: return max(0.92, c.get("ransomware", 0.85))
         if is_ics and is_ransomware: return c.get("ics_ransomware", 0.95)
         if is_ics: return c.get("ics_score", 0.88)
         if is_ransomware: return c.get("ransomware", 0.85)

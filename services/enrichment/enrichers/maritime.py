@@ -95,9 +95,10 @@ class MaritimeEnricher:
         features_list = []
         entities = []
         for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel in zip(parsed, vessels):
-            flags = vessel.get("flags", [])
-            is_sanctioned = 1.0 if any("sanctioned" in f.lower() for f in flags) else 0.0
-            features_list.append([speed, is_sanctioned, 0.5, 0.0, 0.0])
+            from shared.utils.regions import get_region_sensitivity_multiplier
+            reg_mult = get_region_sensitivity_multiplier(region) if region else 1.0
+            nav_anomaly = 1.0 if nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")) else 0.0
+            features_list.append([speed, is_sanctioned, float(reg_mult), float(nav_anomaly), 0.0])
             entities.append(mmsi)
             
         scores = await self.scorer.score_event_batch("vessel_position", entities, features_list)

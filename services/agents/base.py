@@ -13,20 +13,42 @@ import aiohttp
 from pydantic import BaseModel
 
 from shared.utils.ollama import (
-    OllamaClient, SchemaViolationError,
-    OLLAMA_MODEL, OLLAMA_URL
+    OllamaClient, SchemaViolationError, InferenceError,
+    OLLAMA_MODEL, OLLAMA_FALLBACK_MODEL, OLLAMA_URL
 )
 
-logger = logging.getLogger(__name__)
+# Task Queue Keys
+TASK_QUEUE_HIGH   = "sentinel:tasks:high"
+TASK_QUEUE_NORMAL = "sentinel:tasks:normal"
+TASK_QUEUE_LOW    = "sentinel:tasks:low"
 
-TASK_QUEUE_HIGH   = "sentinel:agents:tasks:high"
-TASK_QUEUE_NORMAL = "sentinel:agents:tasks:normal"
-TASK_QUEUE_LOW    = "sentinel:agents:tasks:low"
-HEARTBEAT_INTERVAL = 30
+class ThrottledLogger:
+    """
+    Prevents log swarming during high-frequency data bursts.
+    Throttles repeated log entries by key so they log at most once per interval_sec seconds.
+    """
+    def __init__(self, logger_instance: logging.Logger, default_interval_sec: float = 10.0):
+        self.logger = logger_instance
+        self.default_interval = default_interval_sec
+        self._last_logged: Dict[str, float] = {}
+
+    def info(self, key: str, msg: str, *args, interval_sec: Optional[float] = None, **kwargs):
+        now = time.time()
+        ttl = interval_sec if interval_sec is not None else self.default_interval
+        if key not in self._last_logged or (now - self._last_logged[key]) >= ttl:
+            self._last_logged[key] = now
+            self.logger.info(msg, *args, **kwargs)
+
+    def warning(self, key: str, msg: str, *args, interval_sec: Optional[float] = None, **kwargs):
+        now = time.time()
+        ttl = interval_sec if interval_sec is not None else self.default_interval
+        if key not in self._last_logged or (now - self._last_logged[key]) >= ttl:
+            self._last_logged[key] = now
+            self.logger.warning(msg, *args, **kwargs)
 
 class SentinelAgent(ABC):
     _global_received_count = 0
-    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3"):
+    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3", fallback_model: Optional[str] = None):
         self.name = agent_name
         self.input_topics = input_topics
         self.redis = redis_client 
@@ -36,6 +58,7 @@ class SentinelAgent(ABC):
         self._consumer = consumer
         self._dlq = dlq
         self.model = model
+        self.fallback_model = fallback_model
         self.logger = logging.getLogger(f"agent.{agent_name}")
         self._processed = 0
         self._errors = 0
@@ -136,6 +159,10 @@ class SentinelAgent(ABC):
             except SchemaViolationError as e:
                 self._errors += 1
                 await self._send_dlq(raw, f"SchemaViolationError: {str(e)}", self.input_topics[0])
+            except InferenceError as e:
+                self._errors += 1
+                self.logger.error(f"Inference error in agent {self.name}: {e}")
+                await self._send_dlq(raw, f"InferenceError: {str(e)}", self.input_topics[0])
             except ValueError as e:
                 self._errors += 1
                 await self._send_dlq(raw, f"ValueError: {str(e)}", self.input_topics[0])
@@ -271,8 +298,8 @@ class SentinelAgent(ABC):
 
     async def fetch_global_context(self) -> str:
         """
-        Fetches the top ML anomalies across ALL domains, plus the latest news.
-        Used by strategic macro agents that need a 'World State' view.
+        Fetches the top ML anomalies, latest news, and live outputs from upstream swarm agents
+        (Yield Curve Rates, News Intel, Quant Researcher) to build a unified World State context.
         """
         try:
             anomaly_query = """
@@ -295,7 +322,7 @@ class SentinelAgent(ABC):
             """
             news = await self.db.query(news_query)
             
-            context = "\n### GLOBAL SENTINEL CONTEXT (LAST 24 HOURS) ###\n"
+            context = "\n### GLOBAL SENTINEL SWARM WORLD STATE (LAST 24 HOURS) ###\n"
             context += "TOP ML ANOMALIES:\n"
             for r in anomalies:
                 context += f"- [{r['type']}] {r['headline']} (Score: {r['anomaly_score']:.2f})\n"
@@ -303,6 +330,30 @@ class SentinelAgent(ABC):
             context += "\nLATEST GLOBAL NEWS:\n"
             for r in news:
                 context += f"- {r['headline']}\n"
+
+            # Ingest live rate regime & macro state from Redis cache
+            try:
+                rates_raw = await self.redis.raw.get("sentinel:macro:rates_regime:latest")
+                if rates_raw:
+                    rates_data = json.loads(rates_raw.decode("utf-8") if isinstance(rates_raw, bytes) else rates_raw)
+                    context += f"\nLATEST RATES & CREDIT REGIME (YieldCurveMacroRatesAgent):\n"
+                    context += f"- Curve State: {rates_data.get('curve_state', 'N/A')} | Spread: {rates_data.get('yield_spread_2y10y_bps', 0):+.1f} bps\n"
+                    context += f"- Breakeven Inflation: {rates_data.get('breakeven_inflation_bps', 0):.1f} bps | TIPS Yield: {rates_data.get('tips_yield', 0):.2f}%\n"
+                    context += f"- Credit Risk: {rates_data.get('credit_spread_widening_signal', 'Stable')} | Macro Risk: {rates_data.get('macro_risk_level', 'LOW')}\n"
+            except Exception as rx:
+                self.logger.debug(f"Rates regime cache miss in global context: {rx}")
+
+            # Ingest recent shared agent memories
+            try:
+                mems = await self.redis.raw.zrevrange("sentinel:memory:shared", 0, 4)
+                if mems:
+                    context += "\nSHARED SWARM MEMORIES & INTEL:\n"
+                    for m in mems:
+                        text = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                        context += f"- {text}\n"
+            except Exception as mx:
+                self.logger.debug(f"Shared memory miss in global context: {mx}")
+
             return context + "\n"
         except Exception as e:
             self.logger.error(f"Failed to fetch global context: {e}")
@@ -316,7 +367,7 @@ class SentinelAgent(ABC):
         schema: Optional[Type[BaseModel]] = None,
         temperature: float = 0.1,
         model: Optional[str] = None,
-        fallback_model: Optional[str] = "qwen",
+        fallback_model: Optional[str] = OLLAMA_FALLBACK_MODEL,
         num_predict: Optional[int] = None,
     ) -> Any:
         
@@ -324,6 +375,9 @@ class SentinelAgent(ABC):
         # Fallback to a UUID if no event_id is present (e.g., scheduled tasks)
         run_id = message.get("event_id", str(uuid.uuid4())[:8])
         
+        if not getattr(self._producer, "_started", False):
+            await self._producer.start()
+
         await self._producer.send(
             "agents.telemetry", 
             {
@@ -336,16 +390,52 @@ class SentinelAgent(ABC):
             }
         )
         
-        # 2. Execute LLM with Pydantic Enforcement
-        response = await self._llm.infer(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            schema=schema,
-            temperature=temperature,
-            model=model or self.model,
-            fallback_model=fallback_model,
-            num_predict=num_predict,
-        )
+        # 2. Execute LLM with Pydantic Enforcement & Truncation Fallback Retry
+        try:
+            response = await self._llm.infer(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema=schema,
+                temperature=temperature,
+                model=model or self.model,
+                fallback_model=fallback_model or self.fallback_model,
+                num_predict=num_predict or 512,
+            )
+        except (SchemaViolationError, InferenceError) as err:
+            self.logger.warning(f"LLM inference schema/truncation error ({err}). Executing temperature-decayed fallback retry...")
+            try:
+                response = await self._llm.infer(
+                    system_prompt=system_prompt + "\nIMPORTANT: Return valid, complete, and un-truncated JSON adhering strictly to the schema.",
+                    user_prompt=user_prompt,
+                    schema=schema,
+                    temperature=0.0,
+                    model=fallback_model or self.fallback_model or self.model,
+                    num_predict=max(768, (num_predict or 512) * 2),
+                )
+            except Exception as retry_err:
+                await self._producer.send(
+                    "agents.telemetry",
+                    {
+                        "agent": self.name,
+                        "status": "FAILED",
+                        "task_id": run_id,
+                        "latency_ms": round((time.monotonic() - start_time) * 1000, 2),
+                        "error": f"Original: {err} | Retry: {retry_err}",
+                    }
+                )
+                raise
+        except Exception as err:
+            await self._producer.send(
+                "agents.telemetry",
+                {
+                    "agent": self.name,
+                    "status": "FAILED",
+                    "task_id": run_id,
+                    "latency_ms": round((time.monotonic() - start_time) * 1000, 2),
+                    "error": str(err),
+                }
+            )
+            raise
         
         if hasattr(response, "model_dump"):
             output_payload = response.model_dump()
@@ -365,3 +455,76 @@ class SentinelAgent(ABC):
             }
         )
         return response
+
+    async def verify_ticker_with_reasoning(self, ticker: str) -> bool:
+        """
+        Reasoning Service:
+        Uses an LLM agentic verification step to double-check that a symbol is a valid 
+        primary US common equity (or BTC) and NOT a derivative ETF, option, or crypto altcoin.
+        """
+        from shared.utils.equities import is_valid_primary_equity
+
+        if not ticker or not isinstance(ticker, str):
+            return False
+
+        clean_ticker = ticker.strip().upper()
+        if not is_valid_primary_equity(clean_ticker):
+            return False
+
+        class TickerVerificationDecision(BaseModel):
+            valid: bool
+            asset_type: str
+            rationale: str
+
+        prompt = f"""
+        You are an institutional market metadata verification service.
+        Verify if the symbol '{clean_ticker}' is a valid primary US common equity (e.g. AAPL, NVDA, TSLA) or Bitcoin (BTC).
+        
+        Strict Rules:
+        - If '{clean_ticker}' is a YieldMax, Roundhill, Defiance, T-REX, GraniteShares, or any derivative ETF of a primary equity, set valid=false.
+        - If '{clean_ticker}' is a crypto altcoin (ETH, SOL, XRP, DOGE, etc.), set valid=false.
+        - If '{clean_ticker}' is an option, warrant, preferred share, or invalid token, set valid=false.
+        - If '{clean_ticker}' is a legitimate primary operating company stock or BTC, set valid=true.
+        
+        Return ONLY valid JSON.
+        Schema: {{"valid": boolean, "asset_type": "string", "rationale": "string"}}
+        """
+
+        try:
+            decision = await self._execute_with_telemetry(
+                message={"system": "ticker_verification", "ticker": clean_ticker},
+                system_prompt="You are an institutional market metadata verification service.",
+                user_prompt=prompt,
+                schema=TickerVerificationDecision,
+                temperature=0.0,
+                num_predict=128,
+                fallback_model="gemma:2b"
+            )
+
+            if decision.valid:
+                self.logger.info(f"✅ REASONING VERIFICATION PASSED: {clean_ticker} verified as {decision.asset_type}. Rationale: {decision.rationale}")
+                return True
+            else:
+                self.logger.warning(f"⚠️ REASONING VERIFICATION REJECTED: {clean_ticker} rejected as {decision.asset_type}. Rationale: {decision.rationale}")
+                return False
+        except Exception as e:
+            self.logger.warning(f"Ticker reasoning verification fallback for {clean_ticker}: {e}")
+            return is_valid_primary_equity(clean_ticker)
+
+    async def close(self):
+        """Cleanly close all Kafka connections upon agent shutdown."""
+        if hasattr(self, "_consumer") and self._consumer:
+            try:
+                await self._consumer.close()
+            except Exception:
+                pass
+        if hasattr(self, "_producer") and self._producer:
+            try:
+                await self._producer.close()
+            except Exception:
+                pass
+        if hasattr(self, "_dlq") and self._dlq:
+            try:
+                await self._dlq.close()
+            except Exception:
+                pass

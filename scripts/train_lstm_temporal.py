@@ -54,10 +54,13 @@ class TemporalLSTMAutoEncoder(nn.Module):
             batch_first=True
         )
 
-    def forward(self, x):
-        _, (hidden_n, _) = self.encoder_lstm(x)
-        hidden_n = hidden_n.permute(1, 0, 2).repeat(1, self.seq_len, 1)
-        reconstructed, _ = self.decoder_lstm(hidden_n)
+    def forward(self, x, h0=None, c0=None):
+        if h0 is None or c0 is None:
+            _, (hidden_n, _) = self.encoder_lstm(x)
+        else:
+            _, (hidden_n, _) = self.encoder_lstm(x, (h0, c0))
+        hidden_n_rep = hidden_n.permute(1, 0, 2).expand(-1, self.seq_len, -1)
+        reconstructed, _ = self.decoder_lstm(hidden_n_rep)
         return reconstructed
     
 async def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tensor:
@@ -112,12 +115,21 @@ async def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tens
         return torch.tensor(synthetic)
     
     raw_data = np.array([row['ml_features'] for row in rows], dtype=np.float32)
+    # Log-scale unconstrained financial features (premium_usd at index 3, volume at index 4)
+    raw_data[:, 3] = np.log1p(np.maximum(0, raw_data[:, 3]) / 1000.0)
+    raw_data[:, 4] = np.log1p(np.maximum(0, raw_data[:, 4]) / 1000.0)
+
+    # Z-Score standardization across all 5 features (mean=0, std=1)
+    mean = np.mean(raw_data, axis=0, keepdims=True)
+    std = np.std(raw_data, axis=0, keepdims=True) + 1e-5
+    raw_data = (raw_data - mean) / std
+
     sequences = []
     
     for i in range(len(raw_data) - seq_len):
         sequences.append(raw_data[i:i+seq_len])
     
-    return torch.tensor(np.array(sequences))
+    return torch.tensor(np.array(sequences), dtype=torch.float32)
 
 async def train_and_export_lstm():
     seq_len = 10
@@ -147,18 +159,25 @@ async def train_and_export_lstm():
     model.eval()
     
     dummy_input = torch.randn(1, seq_len, n_features)
+    dummy_h0 = torch.zeros(1, 1, 64)
+    dummy_c0 = torch.zeros(1, 1, 64)
     onnx_path = os.path.join(MODEL_DIR, "temporal_lstm.onnx")
     
     torch.onnx.export(
         model, 
-        dummy_input, 
+        (dummy_input, dummy_h0, dummy_c0), 
         onnx_path,
         export_params=True,
-        opset_version=11,
+        opset_version=14,
         do_constant_folding=True,
-        input_names=['input_seq'],
+        input_names=['input_seq', 'h0', 'c0'],
         output_names=['reconstructed_seq'],
-        dynamic_axes={'input_seq': {0: 'batch_size'}, 'reconstructed_seq': {0: 'batch_size'}}
+        dynamic_axes={
+            'input_seq': {0: 'batch_size'},
+            'h0': {1: 'batch_size'},
+            'c0': {1: 'batch_size'},
+            'reconstructed_seq': {0: 'batch_size'}
+        }
     )
     logger.info(f"✅ LSTM ONNX artifact saved to {onnx_path}")
 

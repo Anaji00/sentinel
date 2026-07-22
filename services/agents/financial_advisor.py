@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
-from shared.utils.ollama import SchemaViolationError
+from shared.utils.ollama import SchemaViolationError, InferenceError
+from shared.utils.equities import is_valid_primary_equity
 
 logger = logging.getLogger("agent.financial_advisor")
 
@@ -148,24 +149,35 @@ class FinancialAdvisorAgent(SentinelAgent):
                 if isinstance(item, dict) and item.get("ticker"):
                     tickers.append(item["ticker"].upper())
                     
-        # 3. Direct ticker or primary_entity from basic event
+        # 3. Direct ticker, financial_data, crypto_data, or primary_entity from event
         if message.get("ticker"):
             tickers.append(message["ticker"].upper())
             
+        fin_data = message.get("financial_data", {})
+        if isinstance(fin_data, dict) and fin_data.get("ticker"):
+            tickers.append(fin_data["ticker"].upper())
+
+        crypto_data = message.get("crypto_data", {})
+        if isinstance(crypto_data, dict) and crypto_data.get("pair"):
+            tickers.append(crypto_data["pair"].upper())
+
         prim_ent = message.get("primary_entity", {})
         if isinstance(prim_ent, dict) and prim_ent.get("id"):
-            tickers.append(prim_ent["id"].upper())
+            ent_id = str(prim_ent["id"]).strip().upper()
+            ent_type = str(prim_ent.get("type", "")).lower()
+            if (ent_type in ("instrument", "equity", "crypto") or not ent_id.isdigit()) and len(ent_id) <= 10:
+                tickers.append(ent_id)
             
-        # Clean and deduplicate
+        # Clean, validate, and deduplicate
         cleaned = []
         for t in tickers:
             t_clean = t.strip().upper()
-            if t_clean and t_clean not in cleaned:
+            if is_valid_primary_equity(t_clean) and t_clean not in cleaned:
                 cleaned.append(t_clean)
         return cleaned
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        self.logger.info("Received live event trigger from input topic. Parsing tickers...")
+        self.logger.debug("Received live event trigger from input topic. Parsing tickers...")
         tickers = self._extract_tickers_from_event(message)
         
         if not tickers:
@@ -177,7 +189,7 @@ class FinancialAdvisorAgent(SentinelAgent):
         indicators_data = {}
         for ticker in tickers:
             closes, highs, lows = await self._fetch_prices(ticker)
-            if len(closes) >= 10:
+            if len(closes) >= 1:
                 indicators = compute_ta_indicators(closes, highs, lows)
                 indicators["current_price"] = closes[-1]
                 indicators_data[ticker] = indicators
@@ -213,8 +225,9 @@ class FinancialAdvisorAgent(SentinelAgent):
         {global_context}
         
         Perform a mathematical assessment of entry levels, support clusters, stop-losses, and targets.
-        Use the Kelly Criterion to allocate theoretical capital sizes to highest-conviction plays.
-        Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0).
+        Use Half-Kelly Criterion (Kelly_half = min(20.0, Kelly_full * 0.50)) to allocate theoretical capital sizes.
+        Factor Sortino Ratio downside semi-variance into conviction scores to protect allocations against asymmetric downside tail risk.
+        Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0). Single position size MUST NEVER exceed 20.0%.
         
         Generate the structured JSON advice.
         """
@@ -259,8 +272,8 @@ class FinancialAdvisorAgent(SentinelAgent):
             await self._producer.send(self.output_topic, advice_payload, key=run_id)
             self.logger.info(f"📊 Live Financial Advice Brief generated successfully. Plays: {[p.ticker for p in response.highest_conviction_plays]}")
             
-        except SchemaViolationError as e:
-            self.logger.error(f"Live financial brief schema violation: {e}")
+        except (SchemaViolationError, InferenceError) as e:
+            self.logger.error(f"Live financial brief error: {e}")
         except Exception as e:
             self.logger.error(f"Live financial review failed: {e}", exc_info=True)
             
@@ -309,13 +322,13 @@ class FinancialAdvisorAgent(SentinelAgent):
                        COALESCE(financial_data->>'high_price', crypto_data->>'high_price')::float as high_price,
                        COALESCE(financial_data->>'low_price', crypto_data->>'low_price')::float as low_price
                 FROM events
-                WHERE primary_entity_id = :ticker
+                WHERE primary_entity_id = $1
                   AND (type = 'market_anomaly' OR type = 'crypto_trade' OR type = 'price_anomaly')
                 ORDER BY occurred_at DESC
                 LIMIT 30
             """
             try:
-                records = await self.db.query(query, {"ticker": ticker})
+                records = await self.db.query(query, ticker)
                 if records:
                     closes = [float(r["close_price"]) for r in reversed(records) if r.get("close_price") is not None]
                     highs = [float(r["high_price"]) for r in reversed(records) if r.get("high_price") is not None]
@@ -324,6 +337,28 @@ class FinancialAdvisorAgent(SentinelAgent):
                 self.logger.error(f"TimescaleDB fallback query failed for {ticker}: {e}")
 
         return closes, highs, lows
+
+    def _is_valid_financial_ticker(self, symbol: str) -> bool:
+        if not symbol or not isinstance(symbol, str):
+            return False
+        s = symbol.strip().upper()
+        
+        NON_TICKER_NAMES = {
+            "ZEROHEDGE", "UN_NEWS", "AL_MONITOR", "REUTERS", "BLOOMBERG",
+            "BBC", "CNBC", "CNN", "FINANCIAL_TIMES", "WSJ", "MARKETWATCH"
+        }
+        if s in NON_TICKER_NAMES:
+            return False
+
+        if "_" in s or " " in s:
+            return False
+
+        # Known non-ticker feed source identifiers and suffixes
+        if any(s.endswith(suffix) for suffix in ["_WORLD", "_MARKETS", "_NEWS", "_BUSINESS", "_FINANCE", "_MONITOR", "_FEED", "_RSS", "_MEDIA"]):
+            return False
+
+        clean = s.replace("-", "").replace(".", "")
+        return clean.isalnum() and 1 <= len(s) <= 10
 
     async def run_scheduled_review(self):
         """Periodically evaluates watched tickers, calculates levels/indicators, and issues advice."""
@@ -336,15 +371,16 @@ class FinancialAdvisorAgent(SentinelAgent):
                 
                 # Retrieve current watched equities
                 watched_bytes = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
-                watched_tickers = [t.decode("utf-8") for t in watched_bytes] if watched_bytes else []
+                watched_tickers = [t.decode("utf-8") if isinstance(t, bytes) else str(t) for t in watched_bytes] if watched_bytes else []
                 
-                # Merge with core target tickers
-                targets = list(set(watched_tickers + ["AAPL", "NVDA", "MSFT", "BTC-USD", "ETH-USD"]))
+                # Merge with core target tickers & filter valid financial tickers
+                all_candidates = list(set(watched_tickers + ["AAPL", "NVDA", "MSFT", "BTC-USD", "ETH-USD"]))
+                targets = [t for t in all_candidates if self._is_valid_financial_ticker(t)]
                 
                 indicators_data = {}
                 for ticker in targets:
                     closes, highs, lows = await self._fetch_prices(ticker)
-                    if len(closes) >= 10:
+                    if len(closes) >= 1:
                         indicators = compute_ta_indicators(closes, highs, lows)
                         indicators["current_price"] = closes[-1]
                         indicators_data[ticker] = indicators
@@ -417,8 +453,8 @@ class FinancialAdvisorAgent(SentinelAgent):
                 await self._producer.send(self.output_topic, advice_payload, key=run_id)
                 self.logger.info(f"📊 Financial Advice Brief generated successfully. Plays: {[p.ticker for p in response.highest_conviction_plays]}")
                 
-            except SchemaViolationError as e:
-                self.logger.error(f"Financial brief schema violation: {e}")
+            except (SchemaViolationError, InferenceError) as e:
+                self.logger.error(f"Financial brief error: {e}")
             except Exception as e:
                 self.logger.error(f"Scheduled financial review failed: {e}", exc_info=True)
                 

@@ -30,12 +30,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from .base import SentinelAgent, SchemaViolationError
+from .base import SentinelAgent, SchemaViolationError, InferenceError
 from .prompts import (
     NEWS_INTEL_SYSTEM,
     NEWS_INTEL_USER_TEMPLATE,
@@ -193,22 +194,26 @@ class NewsIntelAgent(SentinelAgent):
                 schema=IntelBrief,
                 temperature=0.1,
             )
-        except SchemaViolationError as e:
+        except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Failed to publish intel brief: {e}", exc_info=True)
             return None
 
-        for entity in brief.entities:
-            await self._producer.send(
-                "agents.ontology.unknown_entities",
-                {
-                    "name": entity.name,
-                    "trace_id": message.get("trace_id"),
-                    "context": (summary or title)[:500],
-                    "source_domain": source,
-                    "frequency": 1,
-                },
-                key = entity.name
-            )
+        if brief.entities:
+            entity_tasks = [
+                self._producer.send(
+                    "agents.ontology.unknown_entities",
+                    {
+                        "name": entity.name,
+                        "trace_id": message.get("trace_id"),
+                        "context": (summary or title)[:500],
+                        "source_domain": source,
+                        "frequency": 1,
+                    },
+                    key=entity.name
+                )
+                for entity in brief.entities
+            ]
+            await asyncio.gather(*entity_tasks, return_exceptions=True)
 
         # ── STEP 3: Write pre-extracted Graph relationships to Neo4j ───────────
         if brief.graph_triples:
@@ -353,15 +358,19 @@ class NewsIntelAgent(SentinelAgent):
         This closes the loop: a news event about Iran triggers USO/BNO tracking immediately.
         """
         # We use a Python `set` to automatically remove duplicate tickers.
-        instruments_to_add = set(brief.financial_instruments_affected)
+        candidates = set(brief.financial_instruments_affected)
 
         for keyword, tickers in GEO_KEYWORD_INSTRUMENT_MAP.items():
             if keyword in title_lower:
-                instruments_to_add.update(tickers)
+                candidates.update(tickers)
+
+        instruments_to_add = {
+            t.upper().strip() for t in candidates 
+            if t and isinstance(t, str) and "_" not in t and " " not in t and 1 <= len(t.strip()) <= 10
+        }
 
         if instruments_to_add:
             try:
-                import time
                 async with self.redis.raw.pipeline(transaction=True) as pipe:
                     pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time() for ticker in instruments_to_add})
                     pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
@@ -418,7 +427,6 @@ class NewsIntelAgent(SentinelAgent):
             )
             
             if brief:
-                import time
                 run_id = f"scenario_intel_{int(time.time())}"
                 payload = {
                     "agent": self.name,
