@@ -112,9 +112,11 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     await consumer.start()
     await producer.start()
 
+    from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
+
     connector = aiohttp.TCPConnector(limit=10)
-    session = aiohttp.ClientSession(connector=connector)
-    ollama_client = OllamaClient(session)
+    session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
+    ollama_client = OllamaClient(session, redis_client=redis_client)
     neo4j_client = await get_neo4j()
     wargamer = AdversarialSimulationEngine(neo4j_client, redis_client, ollama_client, producer)
 
@@ -223,7 +225,7 @@ async def main():
     db              = await get_timescale()
     redis_client    = await get_redis()
     context_builder = ContextBuilder(db)
-    generator       = ScenarioGenerator(db) 
+    generator       = ScenarioGenerator(db, redis_client=redis_client) 
     tracker_producer = SentinelProducer()
     await tracker_producer.start()
     tracker         = ScenarioTracker(db, tracker_producer)

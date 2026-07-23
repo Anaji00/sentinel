@@ -131,7 +131,7 @@ class AviationEnricher:
             primary_entity=Entity(
                 id=icao24,
                 type=EntityType.AIRCRAFT,
-                name=callsign,
+                name=callsign or f"FLIGHT_{icao24}",
                 country_code=cc,
                 flags=flags,
             ),

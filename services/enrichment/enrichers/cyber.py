@@ -249,7 +249,7 @@ class CyberEnricher:
         
         entity = Entity(
             id=cve_id or vendor, type=EntityType.COMPANY,
-            name=vendor.title() or "Unknown Vendor",
+            name=(f"{cve_id} ({vendor.title()})" if (cve_id and vendor) else (cve_id or vendor.title() or "Vulnerability")),
             country_code="US" if vendor else None,
             flags=check_sanctions(vendor, "")
         )

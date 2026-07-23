@@ -171,7 +171,7 @@ class RuleSynthesizerAgent(SentinelAgent):
         {current_context}
 
         ACTIVE DYNAMIC CORRELATION RULES:
-        {json.dumps(rule_summaries, indent=2)}
+        {json.dumps(rule_summaries, separators=(',', ':'))}
 
         Analyze each rule's relevance to current market conditions. Identify any rules that are obsolete, contradictory, or duplicate.
         Return a JSON list of rule_ids that should be PRUNED and REMOVED from active correlation evaluation.

@@ -216,6 +216,12 @@ class ScenarioTracker:
         # the confidence. This allows human analysts to trace exactly *when* and *why* 
         # an AI decided to upgrade or downgrade a scenario's likelihood.
         try:
+            history_entry = json.dumps([{
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "confidence": new_confidence,
+                "notes": notes
+            }])
+
             if new_status:
                 await self._db.execute("""
                     UPDATE scenarios
@@ -227,8 +233,7 @@ class ScenarioTracker:
                 """, 
                     new_confidence,
                     new_status.value,
-                    f'[{{"ts":"{datetime.now(timezone.utc).isoformat()}",'
-                    f'"confidence":{new_confidence},"notes":"{notes}"}}]',
+                    history_entry,
                     scenario_id,
                 )
             else:
@@ -245,8 +250,7 @@ class ScenarioTracker:
                 """, 
                     new_confidence,
                     new_confidence,
-                    f'[{{"ts":"{datetime.now(timezone.utc).isoformat()}",'
-                    f'"confidence":{new_confidence},"notes":"{notes}"}}]',
+                    history_entry,
                     scenario_id,
                 )
         except Exception as e:

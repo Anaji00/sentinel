@@ -94,7 +94,7 @@ class ContextBuilder:
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id = ANY($1::text[])
+                   WHERE event_id = ANY($1::uuid[])
                    ORDER BY occurred_at DESC""",
                 event_ids
             )
@@ -116,17 +116,17 @@ class ContextBuilder:
         
         try:
             rel_task = neo4j_client.query("""
-                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids
+                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
                 MATCH (v)-[r*1..3]->(n)
-                RETURN coalesce(v.name, v.mmsi) as entity_id, type(r[0]) as rel, coalesce(n.name, n.mmsi) as connected,
+                RETURN coalesce(v.name, v.mmsi, v.id) as entity_id, type(r[0]) as rel, coalesce(n.name, n.mmsi, n.id) as connected,
                        labels(n) as labels
                 LIMIT 100
             """, {"ids": targets})
             
             flag_task = neo4j_client.query("""
-                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids
+                MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
                 MATCH (v)-[:FLAGGED_AS]->(f:Flag)
-                RETURN coalesce(v.name, v.mmsi) as entity_id, f.type as flag
+                RETURN coalesce(v.name, v.mmsi, v.id) as entity_id, f.type as flag
                 LIMIT 50
             """, {"ids": targets})
             

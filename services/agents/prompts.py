@@ -16,8 +16,8 @@ NEWS_INTEL_SYSTEM = """You are SENTINEL-INTEL OSINT analyst. Digest news into a 
 
 OUTPUT RULES:
 1. Return ONLY raw JSON. No markdown or prose.
-2. Catalyst: geopolitical, military, economic, cyber, sanctions, natural_disaster, regulatory, supply_chain, corporate_action, or any you feel need to be classified as.
-3. Entity types: country, company, person, vessel, military_unit, commodity, financial_instrument, threat_actor, infrastructure, or any you feel need to be classified as.
+2. Catalyst: geopolitical, military, economic, cyber, sanctions, natural_disaster, regulatory, supply_chain, corporate_action, or custom.
+3. Entity types: country, company, person, vessel, military_unit, commodity, financial_instrument, threat_actor, infrastructure, or custom.
 4. Severity: 1-5. Keep headline_summary under 120 chars."""
 
 
@@ -41,9 +41,9 @@ QUANT_PEER_DISCOVERY_SYSTEM = """You are SENTINEL-QUANT researcher. Discover cau
 
 OUTPUT RULES:
 1. Return ONLY raw JSON.
-2. Catalyst category: earnings_surprise, geopolitical_shock, supply_chain, regulatory, sector_rotation, macro_rate, commodity_move, technical_breakout, crypto_contagion, or any you feel need to be classified as.
+2. Catalyst category: earnings_surprise, geopolitical_shock, supply_chain, regulatory, sector_rotation, macro_rate, commodity_move, technical_breakout, crypto_contagion, or custom.
 3. Urgency: immediate | within_1h | within_4h | watchlist.
-4. Limit peers to max 5 clean primary US common equities. Exclude leveraged ETFs, derivaties of major stocks, and crypto tokens."""
+4. Limit peers to max 5 clean primary US common equities. Exclude leveraged ETFs, derivatives of major stocks, and crypto tokens."""
 
 
 QUANT_PEER_DISCOVERY_USER_TEMPLATE = """Discover correlated peer instruments for market anomaly:
@@ -75,8 +75,8 @@ ONTOLOGY_CATEGORIZE_SYSTEM = """You are SENTINEL-ONTOLOGY curator. Categorize un
 
 OUTPUT RULES:
 1. Return ONLY raw JSON.
-2. Primary domain: maritime, aviation, tradfi, crypto, cyber, geopolitical, energy, defense, regulatory, space, or any you feel need to be classified as.
-3. Macro concepts: energy_oil, precious_metals, sector_defense, sector_semis, cyber_warfare, macro_rates, sanctions, supply_chain, geopolitics, or any you feel need to be classified as."""
+2. Primary domain: maritime, aviation, tradfi, crypto, cyber, geopolitical, energy, defense, regulatory, space, or custom.
+3. Macro concepts: energy_oil, precious_metals, sector_defense, sector_semis, cyber_warfare, macro_rates, sanctions, supply_chain, geopolitics, or custom."""
 
 
 ONTOLOGY_CATEGORIZE_USER_TEMPLATE = """Categorize unknown entity into SENTINEL ontology:

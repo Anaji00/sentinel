@@ -58,8 +58,12 @@ class VolatilitySurfaceAgent(SentinelAgent):
             pipe.expire(f"sentinel:options:volume:{ticker}:{option_type}", 86400)
             await pipe.execute()
 
-        calls_vol = int(await self.redis.raw.get(f"sentinel:options:volume:{ticker}:CALL") or 100)
-        puts_vol = int(await self.redis.raw.get(f"sentinel:options:volume:{ticker}:PUT") or 100)
+        vals = await self.redis.raw.mget([
+            f"sentinel:options:volume:{ticker}:CALL",
+            f"sentinel:options:volume:{ticker}:PUT",
+        ])
+        calls_vol = int(vals[0] or 100)
+        puts_vol = int(vals[1] or 100)
         pc_ratio = round(puts_vol / max(1, calls_vol), 3)
 
         # Estimate IV Skew from delta or premium
@@ -77,23 +81,22 @@ class VolatilitySurfaceAgent(SentinelAgent):
         global_context = await self.fetch_global_context()
 
         user_prompt = f"""
-        As a volatility arbitrage & options desk quant, evaluate the options surface metrics:
+        Evaluate options surface metrics:
         - Symbol: {ticker}
-        - Put / Call Volume Ratio: {pc_ratio:.3f}
-        - 25-Delta Put/Call IV Skew: {iv_skew_bps:+.1f} bps
-        - Call Volatility: {call_iv:.2%} | Put Volatility: {put_iv:.2%}
+        - P/C Ratio: {pc_ratio:.3f}
+        - 25D IV Skew: {iv_skew_bps:+.1f} bps
+        - Call IV: {call_iv:.2%} | Put IV: {put_iv:.2%}
 
-        GLOBAL SWARM CONTEXT:
+        GLOBAL CONTEXT:
         {global_context}
 
-        Evaluate institutional tail-risk hedging activity, skew expansion, and downside crash protection pricing.
-        Generate structured volatility surface brief JSON.
+        Assess institutional tail-risk hedging and crash protection pricing. Generate volatility brief JSON.
         """
 
         try:
             brief: VolatilitySurfaceBrief = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You are a senior volatility desk quantitative analyst.",
+                system_prompt="You are SENTINEL Volatility Desk Analyst. Evaluate options surface metrics and tail-risk pricing. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=VolatilitySurfaceBrief,
                 temperature=0.1

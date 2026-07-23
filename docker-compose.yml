@@ -256,6 +256,8 @@ services:
     environment:
       - OLLAMA_FLASH_ATTENTION=1
       - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "ollama", "list" ]

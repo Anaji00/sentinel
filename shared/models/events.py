@@ -307,6 +307,7 @@ class CorrelationCluster(BaseModel):
     trigger_event_id: str
     supporting_event_ids: List[str] = Field(default_factory=list)
     entity_ids: List[str] = Field(default_factory=list)
+    entity_names: List[str] = Field(default_factory=list)
     description: str
     tags: List[str] = Field(default_factory=list)
     scenario: Optional[Dict[str, Any]] = None

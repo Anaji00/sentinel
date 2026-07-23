@@ -229,12 +229,12 @@ class QuantResearcherAgent(SentinelAgent):
             notional_m=notional / 1e6,
             anomaly_score=anomaly_score,
             direction=self._extract_direction(message),
-            ontology_context=json.dumps(ontology_context, default=str) if ontology_context else "None",
-            macro_context=json.dumps(macro_context, default=str) if macro_context else "None",
-            news_context=json.dumps(news_context[:8], default=str),
+            ontology_context=json.dumps(ontology_context, separators=(',', ':'), default=str) if ontology_context else "None",
+            macro_context=json.dumps(macro_context, separators=(',', ':'), default=str) if macro_context else "None",
+            news_context=json.dumps(news_context[:8], separators=(',', ':'), default=str),
             agent_memories=agent_memories,
-            graph_context=json.dumps(graph_context[:10], default=str),
-            current_watchlist=json.dumps(list(current_watchlist)[:20]),
+            graph_context=json.dumps(graph_context[:10], separators=(',', ':'), default=str),
+            current_watchlist=json.dumps(list(current_watchlist)[:20], separators=(',', ':')),
         )
 
         try:
@@ -608,7 +608,7 @@ class QuantResearcherAgent(SentinelAgent):
         return is_valid_primary_equity(ticker)
 
     @staticmethod
-    def _map_relationship_type(self, raw_type: str) -> str:
+    def _map_relationship_type(raw_type: str) -> str:
         mapping = {
             "supplier":            "SUPPLIES",
             "customer":            "PURCHASES_FROM",

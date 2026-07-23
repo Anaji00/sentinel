@@ -23,6 +23,9 @@ class DBWriter:
         except (ValueError, TypeError, AttributeError):
             event_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(event_id)))
 
+        pe_id = pe.id if pe else "UNKNOWN"
+        pe_name = (pe.name if (pe and pe.name) else pe_id) or "UNKNOWN"
+
         return (
             event_id,
             e.type.value if hasattr(e.type, 'value') else e.type,
@@ -30,9 +33,9 @@ class DBWriter:
             getattr(e, 'collected_at', datetime.now()),
             e.source,
             getattr(e, 'source_reliability', 1.0),
-            pe.id,
-            pe.type.value if hasattr(pe.type, 'value') else pe.type,
-            pe.name,
+            pe_id,
+            pe.type.value if (pe and hasattr(pe.type, 'value')) else (pe.type if pe else "unknown"),
+            pe_name,
             getattr(pe, 'flags', []),
             getattr(e, 'longitude', None),
             getattr(e, 'latitude', None),

@@ -152,9 +152,11 @@ async def main():
     }
     logger.info("Shared infrastructure connected")
 
+    from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
+
     connector = aiohttp.TCPConnector(limit=20)
-    main_session = aiohttp.ClientSession(connector=connector)
-    ollama_client = OllamaClient(main_session)
+    main_session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
+    ollama_client = OllamaClient(main_session, redis_client=shared_infra["redis"])
     
     soft_correlator = SoftCorrelator(ollama_client)
     asyncio.create_task(soft_correlator._load())
@@ -179,8 +181,8 @@ async def main():
         input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_TRADFI, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.CORRELATIONS],
         group_id="agent-quant-researcher",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     financial_advisor_agent = build_agent(
@@ -199,8 +201,8 @@ async def main():
         input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-macro-strategist",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     # Fast Operational Tier
@@ -241,8 +243,8 @@ async def main():
         input_topics=[Topics.ONTOLOGY_PROPOSALS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS],
         group_id="supervisor-group",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     macro_cointegration_agent = build_agent(
@@ -251,8 +253,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS],
         group_id="agent-macro-cointegration-engine",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     yield_curve_agent = build_agent(
@@ -261,8 +263,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
         group_id="agent-yield-curve-rates",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     volatility_surface_agent = build_agent(
@@ -271,8 +273,8 @@ async def main():
         input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
         group_id="agent-volatility-surface",
         shared_infra=shared_infra,
-        model="llama3",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:7b",
+        fallback_model="gemma:2b",
     )
 
     insider_clustering_agent = build_agent(

@@ -137,6 +137,9 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                 if len(supporting_events) > 0:
                     rule_tier_str = str(rule.get("alert_tier", "ALERT")).strip().upper()
                     alert_tier = AlertTier[rule_tier_str] if rule_tier_str in AlertTier.__members__ else AlertTier.ALERT
+                    entity_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
+                    entity_name = (event.primary_entity.name or entity_id) if event.primary_entity else "UNKNOWN"
+
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
@@ -144,9 +147,10 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         alert_tier=alert_tier,
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
-                        entity_ids=[event.primary_entity.id] if event.primary_entity else [],
-                        description=f"Dynamic rule '{rule.get('rule_name')}' triggered. Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains.",
-                        tags=["dynamic_rule", "ai_generated", f"trigger_anomaly_{event.anomaly_score:.2f}"] + rule.get("tags", [])
+                        entity_ids=[entity_id],
+                        entity_names=[entity_name],
+                        description=f"Dynamic rule '{rule.get('rule_name')}' triggered for entity '{entity_name}'. Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains.",
+                        tags=["dynamic_rule", "ai_generated", f"entity:{entity_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"] + rule.get("tags", [])
                     )
                     clusters.append(cluster)
             except Exception as e:
@@ -180,9 +184,10 @@ async def main():
     await producer.start()
     await consumer.start()
 
+    from shared.utils.ollama import OLLAMA_TIMEOUT
     connector = aiohttp.TCPConnector(limit=20)
-    session = aiohttp.ClientSession(connector=connector)
-    ollama_client = OllamaClient(session)
+    session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
+    ollama_client = OllamaClient(session, redis_client=redis_client)
     soft_correlator = SoftCorrelator(ollama_client)
     asyncio.create_task(soft_correlator._load())
 
@@ -247,6 +252,9 @@ async def main():
                     
                     supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
                     
+                    e_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
+                    e_name = (event.primary_entity.name or e_id) if event.primary_entity else "UNKNOWN"
+
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id="SEMANTIC_001",
@@ -254,9 +262,10 @@ async def main():
                         alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
                         trigger_event_id=event.event_id,
                         supporting_event_ids=supporting_ids,
-                        entity_ids=[event.primary_entity.id] if event.primary_entity else [],
-                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events. Anomalous semantic convergence detected.",
-                        tags=["semantic_match", "cross_domain", "ai_cluster", f"trigger_anomaly_{event.anomaly_score:.2f}"]
+                        entity_ids=[e_id],
+                        entity_names=[e_name],
+                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events for entity '{e_name}'. Anomalous semantic convergence detected.",
+                        tags=["semantic_match", "cross_domain", "ai_cluster", f"entity:{e_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"]
                     )
                     
                     await store.save_correlation(cluster)

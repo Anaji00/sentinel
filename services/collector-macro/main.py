@@ -68,6 +68,8 @@ FALLBACK_MAP = {
     "NQ=F": "QQQ",   # Nasdaq 100 -> QQQ ETF
     "ES=F": "SPY",   # S&P 500 -> SPY ETF
     "^VIX": "VXX",   # Volatility Index -> VXX ETF
+    "TIP":  "TIP",   # TIPS Bond ETF -> TIP ETF
+    "^TNX": "TLT",   # 10-Yr Treasury Yield -> TLT Bond ETF proxy
 }
 
 # Retry config
@@ -170,6 +172,7 @@ async def fetch_fallback_quotes(tickers: list) -> dict:
 
 async def fetch_and_publish(producer: SentinelProducer):
     logger.info("Fetching macro data...")
+    loop = asyncio.get_running_loop()
 
     tickers = list(MACRO_TICKERS.keys())
     data = await _download_with_retry(tickers)
@@ -233,11 +236,13 @@ async def fetch_and_publish(producer: SentinelProducer):
                     high_val = q["high"]
                     low_val = q["low"]
                     volume = q["volume"]
+                    fallback_symbol = FALLBACK_MAP.get(ticker, ticker)
+                    logger.info(f"Using Alpaca proxy fallback ({fallback_symbol}) for {ticker}: {current_price}")
                 else:
                     # Single-ticker yfinance fast_info fallback
                     try:
-                        def _single_yf():
-                            t = yf.Ticker(ticker)
+                        def _single_yf(tk=ticker):
+                            t = yf.Ticker(tk)
                             p = float(getattr(t.fast_info, 'last_price', 0.0) or getattr(t.fast_info, 'previous_close', 0.0) or 0.0)
                             if p <= 0:
                                 df = t.history(period="5d")
@@ -257,7 +262,7 @@ async def fetch_and_publish(producer: SentinelProducer):
                             continue
                     except Exception as s_err:
                         logger.warning(f"Single-ticker yfinance fallback error for {ticker}: {s_err}. Skipping.")
-                    logger.info(f"Using Alpaca proxy fallback ({FALLBACK_MAP[ticker]}) for {ticker}: {current_price}")
+                        continue
 
             tick_direction = (
                 "UpTick" if current_price > previous_price

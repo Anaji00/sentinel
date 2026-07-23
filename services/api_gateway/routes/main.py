@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 # ENVIRONMENT SETUP: Dynamically find the root folder and add it to the system path.
 # This ensures Python can find our custom `shared` modules (like `shared.db`).
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
@@ -82,4 +82,4 @@ if __name__ == "__main__":
     # `reload=True` means every time you save a Python file, the server 
     # automatically restarts so you can test your changes instantly.
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("services.api_gateway.routes.main:app", host="0.0.0.0", port=8000, reload=True)

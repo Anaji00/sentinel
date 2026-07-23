@@ -52,6 +52,7 @@ class SentinelAgent(ABC):
         self.name = agent_name
         self.input_topics = input_topics
         self.redis = redis_client 
+        self.redis_client = redis_client
         self.db = db_client
         self.neo4j = neo4j_client
         self._producer = producer
@@ -80,9 +81,10 @@ class SentinelAgent(ABC):
         pass
 
     async def run(self):
+        from shared.utils.ollama import OLLAMA_TIMEOUT
         connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
-        self._session = aiohttp.ClientSession(connector=connector)
-        self._llm = OllamaClient(self._session, self.model)
+        self._session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
+        self._llm = OllamaClient(self._session, self.model, redis_client=self.redis_client)
 
         self.logger.info("=" * 60)
         self.logger.info(f"SENTINEL Agent: {self.name} | Model: {self.model} @ {OLLAMA_URL}")
@@ -449,14 +451,23 @@ class SentinelAgent(ABC):
             output_payload = response.dict()
         else:
             output_payload = {"raw_text": str(response)}
-        # 3. Emit Completion
+
+        # 3. Log beginning snippet of agent output and emit telemetry
+        elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
+        try:
+            out_str = json.dumps(output_payload, separators=(',', ':'), default=str)
+        except Exception:
+            out_str = str(output_payload)
+        preview_text = out_str[:10] + "..." if len(out_str) > 10 else out_str
+        self.logger.info(f"✅ [{self.name}] Inference completed ({elapsed_ms}ms) | Output: {preview_text}")
+
         await self._producer.send(
             "agents.telemetry", 
             {
                 "agent": self.name, 
                 "status": "COMPLETE",
                 "task_id": run_id,
-                "latency_ms": round((time.monotonic() - start_time) * 1000, 2),
+                "latency_ms": elapsed_ms,
                 "output_payload": output_payload
             }
         )

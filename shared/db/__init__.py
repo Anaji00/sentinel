@@ -26,9 +26,17 @@ logger = logging.getLogger(__name__)
 # --- Redis Async Client ---
 class RedisClient:
     def __init__(self):
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        if "redis://redis:" in redis_url or "@redis:" in redis_url:
+            try:
+                import socket
+                socket.gethostbyname("redis")
+            except socket.gaierror:
+                redis_url = redis_url.replace("redis://redis:", "redis://localhost:").replace("@redis:", "@localhost:")
+
         # Decodes responses to strings natively, uses connection pooling automatically
         self._client = aioredis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379/0"), 
+            redis_url, 
             decode_responses=True,
             max_connections=300
         )
@@ -45,6 +53,12 @@ class RedisClient:
     async def zrange(self, key: str, start, end, desc=False, byscore=False):
         return await self._client.zrange(key, start, end, desc=desc, byscore=byscore)
 
+    async def get(self, key: str) -> Optional[str]:
+        return await self._client.get(key)
+
+    async def set(self, key: str, value: str, ex: Optional[int] = None):
+        await self._client.set(key, value, ex=ex)
+
     async def incr(self, key: str) -> int:
         return await self._client.incr(key)
 
@@ -56,6 +70,13 @@ class Neo4jClient:
     def __init__(self):
         self._driver = None
         self._uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        if "bolt://neo4j:" in self._uri:
+            try:
+                import socket
+                socket.gethostbyname("neo4j")
+            except socket.gaierror:
+                self._uri = self._uri.replace("bolt://neo4j:", "bolt://localhost:")
+
         neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         neo4j_pass = os.getenv("NEO4J_PASSWORD")
         if not neo4j_pass:
@@ -98,6 +119,12 @@ class TimescaleClient:
             if env_name in ("prod", "production", "staging"):
                 raise RuntimeError("CRITICAL SECURITY FAILURE: DATABASE_URL environment variable is missing.")
             dsn = "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel"
+        elif "@timescaledb:" in dsn:
+            try:
+                import socket
+                socket.gethostbyname("timescaledb")
+            except socket.gaierror:
+                dsn = dsn.replace("@timescaledb:", "@localhost:")
         async def init_connection(conn):
             await conn.set_type_codec(
                 'jsonb',
@@ -139,21 +166,21 @@ class TimescaleClient:
         return d
 
     async def query(self, sql: str, *params) -> List[Dict]:
-        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+        if len(params) == 1 and isinstance(params[0], tuple):
             params = params[0]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
             return [self._sanitize_row(r) for r in rows]
 
     async def query_one(self, sql: str, *params) -> Optional[Dict]:
-        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+        if len(params) == 1 and isinstance(params[0], tuple):
             params = params[0]
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(sql, *params)
             return self._sanitize_row(row) if row else None
     
     async def execute(self, sql: str, *params):
-        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+        if len(params) == 1 and isinstance(params[0], tuple):
             params = params[0]
         async with self._pool.acquire() as conn:
             async with conn.transaction():

@@ -6,6 +6,20 @@ import useSWR from "swr";
 import { fetcher } from "../lib/api";
 import { NormalizedEvent } from "../lib/types";
 
+// Polyfill d3 selection.prototype.interrupt to prevent 'r.interrupt is not a function' errors during SVG map transforms
+if (typeof window !== "undefined") {
+  try {
+    const d3Select = require("d3-selection");
+    if (d3Select && d3Select.selection && typeof d3Select.selection.prototype.interrupt !== "function") {
+      d3Select.selection.prototype.interrupt = function () {
+        return this;
+      };
+    }
+  } catch (e) {
+    // fallback
+  }
+}
+
 const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
 
 export default function GlobalMap() {

@@ -158,8 +158,9 @@ class MaritimeEnricher:
                 occurred_at = raw.occurred_at or datetime.now(timezone.utc),
                 source = raw.source,
                 primary_entity = Entity(
-                    id = mmsi, type=EntityType.VESSEL, 
-                    name=vessel.get("name") or meta.get("ShipName", ""),
+                    id=mmsi,
+                    type=EntityType.VESSEL,
+                    name=vessel.get("name") or meta.get("ShipName") or f"VESSEL_{mmsi}",
                     flags=flags,
                 ),
                 latitude = lat,

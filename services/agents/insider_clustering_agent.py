@@ -91,24 +91,22 @@ class InsiderClusteringAgent(SentinelAgent):
         global_context = await self.fetch_global_context()
 
         user_prompt = f"""
-        As an institutional equity analyst, evaluate SEC Form 4 insider trade cluster:
+        Evaluate SEC Form 4 insider trade cluster:
         - Symbol: {ticker}
-        - 48-Hour Filing Count: {exec_count}
-        - Total Aggregate Notional Value: ${total_notional:,.2f}
-        - Recent Filings:
-        {json.dumps([t.get('headline') for t in trades[:5]], indent=2)}
+        - 48-Hour Filings: {exec_count}
+        - Total Notional: ${total_notional:,.2f}
+        - Filings: {json.dumps([t.get('headline') for t in trades[:5]], separators=(',', ':'))}
 
-        GLOBAL SWARM CONTEXT:
+        GLOBAL CONTEXT:
         {global_context}
 
-        Evaluate C-suite conviction, open-market buys vs routine option exercises, and corporate governance signals.
-        Generate structured insider cluster brief JSON.
+        Assess C-suite conviction vs routine option exercises. Generate insider brief JSON.
         """
 
         try:
             brief: InsiderClusterBrief = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You are a senior institutional corporate governance & insider trading analyst.",
+                system_prompt="You are SENTINEL Insider Analyst. Evaluate SEC Form 4 trade clusters. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=InsiderClusterBrief,
                 temperature=0.1

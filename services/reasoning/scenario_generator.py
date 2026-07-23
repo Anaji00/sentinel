@@ -153,9 +153,10 @@ class ScenarioGenerator:
     Drop-in replacement for the Gemini-based generator — same public interface.
     """
 
-    def __init__(self, db_client):
-        # Store the database connection so we can query raw events later
+    def __init__(self, db_client, redis_client=None):
+        # Store the database connection and redis client
         self.db    = db_client
+        self.redis = redis_client
         self.model = os.getenv("AGENT_MODEL", "llama3")
         
         # Concurrency limit: one synthesis at a time per process.
@@ -172,8 +173,9 @@ class ScenarioGenerator:
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            from shared.utils.ollama import OLLAMA_TIMEOUT
             connector = aiohttp.TCPConnector(limit=3, ttl_dns_cache=300)
-            self._session = aiohttp.ClientSession(connector=connector)
+            self._session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
         return self._session
 
     async def generate(
@@ -222,7 +224,7 @@ class ScenarioGenerator:
             cluster.rule_name,
         )
 
-        client = OllamaClient(self._get_session(), self.model)
+        client = OllamaClient(self._get_session(), self.model, redis_client=self.redis)
         max_retries = 2
         retry_delay = 5.0
 
@@ -305,7 +307,7 @@ class ScenarioGenerator:
           Total:                   ~2500 tokens — leaves room for hypothesis generation
         """
         # Cap each section to stay within context window and optimize throughput
-        events_section = json.dumps(raw_events[:5], indent=2, default=str)
+        events_section = json.dumps(raw_events[:5], separators=(',', ':'), default=str)
 
         # Compact 2-hop graph representation to eliminate token bloat
         graph_items = context.get("entity_graph", [])[:5]
@@ -323,7 +325,7 @@ class ScenarioGenerator:
         else:
             graph_section = "None"
 
-        patterns_section = json.dumps(patterns[:3], indent=2, default=str)
+        patterns_section = json.dumps(patterns[:3], separators=(',', ':'), default=str)
 
         headlines = context.get("recent_headlines", [])[:5]
         headlines_section = "\n".join(f"• {h}" for h in headlines) if headlines else "None available"
@@ -334,7 +336,7 @@ class ScenarioGenerator:
             agent_section = f"""
 === AGENT INTELLIGENCE BRIEFS ===
 Pre-analyzed intelligence from the SENTINEL Intel Agent:
-{json.dumps(agent_intel[:2], indent=2, default=str)}
+{json.dumps(agent_intel[:2], separators=(',', ':'), default=str)}
 """
 
         return f"""=== ANOMALY CLUSTER ===

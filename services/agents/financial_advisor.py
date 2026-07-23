@@ -278,22 +278,19 @@ class FinancialAdvisorAgent(SentinelAgent):
             )
         
         user_prompt = f"""
-        As a quantitative researcher at Jane Street, formulate an investment advisory brief FOR A LIVE EVENT TRIGGER.
-        
-        MARKET DATA & TA LEVEL INDICATORS FOR THE TRIGGERED TICKERS:
-        {json.dumps(indicators_data, indent=2, default=str)}
-        
+        Formulate investment advisory brief for live event trigger:
+
+        MARKET DATA & TA LEVEL INDICATORS:
+        {json.dumps(indicators_data, separators=(',', ':'), default=str)}
+
         GLOBAL CONTEXT:
         {global_context}
-        
-        MACRO RISK CIRCUIT BREAKER DIRECTIVE:
+
+        MACRO CIRCUIT BREAKER DIRECTIVE:
         {kelly_mandate}
-        
-        Perform a mathematical assessment of entry levels, support clusters, stop-losses, and targets.
-        Factor Sortino Ratio downside semi-variance into conviction scores to protect allocations against asymmetric downside tail risk.
-        Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0).
-        
-        Generate the structured JSON advice.
+
+        Assess entry levels, support clusters, stop-losses, targets, and Kelly allocations for positive-EV setups (R:R > 2.0).
+        Generate structured advice JSON.
         """
 
         run_id = f"fin_advisor_live_{int(time.time())}"
@@ -303,10 +300,7 @@ class FinancialAdvisorAgent(SentinelAgent):
         try:
             response: FinancialAdviceBrief = await self._execute_with_telemetry(
                 message=msg,
-                system_prompt=(
-                    "You are a Senior Quantitative Advisor at Jane Street. "
-                    "Determine the market regime, highest-conviction plays, and hedging strategy for the triggered assets, and return them strictly in JSON."
-                ),
+                system_prompt="You are SENTINEL Quant Advisor. Determine market regime, highest-conviction plays, and hedging strategy. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=FinancialAdviceBrief,
                 temperature=0.1
@@ -612,19 +606,16 @@ class FinancialAdvisorAgent(SentinelAgent):
                 global_context = await self.fetch_global_context()
                 
                 user_prompt = f"""
-                As a quantitative researcher at Jane Street, formulate an investment advisory brief.
-                
+                Formulate investment advisory brief for scheduled review:
+
                 MARKET DATA & TA LEVEL INDICATORS:
-                {json.dumps(indicators_data, indent=2, default=str)}
-                
+                {json.dumps(indicators_data, separators=(',', ':'), default=str)}
+
                 GLOBAL CONTEXT:
                 {global_context}
-                
-                Perform a mathematical assessment of entry levels, support clusters, stop-losses, and targets.
-                Use the Kelly Criterion to allocate theoretical capital sizes to highest-conviction plays.
-                Focus on establishing positive-EV setups with asymmetric R:R (Risk/Reward > 2.0).
-                
-                Generate the structured JSON advice.
+
+                Assess entry levels, support clusters, stop-losses, targets, and Kelly allocations for positive-EV setups (R:R > 2.0).
+                Generate structured advice JSON.
                 """
 
                 run_id = f"fin_advisor_run_{int(time.time())}"
@@ -634,10 +625,7 @@ class FinancialAdvisorAgent(SentinelAgent):
                 
                 response: FinancialAdviceBrief = await self._execute_with_telemetry(
                     message=msg,
-                    system_prompt=(
-                        "You are a Senior Quantitative Advisor at Jane Street. "
-                        "Determine the market regime, highest-conviction plays, and hedging strategy, and return them strictly in JSON."
-                    ),
+                    system_prompt="You are SENTINEL Quant Advisor. Determine market regime, highest-conviction plays, and hedging strategy. Return ONLY raw JSON.",
                     user_prompt=user_prompt,
                     schema=FinancialAdviceBrief,
                     temperature=0.1

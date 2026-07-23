@@ -14,7 +14,11 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     
     const wsUrl = `${host}/api/v1/events/ws/live-feed`;
 
+    let isMounted = true;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+
     function connect() {
+      if (!isMounted) return;
       try {
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
@@ -35,12 +39,13 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         };
 
         ws.onerror = () => {
-          ws.close();
+          // Browser will automatically close socket and trigger onclose
         };
 
         ws.onclose = () => {
-          // Reconnect after 3 seconds if disconnected
-          setTimeout(connect, 3000);
+          if (isMounted) {
+            reconnectTimer = setTimeout(connect, 5000);
+          }
         };
       } catch (err) {
         console.warn('WebSocket connection fallback to polling:', err);
@@ -50,7 +55,11 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     connect();
 
     return () => {
+      isMounted = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
         wsRef.current.close();
       }
     };

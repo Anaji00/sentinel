@@ -34,6 +34,7 @@ class GraphWriter:
                 "data": {
                     "label": "Vessel",
                     "primary_domain": "maritime",
+                    "name": data.get("name") or mmsi,
                     "macro_concepts": [],
                 }
             }
@@ -60,6 +61,7 @@ class GraphWriter:
                 "data": {
                     "label": "Aircraft",
                     "primary_domain": "aviation",
+                    "name": data.get("callsign") or icao24,
                     "macro_concepts": [],
                 }
             }

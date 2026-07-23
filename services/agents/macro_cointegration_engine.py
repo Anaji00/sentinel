@@ -57,10 +57,11 @@ class MacroAssetCointegrationEngine(SentinelAgent):
         if not exposed_equities:
             return None
 
+        keys = [f"sentinel:quotes:latest:{t}" for t in exposed_equities]
+        raw_micros = await self.redis.raw.mget(keys)
+
         tasks = []
-        for micro_ticker in exposed_equities:
-            # FIX: Await the async redis call (was unawaited coroutine in original)
-            raw_micro = await self.redis.raw.get(f"sentinel:quotes:latest:{micro_ticker}")
+        for micro_ticker, raw_micro in zip(exposed_equities, raw_micros):
             if not raw_micro:
                 continue
             try:

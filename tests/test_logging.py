@@ -88,10 +88,34 @@ def test_batch_kafka_logger():
     klogger.log_error("events.raw.maritime", "TimeoutError")
 
     time.sleep(0.06)
-    klogger._maybe_flush()
+    klogger.flush()
 
     assert len(records) == 1
     msg = records[0].getMessage()
     assert "KAFKA BATCH [test_service]" in msg
     assert "events.raw.maritime: 10" in msg
     assert "events.raw.adsb: 5" in msg
+
+
+def test_ollama_redis_cache():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from pydantic import BaseModel
+    from shared.utils.ollama import OllamaClient
+
+    class SampleSchema(BaseModel):
+        result: str
+
+    redis_mock = MagicMock()
+    raw_mock = MagicMock()
+    raw_mock.get = AsyncMock(return_value='{"result": "cached_response"}')
+    redis_mock.raw = raw_mock
+
+    session_mock = MagicMock()
+    client = OllamaClient(session_mock, model="gemma:2b", redis_client=redis_mock)
+
+    async def run():
+        res = await client.infer("sys", "user", SampleSchema)
+        assert res.result == "cached_response"
+
+    asyncio.run(run())

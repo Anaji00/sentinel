@@ -16,7 +16,7 @@ load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_neo4j, get_redis
-from shared.utils.ollama import OllamaClient
+from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 logger = logging.getLogger("reasoning.wargamer")
@@ -106,8 +106,8 @@ async def main_pipeline_pump():
     producer = SentinelProducer()
     await producer.start()
     
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=5)) as session:
-        engine = AdversarialSimulationEngine(neo4j, redis, OllamaClient(session), producer)
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=5), timeout=OLLAMA_TIMEOUT) as session:
+        engine = AdversarialSimulationEngine(neo4j, redis, OllamaClient(session, redis_client=redis), producer)
         consumer = SentinelConsumer(topics = [Topics.CORRELATIONS], group_id="simulation-wargamer", auto_offset_reset="latest")
         await consumer.start()
 

@@ -133,6 +133,7 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                 """
             )
             for r in recent_rows:
+                e_name = r["primary_entity_name"] or r["primary_entity_id"] or "ENTITY_LIVE"
                 evt = {
                     "event_id": str(r["event_id"]),
                     "type": r["type"],
@@ -141,7 +142,9 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                     "anomaly_score": float(r["anomaly_score"] or 0.5),
                     "region": r["region"] or "Global",
                     "headline": r["headline"] or f"Event {r['event_id']} recorded",
-                    "primary_entity_name": r["primary_entity_name"] or r["primary_entity_id"] or "ENTITY_LIVE"
+                    "primary_entity_name": e_name,
+                    "entity_name": e_name,
+                    "primary_entity_id": str(r["primary_entity_id"] or e_name)
                 }
                 await websocket.send_json(evt)
                 await asyncio.sleep(0.1)

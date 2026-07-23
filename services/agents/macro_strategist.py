@@ -72,13 +72,13 @@ class MacroStrategistAgent(SentinelAgent):
             self.read_agent_memories(limit=10)
         )
         
-        trigger_context = f"\nTRIGGERING LIVE EVENT: {json.dumps(trigger_event, default=str)}\n" if trigger_event else ""
+        trigger_context = f"\nTRIGGERING LIVE EVENT: {json.dumps(trigger_event, separators=(',', ':'), default=str)}\n" if trigger_event else ""
 
         user_prompt = f"""
         Review the following systemic shifts over the last 24 hours:
         {trigger_context}
         Ontology Co-occurrences: {cooccurrence}
-        Sector Data: {json.dumps(sector_data)}
+        Sector Data: {json.dumps(sector_data, separators=(',', ':'), default=str)}
         
         {global_context}
         

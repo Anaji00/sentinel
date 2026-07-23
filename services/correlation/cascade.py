@@ -74,6 +74,9 @@ class GeopoliticalCascadeEngine:
                 f"Domains ({len(domains_present)}): {list(domains_present)} | Headlines: {headlines_list}"
             )
 
+            entity_id = (getattr(event.primary_entity, "id", None) or key) if hasattr(event, "primary_entity") and event.primary_entity else key
+            entity_name = (getattr(event.primary_entity, "name", None) or entity_id) if hasattr(event, "primary_entity") and event.primary_entity else key
+
             import uuid
             cluster = CorrelationCluster(
                 correlation_id=str(uuid.uuid4()),
@@ -82,12 +85,13 @@ class GeopoliticalCascadeEngine:
                 alert_tier=AlertTier.CRITICAL if flashpoint_index >= 75.0 else AlertTier.ELEVATED,
                 trigger_event_id=supporting_ids[0],
                 supporting_event_ids=supporting_ids[1:],
-                entity_ids=[key],
+                entity_ids=[entity_id],
+                entity_names=[entity_name],
                 description=(
-                    f"Geopolitical Cascade Alert (Flashpoint Index: {flashpoint_index}/100) in '{key}' "
+                    f"Geopolitical Cascade Alert (Flashpoint Index: {flashpoint_index}/100) for '{entity_name}' "
                     f"across domains {list(domains_present)}. Co-occurring events include: {'; '.join(headlines_list)}"
                 ),
-                tags=["geopolitical_cascade", key.lower().replace(" ", "_")]
+                tags=["geopolitical_cascade", key.lower().replace(" ", "_"), f"entity:{entity_name}"]
             )
             return cluster
 

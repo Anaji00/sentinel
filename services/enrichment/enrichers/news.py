@@ -16,8 +16,55 @@ import spacy
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions
+from shared.utils.equities import is_valid_primary_equity
 
 logger = logging.getLogger("enrichment.news")
+
+COMPANY_SUFFIX_PATTERN = re.compile(
+    r"\b(Inc|Corp|Corporation|Co|Company|Ltd|Limited|LLC|PLC|SA|AG|NV|SE|Holdings|Group|"
+    r"Technologies|Tech|Therapeutics|Pharmaceuticals|Pharma|Biotech|Capital|Partners|Bank|"
+    r"Financial|Motors|Airlines|Energy|Resources|Mining|Semiconductor|Systems|Software|Labs|"
+    r"Brands|Enterprises|Stores|Aviation|Maritime)\b",
+    re.IGNORECASE
+)
+
+GOV_COUNTRY_KEYWORDS = {
+    "US", "USA", "UNITED STATES", "CHINA", "RUSSIA", "NATO", "EU", "UN", "UKRAINE", 
+    "IRAN", "ISRAEL", "TAIWAN", "FED", "SEC", "TREASURY", "PENTAGON", "KREMLIN", "WHITE HOUSE", "CISA"
+}
+
+# Dynamic Stock Ticker & Cashtag Extractor Pattern:
+# Matches $NVDA, (AAPL), [TSLA], NASDAQ: MSFT, NYSE: BABA, etc.
+RE_TICKER_EXTRACT = re.compile(
+    r"\b\$([A-Z]{1,5})\b|\((?:NASDAQ|NYSE|AMEX|INDEX):\s*([A-Z]{1,5})\)|\b(?:NASDAQ|NYSE|AMEX):\s*([A-Z]{1,5})\b|\(([A-Z]{1,5})\)|\[([A-Z]{1,5})\]",
+    re.IGNORECASE
+)
+
+def resolve_news_entity_type(name: str, source: str) -> EntityType:
+    """Dynamically classifies entity names into EntityType (ticker symbols, corporations, countries, media)."""
+    if not name:
+        return EntityType.UNKNOWN
+    
+    clean = name.strip("$,.():;[]{}'\"").strip()
+    clean_upper = clean.upper()
+
+    # 1. Dynamic Stock Ticker / Equity Instrument Check (e.g. $NVDA, AAPL, TSLA, BTC)
+    if is_valid_primary_equity(clean_upper) or (clean.isupper() and 1 <= len(clean) <= 5 and clean.isalpha()):
+        return EntityType.COMPANY
+
+    # 2. Corporate Suffix & Industry Keyword Check
+    if COMPANY_SUFFIX_PATTERN.search(clean):
+        return EntityType.COMPANY
+
+    # 3. Geopolitical & Government / Country Check
+    if clean_upper in GOV_COUNTRY_KEYWORDS:
+        return EntityType.COUNTRY
+
+    # 4. Media Source Fallback
+    if clean_upper == source.strip().upper() or any(m in clean.lower() for m in ("reuters", "bloomberg", "cnbc", "wsj", "ft", "feed", "news")):
+        return EntityType.MEDIA_SOURCE
+
+    return EntityType.COMPANY if (clean[0].isupper() and " " in clean) else EntityType.UNKNOWN
 
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -200,7 +247,23 @@ class NewsEnricher:
             tags.extend(ofac_hits)
 
         # Extract named entities using spaCy
-        named_entities = []
+        # 1. Dynamic Stock Ticker & Cashtag Extractor ($NVDA, (AAPL), [TSLA], NASDAQ: MSFT)
+        extracted_tickers = []
+        for groups in RE_TICKER_EXTRACT.findall(combined_text[:600]):
+            for candidate in groups:
+                if candidate:
+                    clean_t = candidate.strip("$,.():;[]{}'\"").upper()
+                    if is_valid_primary_equity(clean_t):
+                        extracted_tickers.append(clean_t)
+
+        # 2. Standalone word equity check for major tickers
+        for word in combined_text[:400].split():
+            clean_word = word.strip("$,.():;[]{}'\"").upper()
+            if 1 <= len(clean_word) <= 5 and clean_word.isalpha() and is_valid_primary_equity(clean_word):
+                extracted_tickers.append(clean_word)
+
+        # 3. spaCy Named Entity Recognition
+        named_entities = list(dict.fromkeys(extracted_tickers))
         if nlp:
             try:
                 doc = nlp(combined_text[:500])
@@ -210,7 +273,7 @@ class NewsEnricher:
             except Exception as e:
                 logger.debug(f"spaCy NER extraction failed: {e}")
         
-        unique_entities = list(set(named_entities))
+        unique_entities = list(dict.fromkeys(named_entities))
         tags.extend(unique_entities)
             
         # Rigorous Mathematical Anomaly Scoring
@@ -250,7 +313,13 @@ class NewsEnricher:
             except Exception as e:
                 logger.debug(f"Failed to push to ontology proposals: {e}")
 
-        entity = Entity(id=raw.source, type=EntityType.MEDIA_SOURCE, name=raw.source)
+        primary_name = unique_entities[0] if unique_entities else raw.source
+        entity_type = resolve_news_entity_type(primary_name, raw.source)
+        entity = Entity(
+            id=primary_name,
+            type=entity_type,
+            name=primary_name
+        )
     
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,

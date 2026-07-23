@@ -176,11 +176,12 @@ async def stream_equities(producer: SentinelProducer, redis_client):
                     
                 if to_add or to_remove:
                     current_subs = desired_subs
-                    logger.info("Finnhub: Synced subs. Currently tracking %d/50 limit.", len(current_subs))
+                    logger.info(f"📈 Finnhub: Synced subscriptions ({len(current_subs)}/50 limit): {', '.join(sorted(current_subs))}")
                 else:
-                    logger.info(f"Finnhub Heartbeat: Monitoring {len(current_subs)} symbols (Awaiting live trades).")
-                    # Show exactly which tickers are currently being streamed
-                    logger.info("Active Tickers: %s", ", ".join(current_subs))
+                    ticks = getattr(sync_subscriptions, "_ticks", 0) + 1
+                    setattr(sync_subscriptions, "_ticks", ticks)
+                    if ticks % 5 == 0:
+                        logger.info(f"📊 Finnhub Heartbeat: Streaming {len(current_subs)} symbols | Active: {', '.join(sorted(current_subs))}")
             except Exception as e:
                 logger.error("Sync Task Error: %s", e, exc_info=True)
             await asyncio.sleep(60)
@@ -336,7 +337,12 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 logger.info(f"Published {count} options flow events for {ticker} to Kafka.")
                         else:
                             text = await resp.text()
-                            logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
+                            if resp.status in (401, 403):
+                                logger.warning(f"Alpaca Options API returned HTTP {resp.status} (Subscription level restricted). Throttling retry 10m.")
+                                await asyncio.sleep(600)
+                                break
+                            else:
+                                logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
                             
             except Exception as e:
                 logger.error(f"Error in Options flow collector: {e}", exc_info=True)

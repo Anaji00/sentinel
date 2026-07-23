@@ -12,6 +12,7 @@ Features:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -26,8 +27,9 @@ logger = logging.getLogger("sentinel.ollama")
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b")
-# Dynamic timeout: 30 seconds default allows fast offloading to fallback models
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "30.0")))
+# Dynamic timeout: Enforce 180 seconds minimum to allow local CPU/GPU Llama3 inference completion
+_raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "180.0"))
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(180.0, _raw_timeout))
 
 # Circuit breaker config
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
@@ -68,15 +70,17 @@ class SchemaViolationError(Exception):
 class OllamaClient:
     """
     Async Ollama client with schema enforcement, context sizing optimizations,
-    adaptive circuit breaker, and resilient model fallback retry chains.
+    adaptive circuit breaker, resilient model fallback retry chains, and optional Redis prompt caching.
     """
     def __init__(
         self,
         session: aiohttp.ClientSession,
         model: str = OLLAMA_MODEL,
+        redis_client: Optional[Any] = None,
     ):
         self._session = session
         self.model = model
+        self.redis_client = redis_client
         # Circuit breaker state (per-model)
         self._consecutive_timeouts: Dict[str, int] = {}
         self._circuit_open_until: Dict[str, float] = {}
@@ -168,8 +172,8 @@ class OllamaClient:
                         return recovered[0]
                     return None
                     
-                # Prioritize smaller/faster models (containing 2b, 1.5b, 3b, gemma, qwen, tiny)
-                priority_patterns = ["2b", "1.5b", "3b", "gemma", "qwen", "tiny"]
+                # Prioritize lightweight models (gemma first, then 2b, 1.5b, 3b, qwen, tiny)
+                priority_patterns = ["gemma", "2b", "1.5b", "3b", "qwen", "tiny"]
                 for pattern in priority_patterns:
                     for alt in alternatives:
                         if pattern in alt.lower():
@@ -219,6 +223,20 @@ class OllamaClient:
                 )
             raise InferenceError(f"Circuit breaker OPEN for model '{active_model}'")
 
+        # Check Redis prompt cache if available
+        cache_key = None
+        if self.redis_client is not None:
+            try:
+                h = hashlib.sha256(f"{active_model}:{system_prompt}:{user_prompt}".encode("utf-8")).hexdigest()
+                cache_key = f"sentinel:llm_cache:{h}"
+                cached_data = await self.redis_client.raw.get(cache_key)
+                if cached_data:
+                    parsed = json.loads(cached_data)
+                    return schema(**parsed)
+            except Exception as ce:
+                logger.debug(f"Redis cache lookup bypass: {ce}")
+                pass
+
         semaphore = get_ollama_semaphore(active_model)
 
         schema_dict = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema.schema()
@@ -252,6 +270,12 @@ class OllamaClient:
                     last_error = f"No valid JSON found in: {raw_text[:300]}"
                     logger.warning(f"Ollama attempt {attempt+1} ({active_model}): no JSON — {last_error[:100]}")
                     continue
+
+                if cache_key and self.redis_client is not None:
+                    try:
+                        await self.redis_client.raw.set(cache_key, json.dumps(parsed), ex=3600)
+                    except Exception:
+                        pass
 
                 return schema(**parsed)
                 
@@ -387,7 +411,7 @@ class OllamaClient:
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
-                "num_predict": min(num_predict or 256, 768),
+                "num_predict": min(num_predict or 192, 512),
                 "num_ctx": 2048,  # Cap context size at 2048 to minimize KV cache allocation and maximize throughput
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
