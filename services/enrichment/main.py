@@ -260,6 +260,14 @@ async def main():
                             # FIX: write_events_batch is async — call it directly,
                             # not via run_in_executor (which is for sync functions).
                             await db.write_events_batch(batch_to_write)
+                            # Broadcast every enriched event to Redis PubSub for real-time WebSocket live feed
+                            try:
+                                redis_client = await get_redis()
+                                for evt in batch_to_write:
+                                    payload = json.dumps(evt.model_dump(), default=str)
+                                    await redis_client.raw.publish("sentinel:events:live", payload)
+                            except Exception as pub_err:
+                                logger.debug(f"Redis pubsub publish warning: {pub_err}")
                             break # Success
                         except Exception as write_err:
                             if attempt == 2: 

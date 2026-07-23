@@ -17,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from shared.utils.logging import setup_sentinel_logging
+from shared.utils.logging import setup_sentinel_logging, ThrottledLogger
 
 logger = setup_sentinel_logging("telemetry-worker", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
+throttled_logger = ThrottledLogger(logger, default_interval_sec=10.0)
 
 from shared.kafka import SentinelConsumer, Topics
 from shared.db import get_timescale
@@ -67,7 +68,7 @@ async def process_telemetry(consumer, db):
                             datetime.now(timezone.utc)
                         )
                     except Exception as parse_e:
-                        logger.error(f"Failed parsing telemetry message: {parse_e}")
+                        throttled_logger.error("parse_error", f"Failed parsing telemetry message: {parse_e}")
             await consumer.commit()
         except Exception as batch_error:
             logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}")

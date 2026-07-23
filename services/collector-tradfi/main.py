@@ -29,8 +29,9 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.equities import is_valid_primary_equity
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
-logger = logging.getLogger("collector.tradfi")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 REDIS_EQUITIES_KEY = "sentinel:watched:equities"

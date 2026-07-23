@@ -68,16 +68,16 @@ services:
     ports:
       - "5432:5432"
     environment:
-      # Remove static credentials. Interpolate from host .env variables.
-      POSTGRES_USER: ${POSTGRES_USER:-sentinel}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel_local_dev}
-      POSTGRES_DB: ${POSTGRES_DB:-sentinel}
+      # Interpolated from host .env variables.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     command: postgres -c shared_preload_libraries=timescaledb
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
       - ./shared/db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql
     healthcheck:
-      test: pg_isready -U ${POSTGRES_USER:-sentinel} -d ${POSTGRES_DB:-sentinel}
+      test: pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
       interval: 10s
       timeout: 5s
       retries: 10
@@ -91,8 +91,8 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      # Parameterized auth.
-      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-sentinel_graph}
+      # Parameterized auth from .env.
+      NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'
       # Severely restrict APOC execution. Removes apoc.export.* and apoc.load.* # which are common attack vectors for Remote Code Execution / Host file exfiltration.
       NEO4J_dbms_security_procedures_unrestricted: apoc.meta.*,apoc.algo.*,apoc.spatial.*,apoc.coll.*
@@ -143,6 +143,9 @@ services:
     container_name: sentinel-enrichment
     command: python services/enrichment/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       migrator:
@@ -163,6 +166,9 @@ services:
     container_name: sentinel-correlation
     command: python services/correlation/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -181,6 +187,9 @@ services:
     container_name: sentinel-reasoning
     command: python services/reasoning/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -197,6 +206,9 @@ services:
     container_name: sentinel-tradfi
     command: python services/collector-tradfi/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -209,6 +221,9 @@ services:
     container_name: sentinel-crypto
     command: python services/collector-crypto/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -221,6 +236,9 @@ services:
     container_name: sentinel-prediction
     command: python services/collector-prediction/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -269,6 +287,9 @@ services:
     container_name: sentinel-cyber
     command: python services/collector-cyber/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       redis:
@@ -281,6 +302,9 @@ services:
     command: "python services/collector-radar/main.py"
     container_name: sentinel-radar
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       redis:
@@ -293,6 +317,9 @@ services:
     container_name: sentinel-ais
     command: python services/collector-ais/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -305,6 +332,9 @@ services:
     container_name: sentinel-adsb
     command: python services/collector-adsb/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -317,6 +347,9 @@ services:
     container_name: sentinel-news
     command: python services/collector-news/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -329,6 +362,9 @@ services:
     container_name: sentinel-macro
     command: python services/collector-macro/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -339,8 +375,11 @@ services:
   api-gateway:
     build: .
     container_name: sentinel-api_gateway
-    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --reload
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     ports:
       - "8000:8000"
     restart: always
@@ -359,6 +398,9 @@ services:
     container_name: sentinel-agents
     command: python services/agents/main.py
     env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     environment:
       PYTHONWARNINGS: "ignore::UserWarning"
     restart: always

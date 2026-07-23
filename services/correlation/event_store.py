@@ -116,6 +116,10 @@ class EventStore:
         the correlation engine from processing the next event.
         """
         try:
+            tier_map = {"WATCH": 1, "ALERT": 2, "ELEVATED": 3, "INTELLIGENCE": 4, "CRITICAL": 5}
+            tier_str = cluster.alert_tier.value if hasattr(cluster.alert_tier, 'value') else str(cluster.alert_tier)
+            tier_int = tier_map.get(str(tier_str).upper(), 2)
+
             await self._db.execute("""
                 INSERT INTO correlations (
                     correlation_id, rule_id, rule_name, alert_tier,
@@ -126,7 +130,7 @@ class EventStore:
                 cluster.correlation_id,
                 cluster.rule_id,
                 cluster.rule_name,
-                cluster.alert_tier.value if hasattr(cluster.alert_tier, 'value') else cluster.alert_tier,
+                tier_int,
                 cluster.detected_at,
                 cluster.trigger_event_id,
                 cluster.supporting_event_ids,

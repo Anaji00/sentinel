@@ -27,6 +27,17 @@ export const apiClient = axios.create({
     },
 });
 
+// Response interceptor to handle REST status codes cleanly across the frontend
+apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+        const status = error.response?.status;
+        const endpoint = error.config?.url || 'API';
+        console.warn(`[Sentinel API] Endpoint '${endpoint}' returned HTTP status ${status || 'Network/Connection Unavailable'}`);
+        return Promise.reject(error);
+    }
+);
+
 /**
  * A simple data fetcher function, often used with data-fetching libraries like SWR or React Query.
  * It takes a URL, makes a GET request using our pre-configured `apiClient`, and returns the response data.
@@ -34,4 +45,4 @@ export const apiClient = axios.create({
  * @param {string} url - The API endpoint to fetch data from (e.g., '/users').
  * @returns {Promise<any>} A promise that resolves to the JSON data from the API response.
  */
-export const fetcher = (url: string) => apiClient.get(url).then((res) => res.data);
+export const fetcher = (url: string) => apiClient.get(url).then((res) => res.data).catch(() => null);

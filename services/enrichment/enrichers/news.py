@@ -213,18 +213,22 @@ class NewsEnricher:
         unique_entities = list(set(named_entities))
         tags.extend(unique_entities)
             
-        anomaly, semantic_tags = await self.scorer.score_news(named_entities = unique_entities, sentiment = sentiment, reliability = reliability)
-        tags.extend(semantic_tags)
-        
-        if ofac_hits:
-            anomaly = min(1.0, anomaly + 0.4) # Severe bump for sanctions mention
+        # Rigorous Mathematical Anomaly Scoring
+        sentiment_score = abs(float(sentiment or 0.0)) * 0.40
+        rel_weight = min(1.0, max(0.2, float(reliability or 0.8)))
+        entity_score = min(0.30, len(unique_entities) * 0.05)
+        raw_anomaly = (sentiment_score + entity_score) * rel_weight
 
-        # Threat keyword boosting
+        if ofac_hits:
+            raw_anomaly = min(1.0, raw_anomaly + 0.40)
+
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
         if is_threat:
-            anomaly = max(0.65, anomaly + 0.35)
+            raw_anomaly = min(1.0, max(0.65, raw_anomaly + 0.35))
 
-        if anomaly < 0.3:
+        anomaly = round(raw_anomaly, 3)
+
+        if anomaly < 0.35:
             return None
         
         logger.info(f"Enriched News | Anomaly: {anomaly} | Sentiment: {sentiment} | {title[:60]}...")

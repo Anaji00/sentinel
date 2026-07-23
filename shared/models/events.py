@@ -57,11 +57,12 @@ class EntityType(str, Enum):
     MEDIA_SOURCE = "media_source"
     UNKNOWN = "unknown"
 
-class AlertTier(int, Enum):
-    WATCH = 1
-    ALERT = 2
-    INTELLIGENCE = 3
-    CRITICAL = 4  # Adding missing mapping tier
+class AlertTier(str, Enum):
+    WATCH = "WATCH"
+    ALERT = "ALERT"
+    ELEVATED = "ELEVATED"
+    INTELLIGENCE = "INTELLIGENCE"
+    CRITICAL = "CRITICAL"
 
 class ScenarioStatus(str, Enum):
     HYPOTHESIS = "hypothesis"

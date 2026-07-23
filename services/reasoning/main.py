@@ -154,7 +154,6 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                 batch_tasks = []
                 dlq_payloads = []
                 for tp, msgs in batches.items():
-                    logger.info(f"Received batch of {len(msgs)} messages to reason on partition {tp.topic}:{tp.partition}")
                     for message in msgs:
                         try:
                             raw_data = json.loads(message.value.decode('utf-8'))
@@ -162,7 +161,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                             if tp.topic == "agents.intel.briefs":
                                 brief = raw_data.get("brief", {})
                                 headline = brief.get("headline", "No headline")
-                                logger.info(f"Received intel brief on agents.intel.briefs: {headline} (severity: {brief.get('severity')})")
+                                logger.debug(f"Received intel brief: {headline} (severity: {brief.get('severity')})")
                                 if brief.get("severity", 0) >= 3:
                                     await redis_client.raw.set(
                                         "sentinel:intel:briefs:latest",
@@ -172,7 +171,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                 continue
                                 
                             cluster = CorrelationCluster(**raw_data)
-                            logger.info(f"Received correlation cluster {cluster.correlation_id} (rule: {cluster.rule_name}, tier: {cluster.alert_tier.name}) for reasoning analysis")
+                            logger.debug(f"Received correlation cluster {cluster.correlation_id} for reasoning analysis")
                             
                             task = asyncio.create_task(
                                 sem_process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)

@@ -38,7 +38,7 @@ async def get_active_scenarios(
             query += f" WHERE status = ${len(params)}"
         params.append(limit)
         query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
-        return await db.query(query, tuple(params))
+        return await db.query(query, *params)
     except Exception as e:
         logger.error(f"Error fetching scenarios: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")

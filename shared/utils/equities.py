@@ -210,3 +210,27 @@ def is_valid_primary_equity(ticker: str) -> bool:
     """
     res = fast_classify_equity(ticker)
     return res["is_primary_equity"]
+
+
+async def is_valid_primary_equity_async(ticker: str, redis_client=None) -> bool:
+    """
+    Async validation against structural filters AND Redis dynamic US equities universe set.
+    Filters out non-existent/hallucinated tickers (e.g. CPCG).
+    """
+    if not is_valid_primary_equity(ticker):
+        return False
+
+    sym = ticker.strip().upper()
+    if sym in ALLOWED_CRYPTO_TOKENS or sym in PRIMARY_EQUITY_EXCEPTIONS:
+        return True
+
+    if redis_client and hasattr(redis_client, "raw"):
+        try:
+            exists = await redis_client.raw.exists("sentinel:equities:valid_set")
+            if exists:
+                is_valid = await redis_client.raw.sismember("sentinel:equities:valid_set", sym)
+                return bool(is_valid)
+        except Exception:
+            pass
+
+    return True

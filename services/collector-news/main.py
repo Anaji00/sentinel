@@ -35,11 +35,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
  
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-)
-logger = logging.getLogger("collector.news")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("collector.news", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
  
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent

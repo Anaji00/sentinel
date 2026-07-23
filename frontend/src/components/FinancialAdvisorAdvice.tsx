@@ -23,6 +23,9 @@ interface TradingSignal {
   risk_reward_ratio: number;
   kelly_allocation_pct: number;
   conviction_score: number;
+  sigma_shock?: number;
+  expected_move_usd?: number;
+  expected_move_pct?: number;
   technical_indicators?: TechnicalIndicators;
   quantitative_rationale: string;
 }
@@ -46,30 +49,7 @@ export default function FinancialAdvisorAdvice() {
   );
 
   const brief = data?.brief;
-  const plays = brief?.highest_conviction_plays?.length ? brief.highest_conviction_plays : [
-    {
-      ticker: 'NVDA',
-      action: 'BUY' as const,
-      entry_level: 122.50,
-      target_price: 148.00,
-      stop_loss: 116.20,
-      risk_reward_ratio: 3.42,
-      kelly_allocation_pct: 12.5,
-      conviction_score: 0.88,
-      quantitative_rationale: 'RSI divergence + 12 EMA cross. Options Put/Call IV skew compression signals upside breakout.',
-    },
-    {
-      ticker: 'XLE',
-      action: 'BUY' as const,
-      entry_level: 88.20,
-      target_price: 104.00,
-      stop_loss: 84.50,
-      risk_reward_ratio: 2.85,
-      kelly_allocation_pct: 8.0,
-      conviction_score: 0.76,
-      quantitative_rationale: 'Hormuz maritime chokepoint cascade trigger. Macro cointegration hedge against oil supply shock.',
-    }
-  ];
+  const plays = brief?.highest_conviction_plays || [];
 
   return (
     <Card
@@ -98,41 +78,46 @@ export default function FinancialAdvisorAdvice() {
           {plays.map((p, idx) => (
             <div
               key={idx}
-              className="p-3 rounded-xl bg-slate-900/80 border border-cyan-500/20 hover:border-[#00f2fe]/50 transition-all space-y-2 glass-panel-hover"
+              className="p-3 rounded-lg bg-slate-950 border border-slate-800 hover:border-cyan-500/40 transition-all space-y-2"
             >
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-black text-white">{p.ticker}</span>
-                  <span
-                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                      p.action === 'BUY'
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 glow-emerald'
-                        : 'bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson'
-                    }`}
-                  >
+                  <span className="text-sm font-bold text-white">{p.ticker}</span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    p.action === 'BUY' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
+                  }`}>
                     {p.action}
                   </span>
+                  {p.sigma_shock !== undefined && (
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#00f2fe]/20 text-[#00f2fe] border border-[#00f2fe]/40">
+                      +{p.sigma_shock.toFixed(2)}σ SHOCK
+                    </span>
+                  )}
                 </div>
-                <span className="text-xs text-amber-400 font-bold">
-                  KELLY: {p.kelly_allocation_pct}%
+                <span className="text-xs text-cyan-400 font-bold">
+                  KELLY {p.kelly_allocation_pct}%
                 </span>
               </div>
 
-              {/* Allocation Visual Bar */}
-              <div className="w-full h-1.5 rounded-full bg-slate-800 relative overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-[#00f2fe] to-emerald-400"
-                  style={{ width: `${Math.min(100, p.kelly_allocation_pct * 4)}%` }}
-                />
+              {/* Price & Volatility Sizing Breakdown */}
+              <div className="grid grid-cols-3 gap-2 text-[10px] bg-slate-900/60 p-2 rounded border border-slate-800">
+                <div>
+                  <span className="text-slate-500 block">ENTRY / TARGET</span>
+                  <span className="text-slate-200 font-bold">${p.entry_level} / ${p.target_price}</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">RISK / REWARD</span>
+                  <span className="text-emerald-400 font-bold">{p.risk_reward_ratio}x</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">EXPECTED MOVE</span>
+                  <span className="text-[#00f2fe] font-bold">
+                    {p.expected_move_pct !== undefined ? `+${p.expected_move_pct.toFixed(1)}%` : 'N/A'}
+                  </span>
+                </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-2 text-[10px] text-slate-300 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
-                <div>Entry: <span className="text-white font-bold">${p.entry_level}</span></div>
-                <div>Target: <span className="text-emerald-400 font-bold">${p.target_price}</span></div>
-                <div>Stop: <span className="text-rose-400 font-bold">${p.stop_loss}</span></div>
-              </div>
-
-              <p className="text-[11px] text-slate-300 font-sans leading-snug">
+              <p className="text-[10px] text-slate-400 font-sans leading-snug">
                 {p.quantitative_rationale}
               </p>
             </div>

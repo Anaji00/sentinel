@@ -135,11 +135,13 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         domains_triggered.update([h.get("type", "").split("_")[0] for h in hits])
                         
                 if len(supporting_events) > 0:
+                    rule_tier_str = str(rule.get("alert_tier", "ALERT")).strip().upper()
+                    alert_tier = AlertTier[rule_tier_str] if rule_tier_str in AlertTier.__members__ else AlertTier.ALERT
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
                         rule_name=rule.get("rule_name", "Dynamic AI Rule"),
-                        alert_tier=AlertTier(rule.get("alert_tier", "alert").upper()),
+                        alert_tier=alert_tier,
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
                         entity_ids=[event.primary_entity.id] if event.primary_entity else [],
@@ -266,7 +268,8 @@ async def main():
                     corr_fired += 1
                     
         except Exception as e:
-            logger.error(f"Failed to process correlation for event {event.event_id}: {e}", exc_info=True)
+            import traceback
+            logger.error(f"Failed to process correlation for event {event.event_id}: {e}\n{traceback.format_exc()}")
             return
 
     try:
@@ -279,8 +282,8 @@ async def main():
 
                 for tp, messages in batches.items():
                     total_received += len(messages)
-                    if total_received - last_logged_received >= 250:
-                        logger.info(f"Received batch of {len(messages)} events to correlate on partition {tp.topic}:{tp.partition}")
+                    if total_received - last_logged_received >= 500:
+                        logger.debug(f"Received batch of {len(messages)} events to correlate on partition {tp.topic}:{tp.partition}")
                         last_logged_received = total_received
                     
                     all_events = []

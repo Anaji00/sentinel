@@ -48,6 +48,8 @@ from .prompts import (
 
 logger = logging.getLogger("agent.news_intel")
 
+ANALYSIS_THRESHOLD = 0.35
+
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 

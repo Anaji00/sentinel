@@ -26,7 +26,7 @@ logger = logging.getLogger("api-gateway-main")
 
 from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
-from services.api_gateway.routes import system, scenarios, events, graph
+from services.api_gateway.routes import system, scenarios, events, graph, radar, agents
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,31 +49,32 @@ app = FastAPI(
     description="Secure REST interface for querying Sentinel multi-domain intelligence.",
     version="1.0.0",
     lifespan=lifespan,
-    # GLOBAL SECURITY: By placing the API Key verification here, we lock down the 
-    # ENTIRE application. Every single route will require a valid X-API-KEY header, 
-    # so developers don't have to remember to add it to new routes manually.
     dependencies=[Depends(verify_api_key)]
 )
 
+import os
+
 # CORS (Cross-Origin Resource Sharing):
-# Web browsers block frontend apps (like a React dashboard) from making requests 
-# to an API on a different port/domain by default. This middleware acts as a 
-# bouncer, telling the browser "It's okay, allow requests from anywhere (*)".
+# Driven by CORS_ALLOWED_ORIGINS env var for spec compliance with allow_credentials=True
+raw_cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:8000")
+cors_origins = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
 # MODULAR ROUTING:
-# Instead of writing 5,000 lines of code in this one file, we import specific 
-# "mini-apps" (routers) and plug them into the main app.
 app.include_router(system.router)
 app.include_router(scenarios.router)
 app.include_router(events.router)
 app.include_router(graph.router)
+app.include_router(radar.router)
+app.include_router(agents.router)
 
 if __name__ == "__main__":
     # LOCAL DEVELOPMENT SERVER:

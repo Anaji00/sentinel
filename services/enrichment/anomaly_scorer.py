@@ -140,16 +140,16 @@ class DynamicAnomalyScorer:
         await set_pipe.execute()
         return results
 
-    async def _check_ema_gatekeeper(self, domain: str, raw_score: float) -> bool:
-        res = await self._check_ema_gatekeeper_batch(domain, [raw_score])
+    async def _check_ema_gatekeeper(self, event_type: str, raw_score: float) -> bool:
+        res = await self._check_ema_gatekeeper_batch(event_type, [raw_score])
         return res[0]
         
-    async def _check_ema_gatekeeper_batch(self, domain: str, raw_scores: list) -> list:
+    async def _check_ema_gatekeeper_batch(self, event_type: str, raw_scores: list) -> list:
         if not self.redis or not raw_scores:
             return [score > 0.60 for score in raw_scores]
 
-        mean_key = f"sentinel:ml:ema_mean:{domain}"
-        var_key = f"sentinel:ml:ema_var:{domain}"
+        mean_key = f"sentinel:ml:ema_mean:{event_type}"
+        var_key = f"sentinel:ml:ema_var:{event_type}"
         
         current_mean = float(await self.redis.raw.get(mean_key) or 0.5)
         current_var = float(await self.redis.raw.get(var_key) or 0.05)
@@ -199,7 +199,7 @@ class DynamicAnomalyScorer:
                         val = float(np.atleast_1d(out)[0])
                         scores.append(max(0.0, 0.5 - val))
                         
-                is_significant_list = await self._check_ema_gatekeeper_batch(domain, scores)
+                is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
                 return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
                 
             else:
@@ -232,7 +232,7 @@ class DynamicAnomalyScorer:
                     for i, err in zip(valid_idx, reconstruction_errors):
                         scores[i] = float(1.0 - np.exp(-err))
                         
-                is_significant_list = await self._check_ema_gatekeeper_batch(domain, scores)
+                is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
                 return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
                 
         except Exception as e:
@@ -276,7 +276,7 @@ class DynamicAnomalyScorer:
     async def score_crypto_candle(self, asset: str, features: list) -> float:
         if len(features) >= 3:
             features[2] = await self._dynamic_normalize(f"crypto:{asset}", "candle_notional", features[2])
-        res = await self.score_event("crypto_trade", asset, (features + [0.0] * 5)[:5])
+        res = await self.score_event("crypto_candle", asset, (features + [0.0] * 5)[:5])
         return res["score"]
 
     async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
@@ -303,7 +303,7 @@ class DynamicAnomalyScorer:
     async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
         if len(features) >= 3:
             features[2] = await self._dynamic_normalize(f"{domain}:{ticker}", "candle_notional", features[2])
-        res = await self.score_event("tradfi_trade", ticker, (features + [0.0] * 5)[:5])
+        res = await self.score_event("tradfi_candle", ticker, (features + [0.0] * 5)[:5])
         return res["score"]
 
     async def score_prediction_trade(self, asset_id: str, notional: float) -> float:

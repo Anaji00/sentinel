@@ -7,6 +7,7 @@ import { Scenario, NormalizedEvent } from '../lib/types';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
+import { useLiveEvents } from '../lib/useLiveEvents';
 
 export default function IntelligenceFeed() {
   const [activeTab, setActiveTab] = useState<'events' | 'scenarios'>('events');
@@ -14,86 +15,50 @@ export default function IntelligenceFeed() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedEvent, setSelectedEvent] = useState<NormalizedEvent | null>(null);
 
+  // Real-time WebSocket Live Feed connection
+  const wsLiveEvents = useLiveEvents(selectedDomain);
+
   // Fetch AI Scenarios
   const { data: scenarios } = useSWR<Scenario[]>(
     '/scenarios?limit=20',
     fetcher,
-    { refreshInterval: 12000 }
+    { refreshInterval: 6000 }
   );
 
-  // Dynamic Event domain fetches
+  // Dynamic Event domain fetches with rapid 4-second polling
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'tradfi' ? '/events/tradfi?limit=30' : null,
     fetcher,
-    { refreshInterval: 8000 }
+    { refreshInterval: 4000 }
   );
   const { data: cryptoEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'crypto' ? '/events/crypto?limit=30' : null,
     fetcher,
-    { refreshInterval: 8000 }
+    { refreshInterval: 4000 }
   );
   const { data: predictionEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'prediction' ? '/events/prediction?limit=30' : null,
     fetcher,
-    { refreshInterval: 8000 }
+    { refreshInterval: 4000 }
   );
   const { data: cyberEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'cyber' ? '/events/cyber?limit=30' : null,
     fetcher,
-    { refreshInterval: 8000 }
+    { refreshInterval: 4000 }
   );
   const { data: maritimeEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'maritime' ? '/events/maritime?limit=30' : null,
     fetcher,
-    { refreshInterval: 8000 }
+    { refreshInterval: 4000 }
   );
 
-  // Merge events with rich fallback defaults if backend endpoint is initializing
-  const rawEvents: NormalizedEvent[] = [];
+  // Merge events with zero-latency WebSocket stream
+  const rawEvents: NormalizedEvent[] = [...wsLiveEvents];
   if (selectedDomain === 'all' || selectedDomain === 'tradfi') rawEvents.push(...(tradfiEvents || []));
   if (selectedDomain === 'all' || selectedDomain === 'crypto') rawEvents.push(...(cryptoEvents || []));
   if (selectedDomain === 'all' || selectedDomain === 'prediction') rawEvents.push(...(predictionEvents || []));
   if (selectedDomain === 'all' || selectedDomain === 'cyber') rawEvents.push(...(cyberEvents || []));
   if (selectedDomain === 'all' || selectedDomain === 'maritime') rawEvents.push(...(maritimeEvents || []));
-
-  // Fallback demo items if backend event arrays are empty during cold start
-  if (rawEvents.length === 0) {
-    rawEvents.push(
-      {
-        event_id: 'evt_cascade_001',
-        type: 'geopolitical_cascade',
-        occurred_at: new Date(Date.now() - 120000).toISOString(),
-        source: 'correlation_engine',
-        anomaly_score: 0.88,
-        region: 'Strait of Hormuz',
-        headline: 'Multi-Domain Cascade Alert: AIS Gap + BGP Route Anomaly + Oil Futures Volatility',
-        primary_entity: { id: 'MMSI_235091234', type: 'vessel', name: 'TANKER_HORMUZ_01' },
-        tags: ['maritime', 'cyber', 'tradfi', 'cascade']
-      },
-      {
-        event_id: 'evt_cyber_002',
-        type: 'bgp_anomaly',
-        occurred_at: new Date(Date.now() - 340000).toISOString(),
-        source: 'ripe_ris_bgp',
-        anomaly_score: 0.76,
-        region: 'Global',
-        headline: 'Suspicious BGP Route Announcement Hijack AS-45129',
-        primary_entity: { id: 'AS_45129', type: 'threat_actor', name: 'RIPE_BGP_NODE' },
-        tags: ['cyber', 'bgp', 'cisa_kev']
-      },
-      {
-        event_id: 'evt_tradfi_003',
-        type: 'option_sweep',
-        occurred_at: new Date(Date.now() - 600000).toISOString(),
-        source: 'finnhub_options',
-        anomaly_score: 0.65,
-        region: 'US',
-        headline: 'NVDA Institutional Put Option Sweep $14.2M (25D IV Skew +420bps)',
-        primary_entity: { id: 'NVDA', type: 'instrument', name: 'NVIDIA Corp' },
-        tags: ['tradfi', 'options', 'volatility']
-      }
-    );
-  }
 
   const sortedEvents = rawEvents
     .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime())
@@ -180,7 +145,7 @@ export default function IntelligenceFeed() {
                 {e.headline || e.summary || `Event ${e.event_id}`}
               </p>
               <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400 font-mono">
-                <span>Entity: {e.primary_entity?.name || 'Unknown'}</span>
+                <span>Entity: {e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown'}</span>
                 <span>{new Date(e.occurred_at).toLocaleTimeString()}</span>
               </div>
             </div>
@@ -221,10 +186,10 @@ export default function IntelligenceFeed() {
             </div>
             <div className="space-y-2 text-xs">
               <div><span className="text-slate-400">EVENT ID:</span> <span className="text-white font-bold">{selectedEvent.event_id}</span></div>
-              <div><span className="text-slate-400">HEADLINE:</span> <p className="text-slate-200 mt-1 font-sans">{selectedEvent.headline || 'No summary available'}</p></div>
+              <div><span className="text-slate-400">HEADLINE:</span> <p className="text-slate-200 mt-1 font-sans">{selectedEvent.headline || selectedEvent.summary || 'No summary available'}</p></div>
               <div><span className="text-slate-400">SOURCE:</span> <span className="text-cyan-400">{selectedEvent.source}</span></div>
               <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-rose-400 font-bold">{selectedEvent.anomaly_score.toFixed(4)}</span></div>
-              <div><span className="text-slate-400">PRIMARY ENTITY:</span> <span className="text-amber-400">{selectedEvent.primary_entity?.name || 'N/A'}</span></div>
+              <div><span className="text-slate-400">PRIMARY ENTITY:</span> <span className="text-amber-400">{selectedEvent.primary_entity_name || selectedEvent.entity_name || selectedEvent.primary_entity?.name || 'N/A'}</span></div>
               <div><span className="text-slate-400">REGION:</span> <span className="text-emerald-400">{selectedEvent.region || 'Global'}</span></div>
               <div><span className="text-slate-400">OCCURRED AT:</span> <span className="text-slate-300">{new Date(selectedEvent.occurred_at).toUTCString()}</span></div>
             </div>

@@ -104,6 +104,12 @@ async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
                     ]
                     if len(tickers) > 100:
                         logger.info(f"🌐 Dynamic Tradable Universe Acquired: Tracking {len(tickers)} US equities via {url}.")
+                        try:
+                            redis_client = await get_redis()
+                            await redis_client.raw.delete("sentinel:equities:valid_set")
+                            await redis_client.raw.sadd("sentinel:equities:valid_set", *tickers)
+                        except Exception as rx:
+                            logger.warning(f"Failed to cache valid equities set to Redis: {rx}")
                         return tickers
                 else:
                     body = await resp.text()

@@ -26,26 +26,36 @@ logger = logging.getLogger("sentinel.ollama")
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b")
-# Dynamic timeout: 25 seconds default allows fast offloading to fallback models
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "25.0")))
+# Dynamic timeout: 30 seconds default allows fast offloading to fallback models
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("OLLAMA_TIMEOUT", "30.0")))
 
 # Circuit breaker config
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
 CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "15.0"))  # 15 seconds adaptive cooldown
-OLLAMA_NUM_PARALLEL       = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
+
+# OLLAMA CONCURRENCY CAP (Option A: Static capacity partitioning across replicas)
+# Rule: Client-side concurrency per process MUST satisfy:
+#       OLLAMA_NUM_PARALLEL <= server_side_parallelism // known_replica_count
+# Assumptions for current topology:
+#   - Server-side Ollama max parallel runners (OLLAMA_SERVER_PARALLEL) = 4
+#   - Active local agent process replicas running concurrently (AGENT_REPLICA_COUNT) = 4
+#   - Process-local cap = floor(4 / 4) = 1 (prevents server-side queue congestion)
+# Note: For dynamic scaling in cloud, replace with Redis distributed semaphore (Option B).
+DEFAULT_PARALLEL_CAP = max(1, int(os.getenv("OLLAMA_SERVER_PARALLEL", "4")) // int(os.getenv("AGENT_REPLICA_COUNT", "4")))
+OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL_CAP)))
+
 
 # Model Tier Preference Lists
 MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:7b", "llama3:latest"]
 MODEL_TIER_HEAVY       = ["llama3:latest", "qwen2.5:7b", "gemma:2b"]
 
-_OLLAMA_SEMAPHORES = {}
+_MODEL_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
 
 
-def get_ollama_semaphore(model_name: str = "default"):
-    global _OLLAMA_SEMAPHORES
-    if model_name not in _OLLAMA_SEMAPHORES:
-        _OLLAMA_SEMAPHORES[model_name] = asyncio.Semaphore(OLLAMA_NUM_PARALLEL)
-    return _OLLAMA_SEMAPHORES[model_name]
+def get_ollama_semaphore(model_name: str = "default") -> asyncio.Semaphore:
+    if model_name not in _MODEL_SEMAPHORES:
+        _MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(1)
+    return _MODEL_SEMAPHORES[model_name]
 
 
 class InferenceError(Exception):
@@ -211,12 +221,12 @@ class OllamaClient:
 
         semaphore = get_ollama_semaphore(active_model)
 
-        schema_json = json.dumps(schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema.schema(), indent=2)
+        schema_dict = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema.schema()
+        schema_dict.pop("title", None)
+        schema_json = json.dumps(schema_dict, separators=(',', ':'))
         schema_instruction = (
-            f"\n\nYou MUST return a JSON object that strictly adheres to the following JSON schema:\n"
-            f"```json\n{schema_json}\n```\n"
-            "Do not include any explanation or markdown formatting outside of the JSON object. Output raw JSON only.\n"
-            "CRITICAL: Output the actual data values that fit this schema, DO NOT output the schema definition itself."
+            f"\n\nJSON SCHEMA:\n{schema_json}\n"
+            "Return ONLY a raw JSON object conforming to this schema."
         )
 
         last_error: Optional[str] = None
@@ -367,8 +377,8 @@ class OllamaClient:
 
         # Truncate prompt if longer than 3500 chars to fit within 4096 context window
         clean_prompt = prompt
-        if len(clean_prompt) > 3500:
-            clean_prompt = clean_prompt[:3500] + "\n...[truncated for context size]"
+        if len(clean_prompt) > 1800:
+            clean_prompt = clean_prompt[:1800] + "\n...[truncated]"
 
         payload = {
             "model": resolved_model,
@@ -377,8 +387,8 @@ class OllamaClient:
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
-                "num_predict": num_predict or 256,
-                "num_ctx": 4096,  # Cap at 4096 to handle detailed multi-event contexts without truncation
+                "num_predict": min(num_predict or 256, 768),
+                "num_ctx": 2048,  # Cap context size at 2048 to minimize KV cache allocation and maximize throughput
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }

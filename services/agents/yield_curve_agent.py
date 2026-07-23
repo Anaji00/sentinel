@@ -60,6 +60,9 @@ class YieldCurveMacroRatesAgent(SentinelAgent):
         tips_val = float(raw_tips) if raw_tips else 1.85
         tips_yield = tips_val if tips_val < 15.0 else 1.85
 
+        hyg = float(await self.redis.raw.get("sentinel:quotes:latest:HYG") or 77.5)
+        lqd = float(await self.redis.raw.get("sentinel:quotes:latest:LQD") or 108.2)
+
         spread_2y10y_bps = (y10 - y2) * 100.0
         breakeven_inflation_bps = (y10 - tips_yield) * 100.0
         credit_ratio = hyg / max(1.0, lqd)

@@ -129,9 +129,15 @@ class SentinelAgent(ABC):
                             await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
 
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results:
+                    for r, msg in zip(results, msg_list):
                         if isinstance(r, Exception):
-                            self.logger.error(f"Dispatch task failed: {r}", exc_info=r)
+                            self.logger.error(f"Dispatch task failed with unhandled exception: {r}", exc_info=r)
+                            try:
+                                payload = json.loads(msg.value.decode('utf-8'))
+                            except Exception:
+                                payload = {"raw": str(msg.value)}
+                            topic_name = tp.topic if hasattr(tp, 'topic') else (self.input_topics[0] if self.input_topics else "unknown")
+                            await self._send_dlq(payload, f"UnhandledException: {type(r).__name__}: {str(r)}", topic_name)
                 await self._consumer.commit()
 
             except asyncio.CancelledError:

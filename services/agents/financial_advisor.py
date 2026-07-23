@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 from shared.utils.ollama import SchemaViolationError, InferenceError
-from shared.utils.equities import is_valid_primary_equity
+from shared.utils.equities import is_valid_primary_equity, is_valid_primary_equity_async
 
 logger = logging.getLogger("agent.financial_advisor")
 
@@ -28,13 +28,38 @@ class TradingSignal(BaseModel):
     technical_indicators: Dict[str, float]  # RSI, fast_ema, slow_ema, atr, close
     fib_levels: Dict[str, float]  # Fib retracements (0.0, 0.236, 0.382, 0.500, 0.618, 0.786, 1.0)
     quantitative_rationale: str  # High-level Jane Street style quant reasoning
+    
+    # Quant-trusted volatility context fields
+    sigma_shock: Optional[float] = Field(default=0.0, description="Anomaly severity expressed in standard deviation multiples (z-score)")
+    expected_move_usd: Optional[float] = Field(default=0.0, description="Expected price move in USD based on realized ATR/EWMA volatility")
+    expected_move_pct: Optional[float] = Field(default=0.0, description="Expected price move as a percentage of entry price")
 
 class FinancialAdviceBrief(BaseModel):
     market_regime: str  # "Mean-Reverting", "High-Volatility Expansion", "Trending Up", "Trending Down"
     highest_conviction_plays: List[TradingSignal]
     general_hedging_strategy: str  # tail risk hedge, puts, delta-hedging advice
 
-# ── QUANT LOGIC FOR INDICATORS ────────────────────────────────────────────────
+# ── QUANT LOGIC FOR INDICATORS & VOLATILITY CONTEXT ─────────────────────────
+
+def compute_realized_vol_context(raw_anomaly: float, current_price: float, atr: float) -> Dict[str, Any]:
+    """
+    Translates an abstract [0, 1) reconstruction anomaly score into a quant-trusted
+    Sigma Shock (z-score multiple) and Realized-Volatility Expected Move (USD & %).
+    """
+    import math
+    clamped_score = max(0.0, min(0.999, float(raw_anomaly)))
+    z_sigma = math.sqrt(-math.log(max(1e-4, 1.0 - clamped_score)))
+    eff_atr = atr if atr > 0 else current_price * 0.02
+    expected_move_usd = round(z_sigma * eff_atr, 4)
+    expected_move_pct = round((expected_move_usd / max(1e-5, current_price)) * 100.0, 2)
+    return {
+        "raw_anomaly_score": round(clamped_score, 4),
+        "sigma_shock_z": round(z_sigma, 2),
+        "atr_14": round(eff_atr, 4),
+        "expected_move_usd": expected_move_usd,
+        "expected_move_pct": f"{expected_move_pct}%"
+    }
+
 
 def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
     if not closes:
@@ -120,7 +145,7 @@ class FinancialAdvisorAgent(SentinelAgent):
     def output_topic(self) -> str:
         return Topics.FINANCIAL_ADVICE
 
-    def _extract_tickers_from_event(self, message: Dict[str, Any]) -> List[str]:
+    async def _extract_tickers_from_event(self, message: Dict[str, Any]) -> List[str]:
         tickers = []
         
         # 1. From IntelBrief / Headline Events
@@ -172,13 +197,13 @@ class FinancialAdvisorAgent(SentinelAgent):
         cleaned = []
         for t in tickers:
             t_clean = t.strip().upper()
-            if is_valid_primary_equity(t_clean) and t_clean not in cleaned:
+            if (await is_valid_primary_equity_async(t_clean, self.redis)) and t_clean not in cleaned:
                 cleaned.append(t_clean)
         return cleaned
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         self.logger.debug("Received live event trigger from input topic. Parsing tickers...")
-        tickers = self._extract_tickers_from_event(message)
+        tickers = await self._extract_tickers_from_event(message)
         
         if not tickers:
             self.logger.debug("No target tickers found in message payload.")
@@ -186,12 +211,15 @@ class FinancialAdvisorAgent(SentinelAgent):
             
         self.logger.info(f"Live event triggered evaluation for tickers: {tickers}")
         
+        raw_anomaly = float(message.get("anomaly_score", 0.5))
         indicators_data = {}
         for ticker in tickers:
             closes, highs, lows = await self._fetch_prices(ticker)
             if len(closes) >= 1:
                 indicators = compute_ta_indicators(closes, highs, lows)
                 indicators["current_price"] = closes[-1]
+                atr = indicators.get("atr", closes[-1] * 0.02)
+                indicators["volatility_context"] = compute_realized_vol_context(raw_anomaly, closes[-1], atr)
                 indicators_data[ticker] = indicators
                 
                 # Track ticker in Redis watched equities
@@ -417,21 +445,24 @@ class FinancialAdvisorAgent(SentinelAgent):
                 
                 loop = asyncio.get_running_loop()
                 def fetch_yf():
-                    import yfinance as yf
-                    yf_symbol = ticker_clean
-                    if is_crypto and not yf_symbol.endswith("-USD"):
-                        if yf_symbol.endswith("USD"):
-                            yf_symbol = yf_symbol[:-3] + "-USD"
-                        else:
-                            yf_symbol = yf_symbol + "-USD"
-                    t = yf.Ticker(yf_symbol)
-                    df = t.history(period=period, interval=interval)
-                    if df.empty and interval != "1h":
-                        df = t.history(period="5d", interval="1h")
-                    return df
+                    try:
+                        import yfinance as yf
+                        yf_symbol = ticker_clean
+                        if is_crypto and not yf_symbol.endswith("-USD"):
+                            if yf_symbol.endswith("USD"):
+                                yf_symbol = yf_symbol[:-3] + "-USD"
+                            else:
+                                yf_symbol = yf_symbol + "-USD"
+                        t = yf.Ticker(yf_symbol)
+                        df = t.history(period=period, interval=interval)
+                        if df.empty and interval != "1h":
+                            df = t.history(period="5d", interval="1h")
+                        return df
+                    except (ImportError, ModuleNotFoundError, Exception):
+                        return None
 
                 df = await loop.run_in_executor(None, fetch_yf)
-                if not df.empty and "Close" in df.columns:
+                if df is not None and not df.empty and "Close" in df.columns:
                     closes = [float(val) for val in df["Close"].dropna().tolist()]
                     highs = [float(val) for val in df["High"].dropna().tolist()] if "High" in df.columns else list(closes)
                     lows = [float(val) for val in df["Low"].dropna().tolist()] if "Low" in df.columns else list(closes)
@@ -563,6 +594,8 @@ class FinancialAdvisorAgent(SentinelAgent):
                     if len(closes) >= 1:
                         indicators = compute_ta_indicators(closes, highs, lows)
                         indicators["current_price"] = closes[-1]
+                        atr = indicators.get("atr", closes[-1] * 0.02)
+                        indicators["volatility_context"] = compute_realized_vol_context(0.5, closes[-1], atr)
                         indicators_data[ticker] = indicators
                     else:
                         self.logger.warning(

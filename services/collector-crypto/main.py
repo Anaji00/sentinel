@@ -29,8 +29,9 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
-logger = logging.getLogger("collector.crypto")
+from shared.utils.logging import setup_sentinel_logging
+
+logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL")
 WHALE_THRESHOLD_USD = 250_000

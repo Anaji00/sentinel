@@ -22,9 +22,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from shared.utils.logging import setup_sentinel_logging
+from shared.utils.logging import setup_sentinel_logging, BatchLogger
 
 logger = setup_sentinel_logging("dlq-worker", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
+batch_logger = BatchLogger(logger, "dlq-worker", flush_interval_sec=10.0)
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale
@@ -120,7 +121,7 @@ async def _consume_loop(consumer, db, session, producer):
                             INSERT INTO failed_events (original_topic, error_message, raw_payload, retry_count, permanently_failed)
                             VALUES ($1, $2, $3, $4, $5)
                         """, original_topic, error_msg, json.dumps(raw_data), retry_count, permanently_failed)
-                        logger.info(f"Saved failed event from {original_topic} to DB (Permanent: {permanently_failed}).")
+                        batch_logger.add(category=f"{original_topic}_perm={permanently_failed}")
                     except Exception as e:
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
                         sys.exit(1)

@@ -23,29 +23,76 @@ from aiokafka import AIOKafkaProducer as _Producer
 from kafka.errors import KafkaError, KafkaConnectionError
 import sys
 
+import time
+from shared.utils.logging import suppress_noisy_loggers
+
 logger = logging.getLogger(__name__)
 
-# Configure Kafka libraries to log at WARNING level across all services to prevent flooding
-aiokafka_logger = logging.getLogger("aiokafka")
-aiokafka_logger.setLevel(logging.WARNING)
-logging.getLogger("aiokafka.producer").setLevel(logging.WARNING)
-logging.getLogger("aiokafka.consumer").setLevel(logging.WARNING)
+# Suppress noisy Kafka library loggers across all microservices
+suppress_noisy_loggers(logging.WARNING)
 
-kafka_logger = logging.getLogger("kafka")
-kafka_logger.setLevel(logging.WARNING)
 
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setLevel(logging.WARNING)
-_formatter = logging.Formatter(
-    "%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-_handler.setFormatter(_formatter)
+# ── BATCH KAFKA LOGGER ────────────────────────────────────────────────────────
 
-for _log in (aiokafka_logger, kafka_logger, logging.getLogger("aiokafka.producer"), logging.getLogger("aiokafka.consumer")):
-    if not _log.handlers:
-        _log.addHandler(_handler)
-        _log.propagate = False
+class BatchKafkaLogger:
+    """
+    Aggregates throughput and error statistics for Kafka production & consumption loops.
+    Periodically flushes summary statistics instead of logging per-event or per-poll.
+    """
+
+    def __init__(self, service_name: str, flush_interval_sec: float = 10.0):
+        self.service_name = service_name
+        self.flush_interval_sec = flush_interval_sec
+        self.logger = logging.getLogger(f"kafka.batch.{service_name}")
+        self._last_flush = time.monotonic()
+        self._topic_counts: Dict[str, int] = {}
+        self._error_counts: Dict[str, int] = {}
+
+    def log_produced(self, topic: str, count: int = 1):
+        self._topic_counts[topic] = self._topic_counts.get(topic, 0) + count
+        self._maybe_flush()
+
+    def log_consumed(self, topic: str, count: int = 1):
+        self._topic_counts[topic] = self._topic_counts.get(topic, 0) + count
+        self._maybe_flush()
+
+    def log_error(self, topic: str, error_type: str = "general"):
+        key = f"{topic}:{error_type}"
+        self._error_counts[key] = self._error_counts.get(key, 0) + 1
+        self._maybe_flush()
+
+    def _maybe_flush(self):
+        now = time.monotonic()
+        if now - self._last_flush >= self.flush_interval_sec:
+            self.flush()
+
+    def flush(self):
+        now = time.monotonic()
+        elapsed = max(now - self._last_flush, 0.001)
+        self._last_flush = now
+
+        if not self._topic_counts and not self._error_counts:
+            return
+
+        total_msgs = sum(self._topic_counts.values())
+        rate = total_msgs / elapsed
+        topic_summary = (
+            ", ".join(f"{t}: {c}" for t, c in self._topic_counts.items())
+            if self._topic_counts
+            else "none"
+        )
+        err_summary = (
+            ", ".join(f"{e}: {c}" for e, c in self._error_counts.items())
+            if self._error_counts
+            else "none"
+        )
+
+        self.logger.info(
+            f"📡 KAFKA BATCH [{self.service_name}] Processed {total_msgs} msgs in {elapsed:.1f}s ({rate:.1f}/s) | Topics: [{topic_summary}] | Errors: [{err_summary}]"
+        )
+        self._topic_counts.clear()
+        self._error_counts.clear()
+
 
 # ── TOPIC REGISTRY ────────────────────────────────────────────────────────────
 
@@ -127,7 +174,7 @@ def _serialize(obj: Any) -> bytes:
 # ── PRODUCER ────────────────────────────────────────────────────────────────
 
 class SentinelProducer:
-    def __init__(self, bootstrap_servers: str = None):
+    def __init__(self, bootstrap_servers: str = None, service_name: str = "producer"):
         self._servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self._p = _Producer(
             bootstrap_servers=self._servers,
@@ -137,6 +184,7 @@ class SentinelProducer:
             compression_type="gzip",
         )
         self._started = False
+        self.batch_logger = BatchKafkaLogger(service_name, flush_interval_sec=10.0)
         logger.info(f"Kafka Producer -> {self._servers}")
 
     async def start(self, max_retries: int = 15):
@@ -169,16 +217,17 @@ class SentinelProducer:
             await self._p.send_and_wait(
                 topic,
                 value=data,
-                # KEY: The "Sorting Hat".
-                # Kafka guarantees that messages with the SAME key always go to the SAME partition.
-                # This ensures Event 1, 2, and 3 for "Vessel_A" are processed in order (1->2->3).
                 key=k_bytes,
                 headers=headers
             )
+            self.batch_logger.log_produced(topic, 1)
         except KafkaError as e:
+            self.batch_logger.log_error(topic, type(e).__name__)
             logger.error(f"Failed to send message to Kafka: {e}")
             raise
+
     async def close(self):
+        self.batch_logger.flush()
         try:
             await self._p.stop()
         except Exception:
@@ -207,6 +256,7 @@ class SentinelConsumer:
             max_poll_interval_ms=600000,
         )
         self._started = False
+        self.batch_logger = BatchKafkaLogger(f"consumer.{group_id}", flush_interval_sec=10.0)
         logger.info(f"Kafka Consumer: {self._servers} | Group: {group_id} --> Topics: {topics}")
         
     async def start(self, max_retries: int = 15):
@@ -234,7 +284,11 @@ class SentinelConsumer:
         """
         if not self._started:
             raise RuntimeError("CANNOT FETCH MESSAGES -- Consumer not started.")
-        return await self._c.getmany(timeout_ms=timeout_ms)
+        batches = await self._c.getmany(timeout_ms=timeout_ms)
+        if batches:
+            for tp, records in batches.items():
+                self.batch_logger.log_consumed(tp.topic, len(records))
+        return batches
 
     async def commit(self):
         """
@@ -246,6 +300,7 @@ class SentinelConsumer:
         await self._c.commit()
         
     async def close(self):
+        self.batch_logger.flush()
         try:
             await self._c.stop()
         except Exception:

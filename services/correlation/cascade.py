@@ -58,8 +58,8 @@ class GeopoliticalCascadeEngine:
         current_events = self._sliding_window[key]
         domains_present: Set[str] = {e[1] for e in current_events}
 
-        # Trigger multi-domain cascade if 3+ distinct domains (e.g. Cyber + Aviation + News) co-occur
-        if len(domains_present) >= 3 and len(current_events) >= 3:
+        # Trigger multi-domain cascade if 2+ distinct domains (e.g. Cyber + Aviation, TradFi + Crypto, News + Market) co-occur
+        if (len(domains_present) >= 2 or len(current_events) >= 3) and len(current_events) >= 2:
             dedup_trigger_key = f"cascade:{key}:{int(now // 900)}"  # 15-min dedup
             
             # Calculate composite Flashpoint Index (0.0 to 100.0)
@@ -76,17 +76,18 @@ class GeopoliticalCascadeEngine:
 
             import uuid
             cluster = CorrelationCluster(
-                correlation_id=f"cascade_{uuid.uuid4().hex[:8]}",
-                rule_name=f"rule_geopolitical_cascade_{key}",
+                correlation_id=str(uuid.uuid4()),
+                rule_id=f"rule_geopolitical_cascade_{key.lower().replace(' ', '_')}",
+                rule_name=f"Geopolitical Cascade ({key.title()})",
                 alert_tier=AlertTier.CRITICAL if flashpoint_index >= 75.0 else AlertTier.ELEVATED,
                 trigger_event_id=supporting_ids[0],
                 supporting_event_ids=supporting_ids[1:],
                 entity_ids=[key],
-                domains_involved=list(domains_present),
-                summary=(
+                description=(
                     f"Geopolitical Cascade Alert (Flashpoint Index: {flashpoint_index}/100) in '{key}' "
                     f"across domains {list(domains_present)}. Co-occurring events include: {'; '.join(headlines_list)}"
-                )
+                ),
+                tags=["geopolitical_cascade", key.lower().replace(" ", "_")]
             )
             return cluster
 

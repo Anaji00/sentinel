@@ -59,15 +59,11 @@ load_dotenv(ROOT / ".env")
 
 # SentinelProducer: The Kafka messenger that sends data to the rest of the system.
 # RawEvent: The standard envelope format we use for all incoming data.
+from shared.utils.logging import setup_sentinel_logging
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("collector.cyber")
+logger = setup_sentinel_logging("collector.cyber", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 CENSYS_API_ID     = os.getenv("CENSYS_API_ID")
 CENSYS_API_SECRET = os.getenv("CENSYS_API_SECRET")
@@ -257,6 +253,7 @@ async def poll_cisa_kev(
     session:   aiohttp.ClientSession,
     producer:  SentinelProducer,
     seen_cves: set,
+    is_initial: bool = False,
 ):
     """
     Downloads the CISA KEV catalog and emits an event for each new CVE.
@@ -341,9 +338,9 @@ async def poll_cisa_kev(
             await asyncio.gather(*send_tasks)
             send_tasks = []
 
-        # High-priority: ransomware-linked CVEs or ICS/OT vendor vulnerabilities
+        # High-priority: ransomware-linked CVEs or ICS/OT vendor vulnerabilities (emitted for new CVEs on incremental polls)
         is_ics = any(v in vendor.lower() for v in ICS_VENDORS)
-        if ransomware_use == "Known" or is_ics:
+        if (ransomware_use == "Known" or is_ics) and not is_initial:
             logger.warning(
                 f"🔴 CISA KEV (high priority): {cve_id} — {vendor} {product} "
                 f"| ransomware:{ransomware_use} | ics:{is_ics}"
@@ -506,7 +503,7 @@ async def collect(producer: SentinelProducer):
     async with aiohttp.ClientSession(connector=connector) as session:
         # Full CISA KEV catalog on startup — catches all historical entries
         logger.info("Loading CISA KEV catalog (initial run)...")
-        await poll_cisa_kev(session, producer, seen_cves)
+        await poll_cisa_kev(session, producer, seen_cves, is_initial=True)
 
         last_censys_poll = 0.0
         last_kev_poll    = time.time()   # just ran above

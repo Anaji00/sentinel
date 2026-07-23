@@ -25,6 +25,11 @@ const FinancialAdvisorAdvice = dynamic(() => import('./FinancialAdvisorAdvice'),
   ssr: false,
 });
 
+const QuantRadarPanel = dynamic(() => import('./QuantRadarPanel'), {
+  loading: () => <PanelSkeleton title="Loading Radar & Agents..." />,
+  ssr: false,
+});
+
 export default function DashboardClient() {
   return (
     <main className="flex-1 grid grid-cols-12 gap-3 p-3 min-h-0 overflow-hidden">
@@ -52,11 +57,18 @@ export default function DashboardClient() {
         </div>
       </section>
 
-      {/* Column 3: Right Quantitative Financial Allocator (25%) */}
-      <section className="col-span-3 h-full min-h-0 flex flex-col">
-        <Suspense fallback={<PanelSkeleton title="Quantitative Allocator Loading..." />}>
-          <FinancialAdvisorAdvice />
-        </Suspense>
+      {/* Column 3: Right Quant Radar & Portfolio Allocator (25%) */}
+      <section className="col-span-3 h-full min-h-0 flex flex-col gap-3">
+        <div className="h-1/2 w-full min-h-0 relative">
+          <Suspense fallback={<PanelSkeleton title="Radar Sweeps & Agent Processes Loading..." />}>
+            <QuantRadarPanel />
+          </Suspense>
+        </div>
+        <div className="h-1/2 w-full min-h-0 relative">
+          <Suspense fallback={<PanelSkeleton title="Quantitative Allocator Loading..." />}>
+            <FinancialAdvisorAdvice />
+          </Suspense>
+        </div>
       </section>
     </main>
   );

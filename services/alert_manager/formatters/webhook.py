@@ -15,7 +15,9 @@ TIER_COLOR = {
     # of the Slack message attachment.
     AlertTier.WATCH:        "#FFA500",  # orange
     AlertTier.ALERT:        "#FF4500",  # red-orange
+    AlertTier.ELEVATED:     "#FF8C00",  # dark orange / elevated
     AlertTier.INTELLIGENCE: "#FF0000",  # red
+    AlertTier.CRITICAL:     "#8B0000",  # dark red
 }
 
 

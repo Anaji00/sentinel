@@ -48,12 +48,22 @@ class RedisClient:
     async def incr(self, key: str) -> int:
         return await self._client.incr(key)
 
+    async def ping(self) -> bool:
+        return await self._client.ping()
+
 # --- Neo4j Synchronous Client (For Supervisor ONLY) ---
 class Neo4jClient:
     def __init__(self):
         self._driver = None
         self._uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        self._auth = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "sentinel_graph"))
+        neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+        neo4j_pass = os.getenv("NEO4J_PASSWORD")
+        if not neo4j_pass:
+            env_name = os.getenv("SENTINEL_ENV", "dev").lower()
+            if env_name in ("prod", "production", "staging"):
+                raise RuntimeError("CRITICAL SECURITY FAILURE: NEO4J_PASSWORD environment variable is missing.")
+            neo4j_pass = "sentinel_graph"
+        self._auth = (neo4j_user, neo4j_pass)
 
     async def connect(self):
         if not self._driver:
@@ -82,7 +92,12 @@ class TimescaleClient:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
     async def _connect(self, retries: int = 12):
-        dsn = os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel")
+        dsn = os.getenv("DATABASE_URL")
+        if not dsn:
+            env_name = os.getenv("SENTINEL_ENV", "dev").lower()
+            if env_name in ("prod", "production", "staging"):
+                raise RuntimeError("CRITICAL SECURITY FAILURE: DATABASE_URL environment variable is missing.")
+            dsn = "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel"
         async def init_connection(conn):
             await conn.set_type_codec(
                 'jsonb',
@@ -110,20 +125,36 @@ class TimescaleClient:
                 else:
                     raise
 
+    def _sanitize_row(self, row: dict) -> dict:
+        import uuid
+        from datetime import datetime
+        d = dict(row)
+        for k, v in d.items():
+            if isinstance(v, uuid.UUID):
+                d[k] = str(v)
+            elif isinstance(v, datetime):
+                d[k] = v.isoformat()
+            elif isinstance(v, list):
+                d[k] = [str(item) if isinstance(item, uuid.UUID) else item for item in v]
+        return d
+
     async def query(self, sql: str, *params) -> List[Dict]:
-        # READ OPERATION (SELECT)
-        # 1. Borrow a connection from the pool. This blocks if all 20 connections are busy.
+        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+            params = params[0]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
-            return [dict(r) for r in rows]
+            return [self._sanitize_row(r) for r in rows]
 
     async def query_one(self, sql: str, *params) -> Optional[Dict]:
-        # Helper function: Just return the first result (or None if empty).
+        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+            params = params[0]
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(sql, *params)
-            return dict(row) if row else None
+            return self._sanitize_row(row) if row else None
     
     async def execute(self, sql: str, *params):
+        if len(params) == 1 and isinstance(params[0], (tuple, list)):
+            params = params[0]
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(sql, *params)

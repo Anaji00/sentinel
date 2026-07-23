@@ -67,6 +67,8 @@ export interface NormalizedEvent {
     occurred_at: string;
     source: string;
     primary_entity?: Entity;
+    primary_entity_name?: string;
+    entity_name?: string;
     headline: string;
     summary?: string;
     tags?: string[];
@@ -77,5 +79,6 @@ export interface NormalizedEvent {
     vessel_data?: VesselData;
     security_data?: SecurityData;
     prediction_market_data?: PredictionMarketData;
+    domain_data?: Record<string, any>;
     raw_payload?: Record<string, any>;
 }

@@ -12,6 +12,7 @@ from shared.models import CorrelationCluster, Scenario, AlertTier
 TIER_EMOJI = {
     AlertTier.WATCH:        "👁",
     AlertTier.ALERT:        "⚠️",
+    AlertTier.ELEVATED:     "🚨",
     AlertTier.INTELLIGENCE: "🔴",
     AlertTier.CRITICAL:     "🔥",
 }
