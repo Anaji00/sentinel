@@ -80,6 +80,10 @@ CREATE INDEX IF NOT EXISTS events_entities_idx ON events USING GIN(named_entitie
 CREATE INDEX IF NOT EXISTS events_region_time_idx ON events(region, occurred_at DESC) WHERE region IS NOT NULL;
 CREATE INDEX IF NOT EXISTS events_source_time_idx ON events(source, occurred_at DESC);
 
+-- RETENTION: Automatically drop event chunks older than 90 days to prevent unbounded disk growth.
+-- Adjust the interval based on operational needs. Historical data should be exported to cold storage first.
+SELECT add_retention_policy('events', INTERVAL '90 days', if_not_exists => TRUE);
+
 -- ── VESSEL POSITIONS (high-frequency, separate table) ─────────────────────────
 -- PURPOSE: Stores raw AIS telemetry (pings every few seconds).
 -- STRATEGY: Separated from 'events' to handle high write volume without bloating the main ledger.
@@ -165,10 +169,10 @@ CREATE TABLE IF NOT EXISTS scenarios (
  
 CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
+
 -- HNSW INDEX: This is the "Tier 1" secret. It builds a graph-based index for vectors.
 -- vector_cosine_ops tells it to optimize specifically for Cosine Similarity (<->).
 CREATE INDEX IF NOT EXISTS scenario_embedding_idx ON scenarios USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
 
 

@@ -116,14 +116,23 @@ class MaritimeEnricher:
         results = []
         pipe = self.redis.raw.pipeline()
         for idx, ((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict) in enumerate(zip(parsed, vessels, scores)):
-            anomaly = score_dict.get("score", 0.0)
+            raw_anomaly = score_dict.get("score", 0.0)
             is_watched, f_boost = check_results[idx]
             w_boost = 0.15 if is_watched else 0.0
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
 
             flags = vessel.get("flags", [])
             vtype = vessel.get("vessel_type", "Unknown")
-            
+            is_sanctioned = bool(flags)
+            is_emergency_nav = bool(nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")))
+
+            # ROUTINE TELEMETRY GUARD:
+            # Routine AIS pings in normal status (not sanctioned, not emergency, not watched)
+            # must stay strictly capped at 0.15 to prevent false anomaly flooding in chokepoints.
+            if not is_sanctioned and not is_emergency_nav and not is_watched:
+                anomaly = min(0.15, raw_anomaly * 0.3)
+            else:
+                anomaly = min(1.0, raw_anomaly + w_boost + f_boost)
+
             pipe.set(
                 f"vessel:last_seen:{mmsi}",
                 json.dumps({
@@ -168,6 +177,8 @@ class MaritimeEnricher:
                 region = region,
                 vessel_data = VesselData(
                     mmsi=mmsi, 
+                    latitude=lat,
+                    longitude=lon,
                     speed_knots = speed,
                     heading=heading,
                     nav_status=nav_status,

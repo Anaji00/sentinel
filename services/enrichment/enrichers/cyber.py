@@ -99,7 +99,7 @@ class CyberEnricher:
     def __init__(self, scorer, redis_client, graph_writer, resolver=None):
         self.graph = graph_writer
         self.redis = redis_client
-        self.cyber_scorer = CyberThreatScorer(redis_client)
+        self.cyber_scorer = scorer if (scorer is not None and hasattr(scorer, "load_thresholds")) else CyberThreatScorer(redis_client)
     
     async def _calculate_velocity(self, category: str, entity_id: str, threshold: int = 100) -> float:
         """Processes Redis velocity hits."""
@@ -194,7 +194,8 @@ class CyberEnricher:
         org = (p.get("org") or p.get("organization") or p.get("asn_name") or "").lower()
         country = (p.get("country_code") or "")[:2].upper()
         
-        port = str(p.get("port", ""))
+        raw_port = p.get("port")
+        port = int(raw_port) if raw_port is not None and str(raw_port).isdigit() else None
         product = p.get("product") or p.get("service") or "Unknown"
         
         is_critical = any(kw in org for kw in HIGH_VALUE_ORGS)
@@ -223,7 +224,7 @@ class CyberEnricher:
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"Exposed {product} on {ip} (Port: {port}) ({org})",
-            security_data=SecurityData(exposure_type="open_port", ip_address=ip, affected_org=org, port=port if port else None),
+            security_data=SecurityData(exposure_type="open_port", ip_address=ip, affected_org=org, port=port),
             tags=tags, anomaly_score=anomaly
         )
 

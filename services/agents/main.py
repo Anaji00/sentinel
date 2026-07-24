@@ -34,6 +34,7 @@ from services.agents.financial_advisor import FinancialAdvisorAgent
 from services.agents.yield_curve_agent import YieldCurveMacroRatesAgent
 from services.agents.volatility_surface_agent import VolatilitySurfaceAgent
 from services.agents.insider_clustering_agent import InsiderClusteringAgent
+from shared.utils.tasks import safe_create_task
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -82,7 +83,7 @@ async def run_task_queue_worker(redis_client, agents: dict):
                 # FIRE AND FORGET: create_task schedules the coroutine to run in the background.
                 # We don't `await` it here because we want the worker loop to immediately 
                 # go back to listening for new tasks from Redis without waiting for the handler to finish.
-                asyncio.create_task(agent._dispatch(payload))
+                safe_create_task(agent._dispatch(payload), name=f"agent-dispatch-{agent_name}")
             else:
                 logger.warning(f"Unknown agent in task queue: {agent_name}")
         
@@ -159,7 +160,7 @@ async def main():
     ollama_client = OllamaClient(main_session, redis_client=shared_infra["redis"])
     
     soft_correlator = SoftCorrelator(ollama_client)
-    asyncio.create_task(soft_correlator._load())
+    safe_create_task(soft_correlator._load(), name="soft-correlator-load")
 
     # ── TIERED PER-AGENT MODEL ALLOCATION ───────────────────────────────────────
     # Heavy Analytical Tier: Deep reasoning (llama3 -> gemma:2b fallback)
@@ -308,19 +309,19 @@ async def main():
 
     # ── LAUNCH ALL AGENTS + TASK QUEUE WORKER ─────────────────────────────────
     tasks = [
-        asyncio.create_task(news_agent.run(),      name="news_intel"),
-        asyncio.create_task(quant_agent.run(),     name="quant_researcher"),
-        asyncio.create_task(ontology_agent.run(),  name="ontology_master"),
-        asyncio.create_task(radar_agent.run(),     name="radar_agent"),
-        asyncio.create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
-        asyncio.create_task(yield_curve_agent.run(), name="yield_curve_agent"),
-        asyncio.create_task(volatility_surface_agent.run(), name="volatility_surface_agent"),
-        asyncio.create_task(insider_clustering_agent.run(), name="insider_clustering_agent"),
-        asyncio.create_task(supervisor_agent.run(), name="supervisor"),
-        asyncio.create_task(macro_strategist_agent.run(), name="macro_strategist"),
-        asyncio.create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
-        asyncio.create_task(financial_advisor_agent.run(), name="financial_advisor"),
-        asyncio.create_task(
+        safe_create_task(news_agent.run(),      name="news_intel"),
+        safe_create_task(quant_agent.run(),     name="quant_researcher"),
+        safe_create_task(ontology_agent.run(),  name="ontology_master"),
+        safe_create_task(radar_agent.run(),     name="radar_agent"),
+        safe_create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
+        safe_create_task(yield_curve_agent.run(), name="yield_curve_agent"),
+        safe_create_task(volatility_surface_agent.run(), name="volatility_surface_agent"),
+        safe_create_task(insider_clustering_agent.run(), name="insider_clustering_agent"),
+        safe_create_task(supervisor_agent.run(), name="supervisor"),
+        safe_create_task(macro_strategist_agent.run(), name="macro_strategist"),
+        safe_create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
+        safe_create_task(financial_advisor_agent.run(), name="financial_advisor"),
+        safe_create_task(
             run_task_queue_worker(shared_infra["redis"], agents_by_name),
             name="task_queue_worker",
         ),

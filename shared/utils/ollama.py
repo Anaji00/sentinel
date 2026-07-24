@@ -304,7 +304,7 @@ class OllamaClient:
                     except InferenceError as fe:
                         raise fe
                 else:
-                    logger.warning("No unvisited fallback models available in local Ollama. Retrying with same model.")
+                    logger.info(f"No secondary fallback model pulled in local Ollama. Retrying on '{active_model}' (attempt {attempt+1}/{max_retries})...")
                 
                 # Exponential backoff before retrying
                 await asyncio.sleep(2 ** attempt)
@@ -401,8 +401,8 @@ class OllamaClient:
 
         # Truncate prompt if longer than 3500 chars to fit within 4096 context window
         clean_prompt = prompt
-        if len(clean_prompt) > 1800:
-            clean_prompt = clean_prompt[:1800] + "\n...[truncated]"
+        if len(clean_prompt) > 6000:
+            clean_prompt = clean_prompt[:6000] + "\n...[truncated]"
 
         payload = {
             "model": resolved_model,
@@ -412,7 +412,7 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": min(num_predict or 192, 512),
-                "num_ctx": 2048,  # Cap context size at 2048 to minimize KV cache allocation and maximize throughput
+                "num_ctx": 4096,  # Context window size in tokens
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }

@@ -13,6 +13,7 @@ FIX (code review): TimescaleClient.query() now rolls back and re-raises on
 import logging
 import os
 import json
+import asyncio as _asyncio
 import asyncio
 from typing import Optional, List, Dict
 import time
@@ -199,32 +200,43 @@ class TimescaleClient:
 _timescale: Optional[TimescaleClient] = None
 _async_redis: Optional[RedisClient] = None
 _neo4j: Optional[Neo4jClient] = None
+_timescale_lock = _asyncio.Lock()
+_redis_lock = _asyncio.Lock()
+_neo4j_lock = _asyncio.Lock()
 
 
 async def get_timescale() -> TimescaleClient:
     global _timescale
-    if _timescale is None:
-        # Only happens the very first time the app calls this.
-        _timescale = TimescaleClient()
-        await _timescale._connect()
+    if _timescale is not None:
+        return _timescale
+    async with _timescale_lock:
+        if _timescale is None:
+            _timescale = TimescaleClient()
+            await _timescale._connect()
     return _timescale
 
 
 async def get_redis() -> RedisClient:
-    """Thread-safe async singleton for Redis."""
+    """Async singleton for Redis with lock guard against concurrent initialization."""
     global _async_redis
-    if _async_redis is None:
-        _async_redis = RedisClient()
+    if _async_redis is not None:
+        return _async_redis
+    async with _redis_lock:
+        if _async_redis is None:
+            _async_redis = RedisClient()
     return _async_redis
 
 
 async def get_neo4j() -> Neo4jClient:
     """Asynchronous Neo4j client. Should only be used by the GraphSupervisor."""
     global _neo4j
-    if _neo4j is None:
-        client = Neo4jClient()
-        await client.connect()
-        _neo4j = client
+    if _neo4j is not None:
+        return _neo4j
+    async with _neo4j_lock:
+        if _neo4j is None:
+            client = Neo4jClient()
+            await client.connect()
+            _neo4j = client
     return _neo4j
 
 

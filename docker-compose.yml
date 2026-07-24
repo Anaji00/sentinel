@@ -385,6 +385,12 @@ services:
     ports:
       - "8000:8000"
     restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': 'sentinel-dev-key-2026'}); urllib.request.urlopen(r)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -428,7 +434,7 @@ services:
     restart: always
     depends_on:
       api-gateway:
-        condition: service_started
+        condition: service_healthy
 
 
 volumes:

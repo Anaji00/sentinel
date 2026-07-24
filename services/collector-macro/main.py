@@ -47,9 +47,9 @@ MACRO_TICKERS = {
     "ZW=F": "Wheat Futures",
     "NQ=F": "Nasdaq 100 Futures",
     "ES=F": "S&P 500 Futures",
-    "^VIX": "Volatility Index",
+    "VXX":  "Volatility Index ETN",
     "TIP":  "iShares TIPS Bond ETF",
-    "^TNX": "10-Year Treasury Yield"
+    "TLT":  "20+ Year Treasury Bond ETF"
 }
 
 # Alpaca Fallback Proxies mapping
@@ -67,9 +67,9 @@ FALLBACK_MAP = {
     "ZW=F": "WEAT",  # Wheat -> WEAT ETF
     "NQ=F": "QQQ",   # Nasdaq 100 -> QQQ ETF
     "ES=F": "SPY",   # S&P 500 -> SPY ETF
-    "^VIX": "VXX",   # Volatility Index -> VXX ETF
+    "VXX":  "VXX",   # Volatility Index -> VXX ETF
     "TIP":  "TIP",   # TIPS Bond ETF -> TIP ETF
-    "^TNX": "TLT",   # 10-Yr Treasury Yield -> TLT Bond ETF proxy
+    "TLT":  "TLT",   # 10-20 Yr Treasury Yield -> TLT Bond ETF proxy
 }
 
 # Retry config
@@ -181,12 +181,9 @@ async def fetch_and_publish(producer: SentinelProducer):
     use_fallback = False
 
     if data is None or data.empty:
-        logger.warning("yfinance returned empty. Activating Alpaca fallback for all tickers...")
+        logger.warning("yfinance bulk download returned empty. Switching to single-ticker fast_info & Alpaca fallback...")
         use_fallback = True
         fallback_quotes = await fetch_fallback_quotes(tickers)
-        if not fallback_quotes:
-            logger.error("Alpaca fallback returned no data. Aborting macro cycle.")
-            return
 
     now = datetime.now(timezone.utc).isoformat()
     published = 0
@@ -223,13 +220,9 @@ async def fetch_and_publish(producer: SentinelProducer):
                                 vol_val = vol_col.iloc[-1]
                                 volume = float(vol_val) if vol_val == vol_val else 0.0
 
-            if use_fallback or ticker_failed:
-                # Lazy fetch fallback if not loaded yet
-                if not fallback_quotes:
-                    logger.warning(f"Ticker {ticker} failed on bulk yfinance. Fetching Alpaca proxy...")
-                    fallback_quotes = await fetch_fallback_quotes([ticker])
-                
-                if ticker in fallback_quotes:
+            if use_fallback or ticker_failed or current_price <= 0.0:
+                # Lazy fetch Alpaca fallback if available
+                if fallback_quotes and ticker in fallback_quotes:
                     q = fallback_quotes[ticker]
                     current_price = q["close"]
                     previous_price = q["open"]
@@ -237,31 +230,37 @@ async def fetch_and_publish(producer: SentinelProducer):
                     low_val = q["low"]
                     volume = q["volume"]
                     fallback_symbol = FALLBACK_MAP.get(ticker, ticker)
-                    logger.info(f"Using Alpaca proxy fallback ({fallback_symbol}) for {ticker}: {current_price}")
+                    logger.info(f"Using Alpaca proxy fallback ({fallback_symbol}) for {ticker}: ${current_price}")
                 else:
                     # Single-ticker yfinance fast_info fallback
                     try:
                         def _single_yf(tk=ticker):
-                            t = yf.Ticker(tk)
-                            p = float(getattr(t.fast_info, 'last_price', 0.0) or getattr(t.fast_info, 'previous_close', 0.0) or 0.0)
-                            if p <= 0:
-                                df = t.history(period="5d")
-                                if not df.empty and "Close" in df.columns:
-                                    p = float(df["Close"].iloc[-1])
-                            return p
+                            try:
+                                t = yf.Ticker(tk)
+                                fi = getattr(t, 'fast_info', {})
+                                p = 0.0
+                                if isinstance(fi, dict) or hasattr(fi, '__getitem__'):
+                                    p = float(fi.get('lastPrice') or fi.get('last_price') or fi.get('previousClose') or 0.0)
+                                if p <= 0:
+                                    df = t.history(period="2d")
+                                    if not df.empty and "Close" in df.columns:
+                                        p = float(df["Close"].iloc[-1])
+                                return p
+                            except Exception:
+                                return 0.0
                         
                         single_price = await loop.run_in_executor(None, _single_yf)
                         if single_price > 0:
                             current_price = single_price
-                            previous_price = single_price * 0.999
-                            high_val = single_price * 1.002
-                            low_val = single_price * 0.998
+                            previous_price = single_price
+                            high_val = single_price
+                            low_val = single_price
                             logger.info(f"✅ Single-ticker yfinance fallback recovered {ticker}: ${current_price:.2f}")
                         else:
-                            logger.warning(f"No fallback proxy available for {ticker}. Skipping.")
+                            logger.warning(f"No real market quote retrieved for {ticker}. Skipping ticker.")
                             continue
                     except Exception as s_err:
-                        logger.warning(f"Single-ticker yfinance fallback error for {ticker}: {s_err}. Skipping.")
+                        logger.warning(f"Fallback error for {ticker}: {s_err}. Skipping ticker.")
                         continue
 
             tick_direction = (

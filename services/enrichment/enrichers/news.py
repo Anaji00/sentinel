@@ -73,31 +73,31 @@ except Exception as e:
     nlp = None
 
 NEG_PATTERNS = [
-    r"\battack[s|ed|ing]*\b", r"\bwar[s]*\b", r"\bkill[s|ed|ing]*\b", r"\bexplod[e|es|ed|ing]*\b", r"\bexplosion[s]*\b",
-    r"\bsanction[s|ed|ing]*\b", r"\bseiz[e|es|ed|ure|ures|uring]*\b", r"\bcrash[es|ed|ing]*\b", r"\bdisaster[s]*\b",
-    r"\bcollaps[e|es|ed|ing]*\b", r"\bcris[is|es]*\b", r"\bthreat[s|ened|ening]*\b", r"\bmissile[s]*\b", r"\bdetain[ed|s|ing]*\b",
-    r"\bconflict[s]*\b", r"\bstrike[s|ing]*\b", r"\bblockad[e|es|ed|ing]*\b", r"\barrest[ed|s|ing]*\b", r"\bhijack[s|ed|ing]*\b",
-    r"\bpirac[y]*\b", r"\bbankruptc[y]*\b", r"\bdefault[s|ed|ing]*\b", r"\bliquidat[e|es|ed|ion|ions]*\b", r"\bplung[e|es|ed|ing]*\b",
-    r"\brecession[s]*\b", r"\binflation[s]*\b", r"\bmargin_call[s]*\b", r"\bdowngrad[e|es|ed|ing]*\b", r"\bbearish\b",
-    r"\bbreach[es|ed|ing]*\b", r"\bransomware[s]*\b", r"\bhack[s|ed|ing]*\b", r"\bvulnerabilit[y|ies]*\b", r"\bexploit[s|ed|ing]*\b",
-    r"\boutage[s]*\b", r"\bmalware[s]*\b", r"\bescalat[e|es|ed|ion|ions]*\b", r"\binva[de|des|ded|sion|sions]*\b",
-    r"\bcoup[s]*\b", r"\briot[s|ed|ing]*\b", r"\bembargo[es|ed]*\b", r"\btension[s]*\b", r"\bterroris[m|t|ts]*\b",
-    r"\bfraud[s]*\b", r"\bscam[s|med|ming]*\b", r"\bindict[ed|s|ment|ments]*\b", r"\blawsuit[s]*\b", r"\bselloff[s]*\b",
-    r"\bpenalt[y|ies]*\b", r"\brugpull[s]*\b", r"\bdelist[ed|s|ing]*\b", r"\bslump[s|ed|ing]*\b", r"\btank[ed|s|ing]*\b",
-    r"\bunderperform[s|ed|ing]*\b", r"\bcapitulat[e|es|ed|ion]*\b", r"\bdilution\b", r"\bdeflat[e|es|ed|ion]*\b",
-    r"\bdive[s|d|ing]*\b", r"\bsink[s|ing]*\b", r"\btumb[le|les|led|ling]*\b", r"\bplumm[et|ets|eted|eting]*\b",
-    r"\bdrop[s|ped|ping]*\b", r"\bfall[s|ing]*\b"
+    r"\battack(?:s|ed|ing)?\b", r"\bwars?\b", r"\bkill(?:s|ed|ing)?\b", r"\bexplod(?:e|es|ed|ing)?\b", r"\bexplosions?\b",
+    r"\bsanction(?:s|ed|ing)?\b", r"\bseiz(?:e|es|ed|ure|ures|uring)?\b", r"\bcrash(?:es|ed|ing)?\b", r"\bdisasters?\b",
+    r"\bcollaps(?:e|es|ed|ing)?\b", r"\bcrisis\b", r"\bcrises\b", r"\bthreat(?:s|ened|ening)?\b", r"\bmissiles?\b", r"\bdetain(?:ed|s|ing)?\b",
+    r"\bconflicts?\b", r"\bstrik(?:e|es|ing)?\b", r"\bblockad(?:e|es|ed|ing)?\b", r"\barrest(?:ed|s|ing)?\b", r"\bhijack(?:s|ed|ing)?\b",
+    r"\bpiracy\b", r"\bbankruptcy\b", r"\bdefault(?:s|ed|ing)?\b", r"\bliquidat(?:e|es|ed|ion|ions)?\b", r"\bplung(?:e|es|ed|ing)?\b",
+    r"\brecessions?\b", r"\binflations?\b", r"\bmargin_calls?\b", r"\bdowngrad(?:e|es|ed|ing)?\b", r"\bbearish\b",
+    r"\bbreach(?:es|ed|ing)?\b", r"\bransomware\b", r"\bhack(?:s|ed|ing)?\b", r"\bvulnerabilit(?:y|ies)\b", r"\bexploit(?:s|ed|ing)?\b",
+    r"\boutages?\b", r"\bmalware\b", r"\bescalat(?:e|es|ed|ion|ions)?\b", r"\binvad(?:e|es|ed)?\b", r"\binvasions?\b",
+    r"\bcoups?\b", r"\briot(?:s|ed|ing)?\b", r"\bembargo(?:es|ed)?\b", r"\btensions?\b", r"\bterroris(?:m|t|ts)\b",
+    r"\bfrauds?\b", r"\bscam(?:s|med|ming)?\b", r"\bindict(?:ed|s|ment|ments)?\b", r"\blawsuits?\b", r"\bselloffs?\b",
+    r"\bpenalt(?:y|ies)\b", r"\brugpulls?\b", r"\bdelist(?:ed|s|ing)?\b", r"\bslump(?:s|ed|ing)?\b", r"\btank(?:ed|s|ing)?\b",
+    r"\bunderperform(?:s|ed|ing)?\b", r"\bcapitulat(?:e|es|ed|ion)?\b", r"\bdilution\b", r"\bdeflat(?:e|es|ed|ion)?\b",
+    r"\bdiv(?:e|es|ed|ing)?\b", r"\bsink(?:s|ing)?\b", r"\btumbl(?:e|es|ed|ing)?\b", r"\bplummet(?:s|ed|ing)?\b",
+    r"\bdrop(?:s|ped|ping)?\b", r"\bfall(?:s|ing)?\b"
 ]
 
 POS_PATTERNS = [
-    r"\bdeal[s]*\b", r"\bagreement[s]*\b", r"\bpeace\b", r"\bgrowth\b", r"\brecovery\b", r"\bcooperation\b",
-    r"\bceasefire[s]*\b", r"\bdiplomatic\b", r"\balliance[s]*\b", r"\btrade[s]*\b", r"\baccord[s]*\b",
-    r"\bbullish\b", r"\bmerger[s]*\b", r"\bacquisition[s]*\b", r"\bprofit[s|ed|ing]*\b", r"\bdividend[s]*\b",
-    r"\bsurg[e|es|ed|ing]*\b", r"\brall[y|ies|ied|ying]*\b", r"\bstimulus\b", r"\bbreakout[s]*\b", r"\bupgrad[e|es|ed|ing]*\b",
-    r"\btreat[y|ies]*\b", r"\bnegotiat[e|es|ed|ion|ions]*\b", r"\bpartnershi[p|ps]*\b", r"\baid[s]*\b", r"\bpatch[ed|es|ing]*\b",
-    r"\bsecur[e|ed|es|ing]*\b", r"\bresolv[e|ed|es|ing]*\b", r"\brescu[e|ed|es|ing]*\b", r"\bfunding\b", r"\badoption\b",
-    r"\bapprov[e|ed|es|al|ing]*\b", r"\bbreakthrough[s]*\b", r"\bunder-valued\b", r"\bbull-run\b", r"\bsoar[s|ed|ing]*\b",
-    r"\bjump[s|ed|ing]*\b", r"\bbeat[s|ing|en]*\b", r"\bclimb[s|ed|ing]*\b", r"\bgain[s|ed|ing]*\b", r"\brecord[s]*\b"
+    r"\bdeals?\b", r"\bagreements?\b", r"\bpeace\b", r"\bgrowth\b", r"\brecovery\b", r"\bcooperation\b",
+    r"\bceasefires?\b", r"\bdiplomatic\b", r"\balliances?\b", r"\btrades?\b", r"\baccords?\b",
+    r"\bbullish\b", r"\bmergers?\b", r"\bacquisitions?\b", r"\bprofit(?:s|ed|ing)?\b", r"\bdividends?\b",
+    r"\bsurg(?:e|es|ed|ing)?\b", r"\brall(?:y|ies|ied|ying)?\b", r"\bstimulus\b", r"\bbreakouts?\b", r"\bupgrad(?:e|es|ed|ing)?\b",
+    r"\btreat(?:y|ies)\b", r"\bnegotiat(?:e|es|ed|ion|ions)?\b", r"\bpartnerships?\b", r"\baids?\b", r"\bpatch(?:ed|es|ing)?\b",
+    r"\bsecur(?:e|ed|es|ing)?\b", r"\bresolv(?:e|ed|es|ing)?\b", r"\brescue[ds]?\b", r"\bfunding\b", r"\badoption\b",
+    r"\bapprov(?:e|ed|es|al|ing)?\b", r"\bbreakthroughs?\b", r"\bunder-valued\b", r"\bbull-run\b", r"\bsoar(?:s|ed|ing)?\b",
+    r"\bjump(?:s|ed|ing)?\b", r"\bbeat(?:s|ing|en)?\b", r"\bclimb(?:s|ed|ing)?\b", r"\bgain(?:s|ed|ing)?\b", r"\brecords?\b"
 ]
 
 NEG_REGEXES = [re.compile(p, re.IGNORECASE) for p in NEG_PATTERNS]

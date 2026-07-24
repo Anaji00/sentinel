@@ -34,7 +34,7 @@ python -m pytest
 ```
 
 ### Local Endpoints
-- **API Gateway:** `http://localhost:8000` (`X-API-KEY: sentinel-dev-key-2026`)
+- **API Gateway:** `http://localhost:8000` (`X-API-KEY: <your .env API_GATEWAY_KEY>`)
 - **Frontend Web UI:** `http://localhost:3000`
 - **Kafka UI:** `http://localhost:8080` | **Neo4j Browser:** `http://localhost:7474` | **Qdrant Dashboard:** `http://localhost:6333/dashboard`
 

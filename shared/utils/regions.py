@@ -143,40 +143,40 @@ def get_region_sensitivity_multiplier(region: Optional[str]) -> float:
 
 
     multipliers = {
-        "Strait of Hormuz": 3.0,
-        "Iranian Territorial": 3.0,
-        "Iran Airspace": 3.0,
-        "North Korean Waters": 3.0,
-        "North Korea ADIZ": 3.0,
-        "Ukrainian Waters": 2.5,
-        "Ukraine Airspace": 2.5,
-        "Taiwan Strait": 2.5,
-        "Taiwan ADIZ": 2.5,
-        "Bab-el-Mandeb": 3.0,  # Elevated due to active conflict
-        "Israeli Territorial": 3.0,
-        "Israeli Airspace": 3.0,
-        "Red Sea": 2.5,        # Elevated due to active conflict (was 1.5)
-        "Somali Territorial": 2.5, # Added missing multiplier for piracy risk
-        "Somali Airspace": 2.5,
-        "Syrian Territorial": 2.5, # Added missing multiplier
-        "Syrian Airspace": 2.5,
-        "Yemeni Airspace": 3.0,
-        "Russian Airspace": 2.0,
+        "Strait of Hormuz": 1.5,
+        "Iranian Territorial": 1.5,
+        "Iran Airspace": 1.5,
+        "North Korean Waters": 1.5,
+        "North Korea ADIZ": 1.5,
+        "Ukrainian Waters": 1.4,
+        "Ukraine Airspace": 1.4,
+        "Taiwan Strait": 1.4,
+        "Taiwan ADIZ": 1.4,
+        "Bab-el-Mandeb": 1.5,
+        "Israeli Territorial": 1.5,
+        "Israeli Airspace": 1.5,
+        "Red Sea": 1.4,
+        "Somali Territorial": 1.4,
+        "Somali Airspace": 1.4,
+        "Syrian Territorial": 1.4,
+        "Syrian Airspace": 1.4,
+        "Yemeni Airspace": 1.5,
+        "Russian Airspace": 1.3,
 
         # High
-        "Persian Gulf":         2.0,
-        "Gulf of Aden":         2.0,
-        "Black Sea":            2.0,
-        "Suez Canal":           2.0,
-        "Strait of Malacca":    1.8,
-        "South China Sea":      1.8,
+        "Persian Gulf":         1.3,
+        "Gulf of Aden":         1.3,
+        "Black Sea":            1.3,
+        "Suez Canal":           1.3,
+        "Strait of Malacca":    1.2,
+        "South China Sea":      1.2,
  
         # Elevated
-        "Gulf of Oman":         1.5,
-        "Barents Sea":          1.5,
-        "East China Sea":       1.5,
+        "Gulf of Oman":         1.1,
+        "Barents Sea":          1.1,
+        "East China Sea":       1.1,
     }
-    return multipliers.get(region, 1.2) # 1.2 for all other watch regions, even if not explicitly listed here
+    return multipliers.get(region, 1.0)
     
 # ── VESSEL AIS DECODE HELPERS ─────────────────────────────────────────────────
  

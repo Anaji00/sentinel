@@ -1,5 +1,11 @@
 // frontend/src/lib/types.ts
 
+export interface ScenarioHypothesis {
+    label?: string;
+    mechanism?: string;
+    probability?: number;
+}
+
 export interface Scenario {
     scenario_id?: string;
     correlation_id: string;
@@ -10,6 +16,9 @@ export interface Scenario {
     summary?: string;
     significance: string;
     confidence_overall: number;
+    confidence_rationale?: string;
+    hypotheses?: ScenarioHypothesis[];
+    recommended_monitoring?: string[];
     probability?: number;
     created_at: string;
 }

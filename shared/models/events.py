@@ -5,7 +5,6 @@ from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, field_validator
 import json
-from psycopg2.extras import Json
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -36,7 +35,7 @@ class EventType(str, Enum):
     BGP_ANOMALY = "bgp_anomaly"
     RANSOMWARE = "ransomware"
     CLIMATE_STRESS = "climate_stress"
-    INFASTRUCTURE = "infrastructure"
+    INFRASTRUCTURE = "infrastructure"
     SPORTS_LINE_MOVEMENT = "sports_line_movement"
     PREDICTION_MARKET_TRADE = "prediction_market_trade"
     CRYPTO_LIQUIDATION = "crypto_liquidation"
@@ -95,6 +94,8 @@ class Entity(BaseModel):
 class VesselData(BaseModel):
     mmsi: Optional[str] = None
     imo: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     speed_knots: Optional[float] = None
     heading: Optional[int] = None
     course_over_ground: Optional[float] = None
@@ -128,7 +129,7 @@ class BettingData(BaseModel):
     matchup: Optional[str] = None
     market_type: Optional[str] = None
     selection: Optional[str] = None
-    implied_probablity: Optional[float] = None
+    implied_probability: Optional[float] = None
     american_odds: Optional[int] = None
     sharp_book_deviation: Optional[float] = None
 
@@ -252,7 +253,7 @@ class NormalizedEvent(BaseModel):
             pe.id if pe else None, 
             pe.type.value if pe else EntityType.UNKNOWN.value,
             pe.name if pe else None, 
-            Json(pe.flags) if pe and pe.flags else Json([]),
+            pe.flags if pe and pe.flags else [],
             self.longitude, 
             self.latitude,
             self.region, 
@@ -260,13 +261,13 @@ class NormalizedEvent(BaseModel):
             self.headline, 
             self.summary, 
             self.url,
-            Json(self.vessel_data.model_dump(mode='json')) if self.vessel_data else None,
-            Json(self.flight_data.model_dump(mode='json')) if self.flight_data else None,
-            Json(self.financial_data.model_dump(mode='json')) if self.financial_data else None,
-            Json(self.security_data.model_dump(mode='json')) if self.security_data else None,
-            Json(self.betting_data.model_dump(mode='json')) if self.betting_data else None,
-            Json(self.prediction_market_data.model_dump(mode='json')) if self.prediction_market_data else None,
-            Json(self.crypto_data.model_dump(mode='json')) if self.crypto_data else None,
+            json.dumps(self.vessel_data.model_dump(mode='json')) if self.vessel_data else None,
+            json.dumps(self.flight_data.model_dump(mode='json')) if self.flight_data else None,
+            json.dumps(self.financial_data.model_dump(mode='json')) if self.financial_data else None,
+            json.dumps(self.security_data.model_dump(mode='json')) if self.security_data else None,
+            json.dumps(self.betting_data.model_dump(mode='json')) if self.betting_data else None,
+            json.dumps(self.prediction_market_data.model_dump(mode='json')) if self.prediction_market_data else None,
+            json.dumps(self.crypto_data.model_dump(mode='json')) if self.crypto_data else None,
             self.tags, 
             self.named_entities, 
             float(self.sentiment) if self.sentiment is not None else None, 

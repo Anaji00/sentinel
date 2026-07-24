@@ -31,6 +31,8 @@ from services.enrichment.graph_writer import GraphWriter
 from services.enrichment.entity_resolver import EntityResolver
 from services.enrichment.gap_detector import VesselGapDetector
 
+from shared.utils.tasks import safe_create_task
+
 # --- THE NEW ENRICHERS ---
 from services.enrichment.enrichers.maritime import MaritimeEnricher
 from services.enrichment.enrichers.aviation import AviationEnricher
@@ -83,7 +85,7 @@ async def main():
 
     timescale = await get_timescale()
     redis     = await get_redis()
-    asyncio.create_task(_ofac_sync_loop())
+    safe_create_task(_ofac_sync_loop(), name="ofac-sync")
     
     # Wait for databases to come online
     producer = SentinelProducer()
@@ -119,7 +121,7 @@ async def main():
     await consumer.start()
 
     gap = VesselGapDetector(producer, scorer, db, redis)
-    gap_task = asyncio.create_task(gap.run())
+    gap_task = safe_create_task(gap.run(), name="vessel-gap-detector")
 
     import time as _time
     _start_time = _time.monotonic()
@@ -130,7 +132,7 @@ async def main():
         "errors": 0,
         "elapsed": lambda: _time.monotonic() - _start_time,
     }
-    heartbeat_task = asyncio.create_task(_heartbeat_loop(heartbeat_state))
+    heartbeat_task = safe_create_task(_heartbeat_loop(heartbeat_state), name="enrichment-heartbeat")
 
     logger.info("Enrichment Pipeline LIVE. Listening for raw telemetry...")
     
@@ -163,7 +165,7 @@ async def main():
                         raw_events_by_topic.setdefault(msg.topic, []).append(raw_event)
                     except json.JSONDecodeError as e:
                         logger.error(f"POISON PILL JSON dropped: {e}", exc_info=True)
-                        asyncio.create_task(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}))
+                        safe_create_task(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}), name="dlq-poison-pill")
                 
                 enrich_tasks = []
                 for topic, raw_events in raw_events_by_topic.items():
@@ -186,7 +188,7 @@ async def main():
                     if isinstance(batch_result, Exception):
                         logger.error(f"Batch enrichment failed for topic {topic}: {batch_result}", exc_info=batch_result)
                         for re in raw_events:
-                            asyncio.create_task(
+                            safe_create_task(
                                 dlq.send(
                                     Topics.DLQ,
                                     {
@@ -194,7 +196,8 @@ async def main():
                                         "topic": topic,
                                         "raw": re.model_dump()
                                     }
-                                )
+                                ),
+                                name=f"dlq-batch-error-{topic}",
                             )
                     elif isinstance(batch_result, list):
                         def _flatten(items):
@@ -232,18 +235,19 @@ async def main():
                                 )
                             elif isinstance(enriched, Exception):
                                 logger.error(f"Enrichment failed for event from {topic}: {enriched}", exc_info=enriched)
-                                asyncio.create_task(
+                                safe_create_task(
                                     dlq.send(
                                         Topics.DLQ,
                                         {
                                             "error": f"Enrichment event error: {enriched}",
                                             "topic": topic,
                                         }
-                                    )
+                                    ),
+                                    name=f"dlq-enrich-error-{topic}",
                                 )
 
                         if vessel_positions_to_write:
-                            asyncio.create_task(db.write_vessel_positions_batch(vessel_positions_to_write))
+                            safe_create_task(db.write_vessel_positions_batch(vessel_positions_to_write), name="vessel-position-write")
                 
                 if produce_tasks:
                     await asyncio.gather(*produce_tasks, return_exceptions=True)

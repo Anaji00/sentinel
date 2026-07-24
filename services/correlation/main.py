@@ -54,24 +54,24 @@ async def _listen_for_rule_updates(redis_client):
                 {
                     "rule_id": "rule_cyber_aviation_chokepoint",
                     "trigger_event_type": "cyber_threat",
-                    "conditions": {"min_anomaly": 0.1},
-                    "correlations": [{"event_types": ["flight_position", "vessel_position"], "hours": 48, "min_anomaly": 0.0}],
+                    "conditions": {"min_anomaly": 0.3},
+                    "correlations": [{"event_types": ["flight_position", "vessel_position"], "hours": 48, "min_anomaly": 0.3}],
                     "alert_tier": "CRITICAL",
                     "expires_at": int(time.time()) + 315360000
                 },
                 {
                     "rule_id": "rule_macro_market_volatility",
                     "trigger_event_type": "macro_indicator",
-                    "conditions": {"min_anomaly": 0.0},
-                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 24, "min_anomaly": 0.0}],
+                    "conditions": {"min_anomaly": 0.3},
+                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 24, "min_anomaly": 0.3}],
                     "alert_tier": "ELEVATED",
                     "expires_at": int(time.time()) + 315360000
                 },
                 {
                     "rule_id": "rule_news_market_anomaly",
                     "trigger_event_type": "news_article",
-                    "conditions": {"min_anomaly": 0.0},
-                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 12, "min_anomaly": 0.0}],
+                    "conditions": {"min_anomaly": 0.2},
+                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 12, "min_anomaly": 0.2}],
                     "alert_tier": "WATCH",
                     "expires_at": int(time.time()) + 315360000
                 }
@@ -140,6 +140,17 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     entity_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
                     entity_name = (event.primary_entity.name or entity_id) if event.primary_entity else "UNKNOWN"
 
+                    # Extract rich context from supporting events
+                    supporting_entity_names = list(dict.fromkeys(
+                        e.get("entity_name") or e.get("entity_id", "Unknown")
+                        for e in supporting_events[:10]
+                        if e.get("entity_name") or e.get("entity_id")
+                    ))[:5]
+                    supporting_headlines = [
+                        e.get("headline") or e.get("summary") or f"{e.get('type', 'event')}: {e.get('entity_name', 'Unknown')}"
+                        for e in supporting_events[:3]
+                    ]
+
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
@@ -147,10 +158,17 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         alert_tier=alert_tier,
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
-                        entity_ids=[entity_id],
-                        entity_names=[entity_name],
-                        description=f"Dynamic rule '{rule.get('rule_name')}' triggered for entity '{entity_name}'. Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains.",
-                        tags=["dynamic_rule", "ai_generated", f"entity:{entity_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"] + rule.get("tags", [])
+                        entity_ids=[entity_id] + [e.get("entity_id", "") for e in supporting_events[:5] if e.get("entity_id")],
+                        entity_names=list(dict.fromkeys([entity_name] + supporting_entity_names)),
+                        description=(
+                            f"Rule '{rule.get('rule_name', rule.get('rule_id'))}' triggered by '{entity_name}'. "
+                            f"Correlated with {len(supporting_events)} events across {len(domains_triggered)} domains "
+                            f"({', '.join(sorted(domains_triggered))}). "
+                            f"Related: {'; '.join(supporting_headlines)}"
+                        ),
+                        tags=["dynamic_rule", "ai_generated", f"entity:{entity_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"]
+                            + [f"domain:{d}" for d in sorted(domains_triggered)]
+                            + rule.get("tags", [])
                     )
                     clusters.append(cluster)
             except Exception as e:

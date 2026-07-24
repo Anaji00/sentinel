@@ -7,6 +7,7 @@ incoming web requests to the appropriate databases and backend services.
 """
 
 import sys
+import os
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -41,8 +42,27 @@ async def lifespan(app: FastAPI):
     app.state.neo4j = await get_neo4j()
     app.state.redis = await get_redis()
     yield
-    # CLEANUP: Code placed here would close the database connections gracefully.
-    logger.info("Shutting down...")
+    # CLEANUP: Gracefully close all database connections on shutdown.
+    logger.info("Shutting down — closing database connections...")
+    try:
+        if hasattr(app.state, "db") and app.state.db and app.state.db._pool:
+            await app.state.db._pool.close()
+            logger.info("TimescaleDB pool closed.")
+    except Exception as e:
+        logger.error(f"Error closing TimescaleDB pool: {e}")
+    try:
+        if hasattr(app.state, "neo4j") and app.state.neo4j:
+            await app.state.neo4j.close()
+            logger.info("Neo4j driver closed.")
+    except Exception as e:
+        logger.error(f"Error closing Neo4j driver: {e}")
+    try:
+        if hasattr(app.state, "redis") and app.state.redis:
+            await app.state.redis.raw.aclose()
+            logger.info("Redis connection closed.")
+    except Exception as e:
+        logger.error(f"Error closing Redis connection: {e}")
+    logger.info("Shutdown complete.")
     
 app = FastAPI(
     title="SENTINEL Intelligence API",
@@ -51,8 +71,6 @@ app = FastAPI(
     lifespan=lifespan,
     dependencies=[Depends(verify_api_key)]
 )
-
-import os
 
 # CORS (Cross-Origin Resource Sharing):
 # Driven by CORS_ALLOWED_ORIGINS env var for spec compliance with allow_credentials=True

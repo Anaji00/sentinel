@@ -46,7 +46,7 @@ async def get_domain_events(
     try:
         if domain == "all" or domain not in DOMAIN_TO_COLUMN:
             query = """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, summary as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, summary as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2
@@ -56,7 +56,7 @@ async def get_domain_events(
         target_column = DOMAIN_TO_COLUMN[domain]
         if domain == "news":
             query = """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, summary as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, summary as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2
@@ -64,7 +64,7 @@ async def get_domain_events(
             return await db.query(query, min_anomaly, limit)
         else:
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2

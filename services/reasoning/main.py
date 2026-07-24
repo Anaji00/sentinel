@@ -39,6 +39,7 @@ from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 from services.reasoning.adversarial_wargamer import AdversarialSimulationEngine
 from shared.utils.ollama import OllamaClient
+from shared.utils.tasks import safe_create_task
 
 async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
@@ -99,7 +100,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
 
     if wargamer and cluster.alert_tier in (AlertTier.ALERT, AlertTier.INTELLIGENCE):
         logger.info("⚔️ Triggering Adversarial Wargame Simulation for cluster %s...", cluster.correlation_id)
-        asyncio.create_task(wargamer.run_predictive_wargame(cluster.model_dump()))
+        safe_create_task(wargamer.run_predictive_wargame(cluster.model_dump()), name=f"wargame-{cluster.correlation_id[:8]}")
 
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
@@ -137,7 +138,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                 f"rate={rate:.1f}/s uptime={int(elapsed)}s"
             )
 
-    heartbeat_task = asyncio.create_task(_heartbeat())
+    heartbeat_task = safe_create_task(_heartbeat(), name="reasoning-heartbeat")
     
     sem = asyncio.Semaphore(3)
 
@@ -175,7 +176,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                             cluster = CorrelationCluster(**raw_data)
                             logger.debug(f"Received correlation cluster {cluster.correlation_id} for reasoning analysis")
                             
-                            task = asyncio.create_task(
+                            task = safe_create_task(
                                 sem_process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
                             )
                             batch_tasks.append(task)
@@ -231,8 +232,8 @@ async def main():
     tracker         = ScenarioTracker(db, tracker_producer)
     library         = PatternLibrary(db)
  
-    tracker_task = asyncio.create_task(_tracker_loop(tracker))
-    reasoning_task = asyncio.create_task(run_reasoning_loop(context_builder, generator, library, db, redis_client))
+    tracker_task = safe_create_task(_tracker_loop(tracker), name="scenario-tracker")
+    reasoning_task = safe_create_task(run_reasoning_loop(context_builder, generator, library, db, redis_client), name="reasoning-main-loop")
     
     try:
         await asyncio.gather(tracker_task, reasoning_task)

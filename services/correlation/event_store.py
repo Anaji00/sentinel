@@ -41,7 +41,12 @@ class EventStore:
                 "latitude": event.latitude,
                 "longitude": event.longitude,
                 "headline": event.headline,
+                "summary": getattr(event, "summary", None),
                 "named_entities": event.named_entities,
+                "entity_name": (event.primary_entity.name if event.primary_entity and event.primary_entity.name else
+                                event.primary_entity.id if event.primary_entity else None),
+                "entity_type": (event.primary_entity.type.value if event.primary_entity and hasattr(event.primary_entity.type, 'value') else None),
+                "entity_id": (event.primary_entity.id if event.primary_entity else None),
             })
             await self._redis.zadd(self.cache_key, {payload: timestamp})
 

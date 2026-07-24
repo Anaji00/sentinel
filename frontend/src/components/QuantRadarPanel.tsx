@@ -54,6 +54,7 @@ interface AgentResponse {
 
 export default function QuantRadarPanel() {
   const [subTab, setSubTab] = useState<'radar' | 'agents'>('radar');
+  const [selectedAnomaly, setSelectedAnomaly] = useState<RadarAnomaly | null>(null);
 
   const { data: radarData } = useSWR<RadarResponse>(
     '/radar/anomalies',
@@ -120,7 +121,8 @@ export default function QuantRadarPanel() {
               {anomalies.map((a, idx) => (
                 <div
                   key={idx}
-                  className="p-2.5 rounded-lg bg-slate-900/80 border border-cyan-500/20 hover:border-[#00f2fe]/50 transition-all space-y-1"
+                  onClick={() => setSelectedAnomaly(a)}
+                  className="p-2.5 rounded-lg bg-slate-900/80 border border-cyan-500/20 hover:border-[#00f2fe]/50 cursor-pointer transition-all space-y-1"
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-bold text-white text-xs">{a.ticker} ({a.entity_name})</span>
@@ -186,6 +188,30 @@ export default function QuantRadarPanel() {
           </>
         )}
       </div>
+
+      {/* Radar Anomaly Inspector Modal */}
+      {selectedAnomaly && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#0b0e17] border border-[#00f2fe]/50 rounded-xl max-w-md w-full p-5 space-y-3 shadow-[0_0_30px_rgba(0,242,254,0.3)] font-mono text-xs">
+            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-2.5">
+              <span className="text-xs font-bold text-white uppercase">{selectedAnomaly.ticker} VOLUME SPIKE INSPECTOR</span>
+              <button
+                onClick={() => setSelectedAnomaly(null)}
+                className="text-slate-400 hover:text-white font-bold text-xs bg-slate-800 px-2 py-0.5 rounded cursor-pointer"
+              >
+                ✕ CLOSE
+              </button>
+            </div>
+            <div className="space-y-2">
+              <div><span className="text-slate-400">ENTITY:</span> <span className="text-white font-bold">{selectedAnomaly.entity_name}</span></div>
+              <div><span className="text-slate-400">Z-SCORE SPIKE:</span> <span className="text-rose-400 font-bold">+{selectedAnomaly.z_score.toFixed(2)}σ</span></div>
+              <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-amber-400 font-bold">{selectedAnomaly.anomaly_score.toFixed(3)}</span></div>
+              <div><span className="text-slate-400">REGION:</span> <span className="text-emerald-400">{selectedAnomaly.region}</span></div>
+              <div><span className="text-slate-400">DETECTED AT:</span> <span className="text-slate-300">{new Date(selectedAnomaly.occurred_at).toUTCString()}</span></div>
+            </div>
+          </div>
+        </div>
+      )}
     </Card>
   );
 }
