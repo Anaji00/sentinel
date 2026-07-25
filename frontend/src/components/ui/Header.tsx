@@ -3,7 +3,9 @@
 import React, { useState, useEffect } from 'react';
 
 export const Header: React.FC = () => {
-  const [time, setTime] = useState<string>('');
+  const [time, setTime] = useState<string>(() => {
+    return new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+  });
   const [latency, setLatency] = useState<number>(38);
   const [showStatusModal, setShowStatusModal] = useState<boolean>(false);
 
@@ -41,32 +43,45 @@ export const Header: React.FC = () => {
           </div>
         </div>
 
-        {/* Center Live Telemetry Ticker */}
-        <div className="hidden xl:flex items-center gap-4 bg-slate-950/80 px-4 py-1.5 rounded-lg border border-cyan-500/25 backdrop-blur-md shadow-inner">
-          <div className="flex items-center gap-2 text-xs font-mono">
-            <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse" />
-            <span className="text-slate-400 uppercase text-[10px]">INTEL TICKER:</span>
-            <span className="text-rose-400 font-bold text-[11px] animate-pulse">OFAC TARGET 99 SIGNAL DETECTED</span>
-            <span className="text-slate-600">|</span>
-            <span className="text-amber-300 text-[11px]">HORMUZ DARK VESSEL +2.4σ</span>
-            <span className="text-slate-600">|</span>
-            <span className="text-[#00f2fe] text-[11px]">BTC EWMA VOL 4.2%</span>
+        {/* Center Live Telemetry Ticker & Real-time Metrics Bar */}
+        <div className="hidden xl:flex items-center gap-4 bg-[#080b12]/90 px-4 py-1.5 rounded-lg border border-[#00f2fe]/30 backdrop-blur-md shadow-[0_0_15px_rgba(0,242,254,0.15)]">
+          <div className="flex items-center gap-3 text-xs font-mono">
+            <span className="flex items-center gap-1.5 text-slate-300">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-ping" />
+              <span className="text-[10px] text-slate-400 uppercase tracking-widest font-bold">STREAM:</span>
+              <span className="text-emerald-400 font-extrabold text-[11px]">LIVE (24/7)</span>
+            </span>
+            <span className="text-slate-700">|</span>
+            <span className="text-[11px] text-amber-300 font-bold flex items-center gap-1">
+              <span>🚢 AIS TANKERS:</span>
+              <span className="text-amber-400 font-black">ACTIVE</span>
+            </span>
+            <span className="text-slate-700">|</span>
+            <span className="text-[11px] text-cyan-300 font-bold flex items-center gap-1">
+              <span>✈️ ADS-B FLIGHTS:</span>
+              <span className="text-[#00f2fe] font-black">TRACKING</span>
+            </span>
+            <span className="text-slate-700">|</span>
+            <span className="text-[11px] text-purple-300 font-bold flex items-center gap-1">
+              <span>🤖 AGENT SWARM:</span>
+              <span className="text-purple-400 font-black">ACTIVE (8)</span>
+            </span>
           </div>
         </div>
 
         {/* Right Tactical Badges & Controls */}
-        <div className="flex items-center gap-4 font-mono">
+        <div className="flex items-center gap-3.5 font-mono">
           <button 
             onClick={() => setShowStatusModal(!showStatusModal)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/80 border border-cyan-500/30 text-xs text-slate-200 hover:text-white hover:border-[#00f2fe] transition-all cursor-pointer shadow-md"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cyan-950/40 border border-cyan-500/40 text-xs text-cyan-300 hover:text-white hover:border-[#00f2fe] hover:bg-cyan-500/20 transition-all cursor-pointer shadow-[0_0_12px_rgba(0,242,254,0.2)] font-bold"
           >
             <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="font-bold text-[11px]">SYSTEM HEALTH</span>
+            <span className="text-[11px] tracking-wider uppercase">SYSTEM HEALTH</span>
           </button>
 
           <div className="text-right">
             <div className="text-xs font-semibold text-slate-200 tracking-tight font-mono">
-              {time || '2026-07-22 00:21:00 UTC'}
+              {time}
             </div>
             <div className="text-[10px] text-emerald-400 flex items-center justify-end gap-1 font-bold">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />

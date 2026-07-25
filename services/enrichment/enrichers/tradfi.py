@@ -3,7 +3,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 from shared.kafka import Topics
-from shared.models import NormalizedEvent, EventType, Entity, EntityType, FinancialData
+from shared.models import (
+    NormalizedEvent, EventType, Entity, EntityType, FinancialData,
+    AnomalyBreakdown, MarketMicrostructure
+)
+from shared.utils import quant_calc
 import re 
 
 logger = logging.getLogger("enrichment.tradfi")
@@ -204,6 +208,25 @@ class TradFiEnricher:
 
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
+        # Microstructure calculations
+        aggressor_side = p.get("aggressor_side", p.get("side", "UNKNOWN")).upper()
+        buy_vol = volume if aggressor_side == "BUY" else 0.0
+        sell_vol = volume if aggressor_side == "SELL" else 0.0
+        ofi = quant_calc.order_flow_imbalance(buy_vol, sell_vol)
+
+        micro = MarketMicrostructure(
+            order_flow_imbalance=ofi,
+            vwap=price,
+            twap=price,
+        )
+
+        breakdown = AnomalyBreakdown(
+            composite_score=anomaly,
+            volume_z_score=round(anomaly * 2.0, 2),
+            domain="tradfi",
+            is_significant=anomaly >= 0.65,
+        )
+
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
             type=EventType.EQUITY_BLOCK,
@@ -222,6 +245,8 @@ class TradFiEnricher:
             headline=f"🐋 {direction_str} | {ticker} ${notional/1e6:.2f}M | Anomaly: {anomaly:.2f}",
             tags=tags,
             anomaly_score=anomaly,
+            anomaly_breakdown=breakdown,
+            market_microstructure=micro,
         )
 
     async def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
@@ -282,6 +307,23 @@ class TradFiEnricher:
             direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
             headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
     
+            # Compute Parkinson volatility for the bar
+            parkinson = quant_calc.parkinson_volatility([block["high"]], [block["low"]])
+
+            micro = MarketMicrostructure(
+                parkinson_volatility=parkinson,
+                vwap=block["close"],
+                twap=(block["high"] + block["low"] + block["close"]) / 3.0,
+                realized_volatility=volatility_pct,
+            )
+
+            breakdown = AnomalyBreakdown(
+                composite_score=anomaly,
+                volatility_z_score=round(volatility_pct * 10.0, 2),
+                domain="tradfi",
+                is_significant=anomaly >= 0.65,
+            )
+
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
@@ -303,6 +345,8 @@ class TradFiEnricher:
                 headline=headline,
                 tags=tags,
                 anomaly_score=anomaly,
+                anomaly_breakdown=breakdown,
+                market_microstructure=micro,
             ))
             
         return events

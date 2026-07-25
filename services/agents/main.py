@@ -21,19 +21,13 @@ logger = setup_sentinel_logging("agents.main", level=getattr(logging, os.getenv(
 from shared.db import get_timescale, get_neo4j, get_redis
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.utils.ollama import OllamaClient
+from services.agents.macro_intelligence_engine import MacroIntelligenceEngine
+from services.agents.quant_trading_engine import QuantTradingEngine
+from services.agents.knowledge_graph_engine import KnowledgeGraphEngine
 from services.agents.radar_agent import RadarAgent
-from services.correlation.soft_correlator import SoftCorrelator
-from services.agents.news_intel import NewsIntelAgent
-from services.agents.quant_researcher import QuantResearcherAgent
-from services.agents.ontology_master import OntologyMasterAgent
-from services.agents.macro_cointegration_engine import MacroAssetCointegrationEngine
-from services.agents.supervisor import GraphSupervisor
-from services.agents.macro_strategist import MacroStrategistAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
-from services.agents.financial_advisor import FinancialAdvisorAgent
-from services.agents.yield_curve_agent import YieldCurveMacroRatesAgent
-from services.agents.volatility_surface_agent import VolatilitySurfaceAgent
-from services.agents.insider_clustering_agent import InsiderClusteringAgent
+from services.agents.supervisor import GraphSupervisor
+from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
@@ -163,79 +157,59 @@ async def main():
     safe_create_task(soft_correlator._load(), name="soft-correlator-load")
 
     # ── TIERED PER-AGENT MODEL ALLOCATION ───────────────────────────────────────
-    # Heavy Analytical Tier: Deep reasoning (llama3 -> gemma:2b fallback)
-    # Fast Operational Tier: High-frequency classification/routing (gemma:2b -> llama3 fallback)
+    # Heavy Analytical Tier: Deep reasoning (qwen2.5:7b -> qwen2.5:1.5b fallback)
+    # Fast Operational Tier: Ultra-fast routing/classification (qwen2.5:1.5b -> gemma3:1b fallback)
 
-    news_agent = build_agent(
-        NewsIntelAgent,
-        agent_name="news_intel",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.CORRELATIONS],
-        group_id="agent-news-intel",
-        shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
-    )
+    # ── CONSOLIDATED 5 CORE ENGINES ──────────────────────────────────────────
 
-    quant_agent = build_agent(
-        QuantResearcherAgent,
-        agent_name="quant_researcher",
-        input_topics=[Topics.ENRICHED_EVENTS, Topics.RAW_TRADFI, Topics.RAW_RADAR, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.CORRELATIONS],
-        group_id="agent-quant-researcher",
+    macro_intelligence_engine = build_agent(
+        MacroIntelligenceEngine,
+        agent_name="macro_intelligence_engine",
+        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS, Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.CORRELATIONS],
+        group_id="agent-macro-intelligence",
         shared_infra=shared_infra,
         model="qwen2.5:7b",
-        fallback_model="gemma:2b",
+        fallback_model="qwen2.5:1.5b",
     )
 
-    financial_advisor_agent = build_agent(
-        FinancialAdvisorAgent,
-        agent_name="financial_advisor",
-        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
-        group_id="agent-financial-advisor",
-        shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
-    )
-
-    macro_strategist_agent = build_agent(
-        MacroStrategistAgent,
-        agent_name="macro_strategist",
-        input_topics=[Topics.SYSTEM_HEARTBEAT, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
-        group_id="agent-macro-strategist",
+    quant_trading_engine = build_agent(
+        QuantTradingEngine,
+        agent_name="quant_trading_engine",
+        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS, Topics.QUANT_DISCOVERIES, Topics.SCENARIOS_GENERATED, Topics.CORRELATIONS],
+        group_id="agent-quant-trading",
         shared_infra=shared_infra,
         model="qwen2.5:7b",
-        fallback_model="gemma:2b",
+        fallback_model="qwen2.5:1.5b",
     )
 
-    # Fast Operational Tier
+    knowledge_graph_engine = build_agent(
+        KnowledgeGraphEngine,
+        agent_name="knowledge_graph_engine",
+        input_topics=[Topics.RAW_NEWS, Topics.ENRICHED_EVENTS, Topics.UNKNOWN_ENTITIES, Topics.CORRELATIONS],
+        group_id="agent-knowledge-graph",
+        shared_infra=shared_infra,
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
+    )
+
     radar_agent = build_agent(
         RadarAgent,
         agent_name="radar_agent",
-        input_topics=[Topics.QUANT_DISCOVERIES, Topics.RAW_RADAR, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
+        input_topics=[Topics.RAW_RADAR, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
-    )
-
-    ontology_agent = build_agent(
-        OntologyMasterAgent,
-        agent_name="ontology_master",
-        input_topics=[Topics.UNKNOWN_ENTITIES, Topics.INTEL_BRIEFS, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
-        group_id="agent-ontology-master",
-        shared_infra=shared_infra,
-        soft_correlator=soft_correlator,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
     )
 
     rule_synthesizer_agent = build_agent(
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
-        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.QUANT_DISCOVERIES, Topics.RATES_REGIME, Topics.VOL_SURFACE, Topics.INSIDER_CLUSTERS, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS],
+        input_topics=[Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED, Topics.CORRELATIONS],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
     )
 
     supervisor_agent = build_agent(
@@ -245,89 +219,65 @@ async def main():
         group_id="supervisor-group",
         shared_infra=shared_infra,
         model="qwen2.5:7b",
-        fallback_model="gemma:2b",
+        fallback_model="qwen2.5:1.5b",
     )
 
-    macro_cointegration_agent = build_agent(
-        MacroAssetCointegrationEngine,
-        agent_name="macro_cointegration_engine",
-        input_topics=[Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS],
-        group_id="agent-macro-cointegration-engine",
-        shared_infra=shared_infra,
-        model="qwen2.5:7b",
-        fallback_model="gemma:2b",
-    )
-
-    yield_curve_agent = build_agent(
-        YieldCurveMacroRatesAgent,
-        agent_name="yield_curve_agent",
-        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
-        group_id="agent-yield-curve-rates",
-        shared_infra=shared_infra,
-        model="qwen2.5:7b",
-        fallback_model="gemma:2b",
-    )
-
-    volatility_surface_agent = build_agent(
-        VolatilitySurfaceAgent,
-        agent_name="volatility_surface_agent",
-        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
-        group_id="agent-volatility-surface",
-        shared_infra=shared_infra,
-        model="qwen2.5:7b",
-        fallback_model="gemma:2b",
-    )
-
-    insider_clustering_agent = build_agent(
-        InsiderClusteringAgent,
-        agent_name="insider_clustering_agent",
-        input_topics=[Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS],
-        group_id="agent-insider-clustering",
-        shared_infra=shared_infra,
-        model="gemma:2b",
-        fallback_model="qwen2.5:7b",
-    )
-
+    # Dictionary map with backwards-compatible aliases for task queue dispatch
     agents_by_name = {
-        "news_intel":      news_agent,
-        "quant_researcher": quant_agent,
-        "ontology_master": ontology_agent,
-        "radar_agent": radar_agent,
-        "macro_cointegration_engine": macro_cointegration_agent,
-        "yield_curve_agent": yield_curve_agent,
-        "volatility_surface_agent": volatility_surface_agent,
-        "insider_clustering_agent": insider_clustering_agent,
-        "supervisor": supervisor_agent,
-        "macro_strategist": macro_strategist_agent,
-        "rule_synthesizer": rule_synthesizer_agent,
-        "financial_advisor": financial_advisor_agent,
+        # Core Consolidated Engines
+        "macro_intelligence_engine": macro_intelligence_engine,
+        "quant_trading_engine":       quant_trading_engine,
+        "knowledge_graph_engine":     knowledge_graph_engine,
+        "radar_agent":                 radar_agent,
+        "rule_synthesizer":            rule_synthesizer_agent,
+        "supervisor":                  supervisor_agent,
+
+        # Backwards-compatible Task Routing Aliases
+        "yield_curve_agent":          macro_intelligence_engine,
+        "volatility_surface_agent":   macro_intelligence_engine,
+        "macro_strategist":           macro_intelligence_engine,
+        "macro_cointegration_engine": macro_intelligence_engine,
+        "quant_researcher":           quant_trading_engine,
+        "financial_advisor":          quant_trading_engine,
+        "insider_clustering_agent":   quant_trading_engine,
+        "news_intel":                 knowledge_graph_engine,
+        "ontology_master":            knowledge_graph_engine,
     }
 
-    logger.info(f"Agents built: {list(agents_by_name.keys())}")
+    logger.info(f"Consolidated Swarm built: 5 core engines live.")
     logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', 'llama3')}")
     logger.info("=" * 60)
 
-    # ── LAUNCH ALL AGENTS + TASK QUEUE WORKER ─────────────────────────────────
-    tasks = [
-        safe_create_task(news_agent.run(),      name="news_intel"),
-        safe_create_task(quant_agent.run(),     name="quant_researcher"),
-        safe_create_task(ontology_agent.run(),  name="ontology_master"),
-        safe_create_task(radar_agent.run(),     name="radar_agent"),
-        safe_create_task(macro_cointegration_agent.run(), name="macro_cointegration_engine"),
-        safe_create_task(yield_curve_agent.run(), name="yield_curve_agent"),
-        safe_create_task(volatility_surface_agent.run(), name="volatility_surface_agent"),
-        safe_create_task(insider_clustering_agent.run(), name="insider_clustering_agent"),
-        safe_create_task(supervisor_agent.run(), name="supervisor"),
-        safe_create_task(macro_strategist_agent.run(), name="macro_strategist"),
-        safe_create_task(rule_synthesizer_agent.run(), name="rule_synthesizer"),
-        safe_create_task(financial_advisor_agent.run(), name="financial_advisor"),
-        safe_create_task(
-            run_task_queue_worker(shared_infra["redis"], agents_by_name),
-            name="task_queue_worker",
-        ),
+    # ── LAUNCH CONSOLIDATED ENGINES ───────────────────────────────────────────
+    tier_filter = os.getenv("AGENT_TIER_FILTER", "all").lower()
+
+    agent_tier_map = [
+        ("macro_intelligence_engine", macro_intelligence_engine, "heavy"),
+        ("quant_trading_engine", quant_trading_engine, "heavy"),
+        ("knowledge_graph_engine", knowledge_graph_engine, "fast"),
+        ("radar_agent", radar_agent, "fast"),
+        ("rule_synthesizer", rule_synthesizer_agent, "fast"),
+        ("supervisor", supervisor_agent, "heavy"),
     ]
 
-    logger.info("All agents launched. Swarm is LIVE.")
+    active_agents = {
+        name: agent_inst
+        for name, agent_inst, tier in agent_tier_map
+        if tier_filter in ("all", tier)
+    }
+
+    tasks = [
+        safe_create_task(agent_inst.run(), name=name)
+        for name, agent_inst in active_agents.items()
+    ]
+    tasks.append(
+        safe_create_task(
+            run_task_queue_worker(shared_infra["redis"], active_agents),
+            name="task_queue_worker",
+        )
+    )
+
+    logger.info(f"Swarm launched with AGENT_TIER_FILTER='{tier_filter}' ({len(tasks)-1} active agents).")
     for ag in agents_by_name.values():
         logger.info(f"Agent: {ag.name:<26} | Model: {ag.model:<10} | Fallback: {ag.fallback_model:<10} | Topics: {len(ag.input_topics)}")
 

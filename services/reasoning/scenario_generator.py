@@ -217,9 +217,9 @@ class ScenarioGenerator:
         # ── 2. BUILD USER PROMPT ───────────────────────────────────────────────
         user_prompt = self._build_user_prompt(cluster, context, patterns, raw_events)
 
-        # ── 3. CALL LLAMA3 ─────────────────────────────────────────────────────
+        # ── 3. CALL LLAMA3 PASS 1 (GENERATION) ─────────────────────────────────
         logger.info(
-            "🧠 Synthesizing [%s] %s via Llama3...",
+            "🧠 Synthesizing [%s] %s via Llama3 (Pass 1: Generation)...",
             cluster.alert_tier.name,
             cluster.rule_name,
         )
@@ -228,38 +228,56 @@ class ScenarioGenerator:
         max_retries = 2
         retry_delay = 5.0
 
+        output: Optional[ScenarioOutput] = None
         for attempt in range(max_retries):
             try:
-                # Send the prompt to the AI and force it to match our Pydantic schema
-                output: ScenarioOutput = await client.infer(
+                output = await client.infer(
                     system_prompt=SCENARIO_SYSTEM_PROMPT,
                     user_prompt=user_prompt,
                     schema=ScenarioOutput,
-                    temperature=0.25,   # Slightly higher than agents for narrative diversity
-                    max_retries=3,      # Inner retry loop inside OllamaClient
+                    temperature=0.25,
+                    max_retries=3,
                     num_predict=1024,
                 )
                 break
-            except SchemaViolationError as e:
-                logger.error(
-                    "Schema enforcement failed for %s (attempt %d/%d): %s",
-                    cluster.correlation_id[:8], attempt + 1, max_retries, e,
-                )
+            except (SchemaViolationError, Exception) as e:
+                logger.error("Pass 1 generation error for %s: %s", cluster.correlation_id[:8], e)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
                     continue
                 return None
-            except Exception as e:
-                logger.error(
-                    "Llama3 inference error for %s: %s",
-                    cluster.correlation_id[:8], e, exc_info=True,
-                )
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                return None
+
+        if not output:
+            return None
+
+        # ── 3.5 PASS 2 (DEVIL'S ADVOCATE CRITIQUE & POLISH) ───────────────────
+        try:
+            logger.info("😈 Running Pass 2 Critique (Devil's Advocate) for %s...", cluster.correlation_id[:8])
+            critique_prompt = f"""
+            ORIGINAL SCENARIO DRAFT:
+            {output.model_dump_json() if hasattr(output, 'model_dump_json') else json.dumps(output.dict())}
+
+            ORIGINAL CORRELATION CONTEXT:
+            {user_prompt[:1500]}
+
+            Review this draft ruthlessly. Correct any logical leaps, adjust hypothesis probabilities to sum to 100, and ensure all watch/deny signals are concrete and observable.
+            """
+
+            critique_system = """You are SENTINEL Red Team / Devil's Advocate.
+Review the intelligence scenario draft, challenge weak assumptions, refine confidence ratings, and return a polished final ScenarioOutput JSON. Respond with raw JSON matching the schema exactly."""
+
+            polished_output: ScenarioOutput = await client.infer(
+                system_prompt=critique_system,
+                user_prompt=critique_prompt,
+                schema=ScenarioOutput,
+                temperature=0.15,
+                max_retries=2,
+                num_predict=1024,
+            )
+            output = polished_output
+        except Exception as e:
+            logger.warning(f"Pass 2 critique skipped (fallback to Pass 1 draft): {e}")
 
         # ── 4. VALIDATE HYPOTHESIS PROBABILITIES ──────────────────────────────
         output = self._normalize_probabilities(output)

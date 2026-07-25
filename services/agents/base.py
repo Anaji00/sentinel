@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Type
 
 import aiohttp
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from shared.utils.ollama import (
     OllamaClient, SchemaViolationError, InferenceError,
@@ -21,6 +21,52 @@ from shared.utils.ollama import (
 TASK_QUEUE_HIGH   = "sentinel:tasks:high"
 TASK_QUEUE_NORMAL = "sentinel:tasks:normal"
 TASK_QUEUE_LOW    = "sentinel:tasks:low"
+
+# Heartbeat interval in seconds for agent health reporting
+HEARTBEAT_INTERVAL = 60
+
+# ── STRUCTURED AGENT COMMUNICATION PROTOCOL ──────────────────────────────────
+
+class AgentBulletin(BaseModel):
+    """Typed inter-agent communication message. Replaces free-text episodic memory."""
+    agent_name: str
+    bulletin_type: str  # "regime_change", "signal", "alert", "thesis", "contradiction"
+    ticker: Optional[str] = None
+    conviction: float = 0.5  # 0.0 - 1.0
+    expected_direction: Optional[str] = None  # "up", "down", "neutral"
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    summary: str = ""
+    published_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    expires_at: Optional[str] = None  # ISO timestamp
+    ttl_seconds: int = 3600  # Default 1 hour
+
+
+class AgentPrediction(BaseModel):
+    """Tracked prediction for self-calibration."""
+    prediction_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_name: str
+    ticker: str
+    direction: str  # "up", "down"
+    conviction: float
+    time_horizon_hours: int = 24
+    entry_price: float = 0.0
+    target_price: float = 0.0
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    verified: bool = False
+    outcome_correct: Optional[bool] = None
+
+
+class AgentScorecard(BaseModel):
+    """Performance tracking for agent self-calibration."""
+    agent_name: str
+    predictions_made: int = 0
+    predictions_correct: int = 0
+    predictions_wrong: int = 0
+    mean_conviction_on_correct: float = 0.0
+    mean_conviction_on_wrong: float = 0.0
+    brier_score: float = 0.5  # Lower is better (0=perfect, 1=worst)
+    consensus_weight: float = 1.0  # Multiplier in consensus engine
+    last_calibrated_at: Optional[str] = None
 
 class ThrottledLogger:
     """
@@ -140,7 +186,10 @@ class SentinelAgent(ABC):
                                 payload = {"raw": str(msg.value)}
                             topic_name = tp.topic if hasattr(tp, 'topic') else (self.input_topics[0] if self.input_topics else "unknown")
                             await self._send_dlq(payload, f"UnhandledException: {type(r).__name__}: {str(r)}", topic_name)
-                await self._consumer.commit()
+                try:
+                    await self._consumer.commit()
+                except Exception as commit_err:
+                    self.logger.warning(f"Consumer commit skipped (partition rebalance/timeout): {commit_err}")
 
             except asyncio.CancelledError:
                 raise
@@ -159,6 +208,26 @@ class SentinelAgent(ABC):
                         result,
                         key=result.get("agent_run_id", str(uuid.uuid4())),
                     )
+                    # Broadcast agent decision brief to Redis PubSub for live WebSocket UI streaming
+                    try:
+                        res_dict = result if isinstance(result, dict) else (result.model_dump() if hasattr(result, "model_dump") else {})
+                        agent_pub_payload = {
+                            "event_id": str(res_dict.get("agent_run_id") or uuid.uuid4()),
+                            "type": f"agent_{self.name}",
+                            "occurred_at": datetime.now(timezone.utc).isoformat(),
+                            "source": f"Agent Swarm ({self.name})",
+                            "primary_entity_id": str(res_dict.get("primary_entity") or res_dict.get("ticker") or self.name),
+                            "primary_entity_name": str(res_dict.get("primary_entity") or res_dict.get("name") or self.name.replace("_", " ").title()),
+                            "entity_name": str(res_dict.get("primary_entity") or res_dict.get("name") or self.name.replace("_", " ").title()),
+                            "headline": f"🤖 AGENT [{self.name.upper()}]: {res_dict.get('headline') or res_dict.get('summary') or res_dict.get('hypothesis') or res_dict.get('recommendation') or 'Intelligence Brief Synthesized'}",
+                            "summary": str(res_dict.get("summary") or res_dict.get("rationale") or res_dict.get("narrative") or str(res_dict)[:200]),
+                            "anomaly_score": float(res_dict.get("confidence") or res_dict.get("anomaly_score") or 0.85),
+                            "region": "GLOBAL",
+                            "tags": ["agent_output", f"agent:{self.name}"],
+                        }
+                        await self.redis.raw.publish("sentinel:events:live", json.dumps(agent_pub_payload))
+                    except Exception as pub_err:
+                        self.logger.debug(f"Agent live feed pub bypass: {pub_err}")
                 self._processed += 1
 
                 elapsed = time.monotonic() - t0
@@ -257,6 +326,230 @@ class SentinelAgent(ABC):
         except Exception as e:
             self.logger.warning(f"Failed to read agent memories: {e}")
             return "Failed to fetch memories."
+
+    # ── STRUCTURED BULLETIN SYSTEM ──────────────────────────────────────────
+
+    async def publish_bulletin(
+        self,
+        bulletin_type: str,
+        summary: str,
+        ticker: Optional[str] = None,
+        conviction: float = 0.5,
+        expected_direction: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        ttl_seconds: int = 3600,
+    ) -> None:
+        """
+        Publishes a structured AgentBulletin to Redis.
+        Other agents can query this via read_bulletins() or subscribe_bulletins().
+        """
+        try:
+            bulletin = AgentBulletin(
+                agent_name=self.name,
+                bulletin_type=bulletin_type,
+                ticker=ticker,
+                conviction=conviction,
+                expected_direction=expected_direction,
+                payload=payload or {},
+                summary=summary,
+                ttl_seconds=ttl_seconds,
+            )
+            key = f"sentinel:bulletins:{self.name}:{bulletin_type}"
+            if ticker:
+                key += f":{ticker.upper()}"
+            await self.redis.raw.set(key, bulletin.model_dump_json(), ex=ttl_seconds)
+
+            # Also publish to PubSub for real-time listeners
+            await self.redis.raw.publish(
+                "sentinel:bulletins:stream",
+                bulletin.model_dump_json(),
+            )
+            self.logger.debug(f"Published bulletin: {bulletin_type} | {summary[:60]}")
+        except Exception as e:
+            self.logger.warning(f"Failed to publish bulletin: {e}")
+
+    async def read_bulletins(
+        self,
+        agent_name: Optional[str] = None,
+        bulletin_type: Optional[str] = None,
+        ticker: Optional[str] = None,
+    ) -> List[AgentBulletin]:
+        """
+        Reads active agent bulletins from Redis.
+        Filters by agent_name, bulletin_type, and/or ticker.
+        Returns typed AgentBulletin objects with automatic expiry filtering.
+        """
+        try:
+            pattern_parts = ["sentinel:bulletins"]
+            pattern_parts.append(agent_name if agent_name else "*")
+            pattern_parts.append(bulletin_type if bulletin_type else "*")
+            if ticker:
+                pattern_parts.append(ticker.upper())
+            else:
+                pattern_parts.append("*")
+            pattern = ":".join(pattern_parts)
+
+            bulletins = []
+            cursor = 0
+            while True:
+                cursor, keys = await self.redis.raw.scan(cursor=cursor, match=pattern, count=50)
+                if keys:
+                    values = await self.redis.raw.mget(keys)
+                    for val in values:
+                        if val:
+                            try:
+                                raw = val if isinstance(val, str) else val.decode("utf-8")
+                                bulletins.append(AgentBulletin(**json.loads(raw)))
+                            except Exception:
+                                pass
+                if cursor == 0:
+                    break
+
+            # Sort by published_at descending
+            bulletins.sort(key=lambda b: b.published_at, reverse=True)
+            return bulletins
+        except Exception as e:
+            self.logger.warning(f"Failed to read bulletins: {e}")
+            return []
+
+    async def subscribe_bulletins(self, types: List[str], limit: int = 10) -> List[AgentBulletin]:
+        """
+        Convenience: reads bulletins matching any of the given types across all agents.
+        Returns sorted by recency, limited to `limit` results.
+        """
+        all_bulletins = []
+        for btype in types:
+            bulletins = await self.read_bulletins(bulletin_type=btype)
+            all_bulletins.extend(bulletins)
+        all_bulletins.sort(key=lambda b: b.published_at, reverse=True)
+        return all_bulletins[:limit]
+
+    async def get_bulletins_for_prompt(self, types: Optional[List[str]] = None, limit: int = 5) -> str:
+        """
+        Returns a formatted string of active bulletins for LLM prompt injection.
+        """
+        types = types or ["regime_change", "signal", "alert", "thesis"]
+        bulletins = await self.subscribe_bulletins(types, limit=limit)
+        if not bulletins:
+            return ""
+        context = "\n### ACTIVE AGENT BULLETINS ###\n"
+        for b in bulletins:
+            direction_str = f" ({b.expected_direction})" if b.expected_direction else ""
+            ticker_str = f" [{b.ticker}]" if b.ticker else ""
+            context += (
+                f"- [{b.agent_name}] {b.bulletin_type}{ticker_str}{direction_str} "
+                f"(conviction: {b.conviction:.0%}): {b.summary}\n"
+            )
+        return context + "\n"
+
+    # ── AGENT SELF-CALIBRATION & PREDICTION TRACKING ───────────────────────
+
+    async def record_prediction(
+        self,
+        ticker: str,
+        direction: str,
+        conviction: float,
+        entry_price: float,
+        target_price: float = 0.0,
+        time_horizon_hours: int = 24,
+    ) -> str:
+        """
+        Records a prediction for later verification.
+        Returns the prediction_id.
+        """
+        try:
+            pred = AgentPrediction(
+                agent_name=self.name,
+                ticker=ticker.upper(),
+                direction=direction,
+                conviction=conviction,
+                entry_price=entry_price,
+                target_price=target_price,
+                time_horizon_hours=time_horizon_hours,
+            )
+            key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
+            ttl = max(time_horizon_hours * 3600 + 7200, 86400)  # Horizon + 2h buffer, min 24h
+            await self.redis.raw.set(key, pred.model_dump_json(), ex=ttl)
+
+            # Index by ticker for fast lookup
+            idx_key = f"sentinel:predictions:by_ticker:{ticker.upper()}"
+            await self.redis.raw.sadd(idx_key, key)
+            await self.redis.raw.expire(idx_key, ttl)
+
+            self.logger.debug(f"Recorded prediction {pred.prediction_id}: {ticker} {direction} @ {conviction:.0%}")
+            return pred.prediction_id
+        except Exception as e:
+            self.logger.warning(f"Failed to record prediction: {e}")
+            return ""
+
+    async def get_scorecard(self) -> AgentScorecard:
+        """Retrieves or initializes the agent's performance scorecard from Redis."""
+        try:
+            key = f"sentinel:agents:scorecard:{self.name}"
+            raw = await self.redis.raw.get(key)
+            if raw:
+                data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                return AgentScorecard(**data)
+        except Exception as e:
+            self.logger.debug(f"Scorecard fetch failed: {e}")
+        return AgentScorecard(agent_name=self.name)
+
+    async def update_scorecard(
+        self,
+        prediction_correct: bool,
+        conviction: float,
+    ) -> None:
+        """Updates the agent's scorecard with a verified prediction outcome."""
+        try:
+            card = await self.get_scorecard()
+            card.predictions_made += 1
+
+            if prediction_correct:
+                card.predictions_correct += 1
+                # Running average of conviction on correct predictions
+                n = card.predictions_correct
+                card.mean_conviction_on_correct = (
+                    card.mean_conviction_on_correct * (n - 1) + conviction
+                ) / n
+            else:
+                card.predictions_wrong += 1
+                n = card.predictions_wrong
+                card.mean_conviction_on_wrong = (
+                    card.mean_conviction_on_wrong * (n - 1) + conviction
+                ) / n
+
+            # Brier score update: BS = (1/N) Σ (forecast - outcome)²
+            outcome = 1.0 if prediction_correct else 0.0
+            total = card.predictions_made
+            card.brier_score = (
+                card.brier_score * (total - 1) + (conviction - outcome) ** 2
+            ) / total
+
+            # Adjust consensus weight based on calibration
+            # Well-calibrated agents (low Brier) get higher weight
+            card.consensus_weight = max(0.1, 1.0 - card.brier_score)
+            card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
+
+            key = f"sentinel:agents:scorecard:{self.name}"
+            await self.redis.raw.set(key, card.model_dump_json(), ex=604800)  # 7 day TTL
+
+            if card.predictions_made % 10 == 0:
+                accuracy = card.predictions_correct / max(1, card.predictions_made)
+                self.logger.info(
+                    f"📊 SCORECARD [{self.name}] | Accuracy: {accuracy:.0%} "
+                    f"| Brier: {card.brier_score:.3f} | Weight: {card.consensus_weight:.2f} "
+                    f"| Correct Conviction: {card.mean_conviction_on_correct:.0%} "
+                    f"| Wrong Conviction: {card.mean_conviction_on_wrong:.0%}"
+                )
+
+                # Overconfidence alert
+                if card.mean_conviction_on_wrong > 0.7 and card.predictions_wrong > 5:
+                    self.logger.warning(
+                        f"⚠️ OVERCONFIDENCE DETECTED [{self.name}]: Mean conviction on wrong predictions "
+                        f"is {card.mean_conviction_on_wrong:.0%}. Consider reducing conviction thresholds."
+                    )
+        except Exception as e:
+            self.logger.warning(f"Failed to update scorecard: {e}")
 
     async def is_recently_processed(self, entity_id: str, window_seconds: int = 3600) -> bool:
         return await self.redis.raw.exists(self.state_key("seen", entity_id))
@@ -398,6 +691,14 @@ class SentinelAgent(ABC):
             }
         )
         
+        # Lazy initialize LLM client if agent was dispatched out-of-band without run()
+        if self._llm is None:
+            from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
+            if self._session is None or self._session.closed:
+                connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
+                self._session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
+            self._llm = OllamaClient(self._session, self.model, redis_client=self.redis_client)
+
         # 2. Execute LLM with Pydantic Enforcement & Truncation Fallback Retry
         try:
             response = await self._llm.infer(
@@ -515,7 +816,7 @@ class SentinelAgent(ABC):
                 schema=TickerVerificationDecision,
                 temperature=0.0,
                 num_predict=128,
-                fallback_model="gemma:2b"
+                fallback_model="gemma3:1b"
             )
 
             if decision.valid:

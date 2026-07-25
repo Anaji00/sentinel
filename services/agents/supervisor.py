@@ -79,6 +79,11 @@ class GraphSupervisor(SentinelAgent):
                 if relation in ALLOWED_RELATIONS:
                     source_label = data.get("source_label", "Entity")
                     target_label = data.get("target_label", "Entity")
+                    # Sanitize labels to prevent Cypher injection via f-string interpolation
+                    if not re.match(r"^[A-Za-z0-9]+$", source_label):
+                        source_label = "Entity"
+                    if not re.match(r"^[A-Za-z0-9]+$", target_label):
+                        target_label = "Entity"
                     rel_key = (source_label, relation, target_label)
                     if rel_key not in links_by_relation:
                         links_by_relation[rel_key] = []

@@ -414,9 +414,114 @@ class DynamicAnomalyScorer:
         return res["score"]
 
     async def score_aviation_batch(self, flights: list) -> list:
-        """Dynamic anomaly scorer stub for batched flight events."""
+        """Score batched flight events using the spatial ONNX model.
+        
+        Each flight entry should be a dict with keys like:
+        altitude, speed, latitude, longitude, heading
+        """
         if not flights:
             return []
-        # Return base anomaly scores for simple positions
-        return [0.10 for _ in flights]
+        
+        features_list = []
+        entities = []
+        for f in flights:
+            if isinstance(f, dict):
+                features_list.append([
+                    float(f.get('altitude', 0)) / 45000.0,  # Normalize altitude (max ~45k ft)
+                    float(f.get('speed', 0)) / 600.0,       # Normalize speed (max ~600 kts)
+                    float(f.get('latitude', 0)) / 90.0,      # Normalize latitude
+                    float(f.get('longitude', 0)) / 180.0,    # Normalize longitude
+                    float(f.get('heading', 0)) / 360.0,      # Normalize heading
+                ])
+                entities.append(str(f.get('icao24', f.get('callsign', 'unknown'))))
+            else:
+                features_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                entities.append('unknown')
+        
+        results = await self.score_event_batch("vessel_position", entities, features_list)
+        return [r["score"] for r in results]
 
+    async def composite_score_event(
+        self,
+        event_type: str,
+        entity_id: str,
+        features: list,
+        volume_raw: float = 0.0,
+        volatility_raw: float = 0.0,
+    ) -> dict:
+        """
+        Composite anomaly scoring with dimensional breakdown.
+        Returns an AnomalyBreakdown dict with per-dimension sub-scores
+        so agents receive structured reasoning inputs instead of opaque floats.
+        """
+        domain = self._get_domain(event_type)
+        base_result = await self.score_event(event_type, entity_id, features)
+        base_score = base_result.get("score", 0.0)
+
+        # Dimensional sub-scores
+        spatial_score = base_score if domain == "spatial" else 0.0
+        temporal_score = base_score if domain == "temporal" else 0.0
+
+        # Volume z-score via dynamic normalization
+        volume_z = 0.0
+        if volume_raw > 0:
+            try:
+                volume_z = await self._dynamic_normalize(entity_id, "volume", volume_raw)
+            except Exception:
+                pass
+
+        # Volatility z-score
+        volatility_z = 0.0
+        if volatility_raw > 0:
+            try:
+                volatility_z = await self._dynamic_normalize(entity_id, "volatility", volatility_raw)
+            except Exception:
+                pass
+
+        # EWMA volatility from recent returns stored in Redis
+        ewma_vol = await self._compute_ewma_volatility(entity_id, volatility_raw)
+
+        # Composite: weighted combination of dimensional scores
+        composite = (
+            0.35 * base_score
+            + 0.20 * min(1.0, max(0.0, abs(volume_z) / 3.0))
+            + 0.20 * min(1.0, max(0.0, abs(volatility_z) / 3.0))
+            + 0.25 * temporal_score
+        )
+        composite = round(min(1.0, max(0.0, composite)), 4)
+
+        is_significant = base_result.get("is_significant", False) or composite > 0.65
+
+        return {
+            "composite_score": composite,
+            "spatial_score": round(spatial_score, 4),
+            "temporal_score": round(temporal_score, 4),
+            "volume_z_score": round(volume_z, 4),
+            "volatility_z_score": round(volatility_z, 4),
+            "cross_domain_correlation_score": 0.0,
+            "ewma_volatility": round(ewma_vol, 6),
+            "is_significant": is_significant,
+            "domain": domain,
+        }
+
+    async def _compute_ewma_volatility(
+        self, entity_id: str, new_return: float, lam: float = 0.94
+    ) -> float:
+        """
+        Incremental EWMA volatility update stored in Redis.
+        σ²_t = λ * σ²_{t-1} + (1-λ) * r²_t
+        """
+        if not self.redis:
+            return 0.0
+        try:
+            key = f"sentinel:ml:ewma_var:{entity_id}"
+            prev_var = await self.redis.raw.get(key)
+            prev_var = float(prev_var) if prev_var else new_return ** 2
+
+            new_var = lam * prev_var + (1.0 - lam) * new_return ** 2
+            await self.redis.raw.set(key, str(new_var), ex=604800)
+
+            import math
+            return math.sqrt(max(0.0, new_var))
+        except Exception:
+            return 0.0

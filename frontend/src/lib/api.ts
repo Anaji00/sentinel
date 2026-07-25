@@ -45,4 +45,4 @@ apiClient.interceptors.response.use(
  * @param {string} url - The API endpoint to fetch data from (e.g., '/users').
  * @returns {Promise<any>} A promise that resolves to the JSON data from the API response.
  */
-export const fetcher = (url: string) => apiClient.get(url).then((res) => res.data).catch(() => null);
+export const fetcher = (url: string) => apiClient.get(url).then((res) => res.data);

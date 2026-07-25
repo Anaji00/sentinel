@@ -258,7 +258,6 @@ services:
       - OLLAMA_NUM_PARALLEL=4
       - OLLAMA_KEEP_ALIVE=-1
       - OLLAMA_KV_CACHE_TYPE=q8_0
-    restart: unless-stopped
     healthcheck:
       test: [ "CMD", "ollama", "list" ]
       interval: 10s
@@ -386,7 +385,7 @@ services:
       - "8000:8000"
     restart: always
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': 'sentinel-dev-key-2026'}); urllib.request.urlopen(r)"]
+      test: [ "CMD", "python", "-c", "import urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': 'sentinel-dev-key-2026'}); urllib.request.urlopen(r)" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -399,18 +398,51 @@ services:
       redis:
         condition: service_healthy
 
-  agents:
+  agents-fast:
     build:
       context: .
       dockerfile: ml.Dockerfile
-    container_name: sentinel-agents
+    container_name: sentinel-agents-fast
     command: python services/agents/main.py
     env_file: .env
+    environment:
+      - AGENT_TIER_FILTER=fast
+      - AGENT_MODEL=qwen2.5:1.5b
+      - OLLAMA_FALLBACK_MODEL=gemma3:1b
+      - OLLAMA_TIMEOUT=600.0
+      - PYTHONWARNINGS=ignore::UserWarning
     volumes:
       - ./services:/app/services
       - ./shared:/app/shared
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  agents-heavy:
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-agents-heavy
+    command: python services/agents/main.py
+    env_file: .env
     environment:
-      PYTHONWARNINGS: "ignore::UserWarning"
+      - AGENT_TIER_FILTER=heavy
+      - AGENT_MODEL=qwen2.5:7b
+      - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
+      - OLLAMA_TIMEOUT=600.0
+      - PYTHONWARNINGS=ignore::UserWarning
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
     restart: always
     depends_on:
       kafka:
@@ -435,7 +467,6 @@ services:
     depends_on:
       api-gateway:
         condition: service_healthy
-
 
 volumes:
   zookeeper_data:

@@ -20,6 +20,13 @@ MIGRATIONS = [
             ALTER TABLE correlations ADD COLUMN IF NOT EXISTS trace_id UUID;
             ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS trace_id UUID;
         """
+    },
+    {
+        "version": "0003_add_lat_lon_columns",
+        "sql": """
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS latitude FLOAT;
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude FLOAT;
+        """
     }
 ]
 

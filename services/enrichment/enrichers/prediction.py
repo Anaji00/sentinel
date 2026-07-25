@@ -88,8 +88,7 @@ class PredictionEnricher:
         title = p.get("title", "Unknown Market")
         price = float(p.get("yes_bid") or p.get("no_bid") or p.get("price") or 0.0)
         current_vol = float(p.get("total_volume", 0))
-        loop = asyncio.get_running_loop()
-        # r Stateful delta calculation using Redis
+        # Stateful delta calculation using Redis
         try:
             redis_key = f"sentinel:kalshi:vol:{ticker}"
             last_vol_str = await self.redis.raw.get(redis_key)

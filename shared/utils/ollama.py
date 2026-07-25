@@ -26,10 +26,10 @@ logger = logging.getLogger("sentinel.ollama")
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
-OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b")
-# Dynamic timeout: Enforce 180 seconds minimum to allow local CPU/GPU Llama3 inference completion
-_raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "180.0"))
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(180.0, _raw_timeout))
+OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
+# Dynamic timeout: Enforce 600 seconds (10 mins) to allow local CPU/GPU heavy LLM inference completion
+_raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "600.0"))
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(300.0, _raw_timeout))
 
 # Circuit breaker config
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
@@ -43,7 +43,7 @@ CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "15.0"))  # 15
 #   - Active local agent process replicas running concurrently (AGENT_REPLICA_COUNT) = 4
 #   - Process-local cap = floor(4 / 4) = 1 (prevents server-side queue congestion)
 # Note: For dynamic scaling in cloud, replace with Redis distributed semaphore (Option B).
-DEFAULT_PARALLEL_CAP = max(1, int(os.getenv("OLLAMA_SERVER_PARALLEL", "4")) // int(os.getenv("AGENT_REPLICA_COUNT", "4")))
+DEFAULT_PARALLEL_CAP = max(1, int(os.getenv("OLLAMA_SERVER_PARALLEL", "4")) // int(os.getenv("AGENT_REPLICA_COUNT", "1")))
 OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL_CAP)))
 
 
@@ -56,7 +56,7 @@ _MODEL_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
 
 def get_ollama_semaphore(model_name: str = "default") -> asyncio.Semaphore:
     if model_name not in _MODEL_SEMAPHORES:
-        _MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(1)
+        _MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(OLLAMA_NUM_PARALLEL)
     return _MODEL_SEMAPHORES[model_name]
 
 
@@ -399,10 +399,14 @@ class OllamaClient:
         except TypeError:
             resolved_model = await self._resolve_model(active_model)
 
-        # Truncate prompt if longer than 3500 chars to fit within 4096 context window
+        # Truncate prompt based on model capacity to prevent prompt-processing timeout on lightweight models
         clean_prompt = prompt
-        if len(clean_prompt) > 6000:
-            clean_prompt = clean_prompt[:6000] + "\n...[truncated]"
+        model_lower = resolved_model.lower()
+        is_small_model = any(tag in model_lower for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
+        max_prompt_chars = 3500 if is_small_model else 6000
+
+        if len(clean_prompt) > max_prompt_chars:
+            clean_prompt = clean_prompt[:max_prompt_chars] + "\n...[truncated for speed]"
 
         payload = {
             "model": resolved_model,
@@ -411,8 +415,8 @@ class OllamaClient:
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
-                "num_predict": min(num_predict or 192, 512),
-                "num_ctx": 4096,  # Context window size in tokens
+                "num_predict": min(num_predict or 192, 384) if is_small_model else min(num_predict or 256, 512),
+                "num_ctx": 3072 if is_small_model else 4096,  # Optimized context window size in tokens
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }

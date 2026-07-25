@@ -46,7 +46,7 @@ async def get_domain_events(
     try:
         if domain == "all" or domain not in DOMAIN_TO_COLUMN:
             query = """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, summary as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, summary as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2
@@ -56,7 +56,7 @@ async def get_domain_events(
         target_column = DOMAIN_TO_COLUMN[domain]
         if domain == "news":
             query = """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, summary as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, summary as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2
@@ -64,7 +64,7 @@ async def get_domain_events(
             return await db.query(query, min_anomaly, limit)
         else:
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, latitude, longitude, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
                 FROM events 
                 WHERE anomaly_score >= $1
                 ORDER BY occurred_at DESC LIMIT $2
@@ -120,16 +120,21 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
     await pubsub.subscribe("sentinel:events:live")
     logger.info("Client connected to /ws/live-feed streaming endpoint.")
     
-    # 1. Immediately send recent live events from TimescaleDB on connection
+    # 1. Immediately send recent multi-domain live events from TimescaleDB on connection
     if db:
         try:
             recent_rows = await db.query(
                 """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
-                       primary_entity_name as entity_name, region, anomaly_score, source, summary as headline
-                FROM events
+                WITH ranked_events AS (
+                    SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
+                           primary_entity_name as entity_name, region, anomaly_score, source, summary as headline,
+                           ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude,
+                           ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as rn
+                    FROM events
+                )
+                SELECT * FROM ranked_events WHERE rn <= 4
                 ORDER BY occurred_at DESC
-                LIMIT 5;
+                LIMIT 30;
                 """
             )
             for r in recent_rows:
@@ -144,10 +149,12 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                     "headline": r["headline"] or f"Event {r['event_id']} recorded",
                     "primary_entity_name": e_name,
                     "entity_name": e_name,
-                    "primary_entity_id": str(r["primary_entity_id"] or e_name)
+                    "primary_entity_id": str(r["primary_entity_id"] or e_name),
+                    "latitude": r.get("latitude"),
+                    "longitude": r.get("longitude")
                 }
                 await websocket.send_json(evt)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning(f"Failed to fetch initial events for WebSocket connection: {e}")
 

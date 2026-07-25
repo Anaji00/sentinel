@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { useLiveEvents } from '../lib/useLiveEvents';
@@ -30,7 +30,7 @@ function getDomainMeta(type: string): { label: string; icon: string; badgeStyle:
     return { label: 'NEWS', icon: '📰', badgeStyle: 'text-slate-300 border-slate-700 bg-slate-800' };
 }
 
-// Helper to derive clean source name (ALWAYS included)
+// Helper to derive clean source name
 function getCleanSource(e: NormalizedEvent): string {
     if (e.source && e.source !== 'unknown' && !e.source.startsWith('Event ')) {
         return e.source;
@@ -49,8 +49,6 @@ function getCleanSource(e: NormalizedEvent): string {
 // Helper to format clean English titles for events
 function formatEnglishHeadline(e: NormalizedEvent): string {
     const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || '';
-    
-    // Check if headline is valid and not a raw Event UUID / fallback
     const isRawId = (str?: string) => !str || str.startsWith('Event ') || Boolean(str.match(/^[0-9a-f]{8}-[0-9a-f]{4}/i));
     
     if (!isRawId(e.headline)) {
@@ -60,7 +58,6 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
         return e.summary!;
     }
     
-    // Fallback: construct natural English title based on event type & entity
     const t = (e.type || '').toLowerCase();
     const regionStr = e.region ? ` in ${e.region}` : '';
 
@@ -89,6 +86,48 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
     return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Asset Target'}${regionStr}`;
 }
 
+const getScoreBadge = (score: number) => {
+  if (score >= 0.75) return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">CRITICAL {score.toFixed(2)}</span>;
+  if (score >= 0.50) return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 glow-amber">ELEVATED {score.toFixed(2)}</span>;
+  return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">NORMAL {score.toFixed(2)}</span>;
+};
+
+const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: NormalizedEvent) => void }) => {
+  const domainMeta = getDomainMeta(e.type);
+  const sourceName = getCleanSource(e);
+  const title = formatEnglishHeadline(e);
+  const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown Entity';
+
+  return (
+    <div
+      onClick={() => onClick(e)}
+      className="p-3 rounded-lg bg-slate-900/60 border border-cyan-500/15 hover:border-[#00f2fe]/50 cursor-pointer transition-all hover:bg-slate-900/90 group glass-panel-hover"
+    >
+      <div className="flex items-center justify-between mb-1.5 font-mono text-[10px]">
+        <div className="flex items-center gap-1.5">
+          <span className={`px-1.5 py-0.5 rounded border font-bold uppercase ${domainMeta.badgeStyle}`}>
+            {domainMeta.icon} {domainMeta.label}
+          </span>
+          <span className="text-slate-400 font-medium">
+            via <span className="text-cyan-400 font-bold">{sourceName}</span>
+          </span>
+        </div>
+        {getScoreBadge(e.anomaly_score)}
+      </div>
+
+      <p className="text-xs text-slate-100 font-sans font-semibold line-clamp-2 group-hover:text-white transition-colors leading-snug">
+        {title}
+      </p>
+
+      <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/60">
+        <span>Entity: <span className="text-amber-300 font-bold">{entityName}</span></span>
+        <span>{new Date(e.occurred_at).toLocaleTimeString()}</span>
+      </div>
+    </div>
+  );
+});
+EventRow.displayName = 'EventRow';
+
 export default function IntelligenceFeed() {
   const [activeTab, setActiveTab] = useState<'events' | 'scenarios'>('events');
   const [selectedDomain, setSelectedDomain] = useState<string>('all');
@@ -105,7 +144,7 @@ export default function IntelligenceFeed() {
     { refreshInterval: 6000 }
   );
 
-  // Dynamic Event domain fetches with rapid 4-second polling
+  // Dynamic Event domain fetches with staggered polling to avoid simultaneous burst
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'tradfi' ? '/events/tradfi?limit=30' : null,
     fetcher,
@@ -114,42 +153,48 @@ export default function IntelligenceFeed() {
   const { data: cryptoEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'crypto' ? '/events/crypto?limit=30' : null,
     fetcher,
-    { refreshInterval: 4000 }
+    { refreshInterval: 6000 }
   );
   const { data: predictionEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'prediction' ? '/events/prediction?limit=30' : null,
     fetcher,
-    { refreshInterval: 4000 }
+    { refreshInterval: 8000 }
   );
   const { data: cyberEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'cyber' ? '/events/cyber?limit=30' : null,
     fetcher,
-    { refreshInterval: 4000 }
+    { refreshInterval: 10000 }
   );
   const { data: maritimeEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'maritime' ? '/events/maritime?limit=30' : null,
     fetcher,
-    { refreshInterval: 4000 }
+    { refreshInterval: 8000 }
   );
 
-  // Merge events with zero-latency WebSocket stream
-  const rawEvents: NormalizedEvent[] = [...wsLiveEvents];
-  if (selectedDomain === 'all' || selectedDomain === 'tradfi') rawEvents.push(...(tradfiEvents || []));
-  if (selectedDomain === 'all' || selectedDomain === 'crypto') rawEvents.push(...(cryptoEvents || []));
-  if (selectedDomain === 'all' || selectedDomain === 'prediction') rawEvents.push(...(predictionEvents || []));
-  if (selectedDomain === 'all' || selectedDomain === 'cyber') rawEvents.push(...(cyberEvents || []));
-  if (selectedDomain === 'all' || selectedDomain === 'maritime') rawEvents.push(...(maritimeEvents || []));
+  // Merge events with zero-latency WebSocket stream, deduplicating by event_id
+  const sortedEvents = useMemo(() => {
+    const rawEvents: NormalizedEvent[] = [...wsLiveEvents];
+    if (selectedDomain === 'all' || selectedDomain === 'tradfi') rawEvents.push(...(tradfiEvents || []));
+    if (selectedDomain === 'all' || selectedDomain === 'crypto') rawEvents.push(...(cryptoEvents || []));
+    if (selectedDomain === 'all' || selectedDomain === 'prediction') rawEvents.push(...(predictionEvents || []));
+    if (selectedDomain === 'all' || selectedDomain === 'cyber') rawEvents.push(...(cyberEvents || []));
+    if (selectedDomain === 'all' || selectedDomain === 'maritime') rawEvents.push(...(maritimeEvents || []));
 
-  const sortedEvents = rawEvents
-    .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime())
-    .filter((e) =>
-      searchQuery
-        ? (e.headline || e.type || formatEnglishHeadline(e)).toLowerCase().includes(searchQuery.toLowerCase()) ||
-          (e.source || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-          (e.primary_entity?.name || '').toLowerCase().includes(searchQuery.toLowerCase())
-        : true
-    )
-    .slice(0, 45);
+    const deduped = Array.from(
+      new Map(rawEvents.map(e => [e.event_id, e])).values()
+    );
+
+    return deduped
+      .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime())
+      .filter((e) =>
+        searchQuery
+          ? (e.headline || e.type || formatEnglishHeadline(e)).toLowerCase().includes(searchQuery.toLowerCase()) ||
+            (e.source || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+            (e.primary_entity?.name || '').toLowerCase().includes(searchQuery.toLowerCase())
+          : true
+      )
+      .slice(0, 45);
+  }, [wsLiveEvents, tradfiEvents, cryptoEvents, predictionEvents, cyberEvents, maritimeEvents, selectedDomain, searchQuery]);
 
   const mainTabs = [
     { id: 'events', label: 'LIVE STREAM', count: sortedEvents.length },
@@ -166,12 +211,6 @@ export default function IntelligenceFeed() {
   ];
 
   const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
-
-  const getScoreBadge = (score: number) => {
-    if (score >= 0.75) return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">CRITICAL {score.toFixed(2)}</span>;
-    if (score >= 0.50) return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 glow-amber">ELEVATED {score.toFixed(2)}</span>;
-    return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">NORMAL {score.toFixed(2)}</span>;
-  };
 
   return (
     <Card
@@ -198,6 +237,9 @@ export default function IntelligenceFeed() {
 
         <div className="relative">
           <input
+            id="intelligence-search-input"
+            name="intelligence_search"
+            autoComplete="off"
             type="text"
             placeholder="Search events, tickers, headlines, or entities..."
             value={searchQuery}
@@ -211,44 +253,9 @@ export default function IntelligenceFeed() {
       <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
         {activeTab === 'events' ? (
           sortedEvents.length > 0 ? (
-            sortedEvents.map((e, idx) => {
-              const domainMeta = getDomainMeta(e.type);
-              const sourceName = getCleanSource(e);
-              const title = formatEnglishHeadline(e);
-              const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown Entity';
-
-              return (
-                <div
-                  key={e.event_id || idx}
-                  onClick={() => setSelectedEvent(e)}
-                  className="p-3 rounded-lg bg-slate-900/60 border border-cyan-500/15 hover:border-[#00f2fe]/50 cursor-pointer transition-all hover:bg-slate-900/90 group glass-panel-hover"
-                >
-                  {/* Header: Domain Badge + Source + Anomaly Score */}
-                  <div className="flex items-center justify-between mb-1.5 font-mono text-[10px]">
-                    <div className="flex items-center gap-1.5">
-                      <span className={`px-1.5 py-0.5 rounded border font-bold uppercase ${domainMeta.badgeStyle}`}>
-                        {domainMeta.icon} {domainMeta.label}
-                      </span>
-                      <span className="text-slate-400 font-medium">
-                        via <span className="text-cyan-400 font-bold">{sourceName}</span>
-                      </span>
-                    </div>
-                    {getScoreBadge(e.anomaly_score)}
-                  </div>
-
-                  {/* Main English Headline */}
-                  <p className="text-xs text-slate-100 font-sans font-semibold line-clamp-2 group-hover:text-white transition-colors leading-snug">
-                    {title}
-                  </p>
-
-                  {/* Footer: Primary Entity + Timestamp (NO raw Event IDs in list) */}
-                  <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/60">
-                    <span>Entity: <span className="text-amber-300 font-bold">{entityName}</span></span>
-                    <span>{new Date(e.occurred_at).toLocaleTimeString()}</span>
-                  </div>
-                </div>
-              );
-            })
+            sortedEvents.map((e, idx) => (
+              <EventRow key={e.event_id || idx} e={e} onClick={setSelectedEvent} />
+            ))
           ) : (
             <div className="flex flex-col items-center justify-center p-8 text-center space-y-2 border border-dashed border-cyan-500/20 bg-slate-950/40 rounded-lg font-mono">
               <span className="text-2xl animate-pulse">📡</span>
@@ -286,7 +293,7 @@ export default function IntelligenceFeed() {
         )}
       </div>
 
-      {/* Event Detail Modal (Raw Event IDs & Full Technical Details Drop Down Here Only) */}
+      {/* Event Detail Modal */}
       {selectedEvent && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-xl max-w-lg w-full p-5 space-y-4 shadow-[0_0_30px_rgba(0,242,254,0.2)] font-mono">
@@ -308,26 +315,31 @@ export default function IntelligenceFeed() {
             <div className="space-y-2.5 text-xs">
               <div><span className="text-slate-400 block mb-0.5">EVENT TITLE:</span> <p className="text-white font-bold font-sans text-sm">{formatEnglishHeadline(selectedEvent)}</p></div>
               <div><span className="text-slate-400">SOURCE:</span> <span className="text-cyan-400 font-bold">{getCleanSource(selectedEvent)}</span></div>
-              <div><span className="text-slate-400">EVENT ID:</span> <span className="text-slate-300 font-mono select-all bg-slate-900 px-2 py-0.5 rounded border border-slate-800">{selectedEvent.event_id}</span></div>
-              <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-rose-400 font-bold">{selectedEvent.anomaly_score.toFixed(4)}</span></div>
-              <div><span className="text-slate-400">PRIMARY ENTITY:</span> <span className="text-amber-400 font-bold">{selectedEvent.primary_entity_name || selectedEvent.entity_name || selectedEvent.primary_entity?.name || 'N/A'}</span></div>
-              <div><span className="text-slate-400">REGION / THEATER:</span> <span className="text-emerald-400">{selectedEvent.region || 'Global'}</span></div>
-              <div><span className="text-slate-400">TIMESTAMP (UTC):</span> <span className="text-slate-300">{new Date(selectedEvent.occurred_at).toUTCString()}</span></div>
+              <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-amber-400 font-bold">{selectedEvent.anomaly_score.toFixed(2)}</span></div>
+              <div><span className="text-slate-400">TIMESTAMP:</span> <span className="text-slate-200">{new Date(selectedEvent.occurred_at).toUTCString()}</span></div>
+              <div><span className="text-slate-400">PRIMARY ENTITY:</span> <span className="text-emerald-400 font-bold">{selectedEvent.primary_entity_name || selectedEvent.entity_name || selectedEvent.primary_entity?.name || 'N/A'}</span></div>
+            </div>
+
+            <div className="pt-2">
+              <button
+                onClick={() => setSelectedEvent(null)}
+                className="w-full py-2 bg-slate-900 text-[#00f2fe] border border-cyan-500/30 rounded-lg text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                DISMISS
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Scenario Detail Inspector Modal */}
+      {/* Scenario Detail Modal */}
       {selectedScenario && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0b0e17] border border-purple-500/50 rounded-xl max-w-xl w-full p-6 space-y-4 shadow-[0_0_30px_rgba(168,85,247,0.3)] font-mono max-h-[85vh] overflow-y-auto">
+          <div className="bg-[#0c0914] border border-purple-500/50 rounded-xl max-w-xl w-full p-5 space-y-4 shadow-[0_0_40px_rgba(168,85,247,0.25)] font-mono">
             <div className="flex items-center justify-between border-b border-purple-500/30 pb-3">
               <div className="flex items-center gap-2">
-                <span className="text-xs font-bold text-purple-400 uppercase tracking-wider">AI SCENARIO INSPECTOR</span>
-                <span className="px-2 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-300 border border-purple-500/40">
-                  {selectedScenario.confidence_overall}% CONFIDENCE
-                </span>
+                <span className="text-xl">🧠</span>
+                <span className="text-xs font-bold text-purple-300 uppercase tracking-wider">AI STRATEGIC SCENARIO</span>
               </div>
               <button
                 onClick={() => setSelectedScenario(null)}
@@ -337,53 +349,31 @@ export default function IntelligenceFeed() {
               </button>
             </div>
 
-            <div className="space-y-3">
-              <h3 className="text-sm font-bold text-white font-sans">{selectedScenario.headline}</h3>
-              <p className="text-xs text-slate-300 font-sans leading-relaxed bg-slate-900/60 p-3 rounded border border-purple-500/20">{selectedScenario.significance}</p>
-              
+            <div className="space-y-3 text-xs">
+              <div>
+                <span className="text-purple-400 font-bold block mb-1">HEADLINE:</span>
+                <h3 className="text-sm font-bold text-white font-sans">{selectedScenario.headline}</h3>
+              </div>
+
+              <div>
+                <span className="text-slate-400 block mb-1">STRATEGIC SIGNIFICANCE:</span>
+                <p className="text-slate-200 bg-purple-950/30 p-3 rounded border border-purple-500/20 leading-relaxed font-sans">{selectedScenario.significance}</p>
+              </div>
+
               {selectedScenario.confidence_rationale && (
                 <div>
-                  <span className="text-[11px] font-bold text-purple-400 uppercase block mb-1.5">Confidence Rationale</span>
-                  <p className="text-xs text-slate-400 font-sans">{selectedScenario.confidence_rationale}</p>
-                </div>
-              )}
-
-              {selectedScenario.hypotheses && selectedScenario.hypotheses.length > 0 && (
-                <div className="space-y-2">
-                  <span className="text-[11px] font-bold text-cyan-400 uppercase block">Hypotheses Breakdown</span>
-                  {selectedScenario.hypotheses.map((h, i) => (
-                    <div key={i} className="p-2.5 rounded bg-slate-950 border border-slate-800 space-y-1">
-                      <div className="flex items-center justify-between text-xs font-bold text-slate-200">
-                        <span>{h.label || `Hypothesis ${i+1}`}</span>
-                        <span className="text-[#00f2fe]">{h.probability}%</span>
-                      </div>
-                      <p className="text-[11px] text-slate-400 font-sans">{h.mechanism}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {selectedScenario.recommended_monitoring && (
-                <div>
-                  <span className="text-[11px] font-bold text-amber-400 uppercase block mb-1">Recommended Monitoring</span>
-                  <ul className="list-disc list-inside text-xs text-slate-300 space-y-1">
-                    {selectedScenario.recommended_monitoring.map((m, i) => (
-                      <li key={i}>{m}</li>
-                    ))}
-                  </ul>
+                  <span className="text-slate-400 block mb-1">CONFIDENCE RATIONALE:</span>
+                  <p className="text-slate-300 text-[11px] leading-relaxed">{selectedScenario.confidence_rationale}</p>
                 </div>
               )}
             </div>
 
-            <div className="pt-2 border-t border-purple-500/20 flex justify-end gap-2">
+            <div className="pt-2">
               <button
-                onClick={() => {
-                  alert(`Dispatched scenario '${selectedScenario.headline}' to Adversarial Wargame Engine.`);
-                  setSelectedScenario(null);
-                }}
-                className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs cursor-pointer transition-colors"
+                onClick={() => setSelectedScenario(null)}
+                className="w-full py-2 bg-purple-950/60 text-purple-300 border border-purple-500/40 rounded-lg text-xs font-bold hover:bg-purple-900/60 transition-colors cursor-pointer"
               >
-                ⚔️ RUN ADVERSARIAL WARGAME
+                DISMISS
               </button>
             </div>
           </div>

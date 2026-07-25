@@ -21,4 +21,7 @@ from .events import (
     BettingData,
     FlightData,
     SecurityData,
+    AnomalyBreakdown,
+    MarketMicrostructure,
+    CrossDomainSignal,
 )

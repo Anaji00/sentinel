@@ -197,6 +197,9 @@ export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { en
 
                 <form onSubmit={handleSearch} className="flex items-center gap-1.5">
                     <input
+                        id="graph-entity-search"
+                        name="graph_entity_search"
+                        autoComplete="off"
                         type="text"
                         value={searchInput}
                         onChange={(e) => setSearchInput(e.target.value)}

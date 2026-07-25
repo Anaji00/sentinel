@@ -286,9 +286,8 @@ class NewsEnricher:
             raw_anomaly = min(1.0, raw_anomaly + 0.40)
 
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
-        if is_threat:
-            raw_anomaly = min(1.0, max(0.65, raw_anomaly + 0.35))
-
+        # Up news anomaly score to 0.8 for high-priority news intelligence
+        raw_anomaly = min(1.0, max(0.80, raw_anomaly + 0.35 if is_threat else (raw_anomaly + 0.25)))
         anomaly = round(raw_anomaly, 3)
 
         if anomaly < 0.35:

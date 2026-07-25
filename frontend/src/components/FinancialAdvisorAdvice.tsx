@@ -43,6 +43,15 @@ interface AdviceResponse {
 
 export default function FinancialAdvisorAdvice() {
   const [selectedPlay, setSelectedPlay] = useState<TradingSignal | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Auto-dismiss toast after 4 seconds
+  React.useEffect(() => {
+    if (toastMessage) {
+      const t = setTimeout(() => setToastMessage(null), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [toastMessage]);
 
   const { data } = useSWR<AdviceResponse>(
     '/financial/advice',
@@ -177,7 +186,7 @@ export default function FinancialAdvisorAdvice() {
             <div className="pt-2 border-t border-cyan-500/20 flex justify-end gap-2">
               <button
                 onClick={() => {
-                  alert(`Paper Order for ${selectedPlay.ticker} (${selectedPlay.action}) submitted to Alpaca Brokerage API.`);
+                  setToastMessage(`Paper Order for ${selectedPlay.ticker} (${selectedPlay.action}) submitted to Alpaca Brokerage API.`);
                   setSelectedPlay(null);
                 }}
                 className="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs cursor-pointer transition-colors"
@@ -185,6 +194,16 @@ export default function FinancialAdvisorAdvice() {
                 🚀 EXECUTE PAPER TRADE ({selectedPlay.kelly_allocation_pct}% KELLY)
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Non-blocking Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-[60] bg-emerald-600/95 text-white px-4 py-3 rounded-lg shadow-2xl text-xs font-mono backdrop-blur-md border border-emerald-400/40 animate-[fadeIn_0.3s_ease-out] max-w-sm">
+          <div className="flex items-center gap-2">
+            <span>✅</span>
+            <span>{toastMessage}</span>
           </div>
         </div>
       )}

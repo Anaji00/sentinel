@@ -243,6 +243,8 @@ class SentinelConsumer:
             group_id: str,
             bootstrap_servers: str = None,
             auto_offset_reset: str = "latest",
+            max_poll_records: Optional[int] = None,
+            max_poll_interval_ms: Optional[int] = None,
     ):
         self.topics = topics
         self._servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -252,8 +254,8 @@ class SentinelConsumer:
             group_id=group_id,
             auto_offset_reset=auto_offset_reset,
             enable_auto_commit=False,
-            max_poll_records=100,
-            max_poll_interval_ms=600000,
+            max_poll_records=max_poll_records if max_poll_records is not None else 15,
+            max_poll_interval_ms=max_poll_interval_ms if max_poll_interval_ms is not None else 1800000,
         )
         self._started = False
         self.batch_logger = BatchKafkaLogger(f"consumer.{group_id}", flush_interval_sec=10.0)

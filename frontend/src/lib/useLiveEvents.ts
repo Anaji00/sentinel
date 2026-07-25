@@ -1,9 +1,17 @@
 import { useEffect, useState, useRef } from 'react';
 import { NormalizedEvent } from './types';
 
+// Max events kept in memory per hook instance
+const MAX_LIVE_EVENTS = 300;
+// Reconnect backoff limits (ms)
+const RECONNECT_INITIAL_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+
 export function useLiveEvents(selectedDomain: string = 'all') {
   const [liveEvents, setLiveEvents] = useState<NormalizedEvent[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
+  const seenIds = useRef(new Set<string>());
+  const backoffRef = useRef(RECONNECT_INITIAL_MS);
 
   useEffect(() => {
     // Determine WebSocket URL dynamically based on current window location
@@ -23,15 +31,44 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
+        ws.onopen = () => {
+          // Reset backoff on successful connection
+          backoffRef.current = RECONNECT_INITIAL_MS;
+        };
+
+        let pendingBatch: NormalizedEvent[] = [];
+        let rafId: number | null = null;
+
+        const flushBatch = () => {
+          if (pendingBatch.length > 0) {
+            const batchToAdd = [...pendingBatch];
+            pendingBatch = [];
+            setLiveEvents((prev) => {
+              const combined = [...batchToAdd, ...prev];
+              return combined.slice(0, MAX_LIVE_EVENTS);
+            });
+          }
+          rafId = null;
+        };
+
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
             if (data && data.event_id) {
-              setLiveEvents((prev) => {
-                // Deduplicate by event_id
-                if (prev.some((e) => e.event_id === data.event_id)) return prev;
-                return [data, ...prev].slice(0, 50);
-              });
+              // O(1) dedup check via Set
+              if (seenIds.current.has(data.event_id)) return;
+              seenIds.current.add(data.event_id);
+              
+              if (seenIds.current.size > MAX_LIVE_EVENTS * 2) {
+                const ids = Array.from(seenIds.current);
+                seenIds.current = new Set(ids.slice(ids.length - MAX_LIVE_EVENTS));
+              }
+
+              pendingBatch.unshift(data);
+
+              if (!rafId) {
+                rafId = requestAnimationFrame(flushBatch);
+              }
             }
           } catch (e) {
             console.error('Error parsing WebSocket message:', e);
@@ -44,7 +81,9 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
         ws.onclose = () => {
           if (isMounted) {
-            reconnectTimer = setTimeout(connect, 5000);
+            // Exponential backoff with cap
+            reconnectTimer = setTimeout(connect, backoffRef.current);
+            backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
           }
         };
       } catch (err) {
@@ -84,6 +123,9 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     }
     if (selectedDomain === 'maritime') {
       return t.includes('vessel') || t.includes('maritime') || t.includes('ais') || s.includes('ais') || s.includes('aisstream');
+    }
+    if (selectedDomain === 'aviation') {
+      return t.includes('flight') || t.includes('aviation') || t.includes('adsb') || s.includes('opensky');
     }
     return false;
   });

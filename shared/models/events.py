@@ -190,6 +190,44 @@ class SecurityData(BaseModel):
     ip_address: Optional[str] = None
     port: Optional[int] = None
 
+class AnomalyBreakdown(BaseModel):
+    """Dimensional anomaly sub-scores — gives agents structured reasoning inputs."""
+    composite_score: float = 0.0
+    spatial_score: float = 0.0
+    temporal_score: float = 0.0
+    volume_z_score: float = 0.0
+    volatility_z_score: float = 0.0
+    cross_domain_correlation_score: float = 0.0
+    ewma_volatility: float = 0.0
+    is_significant: bool = False
+    domain: str = "temporal"
+
+class MarketMicrostructure(BaseModel):
+    """Quantitative market metrics computed at enrichment time."""
+    ewma_volatility: Optional[float] = None
+    realized_volatility: Optional[float] = None
+    parkinson_volatility: Optional[float] = None
+    order_flow_imbalance: Optional[float] = None
+    vwap: Optional[float] = None
+    twap: Optional[float] = None
+    kyle_lambda: Optional[float] = None
+    amihud_illiquidity: Optional[float] = None
+    realized_skewness: Optional[float] = None
+    hurst_exponent: Optional[float] = None
+    bid_ask_spread: Optional[float] = None
+
+class CrossDomainSignal(BaseModel):
+    """Pre-computed related signal from another domain, attached at enrichment time."""
+    event_id: str
+    event_type: str
+    domain: str
+    entity_id: str
+    entity_name: Optional[str] = None
+    headline: Optional[str] = None
+    anomaly_score: float = 0.0
+    occurred_at: Optional[datetime] = None
+    region: Optional[str] = None
+
 class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -231,6 +269,9 @@ class NormalizedEvent(BaseModel):
     named_entities: List[str] = Field(default_factory=list) 
     sentiment: Optional[float] = None
     anomaly_score: float = 0.0
+    anomaly_breakdown: Optional[AnomalyBreakdown] = None
+    market_microstructure: Optional[MarketMicrostructure] = None
+    cross_domain_signals: List[CrossDomainSignal] = Field(default_factory=list)
     correlation_ids: List[str] = Field(default_factory=list)
 
     @field_validator("anomaly_score")

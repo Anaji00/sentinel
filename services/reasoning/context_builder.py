@@ -41,6 +41,8 @@ class ContextBuilder:
         # Natively await asynchronous Redis/Neo4j graph calls
         entity_graph = await self._fetch_entity_graph(cluster.entity_ids)
         agent_intel = await self._fetch_agent_intel(cluster)
+        active_bulletins = await self._fetch_active_bulletins(cluster.entity_ids)
+        consensus_report = await self._fetch_consensus_report()
         
         pattern_matches = self._fetch_pattern_matches(cluster) 
         
@@ -60,6 +62,8 @@ class ContextBuilder:
             "recent_headlines": recent_news,
             "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_intel_briefs": agent_intel,
+            "active_bulletins": active_bulletins,
+            "consensus_analysis": consensus_report,
         }
 
     async def _fetch_event(self, event_id: str) -> Optional[Dict]:
@@ -233,3 +237,42 @@ class ContextBuilder:
         except Exception as e:
             logger.debug(f"Agent intel fetch failed: {e}")
         return []
+
+    async def _fetch_active_bulletins(self, entity_ids: List[str]) -> List[Dict]:
+        """Fetch active agent bulletins relevant to cluster entities from Redis."""
+        try:
+            from shared.db import get_redis
+            redis = await get_redis()
+            bulletins = []
+            cursor = 0
+            while True:
+                cursor, keys = await redis.raw.scan(cursor=cursor, match="sentinel:bulletins:*", count=50)
+                if keys:
+                    values = await redis.raw.mget(keys)
+                    for val in values:
+                        if val:
+                            try:
+                                data = json.loads(val if isinstance(val, str) else val.decode("utf-8"))
+                                ticker = data.get("ticker")
+                                if not entity_ids or not ticker or any(e.upper() == ticker.upper() for e in entity_ids):
+                                    bulletins.append(data)
+                            except Exception:
+                                pass
+                if cursor == 0:
+                    break
+            return bulletins[:10]
+        except Exception as e:
+            logger.debug(f"Bulletin fetch failed: {e}")
+            return []
+
+    async def _fetch_consensus_report(self) -> Optional[Dict]:
+        """Fetch the latest consensus and contradiction analysis from Redis."""
+        try:
+            from shared.db import get_redis
+            redis = await get_redis()
+            raw = await redis.raw.get("sentinel:consensus:latest")
+            if raw:
+                return json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        except Exception as e:
+            logger.debug(f"Consensus report fetch failed: {e}")
+        return None

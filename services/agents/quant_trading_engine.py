@@ -1,0 +1,423 @@
+"""
+services/agents/quant_trading_engine.py
+
+MASTER QUANT & SWE CONSOLIDATED QUANT TRADING ENGINE
+===================================================
+Consolidates 3 quantitative agents into a single high-performance engine:
+  - QuantResearcherAgent (Peer discovery, catalyst analysis, Granger causality)
+  - FinancialAdvisorAgent (TA indicators, Fib levels, VaR/CVaR, Half-Kelly signals)
+  - InsiderClusteringAgent (SEC Form 4 C-suite accumulation & insider flow)
+
+Preserves 100% of existing Kafka topics, Redis keys, and output schemas.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel, Field
+
+from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from shared.kafka import Topics
+from shared.utils import quant_calc
+from shared.utils.equities import is_valid_primary_equity_async
+from services.agents.quant_researcher import PeerDiscovery, PeerTicker, MacroInstrument
+from services.agents.financial_advisor import FinancialAdviceBrief, TradingSignal
+
+logger = logging.getLogger("agent.quant_trading")
+
+
+# ── FORM 4 INSIDER MODELS ─────────────────────────────────────────────────────
+
+class InsiderClusterBrief(BaseModel):
+    ticker: str
+    insider_sentiment: str  # "Bullish Accumulation", "Bearish Distribution", "Neutral"
+    total_net_notional_usd: float
+    c_suite_involvement: bool
+    summary: str
+
+
+# ── CONSOLIDATED QUANT TRADING ENGINE ──────────────────────────────────────────
+
+class QuantTradingEngine(SentinelAgent):
+    """
+    Unified Quant & Trading Engine.
+    Combines peer discovery, SEC Form 4 insider flow tracking, quantitative risk modeling
+    (VaR/CVaR, Half-Kelly), and technical trading signal generation in a single pass.
+    """
+
+    @property
+    def output_topic(self) -> str:
+        return Topics.FINANCIAL_ADVICE
+
+    async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        source = message.get("source", "")
+        event_type = message.get("type", "")
+        raw = message.get("raw_payload", message)
+
+        # ── 1. SEC FORM 4 INSIDER TRADE HANDLER ────────────────────────────────
+        if source == "sec_form4" or "insider" in event_type:
+            return await self._process_insider_form4(message, raw)
+
+        # ── 2. ANOMALY TRIGGERED PEER DISCOVERY & TRADING ADVISORY ────────────
+        ticker = str(
+            raw.get("ticker") or
+            message.get("primary_entity", {}).get("id") or
+            ""
+        ).upper()
+
+        if not ticker or ticker == "UNKNOWN":
+            return None
+
+        anomaly_score = float(message.get("anomaly_score", 0.5))
+        if anomaly_score < 0.60:
+            return None
+
+        # Run Peer Discovery & Trading Advisory concurrently via asyncio.gather
+        discovery_task = self._process_peer_discovery(message, ticker, anomaly_score)
+        advisory_task = self._process_trading_advisory(message, ticker, anomaly_score)
+
+        discovery_res, advisory_res = await asyncio.gather(
+            discovery_task, advisory_task, return_exceptions=True
+        )
+
+        if isinstance(discovery_res, dict):
+            await self._producer.send(Topics.QUANT_DISCOVERIES, discovery_res, key=ticker)
+
+        if isinstance(advisory_res, dict):
+            await self._producer.send(Topics.FINANCIAL_ADVICE, advisory_res, key=ticker)
+
+        return advisory_res if isinstance(advisory_res, dict) else None
+
+    # ── SUB-ENGINE 1: SEC FORM 4 INSIDER CLUSTERING ───────────────────────────
+
+    async def _process_insider_form4(self, message: Dict[str, Any], raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        ticker = (raw.get("ticker") or "").upper()
+        if not ticker:
+            title = raw.get("title", "")
+            match = re.search(r'\(\s*([A-Za-z]+)\s*\)', title)
+            if match:
+                ticker = match.group(1).upper()
+
+        if not ticker:
+            return None
+
+        code = str(raw.get("transaction_code", "P")).upper()
+        notional = float(raw.get("notional_usd", 0.0))
+        is_buyer = code in ("P", "M", "X")
+        signed_notional = notional if is_buyer else -notional
+
+        # Aggregate 7-day insider flow in Redis
+        async with self.redis.raw.pipeline(transaction=True) as pipe:
+            pipe.rpush(f"sentinel:insider:flow:{ticker}", json.dumps({"code": code, "notional": signed_notional, "ts": time.time()}))
+            pipe.ltrim(f"sentinel:insider:flow:{ticker}", -50, -1)
+            pipe.expire(f"sentinel:insider:flow:{ticker}", 604800)
+            await pipe.execute()
+
+        raw_history = await self.redis.raw.lrange(f"sentinel:insider:flow:{ticker}", 0, -1)
+        total_net = sum(json.loads(h)["notional"] for h in raw_history if h)
+
+        if abs(total_net) < 100_000:
+            return None
+
+        sentiment = "Bullish Accumulation" if total_net > 0 else "Bearish Distribution"
+        c_suite = any(kw in str(raw).lower() for kw in ("ceo", "cfo", "director", "president", "officer"))
+
+        brief = InsiderClusterBrief(
+            ticker=ticker,
+            insider_sentiment=sentiment,
+            total_net_notional_usd=total_net,
+            c_suite_involvement=c_suite,
+            summary=f"C-Suite {sentiment} in {ticker}: net 7-day flow ${total_net/1e6:+.2f}M across {len(raw_history)} transactions.",
+        )
+
+        res_payload = {
+            "agent": self.name,
+            "agent_run_id": f"insider_{ticker}_{int(time.time())}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "brief": brief.model_dump(),
+        }
+
+        await self.redis.raw.set(f"sentinel:insider:brief:{ticker}", json.dumps(res_payload["brief"]), ex=86400)
+        await self._producer.send(Topics.INSIDER_CLUSTERS, res_payload, key=ticker)
+
+        # Publish structured AgentBulletin
+        asyncio.create_task(self.publish_bulletin(
+            bulletin_type="signal",
+            summary=brief.summary,
+            ticker=ticker,
+            conviction=0.75 if c_suite else 0.55,
+            expected_direction="up" if total_net > 0 else "down",
+            payload={"net_notional": total_net, "c_suite": c_suite},
+            ttl_seconds=86400,
+        ))
+
+        return res_payload
+
+    # ── SUB-ENGINE 2: QUANT PEER DISCOVERY ───────────────────────────────────
+
+    async def _process_peer_discovery(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
+        dedup_key = f"quant_discovery:{ticker}:{int(time.time() // 1800)}"
+        if await self.is_recently_processed(dedup_key, window_seconds=1800):
+            return None
+        await self.mark_processed(dedup_key, window_seconds=1800)
+
+        # Concurrent context hydration
+        news_context, graph_context, global_context = await asyncio.gather(
+            self._fetch_news_context(ticker),
+            self._fetch_graph_context(ticker),
+            self.fetch_global_context(),
+        )
+
+        user_prompt = f"""
+        Research anomalous instrument movement:
+        - Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
+        - Global Context: {global_context}
+        - News Context: {json.dumps(news_context[:5], default=str)}
+        - Graph Context: {json.dumps(graph_context[:5], default=str)}
+
+        Identify correlated peers, macro instruments, and catalyst categories. Return raw JSON.
+        """
+
+        try:
+            discovery: PeerDiscovery = await self._execute_with_telemetry(
+                message=message,
+                system_prompt="You are SENTINEL Quant Researcher. Discover correlated peers and macro drivers. Return ONLY raw JSON.",
+                user_prompt=user_prompt,
+                schema=PeerDiscovery,
+                temperature=0.15,
+            )
+
+            # Test Granger causality on discovered peers if historical prices exist
+            verified_peers = []
+            for peer in discovery.peer_tickers:
+                x_prices, _ = await self._fetch_prices(ticker)
+                y_prices, _ = await self._fetch_prices(peer.ticker)
+                if len(x_prices) >= 20 and len(y_prices) >= 20:
+                    causality = quant_calc.granger_causality(x_prices, y_prices, max_lag=3)
+                    if causality.get("x_granger_causes_y"):
+                        peer.discovery_confidence = min(1.0, peer.discovery_confidence + 0.15)
+                verified_peers.append(peer)
+            discovery.peer_tickers = verified_peers
+
+            # Inject top peers into watched equities ZSET
+            for p in discovery.peer_tickers[:4]:
+                if p.discovery_confidence >= 0.65:
+                    await self.redis.raw.zadd("sentinel:watched:equities", mapping={p.ticker: time.time()})
+
+            discovery_dict = discovery.model_dump()
+            res_payload = {
+                "agent": self.name,
+                "agent_run_id": f"quant_{ticker}_{int(time.time())}",
+                "trigger": {"ticker": ticker, "anomaly_score": anomaly_score},
+                "discovery": discovery_dict,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            # Publish structured AgentBulletin
+            peer_names = [p.ticker for p in discovery.peer_tickers[:4]]
+            asyncio.create_task(self.publish_bulletin(
+                bulletin_type="thesis",
+                summary=f"Quant Discovery {ticker}: {discovery.catalyst_category}. Peers: {peer_names}",
+                ticker=ticker,
+                conviction=min(1.0, anomaly_score * 0.9),
+                expected_direction="uncertain",
+                payload={"peers": peer_names, "catalyst": discovery.catalyst_category},
+                ttl_seconds=3600,
+            ))
+
+            return res_payload
+
+        except (SchemaViolationError, InferenceError) as e:
+            logger.error(f"Quant peer discovery failed for {ticker}: {e}")
+            return None
+
+    # ── SUB-ENGINE 3: FINANCIAL ADVISORY & RISK SIGNALS ─────────────────────
+
+    async def _process_trading_advisory(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
+        closes, highs, lows = await self._fetch_prices(ticker)
+        if len(closes) < 5:
+            return None
+
+        # Calculate TA indicators
+        indicators = self._compute_ta(closes, highs, lows)
+        current_price = closes[-1]
+        atr = indicators.get("atr", current_price * 0.02)
+
+        # Risk calculations: EWMA Volatility, VaR, CVaR, Half-Kelly
+        returns = list(np.diff(closes) / closes[:-1]) if len(closes) > 1 else [0.0]
+        ewma_vol = quant_calc.ewma_volatility(returns, annualize=True)
+        var_95 = quant_calc.var_historical(returns, confidence=0.95, position_value=10_000)
+        cvar_95 = quant_calc.cvar_historical(returns, confidence=0.95, position_value=10_000)
+
+        # Macro risk sizing check
+        macro_regime_raw = await self.redis.raw.get("sentinel:macro:latest_rates_regime")
+        rates_regime = macro_regime_raw.decode("utf-8") if isinstance(macro_regime_raw, bytes) else (macro_regime_raw or "Normal")
+        is_stress = any(s in rates_regime.lower() for s in ("inverted", "bear_flattening", "stress"))
+
+        kelly_pct = quant_calc.kelly_criterion(0.60, 2.0, half_kelly=True)
+        if is_stress:
+            kelly_pct = min(0.10, kelly_pct * 0.5)
+
+        indicators_data = {
+            ticker: {
+                "current_price": current_price,
+                "rsi": indicators["rsi"],
+                "ema_12": indicators["ema_12"],
+                "ema_26": indicators["ema_26"],
+                "atr": atr,
+                "ewma_volatility_annualized": ewma_vol,
+                "var_95_per_10k": var_95,
+                "cvar_95_per_10k": cvar_95,
+                "half_kelly_allocation_pct": kelly_pct * 100.0,
+                "fib_levels": indicators["fib_levels"],
+            }
+        }
+
+        user_prompt = f"""
+        Formulate investment advisory signal for {ticker}:
+        INDICATORS & RISK METRICS:
+        {json.dumps(indicators_data, separators=(',', ':'), default=str)}
+        MACRO REGIME: {rates_regime}
+        """
+
+        try:
+            brief: FinancialAdviceBrief = await self._execute_with_telemetry(
+                message=message,
+                system_prompt="You are SENTINEL Quant Advisor. Formulate high-conviction trading plays and risk parameters. Return ONLY raw JSON.",
+                user_prompt=user_prompt,
+                schema=FinancialAdviceBrief,
+                temperature=0.1,
+            )
+
+            res_payload = {
+                "agent": self.name,
+                "agent_run_id": f"fin_{ticker}_{int(time.time())}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "brief": brief.model_dump(),
+            }
+
+            await self.redis.raw.set("sentinel:financial:advice:latest", json.dumps(res_payload), ex=86400)
+
+            # Record predictions & publish bulletins for top plays
+            for play in brief.highest_conviction_plays[:2]:
+                direction = "up" if play.action == "BUY" else "down" if play.action == "SELL" else "neutral"
+
+                asyncio.create_task(self.record_prediction(
+                    ticker=play.ticker,
+                    direction=direction,
+                    conviction=play.conviction_score,
+                    entry_price=play.entry_level,
+                    target_price=play.target_price,
+                    time_horizon_hours=24,
+                ))
+
+                asyncio.create_task(self.publish_bulletin(
+                    bulletin_type="signal",
+                    summary=f"{play.action} {play.ticker} @ ${play.entry_level:.2f} -> ${play.target_price:.2f} (Kelly {play.kelly_allocation_pct:.1f}%)",
+                    ticker=play.ticker,
+                    conviction=play.conviction_score,
+                    expected_direction=direction,
+                    payload={"action": play.action, "entry": play.entry_level, "target": play.target_price, "var_95": var_95},
+                    ttl_seconds=3600,
+                ))
+
+            return res_payload
+
+        except (SchemaViolationError, InferenceError) as e:
+            logger.error(f"Trading advisory LLM error for {ticker}: {e}")
+            return None
+
+    # ── HELPER METHODS ────────────────────────────────────────────────────────
+
+    async def _fetch_prices(self, ticker: str) -> Tuple[List[float], List[float], List[float]]:
+        key = f"sentinel:candles:1h:{ticker.upper()}"
+        raw = await self.redis.raw.lrange(key, 0, -1)
+        closes, highs, lows = [], [], []
+        for item in raw:
+            try:
+                bar = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
+                closes.append(float(bar.get("close", 0)))
+                highs.append(float(bar.get("high", bar.get("close", 0))))
+                lows.append(float(bar.get("low", bar.get("close", 0))))
+            except Exception:
+                pass
+        return closes, highs, lows
+
+    def _compute_ta(self, closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
+        curr = closes[-1]
+        max_h = max(highs) if highs else curr
+        min_l = min(lows) if lows else curr
+        diff = max_h - min_l if max_h != min_l else curr * 0.05
+
+        fibs = {
+            "0.0": min_l,
+            "0.382": min_l + 0.382 * diff,
+            "0.500": min_l + 0.500 * diff,
+            "0.618": min_l + 0.618 * diff,
+            "1.0": max_h,
+        }
+
+        # RSI calculation
+        gains, losses = [], []
+        for i in range(max(1, len(closes) - 14), len(closes)):
+            change = closes[i] - closes[i - 1]
+            gains.append(change if change > 0 else 0)
+            losses.append(abs(change) if change < 0 else 0)
+        avg_g = sum(gains) / max(1, len(gains))
+        avg_l = sum(losses) / max(1, len(losses))
+        rsi = 100.0 if avg_l == 0 else 100.0 - (100.0 / (1.0 + (avg_g / avg_l)))
+
+        return {
+            "rsi": round(rsi, 2),
+            "ema_12": round(sum(closes[-12:]) / min(12, len(closes)), 4),
+            "ema_26": round(sum(closes[-26:]) / min(26, len(closes)), 4),
+            "atr": round(sum(highs[i] - lows[i] for i in range(min(len(highs), 14))) / max(1, min(len(highs), 14)), 4),
+            "fib_levels": fibs,
+        }
+
+    async def _fetch_news_context(self, ticker: str) -> List[Dict]:
+        try:
+            rows = await self.db.query("""
+                SELECT headline, anomaly_score, occurred_at, named_entities, tags
+                FROM events
+                WHERE type = 'headline'
+                  AND occurred_at > NOW() - INTERVAL '4 hours'
+                  AND anomaly_score >= 0.3
+                  AND (
+                    LOWER(headline) LIKE $1
+                    OR $2 = ANY(tags)
+                  )
+                ORDER BY anomaly_score DESC
+                LIMIT 8
+            """, f"%{ticker.lower()}%", ticker.lower())
+            return [{"headline": r["headline"], "score": r["anomaly_score"]} for r in rows]
+        except Exception as e:
+            logger.debug(f"News context fetch error for {ticker}: {e}")
+            return []
+
+    async def _fetch_graph_context(self, ticker: str) -> List[Dict]:
+        try:
+            neo4j_client = await get_neo4j()
+            rows = await neo4j_client.query("""
+                MATCH (n {id: $ticker})-[r]-(m)
+                RETURN type(r) as relationship, coalesce(m.name, m.id) as connected,
+                       labels(m) as labels
+                LIMIT 20
+            """, {"ticker": ticker.upper()})
+            return [
+                {
+                    "relationship": r.get("relationship"),
+                    "connected_entity": r.get("connected"),
+                    "entity_type": r.get("labels", ["Unknown"])[0],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.debug(f"Graph context fetch error for {ticker}: {e}")
+            return []

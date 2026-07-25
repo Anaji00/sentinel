@@ -16,6 +16,7 @@ import os
 import sys
 import re
 import time
+from datetime import datetime, timezone
 import aiohttp
 from pathlib import Path
 
@@ -96,6 +97,26 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
             producer.send("scenarios.generated", scenario.model_dump(), key=scenario.scenario_id)
         )
         logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
+        # Broadcast synthesized scenario to live WebSocket feed
+        try:
+            scenario_pub_payload = {
+                "event_id": str(scenario.scenario_id),
+                "type": "scenario_synthesis",
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "source": "Reasoning Engine",
+                "primary_entity_id": str(scenario.correlation_id),
+                "primary_entity_name": scenario.headline or "Strategic Intelligence Scenario",
+                "entity_name": scenario.headline or "Strategic Intelligence Scenario",
+                "headline": f"🧠 STRATEGIC SCENARIO: {scenario.headline}",
+                "summary": str(scenario.significance or scenario.confidence_rationale or "Synthesis complete."),
+                "anomaly_score": float((scenario.confidence_overall or 80) / 100.0),
+                "region": "GLOBAL",
+                "tags": ["scenario_synthesis", "llm_generated"],
+            }
+            await redis_client.raw.publish("sentinel:events:live", json.dumps(scenario_pub_payload))
+        except Exception as pub_err:
+            logger.debug(f"Scenario live feed pub bypass: {pub_err}")
+            
         await apply_autonomous_feedback(scenario, redis_client)
 
     if wargamer and cluster.alert_tier in (AlertTier.ALERT, AlertTier.INTELLIGENCE):

@@ -233,6 +233,27 @@ async def main():
     async def _process_correlation_event(event: NormalizedEvent):
         nonlocal corr_fired, processed
         try:
+            # Helper to stream correlation clusters to frontend WebSocket feed
+            async def _stream_live_correlation(c: CorrelationCluster):
+                try:
+                    payload = {
+                        "event_id": str(c.correlation_id),
+                        "type": "correlation_alert",
+                        "occurred_at": c.detected_at.isoformat() if hasattr(c.detected_at, 'isoformat') else str(c.detected_at),
+                        "source": "Correlation Engine",
+                        "primary_entity_id": c.entity_ids[0] if c.entity_ids else "CORRELATION",
+                        "primary_entity_name": c.rule_name or c.rule_id,
+                        "entity_name": c.rule_name or c.rule_id,
+                        "headline": f"🚨 CORRELATION ALERT: {c.rule_name} (Tier: {c.alert_tier.value if hasattr(c.alert_tier, 'value') else c.alert_tier})",
+                        "summary": c.description,
+                        "anomaly_score": 0.95,
+                        "region": "GLOBAL",
+                        "tags": c.tags or [],
+                    }
+                    await redis_client.raw.publish("sentinel:events:live", json.dumps(payload))
+                except Exception as pub_err:
+                    logger.debug(f"Failed to stream correlation live: {pub_err}")
+
             # 1. Evaluate Geopolitical Cascade Engine
             cascade_cluster = cascade_engine.ingest_event(event)
             if cascade_cluster:
@@ -242,6 +263,7 @@ async def main():
                     cascade_cluster.model_dump(),
                     key=cascade_cluster.correlation_id,
                 )
+                await _stream_live_correlation(cascade_cluster)
                 corr_fired += 1
                 logger.info(f"🚨 Geopolitical Cascade Alert Fired: {cascade_cluster.correlation_id}")
 
@@ -253,6 +275,7 @@ async def main():
                     c.model_dump(),
                     key=c.correlation_id,
                 )
+                await _stream_live_correlation(c)
                 corr_fired += 1
                 logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
             
@@ -292,6 +315,7 @@ async def main():
                         cluster.model_dump(),
                         key=cluster.correlation_id,
                     )
+                    await _stream_live_correlation(cluster)
                     corr_fired += 1
                     
         except Exception as e:

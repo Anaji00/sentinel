@@ -21,7 +21,7 @@ from shared.utils.logging import setup_sentinel_logging
 logger = setup_sentinel_logging("enrichment", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
-from shared.models import RawEvent, NormalizedEvent
+from shared.models import RawEvent, NormalizedEvent, CrossDomainSignal
 from shared.db import get_redis, get_timescale, get_neo4j
 from shared.db.bootstrap import bootstrap_database
 
@@ -42,6 +42,88 @@ from services.enrichment.enrichers.tradfi import TradFiEnricher
 from services.enrichment.enrichers.crypto import CryptoEnricher
 from services.enrichment.enrichers.prediction import PredictionEnricher
 
+
+
+async def _attach_cross_domain_signals(events: list, redis_client):
+    """
+    Pre-computed cross-domain signal injection.
+    Cache recent high-anomaly events in Redis by entity/region, and attach
+    matching signals from OTHER domains to each NormalizedEvent before publishing.
+    """
+    if not redis_client or not events:
+        return
+
+    try:
+        pipe = redis_client.raw.pipeline()
+        for evt in events:
+            if not isinstance(evt, NormalizedEvent):
+                continue
+
+            entity_id = evt.primary_entity.id if evt.primary_entity else None
+            region = evt.region
+
+            # Cache current high-anomaly event (TTL 4h)
+            if evt.anomaly_score >= 0.5:
+                sig_data = json.dumps({
+                    "event_id": str(evt.event_id),
+                    "event_type": str(evt.type.value if hasattr(evt.type, "value") else evt.type),
+                    "domain": evt.source.split("_")[0] if "_" in evt.source else evt.source,
+                    "entity_id": entity_id or "unknown",
+                    "entity_name": evt.primary_entity.name if evt.primary_entity else None,
+                    "headline": evt.headline,
+                    "anomaly_score": evt.anomaly_score,
+                    "occurred_at": evt.occurred_at.isoformat() if evt.occurred_at else None,
+                    "region": region,
+                })
+                if entity_id:
+                    pipe.lpush(f"sentinel:recent_signals:entity:{entity_id.upper()}", sig_data)
+                    pipe.ltrim(f"sentinel:recent_signals:entity:{entity_id.upper()}", 0, 9)
+                    pipe.expire(f"sentinel:recent_signals:entity:{entity_id.upper()}", 14400)
+                if region:
+                    pipe.lpush(f"sentinel:recent_signals:region:{region.lower()}", sig_data)
+                    pipe.ltrim(f"sentinel:recent_signals:region:{region.lower()}", 0, 9)
+                    pipe.expire(f"sentinel:recent_signals:region:{region.lower()}", 14400)
+
+            # Query existing cached signals
+            if entity_id:
+                pipe.lrange(f"sentinel:recent_signals:entity:{entity_id.upper()}", 0, 5)
+            elif region:
+                pipe.lrange(f"sentinel:recent_signals:region:{region.lower()}", 0, 5)
+
+        results = await pipe.execute()
+
+        # Parse results and populate cross_domain_signals
+        res_idx = 0
+        for evt in events:
+            if not isinstance(evt, NormalizedEvent):
+                continue
+
+            entity_id = evt.primary_entity.id if evt.primary_entity else None
+            region = evt.region
+
+            # Skip write pipeline commands indices
+            if evt.anomaly_score >= 0.5:
+                if entity_id:
+                    res_idx += 3
+                if region:
+                    res_idx += 3
+
+            if entity_id or region:
+                raw_signals = results[res_idx] if res_idx < len(results) else []
+                res_idx += 1
+                if raw_signals:
+                    current_domain = evt.source.split("_")[0] if "_" in evt.source else evt.source
+                    cross_signals = []
+                    for item in raw_signals:
+                        try:
+                            s = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
+                            if s.get("domain") != current_domain and s.get("event_id") != str(evt.event_id):
+                                cross_signals.append(CrossDomainSignal(**s))
+                        except Exception:
+                            pass
+                    evt.cross_domain_signals = cross_signals[:3]
+    except Exception as e:
+        logger.debug(f"Cross-domain signal attachment warning: {e}")
 
 
 async def _heartbeat_loop(state: dict):
@@ -225,30 +307,41 @@ async def main():
                                         getattr(vd, 'heading', 0) or 0,
                                         getattr(vd, 'nav_status', 'underway') or 'underway'
                                     ))
-                                entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"
-                                produce_tasks.append(
-                                    producer.send(
-                                        Topics.ENRICHED_EVENTS,
-                                        enriched.model_dump(),
-                                        key=entity_key,
-                                    )
-                                )
                             elif isinstance(enriched, Exception):
-                                logger.error(f"Enrichment failed for event from {topic}: {enriched}", exc_info=enriched)
+                                logger.error(f"Enrichment item failed for topic {topic}: {enriched}", exc_info=enriched)
                                 safe_create_task(
                                     dlq.send(
                                         Topics.DLQ,
                                         {
-                                            "error": f"Enrichment event error: {enriched}",
+                                            "error": f"Item enrichment error: {enriched}",
                                             "topic": topic,
                                         }
                                     ),
-                                    name=f"dlq-enrich-error-{topic}",
+                                    name=f"dlq-item-error-{topic}",
                                 )
-
                         if vessel_positions_to_write:
                             safe_create_task(db.write_vessel_positions_batch(vessel_positions_to_write), name="vessel-position-write")
-                
+
+                # Pre-computed cross-domain signal injection pass
+                if batch_to_write:
+                    await _attach_cross_domain_signals(batch_to_write, redis)
+
+                for enriched in batch_to_write:
+                    entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"
+                    produce_tasks.append(
+                        producer.send(
+                            Topics.ENRICHED_EVENTS,
+                            enriched.model_dump(),
+                            key=entity_key,
+                        )
+                    )
+                    try:
+                        live_dict = enriched.model_dump(mode="json")
+                        live_dict["event_id"] = str(enriched.event_id)
+                        safe_create_task(redis.raw.publish("sentinel:events:live", json.dumps(live_dict)), name="live-feed-pub")
+                    except Exception as pub_err:
+                        logger.debug(f"Redis live feed publish bypass: {pub_err}")
+
                 if produce_tasks:
                     await asyncio.gather(*produce_tasks, return_exceptions=True)
                     processed += len(produce_tasks)
@@ -264,12 +357,13 @@ async def main():
                             # FIX: write_events_batch is async — call it directly,
                             # not via run_in_executor (which is for sync functions).
                             await db.write_events_batch(batch_to_write)
-                            # Broadcast every enriched event to Redis PubSub for real-time WebSocket live feed
+                            # Broadcast enriched events to Redis PubSub for real-time WebSocket live feed
                             try:
-                                redis_client = await get_redis()
+                                pub_pipe = redis.raw.pipeline()
                                 for evt in batch_to_write:
                                     payload = json.dumps(evt.model_dump(), default=str)
-                                    await redis_client.raw.publish("sentinel:events:live", payload)
+                                    pub_pipe.publish("sentinel:events:live", payload)
+                                await pub_pipe.execute()
                             except Exception as pub_err:
                                 logger.debug(f"Redis pubsub publish warning: {pub_err}")
                             break # Success
