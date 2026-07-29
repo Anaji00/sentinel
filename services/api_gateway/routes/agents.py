@@ -52,15 +52,22 @@ async def get_agent_processes(redis = Depends(get_redis_client)):
     if redis:
         try:
             # Check recent agent decision keys in Redis
-            keys = await redis.raw.keys("sentinel:agent:decision:*")
-            for k in keys[:15]:
-                val = await redis.raw.get(k)
-                if val:
-                    try:
-                        import json
-                        decisions.append(json.loads(val))
-                    except Exception:
-                        pass
+            cursor = 0
+            keys = []
+            while True:
+                cursor, scan_keys = await redis.raw.scan(cursor=cursor, match="sentinel:agent:decision:*", count=50)
+                if scan_keys:
+                    keys.extend(scan_keys)
+                if cursor == 0 or len(keys) >= 15:
+                    break
+            if keys:
+                values = await redis.raw.mget(keys[:15])
+                for val in values:
+                    if val:
+                        try:
+                            decisions.append(json.loads(val if isinstance(val, str) else val.decode("utf-8")))
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning(f"Error fetching agent decisions from Redis: {e}")
 

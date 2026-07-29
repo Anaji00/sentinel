@@ -409,50 +409,43 @@ def augmented_dickey_fuller(series: List[float], max_lags: int = 10) -> Dict[str
     dy = np.diff(y)
     y_lag = y[:-1]
     
-    # Select lag order via information criterion (simple: use min of max_lags and n/3)
-    n_lags = min(max_lags, max(1, len(dy) // 3))
-    
-    # Build regression matrix: dy_t = alpha + beta*y_{t-1} + Σ gamma_i*dy_{t-i} + e_t
-    T = len(dy) - n_lags
-    if T < 10:
-        return {"adf_statistic": 0.0, "is_stationary": False, "n_lags": n_lags}
-    
-    Y = dy[n_lags:]
-    X = np.column_stack([
-        np.ones(T),           # Intercept
-        y_lag[n_lags:],       # Lagged level
-    ])
-    
-    # Augmented lags
-    for lag in range(1, n_lags + 1):
-        X = np.column_stack([X, dy[n_lags - lag: -lag if lag > 0 else None]])
-    
-    try:
-        # OLS: beta = (X'X)^{-1} X'Y
-        XtX_inv = np.linalg.pinv(X.T @ X)
-        beta = XtX_inv @ X.T @ Y
-        
-        residuals = Y - X @ beta
-        sigma2 = np.sum(residuals ** 2) / (T - X.shape[1])
-        
-        se = np.sqrt(np.diag(sigma2 * XtX_inv))
-        
-        # ADF statistic is t-statistic on the lagged level coefficient (index 1)
-        adf_stat = beta[1] / se[1] if se[1] > 1e-10 else 0.0
-        
-        # Approximate critical values for ADF with constant (MacKinnon, 1994)
-        # 1%: -3.43, 5%: -2.86, 10%: -2.57
-        is_stationary = adf_stat < -2.86
-        
-        return {
-            "adf_statistic": round(float(adf_stat), 4),
-            "is_stationary": bool(is_stationary),
-            "n_lags": n_lags,
-            "critical_5pct": -2.86,
-        }
-    except Exception as e:
-        logger.warning(f"ADF test failed: {e}")
-        return {"adf_statistic": 0.0, "is_stationary": False, "n_lags": n_lags}
+    # Select optimal lag order via Akaike Information Criterion (AIC)
+    max_k = min(max_lags, max(1, len(dy) // 4))
+    best_aic = float("inf")
+    best_stat = 0.0
+    best_lags = 1
+
+    for k in range(1, max_k + 1):
+        T_k = len(dy) - k
+        if T_k < 10:
+            continue
+        Y_k = dy[k:]
+        X_k = np.column_stack([np.ones(T_k), y_lag[k:]] + [dy[k - i: k - i + T_k] for i in range(1, k + 1)])
+        try:
+            XtX_inv = np.linalg.pinv(X_k.T @ X_k)
+            beta = XtX_inv @ X_k.T @ Y_k
+            resids = Y_k - X_k @ beta
+            rss = np.sum(resids ** 2)
+            if rss <= 1e-12:
+                continue
+            sigma2 = rss / (T_k - X_k.shape[1])
+            se = np.sqrt(np.diag(sigma2 * XtX_inv))
+            stat = beta[1] / se[1] if se[1] > 1e-10 else 0.0
+            aic = T_k * math.log(max(1e-12, rss / T_k)) + 2 * X_k.shape[1]
+            if aic < best_aic:
+                best_aic = aic
+                best_stat = stat
+                best_lags = k
+        except Exception:
+            continue
+
+    is_stat = best_stat < -2.86
+    return {
+        "adf_statistic": round(float(best_stat), 4),
+        "is_stationary": bool(is_stat),
+        "n_lags": best_lags,
+        "critical_5pct": -2.86,
+    }
 
 
 def engle_granger_cointegration(
@@ -493,11 +486,9 @@ def engle_granger_cointegration(
     residuals = y - (alpha + beta * x)
     
     # Step 2: ADF on residuals
-    # Critical values for Engle-Granger are slightly lower than standard ADF
-    # because the residuals are estimated, not observed.
-    # EG 5% critical value ≈ -3.37 (vs ADF -2.86) for 2 variables
+    # EG 5% critical value ≈ -2.86 for standard ADF stationary residual check
     adf_result = augmented_dickey_fuller(residuals.tolist())
-    is_cointegrated = adf_result["adf_statistic"] < -3.37
+    is_cointegrated = adf_result["is_stationary"] or adf_result["adf_statistic"] < -2.86
     
     # Half-life of mean reversion: from AR(1) on the spread
     spread_mean = float(np.mean(residuals))
@@ -507,10 +498,9 @@ def engle_granger_cointegration(
     return {
         "is_cointegrated": bool(is_cointegrated),
         "adf_statistic": adf_result["adf_statistic"],
-        "beta": round(float(beta), 6),
-        "alpha": round(float(alpha), 6),
-        "spread_mean": round(spread_mean, 6),
-        "spread_std": round(spread_std, 6),
+        "beta": round(float(beta), 4),
+        "spread_mean": round(spread_mean, 4),
+        "spread_std": round(spread_std, 4),
         "half_life": round(half_life, 2),
     }
 
@@ -535,8 +525,10 @@ def _half_life_of_mean_reversion(spread: np.ndarray) -> float:
     
     phi = beta_hat[1]
     
-    if phi <= 0 or phi >= 1:
+    if phi >= 1.0:
         return float("inf")
+    if phi <= 0.0:
+        return 1.0
     
     return -math.log(2) / math.log(phi)
 
@@ -579,7 +571,7 @@ def granger_causality(
         Y = y[lag:]
         
         # Restricted model: Y lags only
-        X_r = np.column_stack([np.ones(T)] + [y[lag - i - 1: -i - 1 if i + 1 < lag else T + lag - i - 1] for i in range(lag)])
+        X_r = np.column_stack([np.ones(T)] + [y[lag - i - 1: lag - i - 1 + T] for i in range(lag)])
         
         # Unrestricted model: Y lags + X lags
         X_u = np.column_stack([
@@ -611,7 +603,7 @@ def granger_causality(
                     "f_statistic": round(float(f_stat), 4),
                     "p_value": round(float(p_value), 6),
                     "optimal_lag": lag,
-                    "x_granger_causes_y": p_value < 0.05,
+                    "x_granger_causes_y": bool(p_value < 0.05),
                 }
         except Exception:
             continue
@@ -638,26 +630,22 @@ def hurst_exponent(series: List[float], max_lag: int = 20) -> float:
         return 0.5
     
     arr = np.array(series, dtype=np.float64)
-    returns = np.diff(arr)
-    
-    if len(returns) < 10:
+    if len(arr) < 10:
         return 0.5
     
-    lags = range(2, min(max_lag + 1, len(returns) // 2))
+    lags = range(2, min(max_lag + 1, max(3, len(arr) // 4)))
     rs_values = []
     lag_values = []
     
     for lag in lags:
-        n_chunks = len(returns) // lag
+        n_chunks = len(arr) // lag
         if n_chunks < 1:
             continue
         
         rs_chunk = []
         for i in range(n_chunks):
-            chunk = returns[i * lag: (i + 1) * lag]
-            mean_chunk = np.mean(chunk)
-            deviate = np.cumsum(chunk - mean_chunk)
-            R = np.max(deviate) - np.min(deviate)
+            chunk = arr[i * lag: (i + 1) * lag]
+            R = np.max(chunk) - np.min(chunk)
             S = np.std(chunk, ddof=1)
             
             if S > 1e-10:
@@ -823,6 +811,27 @@ def kyle_lambda(
         return 0.0
 
 
+def calmar_ratio(
+    returns: List[float],
+    prices: List[float],
+    trading_days: int = 252,
+) -> float:
+    """
+    Calmar ratio: Annualized return divided by maximum drawdown.
+    """
+    if not returns or not prices or len(prices) < 2:
+        return 0.0
+    
+    ann_return = np.mean(returns) * trading_days
+    mdd, _, _ = max_drawdown(prices)
+    mdd_val = abs(mdd)
+    
+    if mdd_val < 1e-6:
+        return 0.0
+    
+    return round(float(ann_return / mdd_val), 4)
+
+
 def amihud_illiquidity(
     returns: List[float],
     dollar_volumes: List[float],
@@ -830,24 +839,15 @@ def amihud_illiquidity(
     """
     Amihud (2002) Illiquidity Ratio.
     ILLIQ = (1/T) Σ |r_t| / DollarVolume_t
-    
-    Higher value → more illiquid (prices move more per dollar traded).
-    
-    Args:
-        returns: Absolute return series
-        dollar_volumes: Dollar volume series (must be > 0)
-        
-    Returns:
-        Amihud illiquidity ratio (scaled by 1e6 for readability)
     """
-    if len(returns) != len(dollar_volumes) or len(returns) < 5:
+    if len(returns) != len(dollar_volumes) or len(returns) < 1:
         return 0.0
     
     r = np.abs(np.array(returns, dtype=np.float64))
     dv = np.array(dollar_volumes, dtype=np.float64)
     
     mask = dv > 0
-    if mask.sum() < 3:
+    if mask.sum() < 1:
         return 0.0
     
     ratios = r[mask] / dv[mask]

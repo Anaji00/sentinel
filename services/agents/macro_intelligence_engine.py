@@ -344,12 +344,16 @@ class MacroIntelligenceEngine(SentinelAgent):
             exposed = [r["exposed_ticker"] for r in rows if r.get("exposed_ticker")]
 
             if not exposed:
-                keys = await self.redis.raw.keys("sentinel:quotes:latest:*")
+                cursor = 0
                 discovered = []
-                for k in keys:
-                    tk_name = (k.decode() if isinstance(k, bytes) else k).replace("sentinel:quotes:latest:", "")
-                    if tk_name and tk_name != macro_asset:
-                        discovered.append(tk_name)
+                while True:
+                    cursor, keys = await self.redis.raw.scan(cursor=cursor, match="sentinel:quotes:latest:*", count=100)
+                    for k in keys:
+                        tk_name = (k.decode() if isinstance(k, bytes) else k).replace("sentinel:quotes:latest:", "")
+                        if tk_name and tk_name != macro_asset:
+                            discovered.append(tk_name)
+                    if cursor == 0 or len(discovered) >= 15:
+                        break
                 exposed = discovered[:15]
 
             await self.redis.raw.set(cache_key, json.dumps(exposed), ex=GRAPH_CACHE_TTL)
@@ -442,7 +446,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         msg = {"event_id": run_id, "trace_id": trigger_event.get("trace_id") if trigger_event else "auto"}
 
         try:
-            from services.agents.news_intel import IntelBrief
+            from services.agents.knowledge_graph_engine import IntelBrief
             response = await self._execute_with_telemetry(
                 message=msg,
                 system_prompt="You are Master Quantitative Macro Strategist. Generate structured macro brief JSON.",

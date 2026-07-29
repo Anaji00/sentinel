@@ -4,9 +4,68 @@ import json
 import numpy as np
 import onnxruntime as ort
 import logging
-from typing import Optional
+from shared.utils.metrics import MetricsCollector
+
+from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
+
+DYNAMIC_NORMALIZE_LUA = """
+local key_base = KEYS[1]
+local raw_val = tonumber(ARGV[1])
+local alpha = tonumber(ARGV[2])
+
+local mean_key = key_base .. ":mean"
+local var_key = key_base .. ":var"
+
+local mean = redis.call('GET', mean_key)
+local var = redis.call('GET', var_key)
+
+local m = mean and tonumber(mean) or raw_val
+local v = var and tonumber(var) or 1.0
+
+local std_dev = math.sqrt(v) + 1e-5
+local norm_score = (raw_val - m) / std_dev
+
+local new_m = (alpha * raw_val) + ((1.0 - alpha) * m)
+local new_v = (alpha * (raw_val - m)^2) + ((1.0 - alpha) * v)
+
+redis.call('SET', mean_key, tostring(new_m), 'EX', 604800)
+redis.call('SET', var_key, tostring(new_v), 'EX', 604800)
+
+return tostring(norm_score)
+"""
+
+EMA_GATEKEEPER_LUA = """
+local mean_key = KEYS[1]
+local var_key = KEYS[2]
+local alpha = tonumber(ARGV[1])
+local z_thresh = tonumber(ARGV[2])
+
+local current_m = tonumber(redis.call('GET', mean_key) or "0.5")
+local current_v = tonumber(redis.call('GET', var_key) or "0.05")
+
+local results = {}
+for i = 3, #ARGV do
+    local score = tonumber(ARGV[i])
+    local current_std = math.sqrt(current_v)
+    local dynamic_thresh = current_m + (z_thresh * current_std)
+    if score > dynamic_thresh then
+        table.insert(results, 1)
+    else
+        table.insert(results, 0)
+    end
+    
+    local old_m = current_m
+    current_m = (alpha * score) + ((1.0 - alpha) * current_m)
+    current_v = (alpha * (score - old_m)^2) + ((1.0 - alpha) * current_v)
+end
+
+redis.call('SET', mean_key, tostring(current_m))
+redis.call('SET', var_key, tostring(current_v))
+
+return results
+"""
 
 class DynamicAnomalyScorer:
     def __init__(self, redis_client):
@@ -99,77 +158,45 @@ class DynamicAnomalyScorer:
         
     async def _dynamic_normalize_batch(self, requests: list) -> list:
         # requests = [(ticker, feature_name, raw_value), ...]
-        if not self.redis or not requests:
+        if not requests:
+            return []
+        if not self.redis or not getattr(self.redis, "raw", None):
             return [r[2] / 1000.0 for r in requests]
             
         pipe = self.redis.raw.pipeline()
-        for ticker, feature_name, _ in requests:
-            pipe.get(f"sentinel:stats:{ticker}:{feature_name}:mean")
-            pipe.get(f"sentinel:stats:{ticker}:{feature_name}:var")
-        
-        res = await pipe.execute()
-        
-        results = []
-        set_pipe = self.redis.raw.pipeline()
-        local_cache = {}
-        
-        idx = 0
         for ticker, feature_name, raw_value in requests:
             key_base = f"sentinel:stats:{ticker}:{feature_name}"
-            
-            if key_base in local_cache:
-                mean, var = local_cache[key_base]
-            else:
-                mean = float(res[idx] or raw_value)
-                var = float(res[idx+1] or 1.0)
-            
-            idx += 2
-            
-            std_dev = np.sqrt(var) + 1e-5
-            results.append((raw_value - mean) / std_dev)
-            
-            new_mean = (self.alpha * raw_value) + ((1 - self.alpha) * mean)
-            new_var = (self.alpha * (raw_value - mean)**2) + ((1 - self.alpha) * var)
-            
-            local_cache[key_base] = (new_mean, new_var)
-            
-        for key_base, (m, v) in local_cache.items():
-            set_pipe.set(f"{key_base}:mean", m, ex=604800)
-            set_pipe.set(f"{key_base}:var", v, ex=604800)
-            
-        await set_pipe.execute()
-        return results
+            pipe.eval(DYNAMIC_NORMALIZE_LUA, 1, key_base, float(raw_value), float(self.alpha))
+        
+        res = await pipe.execute()
+        return [float(r) for r in res]
 
     async def _check_ema_gatekeeper(self, event_type: str, raw_score: float) -> bool:
         res = await self._check_ema_gatekeeper_batch(event_type, [raw_score])
         return res[0]
         
     async def _check_ema_gatekeeper_batch(self, event_type: str, raw_scores: list) -> list:
-        if not self.redis or not raw_scores:
+        if not raw_scores:
+            return []
+        if not self.redis or not getattr(self.redis, "raw", None):
             return [score > 0.60 for score in raw_scores]
 
         mean_key = f"sentinel:ml:ema_mean:{event_type}"
         var_key = f"sentinel:ml:ema_var:{event_type}"
         
-        current_mean = float(await self.redis.raw.get(mean_key) or 0.5)
-        current_var = float(await self.redis.raw.get(var_key) or 0.05)
-        
-        results = []
-        for score in raw_scores:
-            current_std = np.sqrt(current_var)
-            dynamic_threshold = current_mean + (self.z_score_threshold * current_std)
-            results.append(score > dynamic_threshold)
-            
-            old_mean = current_mean
-            current_mean = (self.alpha * score) + ((1 - self.alpha) * current_mean)
-            current_var = (self.alpha * (score - old_mean)**2) + ((1 - self.alpha) * current_var)
+        res = await self.redis.raw.eval(
+            EMA_GATEKEEPER_LUA, 2, mean_key, var_key, float(self.alpha), float(self.z_score_threshold), *[float(s) for s in raw_scores]
+        )
+        return [bool(r) for r in res]
 
-        pipe = self.redis.raw.pipeline()
-        pipe.set(mean_key, current_mean)
-        pipe.set(var_key, current_var)
-        await pipe.execute()
-        
-        return results
+    async def check_cusum_drift(self, entity_id: str, series: list, threshold: float = 4.0) -> bool:
+        """
+        Applies CUSUM change-point detection on a rolling feature/return series.
+        Returns True if a structural regime drift is detected.
+        """
+        from shared.utils import quant_calc
+        change_points = quant_calc.cusum_change_detection(series, threshold=threshold)
+        return len(change_points) > 0
     
     async def score_event(self, event_type: str, entity_id: str, features: list) -> dict:
         res = await self.score_event_batch(event_type, [entity_id], [features])
@@ -180,6 +207,8 @@ class DynamicAnomalyScorer:
         session = self.sessions.get(domain)
         
         if not session or not features_list:
+            MetricsCollector.increment("onnx_scoring_uninitialized_total")
+            MetricsCollector.increment(f"onnx_scoring_uninitialized_{domain}")
             return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
             
         try:
@@ -236,6 +265,8 @@ class DynamicAnomalyScorer:
                 return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
                 
         except Exception as e:
+            MetricsCollector.increment("onnx_scoring_failures_total")
+            MetricsCollector.increment(f"onnx_scoring_failures_{domain}")
             logger.error(f"ONNX Batch Scoring failed for {event_type}: {e}", exc_info=True)
             return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
 

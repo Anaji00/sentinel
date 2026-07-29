@@ -124,6 +124,7 @@ class Topics:
     INSIDER_CLUSTERS     = "agents.insider.clusters"
     MACRO_ASSESSMENT     = "agents.macro.assessment"
     MACRO_DECOUPLING     = "agents.macro.decoupling"
+    AGENTS_PREDICTIONS   = "agents.predictions.output"
     # ENRICHED: The "Clean Water".
     # We take the raw stuff, fix the dates, add coordinates, and standardize the format
     # into 'NormalizedEvent' so the database can understand it easily.

@@ -69,8 +69,13 @@ async def get_radar_sweeps_status(redis = Depends(get_redis_client)):
     mean_count = 0
     if redis:
         try:
-            keys = await redis.raw.keys("sentinel:radar:mean:*")
-            mean_count = len(keys)
+            cursor = 0
+            mean_count = 0
+            while True:
+                cursor, keys = await redis.raw.scan(cursor=cursor, match="sentinel:radar:mean:*", count=500)
+                mean_count += len(keys)
+                if cursor == 0:
+                    break
         except Exception as e:
             logger.warning(f"Error scanning Redis radar mean keys: {e}")
 

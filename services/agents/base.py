@@ -552,7 +552,8 @@ class SentinelAgent(ABC):
             self.logger.warning(f"Failed to update scorecard: {e}")
 
     async def is_recently_processed(self, entity_id: str, window_seconds: int = 3600) -> bool:
-        return await self.redis.raw.exists(self.state_key("seen", entity_id))
+        res = await self.redis.raw.exists(self.state_key("seen", entity_id))
+        return bool(res) if isinstance(res, (bool, int)) else False
 
     async def mark_processed(self, entity_id: str, window_seconds: int = 3600):
         await self.redis.raw.set(self.state_key("seen", entity_id), "1", ex=window_seconds)

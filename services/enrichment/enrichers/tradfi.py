@@ -213,11 +213,14 @@ class TradFiEnricher:
         buy_vol = volume if aggressor_side == "BUY" else 0.0
         sell_vol = volume if aggressor_side == "SELL" else 0.0
         ofi = quant_calc.order_flow_imbalance(buy_vol, sell_vol)
+        ami = quant_calc.amihud_illiquidity([price / 100.0], [notional]) if notional > 0 else 0.0
+        k_lambda = quant_calc.kyle_lambda([price], [volume]) if volume > 0 else 0.0
 
         micro = MarketMicrostructure(
             order_flow_imbalance=ofi,
-            vwap=price,
-            twap=price,
+            vwap=quant_calc.vwap([price], [volume]) if volume > 0 else price,
+            kyle_lambda=k_lambda,
+            amihud_illiquidity=ami,
         )
 
         breakdown = AnomalyBreakdown(

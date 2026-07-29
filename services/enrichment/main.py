@@ -240,6 +240,7 @@ async def main():
                 
                 # Group raw events by topic
                 raw_events_by_topic = {}
+                pending_dlq_tasks = []
                 for msg in messages:
                     try:
                         raw_data = json.loads(msg.value.decode('utf-8'))
@@ -247,7 +248,7 @@ async def main():
                         raw_events_by_topic.setdefault(msg.topic, []).append(raw_event)
                     except json.JSONDecodeError as e:
                         logger.error(f"POISON PILL JSON dropped: {e}", exc_info=True)
-                        safe_create_task(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}), name="dlq-poison-pill")
+                        pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}))
                 
                 enrich_tasks = []
                 for topic, raw_events in raw_events_by_topic.items():
@@ -270,7 +271,7 @@ async def main():
                     if isinstance(batch_result, Exception):
                         logger.error(f"Batch enrichment failed for topic {topic}: {batch_result}", exc_info=batch_result)
                         for re in raw_events:
-                            safe_create_task(
+                            pending_dlq_tasks.append(
                                 dlq.send(
                                     Topics.DLQ,
                                     {
@@ -278,8 +279,7 @@ async def main():
                                         "topic": topic,
                                         "raw": re.model_dump()
                                     }
-                                ),
-                                name=f"dlq-batch-error-{topic}",
+                                )
                             )
                     elif isinstance(batch_result, list):
                         def _flatten(items):
@@ -309,18 +309,25 @@ async def main():
                                     ))
                             elif isinstance(enriched, Exception):
                                 logger.error(f"Enrichment item failed for topic {topic}: {enriched}", exc_info=enriched)
-                                safe_create_task(
+                                pending_dlq_tasks.append(
                                     dlq.send(
                                         Topics.DLQ,
                                         {
                                             "error": f"Item enrichment error: {enriched}",
                                             "topic": topic,
                                         }
-                                    ),
-                                    name=f"dlq-item-error-{topic}",
+                                    )
                                 )
                         if vessel_positions_to_write:
-                            safe_create_task(db.write_vessel_positions_batch(vessel_positions_to_write), name="vessel-position-write")
+                            pending_dlq_tasks.append(db.write_vessel_positions_batch(vessel_positions_to_write))
+
+                # Await all pending DLQ sends & vessel writes before proceeding
+                if pending_dlq_tasks:
+                    pending_res = await asyncio.gather(*pending_dlq_tasks, return_exceptions=True)
+                    for r in pending_res:
+                        if isinstance(r, Exception):
+                            logger.error(f"DLQ delivery / aux dispatch failed: {r}", exc_info=r)
+                            batch_success = False  # Gate offset commit on DLQ delivery success
 
                 # Pre-computed cross-domain signal injection pass
                 if batch_to_write:

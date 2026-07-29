@@ -121,7 +121,7 @@ async def main_pipeline_pump():
                         payload = json.loads(msg.value.decode('utf-8')) if isinstance(msg.value, bytes) else msg.value
                         sim_result = await engine.run_predictive_wargame(payload)
                         if sim_result:
-                            await engine.producer.send("agents.predictions.output", sim_result, key=sim_result.get("predicted_next_target_entity_id"))
+                            await engine.producer.send(Topics.AGENTS_PREDICTIONS, sim_result, key=sim_result.get("predicted_next_target_entity_id"))
                 
                 await consumer.commit()
         finally:

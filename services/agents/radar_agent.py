@@ -127,7 +127,28 @@ class RadarAgent(SentinelAgent):
             return None
         
         # ─── AGENTIC REASONING ───
-        self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M")
+        # ─── CROSS-DOMAIN QUANT REGIME METRICS ───
+        from shared.utils import quant_calc
+        import numpy as np
+
+        closes = []
+        try:
+            raw_candles = await self.redis.raw.lrange(f"sentinel:candles:1h:{ticker}", 0, -1)
+            for c in raw_candles:
+                item = json.loads(c if isinstance(c, str) else c.decode("utf-8"))
+                closes.append(float(item.get("close", 0)))
+        except Exception:
+            pass
+
+        if len(closes) >= 20:
+            returns = list(np.diff(closes) / closes[:-1])
+            hurst_val = quant_calc.hurst_exponent(closes)
+            garch_vol = quant_calc.garch_volatility(returns, annualize=True)
+            regime_str = f"Hurst Exponent: {hurst_val:.3f} ({'Trending' if hurst_val > 0.5 else 'Mean-Reverting'}) | GARCH(1,1) Volatility: {garch_vol:.2%}"
+        else:
+            regime_str = "Hurst/GARCH Regime: Baseline Initialization"
+
+        self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M | {regime_str}")
         entity_context = await self.fetch_entity_context(ticker)
         
         prompt = f"""
@@ -137,6 +158,7 @@ class RadarAgent(SentinelAgent):
         Metrics:
         - Z-Score: {z_score:.2f} (standard deviations above the EMA)
         - Notional 1-Minute Flow: ${notional_usd / 1_000_000:.2f} Million
+        - Instrument Regime: {regime_str}
         
         {entity_context}
         

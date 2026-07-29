@@ -25,9 +25,8 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
 from shared.utils import quant_calc
+import numpy as np
 from shared.utils.equities import is_valid_primary_equity_async
-from services.agents.quant_researcher import PeerDiscovery, PeerTicker, MacroInstrument
-from services.agents.financial_advisor import FinancialAdviceBrief, TradingSignal
 
 logger = logging.getLogger("agent.quant_trading")
 
@@ -40,6 +39,103 @@ class InsiderClusterBrief(BaseModel):
     total_net_notional_usd: float
     c_suite_involvement: bool
     summary: str
+
+
+# ── PEER DISCOVERY & RESEARCH MODELS ──────────────────────────────────────────
+
+class PeerTicker(BaseModel):
+    ticker: str
+    relation: str
+    discovery_confidence: float
+
+class MacroInstrument(BaseModel):
+    symbol: str
+    instrument_type: str  # "treasury", "forex", "commodity", "volatility"
+    correlation_reasoning: str
+
+class PeerDiscovery(BaseModel):
+    primary_ticker: str
+    peer_tickers: List[PeerTicker] = Field(default_factory=list)
+    macro_instruments: List[MacroInstrument] = Field(default_factory=list)
+    catalyst_category: str
+    structural_decoupling: bool
+
+
+# ── FINANCIAL ADVISORY & RISK MODELS ──────────────────────────────────────────
+
+class TradingSignal(BaseModel):
+    ticker: str
+    action: str  # "BUY", "SELL", "HOLD"
+    entry_level: float
+    target_price: float
+    stop_loss: float
+    risk_reward_ratio: float
+    kelly_allocation_pct: float
+    conviction_score: float
+    technical_indicators: Dict[str, float] = Field(default_factory=dict)
+    fib_levels: Dict[str, float] = Field(default_factory=dict)
+    quantitative_rationale: str
+
+class FinancialAdviceBrief(BaseModel):
+    market_regime: str
+    highest_conviction_plays: List[TradingSignal] = Field(default_factory=list)
+    general_hedging_strategy: str
+
+
+def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
+    """Helper function computing RSI, EMA, ATR, and Fib levels."""
+    curr = closes[-1] if closes else 0.0
+    max_h = max(highs) if highs else curr
+    min_l = min(lows) if lows else curr
+    diff = max_h - min_l if max_h != min_l else curr * 0.05
+
+    fibs = {
+        "0.0": min_l,
+        "0.382": min_l + 0.382 * diff,
+        "0.500": min_l + 0.500 * diff,
+        "0.618": min_l + 0.618 * diff,
+        "1.0": max_h,
+    }
+
+    gains, losses = [], []
+    for i in range(max(1, len(closes) - 14), len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(change if change > 0 else 0)
+        losses.append(-change if change < 0 else 0)
+
+    avg_gain = sum(gains) / max(1, len(gains))
+    avg_loss = sum(losses) / max(1, len(losses))
+
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    def _ema(span: int) -> float:
+        k = 2.0 / (span + 1)
+        res = closes[0] if closes else 0.0
+        for val in closes[1:]:
+            res = (val * k) + (res * (1.0 - k))
+        return res
+
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        tr_list.append(tr)
+    atr = sum(tr_list[-14:]) / max(1, len(tr_list[-14:])) if tr_list else (curr * 0.02)
+
+    return {
+        "rsi": round(rsi, 2),
+        "ema_12": round(_ema(12), 4),
+        "ema_26": round(_ema(26), 4),
+        "atr": round(atr, 4),
+        "fib_levels": {k: round(v, 4) for k, v in fibs.items()},
+    }
 
 
 # ── CONSOLIDATED QUANT TRADING ENGINE ──────────────────────────────────────────
@@ -64,9 +160,10 @@ class QuantTradingEngine(SentinelAgent):
         if source == "sec_form4" or "insider" in event_type:
             return await self._process_insider_form4(message, raw)
 
-        # ── 2. ANOMALY TRIGGERED PEER DISCOVERY & TRADING ADVISORY ────────────
+        trig = message.get("trigger") or {}
         ticker = str(
             raw.get("ticker") or
+            trig.get("ticker") or
             message.get("primary_entity", {}).get("id") or
             ""
         ).upper()
@@ -74,7 +171,7 @@ class QuantTradingEngine(SentinelAgent):
         if not ticker or ticker == "UNKNOWN":
             return None
 
-        anomaly_score = float(message.get("anomaly_score", 0.5))
+        anomaly_score = float(raw.get("anomaly_score") or trig.get("anomaly_score") or message.get("anomaly_score", 0.5))
         if anomaly_score < 0.60:
             return None
 
@@ -92,7 +189,7 @@ class QuantTradingEngine(SentinelAgent):
         if isinstance(advisory_res, dict):
             await self._producer.send(Topics.FINANCIAL_ADVICE, advisory_res, key=ticker)
 
-        return advisory_res if isinstance(advisory_res, dict) else None
+        return advisory_res if isinstance(advisory_res, dict) else (discovery_res if isinstance(discovery_res, dict) else None)
 
     # ── SUB-ENGINE 1: SEC FORM 4 INSIDER CLUSTERING ───────────────────────────
 
@@ -196,8 +293,8 @@ class QuantTradingEngine(SentinelAgent):
             # Test Granger causality on discovered peers if historical prices exist
             verified_peers = []
             for peer in discovery.peer_tickers:
-                x_prices, _ = await self._fetch_prices(ticker)
-                y_prices, _ = await self._fetch_prices(peer.ticker)
+                x_prices, _, _ = await self._fetch_prices(ticker)
+                y_prices, _, _ = await self._fetch_prices(peer.ticker)
                 if len(x_prices) >= 20 and len(y_prices) >= 20:
                     causality = quant_calc.granger_causality(x_prices, y_prices, max_lag=3)
                     if causality.get("x_granger_causes_y"):
@@ -210,12 +307,24 @@ class QuantTradingEngine(SentinelAgent):
                 if p.discovery_confidence >= 0.65:
                     await self.redis.raw.zadd("sentinel:watched:equities", mapping={p.ticker: time.time()})
 
+            closes, _, _ = await self._fetch_prices(ticker)
+            if len(closes) >= 10:
+                returns = list(np.diff(closes) / closes[:-1])
+                sr = quant_calc.sharpe_ratio(returns)
+                mdd, _, _ = quant_calc.max_drawdown(closes)
+            else:
+                sr, mdd = 0.0, 0.0
+
             discovery_dict = discovery.model_dump()
             res_payload = {
                 "agent": self.name,
                 "agent_run_id": f"quant_{ticker}_{int(time.time())}",
                 "trigger": {"ticker": ticker, "anomaly_score": anomaly_score},
                 "discovery": discovery_dict,
+                "quality_metrics": {
+                    "sharpe_ratio": sr,
+                    "max_drawdown": mdd,
+                },
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -233,7 +342,7 @@ class QuantTradingEngine(SentinelAgent):
 
             return res_payload
 
-        except (SchemaViolationError, InferenceError) as e:
+        except (SchemaViolationError, InferenceError, Exception) as e:
             logger.error(f"Quant peer discovery failed for {ticker}: {e}")
             return None
 
@@ -249,20 +358,29 @@ class QuantTradingEngine(SentinelAgent):
         current_price = closes[-1]
         atr = indicators.get("atr", current_price * 0.02)
 
-        # Risk calculations: EWMA Volatility, VaR, CVaR, Half-Kelly
+        # Risk calculations: EWMA Volatility, VaR, CVaR, Empirical Half-Kelly
         returns = list(np.diff(closes) / closes[:-1]) if len(closes) > 1 else [0.0]
         ewma_vol = quant_calc.ewma_volatility(returns, annualize=True)
         var_95 = quant_calc.var_historical(returns, confidence=0.95, position_value=10_000)
         cvar_95 = quant_calc.cvar_historical(returns, confidence=0.95, position_value=10_000)
 
-        # Macro risk sizing check
+        # Empirical Win Probability (W) & Payoff Ratio (R) from scorecard
+        card = await self.get_scorecard()
+        if card.predictions_made >= 5:
+            win_prob = min(0.85, max(0.35, card.predictions_correct / max(1, card.predictions_made)))
+        else:
+            win_prob = 0.55  # Default baseline prior
+
+        win_loss_ratio = 2.0  # 2:1 reward/risk payoff target
+        kelly_pct = quant_calc.kelly_criterion(win_prob, win_loss_ratio, half_kelly=True)
+
+        # Macro risk sizing check & circuit breaker
         macro_regime_raw = await self.redis.raw.get("sentinel:macro:latest_rates_regime")
-        rates_regime = macro_regime_raw.decode("utf-8") if isinstance(macro_regime_raw, bytes) else (macro_regime_raw or "Normal")
+        rates_regime = macro_regime_raw.decode("utf-8") if isinstance(macro_regime_raw, bytes) else (macro_regime_raw if isinstance(macro_regime_raw, str) else "Normal")
         is_stress = any(s in rates_regime.lower() for s in ("inverted", "bear_flattening", "stress"))
 
-        kelly_pct = quant_calc.kelly_criterion(0.60, 2.0, half_kelly=True)
         if is_stress:
-            kelly_pct = min(0.10, kelly_pct * 0.5)
+            kelly_pct = min(0.05, kelly_pct * 0.5)
 
         indicators_data = {
             ticker: {
@@ -274,7 +392,7 @@ class QuantTradingEngine(SentinelAgent):
                 "ewma_volatility_annualized": ewma_vol,
                 "var_95_per_10k": var_95,
                 "cvar_95_per_10k": cvar_95,
-                "half_kelly_allocation_pct": kelly_pct * 100.0,
+                "half_kelly_allocation_pct": round(kelly_pct * 100.0, 2),
                 "fib_levels": indicators["fib_levels"],
             }
         }
@@ -284,6 +402,11 @@ class QuantTradingEngine(SentinelAgent):
         INDICATORS & RISK METRICS:
         {json.dumps(indicators_data, separators=(',', ':'), default=str)}
         MACRO REGIME: {rates_regime}
+
+        HARD RISK CONSTRAINTS (MANDATORY):
+        - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
+        - Computed Half-Kelly Allocation Limit: {kelly_pct * 100:.1f}%
+        - Constraint: You MUST set kelly_allocation_pct <= {kelly_pct * 100:.1f}% for all trading signals. Do not exceed this allocation.
         """
 
         try:
@@ -329,8 +452,29 @@ class QuantTradingEngine(SentinelAgent):
 
             return res_payload
 
-        except (SchemaViolationError, InferenceError) as e:
+        except (SchemaViolationError, InferenceError, Exception) as e:
             logger.error(f"Trading advisory LLM error for {ticker}: {e}")
+            return None
+
+    async def run_scheduled_review(self) -> Optional[Dict[str, Any]]:
+        """
+        Scheduled review sweep across watched equities.
+        Brings scheduled execution path to 100% parity with live trigger path.
+        """
+        try:
+            raw_watched = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
+            tickers = [t.decode("utf-8") if isinstance(t, bytes) else str(t) for t in raw_watched]
+            if not tickers:
+                tickers = ["AAPL", "MSFT", "NVDA", "BTC-USD", "ETH-USD"]
+
+            results = []
+            for ticker in tickers[:5]:  # Sweep top 5 watched tickers
+                res = await self._process_trading_advisory({"ticker": ticker, "anomaly_score": 0.75}, ticker, 0.75)
+                if res:
+                    results.append(res)
+            return {"scheduled_review": results} if results else None
+        except Exception as e:
+            logger.error(f"Error during quant scheduled review: {e}")
             return None
 
     # ── HELPER METHODS ────────────────────────────────────────────────────────
@@ -350,36 +494,7 @@ class QuantTradingEngine(SentinelAgent):
         return closes, highs, lows
 
     def _compute_ta(self, closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
-        curr = closes[-1]
-        max_h = max(highs) if highs else curr
-        min_l = min(lows) if lows else curr
-        diff = max_h - min_l if max_h != min_l else curr * 0.05
-
-        fibs = {
-            "0.0": min_l,
-            "0.382": min_l + 0.382 * diff,
-            "0.500": min_l + 0.500 * diff,
-            "0.618": min_l + 0.618 * diff,
-            "1.0": max_h,
-        }
-
-        # RSI calculation
-        gains, losses = [], []
-        for i in range(max(1, len(closes) - 14), len(closes)):
-            change = closes[i] - closes[i - 1]
-            gains.append(change if change > 0 else 0)
-            losses.append(abs(change) if change < 0 else 0)
-        avg_g = sum(gains) / max(1, len(gains))
-        avg_l = sum(losses) / max(1, len(losses))
-        rsi = 100.0 if avg_l == 0 else 100.0 - (100.0 / (1.0 + (avg_g / avg_l)))
-
-        return {
-            "rsi": round(rsi, 2),
-            "ema_12": round(sum(closes[-12:]) / min(12, len(closes)), 4),
-            "ema_26": round(sum(closes[-26:]) / min(26, len(closes)), 4),
-            "atr": round(sum(highs[i] - lows[i] for i in range(min(len(highs), 14))) / max(1, min(len(highs), 14)), 4),
-            "fib_levels": fibs,
-        }
+        return compute_ta_indicators(closes, highs, lows)
 
     async def _fetch_news_context(self, ticker: str) -> List[Dict]:
         try:

@@ -22,8 +22,33 @@ from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
-from shared.db import get_neo4j
-from services.agents.news_intel import IntelBrief, GraphTriple, IntelEntity, VALID_PREDICATES
+VALID_PREDICATES = {
+    "OPERATES_IN", "OWNED_BY", "AFFILIATED_WITH", "SANCTIONED_BY",
+    "TARGETS", "CONFLICTS_WITH", "SUPPLIES", "LOCATED_IN", "RELATED_TO"
+}
+
+
+class IntelEntity(BaseModel):
+    name: str
+    entity_type: str  # "Company", "Vessel", "Aircraft", "Organization", "Location", "Person"
+
+
+class GraphTriple(BaseModel):
+    subject: str
+    predicate: str
+    object: str
+    confidence: float = 0.8
+
+
+class IntelBrief(BaseModel):
+    headline: str
+    summary: str
+    primary_entity: Optional[str] = None
+    entities: List[IntelEntity] = Field(default_factory=list)
+    graph_triples: List[GraphTriple] = Field(default_factory=list)
+    severity: int = 3
+    tags: List[str] = Field(default_factory=list)
+
 
 logger = logging.getLogger("agent.knowledge_graph")
 
@@ -210,10 +235,32 @@ class KnowledgeGraphEngine(SentinelAgent):
                 """
                 await neo4j_client.query(query, {
                     "subj": t.subject.upper(),
-                    "subj_type": t.subject_type,
+                    "subj_type": getattr(t, 'subject_type', 'entity'),
                     "obj": t.object.upper(),
-                    "obj_type": t.object_type,
+                    "obj_type": getattr(t, 'object_type', 'entity'),
                     "conf": t.confidence,
                 })
         except Exception as e:
-            logger.debug(f"Graph triple MERGE warning: {e}")
+            logger.error(f"Failed to merge graph triples into Neo4j: {e}")
+
+    async def get_entity_centrality(self, entity_id: str) -> float:
+        """
+        Fetches degree centrality for an entity in Neo4j graph.
+        Weights anomaly correlation-cluster severity by node centrality.
+        """
+        try:
+            from shared.db import get_neo4j
+            import math
+            neo4j_client = await get_neo4j()
+            query = """
+            MATCH (e:Entity {id: $id})
+            OPTIONAL MATCH (e)-[r]-(neighbor)
+            RETURN count(r) as degree
+            """
+            res = await neo4j_client.query(query, {"id": entity_id.upper()})
+            if res and res[0].get("degree"):
+                degree = float(res[0]["degree"])
+                return 1.0 + math.log(1.0 + degree)
+        except Exception as e:
+            logger.debug(f"Centrality query fallback for {entity_id}: {e}")
+        return 1.0

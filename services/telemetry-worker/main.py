@@ -24,6 +24,7 @@ throttled_logger = ThrottledLogger(logger, default_interval_sec=10.0)
 
 from shared.kafka import SentinelConsumer, Topics
 from shared.db import get_timescale
+from shared.utils.metrics import MetricsCollector
 
 async def init_db(db):
     await db.execute("""
@@ -36,6 +37,16 @@ async def init_db(db):
             user_prompt_length INT,
             latency_ms FLOAT,
             output_payload JSONB,
+            occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS agent_predictions (
+            id SERIAL PRIMARY KEY,
+            prediction_id VARCHAR(255),
+            correlation_id VARCHAR(255),
+            predicted_target VARCHAR(255),
+            confidence FLOAT,
+            simulated_vector JSONB,
+            recommendations JSONB,
             occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
     """)
@@ -51,24 +62,42 @@ async def process_telemetry(consumer, db):
                 for message in messages:
                     try:
                         data = json.loads(message.value.decode('utf-8'))
-                        await db.execute("""
-                            INSERT INTO agent_telemetry (
-                                agent_name, task_id, status, 
-                                system_prompt_length, user_prompt_length, 
-                                latency_ms, output_payload, occurred_at
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        """,
-                            data.get("agent", "unknown"),
-                            data.get("task_id", "unknown"),
-                            data.get("status", "unknown"),
-                            data.get("system_prompt_length"),
-                            data.get("user_prompt_length"),
-                            data.get("latency_ms"),
-                            json.dumps(data.get("output_payload")) if "output_payload" in data else None,
-                            datetime.now(timezone.utc)
-                        )
+                        if message.topic == Topics.AGENTS_PREDICTIONS:
+                            await db.execute("""
+                                INSERT INTO agent_predictions (
+                                    prediction_id, correlation_id, predicted_target, 
+                                    confidence, simulated_vector, recommendations, occurred_at
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            """,
+                                str(data.get("prediction_id") or data.get("trace_id") or "wargame_sim"),
+                                str(data.get("correlation_id") or ""),
+                                str(data.get("predicted_next_target_entity_id") or data.get("predicted_target") or "unknown"),
+                                float(data.get("simulation_confidence") or data.get("confidence") or 0.0),
+                                json.dumps(data.get("simulated_trajectory_vector", [])),
+                                json.dumps(data.get("preemptive_recommendations", [])),
+                                datetime.now(timezone.utc)
+                            )
+                            MetricsCollector.increment("agent_predictions_consumed_total")
+                            logger.info("🔮 Persisted agent prediction for target: %s", data.get("predicted_next_target_entity_id"))
+                        else:
+                            await db.execute("""
+                                INSERT INTO agent_telemetry (
+                                    agent_name, task_id, status, 
+                                    system_prompt_length, user_prompt_length, 
+                                    latency_ms, output_payload, occurred_at
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            """,
+                                data.get("agent", "unknown"),
+                                data.get("task_id", "unknown"),
+                                data.get("status", "unknown"),
+                                data.get("system_prompt_length"),
+                                data.get("user_prompt_length"),
+                                data.get("latency_ms"),
+                                json.dumps(data.get("output_payload")) if "output_payload" in data else None,
+                                datetime.now(timezone.utc)
+                            )
                     except Exception as parse_e:
-                        throttled_logger.error("parse_error", f"Failed parsing telemetry message: {parse_e}")
+                        throttled_logger.error("parse_error", f"Failed parsing telemetry/prediction message: {parse_e}")
             await consumer.commit()
         except Exception as batch_error:
             logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}")
@@ -80,7 +109,7 @@ async def main():
     await init_db(db)
     
     consumer = SentinelConsumer(
-        topics=[Topics.TELEMETRY],
+        topics=[Topics.TELEMETRY, Topics.AGENTS_PREDICTIONS],
         group_id="telemetry-worker-group",
         auto_offset_reset="latest",
     )

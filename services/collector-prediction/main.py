@@ -105,14 +105,14 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     if isinstance(tokens, str):
                                         try:
                                             tokens = json.loads(tokens)
-                                        except:
+                                        except (json.JSONDecodeError, TypeError, Exception):
                                             continue
                                     
                                     outcomes = market.get("outcomeNames", [])
                                     if isinstance(outcomes, str):
                                         try:
                                             outcomes = json.loads(outcomes)
-                                        except:
+                                        except (json.JSONDecodeError, TypeError, Exception):
                                             outcomes = []
                                     
                                     for i, token_id in enumerate(tokens):

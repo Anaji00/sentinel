@@ -256,8 +256,8 @@ class ContextBuilder:
                                 ticker = data.get("ticker")
                                 if not entity_ids or not ticker or any(e.upper() == ticker.upper() for e in entity_ids):
                                     bulletins.append(data)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"Bulletin parse warning: {e}")
                 if cursor == 0:
                     break
             return bulletins[:10]

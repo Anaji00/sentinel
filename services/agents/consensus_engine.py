@@ -23,7 +23,8 @@ from collections import defaultdict
 
 from pydantic import BaseModel, Field
 
-from .base import AgentBulletin, AgentScorecard
+from .base import SentinelAgent, AgentBulletin, AgentScorecard
+from shared.kafka import Topics
 
 logger = logging.getLogger("agent.consensus")
 
@@ -63,15 +64,44 @@ class ConsensusReport(BaseModel):
 
 # ── CONSENSUS ENGINE ─────────────────────────────────────────────────────────
 
-class ConsensusEngine:
+class ConsensusEngine(SentinelAgent):
     """
-    Reads all active AgentBulletins, detects contradictions,
-    and computes weighted consensus signals.
+    Reads all active AgentBulletins across the swarm, detects contradictions,
+    computes weighted consensus signals, and emits ConsensusReports.
     """
 
-    def __init__(self, redis_client, producer=None):
-        self.redis = redis_client
-        self.producer = producer
+    def __init__(self, *args, redis_client=None, producer=None, **kwargs):
+        # If redis_client is passed positionally as the 1st argument
+        if args and (redis_client is None):
+            redis_client = args[0]
+            args = args[1:]
+
+        kwargs.setdefault("agent_name", "consensus_engine")
+        kwargs.setdefault("input_topics", [Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE, Topics.RULES_FEEDBACK, Topics.SYSTEM_HEARTBEAT])
+        kwargs.setdefault("db_client", None)
+        kwargs.setdefault("neo4j_client", None)
+        kwargs.setdefault("producer", producer)
+        kwargs.setdefault("consumer", None)
+        kwargs.setdefault("dlq", None)
+        kwargs["redis_client"] = redis_client
+
+        super().__init__(*args, **kwargs)
+
+    @property
+    def output_topic(self) -> str:
+        return "agents.consensus.reports"
+
+    async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        report = await self.analyze()
+        if report.contradictions or report.consensus_signals:
+            return report.model_dump()
+        return None
+
+    async def run_scheduled_review(self) -> Optional[Dict[str, Any]]:
+        report = await self.analyze()
+        if report.contradictions or report.consensus_signals:
+            return report.model_dump()
+        return None
 
     async def analyze(self) -> ConsensusReport:
         """

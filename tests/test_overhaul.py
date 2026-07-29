@@ -220,20 +220,23 @@ def test_consolidated_engine_imports():
     assert KnowledgeGraphEngine.__name__ == "KnowledgeGraphEngine"
 
 
-@pytest.mark.asyncio
-async def test_consensus_engine_logic():
-    class DummyRedis:
-        async def scan(self, cursor=0, match="", count=100):
-            return 0, []
-        async def mget(self, keys):
-            return []
-        async def set(self, key, value, ex=None):
-            pass
+def test_consensus_engine_logic():
+    async def run_test():
+        class DummyRedis:
+            async def scan(self, cursor=0, match="", count=100):
+                return 0, []
+            async def mget(self, keys):
+                return []
+            async def set(self, key, value, ex=None):
+                pass
 
-    engine = ConsensusEngine(DummyRedis())
-    report = await engine.analyze()
-    assert isinstance(report, ConsensusReport)
-    assert report.total_active_bulletins == 0
+        engine = ConsensusEngine(DummyRedis())
+        report = await engine.analyze()
+        assert isinstance(report, ConsensusReport)
+        assert report.total_active_bulletins == 0
+
+    import asyncio
+    asyncio.run(run_test())
 
 
 # ── 4. METRICS TESTS ──────────────────────────────────────────────────────────

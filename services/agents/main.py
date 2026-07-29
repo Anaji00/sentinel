@@ -27,6 +27,7 @@ from services.agents.knowledge_graph_engine import KnowledgeGraphEngine
 from services.agents.radar_agent import RadarAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
 from services.agents.supervisor import GraphSupervisor
+from services.agents.consensus_engine import ConsensusEngine
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
@@ -222,6 +223,16 @@ async def main():
         fallback_model="qwen2.5:1.5b",
     )
 
+    consensus_engine = build_agent(
+        ConsensusEngine,
+        agent_name="consensus_engine",
+        input_topics=[Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE, Topics.RULES_FEEDBACK, Topics.SYSTEM_HEARTBEAT],
+        group_id="agent-consensus-engine",
+        shared_infra=shared_infra,
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
+    )
+
     # Dictionary map with backwards-compatible aliases for task queue dispatch
     agents_by_name = {
         # Core Consolidated Engines
@@ -231,6 +242,7 @@ async def main():
         "radar_agent":                 radar_agent,
         "rule_synthesizer":            rule_synthesizer_agent,
         "supervisor":                  supervisor_agent,
+        "consensus_engine":            consensus_engine,
 
         # Backwards-compatible Task Routing Aliases
         "yield_curve_agent":          macro_intelligence_engine,
@@ -244,7 +256,7 @@ async def main():
         "ontology_master":            knowledge_graph_engine,
     }
 
-    logger.info(f"Consolidated Swarm built: 5 core engines live.")
+    logger.info(f"Consolidated Swarm built: 6 core engines live.")
     logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', 'llama3')}")
     logger.info("=" * 60)
 
@@ -258,6 +270,7 @@ async def main():
         ("radar_agent", radar_agent, "fast"),
         ("rule_synthesizer", rule_synthesizer_agent, "fast"),
         ("supervisor", supervisor_agent, "heavy"),
+        ("consensus_engine", consensus_engine, "heavy"),
     ]
 
     active_agents = {
