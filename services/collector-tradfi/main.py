@@ -159,7 +159,7 @@ async def stream_equities(producer: SentinelProducer, redis_client):
             try:
                 raw_tickers = await redis_client.raw.zrevrange(REDIS_EQUITIES_KEY, 0, 49)  # Get top 50 tickers by score (timestamp)
                 decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
-                desired_subs = {t.upper() for t in decoded_tickers if is_valid_primary_equity(t)} if decoded_tickers else {"NOW", "INTC"}
+                desired_subs = {t.upper() for t in decoded_tickers if is_valid_primary_equity(t)}
                 
                 # PROTECT THE FREE TIER: Strictly enforce the 50 symbol limit
                 if len(desired_subs) > 50:

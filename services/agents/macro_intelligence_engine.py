@@ -94,25 +94,28 @@ class MacroIntelligenceEngine(SentinelAgent):
         raw = message.get("raw_payload", message)
         source = message.get("source", "")
         event_type = message.get("type", "")
+        pe = message.get("primary_entity") or {}
+        fd = message.get("financial_data") or {}
+
         ticker = str(
             raw.get("ticker") or
-            message.get("primary_entity", {}).get("id") or
+            pe.get("id") or
             ""
         ).upper()
 
         # ── 1. FIXED INCOME & RATES HANDLER ────────────────────────────────────
-        if ticker in ("US2Y", "US10Y", "US30Y", "HYG", "LQD", "SOFR", "TIP", "^TNX") or "treasury" in source or "rates" in source:
+        if ticker in ("US2Y", "US10Y", "US30Y", "HYG", "LQD", "SOFR", "TIP", "^TNX") or "treasury" in source or "rates" in source or "rate" in str(event_type).lower():
             return await self._process_rates_and_macro_regime(message, ticker)
 
         # ── 2. OPTIONS VOLATILITY SURFACE HANDLER ─────────────────────────────
-        if source in ("alpaca_options", "tradfi_enricher") or raw.get("trade_type") in ("OPTIONS_FLOW", "OPTIONS_SWEEP"):
+        if source in ("alpaca_options", "tradfi_enricher") or raw.get("trade_type") in ("OPTIONS_FLOW", "OPTIONS_SWEEP") or "options" in str(event_type).lower():
             return await self._process_volatility_surface(message, ticker, raw)
 
         # ── 3. COINTEGRATION SPREAD HANDLER ───────────────────────────────────
         if message.get("financial_data") or raw.get("close") or raw.get("price"):
             macro_asset = ticker or raw.get("ticker")
             price = (
-                message.get("financial_data", {}).get("close_price") or
+                fd.get("close_price") or
                 raw.get("close") or
                 raw.get("price")
             )

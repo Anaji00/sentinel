@@ -32,13 +32,13 @@ class GraphSupervisor(SentinelAgent):
         else:
             await self.execute_proposal(message)
 
-    async def acquire_lock(self, entity_id: str, timeout: int = 5) -> bool:
+    async def acquire_lock(self, entity_id: str, timeout: int = 10) -> bool:
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
         end_time = time.time() + timeout
         while time.time() < end_time:
             if await self.redis.raw.set(lock_key, "locked", nx=True, ex=15):
                 return True
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
         return False
 
     async def release_lock(self, entity_id: str):
@@ -105,7 +105,6 @@ class GraphSupervisor(SentinelAgent):
                     e.updated_at = datetime()
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
-                logger.info(f"✅ UNWIND Batch Committed: {len(batch)} nodes ({label})")
 
             for (source_label, relation, target_label), batch in links_by_relation.items():
                 cypher = f"""
@@ -116,7 +115,8 @@ class GraphSupervisor(SentinelAgent):
                 SET r.weight = row.weight, r.updated_at = datetime()
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
-                logger.info(f"✅ UNWIND Batch Committed: {len(batch)} relationships (-[{relation}]->)")
+
+            logger.info(f"✅ UNWIND Batch Cypher committed {len(proposals)} graph proposals.")
 
         except Exception as e:
             logger.error(f"UNWIND batch commit failed: {e}")
@@ -130,7 +130,7 @@ class GraphSupervisor(SentinelAgent):
         if not entity_id or not action: return
 
         if not await self.acquire_lock(entity_id):
-            logger.error(f"Lock timeout for entity {entity_id}. Dropping proposal.")
+            logger.warning(f"Lock timeout for entity {entity_id}. Dropping proposal.")
             return
 
         try:

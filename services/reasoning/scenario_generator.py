@@ -357,6 +357,16 @@ Pre-analyzed intelligence from the SENTINEL Intel Agent:
 {json.dumps(agent_intel[:2], separators=(',', ':'), default=str)}
 """
 
+        bulletins = context.get("active_bulletins", [])
+        consensus = context.get("consensus_analysis", {})
+        consensus_section = ""
+        if bulletins or consensus:
+            consensus_section = f"""
+=== AGENT SWARM BULLETINS & CONSENSUS ANALYSIS ===
+Pre-computed swarm consensus and agent bulletins:
+{json.dumps({'consensus': consensus, 'bulletins': bulletins[:5]}, separators=(',', ':'), default=str)}
+"""
+
         return f"""=== ANOMALY CLUSTER ===
 Rule Fired: {cluster.rule_name}
 Alert Tier: {cluster.alert_tier.name}
@@ -378,6 +388,7 @@ Similar confirmed/denied scenarios from the past 90 days:
 === RECENT GEOPOLITICAL HEADLINES ===
 {headlines_section}
 {agent_section}
+{consensus_section}
 === TASK ===
 Synthesize all signals above into a structured intelligence assessment.
 Produce exactly 3 hypotheses that together explain the observed anomaly cluster.

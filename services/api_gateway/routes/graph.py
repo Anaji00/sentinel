@@ -81,26 +81,3 @@ async def get_shortest_path(
     except Exception as e:
         logger.error(f"Error fetching shortest path: {e}")
         raise HTTPException(status_code=500, detail="Neo4j query failed")
-    
-
-@router.get("/shortest-path")
-async def get_shortest_path(
-    source_id: str, 
-    target_id: str, 
-    graph = Depends(get_graph)
-):
-    """Advanced Graph AI: Find how two geopolitical entities are connected."""
-    try:
-        query = """
-        MATCH (start:Entity {id: $source_id}), (end:Entity {id: $target_id})
-        CALL apoc.algo.dijkstra(start, end, '', 'weight') YIELD path, weight
-        RETURN nodes(path) AS entities, relationships(path) AS relations
-        """
-        results = await graph.query(query, {"source_id": source_id, "target_id": target_id})
-        return results
-        if not results:
-            return {"message": "No path found"}
-        return {"path": results}
-    except Exception as e:
-        logger.error(f"Error fetching shortest path: {e}")
-        raise HTTPException(status_code=500, detail="Neo4j algorithmic query failed")

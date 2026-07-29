@@ -235,7 +235,8 @@ async def main():
                     Topics.RAW_CYBER: enrichers_tuple[3],
                     Topics.RAW_TRADFI: enrichers_tuple[4],
                     Topics.RAW_CRYPTO: enrichers_tuple[5],
-                    Topics.RAW_PREDICTION: enrichers_tuple[6]
+                    Topics.RAW_PREDICTION: enrichers_tuple[6],
+                    Topics.RAW_RADAR: enrichers_tuple[4]
                 }
                 
                 # Group raw events by topic
@@ -244,11 +245,13 @@ async def main():
                 for msg in messages:
                     try:
                         raw_data = json.loads(msg.value.decode('utf-8'))
+                        if isinstance(raw_data, dict) and not raw_data.get("source"):
+                            raw_data["source"] = msg.topic.split(".")[-1] if "." in msg.topic else msg.topic
                         raw_event = RawEvent(**raw_data)
                         raw_events_by_topic.setdefault(msg.topic, []).append(raw_event)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"POISON PILL JSON dropped: {e}", exc_info=True)
-                        pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": "Invalid JSON bytes", "topic": msg.topic, "raw": str(msg.value)}))
+                    except Exception as e:
+                        logger.error(f"POISON PILL / Invalid RawEvent dropped: {e}", exc_info=True)
+                        pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": f"Invalid RawEvent: {e}", "topic": msg.topic, "raw": str(msg.value)}))
                 
                 enrich_tasks = []
                 for topic, raw_events in raw_events_by_topic.items():

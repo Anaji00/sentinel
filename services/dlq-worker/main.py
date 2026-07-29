@@ -85,7 +85,15 @@ async def _consume_loop(consumer, db, session, producer):
                     original_topic = payload.get("topic", "unknown")
                     error_msg = payload.get("error", "No error provided")
                     raw_data = payload.get("raw", {})
-                    
+                    # If raw_data is a string, attempt to parse it back into a dictionary
+                    if isinstance(raw_data, str):
+                        try:
+                            parsed_raw = json.loads(raw_data)
+                            if isinstance(parsed_raw, dict):
+                                raw_data = parsed_raw
+                        except Exception:
+                            pass
+
                     # Resolve retry count from envelope or nested event payload
                     retry_count = payload.get("retry_count")
                     if retry_count is None:
@@ -93,9 +101,15 @@ async def _consume_loop(consumer, db, session, producer):
                             retry_count = raw_data.get("raw_payload", {}).get("_sentinel_retry_count", 0)
                         else:
                             retry_count = 0
-                    
+
                     # 1. Evaluate Retry vs Permanent Failure
-                    is_poison_pill = "JSONDecodeError" in error_msg or "Invalid JSON" in error_msg
+                    is_poison_pill = not isinstance(raw_data, dict) or any(
+                        p.lower() in error_msg.lower() for p in (
+                            "jsondecodeerror", "invalid json", "validationerror",
+                            "invalid rawevent", "field required", "enrichment error",
+                            "type=", "input_value=", "rawevent", "dict expected", "unparseable"
+                        )
+                    )
                     
                     if retry_count < 3 and original_topic != "unknown" and not is_poison_pill:
                         retry_count += 1
@@ -124,6 +138,10 @@ async def _consume_loop(consumer, db, session, producer):
                         batch_logger.add(category=f"{original_topic}_perm={permanently_failed}")
                     except Exception as e:
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
+                        try:
+                            await _send_telegram_alert(session, original_topic, f"FATAL DLQ WORKER DB FAILURE: {e}")
+                        except Exception:
+                            pass
                         sys.exit(1)
  
                     # 3. Rate-Limited Admin Alert

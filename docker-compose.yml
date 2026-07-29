@@ -468,6 +468,40 @@ services:
       api-gateway:
         condition: service_healthy
 
+  dlq-worker:
+    build: .
+    container_name: sentinel-dlq-worker
+    command: python services/dlq-worker/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
+  telemetry-worker:
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-telemetry-worker
+    command: python services/telemetry-worker/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   zookeeper_data:
   zookeeper_log:

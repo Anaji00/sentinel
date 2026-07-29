@@ -64,13 +64,14 @@ class MaritimeEnricher:
         mmsi_list = []
         meta_list = []
         for raw in events:
-            payload = raw.raw_payload
-            meta = payload.get("MetaData", {})
+            payload = raw.raw_payload or {}
+            meta = payload.get("MetaData") or {}
             mmsi = str(meta.get("MMSI", "")).strip()
             
             if not mmsi or mmsi == "0": continue
             
-            pos = payload.get("Message", {}).get("PositionReport", {})
+            msg = payload.get("Message") or {}
+            pos = msg.get("PositionReport") or {}
             lat = pos.get("Latitude")
             lon = pos.get("Longitude")
             if lat is None or lon is None: continue
@@ -195,7 +196,8 @@ class MaritimeEnricher:
     # ── Static ────────────────────────────────────────────────────────────────
     async def _static(self, raw, payload, meta, mmsi) -> Optional[NormalizedEvent]:
         if not mmsi or mmsi == "0": return None
-        s = payload.get("Message", {}).get("ShipStaticData", {})
+        msg = payload.get("Message") or {}
+        s = msg.get("ShipStaticData") or {}
         name = str(s.get("Name", meta.get("ShipName", ""))).strip()
         dest = str(s.get("Destination", "")).strip()
         code = int(s.get("Type") or 0)

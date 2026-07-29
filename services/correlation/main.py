@@ -296,17 +296,33 @@ async def main():
                     e_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
                     e_name = (event.primary_entity.name or e_id) if event.primary_entity else "UNKNOWN"
 
+                    centrality_mult = 1.0
+                    if e_id and e_id != "UNKNOWN":
+                        try:
+                            from shared.db import get_neo4j
+                            import math
+                            neo4j_client = await get_neo4j()
+                            res = await neo4j_client.query("MATCH (e:Entity {id: $id})-[r]-(n) RETURN count(r) as degree", {"id": e_id.upper()})
+                            if res and res[0].get("degree"):
+                                degree = float(res[0]["degree"])
+                                centrality_mult = 1.0 + math.log(1.0 + degree)
+                        except Exception as cx:
+                            logger.debug(f"Centrality lookup fallback for {e_id}: {cx}")
+
+                    effective_score = len(supporting_ids) * centrality_mult
+                    tier = AlertTier.CRITICAL if effective_score >= 4.0 else (AlertTier.INTELLIGENCE if effective_score >= 2.0 else AlertTier.ALERT)
+
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id="SEMANTIC_001",
                         rule_name="Cross-Domain Semantic Convergence",
-                        alert_tier=AlertTier.INTELLIGENCE if len(supporting_ids) >= 2 else AlertTier.ALERT,
+                        alert_tier=tier,
                         trigger_event_id=event.event_id,
                         supporting_event_ids=supporting_ids,
                         entity_ids=[e_id],
                         entity_names=[e_name],
-                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events for entity '{e_name}'. Anomalous semantic convergence detected.",
-                        tags=["semantic_match", "cross_domain", "ai_cluster", f"entity:{e_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"]
+                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events for entity '{e_name}' (Centrality Multiplier: {centrality_mult:.2f}x). Anomalous semantic convergence detected.",
+                        tags=["semantic_match", "cross_domain", "ai_cluster", f"entity:{e_name}", f"trigger_anomaly_{event.anomaly_score:.2f}", f"centrality_{centrality_mult:.2f}"]
                     )
                     
                     await store.save_correlation(cluster)

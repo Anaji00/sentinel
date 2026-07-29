@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
@@ -32,6 +32,17 @@ class IntelEntity(BaseModel):
     name: str
     entity_type: str  # "Company", "Vessel", "Aircraft", "Organization", "Location", "Person"
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_entity(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {"name": data, "entity_type": "Organization"}
+        if isinstance(data, dict):
+            name = data.get("name") or data.get("entity") or data.get("label") or data.get("item") or data.get("title") or "Unknown"
+            entity_type = data.get("entity_type") or data.get("type") or data.get("category") or "Organization"
+            return {"name": str(name), "entity_type": str(entity_type)}
+        return data
+
 
 class GraphTriple(BaseModel):
     subject: str
@@ -39,15 +50,92 @@ class GraphTriple(BaseModel):
     object: str
     confidence: float = 0.8
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_triple(cls, data: Any) -> Any:
+        if isinstance(data, (list, tuple)):
+            if len(data) >= 3:
+                return {"subject": str(data[0]), "predicate": str(data[1]), "object": str(data[2])}
+            elif len(data) == 2:
+                return {"subject": str(data[0]), "predicate": "RELATED_TO", "object": str(data[1])}
+        if isinstance(data, str):
+            parts = data.split()
+            if len(parts) >= 3:
+                return {"subject": parts[0], "predicate": parts[1], "object": " ".join(parts[2:])}
+            return {"subject": data, "predicate": "RELATED_TO", "object": "Unknown"}
+        if isinstance(data, dict):
+            subj = data.get("subject") or data.get("head") or data.get("source") or data.get("from") or "Unknown"
+            pred = data.get("predicate") or data.get("relation") or data.get("type") or data.get("action") or "RELATED_TO"
+            obj = data.get("object") or data.get("tail") or data.get("target") or data.get("to") or "Unknown"
+            conf = data.get("confidence", 0.8)
+            try:
+                conf = float(conf)
+            except (ValueError, TypeError):
+                conf = 0.8
+            return {"subject": str(subj), "predicate": str(pred), "object": str(obj), "confidence": conf}
+        return data
+
 
 class IntelBrief(BaseModel):
     headline: str
     summary: str
+    headline_summary: str = ""
     primary_entity: Optional[str] = None
+    geopolitical_theater: str = "Global"
+    geographic_hotspots: List[str] = Field(default_factory=list)
     entities: List[IntelEntity] = Field(default_factory=list)
     graph_triples: List[GraphTriple] = Field(default_factory=list)
     severity: int = 3
     tags: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_brief(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        headline = data.get("headline") or data.get("title") or data.get("summary") or "Intelligence Brief"
+        summary = data.get("summary") or data.get("description") or headline
+        if isinstance(headline, list):
+            headline = " ".join(str(x) for x in headline)
+        if isinstance(summary, list):
+            summary = " ".join(str(x) for x in summary)
+
+        data["headline"] = str(headline)
+        data["summary"] = str(summary)
+        data["headline_summary"] = str(data.get("headline_summary") or headline)
+
+        pe = data.get("primary_entity")
+        if isinstance(pe, list):
+            data["primary_entity"] = str(pe[0]) if pe else None
+        elif pe is not None:
+            data["primary_entity"] = str(pe)
+
+        gt = data.get("geopolitical_theater") or "Global"
+        if isinstance(gt, list):
+            gt = str(gt[0]) if gt else "Global"
+        data["geopolitical_theater"] = str(gt)
+
+        gh = data.get("geographic_hotspots")
+        if isinstance(gh, str):
+            data["geographic_hotspots"] = [x.strip() for x in gh.split(",") if x.strip()]
+        elif not isinstance(gh, list):
+            data["geographic_hotspots"] = []
+
+        tags = data.get("tags")
+        if isinstance(tags, str):
+            data["tags"] = [x.strip() for x in tags.split(",") if x.strip()]
+        elif not isinstance(tags, list):
+            data["tags"] = []
+
+        sev = data.get("severity", 3)
+        try:
+            sev_int = int(float(sev))
+            data["severity"] = max(1, min(5, sev_int))
+        except (ValueError, TypeError):
+            data["severity"] = 3
+
+        return data
 
 
 logger = logging.getLogger("agent.knowledge_graph")
@@ -162,7 +250,7 @@ class KnowledgeGraphEngine(SentinelAgent):
             # Publish structured AgentBulletin
             asyncio.create_task(self.publish_bulletin(
                 bulletin_type="alert" if brief.severity >= 4 else "thesis",
-                summary=f"Intel ({brief.geopolitical_theater}): {brief.headline_summary[:80]}",
+                summary=f"Intel ({brief.geopolitical_theater}): {(brief.headline_summary or brief.headline or brief.summary)[:80]}",
                 conviction=min(1.0, brief.severity / 5.0),
                 expected_direction="neutral",
                 payload={"severity": brief.severity, "hotspots": brief.geographic_hotspots, "theater": brief.geopolitical_theater},

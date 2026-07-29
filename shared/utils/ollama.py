@@ -27,9 +27,9 @@ logger = logging.getLogger("sentinel.ollama")
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
-# Dynamic timeout: Enforce 600 seconds (10 mins) to allow local CPU/GPU heavy LLM inference completion
-_raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "600.0"))
-OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(300.0, _raw_timeout))
+# Dynamic timeout: Enforce 1200 seconds (20 mins) to allow local CPU/GPU heavy LLM inference completion
+_raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "1200.0"))
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))
 
 # Circuit breaker config
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
@@ -271,6 +271,9 @@ class OllamaClient:
                     logger.warning(f"Ollama attempt {attempt+1} ({active_model}): no JSON — {last_error[:100]}")
                     continue
 
+                if isinstance(parsed, dict):
+                    parsed = self._coerce_parsed_json(parsed, schema)
+
                 if cache_key and self.redis_client is not None:
                     try:
                         await self.redis_client.raw.set(cache_key, json.dumps(parsed), ex=3600)
@@ -415,7 +418,7 @@ class OllamaClient:
             "keep_alive": -1,  # Keep model permanently loaded
             "options": {
                 "temperature": temperature,
-                "num_predict": min(num_predict or 192, 384) if is_small_model else min(num_predict or 256, 512),
+                "num_predict": min(num_predict or 384, 512) if is_small_model else min(num_predict or 512, 1024),
                 "num_ctx": 3072 if is_small_model else 4096,  # Optimized context window size in tokens
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
@@ -525,3 +528,54 @@ class OllamaClient:
                 pass
  
         return None
+
+    @staticmethod
+    def _coerce_parsed_json(parsed: Any, schema: Type[BaseModel]) -> Any:
+        if not isinstance(parsed, dict):
+            return parsed
+
+        model_fields = getattr(schema, "model_fields", None)
+        if not model_fields and hasattr(schema, "__fields__"):
+            model_fields = schema.__fields__
+        if not model_fields:
+            return parsed
+
+        coerced = dict(parsed)
+        for field_name, field_info in model_fields.items():
+            if field_name not in coerced or coerced[field_name] is None:
+                continue
+
+            val = coerced[field_name]
+            annotation = getattr(field_info, "annotation", None) or getattr(field_info, "type_", None)
+            if annotation is None:
+                continue
+            annotation_str = str(annotation)
+
+            # 1. List fields receiving str or dict
+            if "List[" in annotation_str or "list[" in annotation_str or annotation is list:
+                if isinstance(val, str):
+                    if "," in val:
+                        coerced[field_name] = [x.strip() for x in val.split(",") if x.strip()]
+                    elif val.strip():
+                        coerced[field_name] = [val.strip()]
+                    else:
+                        coerced[field_name] = []
+                elif isinstance(val, dict):
+                    coerced[field_name] = [val]
+
+            # 2. String fields receiving list or dict
+            elif annotation is str or "str" in annotation_str:
+                if isinstance(val, list):
+                    coerced[field_name] = " ".join(str(x) for x in val)
+                elif isinstance(val, dict):
+                    coerced[field_name] = json.dumps(val)
+
+            # 3. Numeric fields receiving str or float
+            elif annotation is int or "int" in annotation_str:
+                if isinstance(val, (str, float)):
+                    try:
+                        coerced[field_name] = int(float(val))
+                    except (ValueError, TypeError):
+                        pass
+
+        return coerced

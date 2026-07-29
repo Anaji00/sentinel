@@ -231,7 +231,7 @@ class CrossDomainSignal(BaseModel):
 class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    source: str
+    source: str = "unknown"
     type: Optional[str] = "custom"
     collected_at: datetime = Field(default_factory=_utcnow)
     occurred_at: Optional[datetime] = None

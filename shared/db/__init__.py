@@ -120,7 +120,7 @@ class TimescaleClient:
             if env_name in ("prod", "production", "staging"):
                 raise RuntimeError("CRITICAL SECURITY FAILURE: DATABASE_URL environment variable is missing.")
             dsn = "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel"
-        elif "@timescaledb:" in dsn:
+        elif "@timescaledb:" in dsn and not os.path.exists("/.dockerenv"):
             try:
                 import socket
                 socket.gethostbyname("timescaledb")

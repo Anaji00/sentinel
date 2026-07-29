@@ -226,3 +226,35 @@ def test_agent_dispatch_dlq_on_inference_error():
 
     asyncio.run(run_test())
 
+
+def test_intel_brief_coercion_from_small_llm():
+    """Verify IntelBrief and OllamaClient._coerce_parsed_json handle non-conforming 1.5b LLM output."""
+    from services.agents.knowledge_graph_engine import IntelBrief
+    from shared.utils.ollama import OllamaClient
+
+    bad_llm_json = {
+        "headline": "Severe Naval Movement in Red Sea",
+        "summary": "Tensions rise as foreign warships deploy.",
+        "entities": ["US Navy", "Houthi Rebels"],
+        "graph_triples": [["US Navy", "MONITORS", "Red Sea"]],
+        "geographic_hotspots": "Red Sea, Bab el-Mandeb",
+        "severity": "4",
+        "tags": "maritime, defense"
+    }
+
+    coerced_json = OllamaClient._coerce_parsed_json(bad_llm_json, IntelBrief)
+    brief = IntelBrief(**coerced_json)
+
+    assert brief.headline == "Severe Naval Movement in Red Sea"
+    assert len(brief.entities) == 2
+    assert brief.entities[0].name == "US Navy"
+    assert brief.entities[0].entity_type == "Organization"
+    assert len(brief.graph_triples) == 1
+    assert brief.graph_triples[0].subject == "US Navy"
+    assert brief.graph_triples[0].predicate == "MONITORS"
+    assert brief.graph_triples[0].object == "Red Sea"
+    assert brief.geographic_hotspots == ["Red Sea", "Bab el-Mandeb"]
+    assert brief.severity == 4
+    assert brief.tags == ["maritime", "defense"]
+
+

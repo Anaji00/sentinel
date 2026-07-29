@@ -162,10 +162,11 @@ class QuantTradingEngine(SentinelAgent):
             return await self._process_insider_form4(message, raw)
 
         trig = message.get("trigger") or {}
+        pe = message.get("primary_entity") or {}
         ticker = str(
             raw.get("ticker") or
             trig.get("ticker") or
-            message.get("primary_entity", {}).get("id") or
+            pe.get("id") or
             ""
         ).upper()
 
