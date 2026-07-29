@@ -17,6 +17,7 @@ We match them against recent events using keyword search on headlines
 and named_entities. Not perfect — Phase 3 will use embedding similarity.
 """
  
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional

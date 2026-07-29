@@ -61,25 +61,8 @@ class MarketRegime:
     @staticmethod
     def compute_parkinson_volatility(highs: list[float], lows: list[float]) -> float:
         """
-        Calculates Parkinson High-Low Volatility.
-        sigma_P = sqrt( 1 / (4 * ln(2) * N) * sum( (ln(High_i / Low_i))^2 ) )
-        Provides a 5x more statistically efficient volatility estimate than close-to-close variance.
+        Delegates Parkinson High-Low Volatility calculation to shared quant_calc library.
         """
-        if not highs or not lows or len(highs) != len(lows):
-            return 0.015
-
-        n = len(highs)
-        log_ratios_sq_sum = 0.0
-        valid_samples = 0
-
-        for h, l in zip(highs, lows):
-            if h > 0 and l > 0 and h >= l:
-                log_ratio = math.log(h / l)
-                log_ratios_sq_sum += log_ratio * log_ratio
-                valid_samples += 1
-
-        if valid_samples == 0:
-            return 0.015
-
-        variance = (1.0 / (4.0 * math.log(2.0) * valid_samples)) * log_ratios_sq_sum
-        return max(0.001, round(math.sqrt(variance), 6))
+        from shared.utils import quant_calc
+        vol = quant_calc.parkinson_volatility(highs, lows)
+        return max(0.001, round(vol, 6)) if vol > 0 else 0.015

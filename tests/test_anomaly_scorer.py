@@ -35,3 +35,4 @@ def test_dynamic_anomaly_scorer_fallback():
 
     import asyncio
     asyncio.run(run_test())
+

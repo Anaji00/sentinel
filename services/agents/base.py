@@ -368,6 +368,20 @@ class SentinelAgent(ABC):
         except Exception as e:
             self.logger.warning(f"Failed to publish bulletin: {e}")
 
+    def safe_create_task(self, coro, task_name: Optional[str] = None) -> asyncio.Task:
+        """
+        Launches an async coroutine as a background task with exception logging callback.
+        """
+        task = asyncio.create_task(coro, name=task_name)
+        def _on_done(t: asyncio.Task):
+            try:
+                if not t.cancelled() and t.exception():
+                    self.logger.warning(f"Background task '{t.get_name()}' failed: {t.exception()}")
+            except Exception as ex:
+                self.logger.debug(f"Task callback error: {ex}")
+        task.add_done_callback(_on_done)
+        return task
+
     async def read_bulletins(
         self,
         agent_name: Optional[str] = None,

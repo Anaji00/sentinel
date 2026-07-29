@@ -532,6 +532,11 @@ class TradFiEnricher:
         except Exception:
             pass
 
+        # Watchlist & Frequency boost
+        is_watched = await self.scorer.check_watchlist(ticker, "equities")
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(ticker, "quant_radar")
+
         base_score = min(1.0, z_score / 5.0)
         anomaly = min(1.0, base_score + w_boost + f_boost)
 

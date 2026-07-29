@@ -27,6 +27,7 @@ from shared.kafka import Topics
 from shared.utils import quant_calc
 import numpy as np
 from shared.utils.equities import is_valid_primary_equity_async
+from shared.db import get_neo4j
 
 logger = logging.getLogger("agent.quant_trading")
 
@@ -292,8 +293,8 @@ class QuantTradingEngine(SentinelAgent):
 
             # Test Granger causality on discovered peers if historical prices exist
             verified_peers = []
+            x_prices, _, _ = await self._fetch_prices(ticker)
             for peer in discovery.peer_tickers:
-                x_prices, _, _ = await self._fetch_prices(ticker)
                 y_prices, _, _ = await self._fetch_prices(peer.ticker)
                 if len(x_prices) >= 20 and len(y_prices) >= 20:
                     causality = quant_calc.granger_causality(x_prices, y_prices, max_lag=3)
@@ -302,9 +303,9 @@ class QuantTradingEngine(SentinelAgent):
                 verified_peers.append(peer)
             discovery.peer_tickers = verified_peers
 
-            # Inject top peers into watched equities ZSET
+            # Inject top verified primary equity peers into watched equities ZSET
             for p in discovery.peer_tickers[:4]:
-                if p.discovery_confidence >= 0.65:
+                if p.discovery_confidence >= 0.65 and await is_valid_primary_equity_async(p.ticker):
                     await self.redis.raw.zadd("sentinel:watched:equities", mapping={p.ticker: time.time()})
 
             closes, _, _ = await self._fetch_prices(ticker)
@@ -327,6 +328,21 @@ class QuantTradingEngine(SentinelAgent):
                 },
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+
+            # Register discovered high-confidence peers in ontology/graph pipelines
+            for peer in discovery.peer_tickers:
+                if peer.discovery_confidence >= 0.65:
+                    await self._producer.send(
+                        Topics.ONTOLOGY_PROPOSALS,
+                        {
+                            "source_entity": ticker,
+                            "target_entity": peer.ticker,
+                            "relationship": "CORRELATED_PEER",
+                            "confidence": peer.discovery_confidence,
+                            "rationale": peer.rationale,
+                        },
+                        key=peer.ticker,
+                    )
 
             # Publish structured AgentBulletin
             peer_names = [p.ticker for p in discovery.peer_tickers[:4]]
