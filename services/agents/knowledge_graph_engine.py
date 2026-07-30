@@ -94,15 +94,22 @@ class IntelBrief(BaseModel):
         if not isinstance(data, dict):
             return data
 
-        headline = data.get("headline") or data.get("title") or data.get("summary") or "Intelligence Brief"
-        summary = data.get("summary") or data.get("description") or headline
-        if isinstance(headline, list):
-            headline = " ".join(str(x) for x in headline)
-        if isinstance(summary, list):
-            summary = " ".join(str(x) for x in summary)
+        raw_headline = data.get("headline") or data.get("title") or data.get("summary")
+        raw_summary = data.get("summary") or data.get("description") or raw_headline
 
-        data["headline"] = str(headline)
-        data["summary"] = str(summary)
+        if isinstance(raw_headline, list):
+            raw_headline = " ".join(str(x) for x in raw_headline)
+        if isinstance(raw_summary, list):
+            raw_summary = " ".join(str(x) for x in raw_summary)
+
+        if not raw_headline or not str(raw_headline).strip() or not raw_summary or not str(raw_summary).strip():
+            raise ValueError("No usable headline/title/summary present in intel brief data")
+
+        headline = str(raw_headline).strip()
+        summary = str(raw_summary).strip()
+
+        data["headline"] = headline
+        data["summary"] = summary
         data["headline_summary"] = str(data.get("headline_summary") or headline)
 
         pe = data.get("primary_entity")
@@ -190,8 +197,13 @@ class KnowledgeGraphEngine(SentinelAgent):
 
         logger.info(f"📰 Processing News Intel & Graph Triples | Headline: '{headline[:60]}...'")
 
-        global_context = await self.fetch_global_context()
+        global_context, cross_context = await asyncio.gather(
+            self.fetch_global_context(),
+            self.get_cross_agent_context(limit=3),
+        )
+        cross_block = f"\nCROSS-AGENT INTELLIGENCE:\n{cross_context}\n" if cross_context else ""
 
+        allowed_preds_str = ", ".join(sorted(VALID_PREDICATES))
         user_prompt = f"""
         Extract structured intelligence brief and Neo4j relationship triples:
         - Headline: {headline}
@@ -201,6 +213,12 @@ class KnowledgeGraphEngine(SentinelAgent):
 
         GLOBAL CONTEXT:
         {global_context}
+        {cross_block}
+        PREDICATE CONSTRAINTS & TRIPLE RULES:
+        - Allowed predicates for graph_triples: {allowed_preds_str}
+        - Omit a triple rather than inventing a predicate if none of the allowed predicates fit.
+        - FORBIDDEN: Do NOT use provenance, reporting, or sourcing (e.g., "Source", "SOURCED_FROM", "REPORTED_BY") as relationship predicates.
+        - FORBIDDEN: Do NOT create self-loop triples where subject == object.
 
         Return raw JSON matching IntelBrief schema exactly.
         """
@@ -214,9 +232,18 @@ class KnowledgeGraphEngine(SentinelAgent):
                 temperature=0.1,
             )
 
+            # Filter graph triples using whitelist, self-loop guard, and length limit
+            valid_triples = [
+                t for t in brief.graph_triples
+                if t.predicate in VALID_PREDICATES
+                and t.subject.strip().lower() != t.object.strip().lower()
+                and len(t.subject) <= 80
+                and len(t.object) <= 80
+            ]
+
             # Direct single-transaction Neo4j MERGE for extracted triples
-            if brief.graph_triples:
-                asyncio.create_task(self._merge_graph_triples(brief.graph_triples))
+            if valid_triples:
+                asyncio.create_task(self._merge_graph_triples(valid_triples))
 
             # Update co-occurrence matrix in Redis
             if len(brief.geographic_hotspots) >= 2:
@@ -241,9 +268,9 @@ class KnowledgeGraphEngine(SentinelAgent):
             await self.redis.raw.set("sentinel:intel:briefs:latest", json.dumps(res_payload["brief"]), ex=86400)
 
             # Emit to agents.ontology.updates for backwards compatibility
-            if brief.graph_triples:
+            if valid_triples:
                 await self._producer.send(Topics.ONTOLOGY_UPDATES, {
-                    "triples": [t.model_dump() for t in brief.graph_triples],
+                    "triples": [t.model_dump() for t in valid_triples],
                     "source_headline": headline,
                 }, key=str(time.time()))
 
@@ -310,15 +337,25 @@ class KnowledgeGraphEngine(SentinelAgent):
 
     async def _merge_graph_triples(self, triples: List[GraphTriple]) -> None:
         try:
-            neo4j_client = await get_neo4j()
+            neo4j_client = self.neo4j
+            if neo4j_client is None:
+                from shared.db import get_neo4j
+                neo4j_client = await get_neo4j()
+
             for t in triples:
-                predicate = t.predicate if t.predicate in VALID_PREDICATES else "RELATED_TO"
+                if t.predicate not in VALID_PREDICATES:
+                    continue
+                if t.subject.strip().lower() == t.object.strip().lower():
+                    continue
+                if len(t.subject) > 80 or len(t.object) > 80:
+                    continue
+
                 query = f"""
                 MERGE (a:Entity {{id: $subj}})
                 SET a.type = $subj_type
                 MERGE (b:Entity {{id: $obj}})
                 SET b.type = $obj_type
-                MERGE (a)-[r:{predicate}]->(b)
+                MERGE (a)-[r:{t.predicate}]->(b)
                 SET r.confidence = $conf, r.last_updated = timestamp()
                 """
                 await neo4j_client.query(query, {

@@ -179,7 +179,7 @@ async def main():
     db = DBWriter(timescale)
     graph = GraphWriter(producer)
     neo4j = await get_neo4j()
-    resolver = EntityResolver(redis, neo4j)
+    resolver = EntityResolver(redis, neo4j, producer=producer)
 
 # STRICT DEPENDENCY INJECTION ALIGNMENT: (scorer, redis, graph, [resolver])
     maritime = MaritimeEnricher(scorer, redis, graph, resolver)

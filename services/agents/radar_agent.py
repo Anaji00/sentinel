@@ -150,6 +150,8 @@ class RadarAgent(SentinelAgent):
 
         self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M | {regime_str}")
         entity_context = await self.fetch_entity_context(ticker)
+        cross_context = await self.get_cross_agent_context(ticker=ticker, limit=2)
+        cross_block = f"\nCross-Agent Intelligence:\n{cross_context}\n" if cross_context else ""
         
         prompt = f"""
         You are a quantitative trading systems engineer.
@@ -159,7 +161,7 @@ class RadarAgent(SentinelAgent):
         - Z-Score: {z_score:.2f} (standard deviations above the EMA)
         - Notional 1-Minute Flow: ${notional_usd / 1_000_000:.2f} Million
         - Instrument Regime: {regime_str}
-        
+        {cross_block}
         {entity_context}
         
         Determine if this ${notional_usd / 1_000_000:.2f}M anomaly warrants active high-frequency tracking. 

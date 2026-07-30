@@ -80,3 +80,98 @@ def test_options_flow_enrichment():
         assert normalized.anomaly_score > 0.0
         
     asyncio.run(run_test())
+
+
+def test_entity_resolver_publishes_unknown_entities_on_miss():
+    """Verify that EntityResolver publishes to Topics.UNKNOWN_ENTITIES with raw_entity_name, context_event_id, and timestamp on resolution miss."""
+    from services.enrichment.entity_resolver import EntityResolver
+    from shared.kafka import Topics
+
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw.get = AsyncMock(return_value=None)
+        neo4j_mock = MagicMock()
+        neo4j_mock.execute_and_fetch = AsyncMock(return_value=[])
+        producer_mock = MagicMock()
+        producer_mock.send = AsyncMock()
+
+        resolver = EntityResolver(redis_mock, neo4j_mock, producer=producer_mock)
+
+        # 1. Force resolution miss on resolve_vessel
+        res_vessel = await resolver.resolve_vessel(
+            "999999999",
+            ais_meta=None,
+            context_event_id="evt-vessel-123",
+            timestamp="2026-07-29T18:00:00Z"
+        )
+
+        assert res_vessel is None
+        producer_mock.send.assert_called_once()
+        topic, payload = producer_mock.send.call_args[0][:2]
+        assert topic == Topics.UNKNOWN_ENTITIES
+        assert payload["raw_entity_name"] == "999999999"
+        assert payload["context_event_id"] == "evt-vessel-123"
+        assert payload["timestamp"] == "2026-07-29T18:00:00Z"
+
+        producer_mock.send.reset_mock()
+
+        # 2. Force resolution miss on generic resolve
+        res_generic = await resolver.resolve(
+            "unknown_corp_456",
+            context_event_id="evt-corp-456",
+            timestamp="2026-07-29T18:05:00Z"
+        )
+
+        assert res_generic is None
+        producer_mock.send.assert_called_once()
+        topic_gen, payload_gen = producer_mock.send.call_args[0][:2]
+        assert topic_gen == Topics.UNKNOWN_ENTITIES
+        assert payload_gen["raw_entity_name"] == "unknown_corp_456"
+        assert payload_gen["context_event_id"] == "evt-corp-456"
+        assert payload_gen["timestamp"] == "2026-07-29T18:05:00Z"
+
+    asyncio.run(run_test())
+
+
+def test_payload_readability_and_summaries():
+    """Verify that NormalizedEvent and CorrelationCluster generate clean, readable summaries."""
+    from shared.models.events import NormalizedEvent, EventType, Entity, EntityType, CorrelationCluster, AlertTier, FinancialData
+
+    now = datetime.now(timezone.utc)
+    event = NormalizedEvent(
+        type=EventType.OPTIONS_FLOW,
+        occurred_at=now,
+        source="alpaca_options",
+        primary_entity=Entity(id="AAPL", name="Apple Inc.", type=EntityType.COMPANY),
+        headline="Apple Inc $1.5M Call Option Sweep",
+        anomaly_score=0.88,
+        financial_data=FinancialData(ticker="AAPL", premium_usd=1500000.0)
+    )
+
+    summary_text = event.to_readable_summary()
+    assert "[OPTIONS_FLOW]" in summary_text
+    assert "Apple Inc." in summary_text
+    assert "AAPL" in summary_text
+    assert "$1,500,000.00" in summary_text
+    assert "0.88" in summary_text
+
+    cluster = CorrelationCluster(
+        rule_id="RULE_001",
+        rule_name="Cross-Domain Threat Convergence",
+        alert_tier=AlertTier.CRITICAL,
+        primary_domain="maritime",
+        confidence_score=0.92,
+        summary_headline="🚨 High Risk Vessel STS Transfer in Black Sea",
+        supporting_headlines=["Vessel DARK AIS signal in Sevastopol", "Flight Anomaly near Crimea"],
+        trigger_event_id="evt-1",
+        entity_names=["Vessel Titanic", "USAF Recon"],
+        description="Correlated maritime dark activity with military reconnaissance flights."
+    )
+
+    cluster_summary = cluster.to_readable_summary()
+    assert "CRITICAL" in cluster_summary
+    assert "MARITIME" in cluster_summary
+    assert "High Risk Vessel STS Transfer" in cluster_summary
+    assert "92%" in cluster_summary
+    assert "Vessel Titanic" in cluster_summary
+    assert "Supporting Evidence:" in cluster_summary

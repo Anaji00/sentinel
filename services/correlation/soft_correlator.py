@@ -37,8 +37,8 @@ logger = logging.getLogger("correlation.soft")
  
 # Similarity threshold — events with cosine similarity above this
 # are considered semantically related
-# (Cosine similarity ranges from -1.0 to 1.0. 0.72 means "fairly similar meaning").
-SIMILARITY_THRESHOLD = 0.72
+# (Cosine similarity ranges from -1.0 to 1.0. 0.65 allows subtle cross-domain financial connections to be discovered).
+SIMILARITY_THRESHOLD = 0.65
  
 # Minimum time window to search for correlations (hours)
 LOOKBACK_HOURS = 48

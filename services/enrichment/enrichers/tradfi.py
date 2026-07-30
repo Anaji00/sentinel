@@ -178,7 +178,7 @@ class TradFiEnricher:
                     anomaly = min(1.0, anomaly * 1.1)
                     direction_str = "🟢 ACCUMULATION SWEEP"
 
-            if anomaly < 0.6:  # Strict floor
+            if anomaly < 0.35:  # Sensitive floor for correlation store ingest
                 continue
                 
             results.append(self._finalize_equity_trade(raw, p, ticker, price, volume, notional, tags, direction_str, anomaly))

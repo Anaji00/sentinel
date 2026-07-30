@@ -49,30 +49,68 @@ async def _listen_for_rule_updates(redis_client):
                 if "rule_id" in rule:
                     _dynamic_rules_cache[rule["rule_id"]] = rule
         else:
-            logger.info("⚡ No dynamic rules in Redis. Seeding default baseline correlation rules...")
             default_rules = [
                 {
                     "rule_id": "rule_cyber_aviation_chokepoint",
-                    "trigger_event_type": "cyber_threat",
-                    "conditions": {"min_anomaly": 0.3},
-                    "correlations": [{"event_types": ["flight_position", "vessel_position"], "hours": 48, "min_anomaly": 0.3}],
+                    "rule_name": "Cyber Aviation Chokepoint Disruption",
+                    "trigger_event_type": ["breach_detected", "infra_exposed", "ransomware", "bgp_anomaly"],
+                    "conditions": {"min_anomaly": 0.25},
+                    "correlations": [{"event_types": ["flight_position", "flight_dark", "flight_anomaly", "vessel_position"], "hours": 48, "min_anomaly": 0.25}],
                     "alert_tier": "CRITICAL",
                     "expires_at": int(time.time()) + 315360000
                 },
                 {
-                    "rule_id": "rule_macro_market_volatility",
-                    "trigger_event_type": "macro_indicator",
-                    "conditions": {"min_anomaly": 0.3},
-                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 24, "min_anomaly": 0.3}],
+                    "rule_id": "rule_financial_block_volume_spike",
+                    "rule_name": "Equity Block & Options Convergence",
+                    "trigger_event_type": ["equity_block", "price_anomaly"],
+                    "conditions": {"min_anomaly": 0.25},
+                    "correlations": [{"event_types": ["options_flow", "dark_pool", "insider_trade", "market_anomaly", "price_anomaly"], "hours": 48, "min_anomaly": 0.25}],
                     "alert_tier": "ELEVATED",
                     "expires_at": int(time.time()) + 315360000
                 },
                 {
-                    "rule_id": "rule_news_market_anomaly",
-                    "trigger_event_type": "news_article",
-                    "conditions": {"min_anomaly": 0.2},
-                    "correlations": [{"event_types": ["market_anomaly", "crypto_trade", "price_anomaly"], "hours": 12, "min_anomaly": 0.2}],
-                    "alert_tier": "WATCH",
+                    "rule_id": "rule_insider_options_convergence",
+                    "rule_name": "Insider Form 4 & Microstructure Convergence",
+                    "trigger_event_type": "insider_trade",
+                    "conditions": {"min_anomaly": 0.20},
+                    "correlations": [{"event_types": ["options_flow", "equity_block", "price_anomaly", "dark_pool"], "hours": 72, "min_anomaly": 0.20}],
+                    "alert_tier": "INTELLIGENCE",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_options_darkpool_surge",
+                    "rule_name": "Dark Pool & Options Flow Accumulation",
+                    "trigger_event_type": "options_flow",
+                    "conditions": {"min_anomaly": 0.25},
+                    "correlations": [{"event_types": ["dark_pool", "equity_block", "price_anomaly", "insider_trade"], "hours": 48, "min_anomaly": 0.25}],
+                    "alert_tier": "ELEVATED",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_news_financial_impact",
+                    "rule_name": "Headline Market Impact Convergence",
+                    "trigger_event_type": ["headline", "narrative_cluster"],
+                    "conditions": {"min_anomaly": 0.20},
+                    "correlations": [{"event_types": ["equity_block", "price_anomaly", "options_flow", "crypto_trade", "crypto_liquidation", "dark_pool"], "hours": 24, "min_anomaly": 0.20}],
+                    "alert_tier": "ALERT",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_crypto_equity_contagion",
+                    "rule_name": "Crypto Liquidation & Equity Spillover",
+                    "trigger_event_type": ["crypto_liquidation", "crypto_perp_funding"],
+                    "conditions": {"min_anomaly": 0.25},
+                    "correlations": [{"event_types": ["crypto_trade", "crypto_transfer", "equity_block", "price_anomaly"], "hours": 24, "min_anomaly": 0.25}],
+                    "alert_tier": "ELEVATED",
+                    "expires_at": int(time.time()) + 315360000
+                },
+                {
+                    "rule_id": "rule_prediction_market_divergence",
+                    "rule_name": "Prediction Market & Asset Shift",
+                    "trigger_event_type": ["prediction_market_trade", "prediction_market"],
+                    "conditions": {"min_anomaly": 0.20},
+                    "correlations": [{"event_types": ["equity_block", "options_flow", "headline", "crypto_trade"], "hours": 48, "min_anomaly": 0.20}],
+                    "alert_tier": "ALERT",
                     "expires_at": int(time.time()) + 315360000
                 }
             ]
@@ -107,11 +145,20 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
     clusters = []
     try:
         now = int(time.time())
+        event_type_str = event.type.value if hasattr(event.type, "value") else str(event.type)
         for rule in list(_dynamic_rules_cache.values()):
             try:
                 if rule.get("expires_at", 0) < now:
                     continue
-                if event.type.value != rule.get("trigger_event_type"):
+                    
+                trig_spec = rule.get("trigger_event_type")
+                if isinstance(trig_spec, list):
+                    if event_type_str not in trig_spec:
+                        continue
+                elif isinstance(trig_spec, str):
+                    if event_type_str != trig_spec:
+                        continue
+                else:
                     continue
                     
                 cond = rule.get("conditions", {})
@@ -156,8 +203,20 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
                         rule_name=rule.get("rule_name", "Dynamic AI Rule"),
                         alert_tier=alert_tier,
+                        primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "general",
+                        confidence_score=min(1.0, event.anomaly_score + 0.1),
+                        summary_headline=f"🚨 {rule.get('rule_name', rule.get('rule_id'))}: {entity_name}",
+                        supporting_headlines=supporting_headlines,
+                        metrics_summary={
+                            "supporting_event_count": len(supporting_events),
+                            "domain_count": len(domains_triggered),
+                            "domains": sorted(list(domains_triggered)),
+                            "trigger_anomaly_score": event.anomaly_score,
+                        },
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
+                        primary_entity_id=entity_id,
+                        primary_entity_name=entity_name,
                         entity_ids=[entity_id] + [e.get("entity_id", "") for e in supporting_events[:5] if e.get("entity_id")],
                         entity_names=list(dict.fromkeys([entity_name] + supporting_entity_names)),
                         description=(
@@ -209,54 +268,58 @@ async def main():
     soft_correlator = SoftCorrelator(ollama_client)
     asyncio.create_task(soft_correlator._load())
 
-    _start_time = time.monotonic()
-
-    async def _heartbeat():
-        nonlocal processed, corr_fired, errors
-        while True:
-            await asyncio.sleep(60)
-            elapsed = time.monotonic() - _start_time
-            rate = processed / elapsed if elapsed > 0 else 0
-            logger.info(
-                f"⏱ HEARTBEAT | processed={processed} "
-                f"correlations={corr_fired} errors={errors} "
-                f"rate={rate:.1f}/s uptime={int(elapsed)}s"
-            )
-
-    heartbeat_task = asyncio.create_task(_heartbeat())
-
-    total_received = 0
-    last_logged_received = 0
-
     cascade_engine = GeopoliticalCascadeEngine(window_seconds=3600)
+
+    async def _stream_live_correlation(c: CorrelationCluster):
+        try:
+            headline = c.summary_headline or f"🚨 CORRELATION ALERT: {c.rule_name} (Tier: {c.alert_tier.value if hasattr(c.alert_tier, 'value') else c.alert_tier})"
+            pe_id = c.primary_entity_id or (c.entity_ids[0] if c.entity_ids else "CORRELATION")
+            pe_name = c.primary_entity_name or (c.entity_names[0] if c.entity_names else (c.rule_name or c.rule_id))
+            primary_entities_list = []
+            if c.entity_ids or c.entity_names:
+                max_len = max(len(c.entity_ids), len(c.entity_names))
+                for i in range(max_len):
+                    eid = c.entity_ids[i] if i < len(c.entity_ids) else (c.entity_names[i] if i < len(c.entity_names) else pe_id)
+                    ename = c.entity_names[i] if i < len(c.entity_names) else eid
+                    primary_entities_list.append({"id": str(eid), "name": str(ename)})
+
+            payload = {
+                "event_id": str(c.correlation_id),
+                "type": "correlation_alert",
+                "occurred_at": c.detected_at.isoformat() if hasattr(c.detected_at, 'isoformat') else str(c.detected_at),
+                "source": "Correlation Engine",
+                "primary_entity_id": pe_id,
+                "primary_entity_name": pe_name,
+                "primary_entity": {"id": pe_id, "name": pe_name},
+                "primary_entities": primary_entities_list or [{"id": pe_id, "name": pe_name}],
+                "entity_id": pe_id,
+                "entity_name": pe_name,
+                "entity_ids": c.entity_ids or [pe_id],
+                "entity_names": c.entity_names or [pe_name],
+                "headline": headline,
+                "summary": c.description,
+                "supporting_headlines": c.supporting_headlines,
+                "primary_domain": c.primary_domain or "cross_domain",
+                "confidence_score": c.confidence_score,
+                "anomaly_score": 0.95,
+                "region": "GLOBAL",
+                "tags": c.tags or [],
+                "metrics": c.metrics_summary,
+            }
+            await redis_client.raw.publish("sentinel:events:live", json.dumps(payload))
+        except Exception as pub_err:
+            logger.debug(f"Failed to stream correlation live: {pub_err}")
 
     async def _process_correlation_event(event: NormalizedEvent):
         nonlocal corr_fired, processed
         try:
-            # Helper to stream correlation clusters to frontend WebSocket feed
-            async def _stream_live_correlation(c: CorrelationCluster):
-                try:
-                    payload = {
-                        "event_id": str(c.correlation_id),
-                        "type": "correlation_alert",
-                        "occurred_at": c.detected_at.isoformat() if hasattr(c.detected_at, 'isoformat') else str(c.detected_at),
-                        "source": "Correlation Engine",
-                        "primary_entity_id": c.entity_ids[0] if c.entity_ids else "CORRELATION",
-                        "primary_entity_name": c.rule_name or c.rule_id,
-                        "entity_name": c.rule_name or c.rule_id,
-                        "headline": f"🚨 CORRELATION ALERT: {c.rule_name} (Tier: {c.alert_tier.value if hasattr(c.alert_tier, 'value') else c.alert_tier})",
-                        "summary": c.description,
-                        "anomaly_score": 0.95,
-                        "region": "GLOBAL",
-                        "tags": c.tags or [],
-                    }
-                    await redis_client.raw.publish("sentinel:events:live", json.dumps(payload))
-                except Exception as pub_err:
-                    logger.debug(f"Failed to stream correlation live: {pub_err}")
-
             # 1. Evaluate Geopolitical Cascade Engine
             cascade_cluster = cascade_engine.ingest_event(event)
             if cascade_cluster:
+                if not cascade_cluster.primary_domain:
+                    cascade_cluster.primary_domain = "geopolitical"
+                if not cascade_cluster.summary_headline:
+                    cascade_cluster.summary_headline = f"🌐 Cascade Alert: {cascade_cluster.rule_name}"
                 await store.save_correlation(cascade_cluster)
                 await producer.send(
                     Topics.CORRELATIONS,
@@ -292,6 +355,7 @@ async def main():
                     logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
                     
                     supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
+                    supp_headlines = [e.get("headline") or e.get("summary") or f"{e.get('type')}: {e.get('entity_name', 'Unknown')}" for e in similar_events[:3]]
                     
                     e_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
                     e_name = (event.primary_entity.name or e_id) if event.primary_entity else "UNKNOWN"
@@ -317,8 +381,19 @@ async def main():
                         rule_id="SEMANTIC_001",
                         rule_name="Cross-Domain Semantic Convergence",
                         alert_tier=tier,
+                        primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "semantic",
+                        confidence_score=min(1.0, 0.70 + (0.1 * len(supporting_ids))),
+                        summary_headline=f"🧠 Semantic Convergence: {e_name} across {len(similar_events)} cross-domain events",
+                        supporting_headlines=supp_headlines,
+                        metrics_summary={
+                            "similar_event_count": len(similar_events),
+                            "centrality_multiplier": round(centrality_mult, 2),
+                            "effective_score": round(effective_score, 2),
+                        },
                         trigger_event_id=event.event_id,
                         supporting_event_ids=supporting_ids,
+                        primary_entity_id=e_id,
+                        primary_entity_name=e_name,
                         entity_ids=[e_id],
                         entity_names=[e_name],
                         description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events for entity '{e_name}' (Centrality Multiplier: {centrality_mult:.2f}x). Anomalous semantic convergence detected.",
@@ -333,7 +408,7 @@ async def main():
                     )
                     await _stream_live_correlation(cluster)
                     corr_fired += 1
-                    
+
         except Exception as e:
             import traceback
             logger.error(f"Failed to process correlation for event {event.event_id}: {e}\n{traceback.format_exc()}")

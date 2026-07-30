@@ -67,6 +67,7 @@ class PeerDiscovery(BaseModel):
 class TradingSignal(BaseModel):
     ticker: str
     action: str  # "BUY", "SELL", "HOLD"
+    trade_type: str = Field(default="Long/Buy", description="Type of trade recommendation e.g. 'Long/Buy', 'Short/Sell', 'Scalp/Buy', 'Swing/Long'")
     entry_level: float
     target_price: float
     stop_loss: float
@@ -163,14 +164,50 @@ class QuantTradingEngine(SentinelAgent):
 
         trig = message.get("trigger") or {}
         pe = message.get("primary_entity") or {}
+        raw_sec = message.get("security_data") or raw.get("security_data") or {}
+
+        # Extract entity ID array if CorrelationCluster
+        ent_ids = message.get("entity_ids") or raw.get("entity_ids") or []
+        first_ent_id = ent_ids[0] if isinstance(ent_ids, list) and ent_ids else None
+
         ticker = str(
             raw.get("ticker") or
             trig.get("ticker") or
             pe.get("id") or
+            first_ent_id or
             ""
-        ).upper()
+        ).upper().strip()
 
         if not ticker or ticker == "UNKNOWN":
+            return None
+
+        # ── CVE TO EQUITY MAPPER ───────────────────────────────────────────────
+        if ticker.startswith("CVE-"):
+            vendor_name = (
+                raw.get("vendor") or
+                raw.get("vendor_name") or
+                raw.get("vendorProject") or
+                raw.get("affected_org") or
+                trig.get("vendor") or
+                trig.get("vendor_name") or
+                raw_sec.get("affected_org") or
+                (pe.get("name") if pe and pe.get("id") != ticker else None) or
+                None
+            )
+            description = (
+                raw.get("description") or
+                raw.get("headline") or
+                raw.get("summary") or
+                message.get("headline") or
+                ""
+            )
+            from shared.utils.cyber_mapper import map_cve_to_equity
+            mapped_ticker, _ = map_cve_to_equity(ticker, vendor_name=vendor_name, description=description)
+            if mapped_ticker:
+                ticker = mapped_ticker
+
+        # ── PRIMARY EQUITY VALIDATOR GATE ──────────────────────────────────────
+        if not await is_valid_primary_equity_async(ticker, redis_client=self.redis):
             return None
 
         anomaly_score = float(raw.get("anomaly_score") or trig.get("anomaly_score") or message.get("anomaly_score", 0.5))
@@ -267,16 +304,19 @@ class QuantTradingEngine(SentinelAgent):
         await self.mark_processed(dedup_key, window_seconds=1800)
 
         # Concurrent context hydration
-        news_context, graph_context, global_context = await asyncio.gather(
+        news_context, graph_context, global_context, cross_context = await asyncio.gather(
             self._fetch_news_context(ticker),
             self._fetch_graph_context(ticker),
             self.fetch_global_context(),
+            self.get_cross_agent_context(ticker=ticker, limit=3),
         )
+        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
 
         user_prompt = f"""
         Research anomalous instrument movement:
         - Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
         - Global Context: {global_context}
+        {cross_block}
         - News Context: {json.dumps(news_context[:5], default=str)}
         - Graph Context: {json.dumps(graph_context[:5], default=str)}
 
@@ -330,20 +370,45 @@ class QuantTradingEngine(SentinelAgent):
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            # Register discovered high-confidence peers in ontology/graph pipelines
-            for peer in discovery.peer_tickers:
-                if peer.discovery_confidence >= 0.65:
-                    await self._producer.send(
-                        Topics.ONTOLOGY_PROPOSALS,
-                        {
-                            "source_entity": ticker,
-                            "target_entity": peer.ticker,
-                            "relationship": "CORRELATED_PEER",
-                            "confidence": peer.discovery_confidence,
-                            "rationale": peer.rationale,
-                        },
-                        key=peer.ticker,
-                    )
+            # Register discovered high-confidence peers in ontology/graph pipelines and emit CorrelationCluster
+            high_conf_peers = [p for p in discovery.peer_tickers if p.discovery_confidence >= 0.65]
+            for peer in high_conf_peers:
+                await self._producer.send(
+                    Topics.ONTOLOGY_PROPOSALS,
+                    {
+                        "source_entity": ticker,
+                        "target_entity": peer.ticker,
+                        "relationship": "CORRELATED_PEER",
+                        "confidence": peer.discovery_confidence,
+                        "rationale": peer.rationale,
+                    },
+                    key=peer.ticker,
+                )
+
+            if high_conf_peers:
+                peer_ids = [p.ticker for p in high_conf_peers]
+                corr_cluster = CorrelationCluster(
+                    rule_id="QUANT_PEER_DECOUPLING",
+                    rule_name="Quantitative Equity Peer Cointegration & Decoupling",
+                    alert_tier=AlertTier.INTELLIGENCE,
+                    primary_domain="financial",
+                    confidence_score=float(high_conf_peers[0].discovery_confidence),
+                    summary_headline=f"📈 Peer Decoupling Detected: {ticker} vs {', '.join(peer_ids[:3])}",
+                    supporting_headlines=[f"{p.ticker}: {p.rationale}" for p in high_conf_peers[:3]],
+                    metrics_summary={
+                        "catalyst_category": discovery.catalyst_category,
+                        "sharpe_ratio": sr,
+                        "max_drawdown": mdd,
+                        "peer_count": len(peer_ids),
+                    },
+                    trigger_event_id=f"quant_{ticker}_{int(time.time())}",
+                    supporting_event_ids=[],
+                    entity_ids=[ticker] + peer_ids,
+                    entity_names=[ticker] + peer_ids,
+                    description=f"QuantTradingEngine discovered cointegrated peer correlation for {ticker} with {', '.join(peer_ids)}. Catalyst: {discovery.catalyst_category}",
+                    tags=["quant_peer_discovery", f"ticker:{ticker}"] + [f"peer:{p}" for p in peer_ids],
+                )
+                await self._producer.send(Topics.CORRELATIONS, corr_cluster.model_dump(), key=ticker)
 
             # Publish structured AgentBulletin
             peer_names = [p.ticker for p in discovery.peer_tickers[:4]]
@@ -414,16 +479,20 @@ class QuantTradingEngine(SentinelAgent):
             }
         }
 
+        cross_context = await self.get_cross_agent_context(ticker=ticker, limit=3)
+        cross_block = f"\n        CROSS-AGENT INTELLIGENCE:\n        {cross_context}\n" if cross_context else ""
+
         user_prompt = f"""
         Formulate investment advisory signal for {ticker}:
         INDICATORS & RISK METRICS:
         {json.dumps(indicators_data, separators=(',', ':'), default=str)}
         MACRO REGIME: {rates_regime}
-
+        {cross_block}
         HARD RISK CONSTRAINTS (MANDATORY):
         - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
         - Computed Half-Kelly Allocation Limit: {kelly_pct * 100:.1f}%
         - Constraint: You MUST set kelly_allocation_pct <= {kelly_pct * 100:.1f}% for all trading signals. Do not exceed this allocation.
+        - Strategy Mandate: Specify action ("BUY", "SELL", "HOLD") and trade_type ("Long/Buy", "Short/Sell", "Scalp/Buy", "Swing/Long", etc.) with explicit entry_level, target_price, and stop_loss targets.
         """
 
         try:

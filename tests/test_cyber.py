@@ -121,3 +121,36 @@ def test_collector_concurrency_and_awaiting():
         assert kwargs.get("key") == "1.1.1.1"
 
     asyncio.run(run_test())
+
+
+def test_cyber_enricher_kev_vulnerability_entity_type():
+    """Verify that CyberEnricher correctly sets primary_entity.type to EntityType.VULNERABILITY for KEV entries."""
+    async def run_test():
+        from shared.models import EntityType, EventType
+        redis_mock = MagicMock()
+        redis_mock.raw.get = AsyncMock(return_value=b'{}')
+        graph_mock = MagicMock()
+        graph_mock.producer = AsyncMock()
+
+        enricher = CyberEnricher(scorer=None, redis_client=redis_mock, graph_writer=graph_mock)
+
+        raw_event = RawEvent(
+            source="cisa_kev",
+            raw_payload={
+                "cve_id": "CVE-2026-16812",
+                "vendor": "microsoft",
+                "product": "Windows Server",
+                "vulnerabilityName": "Remote Code Execution",
+                "ransomware_use": "known"
+            }
+        )
+
+        normalized = await enricher.enrich(raw_event)
+
+        assert normalized is not None
+        assert normalized.primary_entity.id == "CVE-2026-16812"
+        assert normalized.primary_entity.type == EntityType.VULNERABILITY
+        assert normalized.type == EventType.VULNERABILITY
+
+    asyncio.run(run_test())
+

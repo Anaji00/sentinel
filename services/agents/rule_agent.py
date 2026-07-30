@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent
+from shared.kafka import Topics
 
 logger = logging.getLogger("agent.rule_synthesizer")
 

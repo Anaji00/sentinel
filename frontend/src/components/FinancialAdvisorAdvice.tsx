@@ -17,6 +17,7 @@ interface TechnicalIndicators {
 interface TradingSignal {
   ticker: string;
   action: 'BUY' | 'SELL' | 'HOLD';
+  trade_type?: string;
   entry_level: number;
   target_price: number;
   stop_loss: number;
@@ -98,7 +99,7 @@ export default function FinancialAdvisorAdvice() {
                   <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                     p.action === 'BUY' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
                   }`}>
-                    {p.action}
+                    {p.trade_type || p.action}
                   </span>
                   {p.sigma_shock !== undefined && (
                     <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#00f2fe]/20 text-[#00f2fe] border border-[#00f2fe]/40">

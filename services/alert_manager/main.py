@@ -212,7 +212,7 @@ async def main():
     logger.info("=" * 60)
  
     consumer = SentinelConsumer(
-        topics=[Topics.CORRELATIONS, "scenarios.generated", Topics.INTEL_BRIEFS],
+        topics=[Topics.CORRELATIONS, Topics.SCENARIOS_GENERATED, Topics.INTEL_BRIEFS],
         group_id="alert-manager",
     )
     await consumer.start()
@@ -232,7 +232,7 @@ async def main():
                     for msg in messages:
                         try:
                             payload = json.loads(msg.value.decode('utf-8'))
-                            if tp.topic == "scenarios.generated":
+                            if tp.topic == Topics.SCENARIOS_GENERATED:
                                 scenario = Scenario(**payload)
                                 await manager.handle_scenario(scenario)
                             elif tp.topic == Topics.INTEL_BRIEFS:

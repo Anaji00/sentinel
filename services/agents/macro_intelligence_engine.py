@@ -34,6 +34,26 @@ logger = logging.getLogger("agent.macro_intelligence")
 
 GRAPH_CACHE_TTL = 3600
 
+TICKER_METADATA_REGISTRY: Dict[str, str] = {
+    "ZC=F": "Corn Futures (CBOT)",
+    "CL=F": "Crude Oil Futures (NYMEX)",
+    "GC=F": "Gold Futures (COMEX)",
+    "SI=F": "Silver Futures (COMEX)",
+    "NG=F": "Natural Gas Futures (NYMEX)",
+    "HG=F": "Copper Futures (COMEX)",
+    "TNX": "10-Year Treasury Yield",
+    "TIP": "iShares TIPS Bond ETF",
+    "SPY": "SPDR S&P 500 ETF Trust",
+    "QQQ": "Invesco QQQ Trust",
+    "IWM": "iShares Russell 2000 ETF",
+    "TLT": "iShares 20+ Year Treasury Bond ETF",
+    "HYG": "iShares iBoxx $ High Yield Corporate Bond ETF",
+    "LQD": "iShares iBoxx $ Investment Grade Corporate Bond ETF",
+    "DX-Y.NYB": "US Dollar Index",
+    "^VIX": "CBOE Volatility Index",
+    "VIX": "CBOE Volatility Index",
+}
+
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 
@@ -168,6 +188,9 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         logger.info(f"📊 Macro Rates Evaluation | 2Y: {y2:.2f}% | 10Y: {y10:.2f}% | Spread: {spread_2y10y_bps:+.1f} bps")
 
+        cross_context = await self.get_cross_agent_context(ticker="US10Y", limit=2)
+        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
+
         user_prompt = f"""
         Analyze Treasury yield curve and inflation metrics:
         - 2Y Yield: {y2:.3f}% | 10Y Yield: {y10:.3f}%
@@ -175,6 +198,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         - 10Y TIPS Real Yield: {tips_yield:.3f}%
         - Breakeven Inflation: {breakeven_inflation_bps:.1f} bps
         - HYG/LQD Credit Ratio: {credit_ratio:.4f}
+        {cross_block}
         """
 
         try:
@@ -254,7 +278,11 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         logger.info(f"⚡ Options Vol Surface | {ticker} | P/C Ratio: {pc_ratio:.2f} | IV Skew: {iv_skew_bps:+.1f} bps")
 
-        global_context = await self.fetch_global_context()
+        global_context, cross_context = await asyncio.gather(
+            self.fetch_global_context(),
+            self.get_cross_agent_context(ticker=ticker, limit=2),
+        )
+        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
 
         user_prompt = f"""
         Evaluate options surface metrics:
@@ -265,6 +293,7 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         GLOBAL CONTEXT:
         {global_context}
+        {cross_block}
         """
 
         try:
@@ -346,18 +375,8 @@ class MacroIntelligenceEngine(SentinelAgent):
             rows = await neo4j_client.query(query, {"macro_asset": macro_asset})
             exposed = [r["exposed_ticker"] for r in rows if r.get("exposed_ticker")]
 
-            if not exposed:
-                cursor = 0
-                discovered = []
-                while True:
-                    cursor, keys = await self.redis.raw.scan(cursor=cursor, match="sentinel:quotes:latest:*", count=100)
-                    for k in keys:
-                        tk_name = (k.decode() if isinstance(k, bytes) else k).replace("sentinel:quotes:latest:", "")
-                        if tk_name and tk_name != macro_asset:
-                            discovered.append(tk_name)
-                    if cursor == 0 or len(discovered) >= 15:
-                        break
-                exposed = discovered[:15]
+            # Fail closed: return empty list if graph has no exposure edge, rather than
+            # pairing macro assets with random unconstrained quotes scanned from Redis.
 
             await self.redis.raw.set(cache_key, json.dumps(exposed), ex=GRAPH_CACHE_TTL)
             return exposed
@@ -392,7 +411,12 @@ class MacroIntelligenceEngine(SentinelAgent):
 
             curr_res = y_vec[-1] - (beta * x_vec[-1] + alpha)
             spread_std = eg_result.get("spread_std", 1.0)
-            z_score = curr_res / max(1e-5, spread_std)
+
+            # Degenerate spread guard: skip signal emission if spread std dev is below threshold (1e-4)
+            if spread_std < 1e-4:
+                return
+
+            z_score = float(np.clip(curr_res / spread_std, -5.0, 5.0))
 
             if abs(z_score) >= 2.5:
                 payload = {
@@ -403,6 +427,11 @@ class MacroIntelligenceEngine(SentinelAgent):
                     "half_life_periods": half_life,
                     "detected_at": datetime.now(timezone.utc).isoformat(),
                 }
+                if macro_asset in TICKER_METADATA_REGISTRY:
+                    payload["macro_asset_name"] = TICKER_METADATA_REGISTRY[macro_asset]
+                if micro_ticker in TICKER_METADATA_REGISTRY:
+                    payload["micro_ticker_name"] = TICKER_METADATA_REGISTRY[micro_ticker]
+
                 await self.redis.raw.set("sentinel:macro:decoupling:latest", json.dumps(payload), ex=3600)
                 await self._producer.send(Topics.MACRO_DECOUPLING, payload, key=macro_asset)
 

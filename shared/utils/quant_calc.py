@@ -500,7 +500,7 @@ def engle_granger_cointegration(
         "adf_statistic": adf_result["adf_statistic"],
         "beta": round(float(beta), 4),
         "spread_mean": round(spread_mean, 4),
-        "spread_std": round(spread_std, 4),
+        "spread_std": float(spread_std),
         "half_life": round(half_life, 2),
     }
 

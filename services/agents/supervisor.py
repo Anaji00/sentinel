@@ -24,13 +24,16 @@ class GraphSupervisor(SentinelAgent):
 
     @property
     def output_topic(self) -> str:
-        return "sentinel.ontology.supervisor.noop"
+        return Topics.ONTOLOGY_UPDATES
 
-    async def handle(self, message: dict) -> None:
+    async def handle(self, message: Any) -> Optional[Dict[str, Any]]:
         if isinstance(message, list):
-            await self.execute_batch_proposals(message)
-        else:
-            await self.execute_proposal(message)
+            res = await self.execute_batch_proposals(message)
+            return {"agent": self.name, "action": "batch_commit", "proposals_processed": len(message)}
+        elif isinstance(message, dict):
+            res = await self.execute_proposal(message)
+            return {"agent": self.name, "action": "single_commit", "entity_id": message.get("entity_id")}
+        return None
 
     async def acquire_lock(self, entity_id: str, timeout: int = 10) -> bool:
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
@@ -207,14 +210,14 @@ async def start_supervisor():
     producer = SentinelProducer()
     dlq = SentinelProducer()
     consumer = SentinelConsumer(
-        topics=["sentinel.ontology.proposals"],
+        topics=[Topics.ONTOLOGY_PROPOSALS],
         group_id="supervisor-group",
         auto_offset_reset="latest",
     )
 
     supervisor = GraphSupervisor(
         agent_name="supervisor",
-        input_topics=["sentinel.ontology.proposals"],
+        input_topics=[Topics.ONTOLOGY_PROPOSALS],
         redis_client=redis_client,
         db_client=db_client,
         neo4j_client=neo4j_client,

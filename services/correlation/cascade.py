@@ -143,6 +143,8 @@ class GeopoliticalCascadeEngine:
                 alert_tier=AlertTier.CRITICAL if flashpoint_index >= 75.0 else AlertTier.ELEVATED,
                 trigger_event_id=supporting_ids[0],
                 supporting_event_ids=supporting_ids[1:],
+                primary_entity_id=ctx["entity_id"],
+                primary_entity_name=ctx["entity_name"],
                 entity_ids=[e[1]["entity_id"] for e in current_entries[:10]],
                 entity_names=unique_entities,
                 description=(

@@ -249,7 +249,7 @@ class CyberEnricher:
         if is_ransomware: tags.append("ransomware_linked")
         
         entity = Entity(
-            id=cve_id or vendor, type=EntityType.COMPANY,
+            id=cve_id or vendor, type=EntityType.VULNERABILITY,
             name=(f"{cve_id} ({vendor.title()})" if (cve_id and vendor) else (cve_id or vendor.title() or "Vulnerability")),
             country_code="US" if vendor else None,
             flags=check_sanctions(vendor, "")

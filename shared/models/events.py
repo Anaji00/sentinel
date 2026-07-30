@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import json
 
 def _utcnow() -> datetime:
@@ -54,6 +54,7 @@ class EntityType(str, Enum):
     INSTRUMENT = "instrument"
     INFRASTRUCTURE = "infrastructure"
     MEDIA_SOURCE = "media_source"
+    VULNERABILITY = "vulnerability"
     UNKNOWN = "unknown"
 
 class AlertTier(str, Enum):
@@ -339,26 +340,97 @@ class NormalizedEvent(BaseModel):
         if self.anomaly_score > 0.5: parts.append(f"ANOMALY:{self.anomaly_score:.2f}")
         return " | ".join(parts)
 
+    def to_readable_summary(self) -> str:
+        """Formatted human-readable event summary for agent prompts, logs, and UI display."""
+        parts = [f"[{self.type.value.upper()}]", f"Source: {self.source}"]
+        ent_name = self.primary_entity.name or self.primary_entity.id if self.primary_entity else None
+        if ent_name:
+            parts.append(f"Entity: {ent_name}")
+        if self.region:
+            parts.append(f"Region: {self.region}")
+        if self.headline:
+            parts.append(f"Headline: '{self.headline}'")
+        elif self.summary:
+            parts.append(f"Summary: '{self.summary[:100]}'")
+
+        # Domain specifics
+        if self.financial_data and self.financial_data.ticker:
+            parts.append(f"Ticker: {self.financial_data.ticker}")
+            if self.financial_data.premium_usd:
+                parts.append(f"Premium: ${self.financial_data.premium_usd:,.2f}")
+        if self.vessel_data and self.vessel_data.mmsi:
+            parts.append(f"MMSI: {self.vessel_data.mmsi}")
+            if self.vessel_data.speed_knots is not None:
+                parts.append(f"Speed: {self.vessel_data.speed_knots}kts")
+        if self.flight_data and self.flight_data.icao24:
+            parts.append(f"ICAO24: {self.flight_data.icao24}")
+            if self.flight_data.callsign:
+                parts.append(f"Callsign: {self.flight_data.callsign}")
+        if self.security_data and self.security_data.cve_id:
+            parts.append(f"CVE: {self.security_data.cve_id}")
+
+        parts.append(f"AnomalyScore: {self.anomaly_score:.2f}")
+        return " | ".join(parts)
+
 class CorrelationCluster(BaseModel):
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     rule_id: str
     rule_name: str
     alert_tier: AlertTier
+    primary_domain: Optional[str] = None
+    confidence_score: float = 0.85
+    summary_headline: Optional[str] = None
+    supporting_headlines: List[str] = Field(default_factory=list)
+    metrics_summary: Dict[str, Any] = Field(default_factory=dict)
     detected_at: datetime = Field(default_factory=_utcnow)
     trigger_event_id: str
     supporting_event_ids: List[str] = Field(default_factory=list)
+    primary_entity_id: Optional[str] = None
+    primary_entity_name: Optional[str] = None
     entity_ids: List[str] = Field(default_factory=list)
     entity_names: List[str] = Field(default_factory=list)
     description: str
     tags: List[str] = Field(default_factory=list)
     scenario: Optional[Dict[str, Any]] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _ensure_primary_entity_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            e_ids = data.get("entity_ids") or []
+            e_names = data.get("entity_names") or []
+            if not data.get("primary_entity_id") and e_ids:
+                data["primary_entity_id"] = str(e_ids[0])
+            if not data.get("primary_entity_name") and e_names:
+                data["primary_entity_name"] = str(e_names[0])
+            elif not data.get("primary_entity_name") and data.get("primary_entity_id"):
+                data["primary_entity_name"] = str(data["primary_entity_id"])
+        return data
+
+    def to_readable_summary(self) -> str:
+        """Clean markdown-formatted cluster summary for LLM prompt injection and logs."""
+        headline = self.summary_headline or self.rule_name or self.rule_id
+        tier_str = self.alert_tier.value if hasattr(self.alert_tier, 'value') else str(self.alert_tier)
+        domain_str = f" [{self.primary_domain.upper()}]" if self.primary_domain else ""
+        primary_str = f" | Primary Entity: {self.primary_entity_name or self.primary_entity_id}" if (self.primary_entity_name or self.primary_entity_id) else ""
+        entities_str = f" | Entities: {', '.join(self.entity_names or self.entity_ids)}" if (self.entity_names or self.entity_ids) else ""
+        confidence_str = f" | Confidence: {self.confidence_score * 100:.0f}%" if self.confidence_score else ""
+        
+        summary = f"🚨 CORRELATION [{tier_str}]{domain_str}: {headline}{confidence_str}{primary_str}{entities_str}\n  Details: {self.description}"
+        if self.supporting_headlines:
+            summary += "\n  Supporting Evidence:\n" + "\n".join(f"    - {h}" for h in self.supporting_headlines[:5])
+        return summary
+
 # FIXED: Removed the shadowed class definition block. Combined the DB model with Hypotheses array.
 class Scenario(BaseModel):
     scenario_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     correlation_id: str
+    primary_entity_id: Optional[str] = None
+    primary_entity_name: Optional[str] = None
+    entity_ids: List[str] = Field(default_factory=list)
+    entity_names: List[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     status: ScenarioStatus = ScenarioStatus.HYPOTHESIS
@@ -370,3 +442,17 @@ class Scenario(BaseModel):
     confidence_rationale: str
     confidence_history: List[Dict] = Field(default_factory=list)
     supporting_event_ids: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ensure_scenario_primary_entity(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            e_ids = data.get("entity_ids") or []
+            e_names = data.get("entity_names") or []
+            if not data.get("primary_entity_id") and e_ids:
+                data["primary_entity_id"] = str(e_ids[0])
+            if not data.get("primary_entity_name") and e_names:
+                data["primary_entity_name"] = str(e_names[0])
+            elif not data.get("primary_entity_name") and data.get("primary_entity_id"):
+                data["primary_entity_name"] = str(data["primary_entity_id"])
+        return data

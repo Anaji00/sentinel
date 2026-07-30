@@ -26,8 +26,10 @@ Phase 2 additions:
 import json
 import logging
 import time
-from typing import Optional, Dict
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
+from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions, mmsi_to_country
 
 logger = logging.getLogger("enrichment.resolver")
@@ -64,14 +66,107 @@ class EntityResolver:
     Output: Dict (Name, Type, Owner, Flags)
     """
 
-    def __init__(self, redis_client, neo4j_client):
+    def __init__(self, redis_client, neo4j_client, producer: Optional[Any] = None):
         self.redis = redis_client
         self.neo4j = neo4j_client
+        self.producer = producer
         self._mem_cache = AsyncTTLCache(maxsize=5000, ttl=300)
+
+    async def _publish_unknown_entity(
+        self,
+        raw_entity_name: str,
+        context_event_id: Optional[str] = None,
+        timestamp: Optional[str] = None
+    ):
+        """Publishes an unknown entity classification request to Topics.UNKNOWN_ENTITIES."""
+        if self.producer:
+            ts = timestamp or datetime.now(timezone.utc).isoformat()
+            payload = {
+                "raw_entity_name": raw_entity_name,
+                "context_event_id": context_event_id,
+                "timestamp": ts,
+            }
+            try:
+                await self.producer.send(Topics.UNKNOWN_ENTITIES, payload, key=raw_entity_name)
+            except Exception as e:
+                logger.error(f"Failed to publish unknown entity to Kafka ({raw_entity_name}): {e}")
+
+    async def resolve(
+        self,
+        raw_entity_name: str,
+        context_event_id: Optional[str] = None,
+        timestamp: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Generic entity resolution waterfall.
+        If resolution fails via Redis/Neo4j/OFAC, publishes to Topics.UNKNOWN_ENTITIES and returns None.
+        """
+        if not raw_entity_name:
+            return None
+
+        # Level 0: RAM cache
+        mem_cached = self._mem_cache.get(f"entity:{raw_entity_name}")
+        if mem_cached:
+            return mem_cached
+
+        # Level 1: Redis
+        if self.redis and hasattr(self.redis, "raw"):
+            try:
+                cached = await self.redis.raw.get(f"entity:info:{raw_entity_name}")
+                if cached:
+                    data = json.loads(cached)
+                    self._mem_cache.set(f"entity:{raw_entity_name}", data)
+                    return data
+            except Exception as e:
+                logger.debug(f"Redis entity lookup failed ({raw_entity_name}): {e}")
+
+        # Level 2: Neo4j
+        if self.neo4j:
+            try:
+                cypher = (
+                    "MATCH (e:Entity) WHERE e.id = $id OR e.name = $id "
+                    "RETURN e.name as name, e.type as type, e.flags as flags"
+                )
+                records = await self.neo4j.execute_and_fetch(cypher, {"id": raw_entity_name})
+                if records:
+                    data = dict(records[0])
+                    if self.redis and hasattr(self.redis, "raw"):
+                        await self.redis.raw.set(
+                            f"entity:info:{raw_entity_name}", json.dumps(data), ex=86400
+                        )
+                    self._mem_cache.set(f"entity:{raw_entity_name}", data)
+                    return data
+            except Exception as e:
+                logger.debug(f"Neo4j entity lookup failed ({raw_entity_name}): {e}")
+
+        # Level 3: OFAC / Sanctions check
+        flags = check_sanctions(raw_entity_name, "")
+        if flags:
+            data = {
+                "name": raw_entity_name,
+                "type": "Unknown",
+                "flags": flags,
+            }
+            if self.redis and hasattr(self.redis, "raw"):
+                await self.redis.raw.set(
+                    f"entity:info:{raw_entity_name}", json.dumps(data), ex=3600
+                )
+            self._mem_cache.set(f"entity:{raw_entity_name}", data)
+            return data
+
+        # Fallback: resolution failed
+        await self._publish_unknown_entity(raw_entity_name, context_event_id, timestamp)
+        return None
 
     # ── Vessel ────────────────────────────────────────────────────────────────
 
-    async def resolve_vessel(self, mmsi: str, ais_meta: dict = None) -> Dict:
+    async def resolve_vessel(
+        self,
+        mmsi: str,
+        ais_meta: dict = None,
+        context_event_id: Optional[str] = None,
+        timestamp: Optional[str] = None
+    ) -> Optional[Dict]:
         """
         Finds out who a vessel is based on its MMSI number.
         """
@@ -80,27 +175,42 @@ class EntityResolver:
         if mem_cached:
             return mem_cached
         # ── LEVEL 1: REDIS (Hot Cache) ────────────────────────────────────────
-        cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
-        if cached:
-            data = json.loads(cached)
-            self._mem_cache.set(f"vessel:{mmsi}", data)
-            return data
+        if self.redis and hasattr(self.redis, "raw"):
+            try:
+                cached = await self.redis.raw.get(f"vessel:info:{mmsi}")
+                if cached:
+                    data = json.loads(cached)
+                    self._mem_cache.set(f"vessel:{mmsi}", data)
+                    return data
+            except Exception as e:
+                logger.debug(f"Redis vessel lookup failed ({mmsi}): {e}")
 
         # ── LEVEL 2: NEO4J (The Graph) ────────────────────────────────────────
-        try:
-            cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state, v.watchlist_tags as watchlist_tags"
-            records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi})
-            if records:
-                data = dict(records[0])
-                await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
-                self._mem_cache.set(f"vessel:{mmsi}", data)
-                return data
-        except Exception as e:
-            logger.debug(f"Neo4j vessel lookup failed ({mmsi}): {e}")
+        if self.neo4j:
+            try:
+                cypher = "MATCH (v:Vessel {mmsi: $mmsi}) RETURN v.name as name, v.vessel_type as vessel_type, v.flags as flags, v.flag_state as flag_state, v.watchlist_tags as watchlist_tags"
+                records = await self.neo4j.execute_and_fetch(cypher, {"mmsi": mmsi})
+                if records:
+                    data = dict(records[0])
+                    if self.redis and hasattr(self.redis, "raw"):
+                        await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=86400)
+                    self._mem_cache.set(f"vessel:{mmsi}", data)
+                    return data
+            except Exception as e:
+                logger.debug(f"Neo4j vessel lookup failed ({mmsi}): {e}")
 
         # ── LEVEL 3: INFERENCE (Fallback) ─────────────────────────────────────
         meta  = ais_meta or {}
         name  = str(meta.get("ShipName", "")).strip()
+
+        if not name or name.lower() in ("unknown", "none", "null"):
+            await self._publish_unknown_entity(
+                raw_entity_name=mmsi,
+                context_event_id=context_event_id,
+                timestamp=timestamp
+            )
+            return None
+
         data  = {
             "name":        name,
             "vessel_type": "Unknown",
@@ -108,7 +218,8 @@ class EntityResolver:
             "flags":       check_sanctions(name, mmsi),
         }
         
-        await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=3600)
+        if self.redis and hasattr(self.redis, "raw"):
+            await self.redis.raw.set(f"vessel:info:{mmsi}", json.dumps(data), ex=3600)
         self._mem_cache.set(f"vessel:{mmsi}", data)
         return data
 
@@ -185,30 +296,44 @@ class EntityResolver:
 
     # ── Aircraft ──────────────────────────────────────────────────────────────
 
-    async def resolve_aircraft(self, icao24: str) -> Dict:
+    async def resolve_aircraft(
+        self,
+        icao24: str,
+        context_event_id: Optional[str] = None,
+        timestamp: Optional[str] = None
+    ) -> Optional[Dict]:
         """Asynchronously resolves aircraft identity using cascading cache strategies."""
         
         # 1. REDIS (Hot Cache)
-        cached = await self.redis.raw.get(f"aircraft:info:{icao24}")
-        if cached:
-            return json.loads(cached)
+        if self.redis and hasattr(self.redis, "raw"):
+            try:
+                cached = await self.redis.raw.get(f"aircraft:info:{icao24}")
+                if cached:
+                    return json.loads(cached)
+            except Exception as e:
+                logger.debug(f"Redis aircraft lookup failed ({icao24}): {e}")
             
         # 2. NEO4J (The Graph)
-        try:
-            cypher = """
-                MATCH (a:Aircraft {icao24: $id}) 
-                RETURN a.callsign as callsign, a.origin_country as origin_country
-            """
-            records = await self.neo4j.execute_and_fetch(cypher, {"id": icao24})
+        if self.neo4j:
+            try:
+                cypher = """
+                    MATCH (a:Aircraft {icao24: $id}) 
+                    RETURN a.callsign as callsign, a.origin_country as origin_country
+                """
+                records = await self.neo4j.execute_and_fetch(cypher, {"id": icao24})
+                
+                if records:
+                    data = dict(records[0])
+                    if self.redis and hasattr(self.redis, "raw"):
+                        await self.redis.raw.set(f"aircraft:info:{icao24}", json.dumps(data), ex=86400)
+                    return data
+            except Exception as e:
+                logger.debug(f"Neo4j async aircraft lookup failed ({icao24}): {e}")
             
-            if records:
-                data = dict(records[0])
-                # Await the write to cache, mapping 'ex' for seconds
-                await self.redis.raw.set(f"aircraft:info:{icao24}", json.dumps(data), ex=86400)
-                return data
-        except Exception as e:
-            logger.debug(f"Neo4j async aircraft lookup failed ({icao24}): {e}")
-            
-        # 3. No Fallback
-        # ADS-B vectors often lack contextual static payload data. Fail cleanly.
-        return {}
+        # 3. No Fallback -> Resolution failed
+        await self._publish_unknown_entity(
+            raw_entity_name=icao24,
+            context_event_id=context_event_id,
+            timestamp=timestamp
+        )
+        return None

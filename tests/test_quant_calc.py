@@ -196,3 +196,16 @@ def test_threshold_calibration_harness():
     assert rec > 0.0
     assert f1 > 0.0
 
+
+def test_engle_granger_cointegration_small_spread_std():
+    np.random.seed(42)
+    x = list(np.linspace(100.0, 110.0, 100))
+    # Y is linearly related to X with extremely small noise (std ~ 1e-5)
+    noise = np.random.normal(0, 1e-5, 100)
+    y = list(1.5 * np.array(x) + noise)
+    res = quant_calc.engle_granger_cointegration(x, y)
+    assert res["spread_std"] > 0.0
+    assert res["spread_std"] < 1e-3
+    assert not math.isclose(res["spread_std"], 0.0, abs_tol=1e-12)
+
+

@@ -115,6 +115,8 @@ class Topics:
     UNKNOWN_ENTITIES     = "agents.ontology.unknown_entities"  # Classification requests
     ONTOLOGY_PROPOSALS   = "sentinel.ontology.proposals"
     RULES_FEEDBACK       = "agents.rules.feedback"
+    RULES_SYNTHESIZED    = "agents.rules.synthesized"
+    CONSENSUS_REPORTS    = "agents.consensus.reports"
     SYSTEM_HEARTBEAT     = "sentinel.system.heartbeat"
     RADAR_DECISIONS      = "agents.radar.decisions"
     TELEMETRY            = "agents.telemetry"

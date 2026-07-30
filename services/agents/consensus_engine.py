@@ -89,7 +89,7 @@ class ConsensusEngine(SentinelAgent):
 
     @property
     def output_topic(self) -> str:
-        return "agents.consensus.reports"
+        return Topics.CONSENSUS_REPORTS
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         report = await self.analyze()

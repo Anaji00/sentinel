@@ -80,6 +80,7 @@ def test_financial_advisor_scheduled_review():
                 TradingSignal(
                     ticker="BTC-USD",
                     action="BUY",
+                    trade_type="Scalp/Buy",
                     entry_level=64000.0,
                     target_price=68000.0,
                     stop_loss=62000.0,

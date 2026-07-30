@@ -31,6 +31,8 @@ class AgentBulletin(BaseModel):
     """Typed inter-agent communication message. Replaces free-text episodic memory."""
     agent_name: str
     bulletin_type: str  # "regime_change", "signal", "alert", "thesis", "contradiction"
+    primary_entity_id: Optional[str] = None
+    primary_entity_name: Optional[str] = None
     ticker: Optional[str] = None
     conviction: float = 0.5  # 0.0 - 1.0
     expected_direction: Optional[str] = None  # "up", "down", "neutral"
@@ -322,10 +324,46 @@ class SentinelAgent(ABC):
                     context += f"- [{mem.get('ts', 'unknown')}] {mem.get('agent', 'UnknownAgent')}: {mem.get('text', '')}\n"
                 except Exception:
                     pass
-            return context + "\n"
         except Exception as e:
             self.logger.warning(f"Failed to read agent memories: {e}")
             return "Failed to fetch memories."
+
+    async def get_cross_agent_context(self, ticker: Optional[str] = None, limit: int = 3) -> str:
+        """
+        Concise, fully dynamic helper for agents to retrieve active bulletins and cross-agent memories for LLM prompt injection.
+        Filtering out self-memories ensures strictly peer-agent intelligence is provided.
+        """
+        lines = []
+        try:
+            bulletins = await self.read_bulletins(ticker=ticker)
+            if bulletins:
+                # Exclude self-bulletins for pure cross-agent context
+                peer_bulletins = [b for b in bulletins if b.agent_name != self.name]
+                if peer_bulletins:
+                    bulletin_strs = [f"[{b.agent_name}->{b.bulletin_type}] {b.summary}" for b in peer_bulletins[:3]]
+                    lines.append("Active Bulletins:\n- " + "\n- ".join(bulletin_strs))
+        except Exception as e:
+            self.logger.debug(f"Bulletin fetch error: {e}")
+
+        try:
+            raw_mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, limit * 2)
+            if raw_mems:
+                mem_strs = []
+                for raw in raw_mems:
+                    try:
+                        m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                        text = m.get('text', '')
+                        agent_name = m.get('agent', 'Agent')
+                        if text and agent_name != self.name:
+                            mem_strs.append(f"[{agent_name}]: {text}")
+                    except Exception:
+                        pass
+                if mem_strs:
+                    lines.append("Cross-Agent Memories:\n- " + "\n- ".join(mem_strs[:limit]))
+        except Exception as e:
+            self.logger.debug(f"Memory fetch error: {e}")
+
+        return "\n".join(lines) if lines else ""
 
     # ── STRUCTURED BULLETIN SYSTEM ──────────────────────────────────────────
 
@@ -334,6 +372,8 @@ class SentinelAgent(ABC):
         bulletin_type: str,
         summary: str,
         ticker: Optional[str] = None,
+        primary_entity_id: Optional[str] = None,
+        primary_entity_name: Optional[str] = None,
         conviction: float = 0.5,
         expected_direction: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
@@ -344,9 +384,13 @@ class SentinelAgent(ABC):
         Other agents can query this via read_bulletins() or subscribe_bulletins().
         """
         try:
+            ent_id = primary_entity_id or ticker
+            ent_name = primary_entity_name or ent_id
             bulletin = AgentBulletin(
                 agent_name=self.name,
                 bulletin_type=bulletin_type,
+                primary_entity_id=ent_id,
+                primary_entity_name=ent_name,
                 ticker=ticker,
                 conviction=conviction,
                 expected_direction=expected_direction,
