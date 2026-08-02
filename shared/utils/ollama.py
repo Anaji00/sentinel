@@ -51,13 +51,23 @@ OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL
 MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:7b", "llama3:latest"]
 MODEL_TIER_HEAVY       = ["llama3:latest", "qwen2.5:7b", "gemma:2b"]
 
-_MODEL_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
+_GLOBAL_OLLAMA_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_GLOBAL_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
 def get_ollama_semaphore(model_name: str = "default") -> asyncio.Semaphore:
-    if model_name not in _MODEL_SEMAPHORES:
-        _MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(OLLAMA_NUM_PARALLEL)
-    return _MODEL_SEMAPHORES[model_name]
+    """Returns the process-global Ollama semaphore to enforce process-wide concurrency caps across all models and fallback chains."""
+    global _GLOBAL_OLLAMA_SEMAPHORE, _GLOBAL_SEMAPHORE_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if _GLOBAL_OLLAMA_SEMAPHORE is None or (current_loop is not None and _GLOBAL_SEMAPHORE_LOOP != current_loop):
+        _GLOBAL_OLLAMA_SEMAPHORE = asyncio.Semaphore(OLLAMA_NUM_PARALLEL)
+        _GLOBAL_SEMAPHORE_LOOP = current_loop
+    return _GLOBAL_OLLAMA_SEMAPHORE
+
 
 
 class InferenceError(Exception):

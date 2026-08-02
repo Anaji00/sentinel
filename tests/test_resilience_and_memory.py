@@ -48,14 +48,15 @@ def test_discrete_circuit_breaker():
     asyncio.run(run_test())
 
 
-def test_model_specific_semaphores():
-    """Verify that different models have different isolated semaphores."""
+def test_process_global_semaphore():
+    """Verify that all models share the single process-global semaphore."""
     sem1 = get_ollama_semaphore("llama3")
     sem2 = get_ollama_semaphore("qwen")
-    sem3 = get_ollama_semaphore("llama3")
+    sem3 = get_ollama_semaphore("gemma")
 
-    assert sem1 is not sem2
+    assert sem1 is sem2
     assert sem1 is sem3
+
 
 
 def test_watchlist_rank_based_pruning():
@@ -256,5 +257,35 @@ def test_intel_brief_coercion_from_small_llm():
     assert brief.geographic_hotspots == ["Red Sea", "Bab el-Mandeb"]
     assert brief.severity == 4
     assert brief.tags == ["maritime", "defense"]
+
+
+def test_read_agent_memories_returns_formatted_string():
+    """Verify that read_agent_memories returns the formatted context string instead of None."""
+    async def run_test():
+        mock_redis = MagicMock()
+        mock_raw = AsyncMock()
+        import json
+        mock_raw.zrevrange = AsyncMock(return_value=[
+            json.dumps({"ts": "2026-07-30T12:00:00Z", "agent": "QuantAgent", "text": "Bullish sweep on AAPL"}).encode("utf-8")
+        ])
+        mock_redis.raw = mock_raw
+
+        class DummyAgent(SentinelAgent):
+            @property
+            def output_topic(self) -> str:
+                return "test.topic"
+            async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                return None
+
+        agent = DummyAgent("test_agent", ["input.topic"], mock_redis, AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock())
+        mem_str = await agent.read_agent_memories(limit=5)
+
+        assert mem_str is not None
+        assert "### CROSS-AGENT MEMORIES ###" in mem_str
+        assert "QuantAgent" in mem_str
+        assert "Bullish sweep on AAPL" in mem_str
+
+    asyncio.run(run_test())
+
 
 

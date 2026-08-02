@@ -75,7 +75,7 @@ class SentinelConsoleFormatter(logging.Formatter):
         return f"{DIM}{time_str}{RESET} {name_str} {msg}"
 
 
-# Noisy third-party loggers to suppress
+# Noisy third-party loggers to suppress to WARNING or higher
 NOISY_LOGGERS = (
     "aiokafka",
     "aiokafka.consumer",
@@ -84,6 +84,12 @@ NOISY_LOGGERS = (
     "aiokafka.protocol",
     "kafka",
     "kafka.conn",
+    "kafka.cluster",
+    "kafka.coordinator",
+    "kafka.coordinator.consumer",
+    "kafka.metrics",
+    "shared.kafka",
+    "kafka.batch",
     "asyncio",
     "httpx",
     "httpcore",

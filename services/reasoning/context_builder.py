@@ -46,6 +46,9 @@ class ContextBuilder:
         
         pattern_matches = self._fetch_pattern_matches(cluster) 
         
+        all_events = ([trigger] if trigger else []) + (supporting or [])
+        compressed_events_table = self._compress_event_sequence(all_events)
+        
         return {
             "correlation": {
                 "id": cluster.correlation_id,
@@ -57,6 +60,7 @@ class ContextBuilder:
             },
             "trigger_event": trigger,
             "supporting_events": supporting,
+            "compressed_events_table": compressed_events_table,
             "entity_graph": entity_graph,
             "historical_patterns": pattern_matches, 
             "recent_headlines": recent_news,
@@ -65,6 +69,62 @@ class ContextBuilder:
             "active_bulletins": active_bulletins,
             "consensus_analysis": consensus_report,
         }
+
+    def _compress_event_sequence(self, events: List[Dict]) -> str:
+        """
+        Hierarchical Context Compression:
+        Summarizes prior event states into structured tables before prompt assembly
+        to reduce context consumption while preserving situational facts.
+        """
+        if not events:
+            return "No event sequence available."
+
+        rows = [
+            "| Timestamp (UTC) | Type | Source | Entity | Region | Core Detail | Anomaly Score |",
+            "| --- | --- | --- | --- | --- | --- | --- |"
+        ]
+
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            ts = str(evt.get("occurred_at") or evt.get("collected_at") or "Unknown")[:19]
+            etype = str(evt.get("type") or "event")
+            source = str(evt.get("source") or "unknown")
+            entity = str(evt.get("primary_entity_name") or evt.get("primary_entity_id") or "N/A")
+            region = str(evt.get("region") or "GLOBAL")
+            score = f"{float(evt.get('anomaly_score', 0.0)):.2f}"
+
+            headline = evt.get("headline") or evt.get("summary")
+            if headline:
+                detail = str(headline)[:60]
+            elif evt.get("financial_data"):
+                fin = evt["financial_data"]
+                ticker = fin.get("ticker", "")
+                prem = fin.get("premium_usd")
+                detail = f"{ticker} Prem: ${prem:,.0f}" if prem else f"Financial {ticker}"
+            elif evt.get("vessel_data"):
+                vessel = evt["vessel_data"]
+                mmsi = vessel.get("mmsi", "")
+                spd = vessel.get("speed_knots")
+                detail = f"Vessel MMSI {mmsi} Spd: {spd}kts" if spd is not None else f"Vessel {mmsi}"
+            elif evt.get("flight_data"):
+                flight = evt["flight_data"]
+                callsign = flight.get("callsign") or flight.get("icao24", "")
+                detail = f"Flight {callsign}"
+            elif evt.get("cyber_data"):
+                cyb = evt["cyber_data"]
+                cve = cyb.get("cve_id") or cyb.get("breach_type", "Cyber incident")
+                detail = f"Cyber {cve}"
+            else:
+                detail = f"{etype} signal"
+
+            detail = detail.replace("|", "/")
+            entity = entity.replace("|", "/")
+            
+            rows.append(f"| {ts} | {etype} | {source} | {entity} | {region} | {detail} | {score} |")
+
+        return "\n".join(rows)
+
 
     async def _fetch_event(self, event_id: str) -> Optional[Dict]:
         try:
@@ -98,7 +158,7 @@ class ContextBuilder:
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id = ANY($1::uuid[])
+                   WHERE event_id::text = ANY($1::text[])
                    ORDER BY occurred_at DESC""",
                 event_ids
             )
@@ -106,7 +166,7 @@ class ContextBuilder:
         except Exception as e:
             logger.error(f"Error fetching events {event_ids}: {e}")
             return []
-        
+
     async def _fetch_entity_graph(self, entity_ids: List[str]) -> List[Dict]:
         """
         Batches and parallelizes Neo4j graph lookup for entities.
@@ -116,9 +176,9 @@ class ContextBuilder:
             return []
         
         targets = list(set(entity_ids[:5]))
-        neo4j_client = await get_neo4j()
         
         try:
+            neo4j_client = await get_neo4j()
             rel_task = neo4j_client.query("""
                 MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
                 MATCH (v)-[r*1..3]->(n)
@@ -232,7 +292,7 @@ class ContextBuilder:
                 # Check if thematically related to this cluster
                 cluster_tags = set(cluster.tags)
                 brief_hotspots = set(brief.get("geographic_hotspots", []))
-                if cluster_tags.intersection(brief_hotspots):
+                if not cluster_tags or cluster_tags.intersection(brief_hotspots):
                     return [brief]
         except Exception as e:
             logger.debug(f"Agent intel fetch failed: {e}")
@@ -245,6 +305,7 @@ class ContextBuilder:
             redis = await get_redis()
             bulletins = []
             cursor = 0
+            search_ids = set(e.upper() for e in (entity_ids or []) if e)
             while True:
                 cursor, keys = await redis.raw.scan(cursor=cursor, match="sentinel:bulletins:*", count=50)
                 if keys:
@@ -253,8 +314,10 @@ class ContextBuilder:
                         if val:
                             try:
                                 data = json.loads(val if isinstance(val, str) else val.decode("utf-8"))
-                                ticker = data.get("ticker")
-                                if not entity_ids or not ticker or any(e.upper() == ticker.upper() for e in entity_ids):
+                                ticker = (data.get("ticker") or "").upper()
+                                ent_id = (data.get("primary_entity_id") or "").upper()
+                                ent_name = (data.get("primary_entity_name") or "").upper()
+                                if not search_ids or ticker in search_ids or ent_id in search_ids or any(s in ent_name for s in search_ids):
                                     bulletins.append(data)
                             except Exception as e:
                                 logger.debug(f"Bulletin parse warning: {e}")

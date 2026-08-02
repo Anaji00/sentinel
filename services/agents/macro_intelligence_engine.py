@@ -466,13 +466,16 @@ class MacroIntelligenceEngine(SentinelAgent):
             self.read_agent_memories(limit=10)
         )
 
-        user_prompt = f"""
-        Systemic Macro Trend Review:
-        Ontology Co-occurrences: {cooccurrence}
-        Sector Data: {json.dumps(sector_data, separators=(',', ':'), default=str)}
-        {global_context}
-        SHARED MEMORIES: {agent_memories}
-        """
+        user_prompt = f"""=== SYSTEMIC MACRO INTELLIGENCE REVIEW ===
+Ontology Co-occurrences: {cooccurrence}
+Sector Metrics: {json.dumps(sector_data, separators=(',', ':'), default=str)}
+Global Macro Context: {global_context}
+{agent_memories}
+
+DIRECTIVES:
+Synthesize macro trends, rate shifts, and sector risks into an IntelBrief JSON.
+Required fields: "headline", "summary", "primary_entity", "geopolitical_theater", "geographic_hotspots", "entities", "graph_triples", "severity" (1-5), "tags".
+Return raw JSON matching schema:"""
 
         run_id = f"macro_review_{int(time.time())}"
         msg = {"event_id": run_id, "trace_id": trigger_event.get("trace_id") if trigger_event else "auto"}
@@ -481,7 +484,7 @@ class MacroIntelligenceEngine(SentinelAgent):
             from services.agents.knowledge_graph_engine import IntelBrief
             response = await self._execute_with_telemetry(
                 message=msg,
-                system_prompt="You are Master Quantitative Macro Strategist. Generate structured macro brief JSON.",
+                system_prompt="You are SENTINEL Chief Macro Strategist. Synthesize systemic macroeconomic, rate regime, and geopolitical spillovers into a high-density intelligence brief. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=IntelBrief,
                 temperature=0.1,

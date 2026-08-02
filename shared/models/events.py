@@ -229,6 +229,57 @@ class CrossDomainSignal(BaseModel):
     occurred_at: Optional[datetime] = None
     region: Optional[str] = None
 
+import hashlib
+
+def compute_payload_hash(payload: Any) -> str:
+    if isinstance(payload, dict):
+        payload_str = json.dumps(payload, sort_keys=True, default=str)
+    elif isinstance(payload, (str, bytes)):
+        payload_str = payload if isinstance(payload, str) else payload.decode("utf-8", errors="ignore")
+    else:
+        payload_str = str(payload)
+    return hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+class RawIngestEnvelope(BaseModel):
+    source_id: str = "unknown"
+    ingest_timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    payload_hash: str = Field(default_factory=str)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _populate_envelope(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Accept source or source_id
+            if "source_id" not in data and "source" in data:
+                data["source_id"] = str(data["source"])
+            elif "source_id" not in data:
+                data["source_id"] = "unknown"
+
+            # Accept payload or raw_payload
+            if "payload" not in data and "raw_payload" in data:
+                data["payload"] = data["raw_payload"]
+            elif "payload" not in data:
+                data["payload"] = {}
+
+            # Handle ingest_timestamp / collected_at
+            if "ingest_timestamp" not in data:
+                cat = data.get("collected_at")
+                if isinstance(cat, datetime):
+                    data["ingest_timestamp"] = cat.isoformat()
+                elif cat:
+                    data["ingest_timestamp"] = str(cat)
+                else:
+                    data["ingest_timestamp"] = datetime.now(timezone.utc).isoformat()
+            elif isinstance(data["ingest_timestamp"], datetime):
+                data["ingest_timestamp"] = data["ingest_timestamp"].isoformat()
+
+            # Compute payload_hash if empty/missing
+            if not data.get("payload_hash"):
+                data["payload_hash"] = compute_payload_hash(data.get("payload", {}))
+
+        return data
+
 class RawEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -238,6 +289,85 @@ class RawEvent(BaseModel):
     occurred_at: Optional[datetime] = None
     financial_data: Optional[Dict[str, Any]] = None
     raw_payload: Dict[str, Any] = Field(default_factory=dict)
+    envelope: Optional[RawIngestEnvelope] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ensure_envelope_and_sync(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_env = data.get("envelope")
+            if isinstance(raw_env, RawIngestEnvelope):
+                env_dict = raw_env.model_dump()
+            elif isinstance(raw_env, dict):
+                env_dict = raw_env
+            else:
+                env_dict = None
+
+            source_val = data.get("source") or data.get("source_id")
+            if not source_val and env_dict:
+                source_val = env_dict.get("source_id") or env_dict.get("source")
+            if not source_val:
+                source_val = "unknown"
+            data["source"] = source_val
+
+            payload_val = data.get("raw_payload") if "raw_payload" in data else data.get("payload")
+            if payload_val is None and env_dict:
+                payload_val = env_dict.get("payload") or env_dict.get("raw_payload")
+            if payload_val is None:
+                payload_val = {}
+            data["raw_payload"] = payload_val
+
+            cat_val = data.get("collected_at")
+            if isinstance(cat_val, str):
+                try:
+                    cat_val = datetime.fromisoformat(cat_val)
+                    data["collected_at"] = cat_val
+                except ValueError:
+                    cat_val = _utcnow()
+                    data["collected_at"] = cat_val
+            elif not cat_val and env_dict and env_dict.get("ingest_timestamp"):
+                try:
+                    cat_val = datetime.fromisoformat(env_dict["ingest_timestamp"])
+                    data["collected_at"] = cat_val
+                except ValueError:
+                    cat_val = _utcnow()
+                    data["collected_at"] = cat_val
+            elif not cat_val:
+                cat_val = _utcnow()
+                data["collected_at"] = cat_val
+
+            env_source = data.get("source_id") or source_val
+            env_ts = data.get("ingest_timestamp")
+            if isinstance(env_ts, datetime):
+                env_ts = env_ts.isoformat()
+            elif not env_ts and isinstance(cat_val, datetime):
+                env_ts = cat_val.isoformat()
+            elif not env_ts:
+                env_ts = datetime.now(timezone.utc).isoformat()
+
+            env_hash = data.get("payload_hash") or (env_dict.get("payload_hash") if env_dict else None) or compute_payload_hash(payload_val)
+
+            data["envelope"] = RawIngestEnvelope(
+                source_id=env_source,
+                ingest_timestamp=env_ts,
+                payload_hash=env_hash,
+                payload=payload_val
+            )
+
+        return data
+
+    @property
+    def source_id(self) -> str:
+        return self.envelope.source_id if self.envelope else self.source
+
+    @property
+    def ingest_timestamp(self) -> str:
+        return self.envelope.ingest_timestamp if self.envelope else self.collected_at.isoformat()
+
+    @property
+    def payload_hash(self) -> str:
+        return self.envelope.payload_hash if self.envelope else compute_payload_hash(self.raw_payload)
+
 
 class NormalizedEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4())) 

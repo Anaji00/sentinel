@@ -254,9 +254,11 @@ async def main():
         auto_offset_reset="latest",
     )
 
-    processed  = 0
+    processed = 0
     corr_fired = 0
-    errors     = 0
+    errors = 0
+    total_received = 0
+    last_logged_received = 0
 
     await producer.start()
     await consumer.start()
@@ -497,7 +499,8 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        heartbeat_task.cancel()
+        if 'heartbeat_task' in locals() and heartbeat_task:
+            heartbeat_task.cancel()
         await producer.close()
         await consumer.close()
         await session.close()

@@ -324,6 +324,8 @@ async def main():
                         if vessel_positions_to_write:
                             pending_dlq_tasks.append(db.write_vessel_positions_batch(vessel_positions_to_write))
 
+                batch_success = True
+
                 # Await all pending DLQ sends & vessel writes before proceeding
                 if pending_dlq_tasks:
                     pending_res = await asyncio.gather(*pending_dlq_tasks, return_exceptions=True)
@@ -353,14 +355,43 @@ async def main():
                         logger.debug(f"Redis live feed publish bypass: {pub_err}")
 
                 if produce_tasks:
-                    await asyncio.gather(*produce_tasks, return_exceptions=True)
-                    processed += len(produce_tasks)
+                    produce_results = await asyncio.gather(*produce_tasks, return_exceptions=True)
+                    failed_produce_dlq_tasks = []
+                    successful_produces = 0
+                    for enriched, produce_res in zip(batch_to_write, produce_results):
+                        if isinstance(produce_res, Exception):
+                            logger.error(
+                                f"Kafka produce to {Topics.ENRICHED_EVENTS} failed for event {enriched.event_id}: {produce_res}",
+                                exc_info=produce_res,
+                            )
+                            errors += 1
+                            batch_success = False
+                            failed_produce_dlq_tasks.append(
+                                dlq.send(
+                                    Topics.DLQ,
+                                    {
+                                        "error": f"KAFKA_PRODUCE_FAILED: {produce_res}",
+                                        "topic": Topics.ENRICHED_EVENTS,
+                                        "raw": enriched.model_dump(),
+                                    },
+                                )
+                            )
+                        else:
+                            successful_produces += 1
+
+                    if failed_produce_dlq_tasks:
+                        dlq_res = await asyncio.gather(*failed_produce_dlq_tasks, return_exceptions=True)
+                        for r in dlq_res:
+                            if isinstance(r, Exception):
+                                logger.error(f"DLQ delivery for failed Kafka produce failed: {r}", exc_info=r)
+
+                    processed += successful_produces
                     heartbeat_state["processed"] = processed
+                    heartbeat_state["errors"] = errors
                     if processed % 250 == 0:
                         logger.info(f"Processed {processed} successfully")
 
                 # ── 3. FAULT-TOLERANT DB WRITES ──────────────────────────────
-                batch_success = True
                 if batch_to_write:
                     for attempt in range(3):
                         try:

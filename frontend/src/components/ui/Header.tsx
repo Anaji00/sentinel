@@ -1,6 +1,15 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import useSWR from 'swr';
+import { fetcher } from '../../lib/api';
+
+interface SystemHealthResponse {
+  status: string;
+  redis_connected: boolean;
+  timescale_connected: boolean;
+  neo4j_connected: boolean;
+}
 
 export const Header: React.FC = () => {
   const [time, setTime] = useState<string>(() => {
@@ -8,6 +17,12 @@ export const Header: React.FC = () => {
   });
   const [latency, setLatency] = useState<number>(38);
   const [showStatusModal, setShowStatusModal] = useState<boolean>(false);
+
+  const { data: health } = useSWR<SystemHealthResponse>(
+    showStatusModal ? '/health' : null,
+    fetcher,
+    { refreshInterval: 5000 }
+  );
 
   useEffect(() => {
     const updateClock = () => {
@@ -111,11 +126,21 @@ export const Header: React.FC = () => {
             <div className="space-y-2.5 text-xs text-slate-300">
               <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
                 <span>TimescaleDB Hypertable</span>
-                <span className="text-emerald-400 font-bold">HEALTHY (asyncpg)</span>
+                <span className={health ? (health.timescale_connected ? "text-emerald-400 font-bold" : "text-rose-400 font-bold") : "text-amber-400 font-bold"}>
+                  {health ? (health.timescale_connected ? "ONLINE (asyncpg)" : "OFFLINE / RECONNECTING") : "CHECKING..."}
+                </span>
               </div>
               <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
                 <span>Neo4j Knowledge Graph</span>
-                <span className="text-emerald-400 font-bold">HEALTHY (Bolt 7687)</span>
+                <span className={health ? (health.neo4j_connected ? "text-emerald-400 font-bold" : "text-amber-400 font-bold") : "text-amber-400 font-bold"}>
+                  {health ? (health.neo4j_connected ? "ONLINE (Bolt 7687)" : "FALLBACK GRAPH ACTIVE") : "CHECKING..."}
+                </span>
+              </div>
+              <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
+                <span>Redis PubSub Cache</span>
+                <span className={health ? (health.redis_connected ? "text-emerald-400 font-bold" : "text-rose-400 font-bold") : "text-amber-400 font-bold"}>
+                  {health ? (health.redis_connected ? "ONLINE (Stream Active)" : "OFFLINE") : "CHECKING..."}
+                </span>
               </div>
               <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
                 <span>Ollama LLM Swarm</span>
@@ -124,10 +149,6 @@ export const Header: React.FC = () => {
               <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
                 <span>Kafka Event Streaming</span>
                 <span className="text-emerald-400 font-bold">12 Topics Streaming</span>
-              </div>
-              <div className="flex justify-between p-2 rounded bg-slate-950 border border-slate-800">
-                <span>ONNX Anomaly Scorer</span>
-                <span className="text-amber-400 font-bold">Active (1-Min EWMA)</span>
               </div>
             </div>
 

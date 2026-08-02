@@ -16,7 +16,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
   useEffect(() => {
     // Determine WebSocket URL dynamically based on current window location
     const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let baseHost = 'localhost:8000';
+    let baseHost = typeof window !== 'undefined' ? `${window.location.hostname}:8000` : 'localhost:8000';
     if (process.env.NEXT_PUBLIC_API_URL) {
       baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '').replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
     }

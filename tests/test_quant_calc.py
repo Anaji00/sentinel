@@ -119,6 +119,8 @@ def test_engle_granger_cointegration_pair():
     res = quant_calc.engle_granger_cointegration(x, y)
     assert res["is_cointegrated"] is True
     assert abs(res["beta"] - 2.0) < 0.2
+    assert res["critical_5pct"] < -3.30
+    assert res["adf_statistic"] < res["critical_5pct"]
 
 def test_granger_causality_pair():
     np.random.seed(42)

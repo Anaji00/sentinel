@@ -317,25 +317,28 @@ class SentinelAgent(ABC):
             if not raw_memories:
                 return "No recent agent memories."
                 
-            context = "\n### RECENT CROSS-AGENT MEMORIES ###\n"
+            context = "\n### CROSS-AGENT MEMORIES ###\n"
             for raw in raw_memories:
                 try:
-                    mem = json.loads(raw)
-                    context += f"- [{mem.get('ts', 'unknown')}] {mem.get('agent', 'UnknownAgent')}: {mem.get('text', '')}\n"
+                    mem = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                    ts = str(mem.get('ts', ''))[:19]
+                    context += f"• [{ts}] {mem.get('agent', 'UnknownAgent')}: {mem.get('text', '')}\n"
                 except Exception:
                     pass
+            return context
         except Exception as e:
             self.logger.warning(f"Failed to read agent memories: {e}")
             return "Failed to fetch memories."
 
-    async def get_cross_agent_context(self, ticker: Optional[str] = None, limit: int = 3) -> str:
+    async def get_cross_agent_context(self, ticker: Optional[str] = None, entity_id: Optional[str] = None, limit: int = 3) -> str:
         """
-        Concise, fully dynamic helper for agents to retrieve active bulletins and cross-agent memories for LLM prompt injection.
+        Concise, fully dynamic helper for agents to retrieve active bulletins, cross-agent memories, and swarm consensus for LLM prompt injection.
         Filtering out self-memories ensures strictly peer-agent intelligence is provided.
         """
         lines = []
+        lookup_key = ticker or entity_id
         try:
-            bulletins = await self.read_bulletins(ticker=ticker)
+            bulletins = await self.read_bulletins(ticker=lookup_key)
             if bulletins:
                 # Exclude self-bulletins for pure cross-agent context
                 peer_bulletins = [b for b in bulletins if b.agent_name != self.name]
@@ -344,6 +347,16 @@ class SentinelAgent(ABC):
                     lines.append("Active Bulletins:\n- " + "\n- ".join(bulletin_strs))
         except Exception as e:
             self.logger.debug(f"Bulletin fetch error: {e}")
+
+        try:
+            raw_consensus = await self.redis.raw.get("sentinel:consensus:latest")
+            if raw_consensus:
+                cons = json.loads(raw_consensus if isinstance(raw_consensus, str) else raw_consensus.decode("utf-8"))
+                summary = cons.get("summary") or cons.get("consensus_summary")
+                if summary:
+                    lines.append(f"Swarm Consensus: {summary[:200]}")
+        except Exception as e:
+            self.logger.debug(f"Consensus fetch error: {e}")
 
         try:
             raw_mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, limit * 2)

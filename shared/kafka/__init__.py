@@ -27,9 +27,13 @@ import time
 from shared.utils.logging import suppress_noisy_loggers
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
-# Suppress noisy Kafka library loggers across all microservices
+# Suppress noisy Kafka library loggers across all microservices to WARNING level
 suppress_noisy_loggers(logging.WARNING)
+logging.getLogger("kafka").setLevel(logging.WARNING)
+logging.getLogger("aiokafka").setLevel(logging.WARNING)
+logging.getLogger("shared.kafka").setLevel(logging.WARNING)
 
 
 # ── BATCH KAFKA LOGGER ────────────────────────────────────────────────────────
@@ -87,7 +91,7 @@ class BatchKafkaLogger:
             else "none"
         )
 
-        self.logger.info(
+        self.logger.warning(
             f"📡 KAFKA BATCH [{self.service_name}] Processed {total_msgs} msgs in {elapsed:.1f}s ({rate:.1f}/s) | Topics: [{topic_summary}] | Errors: [{err_summary}]"
         )
         self._topic_counts.clear()
@@ -188,7 +192,7 @@ class SentinelProducer:
         )
         self._started = False
         self.batch_logger = BatchKafkaLogger(service_name, flush_interval_sec=10.0)
-        logger.info(f"Kafka Producer -> {self._servers}")
+        logger.warning(f"Kafka Producer -> {self._servers}")
 
     async def start(self, max_retries: int = 15):
         """Must be called inside the async event loop to initialize network sockets."""
@@ -198,7 +202,7 @@ class SentinelProducer:
             try:
                 await self._p.start()
                 self._started = True
-                logger.info("✅ Kafka Producer successfully connected and bootstrapped.")
+                logger.warning("✅ Kafka Producer successfully connected and bootstrapped.")
                 return
             except Exception as e:
                 wait_time = min(2 ** attempt, 30)
@@ -262,7 +266,7 @@ class SentinelConsumer:
         )
         self._started = False
         self.batch_logger = BatchKafkaLogger(f"consumer.{group_id}", flush_interval_sec=10.0)
-        logger.info(f"Kafka Consumer: {self._servers} | Group: {group_id} --> Topics: {topics}")
+        logger.warning(f"Kafka Consumer: {self._servers} | Group: {group_id} --> Topics: {topics}")
         
     async def start(self, max_retries: int = 15):
         """Starts the consumer with exponential backoff for broker readiness."""
@@ -273,7 +277,7 @@ class SentinelConsumer:
             try:
                 await self._c.start()
                 self._started = True
-                logger.info(f"✅ Kafka Consumer successfully connected and subscribed to {self.topics}.")
+                logger.warning(f"✅ Kafka Consumer successfully connected and subscribed to {self.topics}.")
                 return
             except Exception as e:
                 wait_time = min(2 ** attempt, 30)

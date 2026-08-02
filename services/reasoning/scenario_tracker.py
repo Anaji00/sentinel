@@ -29,6 +29,8 @@ from .pattern_library import PatternLibrary
  
 logger = logging.getLogger("reasoning.tracker")
 
+from .calibration_harness import DynamicBayesianCalibrator
+
 CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
 
@@ -45,10 +47,6 @@ class ScenarioTracker:
         
         logger.info(f"Checking {len(active)} active scenarios for resolution signals")
         for scenario in active:
-            # CODING CONVICTION: Defensive Programming in Batch Processes.
-            # We wrap the inner loop in a try-except block so that if one scenario 
-            # fails (e.g., due to bad JSON or a weird DB edge case), it doesn't 
-            # crash the entire tracker and stop the other scenarios from being checked.
             try:
                 await self._check_scenario(scenario)
             except Exception as e:
@@ -59,52 +57,44 @@ class ScenarioTracker:
         hypotheses  = scenario.get("hypotheses") or []
         original_confidence = int(scenario.get("confidence_overall") or 50)
         confidence = original_confidence
- 
-        # Collect all watch and deny signals across hypotheses
-        watch_signals = []
-        deny_signals  = []
 
-        for h in hypotheses:
-            watch_signals.extend(h.get("watch_signals") or [])
-            deny_signals.extend(h.get("deny_signals") or [])
-        
-        # FIXED: Typo 'statud_change' changed to 'status_change'. 
-        # Before, if watch_hits was false but deny_hits was true, it would throw an UnboundLocalError.
-        status_change = None
+        watch_hits_by_index = {}
+        deny_hits_by_index = {}
         notes = []
 
-        if watch_signals:
-            # CRITICAL THINKING: Bounded adjustments.
-            # We limit the "bump" to a maximum of 30 points regardless of how many 
-            # watch signals hit. This prevents a single noisy event from artificially 
-            # skyrocketing our confidence to 100% instantly.
-            watch_hits = await self._match_signals(watch_signals)
-            if watch_hits:
-                bump = min(15 * len(watch_hits), 30)  # Cap max bump to prevent overconfidence
-                confidence = min(100, confidence + bump) # Increase confidence by 15% per watch hit, up to 30%
-                notes.append(f"Watch signals hit: {watch_hits[:3]}")
-                if confidence >= CONFIRM_THRESHOLD:
-                    status_change = ScenarioStatus.CONFIRMED
+        for idx, h in enumerate(hypotheses):
+            w_sigs = h.get("watch_signals") or []
+            d_sigs = h.get("deny_signals") or []
 
-        if deny_signals:
-            # CRITICAL THINKING: Asymmetric penalization.
-            # Notice the drop maxes out at 40, while the bump maxes out at 30. 
-            # In intelligence, disproving evidence is often weighted slightly heavier 
-            # than confirming evidence to avoid confirmation bias.
-            deny_hits = await self._match_signals(deny_signals)
-            if deny_hits:
-                drop = min(20 * len(deny_hits), 40) # Cap max drop to prevent over-pessimism
-                confidence = max(0, confidence - drop) # Decrease confidence by 20% per deny hit, up to 40%
-                notes.append(f"Deny signals hit: {deny_hits[:3]}") 
-                if confidence <= DENY_THRESHOLD:
-                    status_change = ScenarioStatus.DENIED
+            w_hits = await self._match_signals(w_sigs) if w_sigs else []
+            if w_hits:
+                watch_hits_by_index[idx] = w_hits
 
-        if confidence != original_confidence or status_change:
+            d_hits = await self._match_signals(d_sigs) if d_sigs else []
+            if d_hits:
+                deny_hits_by_index[idx] = d_hits
+
+        status_change = None
+
+        if watch_hits_by_index or deny_hits_by_index:
+            updated_hypotheses, confidence, bayes_notes = DynamicBayesianCalibrator.recalibrate_hypotheses(
+                hypotheses, watch_hits_by_index, deny_hits_by_index
+            )
+            hypotheses = updated_hypotheses
+            notes.append(bayes_notes)
+
+            if confidence >= CONFIRM_THRESHOLD:
+                status_change = ScenarioStatus.CONFIRMED
+            elif confidence <= DENY_THRESHOLD:
+                status_change = ScenarioStatus.DENIED
+
+        if confidence != original_confidence or status_change or watch_hits_by_index or deny_hits_by_index:
             await self._update_scenario(
                 scenario_id, 
                 confidence, 
                 status_change, 
-                "; ".join(notes)
+                "; ".join(notes),
+                hypotheses=hypotheses
             )
             logger.info(
                 f"Scenario {scenario_id[:8]}: "
@@ -117,7 +107,7 @@ class ScenarioTracker:
                     scenario_id,
                     status_change.value,
                     "; ".join(notes),
-                ) # FIXED: Added missing closing parenthesis
+                )
                 
             if status_change == ScenarioStatus.DENIED and self._producer:
                 try:
@@ -211,11 +201,8 @@ class ScenarioTracker:
         new_confidence: int,
         new_status:     Optional[ScenarioStatus],
         notes:          str,
+        hypotheses:     Optional[List[Dict]] = None,
     ):
-        # CODING CONVICTION: Audit Trails.
-        # We append to a `confidence_history` JSONB array instead of just overwriting 
-        # the confidence. This allows human analysts to trace exactly *when* and *why* 
-        # an AI decided to upgrade or downgrade a scenario's likelihood.
         try:
             history_entry = json.dumps([{
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -223,37 +210,55 @@ class ScenarioTracker:
                 "notes": notes
             }])
 
+            hyp_json = json.dumps(hypotheses) if hypotheses else None
+
             if new_status:
-                await self._db.execute("""
-                    UPDATE scenarios
-                    SET confidence_overall = $1,
-                        status            = $2,
-                        updated_at        = NOW(),
-                        confidence_history = confidence_history || $3::jsonb
-                    WHERE scenario_id = $4
-                """, 
-                    new_confidence,
-                    new_status.value,
-                    history_entry,
-                    scenario_id,
-                )
+                if hyp_json:
+                    await self._db.execute("""
+                        UPDATE scenarios
+                        SET confidence_overall = $1,
+                            status            = $2,
+                            hypotheses        = $3::jsonb,
+                            updated_at        = NOW(),
+                            confidence_history = confidence_history || $4::jsonb
+                        WHERE scenario_id = $5
+                    """, new_confidence, new_status.value, hyp_json, history_entry, scenario_id)
+                else:
+                    await self._db.execute("""
+                        UPDATE scenarios
+                        SET confidence_overall = $1,
+                            status            = $2,
+                            updated_at        = NOW(),
+                            confidence_history = confidence_history || $3::jsonb
+                        WHERE scenario_id = $4
+                    """, new_confidence, new_status.value, history_entry, scenario_id)
             else:
-                await self._db.execute("""
-                    UPDATE scenarios
-                    SET confidence_overall = $1,
-                        status            = CASE
-                            WHEN status = 'hypothesis' AND $2 >= 60 THEN 'developing'
-                            ELSE status
-                        END,
-                        updated_at        = NOW(),
-                        confidence_history = confidence_history || $3::jsonb
-                    WHERE scenario_id = $4
-                """, 
-                    new_confidence,
-                    new_confidence,
-                    history_entry,
-                    scenario_id,
-                )
+                if hyp_json:
+                    await self._db.execute("""
+                        UPDATE scenarios
+                        SET confidence_overall = $1,
+                            hypotheses        = $2::jsonb,
+                            status            = CASE
+                                WHEN status = 'hypothesis' AND $1 >= 60 THEN 'developing'
+                                ELSE status
+                            END,
+                            updated_at        = NOW(),
+                            confidence_history = confidence_history || $3::jsonb
+                        WHERE scenario_id = $4
+                    """, new_confidence, hyp_json, history_entry, scenario_id)
+                else:
+                    await self._db.execute("""
+                        UPDATE scenarios
+                        SET confidence_overall = $1,
+                            status            = CASE
+                                WHEN status = 'hypothesis' AND $1 >= 60 THEN 'developing'
+                                ELSE status
+                            END,
+                            updated_at        = NOW(),
+                            confidence_history = confidence_history || $2::jsonb
+                        WHERE scenario_id = $3
+                    """, new_confidence, history_entry, scenario_id)
         except Exception as e:
             logger.error(f"update_scenario failed ({scenario_id}): {e}")
+
             

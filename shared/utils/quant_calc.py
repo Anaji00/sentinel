@@ -465,30 +465,35 @@ def engle_granger_cointegration(
         
     Returns:
         Dict with 'is_cointegrated', 'adf_statistic', 'beta' (hedge ratio),
-        'spread_mean', 'spread_std', 'half_life'
+        'alpha', 'spread_mean', 'spread_std', 'half_life', 'critical_5pct'
     """
     if len(series_x) != len(series_y) or len(series_x) < 30:
-        return {"is_cointegrated": False, "adf_statistic": 0.0, "beta": 0.0,
-                "spread_mean": 0.0, "spread_std": 0.0, "half_life": float("inf")}
+        return {"is_cointegrated": False, "adf_statistic": 0.0, "beta": 0.0, "alpha": 0.0,
+                "spread_mean": 0.0, "spread_std": 0.0, "half_life": float("inf"),
+                "critical_5pct": -3.34}
     
     x = np.array(series_x, dtype=np.float64)
     y = np.array(series_y, dtype=np.float64)
+    n = len(x)
     
     # Step 1: OLS
-    X = np.column_stack([np.ones(len(x)), x])
+    X = np.column_stack([np.ones(n), x])
     try:
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
     except np.linalg.LinAlgError:
-        return {"is_cointegrated": False, "adf_statistic": 0.0, "beta": 0.0,
-                "spread_mean": 0.0, "spread_std": 0.0, "half_life": float("inf")}
+        return {"is_cointegrated": False, "adf_statistic": 0.0, "beta": 0.0, "alpha": 0.0,
+                "spread_mean": 0.0, "spread_std": 0.0, "half_life": float("inf"),
+                "critical_5pct": -3.34}
     
     alpha, beta = beta_hat[0], beta_hat[1]
     residuals = y - (alpha + beta * x)
     
     # Step 2: ADF on residuals
-    # EG 5% critical value ≈ -2.86 for standard ADF stationary residual check
+    # MacKinnon (2010) response surface 5% critical value for 2-variable Engle-Granger test (N=2, with constant):
+    # CV(n) = -3.3377 - 5.467 / n - 6.44 / (n^2)
+    critical_5pct = -3.3377 - (5.467 / n) - (6.44 / (n ** 2))
     adf_result = augmented_dickey_fuller(residuals.tolist())
-    is_cointegrated = adf_result["is_stationary"] or adf_result["adf_statistic"] < -2.86
+    is_cointegrated = adf_result["adf_statistic"] < critical_5pct
     
     # Half-life of mean reversion: from AR(1) on the spread
     spread_mean = float(np.mean(residuals))
@@ -499,9 +504,11 @@ def engle_granger_cointegration(
         "is_cointegrated": bool(is_cointegrated),
         "adf_statistic": adf_result["adf_statistic"],
         "beta": round(float(beta), 4),
+        "alpha": round(float(alpha), 4),
         "spread_mean": round(spread_mean, 4),
         "spread_std": float(spread_std),
         "half_life": round(half_life, 2),
+        "critical_5pct": round(float(critical_5pct), 4),
     }
 
 

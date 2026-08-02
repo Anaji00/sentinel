@@ -136,3 +136,77 @@ class ThresholdCalibrationHarness:
 
         logger.info(f"🎯 Threshold calibration complete | Z-Threshold: {best_z} | Sim-Threshold: {best_sim} | F1: {best_f1:.3f}")
         return calibrated
+
+
+class DynamicBayesianCalibrator:
+    """
+    Real-time dynamic scenario probability recalibration using Bayes' Theorem:
+        P(S_i | E_obs) = (P(E_obs | S_i) * P(S_i)) / Sum_j (P(E_obs | S_j) * P(S_j))
+    """
+
+    @staticmethod
+    def recalibrate_hypotheses(
+        hypotheses: List[Dict[str, Any]],
+        watch_hits_by_index: Dict[int, List[str]],
+        deny_hits_by_index: Dict[int, List[str]],
+    ) -> Tuple[List[Dict[str, Any]], int, str]:
+        """
+        Recalibrates hypothesis probabilities P(S_i) and overall scenario confidence
+        based on observed watch/deny signal hits.
+        """
+        if not hypotheses:
+            return hypotheses, 50, "No hypotheses to recalibrate"
+
+        n = len(hypotheses)
+        priors = [max(1.0, float(h.get("probability", 100.0 / n))) for h in hypotheses]
+        prior_sum = sum(priors)
+        priors = [p / prior_sum for p in priors]
+
+        likelihoods = [1.0] * n
+        notes = []
+
+        for idx in range(n):
+            w_hits = watch_hits_by_index.get(idx, [])
+            d_hits = deny_hits_by_index.get(idx, [])
+
+            if w_hits:
+                w_factor = min(0.85 + 0.05 * (len(w_hits) - 1), 0.95)
+                likelihoods[idx] *= w_factor
+                for j in range(n):
+                    if j != idx:
+                        likelihoods[j] *= (1.0 - w_factor)
+                notes.append(f"H{idx+1} watch hit (+Bayes): {w_hits[:2]}")
+
+            if d_hits:
+                d_factor = max(0.10 - 0.02 * (len(d_hits) - 1), 0.02)
+                likelihoods[idx] *= d_factor
+                for j in range(n):
+                    if j != idx:
+                        likelihoods[j] *= 0.45
+                notes.append(f"H{idx+1} deny hit (-Bayes): {d_hits[:2]}")
+
+        numerators = [likelihoods[i] * priors[i] for i in range(n)]
+        marginal_likelihood = sum(numerators)
+
+        if marginal_likelihood <= 0:
+            posteriors = priors
+        else:
+            posteriors = [num / marginal_likelihood for num in numerators]
+
+        pcts = [round(p * 100) for p in posteriors]
+        diff = 100 - sum(pcts)
+        if pcts:
+            pcts[0] += diff
+
+        updated_hypotheses = []
+        for i, h in enumerate(hypotheses):
+            h_copy = dict(h)
+            h_copy["probability"] = max(0, min(100, pcts[i]))
+            updated_hypotheses.append(h_copy)
+
+        leading_posterior = max(posteriors) if posteriors else 0.5
+        overall_confidence = int(round(leading_posterior * 100))
+
+        audit_str = "; ".join(notes) if notes else "Bayesian baseline intact"
+        return updated_hypotheses, overall_confidence, audit_str
+

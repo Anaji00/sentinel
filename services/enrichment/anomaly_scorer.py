@@ -245,17 +245,13 @@ class DynamicAnomalyScorer:
                 scores = [0.0] * len(features_list)
                 if valid_seqs:
                     input_name = session.get_inputs()[0].name
-                    reconstructed_list = []
-                    for seq in valid_seqs:
-                        x_single = np.array([seq], dtype=np.float32)
-                        try:
-                            pred_single = await loop.run_in_executor(None, session.run, None, {input_name: x_single})
-                            reconstructed_list.append(pred_single[0][0])
-                        except Exception:
-                            reconstructed_list.append(seq)
-                    
                     X = np.array(valid_seqs, dtype=np.float32)
-                    reconstructed_X = np.array(reconstructed_list, dtype=np.float32)
+                    try:
+                        predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
+                        reconstructed_X = np.array(predictions[0], dtype=np.float32)
+                    except Exception:
+                        reconstructed_X = X
+                    
                     reconstruction_errors = np.mean(np.square(X - reconstructed_X), axis=(1, 2))
                     
                     for i, err in zip(valid_idx, reconstruction_errors):

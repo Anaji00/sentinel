@@ -312,21 +312,20 @@ class QuantTradingEngine(SentinelAgent):
         )
         cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
 
-        user_prompt = f"""
-        Research anomalous instrument movement:
-        - Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
-        - Global Context: {global_context}
-        {cross_block}
-        - News Context: {json.dumps(news_context[:5], default=str)}
-        - Graph Context: {json.dumps(graph_context[:5], default=str)}
+        user_prompt = f"""=== ANOMALOUS INSTRUMENT RESEARCH ===
+Target Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
+Global Context: {global_context}
+{cross_block}
+Recent News: {json.dumps(news_context[:3], default=str)}
+Entity Graph: {json.dumps(graph_context[:3], default=str)}
 
-        Identify correlated peers, macro instruments, and catalyst categories. Return raw JSON.
-        """
+INSTRUCTIONS:
+Discover correlated equity/macro peers, macro instruments, and structural catalysts. Return raw JSON matching schema:"""
 
         try:
             discovery: PeerDiscovery = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You are SENTINEL Quant Researcher. Discover correlated peers and macro drivers. Return ONLY raw JSON.",
+                system_prompt="You are SENTINEL Quant Researcher. Discover correlated equity/macro peers and structural catalysts. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=PeerDiscovery,
                 temperature=0.15,
@@ -482,23 +481,20 @@ class QuantTradingEngine(SentinelAgent):
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=3)
         cross_block = f"\n        CROSS-AGENT INTELLIGENCE:\n        {cross_context}\n" if cross_context else ""
 
-        user_prompt = f"""
-        Formulate investment advisory signal for {ticker}:
-        INDICATORS & RISK METRICS:
-        {json.dumps(indicators_data, separators=(',', ':'), default=str)}
-        MACRO REGIME: {rates_regime}
-        {cross_block}
-        HARD RISK CONSTRAINTS (MANDATORY):
-        - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
-        - Computed Half-Kelly Allocation Limit: {kelly_pct * 100:.1f}%
-        - Constraint: You MUST set kelly_allocation_pct <= {kelly_pct * 100:.1f}% for all trading signals. Do not exceed this allocation.
-        - Strategy Mandate: Specify action ("BUY", "SELL", "HOLD") and trade_type ("Long/Buy", "Short/Sell", "Scalp/Buy", "Swing/Long", etc.) with explicit entry_level, target_price, and stop_loss targets.
-        """
+        user_prompt = f"""=== FINANCIAL ADVISORY & RISK EVALUATION ===
+Target Instrument: {ticker} | Macro Regime: {rates_regime}
+Risk Indicators: {json.dumps(indicators_data, separators=(',', ':'), default=str)}
+{cross_block}
+HARD RISK CONSTRAINTS (MANDATORY):
+- Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
+- Max Half-Kelly Allocation: {kelly_pct * 100:.1f}% (Set kelly_allocation_pct <= {kelly_pct * 100:.1f}%)
+- Specify action (BUY/SELL/HOLD), trade_type, entry_level, target_price, and stop_loss targets.
+Return raw JSON matching schema:"""
 
         try:
             brief: FinancialAdviceBrief = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You are SENTINEL Quant Advisor. Formulate high-conviction trading plays and risk parameters. Return ONLY raw JSON.",
+                system_prompt="You are SENTINEL Chief Quant Risk Strategist. Formulate high-conviction quantitative trade recommendations with strict risk limits. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=FinancialAdviceBrief,
                 temperature=0.1,

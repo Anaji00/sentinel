@@ -91,29 +91,22 @@ class RuleSynthesizerAgent(SentinelAgent):
             self.logger.debug(f"Synthesizing rules based on macro shift: {summary}")
             prompt_context = f"A new macro intelligence brief has been issued:\nSUMMARY: {summary}\nENTITIES: {entities}"
 
-        if not summary:
-            return
+        prompt = f"""=== SYNTHETIC RULE GENERATION ===
+{prompt_context}
 
-        prompt = f"""
-        You are the Sentinel Rule Engine Architect.
-        {prompt_context}
-        
-        Synthesize up to 3 JSON correlation rules that the correlation engine should actively look for.
-        For example, if tensions are rising in the Red Sea, create a rule that triggers on "vessel_dark" 
-        with a condition region "Red Sea" and correlates with "options_flow" tagged "energy" in the last 96 hours.
-        Another example: If a macro divergence occurs (e.g., Oil spikes), create a rule that triggers on "market_anomaly" for the commodity and correlates with "market_anomaly" for inversely exposed equities.
-        
-        Return a RuleList containing DynamicRule objects.
-        Valid event_types: vessel_dark, options_flow, futures_cot, headline, bgp_anomaly, prediction_market_trade, market_anomaly, equity_block, market_candle
-        """
+DIRECTIVES:
+Synthesize up to 3 JSON correlation rules for the SENTINEL evaluation engine.
+- Valid trigger_event_type: vessel_dark, options_flow, futures_cot, headline, bgp_anomaly, prediction_market_trade, market_anomaly, equity_block, market_candle.
+- Alert tiers: WATCH | ALERT | ELEVATED | INTELLIGENCE | CRITICAL.
+- Return raw JSON matching RuleList schema with "rules": [{{"rule_id": "syn_1", "rule_name": "...", "trigger_event_type": "...", "conditions": {{}}, "correlations": [], "alert_tier": "ALERT", "tags": []}}]:"""
         
         try:
             response = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You write JSON DSL rules for a generic evaluation engine.",
+                system_prompt="You are SENTINEL Rule Architect. Synthesize precise JSON DSL correlation rules for real-time anomaly detection. Return ONLY raw JSON.",
                 user_prompt=prompt,
                 schema=RuleList,
-                temperature=0.3
+                temperature=0.2
             )
             
             if hasattr(response, "rules") and response.rules:

@@ -145,3 +145,43 @@ async def test_dynamic_rule_trigger_matching_list_and_string():
     assert matched.primary_entity_id == "AAPL"
     assert matched.primary_entity_name == "Apple Inc"
     assert matched.alert_tier == AlertTier.ELEVATED
+
+
+@pytest.mark.anyio
+async def test_context_builder_builds_full_package():
+    """Verify ContextBuilder fetches and structures events, graph, bulletins, and consensus."""
+    from services.reasoning.context_builder import ContextBuilder
+
+    mock_db = AsyncMock()
+    mock_db.query_one.return_value = {
+        "event_id": "evt_trig_100",
+        "type": "equity_block",
+        "occurred_at": datetime.now(timezone.utc),
+        "source": "tradfi",
+        "region": "GLOBAL",
+        "primary_entity_id": "NVDA",
+        "primary_entity_name": "NVIDIA Corporation",
+        "headline": "Large Block Trade",
+        "anomaly_score": 0.82,
+        "tags": ["equity_block"],
+    }
+    mock_db.query.return_value = []
+
+    builder = ContextBuilder(mock_db)
+
+    cluster = CorrelationCluster(
+        rule_id="RULE_NVDA_01",
+        rule_name="Nvidia Insider & Options Surge",
+        alert_tier=AlertTier.CRITICAL,
+        trigger_event_id="evt_trig_100",
+        entity_ids=["NVDA"],
+        entity_names=["NVIDIA Corporation"],
+        description="Nvidia options surge correlated with dark pool volume",
+    )
+
+    ctx = await builder.build(cluster)
+    assert "correlation" in ctx
+    assert ctx["correlation"]["rule"] == "Nvidia Insider & Options Surge"
+    assert ctx["trigger_event"]["primary_entity_id"] == "NVDA"
+    assert "active_bulletins" in ctx
+    assert "consensus_analysis" in ctx

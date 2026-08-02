@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 

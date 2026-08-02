@@ -20,6 +20,54 @@ def test_raw_event_auto_generates_fields():
     assert type(event.event_id) == str
     assert event.collected_at is not None
     assert event.source == "news_scraper"
+    assert event.envelope is not None
+    assert event.envelope.source_id == "news_scraper"
+    assert event.envelope.payload == {"title": "Test Headline"}
+    assert event.envelope.payload_hash != ""
+
+
+def test_raw_ingest_envelope_auto_generates_fields_and_sha256_hash():
+    """Test that RawIngestEnvelope computes source_id, ISO8601 ingest_timestamp, and SHA-256 payload_hash."""
+    from shared.models.events import RawIngestEnvelope, compute_payload_hash
+
+    raw_payload = {"ticker": "AAPL", "price": 180.5, "volume": 1000}
+    env = RawIngestEnvelope(source_id="alpaca_options", payload=raw_payload)
+
+    assert env.source_id == "alpaca_options"
+    assert "T" in env.ingest_timestamp
+    assert env.payload_hash == compute_payload_hash(raw_payload)
+
+    # Test alias fallback from source / raw_payload
+    env_alias = RawIngestEnvelope(source="aisstream", raw_payload={"mmsi": "123456789"})
+    assert env_alias.source_id == "aisstream"
+    assert env_alias.payload == {"mmsi": "123456789"}
+    assert env_alias.payload_hash == compute_payload_hash({"mmsi": "123456789"})
+
+
+def test_raw_event_preserves_primary_entity_names_end_to_end():
+    """Verify RawEvent integration and that primary entity names are preserved upon normalization."""
+    from shared.models.events import RawEvent, NormalizedEvent, EventType, Entity, EntityType
+
+    raw = RawEvent(
+        source_id="coinbase_spot",
+        raw_payload={"symbol": "BTC-USD", "price": 65000.0, "entity_name": "Bitcoin Core"}
+    )
+    assert raw.source_id == "coinbase_spot"
+    assert raw.envelope is not None
+    assert raw.envelope.source_id == "coinbase_spot"
+
+    norm = NormalizedEvent(
+        type=EventType.CRYPTO_TRADE,
+        occurred_at=datetime.now(timezone.utc),
+        source=raw.source_id,
+        primary_entity=Entity(id="BTC-USD", name="Bitcoin Core", type=EntityType.INSTRUMENT),
+        anomaly_score=0.3
+    )
+
+    assert norm.primary_entity.id == "BTC-USD"
+    assert norm.primary_entity.name == "Bitcoin Core"
+    assert "Bitcoin Core" in norm.to_readable_summary()
+
 
 
 def test_normalized_event_rejects_invalid_anomaly_score():

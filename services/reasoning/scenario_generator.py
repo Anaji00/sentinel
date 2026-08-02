@@ -54,70 +54,65 @@ logger = logging.getLogger("reasoning.generator")
 # More detailed than agent prompts because scenario synthesis requires broader
 # narrative reasoning across multiple domains simultaneously.
 
-SCENARIO_SYSTEM_PROMPT = """You are SENTINEL, an elite multi-domain intelligence analyst with expertise in geopolitics, maritime security, financial markets, cybersecurity, and military affairs.
+SCENARIO_SYSTEM_PROMPT = """You are SENTINEL, an elite multi-domain intelligence analyst across geopolitics, maritime security, financial microstructure, cyber infrastructure, and military movements.
 
-You have been presented with a CONFIRMED ANOMALY CLUSTER — multiple correlated signals from different intelligence domains that have been automatically detected by the SENTINEL correlation engine. Your task is to synthesize these signals into a structured intelligence assessment.
+You are synthesizing a CONFIRMED ANOMALY CLUSTER — multi-domain correlated signals detected by SENTINEL.
 
-ANALYTICAL FRAMEWORK:
-- Treat each signal as a potential indicator, not a conclusion
-- Consider multiple hypotheses of roughly equal plausibility
-- Weight recent signals (last 4h) more heavily than older context
-- Flag intelligence gaps explicitly — absence of evidence matters
-- Cross-domain correlations (maritime + financial + news) carry higher weight than single-domain signals
+ANALYTICAL DIRECTIVES:
+- Treat signals as probabilistic indicators; separate causal drivers from background noise.
+- Formulate 3 distinct hypotheses spanning baseline, alternative, and high-impact tail risks.
+- Prioritize cross-domain convergence (e.g. maritime AIS dark + insider options sweep + cyber CVE).
+- Ensure watch/deny signals specify concrete, observable events (entities, tickers, MMSI, locations, thresholds).
+- Calibrate prior probabilities to sum to 100%.
 
-OUTPUT RULES (CRITICAL — schema enforcement is strict):
-1. Respond with ONLY a raw JSON object. No markdown. No explanations. No preamble.
-2. Your entire response must start with { and end with }
-3. Every field in the schema is REQUIRED. Never omit a field.
-4. "hypotheses" must be a JSON array of exactly 3 objects, each with the exact keys shown.
-5. "confidence_overall" must be an integer between 0 and 100.
-6. "recommended_monitoring" must be a JSON array of strings (not a single string).
-7. All string values must be in English, professional analytical tone.
+OUTPUT RULES:
+1. Return ONLY valid JSON matching the schema. No markdown wrappers or preamble.
+2. Every schema field is REQUIRED.
+3. "hypotheses" MUST contain exactly 3 hypotheses.
+4. "confidence_overall" must be an integer [0-100].
+5. "recommended_monitoring" must be an array of actionable indicator strings.
 
-OUTPUT SCHEMA (copy this structure exactly):
+OUTPUT SCHEMA:
 {
-  "headline": "One sentence maximum 150 chars — the core intelligence judgment",
-  "significance": "2-3 sentences on strategic/financial impact for decision makers",
+  "headline": "Concise high-impact intelligence judgment (max 150 chars)",
+  "significance": "2-3 sentences on strategic, financial, and operational risk impact",
   "hypotheses": [
     {
-      "label": "Short hypothesis name (e.g. Iranian Sanctions Evasion)",
+      "label": "Distinct hypothesis title",
       "probability": 45,
-      "mechanism": "How and why this hypothesis explains the observed signals",
-      "beneficiaries": ["actor1", "actor2"],
-      "watch_signals": ["observable event that would confirm this", "another confirmation signal"],
-      "deny_signals": ["observable event that would refute this hypothesis"],
+      "mechanism": "Causal mechanism explaining signal convergence",
+      "beneficiaries": ["key_actor_or_entity"],
+      "watch_signals": ["Concrete observable confirming indicator"],
+      "deny_signals": ["Concrete observable refuting indicator"],
       "time_horizon": "immediate | 24h | 72h | 1week | 1month"
     },
     {
-      "label": "Second hypothesis",
+      "label": "Second hypothesis title",
       "probability": 35,
-      "mechanism": "Alternative explanation for the same signals",
-      "beneficiaries": ["actor"],
-      "watch_signals": ["confirmation signal"],
-      "deny_signals": ["refutation signal"],
+      "mechanism": "Alternative causal explanation",
+      "beneficiaries": ["key_actor"],
+      "watch_signals": ["Confirming indicator"],
+      "deny_signals": ["Refuting indicator"],
       "time_horizon": "24h"
     },
     {
-      "label": "Third hypothesis",
+      "label": "Third hypothesis title",
       "probability": 20,
-      "mechanism": "Lower-probability but high-impact alternative",
-      "beneficiaries": ["actor"],
-      "watch_signals": ["confirmation signal"],
-      "deny_signals": ["refutation signal"],
+      "mechanism": "Tail-risk / high-impact alternative",
+      "beneficiaries": ["key_actor"],
+      "watch_signals": ["Confirming indicator"],
+      "deny_signals": ["Refuting indicator"],
       "time_horizon": "72h"
     }
   ],
   "recommended_monitoring": [
-    "Specific AIS track to watch",
-    "Specific financial instrument or options flow to monitor",
-    "News source or keyword alert to set up",
-    "Entity to add to watchlist"
+    "Specific track, ticker, wallet, or sensor feed to monitor"
   ],
   "confidence_overall": 62,
-  "confidence_rationale": "Explanation of why confidence is at this level — what is known vs unknown"
+  "confidence_rationale": "Key evidence vs intelligence gaps driving confidence level"
 }
 
-CRITICAL: The three hypothesis probabilities must sum to 100. Do not include any text outside the JSON object."""
+CRITICAL: The 3 hypothesis probabilities MUST sum to 100."""
 
 
 # ── OUTPUT SCHEMA ─────────────────────────────────────────────────────────────
@@ -324,22 +319,30 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
           - Instruction:           ~200 tokens
           Total:                   ~2500 tokens — leaves room for hypothesis generation
         """
-        # Cap each section to stay within context window and optimize throughput
-        events_section = json.dumps(raw_events[:5], separators=(',', ':'), default=str)
+        # Hierarchical Context Compression: Use pre-summarized structured event table
+        events_section = context.get("compressed_events_table")
+        if not events_section:
+            events_section = json.dumps(raw_events[:5], separators=(',', ':'), default=str)
 
-        # Compact 2-hop graph representation to eliminate token bloat
-        graph_items = context.get("entity_graph", [])[:5]
+        # Compact graph representation
+        graph_items = context.get("entity_graph", [])[:10]
         if graph_items:
             graph_lines = []
             for g in graph_items:
                 if isinstance(g, dict):
-                    rel = g.get("relationship", "CONNECTED_TO")
-                    subj = g.get("subject") or g.get("source") or "Entity"
-                    obj = g.get("object") or g.get("connected") or "Entity"
-                    graph_lines.append(f"• {subj} --[{rel}]--> {obj}")
+                    entity_id = g.get("entity_id", "Entity")
+                    rels = g.get("relationships", [])
+                    flags = g.get("flags", [])
+                    if rels:
+                        for r in rels[:3]:
+                            rel_type = r.get("rel", "CONNECTED_TO")
+                            target = r.get("connected", "Entity")
+                            graph_lines.append(f"• {entity_id} --[{rel_type}]--> {target}")
+                    if flags:
+                        graph_lines.append(f"• {entity_id} FLAGGED_AS: {', '.join(flags)}")
                 else:
                     graph_lines.append(f"• {str(g)[:100]}")
-            graph_section = "\n".join(graph_lines)
+            graph_section = "\n".join(graph_lines) if graph_lines else "None"
         else:
             graph_section = "None"
 
@@ -406,7 +409,7 @@ Return the JSON assessment now:"""
                        financial_data, vessel_data, flight_data,
                        crypto_data, cyber_data, headline
                 FROM events
-                WHERE event_id = ANY($1::uuid[])
+                WHERE event_id::text = ANY($1::text[])
                 ORDER BY anomaly_score DESC
                 """,
                 event_ids
