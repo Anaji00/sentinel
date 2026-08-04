@@ -95,15 +95,30 @@ class MaritimeEnricher:
                 
         features_list = []
         entities = []
+        lats_list = []
+        lons_list = []
+        speeds_list = []
+        headings_list = []
+        timestamps_list = []
+        extra_features_list = []
         for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel in zip(parsed, vessels):
             from shared.utils.regions import get_region_sensitivity_multiplier
             reg_mult = get_region_sensitivity_multiplier(region) if region else 1.0
             nav_anomaly = 1.0 if nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")) else 0.0
             is_sanctioned = 1.0 if vessel.get("flags") else 0.0
-            features_list.append([speed, float(is_sanctioned), float(reg_mult), float(nav_anomaly), 0.0])
-            entities.append(mmsi)
             
-        scores = await self.scorer.score_event_batch("vessel_position", entities, features_list)
+            entities.append(mmsi)
+            lats_list.append(lat)
+            lons_list.append(lon)
+            speeds_list.append(speed)
+            headings_list.append(heading)
+            timestamps_list.append((raw.occurred_at or datetime.now(timezone.utc)).timestamp())
+            extra_features_list.append([float(is_sanctioned), float(reg_mult), float(nav_anomaly)])
+            
+        scores = await self.scorer.score_kinematic_event_batch(
+            entities, lats_list, lons_list, speeds_list, headings_list,
+            timestamps_list, extra_features_list,
+        )
         
         # Batch watchlist & frequency checks concurrently to avoid sequential awaits blocking
         check_tasks = []

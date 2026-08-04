@@ -97,9 +97,10 @@ class CyberEnricher:
     Translates raw cyber security alerts into standardized NormalizedEvents.
     """
     def __init__(self, scorer, redis_client, graph_writer, resolver=None):
+        self.scorer = scorer
         self.graph = graph_writer
         self.redis = redis_client
-        self.cyber_scorer = scorer if (scorer is not None and hasattr(scorer, "load_thresholds")) else CyberThreatScorer(redis_client)
+        self.cyber_scorer = CyberThreatScorer(redis_client)
     
     async def _calculate_velocity(self, category: str, entity_id: str, threshold: int = 100) -> float:
         """Processes Redis velocity hits."""
@@ -157,6 +158,7 @@ class CyberEnricher:
         hijack = p.get("is_hijack", False)
         country = (p.get("country_code") or "")[:2].upper()
         as_name = p.get("as_name", f"AS{origin}")
+        as_path = p.get("as_path", [])
         
         if not prefix: return None
         
@@ -165,10 +167,26 @@ class CyberEnricher:
         
         entity_id = f"AS{origin}"
         vel = await self._calculate_velocity("bgp", entity_id, threshold=50) if not hijack else 0.0
-        anomaly = self.cyber_scorer.score_bgp(hijack, vel)
+        
+        # Graph-topology-aware BGP scoring:
+        # Queries Neo4j for betweenness centrality, degree, path novelty, and
+        # feeds structural features into the RRCF streaming detector instead
+        # of flat (is_hijack, velocity_score) pair.
+        bgp_result = await self.scorer.score_bgp_event(
+            origin_as=entity_id,
+            prefix=prefix,
+            is_hijack=hijack,
+            velocity=vel,
+            as_path=as_path if as_path else None,
+        )
+        anomaly = bgp_result["score"]
         if anomaly == 0.0: return None
 
-        tags = ["bgp_anomaly", "routing", "bgp_hijack"] if hijack else ["bgp_anomaly", "routing"]
+        tags = ["bgp_anomaly", "routing"]
+        if hijack:
+            tags.append("bgp_hijack")
+        if bgp_result.get("path_novelty", 0) > 0.9:
+            tags.append("novel_as_path")
         
         entity = Entity(
             id=entity_id, type=EntityType.INFRASTRUCTURE,
@@ -177,11 +195,15 @@ class CyberEnricher:
         )
         await self._propose_ontology({"entity_id": entity_id, "label": "Infrastructure", "confidence": anomaly})
         
+        headline_parts = [f"BGP {'hijack' if hijack else 'anomaly'}: {prefix} via AS{origin}"]
+        if bgp_result.get("path_novelty", 0) > 0.9:
+            headline_parts.append("(NOVEL AS-PATH)")
+        
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.BGP_ANOMALY,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
-            headline=f"BGP {'hijack' if hijack else 'anomaly'}: {prefix} via AS{origin}",
+            headline=" ".join(headline_parts),
             security_data=SecurityData(breach_type="bgp_hijack" if hijack else "bgp_anomaly", affected_org=as_name, ip_address=prefix),
             tags=tags, country_code=country or None, anomaly_score=anomaly
         )

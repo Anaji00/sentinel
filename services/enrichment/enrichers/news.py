@@ -276,19 +276,30 @@ class NewsEnricher:
         unique_entities = list(dict.fromkeys(named_entities))
         tags.extend(unique_entities)
             
-        # Rigorous Mathematical Anomaly Scoring
-        sentiment_score = abs(float(sentiment or 0.0)) * 0.40
-        rel_weight = min(1.0, max(0.2, float(reliability or 0.8)))
-        entity_score = min(0.30, len(unique_entities) * 0.05)
-        raw_anomaly = (sentiment_score + entity_score) * rel_weight
+        # ── Anomaly Scoring: First Story Detection (TDT novelty) as primary signal ──
+        # Replaces the old sentiment × reliability formula.
+        # "Is this a new story?" is what an intelligence analyst actually wants,
+        # not "how extreme is the sentiment?"
+        anomaly, semantic_tags = await self.scorer.score_news(
+            unique_entities, sentiment, reliability,
+            headline=title, summary=summary,
+        )
 
         if ofac_hits:
-            raw_anomaly = min(1.0, raw_anomaly + 0.40)
+            anomaly = min(1.0, anomaly + 0.40)
 
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
-        # Up news anomaly score to 0.8 for high-priority news intelligence
-        raw_anomaly = min(1.0, max(0.80, raw_anomaly + 0.35 if is_threat else (raw_anomaly + 0.25)))
-        anomaly = round(raw_anomaly, 3)
+        if is_threat:
+            anomaly = min(1.0, max(0.80, anomaly + 0.35))
+        else:
+            anomaly = min(1.0, anomaly + 0.25)
+        anomaly = round(anomaly, 3)
+
+        # Record in Hawkes tracker for cross-domain excitation
+        if anomaly >= 0.5:
+            self.scorer.record_hawkes_event("news")
+
+        tags.extend(semantic_tags)
 
         if anomaly < 0.35:
             return None

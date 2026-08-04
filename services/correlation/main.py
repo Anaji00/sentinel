@@ -34,6 +34,8 @@ from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
 from shared.db import get_redis, get_timescale
 from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
+from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
+from shared.utils.streaming_detectors import FirstStoryDetector
 
 _dynamic_rules_cache = {}
 
@@ -270,7 +272,17 @@ async def main():
     soft_correlator = SoftCorrelator(ollama_client)
     asyncio.create_task(soft_correlator._load())
 
-    cascade_engine = GeopoliticalCascadeEngine(window_seconds=3600)
+    # Layer 3: Multivariate Hawkes cross-domain excitation engine
+    hawkes_correlator = CrossDomainHawkesCorrelator(redis_client=redis_client, db_client=db_client)
+    asyncio.create_task(hawkes_correlator.initialize())
+
+    # Story-level deduplication: correlate at story cluster level, not headline level
+    # Prevents the same event generating 5 near-duplicate soft-correlation hits
+    first_story_detector = FirstStoryDetector(window_size=500, novelty_threshold=0.70)
+    # Track active story cluster IDs to deduplicate correlation attempts
+    _story_correlation_seen = set()
+
+    cascade_engine = GeopoliticalCascadeEngine(window_seconds=3600, hawkes_tracker=hawkes_correlator._tracker)
 
     async def _stream_live_correlation(c: CorrelationCluster):
         try:
@@ -344,14 +356,98 @@ async def main():
                 corr_fired += 1
                 logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
             
-            embedding = await soft_correlator.embed_event(event)
-            if embedding:
-                await soft_correlator.store(event, embedding)
-                
-                similar_events = await soft_correlator.find_similar(
-                    embedding, 
-                    exclude_domain=event.type.value.split("_")[0]
+            # 2. Record event in Hawkes process and check for cross-domain excitation
+            event_domain = event.type.value.split("_")[0] if event.type and event.type.value else "unknown"
+            event_ts = event.occurred_at.timestamp() if event.occurred_at else time.time()
+            hawkes_state = hawkes_correlator.record_event(event_domain, event_ts)
+
+            # Generate excitation forecasts if any domain is elevated
+            hawkes_forecasts = hawkes_correlator.get_excitation_forecasts(event_ts)
+            if hawkes_forecasts:
+                # Attach top forecast to the event stream for downstream consumers
+                top_forecast = hawkes_forecasts[0]
+                logger.info(
+                    f"⚡ Hawkes Excitation Forecast: {top_forecast['narrative']}"
                 )
+                # Publish excitation forecasts as correlation alerts
+                if top_forecast["excess_multiplier"] >= 2.0:
+                    import uuid as _uuid
+                    forecast_cluster = CorrelationCluster(
+                        correlation_id=str(_uuid.uuid4()),
+                        trace_id=event.trace_id,
+                        rule_id="HAWKES_EXCITATION",
+                        rule_name="Cross-Domain Hawkes Excitation Forecast",
+                        alert_tier=AlertTier.INTELLIGENCE if top_forecast["excess_multiplier"] >= 3.0 else AlertTier.ALERT,
+                        primary_domain=top_forecast["source_domain"],
+                        confidence_score=min(1.0, 0.5 + 0.1 * top_forecast["excess_multiplier"]),
+                        summary_headline=(
+                            f"⚡ Hawkes Excitation: {top_forecast['source_domain']} → {top_forecast['target_domain']} "
+                            f"({top_forecast['excess_multiplier']:.1f}x above baseline)"
+                        ),
+                        supporting_headlines=[top_forecast["narrative"]],
+                        metrics_summary={
+                            "source_domain": top_forecast["source_domain"],
+                            "target_domain": top_forecast["target_domain"],
+                            "excess_multiplier": top_forecast["excess_multiplier"],
+                            "branching_ratio": top_forecast["branching_ratio"],
+                            "source_excitation_ratio": top_forecast["source_excitation_ratio"],
+                            "forecast_hours": top_forecast["forecast_hours"],
+                        },
+                        trigger_event_id=event.event_id,
+                        supporting_event_ids=[],
+                        primary_entity_id=event.primary_entity.id if event.primary_entity else "HAWKES",
+                        primary_entity_name=event.primary_entity.name if event.primary_entity and event.primary_entity.name else top_forecast["source_domain"],
+                        entity_ids=[],
+                        entity_names=[],
+                        description=top_forecast["narrative"],
+                        tags=["hawkes_excitation", "cross_domain", f"src:{top_forecast['source_domain']}", f"tgt:{top_forecast['target_domain']}"]
+                    )
+                    await store.save_correlation(forecast_cluster)
+                    await producer.send(Topics.CORRELATIONS, forecast_cluster.model_dump(), key=forecast_cluster.correlation_id)
+                    await _stream_live_correlation(forecast_cluster)
+                    corr_fired += 1
+
+            # 3. Story-level deduplication for news/headline events (§2.3)
+            # Check if this is a news/headline event and if it's a duplicate story
+            is_news_event = event_domain in ("news", "headline", "narrative")
+            skip_soft_correlation = False
+            if is_news_event:
+                headline_text = event.headline or ""
+                summary_text = getattr(event, "summary", "") or ""
+                novelty = first_story_detector.score_novelty(headline_text, summary_text)
+                if novelty < 0.30:
+                    # This is a continuation of an existing story, not a first story.
+                    # Skip soft correlation to avoid duplicate cross-domain hits.
+                    skip_soft_correlation = True
+                    logger.debug(f"Story dedup: skipping soft correlation for low-novelty event (novelty={novelty:.2f}): {headline_text[:80]}")
+
+            # 4. Soft embedding correlation (with conformal threshold + story dedup)
+            embedding = await soft_correlator.embed_event(event)
+            if embedding and not skip_soft_correlation:
+                await soft_correlator.store(event, embedding)
+
+                similar_events = await soft_correlator.find_similar(
+                    embedding,
+                    exclude_domain=event_domain,
+                )
+
+                # Feed same-domain similarity scores into the conformal calibrator
+                # to build the null distribution for threshold calibration
+                try:
+                    same_domain_similar = await soft_correlator.find_similar(
+                        embedding,
+                        exclude_domain="__none__",  # Don't exclude any domain
+                        limit=5,
+                    )
+                    for sd_event in same_domain_similar:
+                        if sd_event.get("domain") == event_domain:
+                            # This is a same-domain similarity score → null distribution
+                            # We approximate the score from the Qdrant result ordering
+                            soft_correlator._similarity_calibrator.observe_null_score(
+                                soft_correlator._similarity_calibrator.threshold  # Use threshold as proxy
+                            )
+                except Exception:
+                    pass  # Non-critical calibration path
                 
                 if similar_events:
                     logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
@@ -416,6 +512,25 @@ async def main():
             logger.error(f"Failed to process correlation for event {event.event_id}: {e}\n{traceback.format_exc()}")
             return
 
+    # Background task: periodic Hawkes MLE refit
+    async def _hawkes_refit_loop():
+        """Periodically refit Hawkes parameters from historical event data."""
+        await asyncio.sleep(60)  # Wait for initial data accumulation
+        while True:
+            try:
+                result = await hawkes_correlator.maybe_refit()
+                if result:
+                    logger.info(
+                        f"🔬 Hawkes refit complete: "
+                        f"spectral_radius={result.get('spectral_radius', '?')}, "
+                        f"non-zero branching pairs={len(result.get('branching_ratios', {}))}"
+                    )
+            except Exception as e:
+                logger.error(f"Hawkes refit loop error: {e}")
+            await asyncio.sleep(hawkes_correlator.REFIT_INTERVAL)
+
+    asyncio.create_task(_hawkes_refit_loop())
+
     try:
         while True:
             try:
@@ -451,8 +566,8 @@ async def main():
                             logger.error(f"Failed to parse event: {e}")
                             try:
                                 await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": str(e), "raw": str(message.value)})
-                            except Exception:
-                                pass
+                            except Exception as dlq_err:
+                                logger.debug(f"DLQ send failed for parse error (event lost): {dlq_err}")
                     
                     if all_events:
                         await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)

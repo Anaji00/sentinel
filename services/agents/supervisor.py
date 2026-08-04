@@ -9,6 +9,20 @@ from shared.kafka import Topics
 
 logger = logging.getLogger("agent.supervisor")
 
+# ── SECURITY AUDIT (§3.4) ────────────────────────────────────────────────────
+# Cypher injection surface: All non-parameterizable Cypher elements (labels,
+# relation types) are regex-whitelisted (^[A-Za-z0-9]+$) before f-string
+# interpolation. All property values use query parameters ($name, $id, etc.).
+# ALLOWED_RELATIONS is a fixed allowlist — LLM-derived relation types MUST
+# match this set or be rejected.
+#
+# Concurrency: Agent dispatch uses _dispatch_semaphore (default: 5 inflight
+# tasks, configurable via AGENT_CONCURRENCY env var). This limits Ollama
+# concurrency to prevent thread pool starvation. If §3.2/§3.3 increase
+# proposal volume, monitor this bound and adjust AGENT_CONCURRENCY
+# accordingly. The semaphore is in base.py SentinelAgent.__init__.
+# ─────────────────────────────────────────────────────────────────────────────
+
 ALLOWED_RELATIONS = {
     "RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", 
     "HAS_EXPOSURE_IN", "CORRELATED_WITH", "SUPPLIES", "PURCHASES_FROM", 
@@ -125,7 +139,14 @@ class GraphSupervisor(SentinelAgent):
             logger.error(f"UNWIND batch commit failed: {e}")
 
     async def execute_proposal(self, payload: dict):
-        """Safely maps trusted JSON structs to parameterized Cypher queries."""
+        """Maps trusted JSON structs to Cypher queries.
+
+        Note: Cypher does not support parameterizing labels or relation
+        types.  Non-parameterizable elements (labels, relation types) are
+        strictly regex-whitelisted (``^[A-Za-z0-9]+$``) and validated
+        prior to f-string interpolation, while all property values and
+        identifiers are passed via query parameters.
+        """
         entity_id = payload.get("entity_id")
         action = payload.get("action") 
         data = payload.get("data", {})
@@ -161,6 +182,12 @@ class GraphSupervisor(SentinelAgent):
                 source_label = data.get("source_label", "Entity")
                 target_label = data.get("target_label", "Entity")
                 relation = data.get("relation_type", "RELATED_TO").upper()
+
+                # Sanitize labels — Cypher labels cannot be parameterized
+                if not re.match(r"^[A-Za-z0-9]+$", source_label):
+                    source_label = "Entity"
+                if not re.match(r"^[A-Za-z0-9]+$", target_label):
+                    target_label = "Entity"
                 
                 if relation not in ALLOWED_RELATIONS:
                     logger.warning(f"Rejected invalid LLM graph relation type: {relation}")
@@ -178,6 +205,9 @@ class GraphSupervisor(SentinelAgent):
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
                 label = data.get("label", "Entity")
+                # Sanitize label — Cypher labels cannot be parameterized
+                if not re.match(r"^[A-Za-z0-9]+$", label):
+                    label = "Entity"
                 if not tags: return
 
                 cypher = f"""

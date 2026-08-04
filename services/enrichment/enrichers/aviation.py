@@ -70,8 +70,17 @@ class AviationEnricher:
         elif is_sanctioned:
             score = 0.80 # High alert for OFAC sanctioned flight
         else:
-            # Baseline flight behavior (no ML scoring for simple positions)
-            score = 0.10
+            # Kinematic Kalman prediction residual + RRCF scoring
+            speed = float(p.get("velocity") or p.get("speed") or 0.0)
+            heading = float(p.get("true_track") or p.get("heading") or 0.0)
+            ts = (raw.occurred_at or datetime.now(timezone.utc)).timestamp()
+            alt_norm = float(p.get("baro_altitude") or p.get("geo_altitude") or 0.0) / 45000.0
+            
+            res = await self.scorer.score_kinematic_event(
+                icao24, lat=lat or 0.0, lon=lon or 0.0, speed=speed, heading=heading,
+                timestamp=ts, extra_features=[alt_norm]
+            )
+            score = res.get("score", 0.10)
 
         is_watched = await self.scorer.check_watchlist(icao24, "aircraft") or (callsign and await self.scorer.check_watchlist(callsign, "aircraft"))
         w_boost = 0.15 if is_watched else 0.0

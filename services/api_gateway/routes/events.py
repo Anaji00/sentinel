@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 from fastapi import APIRouter, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
-from services.api_gateway.dependencies import get_db, get_redis_client
+from services.api_gateway.dependencies import get_db, get_redis_client, verify_websocket_api_key
 
 logger = logging.getLogger("api-gateway.events")
 router = APIRouter(prefix="/api/v1/events", tags=["Domain Events"])
@@ -113,6 +113,9 @@ import json
 @router.websocket("/ws/live-feed")
 async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0.0)):
     """Real-time WebSocket event stream for zero-latency dashboard visualization."""
+    # Authenticate BEFORE accepting the connection (Phase 1.1)
+    if not await verify_websocket_api_key(websocket):
+        return
     await websocket.accept()
     redis = websocket.app.state.redis
     db = getattr(websocket.app.state, "db", None)
@@ -180,3 +183,4 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
         logger.error(f"WebSocket live feed error: {e}")
     finally:
         await pubsub.unsubscribe("sentinel:events:live")
+        await pubsub.close()

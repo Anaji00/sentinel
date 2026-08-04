@@ -9,19 +9,18 @@ import logging
 from typing import Optional
 from fastapi import Request, WebSocket, HTTPException, Security
 from fastapi.security import APIKeyHeader
+from shared.utils.env_guard import resolve_env_var
 
 logger = logging.getLogger("api-gateway.auth")
 
-API_KEY = os.getenv("API_GATEWAY_KEY")
-if not API_KEY:
-    env_name = os.getenv("SENTINEL_ENV", "dev").lower()
-    if env_name in ("prod", "production", "staging"):
-        raise RuntimeError("CRITICAL SECURITY FAILURE: API_GATEWAY_KEY is not set in environment.")
-    logger.warning("SECURITY WARNING: API_GATEWAY_KEY not set. Falling back to default dev key.")
-    API_KEY = "sentinel-dev-key-2026"
+API_KEY = resolve_env_var("API_GATEWAY_KEY", "sentinel-dev-key-2026", warn_on_fallback=True)
 
 async def verify_api_key(request: Request = None):
-    """Global dependency to lock down all HTTP routes while permitting WebSocket handshakes."""
+    """Global dependency to lock down all HTTP routes.
+    
+    WebSocket connections are NOT validated here — they must use
+    verify_websocket_api_key() before calling websocket.accept().
+    """
     if request is None:
         return None
     if hasattr(request, "scope") and request.scope.get("type") == "websocket":
@@ -35,6 +34,30 @@ async def verify_api_key(request: Request = None):
         logger.warning("Failed authentication attempt: Invalid X-API-KEY header.")
         raise HTTPException(status_code=403, detail="Could not validate API Key")
     return api_key
+
+
+async def verify_websocket_api_key(websocket: WebSocket) -> bool:
+    """Validate API key on a WebSocket handshake BEFORE calling accept().
+
+    Checks the ``X-API-KEY`` header first, then falls back to the
+    ``api_key`` query parameter.  Returns True on success.  On failure,
+    closes the socket with status 4003 and returns False — the caller
+    must ``return`` immediately.
+    """
+    api_key = (
+        websocket.headers.get("X-API-KEY")
+        or websocket.query_params.get("api_key")
+    )
+    if not api_key:
+        await websocket.close(code=4003, reason="X-API-KEY header or api_key query param required")
+        logger.warning("WebSocket rejected: no API key provided.")
+        return False
+    if not hmac.compare_digest(api_key.encode("utf-8"), API_KEY.encode("utf-8")):
+        await websocket.close(code=4003, reason="Invalid API key")
+        logger.warning("WebSocket rejected: invalid API key.")
+        return False
+    return True
+
 
 def get_db(request: Request = None):
     """Retrieves TimescaleDB connection from the global app state."""

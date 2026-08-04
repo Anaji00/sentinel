@@ -57,9 +57,10 @@ class GeopoliticalCascadeEngine:
     Financial Markets, and News Headlines.
     """
 
-    def __init__(self, window_seconds: int = 3600, cooldown_seconds: int = 900):
+    def __init__(self, window_seconds: int = 3600, cooldown_seconds: int = 900, hawkes_tracker=None):
         self.window_seconds = window_seconds
         self.cooldown_seconds = cooldown_seconds
+        self.hawkes_tracker = hawkes_tracker
         # Buffer: {region_key: [(timestamp, context_dict)]}
         self._sliding_window: Dict[str, List[tuple]] = {}
         # Cooldown map: {region_key: last_triggered_timestamp}
@@ -101,7 +102,21 @@ class GeopoliticalCascadeEngine:
 
         # Calculate composite Flashpoint Index (0.0 to 100.0)
         avg_score = sum(e[1]["score"] for e in current_entries) / len(current_entries) if current_entries else 0.0
-        flashpoint_index = round(min(100.0, (len(domains_present) * 25.0) + (avg_score * 50.0)), 1)
+        
+        # Hawkes cross-domain intensity boost (if hawkes_tracker present)
+        hawkes_boost = 0.0
+        if self.hawkes_tracker:
+            try:
+                # Average excitation ratio across present domains
+                ratios = [self.hawkes_tracker.get_excitation_ratio(d, now) for d in domains_present]
+                if ratios:
+                    avg_hawkes = sum(ratios) / len(ratios)
+                    if avg_hawkes > 1.2:
+                        hawkes_boost = min(20.0, (avg_hawkes - 1.0) * 10.0)
+            except Exception as e:
+                logger.debug(f"Hawkes intensity check in cascade engine failed: {e}")
+
+        flashpoint_index = round(min(100.0, (len(domains_present) * 25.0) + (avg_score * 50.0) + hawkes_boost), 1)
 
         # Tightened Cascade Trigger Rules:
         # 1. Multi-domain: at least 2 distinct domains AND flashpoint_index >= 35.0 AND total events >= 2

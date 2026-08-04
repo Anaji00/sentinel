@@ -51,6 +51,9 @@ class PredictionEnricher:
         if anomaly < 0.6:
             return None
 
+        # Record in Hawkes tracker for cross-domain excitation (prediction -> tradfi/crypto)
+        self.scorer.record_hawkes_event("prediction")
+
         tags = ["prediction_market", "whale_bet", slug.lower()]
         headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
 
@@ -115,6 +118,9 @@ class PredictionEnricher:
         # GATEKEEPER: Drop normal volume variance.
         if anomaly_score < 0.6:
             return None
+
+        # Record in Hawkes tracker for cross-domain excitation
+        self.scorer.record_hawkes_event("prediction")
 
         tags = ["kalshi_prediction", "volume_spike", ticker.lower()]
         headline = f"🚨 KALSHI SPIKE: {ticker} (+${notional_usd:,.2f})"

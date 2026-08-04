@@ -91,8 +91,8 @@ async def _consume_loop(consumer, db, session, producer):
                             parsed_raw = json.loads(raw_data)
                             if isinstance(parsed_raw, dict):
                                 raw_data = parsed_raw
-                        except Exception:
-                            pass
+                        except Exception as parse_err:
+                            logger.debug(f"DLQ raw payload JSON parse failed (non-fatal): {parse_err}")
 
                     # Resolve retry count from envelope or nested event payload
                     retry_count = payload.get("retry_count")
@@ -140,8 +140,8 @@ async def _consume_loop(consumer, db, session, producer):
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
                         try:
                             await _send_telegram_alert(session, original_topic, f"FATAL DLQ WORKER DB FAILURE: {e}")
-                        except Exception:
-                            pass
+                        except Exception as alert_err:
+                            logger.debug(f"Telegram alert failed during fatal DB error (notification lost): {alert_err}")
                         sys.exit(1)
  
                     # 3. Rate-Limited Admin Alert

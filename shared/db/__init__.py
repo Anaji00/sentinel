@@ -4,10 +4,10 @@ shared/db/__init__.py
 Database clients. Import these anywhere:
     from shared.db import get_timescale, get_neo4j, get_redis
 
-FIX (code review): TimescaleClient.query() now rolls back and re-raises on
-  exception. Previously a query error returned the connection to the pool
-  in an indeterminate state — no rollback, no re-raise — which would cause
-  pool exhaustion on repeated errors and hide the real failure.
+Note: TimescaleClient.query() uses asyncpg's connection.fetch() which
+  auto-releases the connection back to the pool on completion or error.
+  Write operations (execute/execute_many) are wrapped in explicit
+  transactions for rollback safety.
 """
 
 import logging
@@ -21,13 +21,14 @@ import time
 import redis.asyncio as aioredis
 import asyncpg
 from neo4j import AsyncGraphDatabase as _Neo4j
+from shared.utils.env_guard import resolve_env_var
 
 logger = logging.getLogger(__name__)
 
 # --- Redis Async Client ---
 class RedisClient:
     def __init__(self):
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        redis_url = resolve_env_var("REDIS_URL", "redis://localhost:6379/0")
         if "redis://redis:" in redis_url or "@redis:" in redis_url:
             try:
                 import socket
@@ -79,12 +80,7 @@ class Neo4jClient:
                 self._uri = self._uri.replace("bolt://neo4j:", "bolt://localhost:")
 
         neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-        neo4j_pass = os.getenv("NEO4J_PASSWORD")
-        if not neo4j_pass:
-            env_name = os.getenv("SENTINEL_ENV", "dev").lower()
-            if env_name in ("prod", "production", "staging"):
-                raise RuntimeError("CRITICAL SECURITY FAILURE: NEO4J_PASSWORD environment variable is missing.")
-            neo4j_pass = "sentinel_graph"
+        neo4j_pass = resolve_env_var("NEO4J_PASSWORD", "sentinel_graph")
         self._auth = (neo4j_user, neo4j_pass)
 
     async def connect(self):
@@ -114,13 +110,11 @@ class TimescaleClient:
     def __init__(self):
         self._pool: Optional[asyncpg.Pool] = None
     async def _connect(self, retries: int = 12):
-        dsn = os.getenv("DATABASE_URL")
-        if not dsn:
-            env_name = os.getenv("SENTINEL_ENV", "dev").lower()
-            if env_name in ("prod", "production", "staging"):
-                raise RuntimeError("CRITICAL SECURITY FAILURE: DATABASE_URL environment variable is missing.")
-            dsn = "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel"
-        elif "@timescaledb:" in dsn and not os.path.exists("/.dockerenv"):
+        dsn = resolve_env_var(
+            "DATABASE_URL",
+            "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel",
+        )
+        if "@timescaledb:" in dsn and not os.path.exists("/.dockerenv"):
             try:
                 import socket
                 socket.gethostbyname("timescaledb")

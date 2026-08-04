@@ -116,11 +116,11 @@ services:
     ports:
       - "6379:6379"
     command: >
-      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-sentinel_redis_dev}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: redis-cli ping || exit 1
+      test: redis-cli -a ${REDIS_PASSWORD:-sentinel_redis_dev} ping || exit 1
       interval: 5s
       timeout: 3s
       retries: 15

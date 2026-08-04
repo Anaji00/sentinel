@@ -1,10 +1,19 @@
 import asyncio
 import os
 import json
+import time
 import numpy as np
-import onnxruntime as ort
 import logging
 from shared.utils.metrics import MetricsCollector
+from shared.utils.streaming_detectors import (
+    RRCFDetector,
+    KalmanResidualFilter,
+    HawkesIntensityTracker,
+    FirstStoryDetector,
+    BGPGraphFeatureExtractor,
+    sts_zone_risk_multiplier,
+)
+from shared.utils.model_registry import ModelRegistry, ConformalZScoreCalibrator
 
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -68,11 +77,10 @@ return results
 """
 
 class DynamicAnomalyScorer:
-    def __init__(self, redis_client):
+    def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
         if redis_client is None:
             raise ValueError("Redis client is required for DynamicAnomalyScorer to function properly.")
         self.redis = redis_client
-        self.sessions = {}
         self.alpha = 0.1
         self.z_score_threshold = 1.5
         
@@ -80,21 +88,50 @@ class DynamicAnomalyScorer:
         self._thresholds_last_loaded = 0.0
         self._thresholds_ttl = 60.0  # 60 seconds config cache TTL
 
-        self._load_onnx_models()
-
-    def _load_onnx_models(self):
-        model_dir = "/app/models"
-        model_files = {
-            "spatial": "spatial_iforest.onnx",
-            "temporal": "temporal_lstm.onnx"
+        # ── PER-DOMAIN STREAMING RRCF DETECTORS (§1.1) ───────────────────────
+        # Distinct, independent RRCF models for all 8 Sentinel domains
+        self._rrcf_detectors: Dict[str, RRCFDetector] = {
+            "maritime":   RRCFDetector(num_trees=40, window_size=256),
+            "aviation":   RRCFDetector(num_trees=40, window_size=256),
+            "tradfi":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3),
+            "crypto":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3),
+            "macro":      RRCFDetector(num_trees=30, window_size=256),
+            "cyber":      RRCFDetector(num_trees=30, window_size=128),
+            "news":       RRCFDetector(num_trees=30, window_size=256),
+            "prediction": RRCFDetector(num_trees=30, window_size=256),
         }
-        for domain, filename in model_files.items():
-            model_path = os.path.join(model_dir, filename)
-            try:
-                self.sessions[domain] = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-                logger.info(f"⚡ Loaded ONNX Engine for {domain}: {filename}")
-            except Exception as e:
-                logger.critical(f"🚨 Missing ONNX model: {model_path}. Run train_models.py! Error: {e}")
+
+        # ── CONFORMAL Z-SCORE CALIBRATORS (§1.3) ─────────────────────────────
+        # Per-domain conformal calibrators for dynamic false-alarm rate bounds
+        self._conformal_z_calibrators: Dict[str, ConformalZScoreCalibrator] = {
+            domain: ConformalZScoreCalibrator(domain=domain, target_far=0.05, default_z_threshold=1.5)
+            for domain in self._rrcf_detectors.keys()
+        }
+
+        # ── MODEL REGISTRY (§1.5) ────────────────────────────────────────────
+        self.registry = ModelRegistry(redis_client=redis_client)
+        for domain, detector in self._rrcf_detectors.items():
+            self.registry.register_model(
+                domain=domain,
+                model_type="RRCF",
+                parameters={"num_trees": detector.num_trees, "window_size": detector.window_size},
+                num_samples=0,
+            )
+
+        # Per-entity Kalman filters for kinematic domains (keyed by MMSI/ICAO24)
+        self._kalman_filters: Dict[str, KalmanResidualFilter] = {}
+        self._kalman_max_entities = 10000  # LRU eviction threshold
+
+        # Multivariate Hawkes process tracker (shared across all enrichers)
+        self.hawkes = hawkes_tracker or HawkesIntensityTracker()
+
+        # First Story Detection for news novelty scoring
+        self._fsd = FirstStoryDetector(window_size=500)
+
+        # BGP graph-topology feature extractor
+        self._bgp_extractor = BGPGraphFeatureExtractor(neo4j_client=neo4j_client)
+
+        logger.info("⚡ Per-domain streaming anomaly detectors & ModelRegistry initialized (8 domain RRCFs + Conformal Z + Kalman + Hawkes + FSD + BGP)")
 
     async def _get_thresholds_config(self, key: str) -> dict:
         import time
@@ -114,43 +151,27 @@ class DynamicAnomalyScorer:
         return self._thresholds_cache.get(key, {})
         
     def _get_domain(self, event_type: str) -> str:
-        return "spatial" if event_type in ["vessel_position", "vessel_dark", "bgp_hijack"] else "temporal"
+        """Map event type to explicit per-domain model key (§1.1)."""
+        evt = (event_type or "").lower()
+        if any(k in evt for k in ["vessel", "mmsi", "ais", "dark", "sts"]):
+            return "maritime"
+        elif any(k in evt for k in ["flight", "icao", "adsb", "aircraft"]):
+            return "aviation"
+        elif any(k in evt for k in ["equity", "stock", "option", "tradfi", "financial"]):
+            return "tradfi"
+        elif any(k in evt for k in ["crypto", "token", "liquidation", "candle"]):
+            return "crypto"
+        elif any(k in evt for k in ["macro", "cpi", "gdp", "rate", "fed"]):
+            return "macro"
+        elif any(k in evt for k in ["bgp", "cyber", "dns", "ddos", "hijack"]):
+            return "cyber"
+        elif any(k in evt for k in ["news", "headline", "narrative"]):
+            return "news"
+        elif any(k in evt for k in ["prediction", "polymarket", "kalshi"]):
+            return "prediction"
+        return "tradfi"
 
-    async def _get_temporal_sequence(self, event_type: str, entity_id: str, new_features: list, seq_len: int = 10) -> list:
-        if not self.redis:
-            return [new_features] * seq_len 
 
-        key = f"sentinel:ml:sequence:{event_type}:{entity_id}"
-        pipe = self.redis.raw.pipeline()
-        pipe.lpush(key, json.dumps(new_features))
-        pipe.ltrim(key, 0, seq_len - 1)
-        pipe.lrange(key, 0, -1)
-        results = await pipe.execute()
-
-        raw_items = results[2]
-        sequence = [json.loads(item) for item in raw_items if item]
-        sequence.reverse()
-        return sequence
-
-    async def _get_temporal_sequence_batch(self, event_type: str, entities: list, features_list: list, seq_len: int = 10) -> list:
-        if not self.redis:
-            return [[f] * seq_len for f in features_list]
-            
-        pipe = self.redis.raw.pipeline()
-        for entity_id, new_features in zip(entities, features_list):
-            key = f"sentinel:ml:sequence:{event_type}:{entity_id}"
-            pipe.lpush(key, json.dumps(new_features))
-            pipe.ltrim(key, 0, seq_len - 1)
-            pipe.lrange(key, 0, -1)
-            
-        results = await pipe.execute()
-        sequences = []
-        for i in range(len(entities)):
-            raw_items = results[i*3 + 2]
-            seq = [json.loads(item) for item in raw_items if item]
-            seq.reverse()
-            sequences.append(seq)
-        return sequences
 
     async def _dynamic_normalize(self, ticker: str, feature_name: str, raw_value: float) -> float:
         res = await self._dynamic_normalize_batch([(ticker, feature_name, raw_value)])
@@ -178,6 +199,17 @@ class DynamicAnomalyScorer:
     async def _check_ema_gatekeeper_batch(self, event_type: str, raw_scores: list) -> list:
         if not raw_scores:
             return []
+
+        # Get conformal z-threshold for this domain (§1.3)
+        domain = self._get_domain(event_type)
+        calibrator = self._conformal_z_calibrators.get(domain)
+        z_thresh = calibrator.z_threshold if calibrator else self.z_score_threshold
+
+        # Observe scores to dynamically calibrate conformal threshold
+        if calibrator:
+            for score in raw_scores:
+                calibrator.observe(score)
+
         if not self.redis or not getattr(self.redis, "raw", None):
             return [score > 0.60 for score in raw_scores]
 
@@ -185,7 +217,7 @@ class DynamicAnomalyScorer:
         var_key = f"sentinel:ml:ema_var:{event_type}"
         
         res = await self.redis.raw.eval(
-            EMA_GATEKEEPER_LUA, 2, mean_key, var_key, float(self.alpha), float(self.z_score_threshold), *[float(s) for s in raw_scores]
+            EMA_GATEKEEPER_LUA, 2, mean_key, var_key, float(self.alpha), float(z_thresh), *[float(s) for s in raw_scores]
         )
         return [bool(r) for r in res]
 
@@ -203,70 +235,280 @@ class DynamicAnomalyScorer:
         return res[0]
         
     async def score_event_batch(self, event_type: str, entities: list, features_list: list) -> list:
+        """Score events using streaming RRCF detectors (replaces ONNX IsolationForest)."""
         domain = self._get_domain(event_type)
-        session = self.sessions.get(domain)
+        detector = self._rrcf_detectors.get(domain)
         
-        if not session or not features_list:
-            MetricsCollector.increment("onnx_scoring_uninitialized_total")
-            MetricsCollector.increment(f"onnx_scoring_uninitialized_{domain}")
-            return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
+        if not detector or not features_list:
+            MetricsCollector.increment("streaming_scoring_uninitialized_total")
+            return [{"score": 0.5, "is_significant": False, "domain": domain, "scoring_degraded": True}
+                    for _ in features_list]
             
         try:
             loop = asyncio.get_running_loop()
-            input_name = session.get_inputs()[0].name
+            points = [np.array(f, dtype=np.float32) for f in features_list]
             
-            if domain == "spatial":
-                X = np.array(features_list, dtype=np.float32)
-                predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                
-                raw_outputs = predictions[1]
-                scores = []
-                for out in raw_outputs:
-                    if isinstance(out, dict):
-                        scores.append(float(out.get(-1, 0.5)))
-                    else:
-                        val = float(np.atleast_1d(out)[0])
-                        scores.append(max(0.0, 0.5 - val))
-                        
-                is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
-                return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
-                
-            else:
-                seq_len = 10
-                sequences = await self._get_temporal_sequence_batch(event_type, entities, features_list, seq_len)
-                
-                valid_idx = []
-                valid_seqs = []
-                for i, seq in enumerate(sequences):
-                    if len(seq) == seq_len:
-                        valid_idx.append(i)
-                        valid_seqs.append(seq)
-                        
-                scores = [0.0] * len(features_list)
-                if valid_seqs:
-                    input_name = session.get_inputs()[0].name
-                    X = np.array(valid_seqs, dtype=np.float32)
-                    try:
-                        predictions = await loop.run_in_executor(None, session.run, None, {input_name: X})
-                        reconstructed_X = np.array(predictions[0], dtype=np.float32)
-                    except Exception:
-                        reconstructed_X = X
-                    
-                    reconstruction_errors = np.mean(np.square(X - reconstructed_X), axis=(1, 2))
-                    
-                    for i, err in zip(valid_idx, reconstruction_errors):
-                        scores[i] = float(1.0 - np.exp(-err))
-                        
-                is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
-                return [{"score": round(s, 4), "is_significant": sig, "domain": domain} for s, sig in zip(scores, is_significant_list)]
+            # RRCF insert is sequential per-tree but fast (~0.1ms per point per tree)
+            scores = await loop.run_in_executor(None, detector.insert_batch, points)
+            
+            is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
+            return [{"score": round(s, 4), "is_significant": sig, "domain": domain}
+                    for s, sig in zip(scores, is_significant_list)]
                 
         except Exception as e:
-            MetricsCollector.increment("onnx_scoring_failures_total")
-            MetricsCollector.increment(f"onnx_scoring_failures_{domain}")
-            logger.error(f"ONNX Batch Scoring failed for {event_type}: {e}", exc_info=True)
-            return [{"score": 0.0, "is_significant": False, "domain": domain} for _ in features_list]
+            MetricsCollector.increment("streaming_scoring_failures_total")
+            MetricsCollector.increment(f"streaming_scoring_failures_{domain}")
+            logger.error(f"Streaming scoring failed for {event_type}: {e}", exc_info=True)
+            return [{"score": 0.5, "is_significant": False, "domain": domain, "scoring_degraded": True}
+                    for _ in features_list]
+
+    # ── KINEMATIC SCORING (Maritime + Aviation) ──────────────────────────────
+
+    def _get_or_create_kalman(self, entity_id: str) -> KalmanResidualFilter:
+        """Get or create a Kalman filter for a kinematic entity (MMSI/ICAO24)."""
+        if entity_id not in self._kalman_filters:
+            # LRU eviction: remove oldest if at capacity
+            if len(self._kalman_filters) >= self._kalman_max_entities:
+                oldest_key = next(iter(self._kalman_filters))
+                del self._kalman_filters[oldest_key]
+            self._kalman_filters[entity_id] = KalmanResidualFilter()
+        return self._kalman_filters[entity_id]
+
+    async def score_kinematic_event(
+        self,
+        entity_id: str,
+        lat: float, lon: float, speed: float, heading: float,
+        timestamp: float,
+        extra_features: Optional[list] = None,
+    ) -> dict:
+        """Score a single kinematic event using Kalman residuals + RRCF."""
+        res = await self.score_kinematic_event_batch(
+            [entity_id], [lat], [lon], [speed], [heading], [timestamp],
+            [extra_features] if extra_features else None,
+        )
+        return res[0]
+
+    async def score_kinematic_event_batch(
+        self,
+        entities: list,
+        lats: list, lons: list, speeds: list, headings: list,
+        timestamps: list,
+        extra_features_list: Optional[list] = None,
+    ) -> list:
+        """
+        Score kinematic events using Kalman prediction residuals fed into RRCF.
+        
+        The Kalman filter predicts where each entity should be based on its
+        previous trajectory. The *residuals* (predicted vs actual) are the
+        features that catch spoofing, dark-period jumps, and impossible maneuvers.
+        """
+        # Determine specific kinematic domain (maritime vs aviation) (§1.1)
+        sample_entity = str(entities[0]).lower() if entities else ""
+        domain = "aviation" if sample_entity.startswith("icao") or "adsb" in sample_entity else "maritime"
+        detector = self._rrcf_detectors.get(domain) or self._rrcf_detectors.get("maritime")
+        if not detector:
+            return [{"score": 0.5, "is_significant": False, "domain": domain, "scoring_degraded": True}
+                    for _ in entities]
+
+        results = []
+        points = []
+        for i, entity_id in enumerate(entities):
+            kf = self._get_or_create_kalman(entity_id)
+            residuals = kf.predict_and_update(
+                lats[i], lons[i], speeds[i], headings[i], timestamps[i]
+            )
+
+            # Feature vector: Kalman residuals + raw kinematic features
+            feat = [
+                residuals["residual_distance"],
+                residuals["residual_speed"],
+                residuals["residual_heading"] / 180.0,  # Normalize to [0, 1]
+                speeds[i] / 30.0,  # Normalize speed (max ~30 kts for vessels)
+                residuals["prediction_confidence"],
+            ]
+            # Append extra features if provided (e.g., region multiplier, sanctions flag)
+            if extra_features_list and i < len(extra_features_list) and extra_features_list[i]:
+                feat.extend(extra_features_list[i])
+
+            points.append(np.array(feat, dtype=np.float32))
+            results.append(residuals)
+
+        loop = asyncio.get_running_loop()
+        scores = await loop.run_in_executor(None, detector.insert_batch, points)
+        is_significant_list = await self._check_ema_gatekeeper_batch("kinematic", scores)
+
+        final = []
+        for i, (score, sig, residuals) in enumerate(zip(scores, is_significant_list, results)):
+            final.append({
+                "score": round(score, 4),
+                "is_significant": sig,
+                "domain": "spatial",
+                "residual_distance": residuals["residual_distance"],
+                "residual_speed": residuals["residual_speed"],
+                "residual_heading": residuals["residual_heading"],
+                "prediction_confidence": residuals["prediction_confidence"],
+            })
+        return final
+
+    # ── HAWKES INTENSITY ─────────────────────────────────────────────────────
+
+    def get_hawkes_intensity(self, domain: str) -> float:
+        """Get current Hawkes process excitation ratio for a domain."""
+        return self.hawkes.get_excitation_ratio(domain, time.time())
+
+    def record_hawkes_event(self, domain: str) -> dict:
+        """Record an anomalous event in the Hawkes tracker."""
+        return self.hawkes.record_event(domain, time.time())
+
+    # ── NEWS NOVELTY SCORING (First Story Detection) ─────────────────────────
+
+    async def score_news_novelty(
+        self,
+        headline: str,
+        summary: str,
+        named_entities: list,
+        sentiment: float,
+        reliability: float,
+    ) -> Tuple[float, list]:
+        """
+        Score news event using First Story Detection (TDT novelty) as the
+        primary signal, with sentiment/reliability/entities as secondary modifiers.
+        
+        Replaces the old sentiment × reliability formula which measured the
+        wrong thing: what we actually want is novelty relative to known stories.
+        """
+        config = {"entity_boost": 0.02, "max_boost": 0.3}
+        try:
+            cfg = await self._get_thresholds_config("news")
+            config.update(cfg)
+        except Exception:
+            pass
+
+        # Primary signal: First Story Detection novelty
+        loop = asyncio.get_running_loop()
+        novelty = await loop.run_in_executor(
+            None, self._fsd.score_novelty, headline, summary
+        )
+
+        # Secondary modifiers (same as before, but additive on novelty base)
+        semantic_boost = 0.0
+        semantic_tags = []
+        watchlist_boost = 0.0
+        frequency_boost = 0.0
+
+        if self.redis and getattr(self.redis, "raw", None) is not None and named_entities:
+            pipe = self.redis.raw.pipeline()
+            for tag in named_entities:
+                pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
+                pipe.zscore("sentinel:watched:equities", tag)
+                pipe.zscore("sentinel:watched:vessels", tag)
+                
+            results = await pipe.execute()
+            vals = []
+            
+            for i, tag in enumerate(named_entities):
+                res = results[i*3]
+                is_eq_zset = results[i*3 + 1]
+                is_ves_zset = results[i*3 + 2]
+
+                if res:
+                    val = float(res)
+                    semantic_boost += abs(val) * 0.1
+                    vals.append(val)
+                    tag_label = "positive" if val > 0 else "critical" if val <= -1.5 else "negative"
+                    semantic_tags.append(f"semantic:{tag_label}")
+
+                if (is_eq_zset is not None) or (is_ves_zset is not None):
+                    watchlist_boost = 0.15
+
+                f_boost = await self.track_frequency(tag, "news")
+                frequency_boost = max(frequency_boost, f_boost)
+
+            if vals:
+                blended_val = sum(vals) / len(vals)
+                sentiment = sentiment * 0.5 + blended_val * 0.5
+
+        # Composite: novelty is primary, modifiers are additive
+        entity_boost = min(config["max_boost"], len(named_entities) * config["entity_boost"])
+        
+        # Sentiment extremity adds to novelty (novel + extreme sentiment = high priority)
+        sentiment_modifier = abs(sentiment) * 0.15
+        
+        # Reliability scales the whole score (unreliable source dampens even novel stories)
+        scaled_reliability = 0.5 + 0.5 * reliability
+        
+        final_score = novelty * 0.55 + sentiment_modifier + entity_boost + semantic_boost + watchlist_boost + frequency_boost
+        final_score = round(min(1.0, final_score * scaled_reliability), 3)
+        
+        return final_score, semantic_tags
+
+    # ── BGP GRAPH-TOPOLOGY SCORING ───────────────────────────────────────────
+
+    async def score_bgp_event(
+        self,
+        origin_as: str,
+        prefix: str,
+        is_hijack: bool,
+        velocity: float,
+        as_path: Optional[list] = None,
+    ) -> dict:
+        """
+        Score a BGP event using graph-structural features from Neo4j + RRCF.
+        
+        BGP anomalies are fundamentally graph-structural (a hijack is a topology
+        violation). Flat feature scoring throws away the one signal that actually
+        distinguishes a hijack from noise.
+        """
+        # 1. Extract graph features from Neo4j
+        graph_features = await self._bgp_extractor.extract_features(origin_as, prefix)
+        
+        # 2. Upsert AS-path into Neo4j for future novelty detection
+        await self._bgp_extractor.upsert_as_path(origin_as, prefix, as_path)
+        
+        # 3. Build feature vector for RRCF
+        feat = np.array([
+            graph_features["betweenness_centrality"],
+            graph_features["degree"],
+            graph_features["path_novelty"],
+            min(1.0, velocity),  # Normalized velocity score
+            graph_features["prefix_specificity"],
+        ], dtype=np.float32)
+        
+        # 4. Score through RRCF cyber detector
+        detector = self._rrcf_detectors.get("cyber")
+        if detector:
+            loop = asyncio.get_running_loop()
+            rrcf_score = await loop.run_in_executor(None, detector.insert, feat)
+        else:
+            rrcf_score = 0.5
+        
+        # 5. Hijack override: known hijacks always score high regardless of RRCF
+        if is_hijack:
+            rrcf_score = max(rrcf_score, 0.85)
+        
+        # 6. Path novelty boost: never-seen AS-prefix pair is strong hijack signal
+        if graph_features["path_novelty"] > 0.9:
+            rrcf_score = min(1.0, rrcf_score * 1.3)
+        
+        is_significant = await self._check_ema_gatekeeper("bgp_anomaly", rrcf_score)
+        
+        return {
+            "score": round(rrcf_score, 4),
+            "is_significant": is_significant,
+            "path_novelty": graph_features["path_novelty"],
+            "centrality": graph_features["betweenness_centrality"],
+            "degree": graph_features["degree"],
+            "prefix_specificity": graph_features["prefix_specificity"],
+            "domain": "cyber",
+        }
 
     async def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
+        """Score a vessel dark event with contextual STS zone significance.
+        
+        A 3-hour gap near a known STS transfer zone is NOT the same event
+        as a 3-hour gap in open ocean — per current maritime-intel practice.
+        Gap anomaly weight scales with dwell time × proximity to sanctioned-transfer zone.
+        """
         config = {"base_divisor": 48.0, "sanctioned_multiplier": 1.5}
         try:
             cfg = await self._get_thresholds_config("vessel_dark")
@@ -277,6 +519,11 @@ class DynamicAnomalyScorer:
         base = min(1.0, gap_hours / config["base_divisor"])
         if "sanctioned" in " ".join(flags).lower():
             base = min(1.0, base * config["sanctioned_multiplier"])
+        
+        # Contextual gap significance: STS transfer zone proximity multiplier
+        zone_mult = sts_zone_risk_multiplier(region)
+        base = min(1.0, base * zone_mult)
+        
         return round(min(1.0, base), 3)
 
     async def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
@@ -380,7 +627,18 @@ class DynamicAnomalyScorer:
         except Exception:
             return 0.0
 
-    async def score_news(self, named_entities: list, sentiment: float, reliability: float) -> tuple:
+    async def score_news(self, named_entities: list, sentiment: float, reliability: float,
+                         headline: str = "", summary: str = "") -> tuple:
+        """Score news using First Story Detection novelty as primary signal.
+        
+        Falls back to legacy sentiment × reliability formula if no headline is provided
+        (backward compatibility for callers that haven't been updated yet).
+        """
+        if headline:
+            # New path: FSD novelty-based scoring
+            return await self.score_news_novelty(headline, summary, named_entities, sentiment, reliability)
+        
+        # Legacy fallback: sentiment × reliability (preserved for backward compat)
         config = {"entity_boost": 0.02, "max_boost": 0.3}
         try:
             cfg = await self._get_thresholds_config("news")
@@ -441,31 +699,45 @@ class DynamicAnomalyScorer:
         return res["score"]
 
     async def score_aviation_batch(self, flights: list) -> list:
-        """Score batched flight events using the spatial ONNX model.
+        """Score batched flight events using Kalman residuals + RRCF.
         
         Each flight entry should be a dict with keys like:
-        altitude, speed, latitude, longitude, heading
+        altitude, speed, latitude, longitude, heading, timestamp
         """
         if not flights:
             return []
         
-        features_list = []
         entities = []
+        lats = []
+        lons = []
+        speeds = []
+        headings = []
+        timestamps = []
+        extra_features = []
+        
         for f in flights:
             if isinstance(f, dict):
-                features_list.append([
-                    float(f.get('altitude', 0)) / 45000.0,  # Normalize altitude (max ~45k ft)
-                    float(f.get('speed', 0)) / 600.0,       # Normalize speed (max ~600 kts)
-                    float(f.get('latitude', 0)) / 90.0,      # Normalize latitude
-                    float(f.get('longitude', 0)) / 180.0,    # Normalize longitude
-                    float(f.get('heading', 0)) / 360.0,      # Normalize heading
-                ])
                 entities.append(str(f.get('icao24', f.get('callsign', 'unknown'))))
+                lats.append(float(f.get('latitude', 0)))
+                lons.append(float(f.get('longitude', 0)))
+                speeds.append(float(f.get('speed', 0)))
+                headings.append(float(f.get('heading', 0)))
+                timestamps.append(float(f.get('timestamp', time.time())))
+                extra_features.append([
+                    float(f.get('altitude', 0)) / 45000.0,  # Normalized altitude
+                ])
             else:
-                features_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
                 entities.append('unknown')
+                lats.append(0.0)
+                lons.append(0.0)
+                speeds.append(0.0)
+                headings.append(0.0)
+                timestamps.append(time.time())
+                extra_features.append([0.0])
         
-        results = await self.score_event_batch("vessel_position", entities, features_list)
+        results = await self.score_kinematic_event_batch(
+            entities, lats, lons, speeds, headings, timestamps, extra_features
+        )
         return [r["score"] for r in results]
 
     async def composite_score_event(

@@ -127,6 +127,17 @@ class TradFiEnricher:
             w_boost = 0.15 if is_watched else 0.0
             anomaly = min(1.0, anomaly + w_boost + f_boost)
             
+            # Hawkes cross-domain excitation: crypto/prediction market events boost tradfi intensity
+            hawkes_ratio = self.scorer.get_hawkes_intensity("tradfi")
+            if hawkes_ratio > 1.5:
+                # Cross-domain excitation is active — boost anomaly proportionally
+                hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
+                anomaly = min(1.0, anomaly + hawkes_boost)
+            
+            # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
+            if anomaly >= 0.5:
+                self.scorer.record_hawkes_event("tradfi")
+                
             if price > 0:
                 set_pipe.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
                 

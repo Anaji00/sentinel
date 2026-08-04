@@ -1,23 +1,24 @@
 """
 services/correlation/soft_correlator.py
- 
-Phase 2 — Embedding-based soft correlation.
- 
-The rule engine (rules/*.py) catches known patterns.
+
+Embedding-based soft correlation — ACTIVE (wired in correlation/main.py).
+
+The rule engine (cascade.py) catches known hard-rule patterns.
 This catches unknown ones by embedding every event and finding
 semantically similar events across domains using cosine similarity.
- 
+
 How it works:
-  1. Every NormalizedEvent gets embedded (sentence-transformers)
-  2. Embeddings stored in Qdrant vector DB (or pgvector)
+  1. Every NormalizedEvent gets embedded (sentence-transformers, all-mpnet-base-v2)
+  2. Embeddings stored in Qdrant vector DB
   3. On each new event, query nearest neighbours across domains
   4. If similarity > threshold and domains differ → soft correlation
- 
+
 This is what catches "tanker named SUNRISE GLORY goes dark" correlating with
 "Russia crude export decline" even though no hard rule connects them —
 the embedding space captures the semantic connection.
- 
-Not running yet — wired in but disabled until Phase 2 infra is ready.
+
+The similarity threshold is conformally calibrated (ConformalSimilarityCalibrator)
+rather than fixed, targeting a specific false cross-domain link rate.
 """
 import asyncio
 import uuid
@@ -28,38 +29,124 @@ from functools import partial
 from datetime import datetime, timezone
 # Import type hints for better code readability and IDE support.
 from typing import List, Optional, Dict
- 
+
 # Import the NormalizedEvent model, which is the standard data format we use across Sentinel.
 from shared.models import NormalizedEvent
 from shared.utils.ollama import OllamaClient
 # Initialize the logger specific to this soft correlation module.
 logger = logging.getLogger("correlation.soft")
- 
-# Similarity threshold — events with cosine similarity above this
-# are considered semantically related
-# (Cosine similarity ranges from -1.0 to 1.0. 0.65 allows subtle cross-domain financial connections to be discovered).
-SIMILARITY_THRESHOLD = 0.65
+
+# Default similarity threshold — used as initial prior before conformal calibration.
+# Once calibrated, the ConformalSimilarityCalibrator's threshold replaces this.
+SIMILARITY_THRESHOLD_DEFAULT = 0.65
+
+
+class ConformalSimilarityCalibrator:
+    """
+    Conformal calibration for embedding-similarity thresholds.
+
+    Instead of a fixed cosine cutoff (0.65), we calibrate against a target
+    false cross-domain link rate (FAR).  The approach:
+
+    1. Maintain a rolling buffer of observed similarity scores from
+       same-domain pairs (which should NOT be linked cross-domain).
+    2. These form the "null distribution" — similarity scores under the
+       null hypothesis that two events are unrelated.
+    3. Set the threshold at the (1 - target_FAR) quantile of this
+       null distribution, so only target_FAR fraction of truly unrelated
+       pairs would exceed the threshold.
+
+    This mirrors the conformal-calibration idea applied to anomaly z-scores:
+    calibrate against an actual target false-positive rate rather than a
+    fixed global cutoff.
+    """
+
+    def __init__(
+        self,
+        target_far: float = 0.05,
+        buffer_size: int = 2000,
+        min_samples: int = 50,
+        default_threshold: float = SIMILARITY_THRESHOLD_DEFAULT,
+    ):
+        self.target_far = target_far
+        self.buffer_size = buffer_size
+        self.min_samples = min_samples
+        self.default_threshold = default_threshold
+
+        # Rolling buffer of null-distribution similarity scores
+        # (scores from same-domain pairs that should not be cross-linked)
+        self._null_scores: list = []
+        self._calibrated_threshold: Optional[float] = None
+
+    @property
+    def threshold(self) -> float:
+        """Return the current calibrated threshold, or default if not yet calibrated."""
+        if self._calibrated_threshold is not None:
+            return self._calibrated_threshold
+        return self.default_threshold
+
+    def observe_null_score(self, similarity: float):
+        """
+        Record a similarity score from a same-domain pair (null hypothesis:
+        these events should NOT produce a cross-domain link).
+        """
+        self._null_scores.append(similarity)
+        if len(self._null_scores) > self.buffer_size:
+            self._null_scores = self._null_scores[-self.buffer_size:]
+
+        # Recalibrate when we have enough samples
+        if len(self._null_scores) >= self.min_samples:
+            self._recalibrate()
+
+    def _recalibrate(self):
+        """Recompute the threshold from the null distribution."""
+        sorted_scores = sorted(self._null_scores)
+        # Threshold = (1 - FAR) quantile of null distribution
+        idx = int(len(sorted_scores) * (1.0 - self.target_far))
+        idx = min(idx, len(sorted_scores) - 1)
+        new_threshold = sorted_scores[idx]
+
+        # Clamp to reasonable range [0.40, 0.90] to prevent degenerate thresholds
+        new_threshold = max(0.40, min(0.90, new_threshold))
+
+        if self._calibrated_threshold is None or abs(new_threshold - self._calibrated_threshold) > 0.01:
+            logger.info(
+                f"Conformal similarity threshold recalibrated: "
+                f"{self._calibrated_threshold or self.default_threshold:.3f} → {new_threshold:.3f} "
+                f"(null samples: {len(self._null_scores)}, target FAR: {self.target_far})"
+            )
+        self._calibrated_threshold = new_threshold
+
+    def get_status(self) -> Dict:
+        """Return calibration status for diagnostics."""
+        return {
+            "threshold": self.threshold,
+            "calibrated": self._calibrated_threshold is not None,
+            "null_samples": len(self._null_scores),
+            "target_far": self.target_far,
+        }
  
 # Minimum time window to search for correlations (hours)
 LOOKBACK_HOURS = 48
 
 class SoftCorrelator:
     """
-    Embedding-based correlator.
+    Embedding-based correlator — ACTIVE.
     Finds semantically similar events across domains without hard-coded rules.
- 
+
     Requires:
       sentence-transformers    (pip install sentence-transformers)
       qdrant-client            (pip install qdrant-client)
-      Running Qdrant instance  (add to docker-compose in Phase 2)
+      Running Qdrant instance  (docker-compose service)
     """
     def __init__(self, ollama_client: OllamaClient):
         self._model = None  # Lazy load the embedding model
         self._client = None  # Lazy load the Qdrant client
-        self._enabled = False  # Set to True when ready to activate'
+        self._enabled = False  # Set to True when ready to activate
         self._llm = ollama_client
         self._embed_semaphore = asyncio.Semaphore(5)  # Limit concurrent embeddings to avoid overload
         self._load_lock = asyncio.Lock()  # Ensure only one load happens if multiple events come in at startup
+        self._similarity_calibrator = ConformalSimilarityCalibrator()
     async def _load(self):
         """Lazy-load heavy dependencies. Called on first use."""
         if self._enabled: return
@@ -177,7 +264,7 @@ class SoftCorrelator:
                         )
                     ]
                 ),
-                score_threshold=SIMILARITY_THRESHOLD, # Only return results above the similarity threshold to reduce noise
+                score_threshold=self._similarity_calibrator.threshold,
             )
             # Map the raw Qdrant results back into a list of our custom 'payload' dictionaries.
             return [r.payload for r in results[:limit]] # Return only the top 'limit' results after filtering

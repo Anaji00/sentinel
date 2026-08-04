@@ -119,6 +119,14 @@ class SentinelAgent(ABC):
         
         # Concurrency bound: Limit inflight tasks to prevent memory explosion and LLM timeouts
         self._dispatch_semaphore = asyncio.Semaphore(int(os.getenv("AGENT_CONCURRENCY", "5")))
+
+        # Cross-agent state synchronization (§3.3):
+        # Track recently processed event IDs for context drift detection.
+        # ConsensusEngine reads these digests to detect when agents have
+        # divergent world-states before fusing their bulletins.
+        from collections import deque
+        self._recent_event_ids: deque = deque(maxlen=20)
+        self._current_regime: Optional[str] = None  # Set by subclass if applicable
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pass
@@ -232,6 +240,11 @@ class SentinelAgent(ABC):
                         self.logger.debug(f"Agent live feed pub bypass: {pub_err}")
                 self._processed += 1
 
+                # Track event ID for cross-agent state synchronization (§3.3)
+                event_id = raw.get("event_id") or raw.get("agent_run_id")
+                if event_id:
+                    self._recent_event_ids.append(str(event_id))
+
                 elapsed = time.monotonic() - t0
                 if elapsed > 10:
                     self.logger.warning(f"Slow dispatch: {elapsed:.1f}s")
@@ -272,6 +285,24 @@ class SentinelAgent(ABC):
                         "ts":        datetime.now(timezone.utc).isoformat(),
                     }),
                     ex=120, 
+                )
+            except Exception:
+                pass
+
+            # Publish state digest for cross-agent context drift detection (§3.3)
+            try:
+                digest = {
+                    "agent_name": self.name,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "recent_event_ids": list(self._recent_event_ids),
+                    "processed_count": self._processed,
+                    "current_regime": self._current_regime,
+                    "model": self.model,
+                }
+                await self.redis.raw.set(
+                    f"sentinel:agent:digest:{self.name}",
+                    json.dumps(digest),
+                    ex=300,  # 5-minute TTL: if not refreshed, agent is stale
                 )
             except Exception:
                 pass

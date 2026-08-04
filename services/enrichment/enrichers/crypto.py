@@ -99,6 +99,16 @@ class CryptoEnricher:
             w_boost = 0.15 if is_watched else 0.0
             anomaly = min(1.0, anomaly + w_boost + f_boost)
             
+            # Hawkes cross-domain excitation: tradfi/prediction events boost crypto intensity
+            hawkes_ratio = self.scorer.get_hawkes_intensity("crypto")
+            if hawkes_ratio > 1.5:
+                hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
+                anomaly = min(1.0, anomaly + hawkes_boost)
+            
+            # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
+            if anomaly >= 0.5:
+                self.scorer.record_hawkes_event("crypto")
+            
             logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
             if anomaly < 0.6: continue
             
@@ -288,6 +298,10 @@ class CryptoEnricher:
             anomaly = min(1.0, notional / 10_000_000 * 0.4)
             tags = ["crypto", "liquidation", asset.lower(), side.lower()]
             headline = f"Massive Liquidation ({side}): ${notional/1e6:.1f}M {asset}"
+            
+            # Liquidation events are the strongest Hawkes excitation source:
+            # crypto liquidation cascades → tradfi anomaly intensity spikes
+            self.scorer.record_hawkes_event("crypto")
 
         await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
             "entity_id": asset,

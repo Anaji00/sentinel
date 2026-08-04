@@ -1,3 +1,7 @@
+# DEPRECATED: Batch PyTorch LSTM Autoencoder ONNX exporter.
+# Sentinel has migrated to online/streaming temporal anomaly detection in shared/utils/streaming_detectors.py.
+# This script is preserved for historical baseline reference.
+
 # scripts/train_lstm_temporal.py
 import os
 import sys 
@@ -27,6 +31,7 @@ import numpy as np
 import logging
 from shared.db import get_timescale
 from shared.models.events import EventType
+from shared.utils.model_registry import validate_training_data, InsufficientTrainingDataError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ml.lstm_training")
@@ -107,14 +112,10 @@ async def fetch_sequential_data(days: int = 40, seq_len: int = 10) -> torch.Tens
     # ────────────────────────────────────────────────────────────────────────────
 
     logger.info(f"Querying macro-financial features for types: {financial_types}")
-    rows = await db.query(query)
-
-    if not rows:
-        logger.warning(f"No data found for financial parameters {financial_types}. Generating synthetic LSTM baseline.")
-        synthetic = np.random.normal(0, 1, (1000, seq_len, 5)).astype(np.float32)
-        return torch.tensor(synthetic)
+    raw_data = np.array([row['ml_features'] for row in rows], dtype=np.float32) if rows else None
     
-    raw_data = np.array([row['ml_features'] for row in rows], dtype=np.float32)
+    # Hard-fail guard per §1.5 — refuse synthetic/insufficient data
+    validate_training_data(raw_data, domain="temporal_lstm", min_samples=200)
     # Log-scale unconstrained financial features (premium_usd at index 3, volume at index 4)
     raw_data[:, 3] = np.log1p(np.maximum(0, raw_data[:, 3]) / 1000.0)
     raw_data[:, 4] = np.log1p(np.maximum(0, raw_data[:, 4]) / 1000.0)

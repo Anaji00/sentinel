@@ -2,14 +2,14 @@
 tests/test_anomaly_scorer.py
 
 Unit tests for services/enrichment/anomaly_scorer.py.
-Validates ONNX scoring fallback, metrics collector failure counting,
-and dynamic normalization batching.
+Validates streaming RRCF detectors, kinematic Kalman scoring, FSD news novelty,
+vessel dark STS context weighting, and BGP graph-topology scoring.
 """
 
 import pytest
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
-from shared.utils.metrics import MetricsCollector
 
 
 def test_dynamic_anomaly_scorer_requires_redis():
@@ -17,62 +17,94 @@ def test_dynamic_anomaly_scorer_requires_redis():
         DynamicAnomalyScorer(redis_client=None)
 
 
-def test_dynamic_anomaly_scorer_fallback():
+def test_dynamic_anomaly_scorer_streaming_batch():
     async def run_test():
-        redis_mock = MagicMock()
-        redis_mock.raw = None  # Force fallback behavior
-        scorer = DynamicAnomalyScorer(redis_client=redis_mock)
-
-        # _dynamic_normalize_batch fallback
-        requests = [("AAPL", "notional", 5000.0), ("MSFT", "notional", 2000.0)]
-        norm_scores = await scorer._dynamic_normalize_batch(requests)
-        assert norm_scores == [5.0, 2.0]
-
-        # _check_ema_gatekeeper_batch fallback (threshold 0.60)
-        scores = [0.85, 0.30, 0.95]
-        gated = await scorer._check_ema_gatekeeper_batch("trade", scores)
-        assert gated == [True, False, True]
-
-    import asyncio
-    asyncio.run(run_test())
-
-
-def test_temporal_anomaly_scorer_batching():
-    async def run_test():
-        import numpy as np
         redis_mock = MagicMock()
         redis_mock.raw = None
-
         scorer = DynamicAnomalyScorer(redis_client=redis_mock)
 
-        mock_session = MagicMock()
-        mock_input = MagicMock()
-        mock_input.name = "input_seq"
-        mock_session.get_inputs.return_value = [mock_input]
+        # Test RRCF streaming batch scoring
+        entities = ["VESSEL_1", "VESSEL_2"]
+        features_list = [[1.0, 2.0, 3.0], [1.1, 2.1, 3.1]]
+        results = await scorer.score_event_batch("vessel_position", entities, features_list)
 
-        # 3 valid sequences, shape (3, 10, 5)
-        mock_session.run.side_effect = lambda output_names, input_feed: [np.zeros_like(input_feed["input_seq"])]
-        scorer.sessions["temporal"] = mock_session
+        assert len(results) == 2
+        assert all(0.0 <= r["score"] <= 1.0 for r in results)
+        assert all(r["domain"] == "spatial" for r in results)
 
-        # Mock sequence retriever to return 3 valid length-10 sequences
-        sample_seq = [[0.1] * 5] * 10
-        scorer._get_temporal_sequence_batch = AsyncMock(return_value=[sample_seq, sample_seq, sample_seq])
-
-        entities = ["BTC", "ETH", "SOL"]
-        features_list = [[1.0] * 5, [2.0] * 5, [3.0] * 5]
-
-        results = await scorer.score_event_batch("crypto_trade", entities, features_list)
-
-        # Ensure session.run was called exactly ONCE with full batch of shape (3, 10, 5)
-        assert mock_session.run.call_count == 1
-        call_args = mock_session.run.call_args[0]
-        input_feed = call_args[1]
-        assert "input_seq" in input_feed
-        assert input_feed["input_seq"].shape == (3, 10, 5)
-        assert len(results) == 3
-        assert all(r["domain"] == "temporal" for r in results)
-
-    import asyncio
     asyncio.run(run_test())
 
 
+def test_kinematic_kalman_scoring():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw = None
+        scorer = DynamicAnomalyScorer(redis_client=redis_mock)
+
+        # Normal sequential positions
+        r1 = await scorer.score_kinematic_event(
+            "MMSI_123456789", lat=25.0, lon=55.0, speed=12.0, heading=90, timestamp=1000.0
+        )
+        assert 0.0 <= r1["score"] <= 1.0
+        assert "residual_distance" in r1
+
+        r2 = await scorer.score_kinematic_event(
+            "MMSI_123456789", lat=25.05, lon=55.05, speed=12.0, heading=90, timestamp=1900.0
+        )
+        assert 0.0 <= r2["score"] <= 1.0
+
+    asyncio.run(run_test())
+
+
+def test_vessel_dark_sts_context():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw = None
+        scorer = DynamicAnomalyScorer(redis_client=redis_mock)
+
+        # 3-hour gap in open ocean vs 3-hour gap in Strait of Hormuz
+        score_ocean = await scorer.score_vessel_dark("MMSI_1", gap_hours=3.0, region="Mid Atlantic", flags=[], heading=90)
+        score_hormuz = await scorer.score_vessel_dark("MMSI_2", gap_hours=3.0, region="Strait of Hormuz", flags=[], heading=90)
+
+        # Gap near Hormuz (STS transfer zone) must score significantly higher!
+        assert score_hormuz > score_ocean
+
+    asyncio.run(run_test())
+
+
+def test_news_fsd_novelty_scoring():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw = None
+        scorer = DynamicAnomalyScorer(redis_client=redis_mock)
+
+        score, tags = await scorer.score_news(
+            named_entities=["AAPL", "Fed"],
+            sentiment=-0.8,
+            reliability=0.9,
+            headline="Federal Reserve announces emergency rate hike after inflation surge",
+            summary="The central bank took aggressive action following higher CPI print."
+        )
+        assert 0.0 <= score <= 1.0
+        assert isinstance(tags, list)
+
+    asyncio.run(run_test())
+
+
+def test_bgp_graph_topology_scoring():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw = None
+        scorer = DynamicAnomalyScorer(redis_client=redis_mock)
+
+        res = await scorer.score_bgp_event(
+            origin_as="AS64500",
+            prefix="1.2.3.0/24",
+            is_hijack=True,
+            velocity=0.8,
+        )
+        assert res["score"] >= 0.85
+        assert res["domain"] == "cyber"
+        assert "path_novelty" in res
+
+    asyncio.run(run_test())

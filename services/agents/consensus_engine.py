@@ -6,17 +6,44 @@ AGENT CONSENSUS & CONTRADICTION ENGINE
 Reads all active AgentBulletins across the swarm, detects contradictions,
 computes weighted consensus scores, and emits ConsensusReports.
 
+Architectural Design Rationale (§3.1 — Agentic Harmonization):
+    This engine uses INDEPENDENT agent estimates with WEIGHTED AGGREGATION,
+    NOT multi-agent debate/consensus loops. This is deliberate:
+
+    - MAST (2025, 1,600+ annotated traces) identifies inter-agent misalignment
+      as a distinct failure category from single-model error.
+    - "The Deliberative Illusion" (2025), "The Inverse-Wisdom Law" (2025),
+      and "Hallucination Amplification in Multi-Agent Debate" (2025) document
+      that debate/consensus architectures amplify hallucination via stance
+      homogenization and informational cascade — agents converge on a shared
+      wrong answer (the LLM analog of Bikhchandani/Hirshleifer herding).
+    - Independent estimates + weighted aggregation is the pattern that the
+      wisdom-of-crowds and prediction-market literature actually favors.
+
+    DO NOT add a debate/chat loop between agents — you'd likely trade a
+    real structural advantage for a fashionable but empirically weaker one.
+
+Fusion Math:
+    Uses Jøsang's Subjective Logic (SL) instead of raw weighted averaging.
+    Each agent's bulletin is mapped to an SL opinion (belief, disbelief,
+    uncertainty, base_rate) with evidence counts derived from the agent's
+    consensus_weight. SL's Cumulative Fusion explicitly carries conflict
+    and uncertainty forward rather than averaging it away.
+
+    When fused uncertainty exceeds a threshold, we emit an Analysis of
+    Competing Hypotheses (ACH) report instead of forcing disagreement into
+    a single blended score.
+
 Contradictions are detected when:
   - Multiple agents have bulletins for the same ticker with divergent directions
   - Conviction divergence exceeds 0.4 between agreeing/disagreeing agents
   - A "thesis" and a "regime_change" bulletin conflict
-
-Consensus scores are weighted by each agent's track record (AgentScorecard.consensus_weight).
 """
 
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -28,8 +55,164 @@ from shared.kafka import Topics
 
 logger = logging.getLogger("agent.consensus")
 
+# Threshold for fused uncertainty above which we emit ACH instead of consensus
+ACH_UNCERTAINTY_THRESHOLD = 0.40
+
+
+# ── SUBJECTIVE LOGIC ─────────────────────────────────────────────────────────
+
+class SubjectiveOpinion(BaseModel):
+    """
+    Jøsang Subjective Logic binomial opinion: ω = (b, d, u, a)
+
+    b = belief      (evidence FOR the proposition)
+    d = disbelief   (evidence AGAINST the proposition)
+    u = uncertainty  (lack of evidence either way)
+    a = base rate    (prior probability in absence of evidence)
+
+    Constraint: b + d + u = 1.0
+    Projected probability: P = b + a * u
+    """
+    belief: float = 0.0
+    disbelief: float = 0.0
+    uncertainty: float = 1.0
+    base_rate: float = 0.5
+
+    @property
+    def projected_probability(self) -> float:
+        return self.belief + self.base_rate * self.uncertainty
+
+    @property
+    def conflict_level(self) -> float:
+        """Measure of internal conflict: high belief AND high disbelief."""
+        return min(self.belief, self.disbelief) * 2.0
+
+    @classmethod
+    def from_bulletin(cls, bulletin: AgentBulletin, weight: float = 1.0) -> "SubjectiveOpinion":
+        """
+        Map an AgentBulletin to a Subjective Logic opinion.
+
+        The agent's conviction becomes the evidence strength.
+        The agent's consensus_weight scales the evidence count,
+        controlling how much this opinion moves the fusion.
+        """
+        conviction = bulletin.conviction
+        direction = bulletin.expected_direction or "neutral"
+
+        # Evidence count: weight * 10 gives reasonable scaling
+        # Higher weight = more evidence = lower uncertainty
+        evidence_count = max(0.1, weight * 10.0)
+
+        if direction in ("up", "bullish", "long"):
+            r = conviction * evidence_count  # positive evidence
+            s = (1.0 - conviction) * evidence_count * 0.3  # weak counter-evidence
+        elif direction in ("down", "bearish", "short"):
+            r = (1.0 - conviction) * evidence_count * 0.3
+            s = conviction * evidence_count
+        else:
+            r = 0.1
+            s = 0.1
+
+        W = 2.0  # Non-informative prior weight
+        b = r / (r + s + W)
+        d = s / (r + s + W)
+        u = W / (r + s + W)
+
+        return cls(belief=round(b, 6), disbelief=round(d, 6),
+                   uncertainty=round(u, 6), base_rate=0.5)
+
+    @classmethod
+    def cumulative_fuse(cls, opinions: List["SubjectiveOpinion"]) -> "SubjectiveOpinion":
+        """
+        Jøsang Cumulative Fusion (CCF) of multiple opinions.
+
+        Unlike raw Dempster-Shafer, CCF doesn't suffer Zadeh's paradox
+        under highly conflicting evidence — it degrades gracefully to
+        higher uncertainty instead of collapsing.
+        """
+        if not opinions:
+            return cls()
+        if len(opinions) == 1:
+            return opinions[0].model_copy()
+
+        result = opinions[0].model_copy()
+        for op in opinions[1:]:
+            result = cls._fuse_two(result, op)
+        return result
+
+    @classmethod
+    def _fuse_two(cls, w1: "SubjectiveOpinion", w2: "SubjectiveOpinion") -> "SubjectiveOpinion":
+        """Cumulative fusion of two opinions (Jøsang §12.3)."""
+        u1, u2 = w1.uncertainty, w2.uncertainty
+
+        # Handle edge cases: if either opinion is dogmatic (u=0)
+        if u1 < 1e-10 and u2 < 1e-10:
+            # Both dogmatic: weighted average by base rates
+            total = 1.0
+            b = (w1.belief + w2.belief) / 2.0
+            d = (w1.disbelief + w2.disbelief) / 2.0
+            u = 0.0
+        elif u1 < 1e-10:
+            return w1.model_copy()
+        elif u2 < 1e-10:
+            return w2.model_copy()
+        else:
+            # Standard cumulative fusion formula
+            # κ = u1 + u2 - u1*u2 (always > 0 for non-dogmatic opinions)
+            kappa = u1 + u2 - u1 * u2
+            if kappa < 1e-10:
+                kappa = 1e-10
+
+            b = (w1.belief * u2 + w2.belief * u1) / kappa
+            d = (w1.disbelief * u2 + w2.disbelief * u1) / kappa
+            u = (u1 * u2) / kappa
+
+        # Fused base rate (evidence-weighted average)
+        a = (w1.base_rate + w2.base_rate) / 2.0
+
+        # Normalize to ensure b + d + u = 1.0
+        total = b + d + u
+        if total > 1e-10:
+            b /= total
+            d /= total
+            u /= total
+
+        return cls(
+            belief=round(b, 6),
+            disbelief=round(d, 6),
+            uncertainty=round(u, 6),
+            base_rate=round(a, 4),
+        )
+
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
+
+class CompetingHypothesis(BaseModel):
+    """A single hypothesis in an ACH matrix."""
+    hypothesis: str  # e.g., "bullish on AAPL"
+    supporting_agents: List[str] = Field(default_factory=list)
+    refuting_agents: List[str] = Field(default_factory=list)
+    opinion: Optional[SubjectiveOpinion] = None
+    evidence_summary: str = ""
+
+
+class ACHReport(BaseModel):
+    """
+    Analysis of Competing Hypotheses (ACH) report.
+
+    Emitted when Subjective Logic fusion produces high uncertainty
+    or conflict — instead of forcing disagreement into a single
+    consensus score that hides it, we surface the competing
+    hypotheses explicitly, matching IC tradecraft.
+    """
+    ticker: str
+    fused_opinion: SubjectiveOpinion
+    competing_hypotheses: List[CompetingHypothesis] = Field(default_factory=list)
+    conflict_level: float = 0.0
+    fused_uncertainty: float = 0.0
+    reason: str = ""  # Why ACH was triggered instead of consensus
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
 
 class ContradictionReport(BaseModel):
     """Detected contradiction between agents."""
@@ -49,6 +232,7 @@ class ConsensusSignal(BaseModel):
     contributing_agents: int = 0
     weighted_conviction: float = 0.0
     agreement_ratio: float = 0.0  # 0.0 = total disagreement, 1.0 = total agreement
+    fused_opinion: Optional[SubjectiveOpinion] = None
     bulletins: List[AgentBulletin] = Field(default_factory=list)
 
 
@@ -58,6 +242,8 @@ class ConsensusReport(BaseModel):
     generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     contradictions: List[ContradictionReport] = Field(default_factory=list)
     consensus_signals: List[ConsensusSignal] = Field(default_factory=list)
+    ach_reports: List[ACHReport] = Field(default_factory=list)
+    stale_agents: List[str] = Field(default_factory=list)
     total_active_bulletins: int = 0
     agents_reporting: List[str] = Field(default_factory=list)
 
@@ -105,8 +291,9 @@ class ConsensusEngine(SentinelAgent):
 
     async def analyze(self) -> ConsensusReport:
         """
-        Full consensus analysis. Call this periodically or on-demand.
-        Returns a ConsensusReport with contradictions and consensus signals.
+        Full consensus analysis using Subjective Logic fusion.
+        Produces consensus signals when agent opinions converge, and
+        ACH reports when they diverge (high fused uncertainty/conflict).
         """
         # 1. Read all active bulletins
         bulletins = await self._read_all_bulletins()
@@ -117,24 +304,36 @@ class ConsensusEngine(SentinelAgent):
         scorecards = await self._read_all_scorecards()
         score_map = {s.agent_name: s for s in scorecards}
 
-        # 3. Group bulletins by ticker
+        # 3. Detect stale agents via state digests (§3.3 context drift)
+        stale_agents = await self._detect_stale_agents()
+
+        # 4. Group bulletins by ticker
         ticker_groups: Dict[str, List[AgentBulletin]] = defaultdict(list)
         for b in bulletins:
             if b.ticker:
                 ticker_groups[b.ticker.upper()].append(b)
 
-        # 4. Analyze each ticker group
+        # 5. Analyze each ticker group
         contradictions = []
         consensus_signals = []
+        ach_reports = []
         agents_reporting = set()
 
         for ticker, group in ticker_groups.items():
+            # Compute weights (downweight stale agents)
+            def _get_weight(agent_name: str) -> float:
+                base = score_map.get(agent_name, AgentScorecard(agent_name=agent_name)).consensus_weight
+                if agent_name in stale_agents:
+                    return base * 0.3  # Heavily downweight stale/drifted agents
+                return base
+
             if len(group) < 2:
-                # Still emit a consensus signal for single-agent tickers
+                # Single-agent ticker: emit consensus directly
                 b = group[0]
                 agents_reporting.add(b.agent_name)
-                weight = score_map.get(b.agent_name, AgentScorecard(agent_name=b.agent_name)).consensus_weight
+                weight = _get_weight(b.agent_name)
                 direction = b.expected_direction or "neutral"
+                opinion = SubjectiveOpinion.from_bulletin(b, weight)
                 consensus_signals.append(ConsensusSignal(
                     ticker=ticker,
                     direction=self._map_direction(direction),
@@ -142,6 +341,7 @@ class ConsensusEngine(SentinelAgent):
                     contributing_agents=1,
                     weighted_conviction=b.conviction * weight,
                     agreement_ratio=1.0,
+                    fused_opinion=opinion,
                     bulletins=group,
                 ))
                 continue
@@ -152,11 +352,16 @@ class ConsensusEngine(SentinelAgent):
             neutral_agents = []
             weighted_scores = []
             total_weight = 0.0
+            opinions = []
 
             for b in group:
                 agents_reporting.add(b.agent_name)
-                weight = score_map.get(b.agent_name, AgentScorecard(agent_name=b.agent_name)).consensus_weight
+                weight = _get_weight(b.agent_name)
                 direction = b.expected_direction or "neutral"
+
+                # Build Subjective Logic opinion from this bulletin
+                opinion = SubjectiveOpinion.from_bulletin(b, weight)
+                opinions.append((b.agent_name, opinion, direction))
 
                 if direction in ("up", "bullish", "long"):
                     bullish_agents.append(b.agent_name)
@@ -170,7 +375,7 @@ class ConsensusEngine(SentinelAgent):
 
                 total_weight += weight
 
-            # Detect contradictions
+            # Detect contradictions (unchanged logic)
             if bullish_agents and bearish_agents:
                 convictions = [b.conviction for b in group]
                 spread = max(convictions) - min(convictions) if convictions else 0.0
@@ -188,33 +393,75 @@ class ConsensusEngine(SentinelAgent):
                 )
                 contradictions.append(contradiction)
 
-            # Compute consensus
-            if total_weight > 0:
-                consensus_score = sum(weighted_scores) / total_weight
+            # Subjective Logic fusion
+            all_opinions = [op for _, op, _ in opinions]
+            fused = SubjectiveOpinion.cumulative_fuse(all_opinions)
+
+            # Decision: ACH report vs consensus signal
+            if fused.uncertainty > ACH_UNCERTAINTY_THRESHOLD or fused.conflict_level > 0.3:
+                # High uncertainty/conflict: emit ACH report instead of consensus
+                bullish_hyp = CompetingHypothesis(
+                    hypothesis=f"Bullish on {ticker}",
+                    supporting_agents=bullish_agents,
+                    refuting_agents=bearish_agents,
+                    opinion=SubjectiveOpinion.cumulative_fuse(
+                        [op for name, op, d in opinions if d in ("up", "bullish", "long")]
+                    ) if bullish_agents else None,
+                    evidence_summary=f"{len(bullish_agents)} agent(s) bullish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('up','bullish','long')) / max(1, len(bullish_agents)):.0%}"
+                )
+                bearish_hyp = CompetingHypothesis(
+                    hypothesis=f"Bearish on {ticker}",
+                    supporting_agents=bearish_agents,
+                    refuting_agents=bullish_agents,
+                    opinion=SubjectiveOpinion.cumulative_fuse(
+                        [op for name, op, d in opinions if d in ("down", "bearish", "short")]
+                    ) if bearish_agents else None,
+                    evidence_summary=f"{len(bearish_agents)} agent(s) bearish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('down','bearish','short')) / max(1, len(bearish_agents)):.0%}"
+                )
+
+                ach = ACHReport(
+                    ticker=ticker,
+                    fused_opinion=fused,
+                    competing_hypotheses=[bullish_hyp, bearish_hyp],
+                    conflict_level=round(fused.conflict_level, 4),
+                    fused_uncertainty=round(fused.uncertainty, 4),
+                    reason=(
+                        f"Fused uncertainty ({fused.uncertainty:.2f}) exceeds ACH threshold ({ACH_UNCERTAINTY_THRESHOLD}). "
+                        f"Emitting competing hypotheses instead of forcing a consensus score."
+                    ),
+                )
+                ach_reports.append(ach)
+                logger.info(f"📊 ACH Report for {ticker}: uncertainty={fused.uncertainty:.2f}, conflict={fused.conflict_level:.2f}")
             else:
-                consensus_score = 0.0
+                # Low uncertainty: emit consensus signal with SL-derived scores
+                # Map fused opinion to consensus direction and score
+                projected = fused.projected_probability
+                if projected > 0.6:
+                    consensus_direction = "bullish"
+                    consensus_score = (projected - 0.5) * 2.0  # Map [0.5, 1.0] → [0, 1.0]
+                elif projected < 0.4:
+                    consensus_direction = "bearish"
+                    consensus_score = (projected - 0.5) * 2.0  # Map [0.0, 0.5] → [-1.0, 0]
+                else:
+                    consensus_direction = "mixed"
+                    consensus_score = (projected - 0.5) * 2.0
 
-            total_agents = len(bullish_agents) + len(bearish_agents) + len(neutral_agents)
-            majority = max(len(bullish_agents), len(bearish_agents), len(neutral_agents))
-            agreement = majority / total_agents if total_agents > 0 else 0.0
+                total_agents = len(bullish_agents) + len(bearish_agents) + len(neutral_agents)
+                majority = max(len(bullish_agents), len(bearish_agents), len(neutral_agents))
+                agreement = majority / total_agents if total_agents > 0 else 0.0
 
-            consensus_direction = "mixed"
-            if consensus_score > 0.2:
-                consensus_direction = "bullish"
-            elif consensus_score < -0.2:
-                consensus_direction = "bearish"
+                weighted_conviction = abs(sum(weighted_scores)) / max(1.0, total_weight)
 
-            weighted_conviction = abs(sum(weighted_scores)) / max(1.0, total_weight)
-
-            consensus_signals.append(ConsensusSignal(
-                ticker=ticker,
-                direction=consensus_direction,
-                consensus_score=round(consensus_score, 4),
-                contributing_agents=total_agents,
-                weighted_conviction=round(weighted_conviction, 4),
-                agreement_ratio=round(agreement, 4),
-                bulletins=group,
-            ))
+                consensus_signals.append(ConsensusSignal(
+                    ticker=ticker,
+                    direction=consensus_direction,
+                    consensus_score=round(consensus_score, 4),
+                    contributing_agents=total_agents,
+                    weighted_conviction=round(weighted_conviction, 4),
+                    agreement_ratio=round(agreement, 4),
+                    fused_opinion=fused,
+                    bulletins=group,
+                ))
 
         # Sort: highest conviction first
         consensus_signals.sort(key=lambda s: abs(s.consensus_score), reverse=True)
@@ -223,6 +470,8 @@ class ConsensusEngine(SentinelAgent):
             report_id=f"consensus-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
             contradictions=contradictions,
             consensus_signals=consensus_signals,
+            ach_reports=ach_reports,
+            stale_agents=stale_agents,
             total_active_bulletins=len(bulletins),
             agents_reporting=sorted(agents_reporting),
         )
@@ -231,7 +480,7 @@ class ConsensusEngine(SentinelAgent):
         await self._persist_report(report)
 
         # Publish to Kafka if available
-        if self.producer and (contradictions or consensus_signals):
+        if self.producer and (contradictions or consensus_signals or ach_reports):
             try:
                 from shared.kafka import Topics
                 await self.producer.send(
@@ -318,8 +567,88 @@ class ConsensusEngine(SentinelAgent):
                 str(len(report.contradictions)),
                 ex=3600,
             )
+            # Store ACH count for metrics
+            if report.ach_reports:
+                await self.redis.raw.set(
+                    "sentinel:consensus:ach_count",
+                    str(len(report.ach_reports)),
+                    ex=3600,
+                )
         except Exception as e:
             logger.debug(f"Failed to persist consensus report: {e}")
+
+    async def _detect_stale_agents(self) -> List[str]:
+        """
+        Read agent state digests from Redis (§3.3) and detect agents
+        with stale/divergent context.
+
+        Each agent publishes its digest to sentinel:agent:digest:{name}
+        containing recently processed event IDs and current thresholds.
+        If a digest is missing or too old, the agent is stale.
+        """
+        stale = []
+        try:
+            cursor = 0
+            digests = {}
+            while True:
+                cursor, keys = await self.redis.raw.scan(
+                    cursor=cursor, match="sentinel:agent:digest:*", count=50
+                )
+                if keys:
+                    values = await self.redis.raw.mget(keys)
+                    for key, val in zip(keys, values):
+                        if val:
+                            try:
+                                key_str = key if isinstance(key, str) else key.decode("utf-8")
+                                agent_name = key_str.split(":")[-1]
+                                digest = json.loads(val if isinstance(val, str) else val.decode("utf-8"))
+                                digests[agent_name] = digest
+                            except Exception:
+                                pass
+                if cursor == 0:
+                    break
+
+            if not digests:
+                return []  # No digests published yet, don't penalize
+
+            # Check for staleness: if digest timestamp is > 5 minutes old
+            now = datetime.now(timezone.utc)
+            for agent_name, digest in digests.items():
+                ts_str = digest.get("timestamp")
+                if ts_str:
+                    try:
+                        digest_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        age_seconds = (now - digest_ts).total_seconds()
+                        if age_seconds > 300:  # 5 minutes
+                            stale.append(agent_name)
+                            logger.info(f"🕐 Agent '{agent_name}' digest is {age_seconds:.0f}s stale — downweighting")
+                    except (ValueError, TypeError):
+                        pass
+
+            # Cross-check: detect context drift by comparing event ID overlap
+            all_event_sets = {}
+            for agent_name, digest in digests.items():
+                event_ids = set(digest.get("recent_event_ids", []))
+                if event_ids:
+                    all_event_sets[agent_name] = event_ids
+
+            if len(all_event_sets) >= 2:
+                agents = list(all_event_sets.keys())
+                for i in range(len(agents)):
+                    for j in range(i + 1, len(agents)):
+                        overlap = all_event_sets[agents[i]] & all_event_sets[agents[j]]
+                        union = all_event_sets[agents[i]] | all_event_sets[agents[j]]
+                        jaccard = len(overlap) / max(1, len(union))
+                        if jaccard < 0.1 and agents[i] not in stale and agents[j] not in stale:
+                            # Very low overlap: these agents have divergent world views
+                            logger.warning(
+                                f"⚠️ Context drift detected: {agents[i]} ↔ {agents[j]} "
+                                f"(Jaccard overlap: {jaccard:.2f})"
+                            )
+
+        except Exception as e:
+            logger.debug(f"State digest check failed: {e}")
+        return stale
 
     @staticmethod
     def _map_direction(direction: str) -> str:

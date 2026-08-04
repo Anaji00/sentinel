@@ -1,3 +1,7 @@
+# DEPRECATED: Batch retrained IsolationForest ONNX exporter.
+# Sentinel has migrated to online/streaming anomaly detection via Robust Random Cut Forest (RRCF)
+# in shared/utils/streaming_detectors.py. This script is preserved for historical baseline reference.
+
 import os
 import sys
 from pathlib import Path
@@ -27,6 +31,7 @@ from sklearn.ensemble import IsolationForest
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 from shared.db import get_timescale
+from shared.utils.model_registry import validate_training_data, InsufficientTrainingDataError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ml.training")
@@ -65,12 +70,13 @@ async def fetch_training_data(domain: str, days: int = 30) -> np.ndarray:
         logger.warning(f"Database query failed: {e}")
         rows = []
 
-    if not rows:
-        logger.warning(f"No database records found for {domain}. Generating synthetic baseline data to allow model creation.")
-        return np.random.normal(loc=0.0, scale=1.0, size=(1000, 5)).astype(np.float32)
-        
-    logger.info(f"Successfully fetched {len(rows)} valid records from the database.")
-    return np.array([row['ml_features'] for row in rows], dtype=np.float32)
+    raw_arr = np.array([row['ml_features'] for row in rows], dtype=np.float32) if rows else None
+    
+    # Hard-fail guard per §1.5 — refuse synthetic/insufficient data
+    validate_training_data(raw_arr, domain=domain, min_samples=100)
+
+    logger.info(f"Successfully fetched and validated {len(rows)} records from the database.")
+    return raw_arr
     
 async def train_and_export_onnx(domain: str):
     logger.info(f"Training {domain} model...")
