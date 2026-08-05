@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { NormalizedEvent } from './types';
+import { useTelemetryStore } from './store';
 
 // Max events kept in memory per hook instance
 const MAX_LIVE_EVENTS = 300;
@@ -20,7 +21,8 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     if (process.env.NEXT_PUBLIC_API_URL) {
       baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '').replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
     }
-    const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed`;
+    const apiKey = process.env.NEXT_PUBLIC_API_KEY || '';
+    const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed${apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : ''}`;
 
     let isMounted = true;
     let reconnectTimer: NodeJS.Timeout | null = null;
@@ -32,8 +34,10 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         wsRef.current = ws;
 
         ws.onopen = () => {
-          // Reset backoff on successful connection
+          // Reset backoff on successful connection & sync Zustand store
           backoffRef.current = RECONNECT_INITIAL_MS;
+          useTelemetryStore.getState().setConnected(true);
+          useTelemetryStore.getState().updateTelemetry();
         };
 
         let pendingBatch: NormalizedEvent[] = [];
@@ -47,6 +51,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
               const combined = [...batchToAdd, ...prev];
               return combined.slice(0, MAX_LIVE_EVENTS);
             });
+            useTelemetryStore.getState().updateTelemetry();
           }
           rafId = null;
         };
@@ -76,11 +81,12 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         };
 
         ws.onerror = () => {
-          // Browser will automatically close socket and trigger onclose
+          useTelemetryStore.getState().setConnected(false);
         };
 
         ws.onclose = () => {
           if (isMounted) {
+            useTelemetryStore.getState().setConnected(false);
             // Exponential backoff with cap
             reconnectTimer = setTimeout(connect, backoffRef.current);
             backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
@@ -88,6 +94,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         };
       } catch (err) {
         console.warn('WebSocket connection fallback to polling:', err);
+        useTelemetryStore.getState().setConnected(false);
       }
     }
 
@@ -100,6 +107,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         wsRef.current.onclose = null;
         wsRef.current.onerror = null;
         wsRef.current.close();
+        useTelemetryStore.getState().setConnected(false);
       }
     };
   }, []);

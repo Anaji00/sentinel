@@ -17,6 +17,7 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions
 from shared.utils.equities import is_valid_primary_equity
+from shared.utils.source_scorecard import get_source_scorecard
 
 logger = logging.getLogger("enrichment.news")
 
@@ -226,7 +227,18 @@ class NewsEnricher:
 
         summary     = (p.get("summary") or "")[:1000]
         url         = p.get("url", "")
-        reliability = float(p.get("reliability", 0.8))
+        
+        source_name = getattr(raw, "source", None) or p.get("source") or ""
+        if source_name and self.redis:
+            try:
+                card = await get_source_scorecard(self.redis, source_name)
+                reliability = card.reliability_weight
+            except Exception as e:
+                logger.debug(f"Failed to fetch scorecard for {source_name}: {e}")
+                reliability = float(p.get("reliability", 0.8))
+        else:
+            reliability = float(p.get("reliability", 0.8))
+
         combined_text = f"{title} {summary}"
         lower_text = combined_text.lower()
 

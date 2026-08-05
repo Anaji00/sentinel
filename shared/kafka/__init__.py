@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 
 from aiokafka import AIOKafkaConsumer as _Consumer
 from aiokafka import AIOKafkaProducer as _Producer
-from kafka.errors import KafkaError, KafkaConnectionError
+from aiokafka.errors import KafkaError, KafkaConnectionError
 import sys
 
 import time

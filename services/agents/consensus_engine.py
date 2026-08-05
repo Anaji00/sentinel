@@ -224,6 +224,15 @@ class ContradictionReport(BaseModel):
     summary: str = ""
 
 
+class EvidenceContributor(BaseModel):
+    """Details of an individual agent/detector contribution to the consensus evidence trail."""
+    agent_name: str
+    direction: str = "neutral"
+    conviction: float = 0.0
+    weight: float = 1.0
+    opinion: Optional[SubjectiveOpinion] = None
+
+
 class ConsensusSignal(BaseModel):
     """Weighted consensus for a ticker."""
     ticker: str
@@ -234,6 +243,7 @@ class ConsensusSignal(BaseModel):
     agreement_ratio: float = 0.0  # 0.0 = total disagreement, 1.0 = total agreement
     fused_opinion: Optional[SubjectiveOpinion] = None
     bulletins: List[AgentBulletin] = Field(default_factory=list)
+    evidence_trail: List[EvidenceContributor] = Field(default_factory=list)
 
 
 class ConsensusReport(BaseModel):
@@ -327,6 +337,20 @@ class ConsensusEngine(SentinelAgent):
                     return base * 0.3  # Heavily downweight stale/drifted agents
                 return base
 
+            def _build_evidence_trail(bulletin_group: List[AgentBulletin]) -> List[EvidenceContributor]:
+                trail = []
+                for b in bulletin_group:
+                    w = _get_weight(b.agent_name)
+                    op = SubjectiveOpinion.from_bulletin(b, w)
+                    trail.append(EvidenceContributor(
+                        agent_name=b.agent_name,
+                        direction=b.expected_direction or "neutral",
+                        conviction=b.conviction,
+                        weight=round(w, 4),
+                        opinion=op,
+                    ))
+                return trail
+
             if len(group) < 2:
                 # Single-agent ticker: emit consensus directly
                 b = group[0]
@@ -343,6 +367,7 @@ class ConsensusEngine(SentinelAgent):
                     agreement_ratio=1.0,
                     fused_opinion=opinion,
                     bulletins=group,
+                    evidence_trail=_build_evidence_trail(group),
                 ))
                 continue
 
@@ -461,6 +486,7 @@ class ConsensusEngine(SentinelAgent):
                     agreement_ratio=round(agreement, 4),
                     fused_opinion=fused,
                     bulletins=group,
+                    evidence_trail=_build_evidence_trail(group),
                 ))
 
         # Sort: highest conviction first
@@ -480,10 +506,11 @@ class ConsensusEngine(SentinelAgent):
         await self._persist_report(report)
 
         # Publish to Kafka if available
-        if self.producer and (contradictions or consensus_signals or ach_reports):
+        producer = getattr(self, "producer", None)
+        if producer and (contradictions or consensus_signals or ach_reports):
             try:
                 from shared.kafka import Topics
-                await self.producer.send(
+                await producer.send(
                     "agents.consensus.reports",
                     report.model_dump(mode="json"),
                 )

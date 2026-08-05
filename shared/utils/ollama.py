@@ -17,10 +17,12 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, Optional, Type
  
 import aiohttp
 from pydantic import BaseModel, ValidationError
+from shared.utils.metrics import MetricsCollector
  
 logger = logging.getLogger("sentinel.ollama")
  
@@ -87,10 +89,12 @@ class OllamaClient:
         session: aiohttp.ClientSession,
         model: str = OLLAMA_MODEL,
         redis_client: Optional[Any] = None,
+        service_name: Optional[str] = None,
     ):
         self._session = session
         self.model = model
         self.redis_client = redis_client
+        self.service_name = service_name or os.getenv("SERVICE_NAME", "default")
         # Circuit breaker state (per-model)
         self._consecutive_timeouts: Dict[str, int] = {}
         self._circuit_open_until: Dict[str, float] = {}
@@ -272,8 +276,20 @@ class OllamaClient:
             full_prompt = f"{system_prompt}\n\n{user_prompt}{schema_instruction}{correction}"
 
             try:
+                sem_start = time.monotonic()
                 async with semaphore:
-                    raw_text = await self._call_ollama(full_prompt, temperature, active_model, format="json", num_predict=num_predict, exclude_models=visited)
+                    sem_wait = time.monotonic() - sem_start
+                    MetricsCollector.observe_latency(f"ollama_semaphore_wait_seconds_{self.service_name}", sem_wait)
+
+                    MetricsCollector.increment("ollama_calls_total")
+                    MetricsCollector.increment(f"ollama_calls_{self.service_name}")
+                    call_start = time.monotonic()
+                    try:
+                        raw_text = await self._call_ollama(full_prompt, temperature, active_model, format="json", num_predict=num_predict, exclude_models=visited)
+                        MetricsCollector.observe_latency(f"ollama_latency_{self.service_name}", time.monotonic() - call_start)
+                    except (InferenceError, asyncio.TimeoutError) as call_err:
+                        MetricsCollector.increment(f"ollama_timeouts_{self.service_name}")
+                        raise call_err
 
                 parsed = self._extract_json(raw_text)
                 if parsed is None:

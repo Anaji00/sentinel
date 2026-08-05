@@ -1,0 +1,68 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Ollama Calls per Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sentinel_ollama_calls_total",
+          "legendFormat": "Total Calls"
+        },
+        {
+          "expr": "sentinel_ollama_calls_{__name__=~\"sentinel_ollama_calls_.*\"}",
+          "legendFormat": "{{__name__}}"
+        }
+      ]
+    },
+    {
+      "title": "Ollama Inference Latency (p95 / avg)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sentinel_ollama_latency_seconds{quantile=\"0.95\"}",
+          "legendFormat": "Latency p95"
+        }
+      ]
+    },
+    {
+      "title": "Ollama Semaphore Wait Time (seconds)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sentinel_ollama_semaphore_wait_seconds",
+          "legendFormat": "Semaphore Wait"
+        }
+      ]
+    },
+    {
+      "title": "Ollama Timeouts per Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sentinel_ollama_timeouts",
+          "legendFormat": "Timeouts"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["sentinel", "ollama"],
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Sentinel - Ollama LLM Performance & Telemetry",
+  "version": 1
+}

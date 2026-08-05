@@ -22,9 +22,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
  
-from shared.db import get_timescale
+from shared.db import get_timescale, get_redis
 from shared.models import ScenarioStatus
 from shared.kafka import SentinelProducer, Topics
+from shared.utils.source_scorecard import update_source_scorecard
 from .pattern_library import PatternLibrary
  
 logger = logging.getLogger("reasoning.tracker")
@@ -35,10 +36,11 @@ CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
 
 class ScenarioTracker:
-    def __init__(self, db, producer=None):
+    def __init__(self, db, producer=None, redis=None):
         self._db = db
         self._library = PatternLibrary(db)
         self._producer = producer
+        self._redis = redis
 
     async def check_all(self):
         active = await self._fetch_active_scenarios()
@@ -108,6 +110,16 @@ class ScenarioTracker:
                     status_change.value,
                     "; ".join(notes),
                 )
+                try:
+                    sources = await self._get_scenario_event_sources(scenario_id)
+                    redis_client = self._redis or (await get_redis())
+                    if sources and redis_client:
+                        story_confirmed = (status_change == ScenarioStatus.CONFIRMED)
+                        conviction_float = float(confidence) / 100.0 if confidence > 1.0 else float(confidence)
+                        for src in sources:
+                            await update_source_scorecard(redis_client, src, story_confirmed, conviction_float)
+                except Exception as e:
+                    logger.error(f"Failed to update source scorecard for scenario {scenario_id}: {e}")
                 
             if status_change == ScenarioStatus.DENIED and self._producer:
                 try:
@@ -260,5 +272,27 @@ class ScenarioTracker:
                     """, new_confidence, history_entry, scenario_id)
         except Exception as e:
             logger.error(f"update_scenario failed ({scenario_id}): {e}")
+
+    async def _get_scenario_event_sources(self, scenario_id: str) -> List[str]:
+        """
+        Finds distinct event sources originating/supporting a scenario.
+        """
+        try:
+            rows = await self._db.query("""
+                SELECT DISTINCT e.source
+                FROM scenarios s
+                LEFT JOIN correlations c ON s.correlation_id = c.correlation_id
+                JOIN events e ON (
+                    (c.trigger_event_id IS NOT NULL AND e.event_id = c.trigger_event_id)
+                    OR (c.supporting_event_ids IS NOT NULL AND e.event_id = ANY(c.supporting_event_ids))
+                    OR (s.supporting_event_ids IS NOT NULL AND e.event_id = ANY(s.supporting_event_ids))
+                )
+                WHERE s.scenario_id::text = $1::text AND e.source IS NOT NULL AND e.source != ''
+            """, scenario_id)
+            return [r["source"] for r in rows if r.get("source")]
+        except Exception as e:
+            logger.error(f"Failed to query scenario event sources ({scenario_id}): {e}")
+            return []
+
 
             

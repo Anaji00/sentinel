@@ -17,27 +17,21 @@ router = APIRouter(prefix="/api/v1", tags=["Intelligence"])
 
 @router.get("/scenarios")
 async def get_active_scenarios(
-    # INPUT VALIDATION: FastAPI automatically validates that 'limit' is an integer
-    # between 1 (ge=1) and 100 (le=100). If a user asks for 500, FastAPI returns a 422 Error automatically.
     limit: int = Query(20, ge=1, le=100),
-    # OPTIONAL INPUT: The user doesn't have to provide a status. Defaults to None.
-    status: Optional[str] = Query(None, description="e.g., HYPOTHESIS, CONFIRMED, DENIED"),
-    # DEPENDENCY INJECTION: Automatically gets a warm DB connection for this specific request.
+    status: Optional[str] = Query(None, description="e.g., HYPOTHESIS, CONFIRMED, UNDER_REVISE, DENIED"),
     db = Depends(get_db)
 ):
-    """Fetch the latest AI-generated geopolitical scenarios."""
+    """Fetch the latest AI-generated geopolitical scenarios with optional status filtering."""
     try:
         query = "SELECT * FROM scenarios"
         params = []
         
-        # DYNAMIC SQL BUILDING: We only add the WHERE clause if the user actually provided a status.
-        # Notice we STILL use `%s` and append to a `params` list to maintain security 
-        # against SQL injection, rather than doing `query += f" WHERE status = '{status}'"`
-        if status:
-            params.append(status)
-            query += f" WHERE status = ${len(params)}"
+        if status and status.lower() != "all":
+            params.append(status.strip())
+            query += f" WHERE toLower(status) = toLower(${len(params)})"
         params.append(limit)
         query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
+        
         return await db.query(query, *params)
     except Exception as e:
         logger.error(f"Error fetching scenarios: {e}")
@@ -51,14 +45,32 @@ async def get_correlations(
     min_tier: int = Query(1, description="Minimum alert tier (1=WATCH, 2=ALERT, 3=INTEL)"),
     db = Depends(get_db)
 ):
-    """Fetch raw correlation clusters before AI scenario generation."""
+    """Fetch raw correlation clusters before AI scenario generation, including evidence trail if present."""
     try:
-        return await db.query("""
-            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags 
+        rows = await db.query("""
+            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario 
             FROM correlations 
             WHERE alert_tier >= $1 
             ORDER BY detected_at DESC LIMIT $2
         """, min_tier, limit)
+
+        results = []
+        for r in rows:
+            item = dict(r)
+            scen = item.get("scenario")
+            if isinstance(scen, str):
+                try:
+                    scen = json.loads(scen)
+                except Exception:
+                    scen = {}
+            elif not isinstance(scen, dict):
+                scen = {}
+
+            # Include evidence trail from correlation scenario payload if present
+            item["evidence_trail"] = item.get("evidence_trail") or scen.get("evidence_trail") or []
+            results.append(item)
+
+        return results
     except Exception as e:
         logger.error(f"Failed to fetch correlations: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")

@@ -130,6 +130,13 @@ def test_granger_causality_pair():
         y[i] = 0.8 * x[i - 1] + np.random.normal(0, 0.1)
     res = quant_calc.granger_causality(list(x), list(y), max_lag=3)
     assert res["x_granger_causes_y"] is True
+    assert res["degraded"] is False
+
+def test_granger_causality_degraded():
+    # Insufficient length -> returns degraded=True
+    res = quant_calc.granger_causality([1.0, 2.0], [1.0, 2.0], max_lag=3)
+    assert res["degraded"] is True
+    assert res["x_granger_causes_y"] is False
 
 def test_hurst_exponent_bounds():
     np.random.seed(42)
@@ -172,7 +179,14 @@ def test_vwap_and_twap():
 # ── 6. CALIBRATION & DRIFT TESTS ──────────────────────────────────────────────
 
 def test_model_drift_scheduler_psi():
-    from services.telemetry_worker.drift_scheduler import ModelDriftScheduler
+    import importlib.util
+    from pathlib import Path
+    drift_path = Path(__file__).resolve().parents[1] / "services" / "telemetry-worker" / "drift_scheduler.py"
+    spec = importlib.util.spec_from_file_location("drift_scheduler", drift_path)
+    drift_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(drift_mod)
+    ModelDriftScheduler = drift_mod.ModelDriftScheduler
+
     scheduler = ModelDriftScheduler()
     np.random.seed(42)
     baseline = list(np.random.normal(0.5, 0.1, 100))

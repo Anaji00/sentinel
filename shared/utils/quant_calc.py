@@ -20,6 +20,7 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
+from scipy.stats import f as f_dist
 
 logger = logging.getLogger("sentinel.quant_calc")
 
@@ -562,13 +563,20 @@ def granger_causality(
     """
     if len(series_x) != len(series_y) or len(series_x) < max_lag + 20:
         return {"f_statistic": 0.0, "p_value": 1.0, "optimal_lag": 0,
-                "x_granger_causes_y": False}
+                "x_granger_causes_y": False, "degraded": True}
     
     x = np.array(series_x, dtype=np.float64)
     y = np.array(series_y, dtype=np.float64)
     
-    best_result = {"f_statistic": 0.0, "p_value": 1.0, "optimal_lag": 0,
-                   "x_granger_causes_y": False}
+    best_result = {
+        "f_statistic": 0.0,
+        "p_value": 1.0,
+        "optimal_lag": 0,
+        "x_granger_causes_y": False,
+        "degraded": False,
+    }
+    
+    has_lag_error = False
     
     for lag in range(1, max_lag + 1):
         T = len(y) - lag
@@ -602,7 +610,6 @@ def granger_causality(
             
             f_stat = ((rss_r - rss_u) / df1) / (rss_u / df2)
             
-            from scipy.stats import f as f_dist
             p_value = 1.0 - f_dist.cdf(f_stat, df1, df2)
             
             if p_value < best_result["p_value"]:
@@ -611,10 +618,15 @@ def granger_causality(
                     "p_value": round(float(p_value), 6),
                     "optimal_lag": lag,
                     "x_granger_causes_y": bool(p_value < 0.05),
+                    "degraded": False,
                 }
-        except Exception:
+        except (np.linalg.LinAlgError, ValueError, TypeError, ZeroDivisionError):
+            has_lag_error = True
             continue
     
+    if best_result["optimal_lag"] == 0 or has_lag_error:
+        best_result["degraded"] = True
+
     return best_result
 
 

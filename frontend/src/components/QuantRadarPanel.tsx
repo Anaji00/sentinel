@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
@@ -55,6 +55,8 @@ interface AgentResponse {
 export default function QuantRadarPanel() {
   const [subTab, setSubTab] = useState<'radar' | 'agents'>('radar');
   const [selectedAnomaly, setSelectedAnomaly] = useState<RadarAnomaly | null>(null);
+  const [minZScore, setMinZScore] = useState<number>(3.0);
+  const [searchQuery, setSearchQuery] = useState<string>('');
 
   const { data: radarData } = useSWR<RadarResponse>(
     '/radar/anomalies',
@@ -74,9 +76,18 @@ export default function QuantRadarPanel() {
     { refreshInterval: 4000 }
   );
 
-  const anomalies = radarData?.anomalies || [];
+  const rawAnomalies = radarData?.anomalies || [];
   const agents = agentData?.agents || [];
   const decisions = agentData?.recent_decisions || [];
+
+  const filteredAnomalies = useMemo(() => {
+    return rawAnomalies.filter(a => {
+      const zPass = (a.z_score || a.anomaly_score * 4.5) >= minZScore;
+      const q = searchQuery.toLowerCase();
+      const searchPass = !q || a.ticker.toLowerCase().includes(q) || a.entity_name.toLowerCase().includes(q);
+      return zPass && searchPass;
+    });
+  }, [rawAnomalies, minZScore, searchQuery]);
 
   return (
     <Card
@@ -89,7 +100,7 @@ export default function QuantRadarPanel() {
       headerAction={
         <Tabs
           tabs={[
-            { id: 'radar', label: 'RADAR SWEEPS', count: anomalies.length },
+            { id: 'radar', label: 'RADAR SWEEPS', count: filteredAnomalies.length },
             { id: 'agents', label: 'AGENTIC OUTPUT', count: agents.length }
           ]}
           activeTab={subTab}
@@ -98,44 +109,79 @@ export default function QuantRadarPanel() {
       }
       noPadding
     >
-      <div className="p-3 space-y-3 flex-1 overflow-y-auto font-mono text-xs">
+      <div className="p-3.5 space-y-3 flex-1 overflow-y-auto font-mono text-xs">
         {subTab === 'radar' ? (
           <>
             {/* Radar Baseline Status HUD */}
-            <div className="p-2.5 rounded-lg bg-slate-950 border border-cyan-500/20 space-y-1">
+            <div className="p-2.5 rounded-lg bg-slate-950 border border-cyan-500/20 space-y-1.5">
               <div className="flex items-center justify-between text-[#00f2fe] font-bold">
                 <span>SWEEP ENGINE</span>
-                <span className="text-emerald-400">Z-SCORE &gt; 3.0 THRESHOLD</span>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-slate-400">Z-SCORE FILTER:</span>
+                  {[3.0, 4.5, 5.0].map(z => (
+                    <button
+                      key={z}
+                      onClick={() => setMinZScore(z)}
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-bold transition-all cursor-pointer ${
+                        minZScore === z
+                          ? 'bg-[#00f2fe] text-[#06080d] border border-white'
+                          : 'bg-slate-900 text-slate-400 border border-slate-700'
+                      }`}
+                    >
+                      &ge; {z.toFixed(1)}&sigma;
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300 pt-1">
+              <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300 pt-1 border-t border-slate-800/80">
                 <div>SCANNED: <span className="text-white font-bold">{sweepData?.total_universe_scanned || 4500} US Equities</span></div>
                 <div>BASELINES: <span className="text-emerald-400 font-bold">{sweepData?.tracked_baselines || 1840} EWMA Keys</span></div>
               </div>
             </div>
 
+            {/* Search Input */}
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="Filter volume anomalies by ticker or company name..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-[#080a10] border border-cyan-500/20 rounded-lg px-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-[#00f2fe]/60 font-mono transition-colors"
+              />
+            </div>
+
             {/* Radar Volume Anomalies List */}
             <div className="space-y-2">
               <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider">
-                QUANTITATIVE VOLUME ANOMALIES (Z &gt; 3.0)
+                QUANTITATIVE VOLUME ANOMALIES (Z &ge; {minZScore.toFixed(1)})
               </span>
-              {anomalies.map((a, idx) => (
-                <div
-                  key={idx}
-                  onClick={() => setSelectedAnomaly(a)}
-                  className="p-2.5 rounded-lg bg-slate-900/80 border border-cyan-500/20 hover:border-[#00f2fe]/50 cursor-pointer transition-all space-y-1"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-white text-xs">{a.ticker} ({a.entity_name})</span>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">
-                      +{a.z_score.toFixed(2)}σ ANOMALY
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-[10px] text-slate-400">
-                    <span>Region: {a.region}</span>
-                    <span>{new Date(a.occurred_at).toLocaleTimeString()}</span>
-                  </div>
+              {filteredAnomalies.length > 0 ? (
+                filteredAnomalies.map((a, idx) => {
+                  const zVal = a.z_score || a.anomaly_score * 4.5;
+                  return (
+                    <div
+                      key={a.event_id || idx}
+                      onClick={() => setSelectedAnomaly(a)}
+                      className="p-2.5 rounded-lg bg-slate-900/80 border border-cyan-500/20 hover:border-[#00f2fe]/50 cursor-pointer transition-all space-y-1 hover:bg-slate-900/95"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-white text-xs">{a.ticker} ({a.entity_name})</span>
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">
+                          +{zVal.toFixed(2)}&sigma; ANOMALY
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 pt-0.5">
+                        <span>Region: <span className="text-slate-300">{a.region}</span></span>
+                        <span>{new Date(a.occurred_at).toLocaleTimeString()}</span>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="p-6 text-center border border-dashed border-cyan-500/20 rounded-lg text-slate-400 text-xs">
+                  No quantitative anomalies match Z &ge; {minZScore.toFixed(1)}.
                 </div>
-              ))}
+              )}
             </div>
           </>
         ) : (
@@ -204,11 +250,18 @@ export default function QuantRadarPanel() {
             </div>
             <div className="space-y-2">
               <div><span className="text-slate-400">ENTITY:</span> <span className="text-white font-bold">{selectedAnomaly.entity_name}</span></div>
-              <div><span className="text-slate-400">Z-SCORE SPIKE:</span> <span className="text-rose-400 font-bold">+{selectedAnomaly.z_score.toFixed(2)}σ</span></div>
+              <div><span className="text-slate-400">Z-SCORE SPIKE:</span> <span className="text-rose-400 font-bold">+{(selectedAnomaly.z_score || selectedAnomaly.anomaly_score * 4.5).toFixed(2)}&sigma;</span></div>
               <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-amber-400 font-bold">{selectedAnomaly.anomaly_score.toFixed(3)}</span></div>
               <div><span className="text-slate-400">REGION:</span> <span className="text-emerald-400">{selectedAnomaly.region}</span></div>
               <div><span className="text-slate-400">DETECTED AT:</span> <span className="text-slate-300">{new Date(selectedAnomaly.occurred_at).toUTCString()}</span></div>
             </div>
+
+            <button
+              onClick={() => setSelectedAnomaly(null)}
+              className="w-full py-2 bg-slate-900 text-[#00f2fe] border border-cyan-500/30 rounded-lg text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer mt-2"
+            >
+              DISMISS
+            </button>
           </div>
         </div>
       )}

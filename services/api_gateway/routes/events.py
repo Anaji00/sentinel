@@ -33,43 +33,56 @@ DOMAIN_TO_COLUMN = {
     "news": "headline" # News doesn't have a JSONB column, it uses the headline/summary natively
 }
 
+from datetime import datetime
+
 @router.get("/{domain}")
 async def get_domain_events(
     domain: str, 
     limit: int = Query(50, le=500),
     min_anomaly: float = Query(0.0, ge=0.0, le=1.0),
+    start_time: Optional[str] = Query(None, description="Optional ISO start timestamp"),
+    end_time: Optional[str] = Query(None, description="Optional ISO end timestamp"),
     db = Depends(get_db)
 ):
-    """Dynamic endpoint to fetch events for a specific domain or all domains."""
+    """Dynamic endpoint to fetch events for a specific domain or all domains with time-window filtering."""
     domain = domain.lower()
     
     try:
-        if domain == "all" or domain not in DOMAIN_TO_COLUMN:
-            query = """
+        where_clauses = ["anomaly_score >= $1"]
+        params = [min_anomaly]
+        param_idx = 2
+
+        if start_time:
+            where_clauses.append(f"occurred_at >= ${param_idx}")
+            params.append(datetime.fromisoformat(start_time.replace("Z", "+00:00")))
+            param_idx += 1
+
+        if end_time:
+            where_clauses.append(f"occurred_at <= ${param_idx}")
+            params.append(datetime.fromisoformat(end_time.replace("Z", "+00:00")))
+            param_idx += 1
+
+        where_sql = " AND ".join(where_clauses)
+        limit_idx = f"${param_idx}"
+        params.append(limit)
+
+        if domain == "all" or domain not in DOMAIN_TO_COLUMN or domain == "news":
+            query = f"""
                 SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, summary as domain_data
                 FROM events 
-                WHERE anomaly_score >= $1
-                ORDER BY occurred_at DESC LIMIT $2
+                WHERE {where_sql}
+                ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
-            return await db.query(query, min_anomaly, limit)
-            
-        target_column = DOMAIN_TO_COLUMN[domain]
-        if domain == "news":
-            query = """
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, summary as domain_data
-                FROM events 
-                WHERE anomaly_score >= $1
-                ORDER BY occurred_at DESC LIMIT $2
-            """
-            return await db.query(query, min_anomaly, limit)
         else:
+            target_column = DOMAIN_TO_COLUMN[domain]
             query = f"""
                 SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
                 FROM events 
-                WHERE anomaly_score >= $1
-                ORDER BY occurred_at DESC LIMIT $2
+                WHERE {where_sql}
+                ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
-            return await db.query(query, min_anomaly, limit)
+
+        return await db.query(query, *params)
     
     except Exception as e:
         logger.error(f"Failed to fetch {domain} events: {e}", exc_info=True)

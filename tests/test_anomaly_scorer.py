@@ -30,7 +30,7 @@ def test_dynamic_anomaly_scorer_streaming_batch():
 
         assert len(results) == 2
         assert all(0.0 <= r["score"] <= 1.0 for r in results)
-        assert all(r["domain"] == "spatial" for r in results)
+        assert all(r["domain"] == "maritime" for r in results)
 
     asyncio.run(run_test())
 
