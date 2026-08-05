@@ -29,6 +29,7 @@ from services.agents.rule_agent import RuleSynthesizerAgent
 from services.agents.supervisor import GraphSupervisor
 from services.agents.consensus_engine import ConsensusEngine
 from services.agents.adversarial_wargamer import AdversarialWargamerAgent
+from services.agents.edge_validator import EdgeValidatorAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
@@ -184,7 +185,7 @@ async def main():
         input_topics=[
             Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.MACRO_DECOUPLING,
-            Topics.MACRO_ASSESSMENT, Topics.RADAR_DECISIONS
+            Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT, Topics.RADAR_DECISIONS
         ],
         group_id="agent-quant-trading",
         shared_infra=shared_infra,
@@ -223,8 +224,8 @@ async def main():
         agent_name="rule_synthesizer",
         input_topics=[
             Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
-            Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT,
-            Topics.INSIDER_CLUSTERS
+            Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES, Topics.MACRO_DECOUPLING,
+            Topics.MACRO_ASSESSMENT, Topics.INSIDER_CLUSTERS
         ],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
@@ -271,6 +272,18 @@ async def main():
         fallback_model="qwen2.5:1.5b",
     )
 
+    edge_validator_agent = build_agent(
+        EdgeValidatorAgent,
+        agent_name="edge_validator",
+        input_topics=[
+            Topics.QUANT_DISCOVERIES, Topics.CORRELATIONS, Topics.INTEL_BRIEFS
+        ],
+        group_id="agent-edge-validator",
+        shared_infra=shared_infra,
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
+    )
+
     # Dictionary map with backwards-compatible aliases for task queue dispatch
     agents_by_name = {
         # Core Consolidated Engines
@@ -282,6 +295,7 @@ async def main():
         "supervisor":                  supervisor_agent,
         "consensus_engine":            consensus_engine,
         "adversarial_wargamer":        adversarial_wargamer,
+        "edge_validator":              edge_validator_agent,
 
         # Backwards-compatible Task Routing Aliases
         "yield_curve_agent":          macro_intelligence_engine,
@@ -312,6 +326,7 @@ async def main():
         ("supervisor", supervisor_agent, "heavy"),
         ("consensus_engine", consensus_engine, "heavy"),
         ("adversarial_wargamer", adversarial_wargamer, "heavy"),
+        ("edge_validator", edge_validator_agent, "fast"),
     ]
 
     active_agents = {

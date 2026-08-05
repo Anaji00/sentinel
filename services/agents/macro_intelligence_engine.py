@@ -361,7 +361,8 @@ class MacroIntelligenceEngine(SentinelAgent):
                 continue
 
     async def _get_exposed_instruments(self, macro_asset: str) -> List[str]:
-        cache_key = f"sentinel:cache:exposure:{macro_asset}"
+        min_confidence = float(os.getenv("MIN_EXPOSURE_EDGE_CONFIDENCE", "0.6"))
+        cache_key = f"sentinel:cache:exposure:{macro_asset}:{min_confidence}"
         cached_raw = await self.redis.raw.get(cache_key)
         if cached_raw:
             return json.loads(cached_raw)
@@ -369,10 +370,11 @@ class MacroIntelligenceEngine(SentinelAgent):
         try:
             neo4j_client = await get_neo4j()
             query = """
-            MATCH (c:Entity {id: $macro_asset})-[:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO*1..2]-(e:Entity {type: 'instrument'})
+            MATCH (c:Entity {id: $macro_asset})-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO*1..2]-(e:Entity {type: 'instrument'})
+            WHERE ALL(rel IN r WHERE coalesce(rel.confidence, 0.0) >= $min_confidence)
             RETURN DISTINCT e.id AS exposed_ticker
             """
-            rows = await neo4j_client.query(query, {"macro_asset": macro_asset})
+            rows = await neo4j_client.query(query, {"macro_asset": macro_asset, "min_confidence": min_confidence})
             exposed = [r["exposed_ticker"] for r in rows if r.get("exposed_ticker")]
 
             # Fail closed: return empty list if graph has no exposure edge, rather than

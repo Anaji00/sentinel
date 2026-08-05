@@ -177,6 +177,17 @@ class MaritimeEnricher:
             
         final_events = []
         for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, region, vessel, flags, vtype, anomaly) in results:
+            is_sanctioned = bool(flags)
+            is_emergency_nav = bool(nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")))
+            is_watched = bool(anomaly > 0.15)
+            
+            headline_str = (
+                f"{vtype or 'Vessel'} '{vessel.get('name') or meta.get('ShipName') or f'MMSI:{mmsi}'}' "
+                f"{nav_status.lower() if nav_status else 'transiting'} in {region or 'unknown waters'}"
+                + (" — sanctioned/flagged vessel" if is_sanctioned else "")
+                + (" — emergency navigation status" if is_emergency_nav else "")
+            ) if (is_sanctioned or is_emergency_nav or is_watched) else None
+
             final_events.append(NormalizedEvent(
                 event_id = raw.event_id, trace_id = raw.trace_id,
                 type = EventType.VESSEL_POSITION,
@@ -191,6 +202,7 @@ class MaritimeEnricher:
                 latitude = lat,
                 longitude = lon,
                 region = region,
+                headline = headline_str,
                 vessel_data = VesselData(
                     mmsi=mmsi, 
                     latitude=lat,

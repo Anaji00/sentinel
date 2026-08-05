@@ -161,6 +161,8 @@ class VesselGapDetector:
             score = await self.scorer.score_vessel_dark(
                 mmsi, data["gap"], data["region"], flags, val.get("heading", 0)
             )
+            gap_hrs = round(data.get("gap", 0.0), 1)
+            reg = data.get("region") or "unknown waters"
             event = NormalizedEvent(
                 type=EventType.VESSEL_DARK, 
                 occurred_at=now, 
@@ -173,18 +175,23 @@ class VesselGapDetector:
                 ),
                 latitude = val.get("lat"),
                 longitude = val.get("lon"),
-                region = region,
+                region = reg,
+                headline=(
+                    f"{vtype or 'Vessel'} '{info.get('name', f'MMSI:{mmsi}')}' went dark in "
+                    f"{reg} after {gap_hrs}h of AIS silence"
+                    + (f" (flagged: {', '.join(flags)})" if flags else "")
+                ),
                 vessel_data = VesselData(
                     mmsi=mmsi, 
-                    gap_hours = round(gap_hours, 1), 
-                    last_seen_region = region, 
+                    gap_hours = gap_hrs, 
+                    last_seen_region = reg, 
                     heading=val.get("heading"), 
                     vessel_type = vtype,
                 ),
                 tags = list(filter(None, [
                     "dark_vessel",
                     "ais_gap", 
-                    region.lower().replace(" ", "_") if region else None,
+                    reg.lower().replace(" ", "_") if reg else None,
                 ])),
                 anomaly_score=score,
             )

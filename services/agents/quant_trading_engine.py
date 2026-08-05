@@ -478,13 +478,35 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             }
         }
 
+        # Fetch validated graph exposure correlations for ticker (§3.4, Task 4)
+        graph_correlations = []
+        try:
+            neo4j_client = self.neo4j or await get_neo4j()
+            if neo4j_client:
+                graph_query = """
+                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO*1..2]-(inst:Entity {id: $ticker})
+                WHERE ALL(rel IN r WHERE coalesce(rel.confidence, 0.0) >= 0.6)
+                RETURN DISTINCT e.id AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, 0.6) AS confidence
+                LIMIT 5
+                """
+                rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper()})
+                if rows:
+                    graph_correlations = [
+                        f"{r['correlated_entity']} -[{r['predicate']}]-> {ticker} (confidence: {r['confidence']:.2f})"
+                        for r in rows if r.get("correlated_entity")
+                    ]
+        except Exception as e:
+            logger.debug(f"Graph exposure lookup for {ticker} bypass: {e}")
+
+        graph_block = f"\n        VALIDATED GRAPH CORRELATIONS:\n        - " + "\n        - ".join(graph_correlations) + "\n" if graph_correlations else ""
+
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=3)
         cross_block = f"\n        CROSS-AGENT INTELLIGENCE:\n        {cross_context}\n" if cross_context else ""
 
         user_prompt = f"""=== FINANCIAL ADVISORY & RISK EVALUATION ===
 Target Instrument: {ticker} | Macro Regime: {rates_regime}
 Risk Indicators: {json.dumps(indicators_data, separators=(',', ':'), default=str)}
-{cross_block}
+{graph_block}{cross_block}
 HARD RISK CONSTRAINTS (MANDATORY):
 - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
 - Max Half-Kelly Allocation: {kelly_pct * 100:.1f}% (Set kelly_allocation_pct <= {kelly_pct * 100:.1f}%)

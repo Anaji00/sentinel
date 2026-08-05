@@ -24,7 +24,8 @@ from services.agents.base import SentinelAgent, SchemaViolationError, InferenceE
 from shared.kafka import Topics
 VALID_PREDICATES = {
     "OPERATES_IN", "OWNED_BY", "AFFILIATED_WITH", "SANCTIONED_BY",
-    "TARGETS", "CONFLICTS_WITH", "SUPPLIES", "LOCATED_IN", "RELATED_TO"
+    "TARGETS", "CONFLICTS_WITH", "SUPPLIES", "LOCATED_IN", "RELATED_TO",
+    "POSITIVE_EXPOSURE_TO", "INVERSE_EXPOSURE_TO", "COMMODITY_EXPOSURE"
 }
 
 
