@@ -251,24 +251,33 @@ class MacroIntelligenceEngine(SentinelAgent):
     # ── SUB-ENGINE 2: OPTIONS VOLATILITY SURFACE ─────────────────────────────
 
     async def _process_volatility_surface(self, message: Dict[str, Any], ticker: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        option_type = str(raw.get("option_type") or "CALL").upper()
-        size = int(raw.get("size") or 1)
+        fd = message.get("financial_data") or {}
+        option_type = str(raw.get("option_type") or fd.get("side") or "CALL").upper()
+        size = int(raw.get("size") or raw.get("volume") or fd.get("volume") or 1)
+        measured_iv = raw.get("implied_volatility") if raw.get("implied_volatility") is not None else fd.get("implied_volatility")
 
         async with self.redis.raw.pipeline(transaction=True) as pipe:
             pipe.incrby(f"sentinel:options:volume:{ticker}:{option_type}", size)
             pipe.expire(f"sentinel:options:volume:{ticker}:{option_type}", 86400)
+            if measured_iv is not None:
+                pipe.set(f"sentinel:options:iv:{ticker}:{option_type}", str(measured_iv), ex=86400)
             await pipe.execute()
 
         vals = await self.redis.raw.mget([
             f"sentinel:options:volume:{ticker}:CALL",
             f"sentinel:options:volume:{ticker}:PUT",
+            f"sentinel:options:iv:{ticker}:CALL",
+            f"sentinel:options:iv:{ticker}:PUT",
         ])
-        calls_vol = int(vals[0] or 100)
-        puts_vol = int(vals[1] or 100)
+        calls_vol = int(vals[0] or (size if option_type == "CALL" else 100))
+        puts_vol = int(vals[1] or (size if option_type == "PUT" else 100))
         pc_ratio = round(puts_vol / max(1, calls_vol), 3)
 
-        call_iv = float(raw.get("implied_volatility") or 0.25)
-        put_iv = float(raw.get("put_implied_volatility") or call_iv * 1.15)
+        call_iv_val = float(vals[2].decode("utf-8") if isinstance(vals[2], bytes) else (vals[2] or (measured_iv if option_type == "CALL" else 0.25)))
+        put_iv_val = float(vals[3].decode("utf-8") if isinstance(vals[3], bytes) else (vals[3] or (measured_iv if option_type == "PUT" else call_iv_val * 1.15)))
+
+        call_iv = call_iv_val
+        put_iv = put_iv_val
         iv_skew_bps = round((put_iv - call_iv) * 10000.0, 1)
 
         dedup_key = f"vol_surface_eval:{ticker}:{int(time.time() // 1800)}"

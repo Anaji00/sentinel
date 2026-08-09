@@ -6,6 +6,14 @@ export interface ScenarioHypothesis {
     probability?: number;
 }
 
+export interface EvidenceItem {
+    agent_name: string;
+    direction?: string;
+    conviction?: number;
+    score?: number;
+    reasoning?: string;
+}
+
 export interface Scenario {
     scenario_id?: string;
     correlation_id: string;
@@ -21,6 +29,8 @@ export interface Scenario {
     recommended_monitoring?: string[];
     probability?: number;
     created_at: string;
+    primary_entity_name?: string;
+    evidence_trail?: EvidenceItem[];
 }
 
 export interface Entity {
@@ -40,6 +50,15 @@ export interface FinancialData {
     volume?: number;
     strike_price?: number;
     expiration_date?: string;
+    current_price?: number;
+}
+
+export interface CryptoData {
+    symbol?: string;
+    price?: number;
+    volume?: number;
+    market_cap?: number;
+    change_24h?: number;
 }
 
 export interface VesselData {
@@ -85,6 +104,7 @@ export interface NormalizedEvent {
     region?: string;
     anomaly_score: number;
     financial_data?: FinancialData;
+    crypto_data?: CryptoData;
     vessel_data?: VesselData;
     security_data?: SecurityData;
     prediction_market_data?: PredictionMarketData;

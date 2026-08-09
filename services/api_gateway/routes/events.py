@@ -14,6 +14,7 @@ ARCHITECTURAL UPGRADES:
 import asyncio
 import json
 import logging
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
 from services.api_gateway.dependencies import get_db, get_redis_client, verify_websocket_api_key
 
@@ -68,7 +69,10 @@ async def get_domain_events(
 
         if domain == "all" or domain not in DOMAIN_TO_COLUMN or domain == "news":
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, summary as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, 
+                       COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude, 
+                       COALESCE(longitude, ST_X(coordinates::geometry)) as longitude, 
+                       summary as domain_data
                 FROM events 
                 WHERE {where_sql}
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
@@ -76,7 +80,10 @@ async def get_domain_events(
         else:
             target_column = DOMAIN_TO_COLUMN[domain]
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude, COALESCE({target_column}, '{{}}'::jsonb) as domain_data
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, 
+                       COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude, 
+                       COALESCE(longitude, ST_X(coordinates::geometry)) as longitude, 
+                       COALESCE({target_column}, '{{}}'::jsonb) as domain_data
                 FROM events 
                 WHERE {where_sql}
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
@@ -109,7 +116,22 @@ async def get_event_detail(
         if not result:
             raise HTTPException(status_code=404, detail="Event not found")
         
-        return result[0]
+        event_dict = dict(result[0])
+        # Optimize payload: ensure top-level latitude & longitude are populated
+        vd = event_dict.get("vessel_data")
+        fd = event_dict.get("flight_data")
+        if event_dict.get("latitude") is None:
+            if isinstance(vd, dict) and vd.get("latitude") is not None:
+                event_dict["latitude"] = vd["latitude"]
+            elif isinstance(fd, dict) and fd.get("latitude") is not None:
+                event_dict["latitude"] = fd["latitude"]
+        if event_dict.get("longitude") is None:
+            if isinstance(vd, dict) and vd.get("longitude") is not None:
+                event_dict["longitude"] = vd["longitude"]
+            elif isinstance(fd, dict) and fd.get("longitude") is not None:
+                event_dict["longitude"] = fd["longitude"]
+
+        return event_dict
         
     except HTTPException:
         raise

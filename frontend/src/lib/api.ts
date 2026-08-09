@@ -10,7 +10,7 @@ import axios from "axios";
 // The `NEXT_PUBLIC_` prefix is required to expose these variables to the browser.
 // A default value is provided for local development if the environment variable is not set.
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || '';
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || 'sentinel-dev-key-2026';
 
 /**
  * A pre-configured Axios instance for making requests to our backend API.

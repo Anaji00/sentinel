@@ -9,7 +9,7 @@ leveraged funds, synthetic option yield ETFs, volatility ETNs, and derivatives.
 """
 
 import re
-from typing import Dict, Set, Tuple, Any
+from typing import Dict, Set, Tuple, Any, Optional
 
 # ── ALLOWED CRYPTO EXCEPTION ──────────────────────────────────────────────────
 ALLOWED_CRYPTO_TOKENS: Set[str] = {"BTC", "BTCUSDT", "BTCUSD"}
@@ -234,3 +234,29 @@ async def is_valid_primary_equity_async(ticker: str, redis_client=None) -> bool:
             pass
 
     return True
+
+
+RE_OCC_OPTION_DETAILED = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$", re.IGNORECASE)
+
+
+def parse_occ_option_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Parses an OCC option contract symbol (e.g. 'AAPL240816C00220000').
+    Returns dict with ticker, expiry (YYYY-MM-DD), option_type ('CALL'|'PUT'), and strike (float),
+    or None if invalid OCC symbol format.
+    """
+    if not symbol:
+        return None
+    m = RE_OCC_OPTION_DETAILED.match(symbol.strip().upper())
+    if not m:
+        return None
+    ticker, date_str, type_char, strike_str = m.groups()
+    expiry = f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
+    option_type = "CALL" if type_char.upper() == "C" else "PUT"
+    strike = float(strike_str) / 1000.0
+    return {
+        "ticker": ticker,
+        "expiry": expiry,
+        "option_type": option_type,
+        "strike": strike,
+    }

@@ -27,7 +27,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
-from shared.utils.equities import is_valid_primary_equity
+from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symbol
 
 from shared.utils.logging import setup_sentinel_logging
 
@@ -319,6 +319,14 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 
                                 # Sweep/large options block filter: premium >= $50,000 or contract size >= 100
                                 if premium >= 50000.0 or size >= 100.0:
+                                    parsed = parse_occ_option_symbol(contract) or {}
+                                    opt_type = parsed.get("option_type", "CALL")
+                                    strike_val = parsed.get("strike")
+                                    expiry_val = parsed.get("expiry")
+                                    greeks_val = snapshot.get("greeks") or {}
+                                    iv_val = snapshot.get("impliedVolatility") if snapshot.get("impliedVolatility") is not None else snapshot.get("implied_volatility")
+                                    oi_val = snapshot.get("openInterest") if snapshot.get("openInterest") is not None else snapshot.get("open_interest")
+
                                     event = RawEvent(
                                         source="alpaca_options",
                                         occurred_at=datetime.now(timezone.utc),
@@ -327,7 +335,14 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                             "option_symbol": contract,
                                             "price": price,
                                             "volume": size,
-                                            "premium_usd": premium
+                                            "size": size,
+                                            "premium_usd": premium,
+                                            "option_type": opt_type,
+                                            "strike": strike_val,
+                                            "expiry": expiry_val,
+                                            "implied_volatility": float(iv_val) if iv_val is not None else None,
+                                            "open_interest": int(oi_val) if oi_val is not None else None,
+                                            "greeks": greeks_val,
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)

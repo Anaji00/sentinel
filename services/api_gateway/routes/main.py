@@ -94,6 +94,29 @@ app.include_router(graph.router)
 app.include_router(radar.router)
 app.include_router(agents.router)
 
+from fastapi.responses import PlainTextResponse
+from shared.utils.metrics import MetricsCollector
+from services.api_gateway.dependencies import get_redis_client
+
+@app.get("/metrics", include_in_schema=False)
+@app.get("/api/v1/metrics", include_in_schema=False)
+async def root_metrics():
+    """Prometheus metrics endpoint scrapers hit at GET /metrics."""
+    return PlainTextResponse(MetricsCollector.to_prometheus_format(), media_type="text/plain")
+
+@app.get("/metrics/json", include_in_schema=False)
+async def root_metrics_json():
+    """JSON summary metrics endpoint."""
+    return MetricsCollector.get_summary()
+
+from fastapi import FastAPI, Depends, Request
+
+@app.get("/health", include_in_schema=False)
+async def root_health(request: Request = None, redis = Depends(get_redis_client)):
+    """Convenience alias for /api/v1/health."""
+    from services.api_gateway.routes import system
+    return await system.health_check(request, redis)
+
 if __name__ == "__main__":
     # LOCAL DEVELOPMENT SERVER:
     # Uvicorn is the lightning-fast web server that runs FastAPI.

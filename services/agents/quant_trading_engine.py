@@ -522,6 +522,34 @@ Return raw JSON matching schema:"""
                 temperature=0.1,
             )
 
+            # Post-hoc deterministic trade signal construction and risk limits enforcement
+            max_kelly_pct = round(kelly_pct * 100.0, 2)
+            for play in brief.highest_conviction_plays:
+                play.entry_level = round(current_price, 2)
+                stop_distance = atr * 1.5
+                
+                # Conviction-tiered Risk-Reward ratio selection
+                if play.conviction_score < 0.6:
+                    rr = 1.5
+                elif play.conviction_score < 0.8:
+                    rr = 2.0
+                else:
+                    rr = 3.0
+                play.risk_reward_ratio = rr
+
+                if play.action == "BUY":
+                    play.stop_loss = round(play.entry_level - stop_distance, 2)
+                    play.target_price = round(play.entry_level + (stop_distance * rr), 2)
+                elif play.action == "SELL":
+                    play.stop_loss = round(play.entry_level + stop_distance, 2)
+                    play.target_price = round(play.entry_level - (stop_distance * rr), 2)
+                else:
+                    play.stop_loss = round(play.entry_level - stop_distance, 2)
+                    play.target_price = play.entry_level
+
+                # Hard clamp Kelly allocation to server-calculated half-Kelly limit
+                play.kelly_allocation_pct = round(min(max(0.0, float(play.kelly_allocation_pct)), max_kelly_pct), 2)
+
             res_payload = {
                 "agent": self.name,
                 "agent_run_id": f"fin_{ticker}_{int(time.time())}",

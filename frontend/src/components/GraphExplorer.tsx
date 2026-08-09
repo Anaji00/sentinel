@@ -82,41 +82,74 @@ function getNodeStyle(id: string, type?: string, isCentral: boolean = false) {
     };
 }
 
-export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { entityId?: string }) {
+export default function GraphExplorer({ entityId: initialEntity }: { entityId?: string }) {
     const [mode, setMode] = useState<'entity' | 'path'>('entity');
-    const [targetEntity, setTargetEntity] = useState<string>(initialEntity);
-    const [searchInput, setSearchInput] = useState<string>(initialEntity);
     
-    // Path Finder State
-    const [sourceEntity, setSourceEntity] = useState<string>("NVDA");
-    const [destinationEntity, setDestinationEntity] = useState<string>("TSMC");
+    // Dynamic SWR fetch for graph entities directly from Neo4j/TimescaleDB
+    const { data: dbEntitiesData } = useSWR<{ entities: Array<{ id: string; name: string; type: string }> }>(
+        '/graph/entities',
+        fetcher,
+        { refreshInterval: 10000 }
+    );
 
-    const [nodes, setNodes] = useState<Node[]>([]);
-    const [edges, setEdges] = useState<Edge[]>([]);
-    const [isLoading, setIsLoading] = useState(false);
-    const [pathResultMsg, setPathResultMsg] = useState<string>('');
-
-    // Dynamic SWR fetch for real streaming entities to populate preset chips
+    // Dynamic SWR fetch for streaming events
     const { data: recentEvents } = useSWR<NormalizedEvent[]>(
         '/events/all?limit=25',
         fetcher,
         { refreshInterval: 6000 }
     );
 
-    // Extract dynamic active entities from live streaming events
+    // Extract active entities from DB and live events dynamically
     const dynamicPresets = React.useMemo(() => {
-        const set = new Set<string>(['NVDA', 'SMCI', 'TSMC', 'Taiwan Strait', 'OFAC_TARGET_99']);
+        const set = new Set<string>();
+        (dbEntitiesData?.entities || []).forEach(e => {
+            const val = e.name || e.id;
+            if (val && val.length >= 2) set.add(val);
+        });
         (recentEvents || []).forEach(e => {
             const name = e.primary_entity_name || e.entity_name || e.primary_entity?.name;
             if (name && name.length >= 2 && name.length <= 25) {
                 set.add(name);
             }
         });
-        return Array.from(set).slice(0, 7);
-    }, [recentEvents]);
+        return Array.from(set).slice(0, 8);
+    }, [dbEntitiesData, recentEvents]);
+
+    const defaultFocus = initialEntity || dynamicPresets[0] || "";
+
+    const [targetEntity, setTargetEntity] = useState<string>("");
+    const [searchInput, setSearchInput] = useState<string>("");
+    
+    // Path Finder State
+    const [sourceEntity, setSourceEntity] = useState<string>("");
+    const [destinationEntity, setDestinationEntity] = useState<string>("");
+
+    const [nodes, setNodes] = useState<Node[]>([]);
+    const [edges, setEdges] = useState<Edge[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [pathResultMsg, setPathResultMsg] = useState<string>('');
+
+    // Sync initial focus dynamically from DB presets when ready
+    useEffect(() => {
+        if (!targetEntity && dynamicPresets.length > 0) {
+            const first = defaultFocus;
+            setTargetEntity(first);
+            setSearchInput(first);
+            if (dynamicPresets.length >= 2) {
+                setSourceEntity(dynamicPresets[0]);
+                setDestinationEntity(dynamicPresets[1]);
+            } else {
+                setSourceEntity(first);
+                setDestinationEntity(first);
+            }
+        }
+    }, [dynamicPresets, defaultFocus, targetEntity]);
 
     useEffect(() => {
         const fetchGraphData = async () => {
+            if (!targetEntity && mode === 'entity') return;
+            if ((!sourceEntity || !destinationEntity) && mode === 'path') return;
+
             setIsLoading(true);
             setPathResultMsg('');
 
@@ -173,28 +206,57 @@ export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { en
                     setIsLoading(false);
                 }
             } else {
-                // Shortest Path Finder Mode (Dijkstra)
+                // Shortest Path Finder Mode
                 try {
                     const response = await apiClient.get(`/graph/shortest-path?source_id=${encodeURIComponent(sourceEntity)}&target_id=${encodeURIComponent(destinationEntity)}`);
                     const pathData = response.data?.path || [];
                     
                     if (!pathData || pathData.length === 0) {
-                        setPathResultMsg(`No multi-hop Neo4j path found between ${sourceEntity} and ${destinationEntity}. Synthesizing hypertable correlation graph.`);
-                        // Fallback visualization
-                        const startNode: Node = { id: sourceEntity, data: { label: `🟢 ${sourceEntity}` }, position: { x: 150, y: 200 }, style: getNodeStyle(sourceEntity, 'central', true) };
-                        const endNode: Node = { id: destinationEntity, data: { label: `🔴 ${destinationEntity}` }, position: { x: 450, y: 200 }, style: getNodeStyle(destinationEntity, 'central', true) };
-                        setNodes([startNode, endNode]);
-                        setEdges([{ id: 'e-fallback', source: sourceEntity, target: destinationEntity, label: 'MACRO CORRELATED', animated: true, style: { stroke: '#f59e0b', strokeWidth: 2 } }]);
+                        setPathResultMsg(`No active relationship path found in Knowledge Graph database between ${sourceEntity} and ${destinationEntity}.`);
+                        setNodes([]);
+                        setEdges([]);
                     } else {
-                        // Render full path from Neo4j results
+                        const firstPath = pathData[0];
+                        const pathEntities: any[] = firstPath.entities || [];
+                        const pathRelations: any[] = firstPath.relations || [];
+
                         const newNodes: Node[] = [];
                         const newEdges: Edge[] = [];
-                        // Render path elements...
+
+                        pathEntities.forEach((ent: any, idx: number) => {
+                            const entId = ent.id || ent.name || `Entity_${idx}`;
+                            const isStart = idx === 0;
+                            const isEnd = idx === pathEntities.length - 1;
+                            newNodes.push({
+                                id: entId,
+                                data: { label: isStart ? `🟢 ${entId}` : (isEnd ? `🔴 ${entId}` : entId), type: ent.type },
+                                position: { x: 120 + idx * 180, y: 200 + (idx % 2 === 0 ? 0 : 40) },
+                                style: getNodeStyle(entId, ent.type, isStart || isEnd),
+                            });
+
+                            if (idx > 0) {
+                                const prevId = pathEntities[idx - 1].id || pathEntities[idx - 1].name;
+                                const relLabel = pathRelations[idx - 1]?.type || 'CONNECTED_TO';
+                                newEdges.push({
+                                    id: `e-path-${prevId}-${entId}-${idx}`,
+                                    source: prevId,
+                                    target: entId,
+                                    label: relLabel.replace(/_/g, ' '),
+                                    animated: true,
+                                    style: { stroke: '#a855f7', strokeWidth: 2 },
+                                    labelStyle: { fill: '#c4b5fd', fontWeight: 700, fontSize: 9 },
+                                    labelBgStyle: { fill: '#06080d', color: '#a855f7', fillOpacity: 0.85 },
+                                });
+                            }
+                        });
+
                         setNodes(newNodes);
                         setEdges(newEdges);
                     }
                 } catch (err) {
-                    setPathResultMsg(`Path search offline: Neo4j Dijkstra APOC procedure required.`);
+                    setPathResultMsg(`Path search query failed: database unreachable or entity missing.`);
+                    setNodes([]);
+                    setEdges([]);
                 } finally {
                     setIsLoading(false);
                 }
@@ -229,8 +291,8 @@ export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { en
             <div className="absolute top-3 left-3 z-10 bg-slate-950/90 px-3 py-2 rounded-lg border border-cyan-500/30 backdrop-blur-md flex flex-wrap items-center gap-3 shadow-xl">
                 <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-[#00f2fe] tracking-wider flex items-center gap-1.5">
-                        <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-pulse" />
-                        KNOWLEDGE GRAPH NETWORK
+                        <span className={`h-2 w-2 rounded-full ${isLoading ? 'bg-amber-400 animate-ping' : 'bg-[#00f2fe] animate-pulse'}`} />
+                        {isLoading ? 'QUERYING DB GRAPH...' : 'KNOWLEDGE GRAPH NETWORK'}
                     </span>
                     <div className="flex bg-slate-900 rounded p-0.5 border border-slate-800 text-[10px]">
                         <button
@@ -270,7 +332,7 @@ export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { en
                             type="text"
                             value={sourceEntity}
                             onChange={(e) => setSourceEntity(e.target.value)}
-                            placeholder="From (e.g. NVDA)"
+                            placeholder="From Entity..."
                             className="bg-slate-900 border border-purple-500/30 rounded px-2 py-1 text-[10px] text-white w-24 font-mono"
                         />
                         <span className="text-purple-400 font-bold">➔</span>
@@ -278,7 +340,7 @@ export default function GraphExplorer({ entityId: initialEntity = "NVDA" }: { en
                             type="text"
                             value={destinationEntity}
                             onChange={(e) => setDestinationEntity(e.target.value)}
-                            placeholder="To (e.g. TSMC)"
+                            placeholder="To Entity..."
                             className="bg-slate-900 border border-purple-500/30 rounded px-2 py-1 text-[10px] text-white w-24 font-mono"
                         />
                     </div>

@@ -184,7 +184,7 @@ class CryptoEnricher:
             
             entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
             direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
-            headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
+            headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% (Range Vol: {volatility_pct*100:.2f}%) on ${notional/1e6:.1f}M vol"
     
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,

@@ -392,6 +392,7 @@ async def main():
                             "branching_ratio": top_forecast["branching_ratio"],
                             "source_excitation_ratio": top_forecast["source_excitation_ratio"],
                             "forecast_hours": top_forecast["forecast_hours"],
+                            "hawkes_intensities": hawkes_state.get("intensities", {}) if isinstance(hawkes_state, dict) else {},
                         },
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[],
@@ -406,6 +407,9 @@ async def main():
                     await producer.send(Topics.CORRELATIONS, forecast_cluster.model_dump(), key=forecast_cluster.correlation_id)
                     await _stream_live_correlation(forecast_cluster)
                     corr_fired += 1
+
+            if corr_fired > 0:
+                logger.info(f"🔥 Event {event.event_id} generated {corr_fired} correlation clusters.")
 
             # 3. Story-level deduplication for news/headline events (§2.3)
             # Check if this is a news/headline event and if it's a duplicate story
@@ -614,8 +618,6 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        if 'heartbeat_task' in locals() and heartbeat_task:
-            heartbeat_task.cancel()
         await producer.close()
         await consumer.close()
         await session.close()

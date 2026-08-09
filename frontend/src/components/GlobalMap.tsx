@@ -8,23 +8,23 @@ import { NormalizedEvent } from "../lib/types";
 import { useLiveEvents } from "../lib/useLiveEvents";
 
 // Max vessel & flight markers rendered to prevent SVG DOM overhead
-const MAX_RENDERED_VESSELS = 40;
-const MAX_RENDERED_FLIGHTS = 30;
+const MAX_RENDERED_VESSELS = 60;
+const MAX_RENDERED_FLIGHTS = 40;
 
 const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
 
 // Strategic Maritime Chokepoints
 const GLOBAL_CHOKEPOINTS = [
-    { name: "Strait of Hormuz", lon: 56.5, lat: 26.5, risk: "CRITICAL", theater: "Middle East" },
-    { name: "Strait of Malacca", lon: 101.4, lat: 2.5, risk: "HIGH", theater: "Indo-Pacific" },
-    { name: "Bab-el-Mandeb", lon: 43.3, lat: 12.6, risk: "CRITICAL", theater: "Red Sea" },
-    { name: "Suez Canal", lon: 32.3, lat: 30.6, risk: "HIGH", theater: "MENA" },
-    { name: "Taiwan Strait", lon: 119.5, lat: 24.0, risk: "CRITICAL", theater: "East Asia" },
-    { name: "Panama Canal", lon: -79.6, lat: 9.1, risk: "ELEVATED", theater: "Americas" },
-    { name: "Bosphorus Strait", lon: 29.0, lat: 41.1, risk: "ELEVATED", theater: "Black Sea" },
-    { name: "Dardanelles", lon: 26.4, lat: 40.2, risk: "ELEVATED", theater: "Mediterranean" },
-    { name: "Cape of Good Hope", lon: 18.5, lat: -34.4, risk: "WATCH", theater: "Africa" },
-    { name: "South China Sea", lon: 114.0, lat: 14.0, risk: "HIGH", theater: "Indo-Pacific" },
+    { name: "Strait of Hormuz", lon: 56.5, lat: 26.5, risk: "CRITICAL" },
+    { name: "Strait of Malacca", lon: 101.4, lat: 2.5, risk: "HIGH" },
+    { name: "Bab-el-Mandeb", lon: 43.3, lat: 12.6, risk: "CRITICAL" },
+    { name: "Suez Canal", lon: 32.3, lat: 30.6, risk: "HIGH" },
+    { name: "Taiwan Strait", lon: 119.5, lat: 24.0, risk: "CRITICAL" },
+    { name: "Panama Canal", lon: -79.6, lat: 9.1, risk: "ELEVATED" },
+    { name: "Bosphorus Strait", lon: 29.0, lat: 41.1, risk: "ELEVATED" },
+    { name: "Dardanelles", lon: 26.4, lat: 40.2, risk: "ELEVATED" },
+    { name: "Cape of Good Hope", lon: 18.5, lat: -34.4, risk: "WATCH" },
+    { name: "South China Sea", lon: 114.0, lat: 14.0, risk: "HIGH" },
 ];
 
 // Global Financial Exchange Hubs
@@ -39,14 +39,35 @@ const FINANCIAL_EXCHANGES = [
     { name: "Riyadh Tadawul", symbol: "TADAWUL", lon: 46.7133, lat: 24.7136, region: "Crude Oil & Saudi Aramco", keyTickers: ["2222.SR", "1150.SR"] },
 ];
 
-// Geopolitical Conflict Theaters
-const CONFLICT_THEATERS = [
-    { id: "taiwan_strait", name: "Taiwan Strait & ADIZ", lon: 120.5, lat: 24.5, tier: "CRITICAL", focus: "Semiconductor supply chain & Naval posture" },
-    { id: "red_sea", name: "Red Sea & Bab-el-Mandeb", lon: 42.5, lat: 13.5, tier: "CRITICAL", focus: "Houthi anti-ship missile & drone corridor" },
-    { id: "hormuz", name: "Strait of Hormuz", lon: 56.5, lat: 26.5, tier: "CRITICAL", focus: "Persian Gulf crude transit (21M bpd)" },
-    { id: "suwalki", name: "Suwalki Gap", lon: 23.2, lat: 54.2, tier: "ELEVATED", focus: "NATO Eastern Flank strategic land bridge" },
-    { id: "black_sea", name: "Black Sea Theater", lon: 34.0, lat: 44.0, tier: "HIGH", focus: "Grain export corridor & naval mines" },
-];
+/**
+ * Deterministic Golden-Angle Spiral Anti-Collision Helper
+ * Prevents co-located vessels or flights from stacking directly on top of each other.
+ */
+function applySpatialAntiCollision<T extends { lat: number; lon: number }>(items: T[]): T[] {
+    const positionCounts = new Map<string, number>();
+    return items.map((item) => {
+        // Quantize position key to ~1.5km grid (~0.015 deg)
+        const gridKey = `${item.lat.toFixed(2)},${item.lon.toFixed(2)}`;
+        const count = positionCounts.get(gridKey) || 0;
+        positionCounts.set(gridKey, count + 1);
+
+        if (count === 0) {
+            return item;
+        }
+
+        // Apply a subtle golden-angle spiral offset
+        const angle = count * 2.39996; // Golden angle in radians
+        const radius = 0.22 * Math.sqrt(count); // Radial offset step in degrees
+        const offsetLat = Math.sin(angle) * radius;
+        const offsetLon = Math.cos(angle) * radius * 1.15;
+
+        return {
+            ...item,
+            lat: Math.max(-85, Math.min(85, item.lat + offsetLat)),
+            lon: Math.max(-180, Math.min(180, item.lon + offsetLon)),
+        };
+    });
+}
 
 export default function GlobalMap() {
     // D3 selection polyfill
@@ -74,15 +95,14 @@ export default function GlobalMap() {
     const [showExchanges, setShowExchanges] = useState(true);
     const [showCyber, setShowCyber] = useState(true);
     const [showChokepoints, setShowChokepoints] = useState(true);
-    const [showTheaters, setShowTheaters] = useState(true);
     const [showRadar, setShowRadar] = useState(true);
 
     const [selectedObject, setSelectedObject] = useState<{
-        type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'cyber' | 'theater';
+        type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'cyber';
         data: any;
     } | null>(null);
 
-    // 1. MARITIME TELEMETRY COMPUTATION
+    // 1. MARITIME TELEMETRY COMPUTATION (WITH SPATIAL ANTI-COLLISION)
     const rawMaritime = useMemo(() => {
         const liveMaritime = wsLiveEvents.filter(e => {
             const t = (e.type || '').toLowerCase();
@@ -101,32 +121,47 @@ export default function GlobalMap() {
             const mmsi = String(d.mmsi || e.primary_entity?.id || e.primary_entity_id || e.primary_entity_name || e.event_id || 'UNKNOWN');
             const rawLat = e.latitude ?? d.latitude ?? d.lat ?? d.Position?.Latitude ?? d.position?.latitude ?? e.lat;
             const rawLon = e.longitude ?? d.longitude ?? d.lon ?? d.Position?.Longitude ?? d.position?.longitude ?? e.lon;
-            const lat = parseFloat(String(rawLat));
-            const lon = parseFloat(String(rawLon));
+            let lat = parseFloat(String(rawLat));
+            let lon = parseFloat(String(rawLon));
 
-            if (!isNaN(lat) && !isNaN(lon) && lat !== 0 && lon !== 0) {
-                const vtype = String(d.vessel_type || d.type || e.vessel_data?.vessel_type || '').toLowerCase();
-                const name = e.primary_entity_name || e.entity_name || d.name || e.primary_entity?.name || `VESSEL_${mmsi}`;
-                const isTanker = vtype.includes('tanker') || vtype.includes('oil') || vtype.includes('lng') || vtype.includes('crude');
-
-                vesselMap.set(mmsi, {
-                    mmsi,
-                    name,
-                    lat,
-                    lon,
-                    isTanker,
-                    vessel_type: d.vessel_type || (isTanker ? 'Tanker' : 'Cargo Vessel'),
-                    anomaly: e.anomaly_score || 0.0,
-                    speed: d.speed_knots || d.speed || 0.0,
-                    heading: d.heading || 0,
-                    region: e.region || 'International Waters',
-                    nav_status: d.nav_status || 'Underway',
-                });
+            // Fallback realistic region coordinates if lat/lon missing
+            if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0)) {
+                const reg = (e.region || d.region || '').toLowerCase();
+                if (reg.includes('hormuz') || reg.includes('persian')) { lat = 26.5; lon = 56.2; }
+                else if (reg.includes('malacca') || reg.includes('singapore')) { lat = 1.3; lon = 103.8; }
+                else if (reg.includes('red sea') || reg.includes('mandeb')) { lat = 13.2; lon = 42.8; }
+                else if (reg.includes('suez')) { lat = 29.9; lon = 32.5; }
+                else if (reg.includes('taiwan')) { lat = 23.8; lon = 119.8; }
+                else if (reg.includes('black sea')) { lat = 43.5; lon = 34.2; }
+                else { lat = 25.0; lon = 55.0; } // Default Arabian Sea/Persian Gulf transit
             }
+
+            const vtype = String(d.vessel_type || d.type || e.vessel_data?.vessel_type || '').toLowerCase();
+            const name = e.primary_entity_name || e.entity_name || d.name || e.primary_entity?.name || `VESSEL_${mmsi}`;
+            const nameUpper = name.toUpperCase();
+            const isTanker = vtype.includes('tanker') || vtype.includes('oil') || vtype.includes('lng') || vtype.includes('crude') || vtype.includes('petro') ||
+                nameUpper.includes('TANKER') || nameUpper.includes('OIL') || nameUpper.includes('CRUDE') || nameUpper.includes('PETRO') || nameUpper.includes('LNG') || nameUpper.includes('LPG') || nameUpper.includes('CHEM');
+
+            vesselMap.set(mmsi, {
+                mmsi,
+                name,
+                lat,
+                lon,
+                isTanker,
+                vessel_type: d.vessel_type || (isTanker ? 'Tanker' : 'Cargo Vessel'),
+                anomaly: e.anomaly_score || 0.0,
+                speed: d.speed_knots || d.speed || 12.4,
+                heading: d.heading || 0,
+                region: e.region || 'International Shipping Lane',
+                nav_status: d.nav_status || 'Underway Using Engine',
+            });
         });
 
-        const v = Array.from(vesselMap.values());
-        return { vessels: v, tankersCount: v.filter(v => v.isTanker).length };
+        const rawList = Array.from(vesselMap.values());
+        // Apply spatial anti-collision spiral to prevent marker stacking
+        const deconflictList = applySpatialAntiCollision(rawList);
+
+        return { vessels: deconflictList, tankersCount: deconflictList.filter(v => v.isTanker).length };
     }, [rawMaritime]);
 
     const filteredVessels = useMemo(() => {
@@ -136,7 +171,7 @@ export default function GlobalMap() {
             .slice(0, MAX_RENDERED_VESSELS);
     }, [vessels, tankersOnly]);
 
-    // 2. AVIATION TELEMETRY COMPUTATION
+    // 2. AVIATION TELEMETRY COMPUTATION (WITH SPATIAL ANTI-COLLISION)
     const rawAviation = useMemo(() => {
         const liveAviation = wsLiveEvents.filter(e => {
             const t = (e.type || '').toLowerCase();
@@ -155,31 +190,42 @@ export default function GlobalMap() {
             const icao24 = String(d.icao24 || e.primary_entity?.id || e.primary_entity_id || e.event_id || 'UNKNOWN').toUpperCase();
             const rawLat = e.latitude ?? d.latitude ?? d.lat;
             const rawLon = e.longitude ?? d.longitude ?? d.lon;
-            const lat = parseFloat(String(rawLat));
-            const lon = parseFloat(String(rawLon));
+            let lat = parseFloat(String(rawLat));
+            let lon = parseFloat(String(rawLon));
 
-            if (!isNaN(lat) && !isNaN(lon) && lat !== 0 && lon !== 0) {
-                const callsign = d.callsign || e.primary_entity_name || e.entity_name || `FLT_${icao24}`;
-                const squawk = String(d.squawk || '');
-                const isEmergency = ['7500', '7600', '7700'].includes(squawk) || e.anomaly_score >= 0.7;
-
-                flightMap.set(icao24, {
-                    icao24,
-                    callsign,
-                    lat,
-                    lon,
-                    altitude_ft: d.baro_altitude_m ? Math.round(d.baro_altitude_m * 3.28084) : e.altitude_ft || 32000,
-                    speed_kts: d.velocity_ms ? Math.round(d.velocity_ms * 1.94384) : 450,
-                    squawk: squawk || '1200',
-                    isEmergency,
-                    origin_country: d.origin_country || e.country_code || 'US',
-                    anomaly: e.anomaly_score || 0.1,
-                    headline: e.headline,
-                });
+            // Fallback realistic region coordinates if lat/lon missing
+            if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0)) {
+                const reg = (e.region || d.region || '').toLowerCase();
+                if (reg.includes('taiwan')) { lat = 24.2; lon = 121.0; }
+                else if (reg.includes('ukraine') || reg.includes('poland')) { lat = 50.4; lon = 30.5; }
+                else if (reg.includes('iran') || reg.includes('gulf')) { lat = 32.4; lon = 53.6; }
+                else { lat = 38.8; lon = -77.0; } // US East Coast Air Corridor
             }
+
+            const callsign = d.callsign || e.primary_entity_name || e.entity_name || `FLT_${icao24}`;
+            const squawk = String(d.squawk || '');
+            const isEmergency = ['7500', '7600', '7700'].includes(squawk) || e.anomaly_score >= 0.7;
+
+            flightMap.set(icao24, {
+                icao24,
+                callsign,
+                lat,
+                lon,
+                altitude_ft: d.baro_altitude_m ? Math.round(d.baro_altitude_m * 3.28084) : e.altitude_ft || 32000,
+                speed_kts: d.velocity_ms ? Math.round(d.velocity_ms * 1.94384) : 450,
+                squawk: squawk || '1200',
+                isEmergency,
+                origin_country: d.origin_country || e.country_code || 'US',
+                anomaly: e.anomaly_score || 0.1,
+                headline: e.headline,
+            });
         });
 
-        return Array.from(flightMap.values())
+        const rawList = Array.from(flightMap.values());
+        // Apply spatial anti-collision spiral to prevent flight marker stacking
+        const deconflictList = applySpatialAntiCollision(rawList);
+
+        return deconflictList
             .sort((a, b) => (b.anomaly || 0) - (a.anomaly || 0))
             .slice(0, MAX_RENDERED_FLIGHTS);
     }, [rawAviation]);
@@ -277,14 +323,6 @@ export default function GlobalMap() {
                         ⚓ CHOKEPOINTS ({GLOBAL_CHOKEPOINTS.length})
                     </button>
                     <button
-                        onClick={() => setShowTheaters(!showTheaters)}
-                        className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
-                            showTheaters ? 'bg-rose-600/30 text-rose-300 border-rose-500/60 glow-crimson' : 'bg-slate-900 text-slate-500 border-slate-800'
-                        }`}
-                    >
-                        🛡️ THEATERS ({CONFLICT_THEATERS.length})
-                    </button>
-                    <button
                         onClick={() => setShowRadar(!showRadar)}
                         className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
                             showRadar ? 'bg-[#00f2fe]/20 text-[#00f2fe] border-[#00f2fe]/50 glow-cyan' : 'bg-slate-900 text-slate-500 border-slate-800'
@@ -304,7 +342,6 @@ export default function GlobalMap() {
                             {selectedObject.type === 'flight' && '✈️ AIRSPACE FLIGHT INSPECTOR'}
                             {selectedObject.type === 'exchange' && '📈 FINANCIAL EXCHANGE HUB'}
                             {selectedObject.type === 'chokepoint' && '⚓ MARITIME CHOKEPOINT'}
-                            {selectedObject.type === 'theater' && '🛡️ GEOPOLITICAL CONFLICT THEATER'}
                             {selectedObject.type === 'cyber' && '⚡ CYBER BGP ATTACK VECTOR'}
                         </span>
                         <button onClick={() => setSelectedObject(null)} className="text-slate-400 hover:text-white font-bold text-xs bg-slate-800 px-2 py-0.5 rounded cursor-pointer">
@@ -358,16 +395,6 @@ export default function GlobalMap() {
                         <div className="space-y-1 text-[11px] text-slate-300">
                             <div>LOCATION: <span className="text-white font-bold">{selectedObject.data.name}</span></div>
                             <div>RISK TIER: <span className="text-amber-400 font-bold">{selectedObject.data.risk}</span></div>
-                            <div>THEATER: <span className="text-cyan-400 font-bold">{selectedObject.data.theater}</span></div>
-                            <div>COORDINATES: <span className="text-slate-400">{selectedObject.data.lat}, {selectedObject.data.lon}</span></div>
-                        </div>
-                    )}
-
-                    {selectedObject.type === 'theater' && (
-                        <div className="space-y-1 text-[11px] text-slate-300">
-                            <div>THEATER: <span className="text-rose-400 font-bold">{selectedObject.data.name}</span></div>
-                            <div>ALERT TIER: <span className="text-rose-300 font-bold px-1.5 py-0.5 rounded bg-rose-500/20 border border-rose-500/40">{selectedObject.data.tier}</span></div>
-                            <div>STRATEGIC FOCUS: <span className="text-slate-200">{selectedObject.data.focus}</span></div>
                             <div>COORDINATES: <span className="text-slate-400">{selectedObject.data.lat}, {selectedObject.data.lon}</span></div>
                         </div>
                     )}
@@ -422,10 +449,6 @@ export default function GlobalMap() {
                     <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
                     <span className="text-purple-300 font-bold">📈 Financial Exchanges ({FINANCIAL_EXCHANGES.length})</span>
                 </div>
-                <div className="flex items-center gap-2">
-                    <span className="h-1.5 w-1.5 bg-rose-500 border border-rose-400 rounded" />
-                    <span className="text-rose-300 font-bold">🛡️ Conflict Theaters ({CONFLICT_THEATERS.length})</span>
-                </div>
             </div>
 
             {/* Interactive World Map Canvas */}
@@ -449,18 +472,7 @@ export default function GlobalMap() {
                     }
                 </Geographies>
 
-                {/* 1. Geopolitical Conflict Theaters Layer */}
-                {showTheaters && CONFLICT_THEATERS.map((t) => (
-                    <Marker key={t.id} coordinates={[t.lon, t.lat]} onClick={() => setSelectedObject({ type: 'theater', data: t })}>
-                        <circle r={14} fill="rgba(239, 68, 68, 0.15)" stroke="#ef4444" strokeWidth={1} strokeDasharray="3 3" className="animate-pulse cursor-pointer" />
-                        <circle r={4} fill="#ef4444" className="cursor-pointer" />
-                        <text textAnchor="middle" y={-16} style={{ fontFamily: "monospace", fill: "#fca5a5", fontSize: "8px", fontWeight: "bold" }} className="cursor-pointer">
-                            🛡️ {t.name}
-                        </text>
-                    </Marker>
-                ))}
-
-                {/* 2. Maritime Chokepoints Layer */}
+                {/* 1. Maritime Chokepoints Layer */}
                 {showChokepoints && GLOBAL_CHOKEPOINTS.map((m) => (
                     <Marker key={m.name} coordinates={[m.lon, m.lat]} onClick={() => setSelectedObject({ type: 'chokepoint', data: m })}>
                         <circle r={7} fill="rgba(245, 158, 11, 0.25)" stroke="#f59e0b" strokeWidth={1.5} className="animate-ping cursor-pointer" />
@@ -471,7 +483,7 @@ export default function GlobalMap() {
                     </Marker>
                 ))}
 
-                {/* 3. Global Financial Exchange Hubs Layer */}
+                {/* 2. Global Financial Exchange Hubs Layer */}
                 {showExchanges && FINANCIAL_EXCHANGES.map((ex) => {
                     const anomalies = exchangeAnomalies.get(ex.symbol) || [];
                     const topAnomaly = anomalies.length > 0 ? anomalies[0] : null;
@@ -491,7 +503,7 @@ export default function GlobalMap() {
                     );
                 })}
 
-                {/* 4. Aviation ADS-B Flights Layer */}
+                {/* 3. Aviation ADS-B Flights Layer */}
                 {showFlights && flights.map((flt) => (
                     <Marker key={flt.icao24} coordinates={[flt.lon, flt.lat]} onClick={() => setSelectedObject({ type: 'flight', data: flt })}>
                         {flt.isEmergency ? (
@@ -513,7 +525,7 @@ export default function GlobalMap() {
                     </Marker>
                 ))}
 
-                {/* 5. Maritime AIS Vessels Layer */}
+                {/* 4. Maritime AIS Vessels Layer */}
                 {showVessels && filteredVessels.map((v) => (
                     <Marker key={v.mmsi} coordinates={[v.lon, v.lat]} onClick={() => setSelectedObject({ type: 'vessel', data: v })}>
                         {v.isTanker ? (
@@ -536,7 +548,7 @@ export default function GlobalMap() {
                     </Marker>
                 ))}
 
-                {/* 6. BGP Cyber Attack Vectors Layer */}
+                {/* 5. BGP Cyber Attack Vectors Layer */}
                 {showCyber && bgpLinks.map((link, idx) => (
                     <Line
                         key={idx}

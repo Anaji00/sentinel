@@ -1,11 +1,7 @@
 'use client';
 
-import React, { Suspense } from 'react';
+import React, { useState, Suspense } from 'react';
 import dynamic from 'next/dynamic';
-import { ResponsiveGridLayout } from 'react-grid-layout';
-
-import 'react-grid-layout/css/styles.css';
-import 'react-resizable/css/styles.css';
 import { PanelSkeleton } from './ui/Skeleton';
 
 const IntelligenceFeed = dynamic(() => import('./IntelligenceFeed'), {
@@ -28,72 +24,156 @@ const FinancialAdvisorAdvice = dynamic(() => import('./FinancialAdvisorAdvice'),
   ssr: false,
 });
 
-const DEFAULT_LAYOUT = [
-  { i: 'intelligence', x: 0, y: 0, w: 4, h: 4, minW: 3, minH: 3 },
-  { i: 'graph', x: 4, y: 0, w: 5, h: 4, minW: 4, minH: 3 },
-  { i: 'radar', x: 9, y: 0, w: 3, h: 2, minW: 3, minH: 2 },
-  { i: 'advisor', x: 9, y: 2, w: 3, h: 2, minW: 3, minH: 2 }
-];
+type ViewMode = 'all' | 'intelligence' | 'graph' | 'radar' | 'advisor';
 
 export function CommandCenterGrid() {
-  const layouts = { lg: DEFAULT_LAYOUT };
+  const [activeView, setActiveView] = useState<ViewMode>('all');
+  const [visibleFeeds, setVisibleFeeds] = useState<{ [key: string]: boolean }>({
+    intelligence: true,
+    graph: true,
+    radar: true,
+    advisor: true,
+  });
+
+  const toggleFeed = (key: string) => {
+    setVisibleFeeds((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      // Ensure at least one feed remains visible
+      if (!Object.values(next).some(Boolean)) return prev;
+      return next;
+    });
+  };
+
+  const setViewMode = (mode: ViewMode) => {
+    setActiveView(mode);
+    if (mode === 'all') {
+      setVisibleFeeds({ intelligence: true, graph: true, radar: true, advisor: true });
+    } else {
+      setVisibleFeeds({
+        intelligence: mode === 'intelligence',
+        graph: mode === 'graph',
+        radar: mode === 'radar',
+        advisor: mode === 'advisor',
+      });
+    }
+  };
+
+  const visibleCount = Object.values(visibleFeeds).filter(Boolean).length;
+
+  // Determine dynamic grid layout style based on visible feed count
+  let gridStyleClass = "grid grid-cols-1 md:grid-cols-2 grid-rows-2 gap-3 h-full w-full";
+  if (visibleCount === 1) {
+    gridStyleClass = "grid grid-cols-1 grid-rows-1 gap-0 h-full w-full";
+  } else if (visibleCount === 2) {
+    gridStyleClass = "grid grid-cols-1 md:grid-cols-2 grid-rows-1 gap-3 h-full w-full";
+  } else if (visibleCount === 3) {
+    gridStyleClass = "grid grid-cols-1 md:grid-cols-3 grid-rows-1 gap-3 h-full w-full";
+  }
 
   return (
-    <div className="h-full w-full overflow-y-auto overflow-x-hidden p-2">
-      <ResponsiveGridLayout
-        className="layout"
-        layouts={layouts}
-        breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
-        cols={{ lg: 12, md: 10, sm: 6, xs: 4, xxs: 2 }}
-        rowHeight={200}
-        // @ts-ignore
-        draggableHandle=".drag-handle"
-        margin={[12, 12]}
-      >
-        <div key="intelligence" className="flex flex-col bg-[#0f1115] rounded-xl border border-slate-800 overflow-hidden">
-          <div className="drag-handle h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 cursor-move">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Intelligence Feed</span>
-          </div>
-          <div className="flex-1 min-h-0 relative">
-            <Suspense fallback={<PanelSkeleton title="Stream Loading..." />}>
-              <IntelligenceFeed />
-            </Suspense>
-          </div>
+    <div className="h-full w-full flex flex-col bg-[#05070c] p-3 space-y-2.5 font-mono overflow-hidden select-none">
+      {/* Top HUD Feed Selector & Dynamic View Toggles */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-[#0b0e17] rounded-xl border border-cyan-500/20 backdrop-blur-md shrink-0 shadow-lg text-xs">
+        <div className="flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-pulse" />
+          <span className="text-[#00f2fe] font-extrabold tracking-wider uppercase text-[11px]">
+            COMMAND FEEDS ({visibleCount}/4 ACTIVE)
+          </span>
         </div>
 
-        <div key="graph" className="flex flex-col bg-[#0f1115] rounded-xl border border-slate-800 overflow-hidden">
-          <div className="drag-handle h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 cursor-move">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Knowledge Graph</span>
-          </div>
-          <div className="flex-1 min-h-0 relative">
-            <Suspense fallback={<PanelSkeleton title="Graph Loading..." />}>
-              <GraphExplorer />
-            </Suspense>
-          </div>
+        {/* View Mode Preset Buttons */}
+        <div className="flex items-center gap-1.5 text-[10px] overflow-x-auto">
+          {[
+            { id: 'all', label: 'ALL FEEDS (4-GRID)', icon: '🎛️' },
+            { id: 'intelligence', label: 'INTELLIGENCE STREAM', icon: '📡' },
+            { id: 'graph', label: 'KNOWLEDGE GRAPH', icon: '🕸️' },
+            { id: 'radar', label: 'QUANT RADAR', icon: '⚡' },
+            { id: 'advisor', label: 'PORTFOLIO ALLOCATOR', icon: '💼' },
+          ].map((view) => (
+            <button
+              key={view.id}
+              onClick={() => setViewMode(view.id as ViewMode)}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+                activeView === view.id
+                  ? 'bg-[#00f2fe] text-[#06080d] border border-white shadow-[0_0_15px_rgba(0,242,254,0.4)]'
+                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              }`}
+            >
+              <span>{view.icon}</span>
+              <span>{view.label}</span>
+            </button>
+          ))}
         </div>
 
-        <div key="radar" className="flex flex-col bg-[#0f1115] rounded-xl border border-slate-800 overflow-hidden">
-          <div className="drag-handle h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 cursor-move">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Quant Radar</span>
-          </div>
-          <div className="flex-1 min-h-0 relative">
-            <Suspense fallback={<PanelSkeleton title="Radar Loading..." />}>
-              <QuantRadarPanel />
-            </Suspense>
-          </div>
+        {/* Individual Feed Toggles */}
+        <div className="flex items-center gap-1 text-[9px] text-slate-400">
+          <span className="uppercase font-bold mr-1">TOGGLE:</span>
+          {[
+            { key: 'intelligence', label: 'STREAM' },
+            { key: 'graph', label: 'GRAPH' },
+            { key: 'radar', label: 'RADAR' },
+            { key: 'advisor', label: 'ALLOCATOR' },
+          ].map((f) => (
+            <button
+              key={f.key}
+              onClick={() => toggleFeed(f.key)}
+              className={`px-2 py-0.5 rounded font-bold transition-all cursor-pointer border ${
+                visibleFeeds[f.key]
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                  : 'bg-slate-950 text-slate-600 border-slate-800 line-through opacity-60'
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
         </div>
+      </div>
 
-        <div key="advisor" className="flex flex-col bg-[#0f1115] rounded-xl border border-slate-800 overflow-hidden">
-          <div className="drag-handle h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 cursor-move">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Financial Advisor</span>
-          </div>
-          <div className="flex-1 min-h-0 relative">
-            <Suspense fallback={<PanelSkeleton title="Advisor Loading..." />}>
-              <FinancialAdvisorAdvice />
-            </Suspense>
-          </div>
+      {/* Dynamic Screen Scaling Layout Grid */}
+      <div className="flex-1 min-h-0 w-full relative">
+        <div className={gridStyleClass}>
+          {visibleFeeds.intelligence && (
+            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Stream Loading..." />}>
+                  <IntelligenceFeed />
+                </Suspense>
+              </div>
+            </div>
+          )}
+
+          {visibleFeeds.graph && (
+            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Graph Loading..." />}>
+                  <GraphExplorer />
+                </Suspense>
+              </div>
+            </div>
+          )}
+
+          {visibleFeeds.radar && (
+            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Radar Loading..." />}>
+                  <QuantRadarPanel />
+                </Suspense>
+              </div>
+            </div>
+          )}
+
+          {visibleFeeds.advisor && (
+            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Advisor Loading..." />}>
+                  <FinancialAdvisorAdvice />
+                </Suspense>
+              </div>
+            </div>
+          )}
         </div>
-      </ResponsiveGridLayout>
+      </div>
     </div>
   );
 }
+

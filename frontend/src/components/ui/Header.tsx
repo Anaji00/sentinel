@@ -1,27 +1,61 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import useSWR from 'swr';
 import SystemHealthHUD from '../SystemHealthHUD';
-import { fetcher } from '../../lib/api';
+import { apiClient } from '../../lib/api';
 import { useTelemetryStore } from '../../lib/store';
 
 export const Header: React.FC = () => {
-  const [time, setTime] = useState<string>(() => {
-    return new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
-  });
-  const [latency, setLatency] = useState<number>(38);
+  const [time, setTime] = useState<string>('');
+  const [timezone, setTimezone] = useState<string>('America/New_York');
+  const [latency, setLatency] = useState<number>(12);
 
   const isConnected = useTelemetryStore((state) => state.isConnected);
 
   useEffect(() => {
     const updateClock = () => {
       const now = new Date();
-      setTime(now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC');
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: timezone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hourCycle: 'h23',
+          timeZoneName: 'short',
+        }).formatToParts(now);
+
+        const p: Record<string, string> = {};
+        parts.forEach((part) => {
+          p[part.type] = part.value;
+        });
+
+        setTime(`${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} ${p.timeZoneName || ''}`);
+      } catch {
+        setTime(now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC');
+      }
     };
     updateClock();
     const interval = setInterval(updateClock, 1000);
     return () => clearInterval(interval);
+  }, [timezone]);
+
+  useEffect(() => {
+    const measureLatency = async () => {
+      const start = Date.now();
+      try {
+        await apiClient.get('/health');
+        setLatency(Math.max(1, Date.now() - start));
+      } catch {
+        setLatency(Math.max(1, Date.now() - start));
+      }
+    };
+    measureLatency();
+    const timer = setInterval(measureLatency, 10000);
+    return () => clearInterval(timer);
   }, []);
 
   return (
@@ -79,9 +113,27 @@ export const Header: React.FC = () => {
       <div className="flex items-center gap-3.5 font-mono">
         <SystemHealthHUD />
 
-        <div className="text-right">
-          <div className="text-xs font-semibold text-slate-200 tracking-tight font-mono">
-            {time}
+        <div className="text-right flex flex-col items-end">
+          <div className="flex items-center gap-1.5">
+            <div className="text-xs font-semibold text-slate-200 tracking-tight font-mono" suppressHydrationWarning>
+              {time}
+            </div>
+            <select
+              value={timezone}
+              onChange={(e) => setTimezone(e.target.value)}
+              className="bg-slate-900/90 text-[10px] text-cyan-400 font-mono font-bold border border-cyan-500/30 rounded px-1 py-0.5 outline-none cursor-pointer hover:border-cyan-400 focus:border-cyan-400 transition-colors"
+              title="Select Clock Timezone"
+            >
+              <option value="America/New_York" className="bg-slate-950 text-slate-200">US EST/EDT</option>
+              <option value="UTC" className="bg-slate-950 text-slate-200">UTC</option>
+              <option value="America/Chicago" className="bg-slate-950 text-slate-200">US CST/CDT</option>
+              <option value="America/Denver" className="bg-slate-950 text-slate-200">US MST/MDT</option>
+              <option value="America/Los_Angeles" className="bg-slate-950 text-slate-200">US PST/PDT</option>
+              <option value="Europe/London" className="bg-slate-950 text-slate-200">GMT/BST</option>
+              <option value="Europe/Paris" className="bg-slate-950 text-slate-200">CET/CEST</option>
+              <option value="Asia/Tokyo" className="bg-slate-950 text-slate-200">JST</option>
+              <option value="Asia/Singapore" className="bg-slate-950 text-slate-200">SGT</option>
+            </select>
           </div>
           <div className="text-[10px] text-emerald-400 flex items-center justify-end gap-1 font-bold">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />

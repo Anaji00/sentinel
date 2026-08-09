@@ -116,8 +116,8 @@ async def get_market_series(
                 SELECT primary_entity_id, primary_entity_name, occurred_at, anomaly_score,
                        financial_data, crypto_data
                 FROM events
-                WHERE toLower(primary_entity_id) IN (SELECT toLower(unnest($1::text[])))
-                   OR toLower(primary_entity_name) IN (SELECT toLower(unnest($1::text[])))
+                WHERE LOWER(primary_entity_id) IN (SELECT LOWER(unnest($1::text[])))
+                   OR LOWER(primary_entity_name) IN (SELECT LOWER(unnest($1::text[])))
                 ORDER BY occurred_at DESC
                 LIMIT $2;
                 """,

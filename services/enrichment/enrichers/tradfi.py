@@ -492,6 +492,21 @@ class TradFiEnricher:
         volume = float(p.get("volume", 0.0))
         premium = float(p.get("premium_usd", 0.0))
         
+        option_type = p.get("option_type")
+        strike = p.get("strike")
+        expiry = p.get("expiry")
+        if (not option_type or strike is None or not expiry) and option_symbol:
+            from shared.utils.equities import parse_occ_option_symbol
+            parsed = parse_occ_option_symbol(option_symbol)
+            if parsed:
+                option_type = option_type or parsed.get("option_type")
+                strike = strike if strike is not None else parsed.get("strike")
+                expiry = expiry or parsed.get("expiry")
+        
+        option_type = str(option_type or "CALL").upper()
+        implied_volatility = float(p["implied_volatility"]) if p.get("implied_volatility") is not None else None
+        open_interest = int(p["open_interest"]) if p.get("open_interest") is not None else None
+        
         # Watchlist & Frequency boost
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         w_boost = 0.15 if is_watched else 0.0
@@ -501,7 +516,7 @@ class TradFiEnricher:
         base_score = min(1.0, premium / 1_000_000.0 * 0.5)
         anomaly = min(1.0, base_score + w_boost + f_boost)
         
-        tags = ["tradfi", "options_flow", ticker.lower()]
+        tags = ["tradfi", "options_flow", ticker.lower(), option_type.lower()]
         if premium >= 100000.0:
             tags.append("options_sweep")
             
@@ -517,12 +532,17 @@ class TradFiEnricher:
             financial_data=FinancialData(
                 ticker=ticker,
                 instrument_type="option",
+                side=option_type,
                 trade_type="OPTIONS_FLOW",
+                strike=float(strike) if strike is not None else None,
+                expiry=expiry,
                 premium_usd=premium,
                 underlying_price=price,
-                volume=int(volume)
+                volume=int(volume),
+                open_interest=open_interest,
+                implied_volatility=implied_volatility,
             ),
-            headline=f"🐋 OPTIONS FLOW Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
+            headline=f"🐋 OPTIONS FLOW {option_type} Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
             tags=tags,
             anomaly_score=anomaly
         )

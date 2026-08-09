@@ -13,6 +13,54 @@ from services.api_gateway.dependencies import get_graph, get_db
 logger = logging.getLogger("api-gateway.graph")
 router = APIRouter(prefix="/api/v1/graph", tags=["Graph Analysis"])
 
+@router.get("/entities")
+async def get_graph_entities(
+    graph = Depends(get_graph),
+    db = Depends(get_db)
+):
+    """Retrieve all active entities registered in the Neo4j Knowledge Graph or TimescaleDB."""
+    try:
+        query = """
+        MATCH (n:Entity)
+        RETURN n.id as id, coalesce(n.name, n.id) as name, coalesce(n.type, 'ENTITY') as type
+        ORDER BY n.name ASC
+        LIMIT 50
+        """
+        records = await graph.query(query)
+        entities = []
+        if records:
+            for r in records:
+                entities.append({
+                    "id": r.get("id") or r.get("name"),
+                    "name": r.get("name") or r.get("id"),
+                    "type": r.get("type", "ENTITY")
+                })
+        
+        # Dynamic fallback to TimescaleDB events if Neo4j returns empty
+        if not entities:
+            db_query = """
+            SELECT DISTINCT primary_entity_id as id, primary_entity_name as name, 'ENTITY' as type
+            FROM events
+            WHERE primary_entity_id IS NOT NULL AND primary_entity_id != ''
+            ORDER BY primary_entity_name ASC
+            LIMIT 50
+            """
+            db_rows = await db.query(db_query)
+            for r in db_rows:
+                e_id = r.get("id") or r.get("name")
+                e_name = r.get("name") or e_id
+                if e_id and not any(e["id"] == e_id for e in entities):
+                    entities.append({
+                        "id": e_id,
+                        "name": e_name,
+                        "type": r.get("type", "ENTITY")
+                    })
+        return {"entities": entities}
+    except Exception as e:
+        logger.error(f"Error fetching graph entities: {e}")
+        return {"entities": []}
+
+
 @router.get("/entity/{entity_id}")
 async def get_entity_graph(
     entity_id: str, 
@@ -35,7 +83,7 @@ async def get_entity_graph(
             db_query = """
             SELECT DISTINCT primary_entity_id, primary_entity_name, type as relationship, region
             FROM events
-            WHERE (toLower(primary_entity_id) LIKE $1 OR toLower(primary_entity_name) LIKE $1 OR toLower(region) LIKE $1)
+            WHERE (LOWER(primary_entity_id) LIKE $1 OR LOWER(primary_entity_name) LIKE $1 OR LOWER(region) LIKE $1)
             ORDER BY occurred_at DESC
             LIMIT 12
             """
@@ -68,23 +116,37 @@ async def get_shortest_path(
     graph = Depends(get_graph),
     db = Depends(get_db)
 ):
-    """Advanced Graph AI: Find how two geopolitical entities are connected."""
+    """Advanced Graph AI: Find how two geopolitical entities are connected using native Cypher shortestPath."""
     try:
         query = """
-        MATCH (start:Entity), (end:Entity)
+        MATCH p = shortestPath((start:Entity)-[*..6]-(end:Entity))
         WHERE (toLower(start.id) = toLower($source_id) OR toLower(start.name) = toLower($source_id))
           AND (toLower(end.id) = toLower($target_id) OR toLower(end.name) = toLower($target_id))
-        CALL apoc.algo.dijkstra(start, end, '', 'weight') YIELD path, weight
-        RETURN nodes(path) AS entities, relationships(path) AS relations
+        RETURN nodes(p) AS entities, relationships(p) AS relations
         """
         results = await graph.query(query, {"source_id": source_id, "target_id": target_id})
+        
+        # Fallback to APOC dijkstra if standard shortestPath returns empty
+        if not results:
+            try:
+                apoc_query = """
+                MATCH (start:Entity), (end:Entity)
+                WHERE (toLower(start.id) = toLower($source_id) OR toLower(start.name) = toLower($source_id))
+                  AND (toLower(end.id) = toLower($target_id) OR toLower(end.name) = toLower($target_id))
+                CALL apoc.algo.dijkstra(start, end, '', 'weight') YIELD path, weight
+                RETURN nodes(path) AS entities, relationships(path) AS relations
+                """
+                results = await graph.query(apoc_query, {"source_id": source_id, "target_id": target_id})
+            except Exception:
+                pass
+
         if not results:
             # Dynamic fallback: query TimescaleDB co-occurrence events
             db_query = """
             SELECT DISTINCT primary_entity_id, primary_entity_name, type as relationship
             FROM events
-            WHERE (toLower(primary_entity_id) LIKE $1 OR toLower(primary_entity_name) LIKE $1)
-               OR (toLower(primary_entity_id) LIKE $2 OR toLower(primary_entity_name) LIKE $2)
+            WHERE (LOWER(primary_entity_id) LIKE $1 OR LOWER(primary_entity_name) LIKE $1)
+               OR (LOWER(primary_entity_id) LIKE $2 OR LOWER(primary_entity_name) LIKE $2)
             ORDER BY occurred_at DESC
             LIMIT 10
             """
@@ -101,4 +163,4 @@ async def get_shortest_path(
         return {"path": results}
     except Exception as e:
         logger.error(f"Error fetching shortest path: {e}")
-        return {"message": "No path found", "path": []}
+        return {"message": "No path found", "path": []}

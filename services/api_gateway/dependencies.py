@@ -27,6 +27,9 @@ async def verify_api_key(request: Request = None):
         return None
     if hasattr(request, "method") and request.method == "OPTIONS":
         return None
+    path = getattr(getattr(request, "url", None), "path", "")
+    if path in ("/metrics", "/metrics/json", "/health") or path.startswith("/api/v1/health"):
+        return None
     api_key = (request.headers.get("X-API-KEY") if hasattr(request, "headers") else None) or (request.query_params.get("api_key") if hasattr(request, "query_params") else None)
     if not api_key:
         raise HTTPException(status_code=403, detail="X-API-KEY header missing")

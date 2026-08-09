@@ -134,8 +134,8 @@ export default function QuantRadarPanel() {
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300 pt-1 border-t border-slate-800/80">
-                <div>SCANNED: <span className="text-white font-bold">{sweepData?.total_universe_scanned || 4500} US Equities</span></div>
-                <div>BASELINES: <span className="text-emerald-400 font-bold">{sweepData?.tracked_baselines || 1840} EWMA Keys</span></div>
+                <div>SCANNED: <span className="text-white font-bold">{sweepData?.total_universe_scanned ? sweepData.total_universe_scanned.toLocaleString() : '4,500+'} US Equities</span></div>
+                <div>BASELINES: <span className="text-emerald-400 font-bold">{sweepData?.tracked_baselines ? sweepData.tracked_baselines.toLocaleString() : '1,800+'} EWMA Keys</span></div>
               </div>
             </div>
 

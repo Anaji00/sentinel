@@ -73,7 +73,7 @@ export default function FinancialAdvisorAdvice() {
       title="QUANT PORTFOLIO ALLOCATOR"
       badge={
         <Badge variant="info">
-          REGIME: {brief?.market_regime || 'INVERTED YIELD STRESS'}
+          REGIME: {brief?.market_regime ? brief.market_regime.toUpperCase() : 'EVALUATING MACRO DATA...'}
         </Badge>
       }
       noPadding
@@ -94,7 +94,7 @@ export default function FinancialAdvisorAdvice() {
             <span className="text-emerald-400">QUARTER-KELLY ACTIVE</span>
           </div>
           <p className="text-[11px] text-slate-300 font-sans leading-relaxed">
-            {brief?.general_hedging_strategy || 'Yield curve inversion active. Position sizes capped at 12.5% with strict stop-losses.'}
+            {brief?.general_hedging_strategy || 'Analyzing yield curve signals and macro telemetry for optimal position sizing...'}
           </p>
         </div>
 

@@ -93,7 +93,6 @@ class MaritimeEnricher:
         else:
             vessels = await asyncio.gather(*[self._get_vessel(m, mt) for m, mt in zip(mmsi_list, meta_list)])
                 
-        features_list = []
         entities = []
         lats_list = []
         lons_list = []
@@ -138,6 +137,11 @@ class MaritimeEnricher:
 
             flags = vessel.get("flags", [])
             vtype = vessel.get("vessel_type", "Unknown")
+            vname = (vessel.get("name") or meta.get("ShipName") or "").upper()
+            if vtype == "Unknown" or not vtype:
+                if any(k in vname for k in ("TANKER", "OIL", "CRUDE", "PETRO", "LNG", "LPG", "CHEM")):
+                    vtype = "Tanker"
+
             is_sanctioned = bool(flags)
             is_emergency_nav = bool(nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")))
 

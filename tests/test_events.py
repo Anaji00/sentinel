@@ -123,11 +123,38 @@ def test_options_flow_enrichment():
         assert normalized.type == EventType.OPTIONS_FLOW
         assert normalized.primary_entity.id == "AAPL"
         assert normalized.financial_data.instrument_type == "option"
+        assert normalized.financial_data.side == "CALL"
+        assert normalized.financial_data.strike == 200.0
+        assert normalized.financial_data.expiry == "2024-06-21"
         assert normalized.financial_data.premium_usd == 104000.0
         assert "options_sweep" in normalized.tags
         assert normalized.anomaly_score > 0.0
         
     asyncio.run(run_test())
+
+
+def test_parse_occ_option_symbol():
+    """Verify OCC option symbol parser correctly extracts ticker, expiry, option_type, and strike."""
+    from shared.utils.equities import parse_occ_option_symbol
+    
+    call_res = parse_occ_option_symbol("AAPL240816C00220000")
+    assert call_res == {
+        "ticker": "AAPL",
+        "expiry": "2024-08-16",
+        "option_type": "CALL",
+        "strike": 220.0
+    }
+    
+    put_res = parse_occ_option_symbol("NVDA250117P00135000")
+    assert put_res == {
+        "ticker": "NVDA",
+        "expiry": "2025-01-17",
+        "option_type": "PUT",
+        "strike": 135.0
+    }
+    
+    assert parse_occ_option_symbol("INVALID") is None
+
 
 
 def test_entity_resolver_publishes_unknown_entities_on_miss():
