@@ -374,6 +374,184 @@ async def run_polling(producer: SentinelProducer, redis_client):
             )
             await asyncio.sleep(60)
 
+
+# ── FINNHUB EARNINGS CALENDAR (REST POLLING) ──────────────────────────────────
+
+async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
+    """
+    Polls Finnhub's /calendar/earnings endpoint daily.
+    - Deduplicates via Redis (sentinel:seen:earnings:{symbol}:{date}).
+    - Auto-injects T-minus-N day upcoming earnings tickers into sentinel:watched:equities.
+    - Emits EARNINGS_REPORT (pre-announcement) or EARNINGS_SURPRISE (post-actual).
+    All cadence, lookahead, and surprise thresholds are configurable via env vars.
+    """
+    import time as _time
+
+    poll_interval = int(os.getenv("EARNINGS_POLL_SECONDS", "3600"))  # Default: hourly
+    lookahead_days = int(os.getenv("EARNINGS_LOOKAHEAD_DAYS", "7"))
+    watchlist_inject_days = int(os.getenv("EARNINGS_WATCHLIST_INJECT_DAYS", "3"))
+
+    session_timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+        while True:
+            try:
+                from datetime import timedelta
+                today = datetime.now(timezone.utc).date()
+                from_date = today.isoformat()
+                to_date = (today + timedelta(days=lookahead_days)).isoformat()
+
+                url = "https://finnhub.io/api/v1/calendar/earnings"
+                params = {
+                    "from": from_date,
+                    "to": to_date,
+                    "token": FINNHUB_API_KEY,
+                }
+
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"Finnhub earnings API returned {resp.status}: {text[:200]}")
+                        await asyncio.sleep(poll_interval)
+                        continue
+
+                    data = await resp.json()
+
+                earnings_list = data.get("earningsCalendar", [])
+                if not earnings_list:
+                    logger.debug("Finnhub earnings calendar returned empty results.")
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                emit_count = 0
+                watchlist_count = 0
+                for entry in earnings_list:
+                    symbol = (entry.get("symbol") or "").upper().strip()
+                    report_date = entry.get("date", "")
+                    if not symbol or not report_date:
+                        continue
+
+                    # Dedup via Redis — skip if already processed
+                    dedup_key = f"sentinel:seen:earnings:{symbol}:{report_date}"
+                    eps_actual = entry.get("epsActual")
+                    eps_estimate = entry.get("epsEstimate")
+                    revenue_actual = entry.get("revenueActual")
+                    revenue_estimate = entry.get("revenueEstimate")
+                    hour = entry.get("hour", "")  # "bmo", "amc", "dmh"
+
+                    # Build a fingerprint including actual values to detect updates
+                    fingerprint = f"{eps_actual}:{revenue_actual}"
+                    existing = await redis_client.raw.get(dedup_key)
+                    if existing:
+                        existing_str = existing.decode() if isinstance(existing, bytes) else str(existing)
+                        if existing_str == fingerprint:
+                            continue  # Already processed with same actuals
+
+                    # Mark as seen with fingerprint
+                    await redis_client.raw.set(dedup_key, fingerprint, ex=604800)
+
+                    # Compute surprise percentage dynamically (not hardcoded threshold)
+                    eps_surprise_pct = None
+                    if eps_actual is not None and eps_estimate is not None and eps_estimate != 0:
+                        eps_surprise_pct = ((float(eps_actual) - float(eps_estimate)) / abs(float(eps_estimate))) * 100.0
+
+                    has_actual = eps_actual is not None
+                    trade_type = "EARNINGS_SURPRISE" if has_actual else "EARNINGS_REPORT"
+
+                    # Pre-earnings watchlist auto-injection (mega-cap gate: >$500B market cap)
+                    mcap_floor_b = float(os.getenv("EARNINGS_MCAP_FLOOR_B", "500"))
+                    try:
+                        report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+                        days_until = (report_dt - today).days
+                        if 0 <= days_until <= watchlist_inject_days:
+                            # Check market cap — use Redis cache first, then Finnhub /stock/profile2
+                            mcap_b = None
+                            mcap_cache_key = f"sentinel:mcap:{symbol}"
+                            try:
+                                cached_mcap = await redis_client.raw.get(mcap_cache_key)
+                                if cached_mcap:
+                                    mcap_b = float(cached_mcap)
+                                else:
+                                    profile_url = "https://finnhub.io/api/v1/stock/profile2"
+                                    async with session.get(profile_url, params={"symbol": symbol, "token": FINNHUB_API_KEY}) as profile_resp:
+                                        if profile_resp.status == 200:
+                                            profile_data = await profile_resp.json()
+                                            mcap_raw = profile_data.get("marketCapitalization", 0)  # Finnhub returns in millions
+                                            mcap_b = float(mcap_raw) / 1000.0 if mcap_raw else 0.0
+                                            await redis_client.raw.set(mcap_cache_key, str(mcap_b), ex=86400)
+                                        elif profile_resp.status == 429:
+                                            logger.debug(f"Finnhub rate limited during mcap lookup for {symbol}")
+                                            mcap_b = None
+                                        else:
+                                            mcap_b = 0.0
+                            except Exception as mcap_err:
+                                logger.debug(f"Market cap lookup failed for {symbol}: {mcap_err}")
+
+                            if mcap_b is not None and mcap_b >= mcap_floor_b:
+                                await redis_client.raw.zadd(
+                                    "sentinel:watched:equities",
+                                    mapping={symbol: _time.time()},
+                                )
+                                await redis_client.raw.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                                watchlist_count += 1
+                                logger.debug(f"Earnings watchlist inject: {symbol} (mcap ${mcap_b:.0f}B >= ${mcap_floor_b:.0f}B floor)")
+                            elif mcap_b is not None:
+                                logger.debug(f"Earnings watchlist skip: {symbol} (mcap ${mcap_b:.0f}B < ${mcap_floor_b:.0f}B floor)")
+                    except (ValueError, TypeError):
+                        pass
+
+                    # Cache earnings context per ticker for agent prompt injection
+                    earnings_context = {
+                        "report_date": report_date,
+                        "session": hour,
+                        "eps_estimate": float(eps_estimate) if eps_estimate is not None else None,
+                        "eps_actual": float(eps_actual) if eps_actual is not None else None,
+                        "eps_surprise_pct": round(eps_surprise_pct, 2) if eps_surprise_pct is not None else None,
+                        "revenue_estimate": float(revenue_estimate) if revenue_estimate is not None else None,
+                        "revenue_actual": float(revenue_actual) if revenue_actual is not None else None,
+                        "trade_type": trade_type,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                    try:
+                        await redis_client.raw.set(
+                            f"sentinel:earnings:{symbol}",
+                            json.dumps(earnings_context),
+                            ex=604800,
+                        )
+                    except Exception as re:
+                        logger.debug(f"Redis earnings cache write for {symbol}: {re}")
+
+                    # Emit to Kafka
+                    event = RawEvent(
+                        source="finnhub_earnings",
+                        occurred_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "ticker": symbol,
+                            "trade_type": trade_type,
+                            "report_date": report_date,
+                            "session": hour,
+                            "eps_estimate": float(eps_estimate) if eps_estimate is not None else None,
+                            "eps_actual": float(eps_actual) if eps_actual is not None else None,
+                            "eps_surprise_pct": round(eps_surprise_pct, 2) if eps_surprise_pct is not None else None,
+                            "revenue_estimate": float(revenue_estimate) if revenue_estimate is not None else None,
+                            "revenue_actual": float(revenue_actual) if revenue_actual is not None else None,
+                        },
+                    )
+                    await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=symbol)
+                    emit_count += 1
+
+                if emit_count > 0 or watchlist_count > 0:
+                    logger.info(
+                        f"📅 Earnings Calendar: Emitted {emit_count} events, "
+                        f"injected {watchlist_count} tickers into watchlist "
+                        f"(window: {from_date} → {to_date})"
+                    )
+
+            except Exception as e:
+                logger.error(f"Finnhub earnings calendar error: {e}", exc_info=True)
+
+            await asyncio.sleep(poll_interval)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL TradFi Service")
@@ -381,12 +559,13 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
     redis_client = await get_redis()
-    logger.info("Starting TradFi Collector (Finnhub, SEC & Alpaca Options)")
+    logger.info("Starting TradFi Collector (Finnhub, SEC, Alpaca Options & Earnings)")
     try:
         await asyncio.gather(
             run_polling(producer, redis_client),
             stream_equities(producer, redis_client),
-            poll_options(producer, redis_client)
+            poll_options(producer, redis_client),
+            poll_finnhub_earnings(producer, redis_client),
         )
     finally:
         await producer.close()

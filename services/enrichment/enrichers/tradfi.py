@@ -85,6 +85,8 @@ class TradFiEnricher:
             return await self._enrich_options_flow(raw, p)
         elif source == "alpaca_quant_radar":
             return await self._enrich_quant_radar(raw, p)
+        elif source == "finnhub_earnings":
+            return await self._enrich_earnings_calendar(raw, p)
             
         return None
 
@@ -541,6 +543,7 @@ class TradFiEnricher:
                 volume=int(volume),
                 open_interest=open_interest,
                 implied_volatility=implied_volatility,
+                option_type=option_type,
             ),
             headline=f"🐋 OPTIONS FLOW {option_type} Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
             tags=tags,
@@ -592,4 +595,105 @@ class TradFiEnricher:
             headline=f"⚡ QUANT RADAR VOLUME SPIKE | {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional/1e6:.2f}M",
             tags=tags,
             anomaly_score=anomaly,
+        )
+
+    async def _enrich_earnings_calendar(self, raw, p) -> Optional[NormalizedEvent]:
+        """Enriches Finnhub earnings calendar events into NormalizedEvents.
+        Uses dynamic EMA z-score on surprise % for anomaly scoring."""
+        import os
+
+        ticker = (p.get("ticker") or "").upper()
+        if not ticker:
+            return None
+
+        trade_type = p.get("trade_type", "EARNINGS_REPORT")
+        report_date = p.get("report_date", "")
+        session = p.get("session", "")
+        eps_estimate = p.get("eps_estimate")
+        eps_actual = p.get("eps_actual")
+        eps_surprise_pct = p.get("eps_surprise_pct")
+        revenue_estimate = p.get("revenue_estimate")
+        revenue_actual = p.get("revenue_actual")
+
+        # Determine event type
+        if trade_type == "EARNINGS_SURPRISE" and eps_actual is not None:
+            event_type = EventType.EARNINGS_SURPRISE
+        else:
+            event_type = EventType.EARNINGS_REPORT
+
+        # Anomaly scoring — dynamic EMA z-score on abs(surprise_pct)
+        anomaly = 0.3  # Baseline for pre-announcement
+        if eps_surprise_pct is not None:
+            abs_surprise = abs(eps_surprise_pct)
+            # Dynamic z-score against historical surprises for this ticker
+            try:
+                ema_alpha = float(os.getenv("EARNINGS_EMA_ALPHA", "0.1"))
+                ema_key = f"sentinel:earnings:surprise_ema:{ticker}"
+                var_key = f"sentinel:earnings:surprise_var:{ticker}"
+                raw_mean = await self.redis_client.raw.get(ema_key)
+                raw_var = await self.redis_client.raw.get(var_key)
+                ema_mean = float(raw_mean) if raw_mean else abs_surprise
+                ema_var = float(raw_var) if raw_var else 1.0
+                std = max(ema_var ** 0.5, 0.01)
+                z = (abs_surprise - ema_mean) / std
+                # Update EMA
+                new_mean = ema_alpha * abs_surprise + (1 - ema_alpha) * ema_mean
+                new_var = ema_alpha * (abs_surprise - ema_mean) ** 2 + (1 - ema_alpha) * ema_var
+                pipe = self.redis_client.raw.pipeline()
+                pipe.set(ema_key, str(new_mean), ex=604800 * 4)
+                pipe.set(var_key, str(new_var), ex=604800 * 4)
+                await pipe.execute()
+                # Map z-score to anomaly: z>=2 is significant
+                anomaly = min(1.0, max(0.3, abs(z) / 4.0))
+            except Exception:
+                # Fallback: simple scaled surprise
+                anomaly = min(1.0, abs_surprise / 50.0)
+
+        # Watchlist & Frequency boost
+        is_watched = await self.scorer.check_watchlist(ticker, "equities")
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(ticker, "earnings")
+        anomaly = min(1.0, anomaly + w_boost + f_boost)
+
+        # Direction tags
+        direction = "beat" if (eps_surprise_pct or 0) > 0 else "miss" if (eps_surprise_pct or 0) < 0 else "inline"
+        tags = ["tradfi", "earnings", ticker.lower(), direction]
+
+        if event_type == EventType.EARNINGS_SURPRISE:
+            surprise_str = f"{eps_surprise_pct:+.1f}%" if eps_surprise_pct is not None else "N/A"
+            headline = f"📊 EARNINGS {'BEAT' if direction == 'beat' else 'MISS' if direction == 'miss' else 'INLINE'} | {ticker} | EPS: {eps_actual} vs Est {eps_estimate} ({surprise_str})"
+        else:
+            session_label = {"bmo": "Pre-Market", "amc": "After-Close", "dmh": "During Hours"}.get(session, session.upper() if session else "TBD")
+            headline = f"📅 EARNINGS UPCOMING | {ticker} | Date: {report_date} ({session_label}) | Est EPS: {eps_estimate}"
+
+        entity = Entity(id=ticker, type=EntityType.COMPANY, name=ticker)
+
+        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+            "entity_id": ticker,
+            "action": "MERGE_ONTOLOGY_NODE",
+            "data": {"label": "Company", "primary_domain": "financial"}
+        }, key=ticker)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=event_type,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            primary_entity=entity,
+            financial_data=FinancialData(
+                ticker=ticker,
+                instrument_type="equity",
+                trade_type=trade_type,
+                earnings_report_date=report_date,
+                earnings_session=session,
+                eps_estimate=float(eps_estimate) if eps_estimate is not None else None,
+                eps_actual=float(eps_actual) if eps_actual is not None else None,
+                eps_surprise_pct=float(eps_surprise_pct) if eps_surprise_pct is not None else None,
+                revenue_estimate=float(revenue_estimate) if revenue_estimate is not None else None,
+                revenue_actual=float(revenue_actual) if revenue_actual is not None else None,
+            ),
+            headline=headline,
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
         )

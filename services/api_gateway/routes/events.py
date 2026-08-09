@@ -166,6 +166,7 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                 WITH ranked_events AS (
                     SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
                            primary_entity_name as entity_name, region, anomaly_score, source, summary as headline,
+                           tags, crypto_data, financial_data, vessel_data, flight_data, security_data, prediction_market_data,
                            ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude,
                            ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as rn
                     FROM events
@@ -188,6 +189,13 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                     "primary_entity_name": e_name,
                     "entity_name": e_name,
                     "primary_entity_id": str(r["primary_entity_id"] or e_name),
+                    "tags": r.get("tags") or [],
+                    "crypto_data": r.get("crypto_data"),
+                    "financial_data": r.get("financial_data"),
+                    "vessel_data": r.get("vessel_data"),
+                    "flight_data": r.get("flight_data"),
+                    "security_data": r.get("security_data"),
+                    "prediction_market_data": r.get("prediction_market_data"),
                     "latitude": r.get("latitude"),
                     "longitude": r.get("longitude")
                 }

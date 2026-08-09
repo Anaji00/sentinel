@@ -1,0 +1,155 @@
+'use client';
+
+import React, { useState } from 'react';
+import Link from 'next/link';
+
+export default function LoginPage() {
+  const [authMode, setAuthMode] = useState<'credentials' | 'apikey'>('credentials');
+  const [email, setEmail] = useState('vance@sentinel-quant.io');
+  const [password, setPassword] = useState('••••••••••••••••');
+  const [apiKey, setApiKey] = useState('sentinel-dev-key-2026');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSuccess, setIsSuccess] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsLoading(true);
+    setTimeout(() => {
+      setIsLoading(false);
+      setIsSuccess(true);
+    }, 1000);
+  };
+
+  return (
+    <div className="min-h-screen w-full bg-[#05070c] text-slate-100 font-mono flex flex-col items-center justify-center relative overflow-hidden select-none p-4">
+      {/* Dynamic Cyber Grid Background & Glow Orbs */}
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-cyan-950/30 via-[#05070c] to-[#030407]" />
+      <div className="absolute -top-40 -left-40 w-96 h-96 bg-cyan-500/15 rounded-full blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-purple-500/15 rounded-full blur-3xl pointer-events-none" />
+
+      {/* Main Glass Card */}
+      <div className="relative w-full max-w-md bg-[#090d16]/90 border border-[#00f2fe]/40 rounded-3xl p-8 backdrop-blur-2xl shadow-[0_0_60px_rgba(0,242,254,0.15)] z-10 space-y-6">
+        
+        {/* Brand Header */}
+        <div className="text-center space-y-2">
+          <div className="inline-flex h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-950 to-slate-950 border border-[#00f2fe]/60 items-center justify-center shadow-[0_0_30px_rgba(0,242,254,0.5)] mb-2">
+            <span className="text-[#00f2fe] font-black text-2xl tracking-tighter drop-shadow-[0_0_12px_rgba(0,242,254,0.9)]">S</span>
+          </div>
+          <h1 className="text-xl font-black text-white tracking-widest uppercase">
+            SENTINEL <span className="text-[#00f2fe]">INTELLIGENCE</span>
+          </h1>
+          <p className="text-[11px] text-slate-400 font-mono tracking-wide">
+            INSTITUTIONAL MULTI-DOMAIN QUANT RADAR & SWARM PLATFORM
+          </p>
+        </div>
+
+        {/* Mode Selector Tabs */}
+        <div className="flex bg-slate-950/80 p-1 rounded-xl border border-slate-800 text-xs">
+          <button
+            type="button"
+            onClick={() => setAuthMode('credentials')}
+            className={`flex-1 py-2 rounded-lg font-bold transition-all ${
+              authMode === 'credentials'
+                ? 'bg-cyan-950 text-cyan-400 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,242,254,0.2)]'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            CREDENTIALS
+          </button>
+          <button
+            type="button"
+            onClick={() => setAuthMode('apikey')}
+            className={`flex-1 py-2 rounded-lg font-bold transition-all ${
+              authMode === 'apikey'
+                ? 'bg-cyan-950 text-cyan-400 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,242,254,0.2)]'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            API KEY
+          </button>
+        </div>
+
+        {/* Authentication Form */}
+        <form onSubmit={handleSubmit} className="space-y-4 text-xs">
+          {authMode === 'credentials' ? (
+            <>
+              <div>
+                <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Corporate Email</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full mt-1.5 bg-slate-950/90 border border-slate-800 focus:border-[#00f2fe] rounded-xl px-4 py-3 text-white outline-none transition-colors"
+                  placeholder="name@firm.com"
+                  required
+                />
+              </div>
+              <div>
+                <div className="flex justify-between items-center">
+                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Password</label>
+                  <span className="text-[10px] text-cyan-400 hover:underline cursor-pointer">SAML SSO</span>
+                </div>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full mt-1.5 bg-slate-950/90 border border-slate-800 focus:border-[#00f2fe] rounded-xl px-4 py-3 text-white outline-none transition-colors"
+                  required
+                />
+              </div>
+            </>
+          ) : (
+            <div>
+              <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Master API Gateway Key</label>
+              <input
+                type="text"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                className="w-full mt-1.5 bg-slate-950/90 border border-slate-800 focus:border-[#00f2fe] rounded-xl px-4 py-3 text-cyan-300 font-mono outline-none transition-colors"
+                placeholder="sentinel-key-..."
+                required
+              />
+              <p className="text-[10px] text-slate-500 mt-1">Validates X-API-KEY header across REST & WebSocket subscriptions.</p>
+            </div>
+          )}
+
+          {/* Submit Button */}
+          <button
+            type="submit"
+            disabled={isLoading || isSuccess}
+            className="w-full py-3.5 mt-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-extrabold tracking-widest uppercase transition-all shadow-[0_0_25px_rgba(0,242,254,0.4)] disabled:opacity-50 flex items-center justify-center gap-2"
+          >
+            {isLoading ? (
+              <span className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full bg-white animate-ping" />
+                AUTHENTICATING...
+              </span>
+            ) : isSuccess ? (
+              <span className="text-emerald-300 font-bold">✓ AUTHENTICATED</span>
+            ) : (
+              'ENTER COMMAND HUD'
+            )}
+          </button>
+        </form>
+
+        {/* Development Quick Navigation Bypass */}
+        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
+          <span className="text-slate-500">DEV MODE ACTIVE</span>
+          <Link
+            href="/"
+            className="text-cyan-400 hover:text-cyan-300 font-bold underline flex items-center gap-1"
+          >
+            <span>Proceed to Dashboards</span> →
+          </Link>
+        </div>
+
+      </div>
+
+      {/* Footer Security Badges */}
+      <div className="mt-8 text-center text-[10px] text-slate-500 space-y-1 z-10">
+        <p>SENTINEL ENTERPRISE SECURITY • RSA 4096 / TLS 1.3 ENCRYPTED</p>
+        <p className="text-slate-600">CONFIDENTIAL & PROPRIETARY SYSTEM</p>
+      </div>
+    </div>
+  );
+}

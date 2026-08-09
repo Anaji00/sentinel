@@ -118,10 +118,10 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     const s = (e.source || '').toLowerCase();
     
     if (selectedDomain === 'tradfi') {
-      return t.includes('tradfi') || t.includes('option') || t.includes('dark_pool') || t.includes('equity') || t.includes('price') || t.includes('market') || t.includes('insider') || t.includes('futures') || s.includes('finnhub') || s.includes('alphavantage');
+      return t.includes('tradfi') || t.includes('option') || t.includes('dark_pool') || t.includes('equity') || t.includes('price') || t.includes('market') || t.includes('insider') || t.includes('futures') || t.includes('earnings') || s.includes('finnhub') || s.includes('alphavantage');
     }
     if (selectedDomain === 'crypto') {
-      return t.includes('crypto') || s.includes('binance') || s.includes('coingecko');
+      return t.includes('crypto') || t.includes('funding') || t.includes('interest') || s.includes('binance') || s.includes('coingecko') || s.includes('coinbase');
     }
     if (selectedDomain === 'prediction') {
       return t.includes('pred') || s.includes('polymarket') || s.includes('kalshi');

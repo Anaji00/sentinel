@@ -1,5 +1,11 @@
 """
 services/enrichment/enrichers/prediction.py
+
+ENTERPRISE PREDICTION MARKET ENRICHER & VOLATILITY SCORER
+=========================================================
+Enriches PolyMarket & Kalshi prediction events.
+Ignores zero-volume markets, delegates Z-score anomaly scoring to AnomalyScorer,
+and structures full PredictionMarketData models for the Probability Radar Matrix.
 """
 
 import asyncio
@@ -38,27 +44,34 @@ class PredictionEnricher:
         notional = float(p.get("notional_usd", 0))
         shares = float(p.get("size_shares", 0))
         price = float(p.get("price", 0))
+        total_vol = float(p.get("total_volume", 0) or notional)
         asset_id = p.get("asset_id", slug)
 
-        # BRAIN CHECK: Ask the AnomalyScorer if this is unusual
-        anomaly = await self.scorer.score_prediction_trade(asset_id, notional)
+        # GATEKEEPER: Ignore dead markets with zero volume & zero trade size
+        if total_vol <= 0 and notional <= 0 and shares <= 0:
+            return None
+
+        # Delegate volume anomaly scoring to central AnomalyScorer
+        anomaly = await self.scorer.score_prediction_volume_anomaly(asset_id, notional, shares)
 
         # Frequency boost for high activity
         f_boost = await self.scorer.track_frequency(slug, "prediction_market")
-        anomaly = min(1.0, anomaly + f_boost)
+        anomaly_score = min(1.0, anomaly + f_boost)
 
-        # GATEKEEPER: Drop normal trades. We only care about anomalies > 0.6
-        if anomaly < 0.6:
-            return None
-
-        # Record in Hawkes tracker for cross-domain excitation (prediction -> tradfi/crypto)
+        # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
 
-        tags = ["prediction_market", "whale_bet", slug.lower()]
-        headline = f"🐋 WHALE BET on {slug}: ${notional:,.2f}"
+        # Classify volume-based anomaly vs routine odds update
+        tags = ["prediction_market", slug.lower()]
+        is_volume_anomaly = notional >= 10000 or anomaly_score >= 0.70
+        if is_volume_anomaly:
+            tags.extend(["volume_spike", "whale_bet"])
+            headline = f"🐋 POLYMARKET WHALE BET on {slug.upper()}: ${notional:,.2f} ({outcome})"
+        else:
+            tags.append("odds_update")
+            headline = f"🎯 POLYMARKET ODDS: {slug.upper()} ({outcome})"
 
         try:
-            # ASYNC REDIS RAW API - Dropped executor wrapper
             await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
         except Exception:
             pass
@@ -67,23 +80,27 @@ class PredictionEnricher:
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
-            type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
+            type=EventType.PREDICTION_MARKET_TRADE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
             prediction_market_data=PredictionMarketData(
-                market_id = slug,
-                question = question,
-                outcome = outcome,
-                notional_usd = notional,
-                shares_traded = shares,
-                price_usd = price,
-                yes_probability = p.get("yes_probability"),
-                no_probability = p.get("no_probability")
+                market_id=slug,
+                ticker=slug.upper(),
+                question=question,
+                outcome=outcome,
+                notional_usd=notional,
+                shares_traded=shares,
+                price_usd=price,
+                total_volume=total_vol,
+                yes_probability=p.get("yes_probability"),
+                no_probability=p.get("no_probability"),
+                category=p.get("category") or "Macro & Geopolitics",
+                resolution_date=p.get("resolution_date")
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=anomaly,
+            anomaly_score=max(0.15, anomaly_score),
         )
     
     async def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
@@ -91,7 +108,12 @@ class PredictionEnricher:
         title = p.get("title", "Unknown Market")
         price = float(p.get("yes_bid") or p.get("no_bid") or p.get("price") or 0.0)
         current_vol = float(p.get("total_volume", 0))
-        # Stateful delta calculation using Redis
+
+        # GATEKEEPER: Ignore dead Kalshi markets with zero volume
+        if current_vol <= 0 and float(p.get("yes_bid") or 0) <= 0 and float(p.get("no_bid") or 0) <= 0:
+            return None
+
+        # Stateful volume delta calculation using Redis
         try:
             redis_key = f"sentinel:kalshi:vol:{ticker}"
             last_vol_str = await self.redis.raw.get(redis_key)
@@ -100,30 +122,28 @@ class PredictionEnricher:
         except Exception:
             last_vol = current_vol
 
-        delta = current_vol - last_vol
-        notional_usd = delta * price
-
-        # GATEKEEPER: Ignore if there was no new volume
-        if delta <= 0:
-            return None
+        delta = max(0.0, current_vol - last_vol)
+        notional_usd = delta * price if delta > 0 else current_vol * price
         
-        # BRAIN CHECK: Await the AnomalyScorer
-        anomaly_dict = await self.scorer.score_event("prediction_market_trade", ticker, [notional_usd, delta, price, 0, 0])
-        anomaly_score = anomaly_dict.get("score", 0.0)
+        # Delegate volume anomaly scoring to central AnomalyScorer
+        anomaly_score = await self.scorer.score_prediction_volume_anomaly(ticker, notional_usd, delta)
 
         # Frequency boost for high activity
         f_boost = await self.scorer.track_frequency(ticker, "prediction_market")
         anomaly_score = min(1.0, anomaly_score + f_boost)
 
-        # GATEKEEPER: Drop normal volume variance.
-        if anomaly_score < 0.6:
-            return None
-
-        # Record in Hawkes tracker for cross-domain excitation
+        # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
 
-        tags = ["kalshi_prediction", "volume_spike", ticker.lower()]
-        headline = f"🚨 KALSHI SPIKE: {ticker} (+${notional_usd:,.2f})"
+        is_volume_anomaly = delta >= 50000 or notional_usd >= 25000 or anomaly_score >= 0.70
+        tags = ["kalshi_prediction", ticker.lower()]
+        if is_volume_anomaly:
+            tags.extend(["volume_spike", "whale_bet"])
+            headline = f"🚨 KALSHI VOLUME SPIKE: {ticker} (+${notional_usd:,.2f})"
+        else:
+            tags.append("odds_update")
+            headline = f"🎯 KALSHI ODDS: {ticker} ({title})"
+
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         try:
@@ -133,23 +153,27 @@ class PredictionEnricher:
             
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
-            type=getattr(EventType, "PREDICTION_MARKET_TRADE", EventType.PREDICTION_MARKET_TRADE),
+            type=EventType.PREDICTION_MARKET_TRADE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             primary_entity=entity,
             prediction_market_data=PredictionMarketData(
                 market_id=ticker,
+                ticker=ticker,
                 question=title,
-                outcome="Volume Spike",
+                outcome="Volume Spike" if is_volume_anomaly else "Market Odds",
                 shares_traded=delta,
                 notional_usd=notional_usd,
                 price_usd=price,
+                total_volume=current_vol,
                 yes_bid=p.get("yes_bid"),
                 no_bid=p.get("no_bid"),
                 yes_probability=p.get("yes_probability"),
-                no_probability=p.get("no_probability")
+                no_probability=p.get("no_probability"),
+                category=p.get("category") or "Macro & Fed Rates",
+                resolution_date=p.get("resolution_date")
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=anomaly_score,
+            anomaly_score=max(0.15, anomaly_score),
         )

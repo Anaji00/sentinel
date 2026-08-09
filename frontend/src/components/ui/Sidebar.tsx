@@ -9,7 +9,8 @@ import {
   Globe2, 
   TrendingUp, 
   Bitcoin, 
-  Map 
+  Map,
+  LineChart
 } from 'lucide-react';
 
 const NAV_ITEMS = [
@@ -18,6 +19,7 @@ const NAV_ITEMS = [
   { href: '/macro', label: 'Macro Matrix', icon: Globe2 },
   { href: '/options', label: 'Options Flow', icon: TrendingUp },
   { href: '/crypto', label: 'Crypto Analytics', icon: Bitcoin },
+  { href: '/charts', label: 'Market Charts', icon: LineChart },
   { href: '/map', label: 'Global Map', icon: Map },
 ];
 

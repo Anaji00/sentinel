@@ -186,7 +186,231 @@ async def stream_binance_liquidations(producer: SentinelProducer):
         await asyncio.sleep(3600)
 
 
-# ── 3. ON-CHAIN WHALE TRACKING ────────────────────────────────────────────────
+# ── 3. BINANCE FUTURES FUNDING RATES (!markPrice@arr@1s) ──────────────────────
+
+# Dynamically tracked perp symbols observed from the markPrice stream.
+# Used by the OI REST poller so no hardcoded symbol list is needed.
+_observed_perp_symbols: set = set()
+
+async def stream_binance_funding_rates(producer: SentinelProducer, redis_client):
+    """
+    Streams Binance Futures !markPrice@arr@1s for funding rate, mark price,
+    index price, and computes perp-spot basis in bps.  Uses the /market routed
+    endpoint (same tier as the liquidation stream).
+    """
+    from shared.utils.websocket import ResilientWebSocketClient
+
+    url = "wss://fstream.binance.com/market/ws/!markPrice@arr@1s"
+    msg_count = 0
+    # Dynamic EMA-based funding rate thresholds per symbol stored in Redis
+    FUNDING_EMA_ALPHA = float(os.getenv("FUNDING_EMA_ALPHA", "0.05"))
+    FUNDING_ZSCORE_TRIGGER = float(os.getenv("FUNDING_ZSCORE_TRIGGER", "2.0"))
+
+    async def on_message(raw_msg):
+        nonlocal msg_count
+        try:
+            items = json.loads(raw_msg)
+            if not isinstance(items, list):
+                items = [items]
+
+            for data in items:
+                if data.get("e") != "markPriceUpdate":
+                    continue
+
+                symbol = data.get("s", "")
+                if not symbol:
+                    continue
+
+                # Track observed perp symbols dynamically for OI poller
+                _observed_perp_symbols.add(symbol)
+
+                try:
+                    funding_rate = float(data.get("r", "0"))
+                    mark_price = float(data.get("p", "0"))
+                    index_price = float(data.get("i", "0"))
+                    next_funding_time = int(data.get("T", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if mark_price <= 0 or index_price <= 0:
+                    continue
+
+                basis_bps = ((mark_price - index_price) / index_price) * 10_000.0
+
+                msg_count += 1
+                if msg_count % 10000 == 0:
+                    logger.info(f"💓 Funding Heartbeat: Processed {msg_count} markPrice updates across {len(_observed_perp_symbols)} symbols.")
+
+                # Cache latest funding data per symbol in Redis for enricher/agent lookups
+                funding_data = {
+                    "funding_rate": funding_rate,
+                    "mark_price": mark_price,
+                    "index_price": index_price,
+                    "basis_bps": round(basis_bps, 4),
+                    "next_funding_time": next_funding_time,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    await redis_client.raw.set(
+                        f"sentinel:crypto:funding:{symbol}",
+                        json.dumps(funding_data),
+                        ex=3600,
+                    )
+                except Exception as re:
+                    logger.debug(f"Redis funding cache write failed for {symbol}: {re}")
+
+                # Determine if funding rate is extreme via dynamic EMA z-score
+                # stored per-symbol in Redis (no hardcoded threshold)
+                is_extreme = False
+                try:
+                    ema_key = f"sentinel:crypto:funding_ema:{symbol}"
+                    var_key = f"sentinel:crypto:funding_var:{symbol}"
+                    raw_mean = await redis_client.raw.get(ema_key)
+                    raw_var = await redis_client.raw.get(var_key)
+                    ema_mean = float(raw_mean) if raw_mean else funding_rate
+                    ema_var = float(raw_var) if raw_var else 1e-10
+                    std = max(abs(ema_var) ** 0.5, 1e-10)
+                    z = (funding_rate - ema_mean) / std
+                    # Update EMA statistics
+                    new_mean = FUNDING_EMA_ALPHA * funding_rate + (1 - FUNDING_EMA_ALPHA) * ema_mean
+                    new_var = FUNDING_EMA_ALPHA * (funding_rate - ema_mean) ** 2 + (1 - FUNDING_EMA_ALPHA) * ema_var
+                    pipe = redis_client.raw.pipeline()
+                    pipe.set(ema_key, str(new_mean), ex=604800)
+                    pipe.set(var_key, str(new_var), ex=604800)
+                    await pipe.execute()
+                    is_extreme = abs(z) >= FUNDING_ZSCORE_TRIGGER
+                except Exception:
+                    pass
+
+                # Only emit Kafka events for extreme funding rates to avoid flooding
+                if is_extreme:
+                    event = RawEvent(
+                        source="binance_futures",
+                        occurred_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "asset": symbol.lower(),
+                            "trade_type": "CRYPTO_PERP_FUNDING",
+                            "funding_rate": funding_rate,
+                            "mark_price": mark_price,
+                            "index_price": index_price,
+                            "basis_bps": round(basis_bps, 4),
+                            "next_funding_time": next_funding_time,
+                        },
+                    )
+                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                    logger.info(
+                        f"⚡ FUNDING RATE EXTREME | {symbol} | Rate: {funding_rate:.6f} | "
+                        f"Basis: {basis_bps:.2f}bps | Mark: {mark_price:.2f} | Index: {index_price:.2f}"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error handling Binance markPrice WS message: {e}")
+
+    client = ResilientWebSocketClient(
+        url=url,
+        name="Binance_FundingRates",
+        ping_interval=20.0,
+        on_message=on_message,
+    )
+    await client.start()
+
+    while True:
+        await asyncio.sleep(3600)
+
+
+# ── 4. BINANCE FUTURES OPEN INTEREST (REST POLLER) ────────────────────────────
+
+async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
+    """
+    REST poller for Binance Futures /fapi/v1/openInterest.
+    Polls symbols discovered dynamically from the markPrice stream.
+    Cadence is configurable via BINANCE_OI_POLL_SECONDS env var (default 300s/5min).
+    """
+    import aiohttp
+
+    poll_interval = int(os.getenv("BINANCE_OI_POLL_SECONDS", "300"))
+    base_url = "https://fapi.binance.com/fapi/v1/openInterest"
+
+    # Wait for the funding stream to discover some symbols before starting
+    await asyncio.sleep(30)
+
+    session_timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+        while True:
+            try:
+                # Use dynamically observed symbols, not a hardcoded list
+                symbols = list(_observed_perp_symbols)
+                if not symbols:
+                    logger.info("OI Poller: No perp symbols observed yet, waiting...")
+                    await asyncio.sleep(60)
+                    continue
+
+                # Prioritize top symbols by fetching latest funding rate magnitude from Redis
+                scored = []
+                for sym in symbols:
+                    try:
+                        cached = await redis_client.raw.get(f"sentinel:crypto:funding:{sym}")
+                        if cached:
+                            fr = abs(json.loads(cached).get("funding_rate", 0))
+                        else:
+                            fr = 0.0
+                    except Exception:
+                        fr = 0.0
+                    scored.append((sym, fr))
+                scored.sort(key=lambda x: x[1], reverse=True)
+
+                # Cap per-cycle to top 50 most active to respect API rate limits
+                poll_batch = [s[0] for s in scored[:50]]
+
+                count = 0
+                for symbol in poll_batch:
+                    try:
+                        async with session.get(base_url, params={"symbol": symbol}) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                oi_value = float(data.get("openInterest", "0"))
+                                if oi_value > 0:
+                                    # Cache in Redis for enricher access
+                                    await redis_client.raw.set(
+                                        f"sentinel:crypto:oi:{symbol}",
+                                        str(oi_value),
+                                        ex=600,
+                                    )
+                                    event = RawEvent(
+                                        source="binance_futures",
+                                        occurred_at=datetime.now(timezone.utc),
+                                        raw_payload={
+                                            "asset": symbol.lower(),
+                                            "trade_type": "OPEN_INTEREST",
+                                            "open_interest": oi_value,
+                                            "symbol": symbol,
+                                        },
+                                    )
+                                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                                    count += 1
+                            elif resp.status == 429:
+                                logger.warning("OI Poller: Binance rate limited, backing off 60s.")
+                                await asyncio.sleep(60)
+                                break
+                            else:
+                                text = await resp.text()
+                                logger.debug(f"OI poll {symbol} returned {resp.status}: {text[:100]}")
+                    except Exception as e:
+                        logger.debug(f"OI poll error for {symbol}: {e}")
+
+                    # Small delay between requests to respect rate limits
+                    await asyncio.sleep(0.2)
+
+                if count > 0:
+                    logger.info(f"📊 OI Poller: Published {count}/{len(poll_batch)} open interest snapshots.")
+
+            except Exception as e:
+                logger.error(f"OI Poller cycle error: {e}", exc_info=True)
+
+            await asyncio.sleep(poll_interval)
+
+
+# ── 5. ON-CHAIN WHALE TRACKING ────────────────────────────────────────────────
 
 async def stream_onchain_whales(producer: SentinelProducer, redis_client):
     from shared.utils.websocket import ResilientWebSocketClient
@@ -265,11 +489,13 @@ async def main():
     redis_client = await get_redis()
     
     try:
-        # Run all three WebSocket streams concurrently 
+        # Run all WebSocket streams and REST pollers concurrently 
         await asyncio.gather(
             stream_coinbase_market_data(producer),
             stream_binance_liquidations(producer),
-            stream_onchain_whales(producer, redis_client)
+            stream_binance_funding_rates(producer, redis_client),
+            poll_binance_open_interest(producer, redis_client),
+            stream_onchain_whales(producer, redis_client),
         )
     except KeyboardInterrupt:
         logger.info("Shutting down...")

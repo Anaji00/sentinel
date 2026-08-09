@@ -24,7 +24,12 @@ const FinancialAdvisorAdvice = dynamic(() => import('./FinancialAdvisorAdvice'),
   ssr: false,
 });
 
-type ViewMode = 'all' | 'intelligence' | 'graph' | 'radar' | 'advisor';
+const BondYieldsChart = dynamic(() => import('./charts/BondYieldsChart'), {
+  loading: () => <PanelSkeleton title="Loading Bond Yields..." />,
+  ssr: false,
+});
+
+type ViewMode = 'all' | 'intelligence' | 'graph' | 'radar' | 'advisor' | 'charts';
 
 export function CommandCenterGrid() {
   const [activeView, setActiveView] = useState<ViewMode>('all');
@@ -54,6 +59,7 @@ export function CommandCenterGrid() {
         graph: mode === 'graph',
         radar: mode === 'radar',
         advisor: mode === 'advisor',
+        charts: mode === 'charts',
       });
     }
   };
@@ -77,7 +83,7 @@ export function CommandCenterGrid() {
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-pulse" />
           <span className="text-[#00f2fe] font-extrabold tracking-wider uppercase text-[11px]">
-            COMMAND FEEDS ({visibleCount}/4 ACTIVE)
+            COMMAND FEEDS ({visibleCount} ACTIVE)
           </span>
         </div>
 
@@ -89,6 +95,7 @@ export function CommandCenterGrid() {
             { id: 'graph', label: 'KNOWLEDGE GRAPH', icon: '🕸️' },
             { id: 'radar', label: 'QUANT RADAR', icon: '⚡' },
             { id: 'advisor', label: 'PORTFOLIO ALLOCATOR', icon: '💼' },
+            { id: 'charts', label: 'MARKET CHARTS', icon: '📈' },
           ].map((view) => (
             <button
               key={view.id}
@@ -113,6 +120,7 @@ export function CommandCenterGrid() {
             { key: 'graph', label: 'GRAPH' },
             { key: 'radar', label: 'RADAR' },
             { key: 'advisor', label: 'ALLOCATOR' },
+            { key: 'charts', label: 'CHARTS' },
           ].map((f) => (
             <button
               key={f.key}
@@ -171,9 +179,18 @@ export function CommandCenterGrid() {
               </div>
             </div>
           )}
+
+          {visibleFeeds.charts && (
+            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Charts Loading..." />}>
+                  <BondYieldsChart />
+                </Suspense>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
-

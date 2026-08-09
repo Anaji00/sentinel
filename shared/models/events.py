@@ -40,6 +40,8 @@ class EventType(str, Enum):
     PREDICTION_MARKET_TRADE = "prediction_market_trade"
     CRYPTO_LIQUIDATION = "crypto_liquidation"
     CRYPTO_PERP_FUNDING = "crypto_perp_funding"
+    EARNINGS_REPORT = "earnings_report"
+    EARNINGS_SURPRISE = "earnings_surprise"
     CUSTOM = "custom"
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
@@ -146,6 +148,12 @@ class PredictionMarketData(BaseModel):
    no_bid: Optional[float] = None
    yes_probability: Optional[float] = None
    no_probability: Optional[float] = None
+   ticker: Optional[str] = None
+   total_volume: Optional[float] = None
+   resolution_date: Optional[str] = None
+   category: Optional[str] = None
+   outcome_prices: Optional[dict] = None
+   probability_delta_24h: Optional[float] = None
 
 class CryptoData(BaseModel):
     pair: str
@@ -158,6 +166,12 @@ class CryptoData(BaseModel):
     close_price: Optional[float] = None
     size_tokens: float
     leverage: Optional[float] = None
+    funding_rate: Optional[float] = None
+    mark_price: Optional[float] = None
+    index_price: Optional[float] = None
+    basis_bps: Optional[float] = None
+    open_interest: Optional[float] = None
+    market_microstructure: Optional['MarketMicrostructure'] = None
 
 class FinancialData(BaseModel):
     ticker: Optional[str] = None
@@ -178,6 +192,15 @@ class FinancialData(BaseModel):
     exchange: Optional[str] = None
     volume_oi_ratio: Optional[float] = None
     otm_percentage: Optional[float] = None
+    option_type: Optional[str] = None
+    # Earnings calendar fields (Phase 4)
+    earnings_report_date: Optional[str] = None
+    earnings_session: Optional[str] = None
+    eps_estimate: Optional[float] = None
+    eps_actual: Optional[float] = None
+    eps_surprise_pct: Optional[float] = None
+    revenue_estimate: Optional[float] = None
+    revenue_actual: Optional[float] = None
 
 class SecurityData(BaseModel):
     breach_type: Optional[str] = None
@@ -460,6 +483,7 @@ class NormalizedEvent(BaseModel):
             EventType.PRICE_ANOMALY, EventType.INSIDER_TRADE, EventType.EQUITY_BLOCK,             
             EventType.CRYPTO_TRADE, EventType.MARKET_CANDLE, EventType.MARKET_ANOMALY,           
             EventType.CRYPTO_LIQUIDATION, EventType.PREDICTION_MARKET_TRADE, EventType.CRYPTO_TRANSFER,
+            EventType.CRYPTO_PERP_FUNDING, EventType.EARNINGS_REPORT, EventType.EARNINGS_SURPRISE,
         ]
     
     def to_summary(self) -> str:

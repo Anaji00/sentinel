@@ -99,6 +99,90 @@ async def get_radar_sweeps_status(redis = Depends(get_redis_client)):
     }
 
 
+import aiohttp
+import asyncio
+from datetime import datetime, timezone
+
+SYMBOL_YAF_MAP = {
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "DJI": "^DJI",
+    "VIX": "^VIX",
+    "WTI": "CL=F",
+    "BRENT": "BZ=F",
+    "GLD": "GLD",
+    "US10Y": "^TNX",
+    "US02Y": "2YR",
+    "TLT": "TLT",
+}
+
+async def fetch_on_the_spot_historical(symbol: str, limit: int = 60):
+    """
+    Fetches real authentic historical price series on the spot from public APIs
+    if no events currently persist in TimescaleDB for the requested symbol.
+    """
+    symbol_upper = symbol.upper()
+    
+    # 1. Check Crypto symbols via Binance Public KLines API (Zero Auth Required)
+    if "BTC" in symbol_upper or "ETH" in symbol_upper or "SOL" in symbol_upper or symbol_upper.endswith("USDT") or symbol_upper.endswith("USD"):
+        pair = symbol_upper.replace("USD", "USDT")
+        url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&limit={limit}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        klines = await resp.json()
+                        pts = []
+                        for k in klines:
+                            ts_str = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc).isoformat()
+                            close_p = float(k[4])
+                            vol = float(k[5])
+                            pts.append({
+                                "timestamp": ts_str,
+                                "price": round(close_p, 2),
+                                "volume": round(vol, 2),
+                                "anomaly_score": 0.0
+                            })
+                        if pts:
+                            return pts
+        except Exception as e:
+            logger.debug(f"Binance historical fetch failed for {symbol}: {e}")
+
+    # 2. Check Equities, Commodities, Yields via Yahoo Finance v8 Chart API
+    yf_symbol = SYMBOL_YAF_MAP.get(symbol_upper, symbol_upper)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}?range=1d&interval=5m"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    chart = data.get("chart", {}).get("result", [])[0]
+                    timestamps = chart.get("timestamp", [])
+                    indicators = chart.get("indicators", {}).get("quote", [])[0]
+                    closes = indicators.get("close", [])
+                    volumes = indicators.get("volume", [])
+
+                    pts = []
+                    for t, c, v in zip(timestamps, closes, volumes):
+                        if c is not None:
+                            ts_str = datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+                            pts.append({
+                                "timestamp": ts_str,
+                                "price": round(float(c), 2),
+                                "volume": float(v or 1000),
+                                "anomaly_score": 0.0
+                            })
+                    if pts:
+                        return pts[-limit:]
+    except Exception as e:
+        logger.debug(f"Yahoo Finance historical fetch failed for {symbol}: {e}")
+
+    return []
+
+
 @router.get("/market-series")
 async def get_market_series(
     symbols: Optional[str] = Query(None, description="Comma-separated symbols, e.g. TLT,IEF,SHY,BTCUSD,SPY,QQQ"),
@@ -131,7 +215,7 @@ async def get_market_series(
                 
                 fin = r.get("financial_data") or {}
                 cryp = r.get("crypto_data") or {}
-                price = fin.get("current_price") or fin.get("close") or cryp.get("price") or 100.0
+                price = fin.get("current_price") or fin.get("close") or cryp.get("price") or cryp.get("mark_price") or 100.0
                 
                 series_data[sym].append({
                     "timestamp": r["occurred_at"].isoformat() if hasattr(r["occurred_at"], "isoformat") else str(r["occurred_at"]),
@@ -142,37 +226,21 @@ async def get_market_series(
         except Exception as e:
             logger.warning(f"Error fetching market series from DB: {e}")
 
-    # Synthesize realistic intraday baseline ticks for any requested symbol without DB rows
-    now_ts = time.time()
-
-    baselines = {
-        "TLT": 92.50,     # 20+ Y Treasury ETF
-        "IEF": 94.20,     # 7-10 Y Treasury ETF
-        "SHY": 81.80,     # 1-3 Y Treasury ETF
-        "US10Y": 4.25,    # 10Y Yield Rate %
-        "US02Y": 4.45,    # 2Y Yield Rate %
-        "BTCUSD": 67450.0,# BTC/USD
-        "BTC": 67450.0,
-        "SPY": 545.20,    # S&P 500 ETF
-        "QQQ": 478.60,    # Nasdaq 100 ETF
-    }
-
+    # Fetch on-the-spot historical ticks for any target symbol with missing or insufficient DB events
+    fetch_tasks = []
+    missing_symbols = []
     for sym in target_symbols:
         if sym not in series_data or len(series_data[sym]) < 5:
-            base_p = baselines.get(sym, 100.0)
-            pts = []
-            for i in range(limit):
-                t_offset = (limit - 1 - i) * 60
-                ts_str = datetime.fromtimestamp(now_ts - t_offset, timezone.utc).isoformat()
-                wave = math.sin(i * 0.15) * (base_p * 0.008) + math.cos(i * 0.08) * (base_p * 0.004)
-                price = round(base_p + wave, 2 if base_p < 1000 else 1)
-                pts.append({
-                    "timestamp": ts_str,
-                    "price": price,
-                    "volume": int(15000 + math.sin(i) * 5000),
-                    "anomaly_score": round(abs(math.sin(i * 0.3)) * 0.5, 2)
-                })
-            series_data[sym] = pts
+            missing_symbols.append(sym)
+            fetch_tasks.append(fetch_on_the_spot_historical(sym, limit))
+
+    if fetch_tasks:
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        for sym, res in zip(missing_symbols, results):
+            if isinstance(res, list) and res:
+                series_data[sym] = res
+            elif sym not in series_data:
+                series_data[sym] = []
 
     return {
         "symbols": target_symbols,

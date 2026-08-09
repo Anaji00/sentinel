@@ -30,6 +30,12 @@ interface CorrelationCluster {
 // Helper to derive clean domain tag + icon
 function getDomainMeta(type: string): { label: string; icon: string; badgeStyle: string } {
     const t = (type || '').toLowerCase();
+    if (t.includes('earnings')) {
+        return { label: 'EARNINGS', icon: '📅', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
+    }
+    if (t.includes('funding')) {
+        return { label: 'PERP FUNDING', icon: '⚡', badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10' };
+    }
     if (t.includes('vessel') || t.includes('maritime') || t.includes('ais')) {
         return { label: 'MARITIME', icon: '🚢', badgeStyle: 'text-cyan-400 border-cyan-500/40 bg-cyan-500/10' };
     }
@@ -116,16 +122,38 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
   const title = formatEnglishHeadline(e);
   const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown Entity';
 
+  const fd = e.financial_data || {};
+  const cd = e.crypto_data || {};
+
   return (
     <div
       onClick={() => onClick(e)}
       className="p-3 rounded-lg bg-slate-900/60 border border-cyan-500/15 hover:border-[#00f2fe]/50 cursor-pointer transition-all hover:bg-slate-900/90 group glass-panel-hover"
     >
       <div className="flex items-center justify-between mb-1.5 font-mono text-[10px]">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <span className={`px-1.5 py-0.5 rounded border font-bold uppercase ${domainMeta.badgeStyle}`}>
             {domainMeta.icon} {domainMeta.label}
           </span>
+          {fd.option_type && (
+            <span className={`px-1.5 py-0.5 rounded border font-extrabold text-[9px] ${
+              fd.option_type === 'CALL' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+            }`}>
+              {fd.option_type}
+            </span>
+          )}
+          {fd.eps_surprise_pct !== undefined && fd.eps_surprise_pct !== null && (
+            <span className={`px-1.5 py-0.5 rounded border font-extrabold text-[9px] ${
+              fd.eps_surprise_pct >= 0 ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+            }`}>
+              EPS {fd.eps_surprise_pct >= 0 ? '+' : ''}{fd.eps_surprise_pct.toFixed(1)}%
+            </span>
+          )}
+          {cd.funding_rate !== undefined && (
+            <span className="px-1.5 py-0.5 rounded border border-purple-500/40 bg-purple-500/20 text-purple-300 font-extrabold text-[9px]">
+              {(cd.funding_rate * 100).toFixed(4)}% RATE
+            </span>
+          )}
           <span className="text-slate-400 font-medium">
             via <span className="text-cyan-400 font-bold">{sourceName}</span>
           </span>

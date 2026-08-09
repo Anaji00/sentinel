@@ -304,18 +304,22 @@ class QuantTradingEngine(SentinelAgent):
         await self.mark_processed(dedup_key, window_seconds=1800)
 
         # Concurrent context hydration
-        news_context, graph_context, global_context, cross_context = await asyncio.gather(
+        news_context, graph_context, global_context, cross_context, earnings_ctx, funding_ctx = await asyncio.gather(
             self._fetch_news_context(ticker),
             self._fetch_graph_context(ticker),
             self.fetch_global_context(),
             self.get_cross_agent_context(ticker=ticker, limit=3),
+            self._fetch_earnings_context(ticker),
+            self._fetch_funding_context(ticker),
         )
         cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
+        earnings_block = f"\n- Earnings Context: {earnings_ctx}" if earnings_ctx else ""
+        funding_block = f"\n- Derivatives Context: {funding_ctx}" if funding_ctx else ""
 
         user_prompt = f"""=== ANOMALOUS INSTRUMENT RESEARCH ===
 Target Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
 Global Context: {global_context}
-{cross_block}
+{cross_block}{earnings_block}{funding_block}
 Recent News: {json.dumps(news_context[:3], default=str)}
 Entity Graph: {json.dumps(graph_context[:3], default=str)}
 
@@ -503,10 +507,16 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=3)
         cross_block = f"\n        CROSS-AGENT INTELLIGENCE:\n        {cross_context}\n" if cross_context else ""
 
+        # Earnings & derivatives context injection (Phase 4)
+        earnings_ctx = await self._fetch_earnings_context(ticker)
+        funding_ctx = await self._fetch_funding_context(ticker)
+        earnings_block = f"\n        EARNINGS CONTEXT: {earnings_ctx}\n" if earnings_ctx else ""
+        funding_block = f"\n        DERIVATIVES CONTEXT: {funding_ctx}\n" if funding_ctx else ""
+
         user_prompt = f"""=== FINANCIAL ADVISORY & RISK EVALUATION ===
 Target Instrument: {ticker} | Macro Regime: {rates_regime}
 Risk Indicators: {json.dumps(indicators_data, separators=(',', ':'), default=str)}
-{graph_block}{cross_block}
+{graph_block}{cross_block}{earnings_block}{funding_block}
 HARD RISK CONSTRAINTS (MANDATORY):
 - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
 - Max Half-Kelly Allocation: {kelly_pct * 100:.1f}% (Set kelly_allocation_pct <= {kelly_pct * 100:.1f}%)
@@ -650,21 +660,65 @@ Return raw JSON matching schema:"""
 
     async def _fetch_graph_context(self, ticker: str) -> List[Dict]:
         try:
-            neo4j_client = await get_neo4j()
-            rows = await neo4j_client.query("""
-                MATCH (n {id: $ticker})-[r]-(m)
-                RETURN type(r) as relationship, coalesce(m.name, m.id) as connected,
-                       labels(m) as labels
-                LIMIT 20
-            """, {"ticker": ticker.upper()})
-            return [
-                {
-                    "relationship": r.get("relationship"),
-                    "connected_entity": r.get("connected"),
-                    "entity_type": r.get("labels", ["Unknown"])[0],
-                }
-                for r in rows
-            ]
+            neo4j_client = self.neo4j or await get_neo4j()
+            if not neo4j_client:
+                return []
+            q = "MATCH (e:Entity)-[r]-(t:Entity {id: $ticker}) RETURN e.id AS related_id, type(r) AS rel_type, coalesce(r.confidence, 0.5) AS confidence LIMIT 10"
+            rows = await neo4j_client.query(q, {"ticker": ticker.upper()})
+            return rows or []
         except Exception as e:
             logger.debug(f"Graph context fetch error for {ticker}: {e}")
             return []
+
+    async def _fetch_earnings_context(self, ticker: str) -> str:
+        """Fetch cached earnings context from Redis (populated by Finnhub earnings poller)."""
+        try:
+            raw = await self.redis.raw.get(f"sentinel:earnings:{ticker}")
+            if raw:
+                data = json.loads(raw)
+                report_date = data.get("report_date", "")
+                session = data.get("session", "")
+                eps_est = data.get("eps_estimate")
+                eps_act = data.get("eps_actual")
+                surprise = data.get("eps_surprise_pct")
+                rev_est = data.get("revenue_estimate")
+                rev_act = data.get("revenue_actual")
+                trade_type = data.get("trade_type", "")
+
+                if trade_type == "EARNINGS_SURPRISE" and eps_act is not None:
+                    return (
+                        f"📊 EARNINGS REPORTED: {ticker} | Date: {report_date} ({session}) | "
+                        f"EPS: {eps_act} vs Est {eps_est} (Surprise: {surprise:+.1f}%) | "
+                        f"Revenue: {rev_act} vs Est {rev_est}"
+                    )
+                else:
+                    session_label = {"bmo": "Pre-Market", "amc": "After-Close", "dmh": "During Hours"}.get(
+                        session, session.upper() if session else "TBD"
+                    )
+                    return (
+                        f"📅 EARNINGS UPCOMING: {ticker} | Date: {report_date} ({session_label}) | "
+                        f"Est EPS: {eps_est} | Est Revenue: {rev_est}"
+                    )
+        except Exception:
+            pass
+        return ""
+
+    async def _fetch_funding_context(self, symbol: str) -> str:
+        """Fetch cached crypto funding rate context from Redis (populated by markPrice stream)."""
+        try:
+            for candidate in [symbol.upper(), symbol.upper() + "USDT"]:
+                raw = await self.redis.raw.get(f"sentinel:crypto:funding:{candidate}")
+                if raw:
+                    data = json.loads(raw)
+                    fr = data.get("funding_rate", 0)
+                    basis = data.get("basis_bps", 0)
+                    mark = data.get("mark_price", 0)
+                    idx = data.get("index_price", 0)
+                    annualized = abs(fr) * 3 * 365 * 100
+                    return (
+                        f"⚡ PERP FUNDING: {candidate} | Rate: {fr:.6f} ({annualized:.1f}% annualized) | "
+                        f"Basis: {basis:.2f}bps | Mark: {mark:.2f} | Index: {idx:.2f}"
+                    )
+        except Exception:
+            pass
+        return ""

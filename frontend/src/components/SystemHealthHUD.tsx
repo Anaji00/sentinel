@@ -42,7 +42,7 @@ export default function SystemHealthHUD() {
       {/* Trigger Pill in Header */}
       <button
         onClick={() => setIsOpen(true)}
-        className={`flex items-center gap-2 px-2.5 py-1 rounded-md text-xs font-mono border transition-all cursor-pointer ${
+        className={`flex items-center gap-2.5 px-3.5 py-2 rounded-xl text-xs font-mono border transition-all cursor-pointer shadow-md ${
           isHealthy
             ? 'bg-emerald-950/40 text-emerald-400 border-emerald-500/40 hover:bg-emerald-900/50 glow-emerald'
             : 'bg-amber-950/40 text-amber-400 border-amber-500/40 hover:bg-amber-900/50'

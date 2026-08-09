@@ -589,6 +589,33 @@ class DynamicAnomalyScorer:
             pass
         res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
         return res["score"]
+
+    async def score_prediction_volume_anomaly(self, asset_id: str, notional: float, volume_delta: float = 0.0) -> float:
+        """
+        Centralized prediction market anomaly scorer.
+        Evaluates trade size & volume delta, computes rolling Z-scores,
+        and applies an automatic +0.25 anomaly boost if Z-score > 2.0.
+        """
+        config = {"divisor": 100_000.0}
+        try:
+            cfg = await self._get_thresholds_config("prediction_trade")
+            config.update(cfg)
+        except Exception:
+            pass
+
+        val_to_score = max(notional, volume_delta)
+        res = await self.score_event("prediction_market_trade", asset_id, [val_to_score / config["divisor"], 0.0, 0.0, 0.0, 0.0])
+        score = res.get("score", 0.0)
+
+        # Dynamic rolling Z-score normalization in Redis
+        try:
+            norm_val = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "volume_surge", val_to_score)
+            if norm_val > 2.0:
+                score += 0.25
+        except Exception:
+            pass
+
+        return min(1.0, score)
         
     async def check_watchlist(self, entity_id: str, watchlist_type: str) -> bool:
         """
