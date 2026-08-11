@@ -963,3 +963,141 @@ def twap(prices: List[float]) -> float:
     if not prices:
         return 0.0
     return round(float(np.mean(prices)), 4)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SECTION 8: ADVANCED ADVISORY & PORTFOLIO RISK MODELS
+# ════════════════════════════════════════════════════════════════════════════════
+
+def black_litterman_optimization(
+    market_caps: Dict[str, float],
+    cov_matrix: List[List[float]],
+    views_matrix: List[List[float]],
+    view_returns: List[float],
+    view_uncertainties: List[float],
+    risk_aversion: float = 2.5,
+    tau: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    Black-Litterman Portfolio Optimization model.
+    Combines CAPM market equilibrium returns (Pi) with agent views (P, Q, Omega)
+    to compute posterior expected returns E[R] and optimal portfolio weights w*.
+    """
+    tickers = list(market_caps.keys())
+    n = len(tickers)
+    if n == 0 or not cov_matrix:
+        return {"expected_returns": {}, "optimal_weights": {}}
+
+    try:
+        sigma = np.array(cov_matrix, dtype=np.float64)
+        total_mcap = sum(market_caps.values()) or 1.0
+        w_eq = np.array([market_caps[t] / total_mcap for t in tickers], dtype=np.float64)
+        
+        pi = risk_aversion * np.dot(sigma, w_eq)
+        
+        if not views_matrix or not view_returns:
+            return {
+                "expected_returns": {tickers[i]: round(float(pi[i]), 4) for i in range(n)},
+                "optimal_weights": {tickers[i]: round(float(w_eq[i] * 100), 2) for i in range(n)},
+                "equilibrium_returns": {tickers[i]: round(float(pi[i]), 4) for i in range(n)},
+            }
+
+        P = np.array(views_matrix, dtype=np.float64)
+        Q = np.array(view_returns, dtype=np.float64)
+        omega = np.diag(view_uncertainties) if view_uncertainties else np.eye(len(Q)) * 0.01
+
+        tau_sigma_inv = np.linalg.pinv(tau * sigma)
+        omega_inv = np.linalg.pinv(omega)
+
+        post_prec = tau_sigma_inv + np.dot(P.T, np.dot(omega_inv, P))
+        post_cov = np.linalg.pinv(post_prec)
+
+        post_mean = np.dot(post_cov, (np.dot(tau_sigma_inv, pi) + np.dot(P.T, np.dot(omega_inv, Q))))
+
+        sigma_inv = np.linalg.pinv(sigma)
+        w_post = (1.0 / risk_aversion) * np.dot(sigma_inv, post_mean)
+        
+        w_pos = np.maximum(0, w_post)
+        w_sum = np.sum(w_pos)
+        w_norm = w_pos / w_sum if w_sum > 0 else w_eq
+
+        return {
+            "expected_returns": {tickers[i]: round(float(post_mean[i]), 4) for i in range(n)},
+            "optimal_weights": {tickers[i]: round(float(w_norm[i] * 100), 2) for i in range(n)},
+            "equilibrium_returns": {tickers[i]: round(float(pi[i]), 4) for i in range(n)},
+        }
+    except Exception as e:
+        logger.error(f"Black-Litterman optimization failed: {e}")
+        return {"expected_returns": {}, "optimal_weights": {}}
+
+
+def garch_volatility_cone(
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    horizon_hours: int = 24,
+) -> Dict[str, Any]:
+    """
+    Projects GARCH(1,1) conditional volatility cone targets (1.0sigma, 2.0sigma, 3.0sigma)
+    and tranche scale-out exits.
+    """
+    if not closes or len(closes) < 3:
+        return {"tp1_sigma": 0.0, "tp2_sigma": 0.0, "tp3_sigma": 0.0}
+
+    returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] > 0]
+    cond_vol = garch_volatility(returns, annualize=False)
+    if cond_vol <= 0:
+        cond_vol = np.std(returns) if len(returns) > 1 else 0.02
+
+    curr_price = closes[-1]
+    time_factor = math.sqrt(max(1, horizon_hours) / 24.0)
+    vol_step = curr_price * cond_vol * time_factor
+
+    return {
+        "cond_volatility_pct": round(cond_vol * 100, 2),
+        "tp1_sigma_1_0": round(curr_price + vol_step, 2),
+        "tp2_sigma_2_0": round(curr_price + 2.0 * vol_step, 2),
+        "tp3_sigma_3_0": round(curr_price + 3.0 * vol_step, 2),
+        "sl_sigma_1_5": round(curr_price - 1.5 * vol_step, 2),
+    }
+
+
+def microstructure_stop_distance(
+    atr: float,
+    ofi: float,
+    kyle_lambda: float,
+    base_multiplier: float = 1.5,
+) -> float:
+    """
+    Dynamic stop-loss distance multiplier derived from Order Flow Imbalance and Kyle's Lambda.
+    Tightens stop multiplier down to 0.5 * ATR during illiquidity spikes or heavy aggressor selling.
+    """
+    mult = base_multiplier
+    if ofi < -0.60:
+        mult -= 0.50
+    elif ofi < -0.30:
+        mult -= 0.25
+        
+    if kyle_lambda > 2.0:
+        mult -= 0.50
+    elif kyle_lambda > 1.0:
+        mult -= 0.25
+
+    return round(max(0.50, min(2.50, mult)), 2)
+
+
+def hawkes_risk_multiplier(
+    hawkes_intensity: float,
+    base_multiplier: float = 1.0,
+) -> float:
+    """
+    Computes Kelly position sizing decay factor under cross-domain shock excitation.
+    Scales down Kelly position sizing when Hawkes intensity ratio > 1.5.
+    """
+    if hawkes_intensity <= 1.5:
+        return base_multiplier
+    
+    excess_shock = hawkes_intensity - 1.5
+    decay_factor = 1.0 / (1.0 + excess_shock)
+    return round(max(0.20, min(1.0, base_multiplier * decay_factor)), 2)
+

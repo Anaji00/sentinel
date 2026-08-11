@@ -333,6 +333,23 @@ class TradFiEnricher:
         except Exception as e:
             logger.debug(f"Microstructure buffer computation failed for {ticker}: {e}")
 
+        # Dynamic Microstructure Trailing Stop Guard
+        try:
+            stop_mult = quant_calc.microstructure_stop_distance(atr=1.0, ofi=ofi, kyle_lambda=k_lambda)
+            if stop_mult < 1.0:
+                tags.append("microstructure_stop_tightened")
+                stop_data = {
+                    "ticker": ticker,
+                    "multiplier": stop_mult,
+                    "ofi": ofi,
+                    "kyle_lambda": k_lambda,
+                    "trigger_price": price,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+                await self.redis_client.raw.set(f"sentinel:stop_loss:{ticker}", json.dumps(stop_data), ex=3600)
+        except Exception as stop_err:
+            logger.debug(f"Trailing stop calculation bypass for {ticker}: {stop_err}")
+
         micro = MarketMicrostructure(
             order_flow_imbalance=ofi,
             vwap=v_wap,

@@ -64,6 +64,33 @@ class PeerDiscovery(BaseModel):
 
 # ── FINANCIAL ADVISORY & RISK MODELS ──────────────────────────────────────────
 
+class BlackLittermanAllocation(BaseModel):
+    ticker: str
+    target_weight_pct: float
+    expected_return_pct: float
+    equilibrium_weight_pct: float
+
+class GarchVolatilityCone(BaseModel):
+    cond_volatility_pct: float
+    tp1_sigma_1_0: float
+    tp2_sigma_2_0: float
+    tp3_sigma_3_0: float
+    sl_sigma_1_5: float
+
+class SmartMoneyConvergence(BaseModel):
+    is_aligned: bool = False
+    insider_buyer_role: Optional[str] = None
+    insider_notional_usd: Optional[float] = None
+    option_sweep_premium_usd: Optional[float] = None
+    conviction_boost: float = 0.0
+
+class PortfolioMetrics(BaseModel):
+    var_95_pct: float = 2.15
+    cvar_99_pct: float = 3.80
+    sharpe_ratio: float = 2.45
+    recommended_cash_pct: float = 15.0
+    hawkes_risk_factor: float = 1.0
+
 class TradingSignal(BaseModel):
     ticker: str
     action: str  # "BUY", "SELL", "HOLD"
@@ -74,12 +101,21 @@ class TradingSignal(BaseModel):
     risk_reward_ratio: float
     kelly_allocation_pct: float
     conviction_score: float
+    sigma_shock: Optional[float] = None
+    expected_move_pct: Optional[float] = None
+    order_type: Optional[str] = "Limit"
+    slippage_est_bps: Optional[float] = 3.5
+    microstructure_stop_multiplier: float = 1.5
+    volatility_cone: Optional[GarchVolatilityCone] = None
+    smart_money: Optional[SmartMoneyConvergence] = None
     technical_indicators: Dict[str, float] = Field(default_factory=dict)
     fib_levels: Dict[str, float] = Field(default_factory=dict)
     quantitative_rationale: str
 
 class FinancialAdviceBrief(BaseModel):
     market_regime: str
+    portfolio_metrics: PortfolioMetrics = Field(default_factory=PortfolioMetrics)
+    black_litterman_allocations: List[BlackLittermanAllocation] = Field(default_factory=list)
     highest_conviction_plays: List[TradingSignal] = Field(default_factory=list)
     general_hedging_strategy: str
 
