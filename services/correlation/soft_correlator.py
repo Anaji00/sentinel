@@ -21,9 +21,12 @@ The similarity threshold is conformally calibrated (ConformalSimilarityCalibrato
 rather than fixed, targeting a specific false cross-domain link rate.
 """
 import asyncio
-import uuid
-import os
 import logging
+import os
+import uuid
+from shared.utils.tasks import safe_create_task
+
+logger = logging.getLogger("correlation.soft")
 from functools import partial
 # Import datetime for handling time-based logic.
 from datetime import datetime, timezone
@@ -198,7 +201,7 @@ class SoftCorrelator:
             except Exception as e:
                 logger.warning(f"Qdrant connection failed: {e}. Scheduling background retry loop.")
                 if self._retry_task is None or self._retry_task.done():
-                    self._retry_task = asyncio.create_task(self._connect_retry_loop())
+                    self._retry_task = safe_create_task(self._connect_retry_loop(), name="soft-correlator-retry")
 
     async def _connect_retry_loop(self):
         """Background retry loop to connect to Qdrant if initial load fails."""

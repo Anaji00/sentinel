@@ -77,6 +77,7 @@ class PatternLibrary:
                 # Even if the rule_id is different, an event sharing tags like ['strait_of_hormuz', 'tanker'] 
                 # might provide the LLM with valuable geopolitical precedent.
                 
+                min_overlap = min(SIMILARITY_TAGS_THRESHOLD, max(1, len(tags)))
                 extra = await self._db.query("""
                     SELECT
                         s.scenario_id,
@@ -90,14 +91,11 @@ class PatternLibrary:
                     FROM scenarios s
                     JOIN correlations c ON s.correlation_id = c.correlation_id
                     WHERE s.status IN ('confirmed', 'denied')
-                      -- BEGINNER EXPLANATION: The '&&' operator in PostgreSQL means "Array Overlap".
-                      -- It checks if the array of tags in the database shares ANY elements 
-                      -- with the array of tags we passed in ($1). It's much faster than looping in Python!
-                      AND c.tags && $1::text[]
+                      AND (SELECT count(*) FROM unnest(c.tags) t WHERE t = ANY($1::text[])) >= $4
                       AND c.rule_id != $2
                     ORDER BY s.created_at DESC
                     LIMIT $3
-                """, list(tags), rule_id, int(remaining_limit))
+                """, list(tags), rule_id, int(remaining_limit), int(min_overlap))
                 rows += extra
             return [self._format_pattern(r) for r in rows]
         

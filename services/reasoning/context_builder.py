@@ -175,7 +175,7 @@ class ContextBuilder:
         if not entity_ids:
             return []
         
-        targets = list(set(entity_ids[:5]))
+        targets = list(dict.fromkeys(entity_ids))[:5]
         
         try:
             neo4j_client = await get_neo4j()

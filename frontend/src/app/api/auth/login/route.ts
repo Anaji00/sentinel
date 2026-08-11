@@ -4,7 +4,7 @@ import crypto from 'crypto';
 // Admin authentication secret and password hash configuration
 const SESSION_SECRET = process.env.SESSION_SECRET || 'sentinel-secure-session-secret-key-2026';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'vance@sentinel-quant.io';
-// Default password: sentinel2026! (can be overridden via env ADMIN_PASSWORD)
+
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'sentinel2026!';
 
 function signSessionToken(email: string, expiresAt: number): string {

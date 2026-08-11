@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
 from shared.utils import quant_calc
+from shared.utils.tasks import safe_create_task
 from shared.db import get_neo4j
 
 logger = logging.getLogger("agent.macro_intelligence")
@@ -232,15 +233,18 @@ class MacroIntelligenceEngine(SentinelAgent):
 
             # Publish structured AgentBulletin for Consensus Engine
             direction = "down" if "inverted" in brief.curve_state.lower() else "up"
-            asyncio.create_task(self.publish_bulletin(
-                bulletin_type="regime_change",
-                summary=f"Rates Regime: {brief.curve_state} (2Y10Y: {spread_2y10y_bps:+.1f}bps, Risk: {brief.macro_risk_level})",
-                ticker="US10Y",
-                conviction=0.85 if brief.macro_risk_level == "CRITICAL" else 0.65,
-                expected_direction=direction,
-                payload=res_payload["metrics"],
-                ttl_seconds=3600,
-            ))
+            safe_create_task(
+                self.publish_bulletin(
+                    bulletin_type="regime_change",
+                    summary=f"Rates Regime: {brief.curve_state} (2Y10Y: {spread_2y10y_bps:+.1f}bps, Risk: {brief.macro_risk_level})",
+                    ticker="US10Y",
+                    conviction=0.85 if brief.macro_risk_level == "CRITICAL" else 0.65,
+                    expected_direction=direction,
+                    payload=res_payload["metrics"],
+                    ttl_seconds=3600,
+                ),
+                name="macro-rates-bulletin"
+            )
 
             return res_payload
 

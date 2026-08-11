@@ -225,3 +225,71 @@ def test_engle_granger_cointegration_small_spread_std():
     assert not math.isclose(res["spread_std"], 0.0, abs_tol=1e-12)
 
 
+# ── 7. ADVANCED QUANT & SMA ENGINE TESTS ─────────────────────────────────────
+
+def test_black_litterman_optimization():
+    market_caps = {"AAPL": 3.0e12, "MSFT": 2.8e12, "NVDA": 2.5e12}
+    cov_matrix = [
+        [0.04, 0.02, 0.025],
+        [0.02, 0.035, 0.02],
+        [0.025, 0.02, 0.05],
+    ]
+    views_matrix = [[1.0, 0.0, -1.0]]  # AAPL outperforms NVDA
+    view_returns = [0.05]
+    view_uncertainties = [0.01]
+
+    res = quant_calc.black_litterman_optimization(
+        market_caps=market_caps,
+        cov_matrix=cov_matrix,
+        views_matrix=views_matrix,
+        view_returns=view_returns,
+        view_uncertainties=view_uncertainties,
+    )
+    assert "expected_returns" in res
+    assert "optimal_weights" in res
+    assert len(res["optimal_weights"]) == 3
+    assert sum(res["optimal_weights"].values()) > 99.0  # Sums ~ 100%
+
+
+def test_garch_volatility_cone():
+    closes = [100.0 + i * 0.5 + ((-1) ** i) * 1.2 for i in range(50)]
+    highs = [c + 1.5 for c in closes]
+    lows = [c - 1.5 for c in closes]
+
+    cone = quant_calc.garch_volatility_cone(closes, highs, lows, horizon_hours=24)
+    assert "cond_volatility_pct" in cone
+    assert cone["tp1_sigma_1_0"] > closes[-1]
+    assert cone["tp2_sigma_2_0"] > cone["tp1_sigma_1_0"]
+    assert cone["tp3_sigma_3_0"] > cone["tp2_sigma_2_0"]
+    assert cone["sl_sigma_1_5"] < closes[-1]
+
+
+def test_microstructure_stop_distance():
+    mult_normal = quant_calc.microstructure_stop_distance(atr=2.5, ofi=0.1, kyle_lambda=0.2)
+    mult_tight = quant_calc.microstructure_stop_distance(atr=2.5, ofi=-0.70, kyle_lambda=2.5)
+    assert mult_normal == 1.5
+    assert mult_tight == 0.5  # Max tightened bound
+
+
+def test_hawkes_risk_multiplier():
+    mult_low = quant_calc.hawkes_risk_multiplier(hawkes_intensity=1.2)
+    mult_high = quant_calc.hawkes_risk_multiplier(hawkes_intensity=3.5)
+    assert mult_low == 1.0
+    assert mult_high < 1.0
+
+
+def test_moving_average_distances():
+    # Construct 220 prices in a strong bullish stack (current > 20 > 50 > 200)
+    closes = [100.0 + i * 0.5 for i in range(220)]
+    res = quant_calc.moving_average_distances(closes)
+
+    assert res["sma_20"] is not None
+    assert res["sma_50"] is not None
+    assert res["sma_200"] is not None
+    assert res["dist_sma_20_pct"] > 0
+    assert res["dist_sma_50_pct"] > res["dist_sma_20_pct"]
+    assert res["dist_sma_200_pct"] > res["dist_sma_50_pct"]
+    assert res["ma_alignment"] == "BULLISH_STACK"
+
+
+

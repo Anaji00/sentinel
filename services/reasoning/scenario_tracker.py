@@ -127,7 +127,7 @@ class ScenarioTracker:
                     rows = await self._db.query("""
                         SELECT c.rule_id 
                         FROM scenarios s
-                        JOIN correlation_clusters c ON s.correlation_id = c.correlation_id
+                        JOIN correlations c ON s.correlation_id = c.correlation_id
                         WHERE s.scenario_id = $1
                     """, scenario_id)
                     

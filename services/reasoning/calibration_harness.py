@@ -39,8 +39,8 @@ class ThresholdCalibrationHarness:
 
         if not outcomes and self.db:
             try:
-                query = "SELECT scenario_id, status, confidence_overall, payload FROM scenarios WHERE status IN ('CONFIRMED', 'DENIED') ORDER BY created_at DESC LIMIT 500"
-                rows = await self.db.fetch_all(query)
+                query = "SELECT scenario_id, status, confidence_overall, payload FROM scenarios WHERE LOWER(status) IN ('confirmed', 'denied') ORDER BY created_at DESC LIMIT 500"
+                rows = await self.db.query(query)
                 for r in rows:
                     outcomes.append({
                         "scenario_id": str(r["scenario_id"]),
@@ -49,7 +49,7 @@ class ThresholdCalibrationHarness:
                         "payload": json.loads(r["payload"]) if isinstance(r.get("payload"), str) else (r.get("payload") or {}),
                     })
             except Exception as e:
-                logger.debug(f"DB calibration fetch fallback: {e}")
+                logger.warning(f"DB calibration fetch failed: {e}")
 
         return outcomes
 
@@ -88,7 +88,7 @@ class ThresholdCalibrationHarness:
 
         return precision, recall, f1
 
-    async def calibrate_optimal_thresholds() -> Dict[str, Any]:
+    async def calibrate_optimal_thresholds(self) -> Dict[str, Any]:
         """
         Grid-searches optimal thresholds and saves recommendations to Redis.
         """

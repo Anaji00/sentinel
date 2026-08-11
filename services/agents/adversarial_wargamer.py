@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("agent.adversarial_wargamer")
 
@@ -155,15 +156,18 @@ class AdversarialWargamerAgent(SentinelAgent):
                 )
 
             # Publish structured AgentBulletin for Consensus Engine & UI
-            asyncio.create_task(self.publish_bulletin(
-                bulletin_type="alert" if synthesis.cascade_failure_probability >= 70 else "thesis",
-                summary=f"Wargame Target {synthesis.predicted_next_target_entity_id}: Cascade Risk {synthesis.cascade_failure_probability}%",
-                ticker=synthesis.predicted_next_target_entity_id,
-                conviction=min(1.0, synthesis.cascade_failure_probability / 100.0),
-                expected_direction="down" if synthesis.cascade_failure_probability >= 50 else "neutral",
-                payload=output,
-                ttl_seconds=7200,
-            ))
+            safe_create_task(
+                self.publish_bulletin(
+                    bulletin_type="alert" if synthesis.cascade_failure_probability >= 70 else "thesis",
+                    summary=f"Wargame Target {synthesis.predicted_next_target_entity_id}: Cascade Risk {synthesis.cascade_failure_probability}%",
+                    ticker=synthesis.predicted_next_target_entity_id,
+                    conviction=min(1.0, synthesis.cascade_failure_probability / 100.0),
+                    expected_direction="down" if synthesis.cascade_failure_probability >= 50 else "neutral",
+                    payload=output,
+                    ttl_seconds=7200,
+                ),
+                name=f"wargamer-bulletin-{synthesis.predicted_next_target_entity_id}"
+            )
 
             return output
 

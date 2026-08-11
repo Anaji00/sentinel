@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
 from shared.utils import quant_calc
+from shared.utils.tasks import safe_create_task
 import numpy as np
 from shared.utils.equities import is_valid_primary_equity_async
 from shared.db import get_neo4j
@@ -108,7 +109,7 @@ class TradingSignal(BaseModel):
     microstructure_stop_multiplier: float = 1.5
     volatility_cone: Optional[GarchVolatilityCone] = None
     smart_money: Optional[SmartMoneyConvergence] = None
-    technical_indicators: Dict[str, float] = Field(default_factory=dict)
+    technical_indicators: Dict[str, Any] = Field(default_factory=dict)
     fib_levels: Dict[str, float] = Field(default_factory=dict)
     quantitative_rationale: str
 
@@ -121,7 +122,7 @@ class FinancialAdviceBrief(BaseModel):
 
 
 def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
-    """Helper function computing RSI, EMA, ATR, and Fib levels."""
+    """Helper function computing RSI, EMA, ATR, Fib levels, and 20d/50d/200d SMAs."""
     curr = closes[-1] if closes else 0.0
     max_h = max(highs) if highs else curr
     min_l = min(lows) if lows else curr
@@ -167,11 +168,20 @@ def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[fl
         tr_list.append(tr)
     atr = sum(tr_list[-14:]) / max(1, len(tr_list[-14:])) if tr_list else (curr * 0.02)
 
+    ma_res = quant_calc.moving_average_distances(closes)
+
     return {
         "rsi": round(rsi, 2),
         "ema_12": round(_ema(12), 4),
         "ema_26": round(_ema(26), 4),
         "atr": round(atr, 4),
+        "sma_20": ma_res.get("sma_20"),
+        "dist_sma_20_pct": ma_res.get("dist_sma_20_pct"),
+        "sma_50": ma_res.get("sma_50"),
+        "dist_sma_50_pct": ma_res.get("dist_sma_50_pct"),
+        "sma_200": ma_res.get("sma_200"),
+        "dist_sma_200_pct": ma_res.get("dist_sma_200_pct"),
+        "ma_alignment": ma_res.get("ma_alignment", "NEUTRAL"),
         "fib_levels": {k: round(v, 4) for k, v in fibs.items()},
     }
 
@@ -319,15 +329,18 @@ class QuantTradingEngine(SentinelAgent):
         await self._producer.send(Topics.INSIDER_CLUSTERS, res_payload, key=ticker)
 
         # Publish structured AgentBulletin
-        asyncio.create_task(self.publish_bulletin(
-            bulletin_type="signal",
-            summary=brief.summary,
-            ticker=ticker,
-            conviction=0.75 if c_suite else 0.55,
-            expected_direction="up" if total_net > 0 else "down",
-            payload={"net_notional": total_net, "c_suite": c_suite},
-            ttl_seconds=86400,
-        ))
+        safe_create_task(
+            self.publish_bulletin(
+                bulletin_type="signal",
+                summary=brief.summary,
+                ticker=ticker,
+                conviction=0.75 if c_suite else 0.55,
+                expected_direction="up" if total_net > 0 else "down",
+                payload={"net_notional": total_net, "c_suite": c_suite},
+                ttl_seconds=86400,
+            ),
+            name=f"insider-bulletin-{ticker}"
+        )
 
         return res_payload
 
@@ -451,15 +464,18 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 
             # Publish structured AgentBulletin
             peer_names = [p.ticker for p in discovery.peer_tickers[:4]]
-            asyncio.create_task(self.publish_bulletin(
-                bulletin_type="thesis",
-                summary=f"Quant Discovery {ticker}: {discovery.catalyst_category}. Peers: {peer_names}",
-                ticker=ticker,
-                conviction=min(1.0, anomaly_score * 0.9),
-                expected_direction="uncertain",
-                payload={"peers": peer_names, "catalyst": discovery.catalyst_category},
-                ttl_seconds=3600,
-            ))
+            safe_create_task(
+                self.publish_bulletin(
+                    bulletin_type="thesis",
+                    summary=f"Quant Discovery {ticker}: {discovery.catalyst_category}. Peers: {peer_names}",
+                    ticker=ticker,
+                    conviction=min(1.0, anomaly_score * 0.9),
+                    expected_direction="uncertain",
+                    payload={"peers": peer_names, "catalyst": discovery.catalyst_category},
+                    ttl_seconds=3600,
+                ),
+                name=f"quant-discovery-bulletin-{ticker}"
+            )
 
             return res_payload
 
@@ -510,6 +526,13 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 "ema_12": indicators["ema_12"],
                 "ema_26": indicators["ema_26"],
                 "atr": atr,
+                "sma_20": indicators.get("sma_20"),
+                "dist_sma_20_pct": indicators.get("dist_sma_20_pct"),
+                "sma_50": indicators.get("sma_50"),
+                "dist_sma_50_pct": indicators.get("dist_sma_50_pct"),
+                "sma_200": indicators.get("sma_200"),
+                "dist_sma_200_pct": indicators.get("dist_sma_200_pct"),
+                "ma_alignment": indicators.get("ma_alignment", "NEUTRAL"),
                 "ewma_volatility_annualized": ewma_vol,
                 "var_95_per_10k": var_95,
                 "cvar_95_per_10k": cvar_95,
@@ -609,24 +632,30 @@ Return raw JSON matching schema:"""
             for play in brief.highest_conviction_plays[:2]:
                 direction = "up" if play.action == "BUY" else "down" if play.action == "SELL" else "neutral"
 
-                asyncio.create_task(self.record_prediction(
-                    ticker=play.ticker,
-                    direction=direction,
-                    conviction=play.conviction_score,
-                    entry_price=play.entry_level,
-                    target_price=play.target_price,
-                    time_horizon_hours=24,
-                ))
+                safe_create_task(
+                    self.record_prediction(
+                        ticker=play.ticker,
+                        direction=direction,
+                        conviction=play.conviction_score,
+                        entry_price=play.entry_level,
+                        target_price=play.target_price,
+                        time_horizon_hours=24,
+                    ),
+                    name=f"record-prediction-{play.ticker}"
+                )
 
-                asyncio.create_task(self.publish_bulletin(
-                    bulletin_type="signal",
-                    summary=f"{play.action} {play.ticker} @ ${play.entry_level:.2f} -> ${play.target_price:.2f} (Kelly {play.kelly_allocation_pct:.1f}%)",
-                    ticker=play.ticker,
-                    conviction=play.conviction_score,
-                    expected_direction=direction,
-                    payload={"action": play.action, "entry": play.entry_level, "target": play.target_price, "var_95": var_95},
-                    ttl_seconds=3600,
-                ))
+                safe_create_task(
+                    self.publish_bulletin(
+                        bulletin_type="signal",
+                        summary=f"{play.action} {play.ticker} @ ${play.entry_level:.2f} -> ${play.target_price:.2f} (Kelly {play.kelly_allocation_pct:.1f}%)",
+                        ticker=play.ticker,
+                        conviction=play.conviction_score,
+                        expected_direction=direction,
+                        payload={"action": play.action, "entry": play.entry_level, "target": play.target_price, "var_95": var_95},
+                        ttl_seconds=3600,
+                    ),
+                    name=f"quant-advisory-bulletin-{play.ticker}"
+                )
 
             return res_payload
 

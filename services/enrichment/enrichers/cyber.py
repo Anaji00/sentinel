@@ -179,8 +179,7 @@ class CyberEnricher:
             velocity=vel,
             as_path=as_path if as_path else None,
         )
-        anomaly = bgp_result["score"]
-        if anomaly == 0.0: return None
+        anomaly = max(0.05, float(bgp_result["score"]))
 
         tags = ["bgp_anomaly", "routing"]
         if hijack:

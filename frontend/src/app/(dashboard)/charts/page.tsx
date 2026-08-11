@@ -243,24 +243,73 @@ export default function ChartsPage() {
   const expandedPriceChange = expandedLatest && expandedFirst ? expandedLatest.price - expandedFirst.price : 0;
   const expandedPctChange = expandedFirst && expandedFirst.price > 0 ? (expandedPriceChange / expandedFirst.price) * 100 : 0;
 
-  // Max/Min prices for expanded chart
-  const { maxPrice, minPrice, expandedSvgPath, volumeBars } = useMemo(() => {
+  // Max/Min prices & SMA overlays for expanded chart
+  const { maxPrice, minPrice, expandedSvgPath, volumeBars, sma20Path, sma50Path, sma200Path, smaMetrics } = useMemo(() => {
     if (!hasExpandedData) {
-      return { maxPrice: 0, minPrice: 0, expandedSvgPath: '', volumeBars: [] };
+      return {
+        maxPrice: 0, minPrice: 0, expandedSvgPath: '', volumeBars: [],
+        sma20Path: '', sma50Path: '', sma200Path: '',
+        smaMetrics: { sma20: 0, sma50: 0, sma200: 0, dist20: 0, dist50: 0, dist200: 0, alignment: 'NEUTRAL' }
+      };
     }
     const prices = expandedSeries.map((s) => s.price);
+    const n = prices.length;
     const maxP = Math.max(...prices) * 1.005;
     const minP = Math.min(...prices) * 0.995;
     const height = 300;
     const width = 1000;
 
     const pts = expandedSeries.map((d, i) => {
-      const x = (i / Math.max(1, expandedSeries.length - 1)) * width;
+      const x = (i / Math.max(1, n - 1)) * width;
       const y = height - ((d.price - minP) / (maxP - minP || 1)) * height;
-      return { x, y, vol: d.volume };
+      return { x, y, vol: d.volume, price: d.price };
     });
 
     const path = pts.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`, '');
+
+    // Compute rolling SMAs (using period 20, 50, 200 or proportionally scaled for shorter series)
+    const p20 = Math.max(3, Math.min(20, Math.floor(n * 0.2)));
+    const p50 = Math.max(5, Math.min(50, Math.floor(n * 0.4)));
+    const p200 = Math.max(10, Math.min(200, Math.floor(n * 0.8)));
+
+    const getSmaPts = (period: number) => {
+      const smaPts: { x: number; y: number; val: number }[] = [];
+      for (let i = 0; i < n; i++) {
+        if (i < period - 1) continue;
+        const windowSlice = prices.slice(i - period + 1, i + 1);
+        const avg = windowSlice.reduce((a, b) => a + b, 0) / period;
+        const x = (i / Math.max(1, n - 1)) * width;
+        const y = height - ((avg - minP) / (maxP - minP || 1)) * height;
+        smaPts.push({ x, y, val: avg });
+      }
+      return smaPts;
+    };
+
+    const sma20Pts = getSmaPts(p20);
+    const sma50Pts = getSmaPts(p50);
+    const sma200Pts = getSmaPts(p200);
+
+    const buildPath = (ptsArr: { x: number; y: number }[]) =>
+      ptsArr.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`, '');
+
+    const sma20PathStr = buildPath(sma20Pts);
+    const sma50PathStr = buildPath(sma50Pts);
+    const sma200PathStr = buildPath(sma200Pts);
+
+    const latestPrice = prices[n - 1] || 1;
+    const latest20 = sma20Pts.length > 0 ? sma20Pts[sma20Pts.length - 1].val : latestPrice;
+    const latest50 = sma50Pts.length > 0 ? sma50Pts[sma50Pts.length - 1].val : latestPrice;
+    const latest200 = sma200Pts.length > 0 ? sma200Pts[sma200Pts.length - 1].val : latestPrice;
+
+    const dist20 = Number((((latestPrice - latest20) / latest20) * 100).toFixed(2));
+    const dist50 = Number((((latestPrice - latest50) / latest50) * 100).toFixed(2));
+    const dist200 = Number((((latestPrice - latest200) / latest200) * 100).toFixed(2));
+
+    let alignment = 'NEUTRAL';
+    if (latestPrice > latest20 && latest20 > latest50 && latest50 > latest200) alignment = 'BULLISH_STACK';
+    else if (latestPrice < latest20 && latest20 < latest50 && latest50 < latest200) alignment = 'BEARISH_STACK';
+    else if (latestPrice > latest20 && latestPrice > latest50) alignment = 'BULLISH_CROSS';
+    else if (latestPrice < latest20 && latestPrice < latest50) alignment = 'BEARISH_CROSS';
 
     const maxVol = Math.max(...expandedSeries.map((s) => s.volume)) || 1;
     const bars = pts.map((pt) => ({
@@ -268,7 +317,24 @@ export default function ChartsPage() {
       h: (pt.vol / maxVol) * 60,
     }));
 
-    return { maxPrice: maxP, minPrice: minP, expandedSvgPath: path, volumeBars: bars };
+    return {
+      maxPrice: maxP,
+      minPrice: minP,
+      expandedSvgPath: path,
+      volumeBars: bars,
+      sma20Path: sma20PathStr,
+      sma50Path: sma50PathStr,
+      sma200Path: sma200PathStr,
+      smaMetrics: {
+        sma20: Number(latest20.toFixed(2)),
+        sma50: Number(latest50.toFixed(2)),
+        sma200: Number(latest200.toFixed(2)),
+        dist20,
+        dist50,
+        dist200,
+        alignment,
+      },
+    };
   }, [expandedSeries, hasExpandedData]);
 
   return (
@@ -397,11 +463,47 @@ export default function ChartsPage() {
                     </div>
                   </div>
 
+                  {/* Moving Average Telemetry HUD */}
+                  <div className="p-3 bg-[#0b0f1d] border border-cyan-500/30 rounded-2xl flex items-center justify-between text-[11px]">
+                    <div className="flex items-center gap-2">
+                      <span className="font-extrabold text-white uppercase text-[10px]">MA ALIGNMENT:</span>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
+                        {smaMetrics.alignment}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 text-[10px]">
+                      <div className="flex items-center gap-1.5">
+                        <span className="h-2 w-2 rounded-full bg-[#00f2fe]" />
+                        <span className="text-slate-400">SMA 20:</span>
+                        <span className="text-white font-bold">${smaMetrics.sma20}</span>
+                        <span className={`font-bold ${smaMetrics.dist20 >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          ({smaMetrics.dist20 >= 0 ? '+' : ''}{smaMetrics.dist20}%)
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="h-2 w-2 rounded-full bg-[#a855f7]" />
+                        <span className="text-slate-400">SMA 50:</span>
+                        <span className="text-white font-bold">${smaMetrics.sma50}</span>
+                        <span className={`font-bold ${smaMetrics.dist50 >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          ({smaMetrics.dist50 >= 0 ? '+' : ''}{smaMetrics.dist50}%)
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="h-2 w-2 rounded-full bg-[#10b981]" />
+                        <span className="text-slate-400">SMA 200:</span>
+                        <span className="text-white font-bold">${smaMetrics.sma200}</span>
+                        <span className={`font-bold ${smaMetrics.dist200 >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          ({smaMetrics.dist200 >= 0 ? '+' : ''}{smaMetrics.dist200}%)
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Large Interactive SVG Chart */}
                   <div className="bg-[#05070d] border border-slate-800 rounded-2xl p-4 relative h-[360px] flex flex-col justify-between overflow-hidden">
                     <div className="flex justify-between items-center text-[10px] text-slate-500 mb-2">
                       <span>MAX: ${maxPrice.toFixed(2)}</span>
-                      <span>TIME HORIZON: REAL-TIME {timeframe} INTRADAY</span>
+                      <span>TIME HORIZON: REAL-TIME {timeframe} INTRADAY WITH SMA 20/50/200 OVERLAYS</span>
                       <span>MIN: ${minPrice.toFixed(2)}</span>
                     </div>
 
@@ -412,7 +514,41 @@ export default function ChartsPage() {
                         <line x1="0" y1="150" x2="1000" y2="150" stroke="#1e293b" strokeDasharray="4 4" strokeWidth="0.5" />
                         <line x1="0" y1="225" x2="1000" y2="225" stroke="#1e293b" strokeDasharray="4 4" strokeWidth="0.5" />
 
-                        {/* Price Curve */}
+                        {/* SMA 200 Overlay (Emerald) */}
+                        {sma200Path && (
+                          <path
+                            d={sma200Path}
+                            fill="none"
+                            stroke="#10b981"
+                            strokeWidth="1.5"
+                            strokeDasharray="4 2"
+                            opacity="0.8"
+                          />
+                        )}
+
+                        {/* SMA 50 Overlay (Purple) */}
+                        {sma50Path && (
+                          <path
+                            d={sma50Path}
+                            fill="none"
+                            stroke="#a855f7"
+                            strokeWidth="2.0"
+                            opacity="0.85"
+                          />
+                        )}
+
+                        {/* SMA 20 Overlay (Cyan) */}
+                        {sma20Path && (
+                          <path
+                            d={sma20Path}
+                            fill="none"
+                            stroke="#00f2fe"
+                            strokeWidth="2.0"
+                            opacity="0.9"
+                          />
+                        )}
+
+                        {/* Main Price Curve */}
                         {expandedSvgPath && (
                           <path
                             d={expandedSvgPath}

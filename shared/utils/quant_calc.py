@@ -1101,3 +1101,72 @@ def hawkes_risk_multiplier(
     decay_factor = 1.0 / (1.0 + excess_shock)
     return round(max(0.20, min(1.0, base_multiplier * decay_factor)), 2)
 
+
+def moving_average_distances(closes: List[float]) -> Dict[str, Any]:
+    """
+    Calculates 20-period, 50-period, and 200-period Simple Moving Averages (SMAs)
+    and percentage distance of the latest price from each average.
+    Also determines MA alignment regime ('BULLISH_STACK', 'BEARISH_STACK', 'BULLISH_CROSS', 'BEARISH_CROSS', 'NEUTRAL').
+    """
+    if not closes or len(closes) < 2:
+        return {
+            "sma_20": None, "dist_sma_20_pct": None,
+            "sma_50": None, "dist_sma_50_pct": None,
+            "sma_200": None, "dist_sma_200_pct": None,
+            "ma_alignment": "NEUTRAL"
+        }
+
+    curr_price = float(closes[-1])
+    n = len(closes)
+
+    def _sma(period: int) -> Optional[float]:
+        if n < period:
+            return None
+        return float(np.mean(closes[-period:]))
+
+    sma20 = _sma(20)
+    sma50 = _sma(50)
+    sma200 = _sma(200)
+
+    def _dist(sma_val: Optional[float]) -> Optional[float]:
+        if sma_val is None or sma_val <= 0:
+            return None
+        return round(((curr_price - sma_val) / sma_val) * 100.0, 2)
+
+    dist20 = _dist(sma20)
+    dist50 = _dist(sma50)
+    dist200 = _dist(sma200)
+
+    if sma20 and sma50 and sma200:
+        if curr_price > sma20 > sma50 > sma200:
+            alignment = "BULLISH_STACK"
+        elif curr_price < sma20 < sma50 < sma200:
+            alignment = "BEARISH_STACK"
+        elif curr_price > sma20 and curr_price > sma50:
+            alignment = "BULLISH_CROSS"
+        elif curr_price < sma20 and curr_price < sma50:
+            alignment = "BEARISH_CROSS"
+        else:
+            alignment = "NEUTRAL"
+    elif sma20 and sma50:
+        if curr_price > sma20 > sma50:
+            alignment = "BULLISH_STACK"
+        elif curr_price < sma20 < sma50:
+            alignment = "BEARISH_STACK"
+        else:
+            alignment = "NEUTRAL"
+    else:
+        alignment = "NEUTRAL"
+
+    return {
+        "current_price": round(curr_price, 2),
+        "sma_20": round(sma20, 2) if sma20 else None,
+        "dist_sma_20_pct": dist20,
+        "sma_50": round(sma50, 2) if sma50 else None,
+        "dist_sma_50_pct": dist50,
+        "sma_200": round(sma200, 2) if sma200 else None,
+        "dist_sma_200_pct": dist200,
+        "ma_alignment": alignment,
+    }
+
+

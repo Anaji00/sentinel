@@ -35,7 +35,7 @@ from shared.db import get_redis, get_timescale
 from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
 from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
-from shared.utils.streaming_detectors import FirstStoryDetector
+from shared.utils.tasks import safe_create_task
 
 _dynamic_rules_cache = {}
 
@@ -246,7 +246,7 @@ async def main():
     redis_client = await get_redis()
     db_client = await get_timescale()
     
-    asyncio.create_task(_listen_for_rule_updates(redis_client))
+    rule_listener_task = safe_create_task(_listen_for_rule_updates(redis_client), name="correlation-rule-listener")
     
     store    = EventStore(redis_client, db_client)
     producer = SentinelProducer()
