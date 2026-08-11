@@ -652,24 +652,35 @@ class ConsensusEngine(SentinelAgent):
                     except (ValueError, TypeError):
                         pass
 
-            # Cross-check: detect context drift by comparing event ID overlap
+            # Cross-check: detect context drift by comparing entity and event ID overlap for agents sharing topics
             all_event_sets = {}
             for agent_name, digest in digests.items():
+                entities = set(digest.get("recent_entities", []))
                 event_ids = set(digest.get("recent_event_ids", []))
-                if event_ids:
-                    all_event_sets[agent_name] = event_ids
+                topics = set(digest.get("input_topics", []))
+                overlap_set = entities if entities else event_ids
+                if overlap_set:
+                    all_event_sets[agent_name] = (overlap_set, topics)
 
             if len(all_event_sets) >= 2:
                 agents = list(all_event_sets.keys())
                 for i in range(len(agents)):
                     for j in range(i + 1, len(agents)):
-                        overlap = all_event_sets[agents[i]] & all_event_sets[agents[j]]
-                        union = all_event_sets[agents[i]] | all_event_sets[agents[j]]
+                        set_i, topics_i = all_event_sets[agents[i]]
+                        set_j, topics_j = all_event_sets[agents[j]]
+
+                        # Only compare drift if agents share input topics or share entity focus space
+                        shared_topics = topics_i & topics_j if (topics_i and topics_j) else True
+                        if not shared_topics:
+                            continue
+
+                        overlap = set_i & set_j
+                        union = set_i | set_j
                         jaccard = len(overlap) / max(1, len(union))
                         if jaccard < 0.1 and agents[i] not in stale and agents[j] not in stale:
-                            # Very low overlap: these agents have divergent world views
-                            logger.warning(
-                                f"⚠️ Context drift detected: {agents[i]} ↔ {agents[j]} "
+                            # Low overlap on shared topic stream: these agents have divergent focus
+                            logger.info(
+                                f"ℹ️ Context drift check: {agents[i]} ↔ {agents[j]} "
                                 f"(Jaccard overlap: {jaccard:.2f})"
                             )
 

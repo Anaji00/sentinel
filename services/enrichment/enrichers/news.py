@@ -288,23 +288,26 @@ class NewsEnricher:
         unique_entities = list(dict.fromkeys(named_entities))
         tags.extend(unique_entities)
             
-        # ── Anomaly Scoring: First Story Detection (TDT novelty) as primary signal ──
-        # Replaces the old sentiment × reliability formula.
-        # "Is this a new story?" is what an intelligence analyst actually wants,
-        # not "how extreme is the sentiment?"
+        # ── Anomaly Scoring: First Story Detection (TDT novelty) + Dynamic Multi-Signal Context ──
         anomaly, semantic_tags = await self.scorer.score_news(
             unique_entities, sentiment, reliability,
             headline=title, summary=summary,
         )
 
+        # Hawkes cross-domain intensity excitation boost
+        if hasattr(self.scorer, "get_hawkes_intensity"):
+            hawkes_ratio = self.scorer.get_hawkes_intensity("news")
+            if hawkes_ratio and hawkes_ratio > 1.2:
+                hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
+                anomaly = min(1.0, anomaly + hawkes_boost)
+
         if ofac_hits:
-            anomaly = min(1.0, anomaly + 0.40)
+            anomaly = min(1.0, max(0.85, anomaly + 0.40))
 
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
         if is_threat:
             anomaly = min(1.0, max(0.80, anomaly + 0.35))
-        else:
-            anomaly = min(1.0, anomaly + 0.25)
+
         anomaly = round(anomaly, 3)
 
         # Record in Hawkes tracker for cross-domain excitation
@@ -316,7 +319,11 @@ class NewsEnricher:
         if anomaly < 0.35:
             return None
         
-        logger.info(f"Enriched News | Anomaly: {anomaly} | Sentiment: {sentiment} | {title[:60]}...")
+        logger.info(
+            f"📰 ENRICHED NEWS | Anomaly: {anomaly:.3f} | Sentiment: {sentiment:.2f} | "
+            f"Reliability: {reliability:.2f} | Threat: {is_threat} | OFAC: {bool(ofac_hits)} | "
+            f"{title[:65]}..."
+        )
 
         if anomaly >=0.5 and self.graph:
             topic_str = "High_Impact_News"

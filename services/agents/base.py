@@ -121,11 +121,12 @@ class SentinelAgent(ABC):
         self._dispatch_semaphore = asyncio.Semaphore(int(os.getenv("AGENT_CONCURRENCY", "5")))
 
         # Cross-agent state synchronization (§3.3):
-        # Track recently processed event IDs for context drift detection.
+        # Track recently processed event IDs and entities for context drift detection.
         # ConsensusEngine reads these digests to detect when agents have
         # divergent world-states before fusing their bulletins.
         from collections import deque
         self._recent_event_ids: deque = deque(maxlen=20)
+        self._recent_entities: deque = deque(maxlen=20)
         self._current_regime: Optional[str] = None  # Set by subclass if applicable
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -244,10 +245,17 @@ class SentinelAgent(ABC):
                         self.logger.debug(f"Agent live feed pub bypass: {pub_err}")
                 self._processed += 1
 
-                # Track event ID for cross-agent state synchronization (§3.3)
+                # Track event ID & entity for cross-agent state synchronization (§3.3)
                 event_id = raw.get("event_id") or raw.get("agent_run_id")
                 if event_id:
                     self._recent_event_ids.append(str(event_id))
+
+                ent = raw.get("primary_entity_id") or raw.get("ticker") or raw.get("asset") or raw.get("primary_entity")
+                if ent:
+                    if isinstance(ent, dict):
+                        ent = ent.get("id") or ent.get("name")
+                    if ent:
+                        self._recent_entities.append(str(ent))
 
                 elapsed = time.monotonic() - t0
                 if elapsed > 10:
@@ -299,6 +307,8 @@ class SentinelAgent(ABC):
                     "agent_name": self.name,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "recent_event_ids": list(self._recent_event_ids),
+                    "recent_entities": list(self._recent_entities),
+                    "input_topics": self.input_topics,
                     "processed_count": self._processed,
                     "current_regime": self._current_regime,
                     "model": self.model,

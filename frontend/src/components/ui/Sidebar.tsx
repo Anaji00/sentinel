@@ -6,16 +6,22 @@ import { usePathname } from 'next/navigation';
 import { 
   LayoutDashboard, 
   ShieldAlert, 
+  ShieldCheck,
   Globe2, 
   TrendingUp, 
+  Layers,
   Bitcoin, 
   Map,
-  LineChart
+  LineChart,
+  Bot
 } from 'lucide-react';
 
 const NAV_ITEMS = [
   { href: '/', label: 'Command Center', icon: LayoutDashboard },
   { href: '/intelligence', label: 'Intelligence Feed', icon: ShieldAlert },
+  { href: '/osint', label: 'OSINT Threat Matrix', icon: ShieldCheck },
+  { href: '/flow', label: 'Dark Pool & Sweeps', icon: Layers },
+  { href: '/agents', label: 'Agent Swarm HUD', icon: Bot },
   { href: '/macro', label: 'Macro Matrix', icon: Globe2 },
   { href: '/options', label: 'Options Flow', icon: TrendingUp },
   { href: '/crypto', label: 'Crypto Analytics', icon: Bitcoin },

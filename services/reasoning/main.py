@@ -117,6 +117,8 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
             logger.debug(f"Scenario live feed pub bypass: {pub_err}")
             
         await apply_autonomous_feedback(scenario, redis_client)
+        return scenario
+    return None
 
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""

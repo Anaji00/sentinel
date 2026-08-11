@@ -124,7 +124,9 @@ class CryptoEnricher:
             if anomaly >= 0.5:
                 self.scorer.record_hawkes_event("crypto")
             
-            logger.info(f"🧠 ML INFERENCE | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
+            from shared.utils.candles import get_domain_tag
+            domain_tag = get_domain_tag("crypto", asset)
+            logger.info(f"🧠 ML INFERENCE [{domain_tag}] | {asset} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
             if anomaly < 0.6: continue
             
             tags = ["crypto", "spot_trade", asset.lower(), side.lower()]

@@ -171,24 +171,44 @@ class KnowledgeGraphEngine(SentinelAgent):
         return Topics.INTEL_BRIEFS
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        source = message.get("source", "")
-        event_type = message.get("type", "")
-        raw = message.get("raw_payload", message)
+        source = str(message.get("source", ""))
+        event_type = str(message.get("type", ""))
+        raw = message.get("raw_payload") if isinstance(message.get("raw_payload"), dict) else message
 
         # ── 1. UNKNOWN ENTITY CLASSIFICATION REQUEST HANDLER ──────────────────
-        if "unknown_entities" in source or event_type == "CLASSIFY_ENTITY":
-            entity_name = message.get("entity_name") or raw.get("entity_name")
-            if entity_name:
-                return await self._classify_and_merge_entity(entity_name, message)
-            return None
+        if "unknown_entities" in source or event_type in ("CLASSIFY_ENTITY", "ONTOLOGY_PROPOSAL"):
+            entity_name = (
+                message.get("entity_name")
+                or raw.get("entity_name")
+                or message.get("entity_id")
+                or raw.get("entity_id")
+                or message.get("primary_entity_id")
+            )
+            if entity_name and not (message.get("headline") or raw.get("headline") or raw.get("title")):
+                return await self._classify_and_merge_entity(str(entity_name), message)
 
         # ── 2. NEWS INTEL & GRAPH TRIPLE EXTRACTION HANDLER ───────────────────
-        headline = message.get("headline") or raw.get("headline") or raw.get("title")
+        headline = (
+            message.get("headline")
+            or raw.get("headline")
+            or raw.get("title")
+            or message.get("summary")
+            or raw.get("summary")
+            or message.get("description")
+            or raw.get("description")
+            or message.get("hypothesis")
+            or raw.get("hypothesis")
+        )
         if not headline:
-            return None
+            ent = message.get("primary_entity") or message.get("ticker") or message.get("entity_id") or raw.get("entity_id")
+            if ent:
+                headline = f"Intelligence update for entity {ent}"
+            else:
+                return None
 
-        anomaly_score = float(message.get("anomaly_score", 0.35))
-        if anomaly_score < 0.35:
+        raw_anomaly = message.get("anomaly_score") if message.get("anomaly_score") is not None else raw.get("anomaly_score")
+        anomaly_score = float(raw_anomaly) if raw_anomaly is not None else 0.50
+        if anomaly_score < 0.20:
             return None
 
         dedup_key = f"news_intel:{hash(headline)}:{int(time.time() // 3600)}"
@@ -196,7 +216,7 @@ class KnowledgeGraphEngine(SentinelAgent):
             return None
         await self.mark_processed(dedup_key, window_seconds=3600)
 
-        logger.info(f"📰 Processing News Intel & Graph Triples | Headline: '{headline[:60]}...'")
+        logger.info(f"🌐 KNOWLEDGE GRAPH | Processing Graph Triples & Intel | Headline: '{headline[:60]}...'")
 
         global_context, cross_context = await asyncio.gather(
             self.fetch_global_context(),

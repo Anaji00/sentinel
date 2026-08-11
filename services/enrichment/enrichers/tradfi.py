@@ -149,10 +149,24 @@ class TradFiEnricher:
             if anomaly >= 0.5:
                 self.scorer.record_hawkes_event("tradfi")
                 
+            # Trigger multi-timeframe structural candle evaluation & logging for watched equities
+            if is_watched and price > 0:
+                try:
+                    from shared.utils.candles import evaluate_multi_timeframe
+                    ts = raw.occurred_at or datetime.now(timezone.utc)
+                    await evaluate_multi_timeframe(
+                        self.redis_client, self.scorer, domain="tradfi", asset=ticker,
+                        ts=ts, open_p=price, high_p=price, low_p=price, close_p=price, volume=volume
+                    )
+                except Exception as candle_err:
+                    logger.debug(f"Candle evaluation warning for {ticker}: {candle_err}")
+
             if price > 0:
                 set_pipe.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
                 
-            logger.info(f"🧠 ML INFERENCE | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
+            from shared.utils.candles import get_domain_tag
+            domain_tag = get_domain_tag("tradfi", ticker)
+            logger.info(f"🧠 ML INFERENCE [{domain_tag}] | {ticker} | Score: {anomaly:.3f} | Size: ${notional/1e6:.2f}M")
             
             tags = ["tradfi", "equity_block", ticker.lower()]
             
@@ -368,10 +382,10 @@ class TradFiEnricher:
         if not ticker: return None
 
         open_p = float(p.get("open", 0))
+        high_p = float(p.get("high", 0))
+        low_p = float(p.get("low", 0))
         close_p = float(p.get("close", 0))
         volume = float(p.get("volume", 0))
-        low_p = float(p.get("low", 0))
-        high_p = float(p.get("high", 0))
         
         # Cache the absolute latest price so the Cointegration Engine can reference it
         if close_p > 0:
@@ -383,6 +397,10 @@ class TradFiEnricher:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
         if open_p == 0 or close_p == 0:
+            return []
+
+        is_watched = await self.scorer.check_watchlist(ticker, "equities")
+        if not is_watched:
             return []
             
         from shared.utils.candles import evaluate_multi_timeframe

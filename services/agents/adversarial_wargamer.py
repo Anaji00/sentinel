@@ -53,10 +53,41 @@ class AdversarialWargamerAgent(SentinelAgent):
         return Topics.AGENTS_PREDICTIONS
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        entity_ids = message.get("entity_ids", [])
-        description = message.get("description", "Generic threat cluster.")
+        # Robust multi-key entity extraction across CorrelationCluster, Scenario, IntelBrief, and trade events
+        raw_eids = message.get("entity_ids") or []
+        if isinstance(raw_eids, str):
+            raw_eids = [raw_eids]
+        
+        extracted = set(raw_eids)
+        for key in ("primary_entity_id", "primary_entity", "target_entity_id", "ticker", "asset", "entity_id"):
+            val = message.get(key)
+            if val:
+                if isinstance(val, dict):
+                    if val.get("id"): extracted.add(str(val["id"]))
+                    elif val.get("name"): extracted.add(str(val["name"]))
+                elif isinstance(val, str):
+                    extracted.add(val)
+
+        for name in message.get("entity_names") or []:
+            if name: extracted.add(str(name))
+
+        entity_ids = [e for e in extracted if e]
+
+        description = (
+            message.get("description")
+            or message.get("headline")
+            or message.get("summary")
+            or message.get("hypothesis")
+            or "Generic threat cluster."
+        )
+
         if not entity_ids:
-            return None
+            if description and description != "Generic threat cluster.":
+                entity_ids = ["GLOBAL_SYS"]
+            else:
+                return None
+
+        self.logger.info(f"⚔️ WARGAME SIMULATION | Targets: {entity_ids} | Description: {description[:70]}...")
 
         # 1. Fetch Neo4j Subgraph Context
         subgraph = await self._fetch_subgraph_context(entity_ids)
@@ -72,18 +103,15 @@ class AdversarialWargamerAgent(SentinelAgent):
             "Asymmetric_Defender": "You are an advanced intelligence defense grid. Propose hardening & remediation counter-measures."
         }
 
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tasks = [
-                    tg.create_task(self._execute_persona_turn(name, prompt, description, subgraph, cross_block))
-                    for name, prompt in personas.items()
-                ]
-            moves = [t.result() for t in tasks if t.result() is not None]
-        except Exception as e:
-            self.logger.error(f"Persona simulation task group failed: {e}")
-            moves = []
+        tasks = [
+            self._execute_persona_turn(name, prompt, description, subgraph, cross_block)
+            for name, prompt in personas.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        moves = [r for r in results if isinstance(r, SimulationMove)]
 
         if not moves:
+            self.logger.warning(f"⚔️ WARGAME SKIPPED | All persona turns returned empty for {entity_ids}")
             return None
 
         # 4. Game-Theoretic Arbitration & Synthesis
@@ -109,6 +137,12 @@ class AdversarialWargamerAgent(SentinelAgent):
             output["agent"] = self.name
             output["agent_run_id"] = f"wargame_{int(datetime.now(timezone.utc).timestamp())}"
             output["source_correlation_id"] = message.get("correlation_id", "unknown")
+
+            self.logger.info(
+                f"⚔️ WARGAME COMPLETED | Target: {synthesis.predicted_next_target_entity_id} | "
+                f"Cascade Risk: {synthesis.cascade_failure_probability}% | "
+                f"Vuln: {synthesis.primary_vulnerability_isolated[:60]}"
+            )
 
             # Record prediction on agent scorecard
             if synthesis.predicted_next_target_entity_id and synthesis.predicted_next_target_entity_id != "NONE":

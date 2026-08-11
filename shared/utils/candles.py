@@ -8,6 +8,27 @@ logger = logging.getLogger(__name__)
 
 TIMEFRAMES_MINUTES = [1, 5, 15, 30, 60, 240]
 
+def get_domain_tag(domain: str, asset: str) -> str:
+    """
+    Dynamically determines the domain classification tag for structured logging & telemetry.
+    Returns: 'CRYPTO', 'MACRO', or 'EQUITY'.
+    """
+    domain_clean = str(domain or "").lower().strip()
+    asset_upper = str(asset or "").upper().strip()
+
+    if domain_clean == "crypto" or asset_upper.endswith(("USDT", "BUSD", "USDC", "-USD", "/USD")):
+        return "CRYPTO"
+    elif (
+        domain_clean == "macro"
+        or asset_upper.endswith("=F")
+        or asset_upper.startswith("^")
+        or asset_upper in {"CL", "NG", "BZ", "GC", "SI", "HG", "TNX", "DXY", "VIX", "^VIX"}
+    ):
+        return "MACRO"
+    elif domain_clean in ("tradfi", "equity", "equities", "stocks"):
+        return "EQUITY"
+    return domain_clean.upper() if domain_clean else "UNKNOWN"
+
 async def evaluate_multi_timeframe(
     redis_client,
     scorer,
@@ -150,8 +171,18 @@ async def evaluate_multi_timeframe(
         # Sanitize ML inference score against NaN
         if anomaly is None or math.isnan(anomaly) or math.isinf(anomaly):
             anomaly = 0.0
+
+        # Apply watchlist boost (+0.15) for watched equities
+        if hasattr(scorer, "check_watchlist"):
+            try:
+                is_watched = await scorer.check_watchlist(asset, "equities")
+                if is_watched:
+                    anomaly = min(1.0, anomaly + 0.15)
+            except Exception:
+                pass
             
-        logger.info(f"🧠 ML INFERENCE | {asset} {tf}-min Structural Candle | Score: {anomaly:.3f} | Change: {price_change_pct*100:.2f}% | Vol: ${notional_volume/1e6:.2f}M | RSI: {rsi_normalized*100:.1f} | Div: {ema_divergence*100:.2f}%")
+        domain_tag = get_domain_tag(domain, asset)
+        logger.info(f"🧠 ML INFERENCE [{domain_tag}] | {asset} {tf}-min Structural Candle | Score: {anomaly:.3f} | Change: {price_change_pct*100:.2f}% | Vol: ${notional_volume/1e6:.2f}M | RSI: {rsi_normalized*100:.1f} | Div: {ema_divergence*100:.2f}%")
         
         if anomaly >= 0.6:
             anomalous_frames.append((tf, block, features, anomaly))
