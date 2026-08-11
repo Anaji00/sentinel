@@ -18,11 +18,12 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     // Determine WebSocket URL dynamically based on current window location
     const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     let baseHost = typeof window !== 'undefined' ? `${window.location.hostname}:8000` : 'localhost:8000';
-    if (process.env.NEXT_PUBLIC_API_URL) {
+    if (process.env.NEXT_PUBLIC_WS_URL) {
+      baseHost = process.env.NEXT_PUBLIC_WS_URL.replace(/^wss?:\/\//, '').replace(/\/+$/, '');
+    } else if (process.env.NEXT_PUBLIC_API_URL) {
       baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '').replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
     }
-    const apiKey = process.env.NEXT_PUBLIC_API_KEY || 'sentinel-dev-key-2026';
-    const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed${apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : ''}`;
+    const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed`;
 
     let isMounted = true;
     let reconnectTimer: NodeJS.Timeout | null = null;

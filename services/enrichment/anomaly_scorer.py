@@ -774,6 +774,7 @@ class DynamicAnomalyScorer:
         features: list,
         volume_raw: float = 0.0,
         volatility_raw: float = 0.0,
+        hawkes_ratio: float = 0.0,
     ) -> dict:
         """
         Composite anomaly scoring with dimensional breakdown.
@@ -824,7 +825,7 @@ class DynamicAnomalyScorer:
             "temporal_score": round(temporal_score, 4),
             "volume_z_score": round(volume_z, 4),
             "volatility_z_score": round(volatility_z, 4),
-            "cross_domain_correlation_score": 0.0,
+            "cross_domain_correlation_score": round(hawkes_ratio, 4),
             "ewma_volatility": round(ewma_vol, 6),
             "is_significant": is_significant,
             "domain": domain,

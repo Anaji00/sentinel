@@ -216,11 +216,27 @@ class CryptoEnricher:
                 return None
 
             ofi = quant_calc.order_flow_imbalance(buy_vol, sell_vol)
-            k_lambda = quant_calc.kyle_lambda(prices, volumes) if len(prices) >= 5 else 0.0
+
+            # Kyle's λ: ΔP vs signed volume (guarded by n≥10 price changes)
+            price_changes = [prices[i] - prices[i + 1] for i in range(len(prices) - 1)]
+            # Build signed volumes from buffer side info
+            signed_volumes_computed = []
+            for i in range(len(prices) - 1):
+                try:
+                    t = json.loads(raw_buffer[i])
+                    s = t.get("s", "").upper()
+                    sv = volumes[i] if s == "BUY" else (-volumes[i] if s == "SELL" else 0.0)
+                    signed_volumes_computed.append(sv)
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    signed_volumes_computed.append(0.0)
+
+            k_lambda = quant_calc.kyle_lambda(price_changes, signed_volumes_computed) if len(price_changes) >= 10 else 0.0
+            returns = [abs(prices[i] / prices[i + 1] - 1) for i in range(len(prices) - 1)]
+            valid_notionals = notionals[:-1]
             ami = quant_calc.amihud_illiquidity(
-                [abs(prices[j] / prices[j - 1] - 1) for j in range(1, len(prices))],
-                notionals[1:]
-            ) if len(prices) >= 5 and all(n > 0 for n in notionals[1:]) else 0.0
+                returns,
+                valid_notionals
+            ) if len(prices) >= 5 and all(n > 0 for n in valid_notionals) else 0.0
             v = quant_calc.vwap(prices, volumes) if volumes else price
 
             return MarketMicrostructure(

@@ -468,9 +468,25 @@ class MacroIntelligenceEngine(SentinelAgent):
             GROUP BY type
         """
         try:
-            sector_data = await self.db.query(query)
+            event_type_metrics = await self.db.query(query)
         except Exception:
-            sector_data = []
+            event_type_metrics = []
+
+        # Real sector-level metrics (populated once Phase 2 ref data is live)
+        sector_query = """
+            SELECT financial_data->>'sector' as sector, COUNT(*) as volume, 
+                   AVG(anomaly_score) as avg_anomaly
+            FROM events 
+            WHERE occurred_at > NOW() - INTERVAL '24 hours'
+              AND financial_data->>'sector' IS NOT NULL
+              AND financial_data->>'sector' != ''
+            GROUP BY financial_data->>'sector'
+            ORDER BY avg_anomaly DESC
+        """
+        try:
+            sector_metrics = await self.db.query(sector_query)
+        except Exception:
+            sector_metrics = []
 
         global_context, agent_memories = await asyncio.gather(
             self.fetch_global_context(),
@@ -479,7 +495,8 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         user_prompt = f"""=== SYSTEMIC MACRO INTELLIGENCE REVIEW ===
 Ontology Co-occurrences: {cooccurrence}
-Sector Metrics: {json.dumps(sector_data, separators=(',', ':'), default=str)}
+Event Type Distribution Metrics: {json.dumps(event_type_metrics, separators=(',', ':'), default=str)}
+Sector Risk Metrics: {json.dumps(sector_metrics, separators=(',', ':'), default=str)}
 Global Macro Context: {global_context}
 {agent_memories}
 

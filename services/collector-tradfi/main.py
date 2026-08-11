@@ -87,7 +87,8 @@ class OHLCVAggregator:
         if ticker not in self.buffer:
             # First trade of the minute sets the Open, High, Low, and Close
             self.buffer[ticker] = {
-                "O": price, "H": price, "L": price, "C": price, "V": volume
+                "O": price, "H": price, "L": price, "C": price, "V": volume,
+                "pv_sum": price * volume,
             }
         else:
             d = self.buffer[ticker]
@@ -95,6 +96,7 @@ class OHLCVAggregator:
             d["L"] = min(d["L"], price)
             d["C"] = price
             d["V"] = d["V"] + volume
+            d["pv_sum"] = d["pv_sum"] + price * volume
     async def flush(self):
         now = datetime.now(timezone.utc)
         count = 0
@@ -102,7 +104,7 @@ class OHLCVAggregator:
         async with self.redis_client.raw.pipeline() as pipe:
             for ticker, data in self.buffer.items():
                 if data["V"] > 0:
-                    vwap = round(data["C"] * data["V"] / data["V"], 4) if data["V"] > 0 else data["C"]
+                    vwap = round(data["pv_sum"] / data["V"], 4) if data["V"] > 0 else data["C"]
                     vwap_dev = round((data["C"] - vwap) / vwap, 6) if vwap > 0 else 0.0
                     candle = {
                         "ticker": ticker,
@@ -114,7 +116,7 @@ class OHLCVAggregator:
                         "volume": data["V"],
                         "vwap": vwap,
                         "vwap_deviation": vwap_dev,
-                        "notional_usd": data["C"] * data["V"]
+                        "notional_usd": round(data["pv_sum"], 2)
                     }
                     event = RawEvent(
                         source="finnhub_equities",

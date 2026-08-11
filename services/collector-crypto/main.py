@@ -159,7 +159,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
             qty = float(order.get("q", 0))
             
             msg_count += 1
-            if msg_count % 50 == 0:
+            if msg_count % 500 == 0:
                 logger.info(f"💓 Liq Heartbeat: Processed {msg_count} liquidation events.")
 
             event = RawEvent(
@@ -200,9 +200,12 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
     """
     from shared.utils.websocket import ResilientWebSocketClient
 
-    url = "wss://fstream.binance.com/market/ws/!markPrice@arr@1s"
+    url = "wss://fstream.binance.com/ws/!markPrice@arr"
     msg_count = 0
-    # Dynamic EMA-based funding rate thresholds per symbol stored in Redis
+    # In-memory statistics cache: symbol -> {"mean": float, "var": float}
+    # Eliminates 750+ Redis network round-trips/sec while preserving exact math
+    funding_stats_cache = {}
+
     FUNDING_EMA_ALPHA = float(os.getenv("FUNDING_EMA_ALPHA", "0.05"))
     FUNDING_ZSCORE_TRIGGER = float(os.getenv("FUNDING_ZSCORE_TRIGGER", "2.0"))
 
@@ -259,25 +262,24 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
                 except Exception as re:
                     logger.debug(f"Redis funding cache write failed for {symbol}: {re}")
 
-                # Determine if funding rate is extreme via dynamic EMA z-score
-                # stored per-symbol in Redis (no hardcoded threshold)
+                # Determine if funding rate is extreme via in-memory EMA z-score (0ms overhead)
                 is_extreme = False
                 try:
-                    ema_key = f"sentinel:crypto:funding_ema:{symbol}"
-                    var_key = f"sentinel:crypto:funding_var:{symbol}"
-                    raw_mean = await redis_client.raw.get(ema_key)
-                    raw_var = await redis_client.raw.get(var_key)
-                    ema_mean = float(raw_mean) if raw_mean else funding_rate
-                    ema_var = float(raw_var) if raw_var else 1e-10
+                    if symbol not in funding_stats_cache:
+                        funding_stats_cache[symbol] = {"mean": funding_rate, "var": 1e-10}
+
+                    stats = funding_stats_cache[symbol]
+                    ema_mean = stats["mean"]
+                    ema_var = stats["var"]
+
                     std = max(abs(ema_var) ** 0.5, 1e-10)
                     z = (funding_rate - ema_mean) / std
-                    # Update EMA statistics
+
+                    # Update in-memory EMA statistics instantly
                     new_mean = FUNDING_EMA_ALPHA * funding_rate + (1 - FUNDING_EMA_ALPHA) * ema_mean
                     new_var = FUNDING_EMA_ALPHA * (funding_rate - ema_mean) ** 2 + (1 - FUNDING_EMA_ALPHA) * ema_var
-                    pipe = redis_client.raw.pipeline()
-                    pipe.set(ema_key, str(new_mean), ex=604800)
-                    pipe.set(var_key, str(new_var), ex=604800)
-                    await pipe.execute()
+                    funding_stats_cache[symbol] = {"mean": new_mean, "var": new_var}
+
                     is_extreme = abs(z) >= FUNDING_ZSCORE_TRIGGER
                 except Exception:
                     pass

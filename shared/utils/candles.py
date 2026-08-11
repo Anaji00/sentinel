@@ -47,8 +47,21 @@ async def evaluate_multi_timeframe(
                 block["count"] += 1
             else:
                 # Bucket changed! Fully close the old one.
-                await redis_client.raw.lpush(history_key, block["close"])
-                await redis_client.raw.ltrim(history_key, 0, 14)
+                bar_close = block["close"]
+                bar_volume = block["volume"]
+                bar_notional = bar_close * bar_volume
+
+                history_vol_key = f"{domain}:history{tf}m:{asset}:volumes"
+                history_not_key = f"{domain}:history{tf}m:{asset}:notionals"
+
+                pipe = redis_client.raw.pipeline()
+                pipe.lpush(history_key, bar_close)
+                pipe.ltrim(history_key, 0, 14)
+                pipe.lpush(history_vol_key, bar_volume)
+                pipe.ltrim(history_vol_key, 0, 14)
+                pipe.lpush(history_not_key, bar_notional)
+                pipe.ltrim(history_not_key, 0, 14)
+                await pipe.execute()
                 
                 # Also store complete OHLCV bar object in sentinel:candles:{tf}m:{asset}
                 candles_tf_key = f"sentinel:candles:{tf}m:{asset}"

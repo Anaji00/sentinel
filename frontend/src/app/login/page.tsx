@@ -2,22 +2,45 @@
 
 import React, { useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 
 export default function LoginPage() {
+  const router = useRouter();
   const [authMode, setAuthMode] = useState<'credentials' | 'apikey'>('credentials');
   const [email, setEmail] = useState('vance@sentinel-quant.io');
-  const [password, setPassword] = useState('••••••••••••••••');
-  const [apiKey, setApiKey] = useState('sentinel-dev-key-2026');
+  const [password, setPassword] = useState('');
+  const [apiKey, setApiKey] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
-    setTimeout(() => {
+    setErrorMsg(null);
+
+    try {
+      const payload = authMode === 'credentials' ? { email, password } : { apiKey };
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setIsSuccess(true);
+        setTimeout(() => {
+          router.push('/');
+        }, 500);
+      } else {
+        setErrorMsg(data.error || 'Authentication failed. Please check credentials.');
+      }
+    } catch (err: any) {
+      setErrorMsg('Connection error during authentication.');
+    } finally {
       setIsLoading(false);
-      setIsSuccess(true);
-    }, 1000);
+    }
   };
 
   return (
@@ -110,6 +133,12 @@ export default function LoginPage() {
                 required
               />
               <p className="text-[10px] text-slate-500 mt-1">Validates X-API-KEY header across REST & WebSocket subscriptions.</p>
+            </div>
+          )}
+
+          {errorMsg && (
+            <div className="p-3 rounded-xl bg-red-950/80 border border-red-500/40 text-red-300 text-[11px] font-semibold">
+              ⚠️ {errorMsg}
             </div>
           )}
 

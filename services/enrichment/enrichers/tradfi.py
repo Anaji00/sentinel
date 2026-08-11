@@ -5,7 +5,7 @@ from typing import Optional
 from shared.kafka import Topics
 from shared.models import (
     NormalizedEvent, EventType, Entity, EntityType, FinancialData,
-    AnomalyBreakdown, MarketMicrostructure
+    AnomalyBreakdown, MarketMicrostructure, ScoreAdjustment
 )
 from shared.utils import quant_calc
 import re 
@@ -127,7 +127,15 @@ class TradFiEnricher:
             anomaly = scores[i]
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
+            base_score = anomaly
             anomaly = min(1.0, anomaly + w_boost + f_boost)
+
+            # Score adjustment provenance
+            adjustments = []
+            if w_boost > 0:
+                adjustments.append(ScoreAdjustment(reason="watchlist_boost", delta=w_boost))
+            if f_boost > 0:
+                adjustments.append(ScoreAdjustment(reason="frequency_boost", delta=f_boost))
             
             # Hawkes cross-domain excitation: crypto/prediction market events boost tradfi intensity
             hawkes_ratio = self.scorer.get_hawkes_intensity("tradfi")
@@ -135,6 +143,7 @@ class TradFiEnricher:
                 # Cross-domain excitation is active — boost anomaly proportionally
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
                 anomaly = min(1.0, anomaly + hawkes_boost)
+                adjustments.append(ScoreAdjustment(reason="hawkes_cross_domain", delta=hawkes_boost))
             
             # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
             if anomaly >= 0.5:
@@ -161,12 +170,14 @@ class TradFiEnricher:
             voi = buy_vol - sell_vol
 
             if volume > 0 and abs(voi) / volume >= 0.60:
+                pre_voi = anomaly
                 if voi > 0:
                     tags.append("institutional_accumulation")
                     anomaly = min(1.0, anomaly * 1.15)
                 else:
                     tags.append("institutional_distribution")
                     anomaly = min(1.0, anomaly * 1.15)
+                adjustments.append(ScoreAdjustment(reason="institutional_flow_x1.15", delta=round(anomaly - pre_voi, 6)))
                     
             conditions = str(p.get("conditions", "")).lower()
             is_dark_pool = "out of sequence" in conditions or "average price" in conditions
@@ -179,34 +190,44 @@ class TradFiEnricher:
                 tags.append("aggressor_sell")
                 if not is_dark_pool:
                     tags.append("lit_aggressor_sell")
+                    pre_lit = anomaly
                     anomaly = min(1.0, anomaly * 1.2)
+                    adjustments.append(ScoreAdjustment(reason="lit_aggressor_sell_x1.2", delta=round(anomaly - pre_lit, 6)))
                 if notional > 5_000_000:
                     tags.append("institutional_distribution")
+                    pre_dist = anomaly
                     anomaly = min(1.0, anomaly * 1.3)
+                    adjustments.append(ScoreAdjustment(reason="large_distribution_x1.3", delta=round(anomaly - pre_dist, 6)))
                     direction_str = "🔴 INSTITUTIONAL DUMP"
             elif aggressor_side == "BUY":
                 tags.append("aggressor_buy")
                 if notional > 5_000_000:
                     tags.append("institutional_accumulation")
+                    pre_acc = anomaly
                     anomaly = min(1.0, anomaly * 1.1)
+                    adjustments.append(ScoreAdjustment(reason="accumulation_sweep_x1.1", delta=round(anomaly - pre_acc, 6)))
                     direction_str = "🟢 ACCUMULATION SWEEP"
 
             if anomaly < 0.35:  # Sensitive floor for correlation store ingest
                 continue
                 
-            results.append(self._finalize_equity_trade(raw, p, ticker, price, volume, notional, tags, direction_str, anomaly))
+            results.append(self._finalize_equity_trade(raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio, adjustments))
             
         await set_pipe.execute()
         
         final_events = await asyncio.gather(*results) if results else []
         return [e for e in final_events if e]
 
-    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly):
+    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None):
+        if score_adjustments is None:
+            score_adjustments = []
         try:
             baseline = await self.redis_client.raw.get(f"baseline:volume:{ticker}")
             if baseline and float(baseline) > 0 and volume > float(baseline) * 20:
                 tags.append("volume_capitulation")
+                pre_cap = anomaly
                 anomaly = min(1.0, anomaly * 1.4)
+                score_adjustments.append(ScoreAdjustment(reason="volume_capitulation_x1.4", delta=round(anomaly - pre_cap, 6)))
         except Exception as e:
             logger.debug(f"Baseline fetch failed: {e}")
 
@@ -219,19 +240,88 @@ class TradFiEnricher:
             "data": {"label": "Company", "primary_domain": "financial", "confidence": anomaly}
         }, key=ticker)
 
+        # Attach reference data (sector, industry, exchange) from daily cache
+        ref_data = None
+        try:
+            from services.enrichment.ref_data import get_reference_data
+            ref_data = await get_reference_data(self.redis_client, ticker)
+            if ref_data:
+                sector = ref_data.get("sector", "")
+                if sector:
+                    # Emit deterministic SECTOR_PEER edge
+                    await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                        "entity_id": ticker,
+                        "action": "MERGE_SECTOR_EDGE",
+                        "data": {"sector": sector, "edge_type": "SECTOR_PEER"}
+                    }, key=ticker)
+                # Emit INDEX_CO_MEMBER edges for each index this ticker belongs to
+                for idx in ref_data.get("index_membership", []):
+                    await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                        "entity_id": ticker,
+                        "action": "MERGE_INDEX_EDGE",
+                        "data": {"index": idx, "edge_type": "INDEX_CO_MEMBER"}
+                    }, key=ticker)
+        except Exception as e:
+            logger.debug(f"Ref data lookup failed for {ticker}: {e}")
+
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
-        # Microstructure calculations
+        # Microstructure calculations — rolling trade buffer (mirrors crypto.py pattern)
         aggressor_side = p.get("aggressor_side", p.get("side", "UNKNOWN")).upper()
         buy_vol = volume if aggressor_side == "BUY" else 0.0
         sell_vol = volume if aggressor_side == "SELL" else 0.0
         ofi = quant_calc.order_flow_imbalance(buy_vol, sell_vol)
-        ami = quant_calc.amihud_illiquidity([price / 100.0], [notional]) if notional > 0 else 0.0
-        k_lambda = quant_calc.kyle_lambda([price], [volume]) if volume > 0 else 0.0
+
+        # Maintain a 30-trade rolling buffer in Redis for windowed microstructure
+        import json
+        micro_key = f"sentinel:microstructure:tradfi:{ticker}"
+        k_lambda = 0.0
+        ami = 0.0
+        v_wap = price  # fallback
+
+        try:
+            signed_vol = volume if aggressor_side == "BUY" else (-volume if aggressor_side == "SELL" else 0.0)
+            trade_record = json.dumps({
+                "p": price, "v": volume, "sv": signed_vol, "n": notional,
+            })
+            pipe = self.redis_client.raw.pipeline()
+            pipe.lpush(micro_key, trade_record)
+            pipe.ltrim(micro_key, 0, 29)
+            pipe.expire(micro_key, 3600)
+            await pipe.execute()
+
+            raw_buffer = await self.redis_client.raw.lrange(micro_key, 0, 29)
+            if raw_buffer and len(raw_buffer) >= 5:
+                prices_buf, volumes_buf, signed_vols_buf, notionals_buf = [], [], [], []
+                for entry in raw_buffer:
+                    try:
+                        t = json.loads(entry)
+                        prices_buf.append(float(t["p"]))
+                        volumes_buf.append(float(t["v"]))
+                        signed_vols_buf.append(float(t["sv"]))
+                        notionals_buf.append(float(t["n"]))
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        continue
+
+                if len(prices_buf) >= 5:
+                    # Kyle's λ: ΔP vs signed volume (guarded by n≥10 inside kyle_lambda)
+                    price_changes = [prices_buf[i] - prices_buf[i + 1] for i in range(len(prices_buf) - 1)]
+                    signed_flows = signed_vols_buf[:-1]  # align with price_changes
+                    k_lambda = quant_calc.kyle_lambda(price_changes, signed_flows)
+
+                    # Amihud: proper period returns |r_t| = |p_t/p_{t-1} - 1|
+                    if len(prices_buf) >= 2 and all(p_val > 0 for p_val in prices_buf):
+                        returns = [abs(prices_buf[i] / prices_buf[i + 1] - 1) for i in range(len(prices_buf) - 1)]
+                        ami = quant_calc.amihud_illiquidity(returns, notionals_buf[:-1])
+
+                    # Multi-trade VWAP
+                    v_wap = quant_calc.vwap(prices_buf, volumes_buf)
+        except Exception as e:
+            logger.debug(f"Microstructure buffer computation failed for {ticker}: {e}")
 
         micro = MarketMicrostructure(
             order_flow_imbalance=ofi,
-            vwap=quant_calc.vwap([price], [volume]) if volume > 0 else price,
+            vwap=v_wap,
             kyle_lambda=k_lambda,
             amihud_illiquidity=ami,
         )
@@ -239,6 +329,7 @@ class TradFiEnricher:
         breakdown = AnomalyBreakdown(
             composite_score=anomaly,
             volume_z_score=round(anomaly * 2.0, 2),
+            cross_domain_correlation_score=round(hawkes_ratio, 4),
             domain="tradfi",
             is_significant=anomaly >= 0.65,
         )
@@ -256,13 +347,19 @@ class TradFiEnricher:
                 premium_usd=notional,
                 underlying_price=price,
                 volume=volume,
-                volume_oi_ratio=p.get("vol_oi_ratio")
+                volume_oi_ratio=p.get("vol_oi_ratio"),
+                sector=ref_data.get("sector") if ref_data else None,
+                industry=ref_data.get("industry") if ref_data else None,
+                exchange=ref_data.get("exchange") if ref_data else None,
+                market_cap_tier=ref_data.get("market_cap_tier") if ref_data else None,
+                index_membership=ref_data.get("index_membership", []) if ref_data else [],
             ),
             headline=f"🐋 {direction_str} | {ticker} ${notional/1e6:.2f}M | Anomaly: {anomaly:.2f}",
             tags=tags,
             anomaly_score=anomaly,
             anomaly_breakdown=breakdown,
             market_microstructure=micro,
+            score_adjustments=score_adjustments,
         )
 
     async def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
@@ -303,11 +400,25 @@ class TradFiEnricher:
             volatility_pct = features[1]
             notional = features[2]
             
+            # Score adjustment provenance
+            bar_adjustments = []
+
             # Watchlist & Frequency boost
             is_watched = await self.scorer.check_watchlist(ticker, "equities")
             w_boost = 0.15 if is_watched else 0.0
             f_boost = await self.scorer.track_frequency(ticker, f"tradfi_candle_{tf}m")
             anomaly = min(1.0, anomaly + w_boost + f_boost)
+            if w_boost > 0:
+                bar_adjustments.append(ScoreAdjustment(reason="watchlist_boost", delta=w_boost))
+            if f_boost > 0:
+                bar_adjustments.append(ScoreAdjustment(reason="frequency_boost", delta=f_boost))
+
+            # Hawkes cross-domain excitation
+            bar_hawkes_ratio = self.scorer.get_hawkes_intensity("tradfi")
+            if bar_hawkes_ratio > 1.5:
+                hawkes_boost = min(0.15, (bar_hawkes_ratio - 1.0) * 0.05)
+                anomaly = min(1.0, anomaly + hawkes_boost)
+                bar_adjustments.append(ScoreAdjustment(reason="hawkes_cross_domain", delta=hawkes_boost))
             
             tags = ["tradfi", "market_structure", f"volatile_{tf}m_candle", ticker.lower()]
             await self._sync_geo_watchlist(ticker, tags)
@@ -326,16 +437,62 @@ class TradFiEnricher:
             # Compute Parkinson volatility for the bar
             parkinson = quant_calc.parkinson_volatility([block["high"]], [block["low"]])
 
+            # Multi-bar microstructure from 15-bar rolling history
+            history_vol_key = f"tradfi:history{tf}m:{ticker}:volumes"
+            history_not_key = f"tradfi:history{tf}m:{ticker}:notionals"
+            history_cls_key = f"tradfi:history{tf}m:{ticker}:closes"
+
+            bar_k_lambda = 0.0
+            bar_ami = 0.0
+            bar_vwap = block["close"]  # fallback
+
+            try:
+                cls_bytes, vol_bytes, not_bytes = await asyncio.gather(
+                    self.redis_client.raw.lrange(history_cls_key, 0, 14),
+                    self.redis_client.raw.lrange(history_vol_key, 0, 14),
+                    self.redis_client.raw.lrange(history_not_key, 0, 14),
+                )
+                hist_closes = [float(c) for c in reversed(cls_bytes)] if cls_bytes else []
+                hist_volumes = [float(v) for v in reversed(vol_bytes)] if vol_bytes else []
+                hist_notionals = [float(n) for n in reversed(not_bytes)] if not_bytes else []
+
+                # Append current bar
+                hist_closes.append(block["close"])
+                hist_volumes.append(block["volume"])
+                hist_notionals.append(block["close"] * block["volume"])
+
+                if len(hist_closes) >= 2:
+                    # Kyle's λ: ΔP vs signed volumes (guarded by n≥10 inside kyle_lambda)
+                    price_changes = [hist_closes[i] - hist_closes[i - 1] for i in range(1, len(hist_closes))]
+                    hist_signed_vols = [hist_volumes[i] if hist_closes[i] >= hist_closes[i - 1] else -hist_volumes[i] for i in range(1, len(hist_closes))]
+                    bar_k_lambda = quant_calc.kyle_lambda(price_changes, hist_signed_vols)
+
+                    # Amihud: proper period returns |r_t| = |(close_t - close_{t-1}) / close_{t-1}|
+                    if all(c > 0 for c in hist_closes):
+                        returns = [abs((hist_closes[i] - hist_closes[i - 1]) / hist_closes[i - 1]) for i in range(1, len(hist_closes))]
+                        valid_notionals = hist_notionals[1:]
+                        if valid_notionals and all(n > 0 for n in valid_notionals):
+                            bar_ami = quant_calc.amihud_illiquidity(returns, valid_notionals)
+
+                # Multi-bar VWAP
+                if hist_volumes and sum(hist_volumes) > 0:
+                    bar_vwap = quant_calc.vwap(hist_closes, hist_volumes)
+            except Exception as e:
+                logger.debug(f"Multi-bar microstructure failed for {ticker} {tf}m: {e}")
+
             micro = MarketMicrostructure(
                 parkinson_volatility=parkinson,
-                vwap=block["close"],
+                vwap=bar_vwap,
                 twap=(block["high"] + block["low"] + block["close"]) / 3.0,
                 realized_volatility=volatility_pct,
+                kyle_lambda=bar_k_lambda,
+                amihud_illiquidity=bar_ami,
             )
 
             breakdown = AnomalyBreakdown(
                 composite_score=anomaly,
                 volatility_z_score=round(volatility_pct * 10.0, 2),
+                cross_domain_correlation_score=round(bar_hawkes_ratio, 4),
                 domain="tradfi",
                 is_significant=anomaly >= 0.65,
             )
@@ -363,6 +520,7 @@ class TradFiEnricher:
                 anomaly_score=anomaly,
                 anomaly_breakdown=breakdown,
                 market_microstructure=micro,
+                score_adjustments=bar_adjustments,
             ))
             
         return events

@@ -79,6 +79,17 @@ export interface FinancialData {
     eps_surprise_pct?: number;
     revenue_estimate?: number;
     revenue_actual?: number;
+    // Reference data fields
+    sector?: string;
+    industry?: string;
+    index_membership?: string[];
+    market_cap_tier?: string;
+    exchange?: string;
+}
+
+export interface ScoreAdjustment {
+    reason: string;
+    delta: number;
 }
 
 export interface CryptoData {
@@ -184,6 +195,7 @@ export interface NormalizedEvent {
     security_data?: SecurityData;
     prediction_market_data?: PredictionMarketData;
     market_microstructure?: MarketMicrostructure;
+    score_adjustments?: ScoreAdjustment[];
     domain_data?: Record<string, any>;
     raw_payload?: Record<string, any>;
 }

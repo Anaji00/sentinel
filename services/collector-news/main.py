@@ -267,7 +267,7 @@ async def poll_feed(
             new_count += 1
 
     except asyncio.TimeoutError:
-        logger.warning(f"{feed_name}: Request timed out")
+        logger.debug(f"{feed_name}: Request timed out")
     except Exception as e:
         # Broad Exception Catch:
         # In a long-running collector loop, we never want one malformed feed to crash

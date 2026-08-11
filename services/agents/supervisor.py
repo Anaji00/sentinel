@@ -64,53 +64,71 @@ class GraphSupervisor(SentinelAgent):
     async def execute_batch_proposals(self, proposals: List[dict]):
         """
         Executes Cypher UNWIND $batch AS row queries to commit graph updates in high-throughput ACID batches.
+        Acquires Redis locks for involved entities to prevent race conditions.
         """
         if not proposals:
             return
 
-        nodes_by_label: Dict[str, List[dict]] = {}
-        links_by_relation: Dict[tuple, List[dict]] = {}
-
+        # Extract entity IDs for batch locking
+        entity_ids = set()
         for p in proposals:
-            action = p.get("action")
-            entity_id = p.get("entity_id")
-            data = p.get("data", {})
-            if not entity_id or not action:
-                continue
+            eid = p.get("entity_id")
+            if eid:
+                entity_ids.add(eid)
+            tid = p.get("data", {}).get("target_id")
+            if tid:
+                entity_ids.add(tid)
 
-            if action == "MERGE_ONTOLOGY_NODE":
-                label = data.get("label", "UnknownEntity")
-                if not re.match(r"^[A-Za-z0-9]+$", label):
-                    label = "UnknownEntity"
-                if label not in nodes_by_label:
-                    nodes_by_label[label] = []
-                nodes_by_label[label].append({
-                    "name": entity_id,
-                    "domain": data.get("primary_domain"),
-                    "concepts": data.get("macro_concepts"),
-                    "sanctions": data.get("sanctions_risk"),
-                    "confidence": data.get("confidence")
-                })
-            elif action == "LINK_ENTITY":
-                relation = data.get("relation_type", "RELATED_TO").upper()
-                if relation in ALLOWED_RELATIONS:
-                    source_label = data.get("source_label", "Entity")
-                    target_label = data.get("target_label", "Entity")
-                    # Sanitize labels to prevent Cypher injection via f-string interpolation
-                    if not re.match(r"^[A-Za-z0-9]+$", source_label):
-                        source_label = "Entity"
-                    if not re.match(r"^[A-Za-z0-9]+$", target_label):
-                        target_label = "Entity"
-                    rel_key = (source_label, relation, target_label)
-                    if rel_key not in links_by_relation:
-                        links_by_relation[rel_key] = []
-                    links_by_relation[rel_key].append({
-                        "id": entity_id,
-                        "target_id": data.get("target_id"),
-                        "weight": data.get("weight", 1.0)
-                    })
+        acquired_locks = []
+        for eid in entity_ids:
+            if await self.acquire_lock(eid):
+                acquired_locks.append(eid)
+            else:
+                logger.warning(f"Lock timeout for entity {eid} in batch proposal. Continuing with remaining locks.")
 
         try:
+            nodes_by_label: Dict[str, List[dict]] = {}
+            links_by_relation: Dict[tuple, List[dict]] = {}
+
+            for p in proposals:
+                action = p.get("action")
+                entity_id = p.get("entity_id")
+                data = p.get("data", {})
+                if not entity_id or not action:
+                    continue
+
+                if action == "MERGE_ONTOLOGY_NODE":
+                    label = data.get("label", "UnknownEntity")
+                    if not re.match(r"^[A-Za-z0-9]+$", label):
+                        label = "UnknownEntity"
+                    if label not in nodes_by_label:
+                        nodes_by_label[label] = []
+                    nodes_by_label[label].append({
+                        "name": entity_id,
+                        "domain": data.get("primary_domain"),
+                        "concepts": data.get("macro_concepts"),
+                        "sanctions": data.get("sanctions_risk"),
+                        "confidence": data.get("confidence")
+                    })
+                elif action == "LINK_ENTITY":
+                    relation = data.get("relation_type", "RELATED_TO").upper()
+                    if relation in ALLOWED_RELATIONS:
+                        source_label = data.get("source_label", "Entity")
+                        target_label = data.get("target_label", "Entity")
+                        # Sanitize labels to prevent Cypher injection via f-string interpolation
+                        if not re.match(r"^[A-Za-z0-9]+$", source_label):
+                            source_label = "Entity"
+                        if not re.match(r"^[A-Za-z0-9]+$", target_label):
+                            target_label = "Entity"
+                        rel_key = (source_label, relation, target_label)
+                        if rel_key not in links_by_relation:
+                            links_by_relation[rel_key] = []
+                        links_by_relation[rel_key].append({
+                            "id": entity_id,
+                            "target_id": data.get("target_id"),
+                            "weight": data.get("weight", 1.0)
+                        })
+
             for label, batch in nodes_by_label.items():
                 cypher = f"""
                 UNWIND $batch AS row
@@ -137,6 +155,10 @@ class GraphSupervisor(SentinelAgent):
 
         except Exception as e:
             logger.error(f"UNWIND batch commit failed: {e}")
+            raise
+        finally:
+            for eid in acquired_locks:
+                await self.release_lock(eid)
 
     async def execute_proposal(self, payload: dict):
         """Maps trusted JSON structs to Cypher queries.
@@ -225,6 +247,7 @@ class GraphSupervisor(SentinelAgent):
 
         except Exception as e:
             logger.error(f"Neo4j commit failed for {entity_id}: {e}")
+            raise
         finally:
             await self.release_lock(entity_id)
 

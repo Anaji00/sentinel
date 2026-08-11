@@ -505,8 +505,8 @@ class CrossDomainHawkesCorrelator:
         total = sum(len(v) for v in streams.values())
         if total < self.MIN_EVENTS_FOR_FIT and self._db:
             try:
-                rows = await self._db.fetch("""
-                    SELECT event_type, occurred_at
+                rows = await self._db.query("""
+                    SELECT type AS event_type, occurred_at
                     FROM events
                     WHERE occurred_at > NOW() - INTERVAL '%s hours'
                     ORDER BY occurred_at ASC
@@ -514,10 +514,16 @@ class CrossDomainHawkesCorrelator:
 
                 streams = {d: [] for d in SENTINEL_DOMAINS}
                 for row in rows:
-                    domain = str(row["event_type"]).split("_")[0]
+                    domain = str(row.get("event_type", "")).split("_")[0]
                     if domain in streams:
-                        ts = row["occurred_at"]
-                        if hasattr(ts, "timestamp"):
+                        ts = row.get("occurred_at")
+                        if isinstance(ts, str):
+                            try:
+                                ts_dt = datetime.fromisoformat(ts)
+                                streams[domain].append(ts_dt.timestamp())
+                            except Exception:
+                                pass
+                        elif hasattr(ts, "timestamp"):
                             streams[domain].append(ts.timestamp())
             except Exception as db_err:
                 logger.error(f"TimescaleDB event history load failed: {db_err}")

@@ -145,8 +145,22 @@ class SoftCorrelator:
         self._enabled = False  # Set to True when ready to activate
         self._llm = ollama_client
         self._embed_semaphore = asyncio.Semaphore(5)  # Limit concurrent embeddings to avoid overload
-        self._load_lock = asyncio.Lock()  # Ensure only one load happens if multiple events come in at startup
+        self._retry_task = None
+        self._load_lock = asyncio.Lock()
         self._similarity_calibrator = ConformalSimilarityCalibrator()
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def get_status(self) -> Dict:
+        return {
+            "enabled": self._enabled,
+            "model_loaded": self._model is not None,
+            "client_connected": self._client is not None,
+            "calibrator": self._similarity_calibrator.get_status(),
+        }
+
     async def _load(self):
         """Lazy-load heavy dependencies. Called on first use."""
         if self._enabled: return
@@ -157,16 +171,15 @@ class SoftCorrelator:
                 from qdrant_client import AsyncQdrantClient
                 from qdrant_client.http import models
                 loop = asyncio.get_running_loop()
-                self._model = await loop.run_in_executor(
+                if not self._model:
+                    self._model = await loop.run_in_executor(
                         None, 
                         lambda: sentence_transformers.SentenceTransformer("all-mpnet-base-v2")
                     )
-                
-                logger.info("SentenceTransformer model loaded")
+                    logger.info("SentenceTransformer model loaded")
+
                 qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
-                # Connect to the local Qdrant instance on its default port.
                 self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
-                # Mark the correlator as fully active and ready to process events.
                 for collection in ["sentinel_events", "sentinel_concepts"]:
                     exists = await self._client.collection_exists(collection)
                     if not exists:
@@ -183,8 +196,24 @@ class SoftCorrelator:
                 self._enabled = True
                 logger.info(f"Async Qdrant client connected to {qdrant_host} and SoftCorrelator enabled.")
             except Exception as e:
-                # Catch any other errors (like Qdrant being unreachable) so the main app doesn't crash.
-                logger.warning(f"Qdrant unreachable (Phase 2 feature): {e}. Soft correlation disabled.")
+                logger.warning(f"Qdrant connection failed: {e}. Scheduling background retry loop.")
+                if self._retry_task is None or self._retry_task.done():
+                    self._retry_task = asyncio.create_task(self._connect_retry_loop())
+
+    async def _connect_retry_loop(self):
+        """Background retry loop to connect to Qdrant if initial load fails."""
+        backoff = 5
+        while not self._enabled:
+            await asyncio.sleep(backoff)
+            logger.info(f"Retrying Qdrant connection (backoff={backoff}s)...")
+            try:
+                await self._load()
+                if self._enabled:
+                    logger.info("Qdrant connection established via background retry loop!")
+                    break
+            except Exception as e:
+                logger.debug(f"Retry connect failed: {e}")
+            backoff = min(backoff * 2, 60)
         
     async def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
         """Convert event to embedding vector for similarity search."""

@@ -7,14 +7,18 @@
 
 import axios from "axios";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || 'sentinel-dev-key-2026';
+const getBaseUrl = () => {
+  if (typeof window !== 'undefined') {
+    return '/api/proxy/api/v1';
+  }
+  return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+};
 
 export const apiClient = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: getBaseUrl(),
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json',
-    'X-API-KEY': API_KEY,
   },
 });
 

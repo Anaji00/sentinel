@@ -12,11 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgeos-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-base.txt .
-RUN pip install --prefix=/install --no-cache-dir -r requirements-base.txt
-
-COPY requirements-ml.txt .
-RUN pip install --prefix=/install --no-cache-dir -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+COPY requirements-base.txt requirements-ml.txt ./
+RUN pip install --prefix=/install --no-cache-dir -r requirements-base.txt -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 RUN pip install --prefix=/install --no-cache-dir https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz
 
 # Stage 2: Final runtime stage

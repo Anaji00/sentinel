@@ -102,16 +102,11 @@ PRIMARY_EQUITY_EXCEPTIONS: Set[str] = {
 }
 
 
-def fast_classify_equity(ticker: str) -> Dict[str, Any]:
+def fast_classify_equity(ticker: str, cached_asset_type: Optional[str] = None) -> Dict[str, Any]:
     """
-    Sub-millisecond lightweight classifier evaluating asset classification:
-    Returns dict:
-      {
-        "ticker": "IONZ",
-        "is_primary_equity": False,
-        "asset_class": "LEVERAGED_INVERSE_ETF",
-        "reason": "Single-stock leveraged ETF pattern (ION + Z)"
-      }
+    Sub-millisecond lightweight classifier evaluating asset classification.
+    Checks cached_asset_type (from Redis daily refdata) first, falling back to
+    regex and blocklist heuristics.
     """
     if not ticker or not isinstance(ticker, str):
         return {
@@ -122,6 +117,23 @@ def fast_classify_equity(ticker: str) -> Dict[str, Any]:
         }
 
     sym = ticker.strip().upper()
+
+    if cached_asset_type:
+        cat_str = str(cached_asset_type).strip().upper()
+        if cat_str in ("ETP", "ETF"):
+            return {
+                "ticker": sym,
+                "is_primary_equity": False,
+                "asset_class": "LEVERAGED_INVERSE_ETF",
+                "reason": f"Redis cached asset type: {cached_asset_type}"
+            }
+        elif cat_str in ("COMMON STOCK", "ADR"):
+            return {
+                "ticker": sym,
+                "is_primary_equity": True,
+                "asset_class": "PRIMARY_COMMON_EQUITY",
+                "reason": f"Redis cached asset type: {cached_asset_type}"
+            }
 
     if sym in ALLOWED_CRYPTO_TOKENS:
         return {
@@ -215,14 +227,30 @@ def is_valid_primary_equity(ticker: str) -> bool:
 async def is_valid_primary_equity_async(ticker: str, redis_client=None) -> bool:
     """
     Async validation against structural filters AND Redis dynamic US equities universe set.
-    Filters out non-existent/hallucinated tickers (e.g. CPCG).
+    Uses cache-first Finnhub asset type classification when available, falling back to
+    regex/blocklist heuristics for cache misses.
     """
-    if not is_valid_primary_equity(ticker):
-        return False
-
     sym = ticker.strip().upper()
     if sym in ALLOWED_CRYPTO_TOKENS or sym in PRIMARY_EQUITY_EXCEPTIONS:
         return True
+
+    # Cache-first: check Finnhub-sourced asset type from daily ref data refresh
+    if redis_client and hasattr(redis_client, "raw"):
+        try:
+            cached_type = await redis_client.raw.get(f"sentinel:asset_type:{sym}")
+            if cached_type:
+                asset_type = cached_type.decode("utf-8") if isinstance(cached_type, bytes) else str(cached_type)
+                # Finnhub types: "Common Stock", "ETP", "ADR", "ETF", etc.
+                if asset_type in ("ETP", "ETF"):
+                    return False
+                if asset_type == "Common Stock":
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: regex + blocklist classification
+    if not is_valid_primary_equity(ticker):
+        return False
 
     if redis_client and hasattr(redis_client, "raw"):
         try:

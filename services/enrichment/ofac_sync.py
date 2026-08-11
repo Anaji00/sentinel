@@ -42,7 +42,7 @@ async def fetch_ofac_keywords():
                 for row in reader:
                     if len(row) > 1 and row[1]:
                         # Basic cleanup
-                        name = row[1].strip().lower()
+                        name = row[1].strip(' "\'').lower()
                         # Avoid single character garbage
                         if len(name) > 3:
                             keywords.add(name)
@@ -57,7 +57,7 @@ async def fetch_ofac_keywords():
                 reader = csv.reader(StringIO(text))
                 for row in reader:
                     if len(row) > 3 and row[3]:
-                        name = row[3].strip().lower()
+                        name = row[3].strip(' "\'').lower()
                         if len(name) > 3:
                             keywords.add(name)
                             

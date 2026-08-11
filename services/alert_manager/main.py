@@ -117,6 +117,8 @@ class AlertManager:
         if success:
             await self._record_alert_sent(rule_name)
             logger.info(f"!! [INTELLIGENCE_BRIEFING] Sent for correlation {scenario.correlation_id[:8]}")
+        if WEBHOOK_URL:
+            await self._send_webhook(scenario.model_dump(mode="json"))
 
     async def handle_intel_brief(self, brief: dict):
         b = brief.get("brief", {})
@@ -143,6 +145,8 @@ class AlertManager:
             await self._record_alert_sent(rule_name)
             await self._redis.raw.set(dedup_key, "1", ex=DEDUP_TTL)
             logger.info(f"!! [INTEL_BRIEF] Sent for agent run {run_id}")
+        if WEBHOOK_URL:
+            await self._send_webhook(brief)
 
     async def _send_telegram(self, text: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:

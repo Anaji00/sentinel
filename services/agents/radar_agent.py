@@ -29,21 +29,29 @@ class RadarAgent(SentinelAgent):
         z_score = 0.0
         notional_usd = 0.0
 
+        def _safe_float(val, default=0.0) -> float:
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
         if "raw_payload" in message and isinstance(message["raw_payload"], dict):
             p = message["raw_payload"]
             ticker = p.get("ticker")
-            z_score = float(p.get("z_score", 0.0))
-            notional_usd = float(p.get("notional_usd", 0.0))
+            z_score = _safe_float(p.get("z_score"))
+            notional_usd = _safe_float(p.get("notional_usd"))
         elif "financial_data" in message and isinstance(message["financial_data"], dict):
             fd = message["financial_data"]
             ticker = fd.get("ticker")
-            z_score = float(message.get("anomaly_score", 0.0)) * 5.0
-            notional_usd = float(fd.get("premium_usd", 0.0))
+            z_score = _safe_float(message.get("anomaly_score")) * 5.0
+            notional_usd = _safe_float(fd.get("premium_usd"))
         elif "trigger" in message and isinstance(message["trigger"], dict):
             trig = message["trigger"]
             ticker = trig.get("ticker")
-            z_score = float(trig.get("anomaly_score", 0.0))
-            notional_usd = float(trig.get("notional_usd", 0.0))
+            z_score = _safe_float(trig.get("anomaly_score"))
+            notional_usd = _safe_float(trig.get("notional_usd"))
 
         if ticker:
             ticker = str(ticker).upper().strip()
@@ -117,8 +125,8 @@ class RadarAgent(SentinelAgent):
         if not ticker or not is_valid_primary_equity(ticker):
             return None
 
-        # 2. HEIGHTENED ANOMALY FLOW GATEKEEPER ($150k notional minimum)
-        if notional_usd < 150_000:
+        # 2. HEIGHTENED ANOMALY FLOW GATEKEEPER ($50k notional minimum)
+        if notional_usd < 50_000:
             return None
         
         # Idempotency: Do not re-evaluate a ticker we already escalated today
@@ -136,7 +144,13 @@ class RadarAgent(SentinelAgent):
             raw_candles = await self.redis.raw.lrange(f"sentinel:candles:1h:{ticker}", 0, -1)
             for c in raw_candles:
                 item = json.loads(c if isinstance(c, str) else c.decode("utf-8"))
-                closes.append(float(item.get("close", 0)))
+                if isinstance(item, dict):
+                    c_val = item.get("close")
+                    if c_val is not None:
+                        try:
+                            closes.append(float(c_val))
+                        except (ValueError, TypeError):
+                            pass
         except Exception:
             pass
 
@@ -203,7 +217,7 @@ class RadarAgent(SentinelAgent):
                 self.logger.info(f"🧠 AGENT BYPASS: {ticker} not escalated. Rationale: {decision.rationale}")
         except Exception as e:
             self.logger.warning(f"Agent LLM reasoning unavailable for {ticker}: {e}. Engaging Deterministic Quant Rules.")
-            if z_score >= 3.5 and notional_usd >= 150_000:
+            if z_score >= 3.5 and notional_usd >= 50_000:
                 decision = RadarDecision(
                     investigate=True, 
                     rationale=f"Deterministic Quant Fallback: Volume Z-score {z_score:.2f} >= 3.5 with ${notional_usd/1e6:.2f}M flow."

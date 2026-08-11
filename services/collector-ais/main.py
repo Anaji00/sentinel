@@ -44,6 +44,8 @@ load_dotenv(ROOT / ".env")
 # RawEvent: The standardized "Envelope" we put all raw data into.
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
+from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 
 
@@ -226,11 +228,15 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
     counter = MessageCounter()
+    hb_task = None
     try:
+        redis = await get_redis()
+        hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-ais"))
         await collect(producer, counter)
     except KeyboardInterrupt:
         logger.info("Shutting down AIS Collector...")
     finally:
+        if hb_task: hb_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

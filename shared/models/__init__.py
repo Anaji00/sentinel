@@ -26,4 +26,5 @@ from .events import (
     AnomalyBreakdown,
     MarketMicrostructure,
     CrossDomainSignal,
+    ScoreAdjustment,
 )

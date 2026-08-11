@@ -219,7 +219,7 @@ class EdgeValidatorAgent(SentinelAgent):
                     neo4j_client=self.neo4j,
                     timescale_client=self.db,
                     redis_client=self.redis,
-                    producer=self.producer,
+                    producer=self._producer,
                 )
                 if res.get("validated", 0) > 0:
                     logger.info(f"⚡ Edge Validation Sweep: {res['validated']} edges evaluated ({res['promoted']} promoted, {res['decayed']} decayed)")

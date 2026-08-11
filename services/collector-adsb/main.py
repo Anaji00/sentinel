@@ -57,6 +57,8 @@ logger = setup_sentinel_logging("collector.adsb", level=getattr(logging, os.gete
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
+from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 OPENSKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
 OPENSKY_CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET")
@@ -285,11 +287,15 @@ async def main():
  
     producer = SentinelProducer()
     await producer.start()
+    hb_task = None
     try:
+        redis = await get_redis()
+        hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-adsb"))
         await collect(producer)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        if hb_task: hb_task.cancel()
         await producer.close()
  
  

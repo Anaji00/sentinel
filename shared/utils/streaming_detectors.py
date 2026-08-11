@@ -115,27 +115,40 @@ class RRCFDetector:
     def _insert_rrcf(self, point: np.ndarray) -> float:
         """Insert into RRCF forest, return normalized CoDisp."""
         avg_codisp = 0.0
+        valid_trees = 0
         idx = self._index
         self._index += 1
 
-        for tree in self._forest:
-            # Evict oldest point if at capacity
-            if len(tree.leaves) >= self.window_size:
-                oldest = min(tree.leaves.keys())
-                tree.forget_point(oldest)
-
-            # Insert new point
-            tree.insert_point(point, index=idx)
-
-            # CoDisp = Collusive Displacement
+        for i, tree in enumerate(self._forest):
             try:
-                codisp = tree.codisp(idx)
-                avg_codisp += codisp
-            except Exception:
-                pass
+                # Evict oldest point if at capacity
+                if len(tree.leaves) >= self.window_size:
+                    oldest = min(tree.leaves.keys())
+                    tree.forget_point(oldest)
 
-        if self.num_trees > 0:
-            avg_codisp /= self.num_trees
+                # Insert new point
+                tree.insert_point(point, index=idx)
+
+                # CoDisp requires >1 leaf in tree to compute displacement
+                if len(tree.leaves) > 1:
+                    codisp = tree.codisp(idx)
+                    if codisp is not None and not math.isnan(codisp):
+                        avg_codisp += codisp
+                        valid_trees += 1
+            except Exception as e:
+                # If rrcf internal tree structure gets corrupted (e.g. cut not found or leaf attribute error),
+                # reset the corrupted tree instance cleanly
+                try:
+                    fresh_tree = rrcf.RCTree()
+                    fresh_tree.insert_point(point, index=idx)
+                    self._forest[i] = fresh_tree
+                except Exception:
+                    pass
+
+        if valid_trees > 0:
+            avg_codisp /= valid_trees
+        else:
+            return 0.0
 
         # Sigmoid normalization: maps raw CoDisp to [0, 1]
         # CoDisp of ~3-5 should map to ~0.5-0.7 (anomalous territory)

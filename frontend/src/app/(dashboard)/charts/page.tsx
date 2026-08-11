@@ -36,7 +36,7 @@ const ASSET_REGISTRY: AssetConfig[] = [
   { symbol: 'QQQ', title: 'NASDAQ 100 ETF TRUST', subtitle: 'US Mega-Cap Tech Benchmark Futures', category: 'futures', color: '#a855f7', badgeText: 'TECH FUTURES' },
   { symbol: 'DJI', title: 'DOW JONES INDUSTRIAL', subtitle: 'US Blue-Chip Industrial Benchmark', category: 'futures', color: '#3b82f6', badgeText: 'DOW FUTURES' },
   { symbol: 'VIX', title: 'CBOE VOLATILITY INDEX', subtitle: 'Market Fear & Volatility Implied Index', category: 'futures', color: '#ef4444', badgeText: 'VOLATILITY' },
-  
+
   // Energy & Commodities
   { symbol: 'WTI', title: 'WTI CRUDE OIL FUTURES', subtitle: 'US Light Sweet Crude ($/bbl)', category: 'commodities', color: '#f59e0b', badgeText: 'ENERGY FUTURES' },
   { symbol: 'BRENT', title: 'BRENT CRUDE OIL FUTURES', subtitle: 'Global Crude Oil Benchmark ($/bbl)', category: 'commodities', color: '#eab308', badgeText: 'GLOBAL ENERGY' },
@@ -273,7 +273,7 @@ export default function ChartsPage() {
 
   return (
     <div className="flex h-full w-full flex-col p-4 sm:p-6 gap-5 overflow-y-auto font-mono bg-[#06080d] text-slate-100">
-      
+
       {/* Header & Live Stream Bar */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-[#080d1a] p-4 rounded-2xl border border-cyan-500/20 shadow-xl">
         <div>
@@ -320,7 +320,7 @@ export default function ChartsPage() {
       {expandedAsset && (
         <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xl flex items-center justify-center p-4 sm:p-8 font-mono">
           <div className="bg-[#070a12] border border-cyan-500/50 rounded-3xl max-w-6xl w-full h-[90vh] flex flex-col overflow-hidden shadow-[0_0_60px_rgba(0,242,254,0.3)] text-xs text-slate-200">
-            
+
             {/* Modal Header Bar */}
             <div className="flex items-center justify-between px-6 py-4 bg-[#0b0f1d] border-b border-cyan-500/30">
               <div className="flex items-center gap-3">
@@ -345,9 +345,8 @@ export default function ChartsPage() {
                     <button
                       key={tf}
                       onClick={() => setTimeframe(tf)}
-                      className={`px-3 py-1 rounded-lg font-bold text-xs transition-colors cursor-pointer ${
-                        timeframe === tf ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-white'
-                      }`}
+                      className={`px-3 py-1 rounded-lg font-bold text-xs transition-colors cursor-pointer ${timeframe === tf ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-white'
+                        }`}
                     >
                       {tf}
                     </button>

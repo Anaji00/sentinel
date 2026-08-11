@@ -101,7 +101,7 @@ export default function CyberIntelligencePanel() {
         <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
           {filteredEvents.length > 0 ? (
             filteredEvents.map((e, i) => {
-              const sd = e.security_data || {};
+              const sd: any = e.security_data || {};
               const isCritical = e.anomaly_score >= 0.75 || (sd.cvss_score || 0) >= 8.0;
 
               return (

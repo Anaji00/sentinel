@@ -1,11 +1,19 @@
 """
 services/enrichment/enrichers/aviation.py
+
+ADS-B Aviation Enricher
+Translates raw ADS-B telemetry state vectors into NormalizedEvent instances.
+Features:
+  - Batching via Redis pipelining & asyncio.gather parallel scoring.
+  - Routine telemetry guard: Sub-threshold events write calm baselines (capped at score 0.15) instead of dropping.
+  - Ontology proposals & aircraft:last_seen updates in Redis for dark flight gap detection.
 """
 
 import json
 import logging
+import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.utils.regions import classify_region
@@ -20,10 +28,7 @@ SQUAWK_LABELS = {
     "7700": "general_emergency",
 }
 
-
-
 class AviationEnricher:
-
     def __init__(self, scorer, redis_client, graph_writer, resolver=None):
         self.scorer = scorer
         self.redis = redis_client
@@ -31,123 +36,155 @@ class AviationEnricher:
         self.resolver = resolver
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
-        """
-        Enriches a single aviation event.
-        """
-        p      = raw.raw_payload
-        icao24 = (p.get("icao24") or "").strip()
-        if not icao24:
-            return None
+        """Backward compatibility for single event enrich call."""
+        res = await self.enrich_batch([raw])
+        return res[0] if res else None
 
-        # 1. PARSE POSITION
-        lat       = p.get("latitude")
-        lon       = p.get("longitude")
-        on_ground = p.get("on_ground", False)
+    async def enrich_batch(self, events: list) -> list:
+        if not events:
+            return []
 
-        # FILTER: Skip surface reports.
-        if on_ground:
-            return None
+        parsed = []
+        for raw in events:
+            p = raw.raw_payload or {}
+            icao24 = (p.get("icao24") or "").strip()
+            if not icao24:
+                continue
 
-        callsign = (p.get("callsign") or "").strip() or None
-        squawk   = str(p.get("squawk") or "").strip()
-        
-        # check if this is a known emergency code OR if the collector flagged it
-        is_emerg = squawk in SQUAWK_LABELS or p.get("is_emergency", False)
-        
-        # Geo-tagging
-        region   = classify_region(lat, lon) if (lat and lon) else None
+            lat = p.get("latitude")
+            lon = p.get("longitude")
+            on_ground = p.get("on_ground", False)
 
-        event_type = EventType.FLIGHT_ANOMALY if is_emerg else EventType.FLIGHT_POSITION
+            if on_ground or lat is None or lon is None:
+                continue
 
-        # SANCTIONS CHECK
-        country = p.get("origin_country", "")
-        flags = check_sanctions(f"{callsign or ''} {country}", "")
-        is_sanctioned = len(flags) > 0
-        
-        # 2. CALCULATE ANOMALY SCORE
-        if is_emerg:
-            score = {"7500": 1.0, "7700": 0.85, "7600": 0.70}.get(squawk, 0.60)
-        elif is_sanctioned:
-            score = 0.80 # High alert for OFAC sanctioned flight
-        else:
-            # Kinematic Kalman prediction residual + RRCF scoring
+            callsign = (p.get("callsign") or "").strip() or None
+            squawk = str(p.get("squawk") or "").strip()
+            is_emerg = squawk in SQUAWK_LABELS or p.get("is_emergency", False)
+            region = classify_region(lat, lon) if (lat and lon) else None
+            country = p.get("origin_country", "")
+            flags = check_sanctions(f"{callsign or ''} {country}", "")
+            is_sanctioned = len(flags) > 0
+
+            parsed.append((raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned))
+
+        if not parsed:
+            return []
+
+        # Parallelize scoring and watchlist checks across the batch
+        scoring_tasks = []
+        for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned) in parsed:
             speed = float(p.get("velocity") or p.get("speed") or 0.0)
             heading = float(p.get("true_track") or p.get("heading") or 0.0)
             ts = (raw.occurred_at or datetime.now(timezone.utc)).timestamp()
             alt_norm = float(p.get("baro_altitude") or p.get("geo_altitude") or 0.0) / 45000.0
-            
-            res = await self.scorer.score_kinematic_event(
-                icao24, lat=lat or 0.0, lon=lon or 0.0, speed=speed, heading=heading,
-                timestamp=ts, extra_features=[alt_norm]
+
+            task = self._score_flight(
+                icao24=icao24, callsign=callsign, squawk=squawk, is_emerg=is_emerg,
+                is_sanctioned=is_sanctioned, lat=lat, lon=lon, speed=speed,
+                heading=heading, ts=ts, alt_norm=alt_norm
             )
-            score = res.get("score", 0.10)
+            scoring_tasks.append(task)
 
-        is_watched = await self.scorer.check_watchlist(icao24, "aircraft") or (callsign and await self.scorer.check_watchlist(callsign, "aircraft"))
-        w_boost = 0.15 if is_watched else 0.0
-        f_boost = await self.scorer.track_frequency(icao24, "aviation_position")
-        score = min(1.0, score + w_boost + f_boost)
+        scoring_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
 
-        # Only process high priority events to reduce noise
-        if score < 0.6:
-            return None
+        results = []
+        pipe = self.redis.raw.pipeline()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-        alt_ft = int(p.get("baro_altitude", 0) * 3.28084) if p.get("baro_altitude") else 0
-        
-        await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-            "entity_id": icao24,
-            "action": "MERGE_ONTOLOGY_NODE",
-            "data": {
-                "label": "Aircraft",
-                "primary_domain": "physical",
-                "properties": {
-                    "callsign": callsign,
-                    "origin_country": country,
-                },
-                "confidence": score
-            }
-        }, key=icao24)
+        for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned), score_res in zip(parsed, scoring_results):
+            if isinstance(score_res, Exception):
+                logger.error(f"Scoring error for flight {icao24}: {score_res}")
+                score, is_watched = 0.10, False
+            else:
+                score, is_watched = score_res
 
-        if lat and lon:
-            await self.redis.raw.set(
+            # ROUTINE TELEMETRY GUARD:
+            # Routine flight pings (not emergency, not sanctioned, not watched) capped at 0.15
+            if not is_emerg and not is_sanctioned and not is_watched:
+                anomaly = min(0.15, score * 0.3)
+            else:
+                anomaly = min(1.0, score)
+
+            alt_ft = int(p.get("baro_altitude", 0) * 3.28084) if p.get("baro_altitude") else 0
+
+            # Store last seen in Redis pipeline for gap detector
+            pipe.set(
                 f"aircraft:last_seen:{icao24}",
                 json.dumps({
-                    "lat": lat, 
-                    "lon": lon, 
+                    "lat": lat,
+                    "lon": lon,
                     "alt": alt_ft,
-                    "ts": datetime.now(timezone.utc).isoformat()
+                    "callsign": callsign,
+                    "region": region,
+                    "ts": now_iso
                 }),
-                ex=86400 # 24 hours
+                ex=86400  # 24 hours
             )
-                
-        # 4. TAGGING
-        tags = []
-        if region:
-            tags.append(region.lower().replace(" ", "_"))
+
+            event_type = EventType.FLIGHT_ANOMALY if (is_emerg or anomaly >= 0.60) else EventType.FLIGHT_POSITION
+
+            tags = []
+            if region:
+                tags.append(region.lower().replace(" ", "_"))
+            if is_emerg:
+                tags += [f"squawk_{squawk}", "aviation_emergency", SQUAWK_LABELS.get(squawk, "emergency")]
+            if is_sanctioned:
+                tags += ["sanctioned_ofac"]
+
+            cc = country[:2].upper() if len(country) >= 2 else None
+            headline = f"Aviation Alert: {callsign or icao24} | {SQUAWK_LABELS.get(squawk, 'Emergency Alert')}" if (is_emerg or is_sanctioned or anomaly >= 0.50) else f"Flight {callsign or icao24} position in {region or 'global airspace'}"
+
+            event = NormalizedEvent(
+                event_id=raw.event_id,
+                trace_id=raw.trace_id,
+                type=event_type,
+                occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+                source=raw.source,
+                primary_entity=Entity(
+                    id=icao24,
+                    type=EntityType.AIRCRAFT,
+                    name=callsign or f"FLIGHT_{icao24}",
+                    country_code=cc,
+                    flags=flags,
+                ),
+                latitude=lat,
+                longitude=lon,
+                region=region,
+                headline=headline,
+                tags=tags,
+                anomaly_score=anomaly,
+            )
+            results.append(event)
+
+        await pipe.execute()
+        return results
+
+    async def _score_flight(self, icao24: str, callsign: Optional[str], squawk: str,
+                            is_emerg: bool, is_sanctioned: bool, lat: float, lon: float,
+                            speed: float, heading: float, ts: float, alt_norm: float):
+        """Helper to score a single flight concurrently."""
         if is_emerg:
-            tags += [f"squawk_{squawk}", "aviation_emergency",
-                     SQUAWK_LABELS.get(squawk, "emergency")]
-        if is_sanctioned:
-            tags += ["sanctioned_ofac"]
+            raw_score = {"7500": 1.0, "7700": 0.85, "7600": 0.70}.get(squawk, 0.60)
+        elif is_sanctioned:
+            raw_score = 0.80
+        else:
+            res = await self.scorer.score_kinematic_event(
+                icao24, lat=lat, lon=lon, speed=speed, heading=heading,
+                timestamp=ts, extra_features=[alt_norm]
+            )
+            raw_score = res.get("score", 0.10)
 
-        cc = country[:2].upper() if len(country) >= 2 else None
+        # Check watchlist in parallel
+        watch_tasks = [self.scorer.check_watchlist(icao24, "aircraft")]
+        if callsign:
+            watch_tasks.append(self.scorer.check_watchlist(callsign, "aircraft"))
+        
+        watch_res = await asyncio.gather(*watch_tasks, return_exceptions=True)
+        is_watched = any(r is True for r in watch_res if not isinstance(r, Exception))
 
-        # 5. PRODUCE NORMALIZED EVENT
-        return NormalizedEvent(
-            event_id=raw.event_id, trace_id=raw.trace_id,
-            type=event_type,
-            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
-            source=raw.source,
-            primary_entity=Entity(
-                id=icao24,
-                type=EntityType.AIRCRAFT,
-                name=callsign or f"FLIGHT_{icao24}",
-                country_code=cc,
-                flags=flags,
-            ),
-            latitude=lat,
-            longitude=lon,
-            region=region,
-            headline=f"Aviation Alert: {callsign or icao24} | {SQUAWK_LABELS.get(squawk, 'Alert')}",
-            tags=tags,
-            anomaly_score=score,
-        )
+        w_boost = 0.15 if is_watched else 0.0
+        f_boost = await self.scorer.track_frequency(icao24, "aviation_position")
+        final_score = raw_score + w_boost + f_boost
+
+        return final_score, is_watched

@@ -97,7 +97,7 @@ export default function PredictionMarketPanel() {
         <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
           {filteredEvents.length > 0 ? (
             filteredEvents.map((e, i) => {
-              const pd = e.prediction_market_data || {};
+              const pd: any = e.prediction_market_data || {};
               const yesProb = pd.yes_probability !== undefined ? (pd.yes_probability * 100).toFixed(0) : '50';
               const noProb = pd.no_probability !== undefined ? (pd.no_probability * 100).toFixed(0) : `${100 - Number(yesProb)}`;
               const volumeStr = pd.total_volume ? `$${(pd.total_volume / 1e3).toFixed(0)}k Vol` : '$120k Vol';

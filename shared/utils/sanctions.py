@@ -103,6 +103,12 @@ def _init_automaton(keywords: List[str] = None):
 if HAS_AHOCORASICK:
     _init_automaton() # Boot with hardcoded defaults
 
+try:
+    from rapidfuzz import fuzz
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    HAS_RAPIDFUZZ = False
+
 def rebuild_sanctions_from_list(keywords: List[str]):
     """Triggered by Enrichment Service when Redis pushes new OFAC payload."""
     if HAS_AHOCORASICK and keywords:
@@ -111,51 +117,41 @@ def rebuild_sanctions_from_list(keywords: List[str]):
 
 async def fetch_and_sync_ofac_sdn_list():
     """
-    Downloads and updates OFAC SDN list keywords into memory.
+    Downloads and updates OFAC SDN list keywords into memory via Treasury CSV streams.
     """
-    import aiohttp
-    import xml.etree.ElementTree as ET
-    url = "https://sanctionslist.ofac.treas.gov/Home/SdnList"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15.0)) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Parse entity names from XML SDN payload
-                    keywords = set(SANCTIONED_KEYWORDS)
-                    try:
-                        root = ET.fromstring(text)
-                        for entry in root.findall(".//sdnEntry"):
-                            last_name = entry.findtext("lastName")
-                            first_name = entry.findtext("firstName")
-                            if last_name:
-                                full_name = f"{first_name} {last_name}".strip() if first_name else last_name.strip()
-                                if len(full_name) >= 3:
-                                    keywords.add(full_name.lower())
-                    except Exception as pe:
-                        logger.warning(f"Could not parse XML SDN stream: {pe}")
-                    
-                    rebuild_sanctions_from_list(list(keywords))
-                    logger.info(f"✅ OFAC SDN list synced successfully. Total entities: {len(keywords)}")
+        from services.enrichment.ofac_sync import fetch_ofac_keywords
+        keywords = await fetch_ofac_keywords()
+        if keywords:
+            all_keywords = list(set(SANCTIONED_KEYWORDS + keywords))
+            rebuild_sanctions_from_list(all_keywords)
+            logger.info(f"✅ OFAC SDN list synced successfully. Total entities: {len(all_keywords)}")
+            return all_keywords
     except Exception as e:
         logger.warning(f"OFAC SDN dynamic sync skipped (offline/timeout): {e}")
+    rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
+    return SANCTIONED_KEYWORDS
 
 def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     """
-    Return list of flag strings for a vessel.
-    Checks name against known sanctioned keywords and MMSI prefix
-    against sanctioned flag states.
- 
+    Return list of flag strings for a vessel/aircraft/entity.
+    Checks name against known sanctioned keywords (via Aho-Corasick & fuzzy ratio)
+    and MMSI prefix against sanctioned flag states.
+
     Returns empty list if no flags.
     """
     flags = []
-    name_lower = (name or "").lower()
+    name_lower = (name or "").strip().lower()
+    if not name_lower:
+        return flags
 
+    matched = False
     if _automaton is not None:
         # Aho-Corasick fast path: O(N) where N is length of name_lower
         for end_index, (insert_order, original_value) in _automaton.iter(name_lower):
             flags.append("sanctioned_ofac")
             flags.append(f"sanctioned_kw:{original_value}")
+            matched = True
             break
     else:
         # Fallback slow path
@@ -163,6 +159,15 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
             if kw in name_lower:
                 flags.append("sanctioned_ofac")
                 flags.append(f"sanctioned_kw:{kw}")
+                matched = True
+                break
+
+    # Fuzzy matching for names >= 5 chars if exact/substring match didn't trigger
+    if not matched and HAS_RAPIDFUZZ and len(name_lower) >= 5:
+        for kw in SANCTIONED_KEYWORDS:
+            if len(kw) >= 5 and fuzz.token_set_ratio(name_lower, kw) >= 88.0:
+                flags.append("sanctioned_ofac")
+                flags.append(f"sanctioned_fuzzy:{kw}")
                 break
 
     prefix = (mmsi or "")[:3]

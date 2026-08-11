@@ -136,6 +136,10 @@ class SentinelAgent(ABC):
     def output_topic(self) -> str:
         pass
 
+    @property
+    def producer(self):
+        return self._producer
+
     async def run(self):
         from shared.utils.ollama import OLLAMA_TIMEOUT
         connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)

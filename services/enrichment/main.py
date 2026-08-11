@@ -141,21 +141,33 @@ async def _heartbeat_loop(state: dict):
 async def _ofac_sync_loop():
     """Syncs OFAC sanctions list on startup then every 24 hours.
     
-    Uses a simple asyncio loop instead of apscheduler — no external
-    dependency needed for a single daily job.
+    Downloads real Treasury SDN & ALT CSV lists from treasury.gov and updates Aho-Corasick automaton.
     """
-    from shared.utils.sanctions import rebuild_sanctions_from_list
+    from shared.utils.sanctions import rebuild_sanctions_from_list, SANCTIONED_KEYWORDS
+    from services.enrichment.ofac_sync import fetch_ofac_keywords
+    import json
 
     while True:
         try:
-            logger.info("Starting OFAC sanctions sync...")
-            # Phase 2: download and parse the actual SDN list from OFAC.
-            # For now, we rebuild from a static keyword set.
-            updated_keywords = ["irgc", "dprk", "wagner", "pdvsa", "new_sanction_target"]
-            rebuild_sanctions_from_list(updated_keywords)
-            logger.info("OFAC sanctions sync complete.")
+            logger.info("Starting OFAC sanctions sync from US Treasury SDN list...")
+            fetched_keywords = await fetch_ofac_keywords()
+            if fetched_keywords:
+                all_keywords = list(set(SANCTIONED_KEYWORDS + fetched_keywords))
+                rebuild_sanctions_from_list(all_keywords)
+                logger.info(f"OFAC sanctions sync complete. Total entities in automaton: {len(all_keywords)}")
+                
+                try:
+                    redis = await get_redis()
+                    await redis.raw.set("sentinel:config:sanctions", json.dumps({"keywords": all_keywords}))
+                    await redis.raw.publish("sentinel:config:updates", "ofac_rebuild")
+                except Exception as re:
+                    logger.debug(f"Redis OFAC broadcast skipped: {re}")
+            else:
+                logger.warning("OFAC download returned 0 keywords. Retaining baseline SANCTIONED_KEYWORDS.")
+                rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
         except Exception as e:
-            logger.error(f"OFAC sync failed: {e}")
+            logger.error(f"OFAC sync failed: {e}. Retaining baseline SANCTIONED_KEYWORDS.")
+            rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
         await asyncio.sleep(86_400)  # 24 hours
 
 async def main():
@@ -200,8 +212,12 @@ async def main():
     )
     await consumer.start()
 
+    from services.enrichment.aviation_gap_detector import AviationGapDetector
     gap = VesselGapDetector(producer, scorer, db, redis)
     gap_task = safe_create_task(gap.run(), name="vessel-gap-detector")
+
+    av_gap = AviationGapDetector(producer, scorer, db, redis)
+    av_gap_task = safe_create_task(av_gap.run(), name="aviation-gap-detector")
 
     import time as _time
     _start_time = _time.monotonic()

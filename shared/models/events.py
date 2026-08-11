@@ -46,6 +46,7 @@ class EventType(str, Enum):
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
     VULNERABILITY = "vulnerability"
+    INFRASTRUCTURE_DEGRADED = "infrastructure_degraded"
 
 class EntityType(str, Enum):
     VESSEL = "vessel"
@@ -201,6 +202,11 @@ class FinancialData(BaseModel):
     eps_surprise_pct: Optional[float] = None
     revenue_estimate: Optional[float] = None
     revenue_actual: Optional[float] = None
+    # Reference data fields (Phase 2)
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    index_membership: List[str] = Field(default_factory=list)
+    market_cap_tier: Optional[str] = None
 
 class SecurityData(BaseModel):
     breach_type: Optional[str] = None
@@ -213,6 +219,11 @@ class SecurityData(BaseModel):
     exposure_type: Optional[str] = None
     ip_address: Optional[str] = None
     port: Optional[int] = None
+
+class ScoreAdjustment(BaseModel):
+    """Records a single step in anomaly score derivation for provenance tracking."""
+    reason: str
+    delta: float
 
 class AnomalyBreakdown(BaseModel):
     """Dimensional anomaly sub-scores — gives agents structured reasoning inputs."""
@@ -427,6 +438,7 @@ class NormalizedEvent(BaseModel):
     market_microstructure: Optional[MarketMicrostructure] = None
     cross_domain_signals: List[CrossDomainSignal] = Field(default_factory=list)
     correlation_ids: List[str] = Field(default_factory=list)
+    score_adjustments: List['ScoreAdjustment'] = Field(default_factory=list)
 
     @field_validator("anomaly_score")
     @classmethod

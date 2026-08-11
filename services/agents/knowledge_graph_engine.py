@@ -244,7 +244,15 @@ class KnowledgeGraphEngine(SentinelAgent):
 
             # Direct single-transaction Neo4j MERGE for extracted triples
             if valid_triples:
-                asyncio.create_task(self._merge_graph_triples(valid_triples))
+                task = asyncio.create_task(self._merge_graph_triples(valid_triples))
+                if not hasattr(self, "_background_tasks"):
+                    self._background_tasks = set()
+                self._background_tasks.add(task)
+                def _on_done(t):
+                    self._background_tasks.discard(t)
+                    if not t.cancelled() and t.exception():
+                        logger.error(f"Background _merge_graph_triples failed: {t.exception()}")
+                task.add_done_callback(_on_done)
 
             # Update co-occurrence matrix in Redis
             if len(brief.geographic_hotspots) >= 2:

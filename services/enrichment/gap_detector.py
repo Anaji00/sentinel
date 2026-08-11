@@ -20,6 +20,7 @@ from typing import Optional, List
  
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
+from shared.utils.heartbeat import is_component_healthy
  
 logger = logging.getLogger("enrichment.gap_detector")
  
@@ -57,6 +58,26 @@ class VesselGapDetector:
             await asyncio.sleep(300) # Additional sleep to prevent tight loop on errors
     async def _check(self):
         now = datetime.now(timezone.utc)
+        
+        # Liveness check: Verify collector-ais is healthy before checking gaps
+        is_healthy = await is_component_healthy(self.redis, "collector-ais")
+        if not is_healthy:
+            logger.warning("Collector collector-ais heartbeat is stale/missing. Suppressing VESSEL_DARK scan.")
+            degraded_event = NormalizedEvent(
+                type=EventType.INFRASTRUCTURE_DEGRADED,
+                occurred_at=now,
+                source="gap_detector",
+                primary_entity=Entity(id="collector-ais", name="collector-ais", type=EntityType.INFRASTRUCTURE, flags=["heartbeat_stale"]),
+                headline="AIS Collector heartbeat stale — suppressing false VESSEL_DARK alerts",
+                anomaly_score=0.85,
+                region="Global"
+            )
+            if self.db_writer:
+                await self.db_writer.write_events_batch([degraded_event])
+            if self.producer:
+                await self.producer.send(Topics.ALERTS, degraded_event.model_dump(mode="json"))
+            return
+
         fired = 0
         has_keys = False
         batch_events_to_write: List[NormalizedEvent] = []
