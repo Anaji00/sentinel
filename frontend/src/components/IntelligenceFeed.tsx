@@ -33,6 +33,9 @@ function getDomainMeta(type: string): { label: string; icon: string; badgeStyle:
     if (t.includes('pred') || t.includes('poly') || t.includes('kalshi')) {
         return { label: 'PREDICTION', icon: '🎯', badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10' };
     }
+    if (t.includes('crypto') || t.includes('coinbase') || t.includes('binance') || t.includes('token') || t.includes('wallet') || t.includes('blockchain') || t.includes('perp') || t.includes('btc') || t.includes('eth') || t.includes('sol')) {
+        return { label: 'CRYPTO', icon: '₿', badgeStyle: 'text-amber-400 border-amber-500/40 bg-amber-500/10' };
+    }
     if (t.includes('earnings')) {
         return { label: 'EARNINGS', icon: '📅', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
     }
@@ -47,9 +50,6 @@ function getDomainMeta(type: string): { label: string; icon: string; badgeStyle:
     }
     if (t.includes('cyber') || t.includes('bgp') || t.includes('breach')) {
         return { label: 'CYBER', icon: '🔐', badgeStyle: 'text-rose-400 border-rose-500/40 bg-rose-500/10' };
-    }
-    if (t.includes('crypto') || t.includes('token') || t.includes('wallet') || t.includes('blockchain') || t.includes('perp')) {
-        return { label: 'CRYPTO', icon: '₿', badgeStyle: 'text-amber-400 border-amber-500/40 bg-amber-500/10' };
     }
     if (t.includes('tradfi') || t.includes('stock') || t.includes('equity') || t.includes('option') || t.includes('market')) {
         return { label: 'TRADFI', icon: '📈', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
@@ -77,55 +77,28 @@ function getCleanSource(e: NormalizedEvent): string {
 function formatEnglishHeadline(e: NormalizedEvent): string {
     const rawHeadline = e.headline || '';
     
-    // Sanitize any raw string split artifacts like 'tradfi | prediction_market' or 'tradfi - prediction market'
-    if (rawHeadline.includes('tradfi | prediction') || rawHeadline.includes('tradfi - prediction')) {
-        const cleaned = rawHeadline.replace(/tradfi\s*[|\-]\s*prediction_market/gi, 'Prediction Market');
-        return cleaned;
+    // Priority 1: If backend provided an enriched headline, use it directly!
+    if (rawHeadline && !rawHeadline.startsWith('Event ') && !rawHeadline.match(/^[0-9a-f]{8}-[0-9a-f]{4}/i)) {
+        return rawHeadline.replace(/tradfi\s*[|\-]\s*prediction_market/gi, 'Prediction Market');
     }
     
+    // Priority 2: If summary is present and rich, use it
+    if (e.summary && e.summary.length > 15 && !e.summary.startsWith('Event ')) {
+        return e.summary;
+    }
+
     if (e.prediction_market_data?.question) {
         const pm = e.prediction_market_data;
         const sideStr = pm.outcome ? ` (${pm.outcome})` : '';
         const qUpper = (pm.question || '').toUpperCase();
-        return `🎯 PREDICTION MARKET: ${qUpper}${sideStr} — Notional: $${(pm.notional_usd || 0).toLocaleString()}`;
+        return `🎯 PREDICTION MARKET: ${qUpper}${sideStr}`;
     }
 
     const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || '';
-    const isRawId = (str?: string) => !str || str.startsWith('Event ') || Boolean(str.match(/^[0-9a-f]{8}-[0-9a-f]{4}/i));
-    
-    if (!isRawId(e.headline)) {
-        return e.headline;
-    }
-    if (!isRawId(e.summary)) {
-        return e.summary!;
-    }
-    
     const t = (e.type || '').toLowerCase();
     const regionStr = e.region ? ` in ${e.region}` : '';
 
-    if (t.includes('vessel_position')) {
-        return `Vessel position report for ${entityName || 'Maritime Vessel'}${regionStr}`;
-    }
-    if (t.includes('vessel_dark')) {
-        return `AIS Dark gap anomaly detected on ${entityName || 'Vessel'}${regionStr}`;
-    }
-    if (t.includes('vessel_static')) {
-        return `Vessel static registry report: ${entityName || 'Vessel'}`;
-    }
-    if (t.includes('cyber') || t.includes('bgp')) {
-        return `BGP routing hijack anomaly on ${entityName || 'Network Target'}`;
-    }
-    if (t.includes('pred')) {
-        return `Prediction market probability move for ${entityName || 'Contract'}`;
-    }
-    if (t.includes('crypto')) {
-        return `Cryptocurrency market anomaly on ${entityName || 'Asset'}`;
-    }
-    if (t.includes('tradfi') || t.includes('market')) {
-        return `Equity market volume anomaly on ${entityName || 'Ticker'}`;
-    }
-    
-    return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Asset Target'}${regionStr}`;
+    return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Target'}${regionStr}`;
 }
 
 const getScoreBadge = (score: number) => {
@@ -182,6 +155,12 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
       <p className="text-xs text-slate-100 font-sans font-semibold line-clamp-2 group-hover:text-white transition-colors leading-snug">
         {title}
       </p>
+
+      {e.summary && (
+        <p className="text-[11px] text-slate-300 font-sans mt-1 line-clamp-2 leading-tight">
+          {e.summary}
+        </p>
+      )}
 
       <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400 font-mono pt-1 border-t border-slate-800/60">
         <span>Entity: <span className="text-amber-300 font-bold">{entityName}</span></span>
@@ -348,134 +327,172 @@ export default function IntelligenceFeed() {
     setFullEventDetail(null);
     setIsLoadingDetail(true);
     try {
-      const res = await apiClient.get(`/events/detail/${event.event_id}`);
-      setFullEventDetail(res.data);
+      const response = await apiClient.get(`/events/${event.event_id}`);
+      setFullEventDetail(response.data);
     } catch (err) {
-      console.warn("Could not fetch deep event details:", err);
+      console.warn("Could not fetch deep event detail from hypertable, using live payload fallback:", err);
+      setFullEventDetail(event);
     } finally {
       setIsLoadingDetail(false);
     }
   };
 
   return (
-    <Card
-      title="INTELLIGENCE FEED"
-      badge={<Badge variant="live" pulse>STREAMING</Badge>}
-      headerAction={
-        <Tabs
-          tabs={mainTabs}
-          activeTab={activeTab}
-          onChange={(id) => setActiveTab(id as 'events' | 'scenarios' | 'correlations')}
-        />
-      }
-      noPadding
-    >
-      {/* Search & Domain Filter Bar */}
-      <div className="p-3 border-b border-[#00f2fe]/10 bg-slate-950/80 flex flex-col gap-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <Tabs
-            tabs={domainTabs}
-            activeTab={selectedDomain}
-            onChange={setSelectedDomain}
-          />
+    <div className="space-y-4 max-w-[1600px] mx-auto font-sans">
+      {/* Header Bar */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 bg-[#090d16] border border-cyan-500/20 rounded-xl shadow-[0_0_20px_rgba(0,242,254,0.05)]">
+        <div>
+          <h1 className="text-lg font-mono font-bold text-white tracking-wider flex items-center gap-2">
+            <span className="h-2.5 w-2.5 rounded-full bg-cyan-400 animate-pulse shadow-[0_0_10px_#00f2fe]" />
+            MULTI-DOMAIN INTELLIGENCE FEED
+          </h1>
+          <p className="text-xs text-slate-400 font-mono mt-0.5">
+            Real-time cross-domain event stream, AI strategic scenarios & macro correlation clusters.
+          </p>
         </div>
 
-        <div className="relative">
+        {/* Search & Filter Inputs */}
+        <div className="flex items-center gap-2">
           <input
-            id="intelligence-search-input"
-            name="intelligence_search"
-            autoComplete="off"
             type="text"
-            placeholder="Search events, tickers, headlines, or entities..."
+            placeholder="Search events, tickers, entities..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-[#080a10] border border-cyan-500/20 rounded-lg px-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-[#00f2fe]/60 font-mono transition-colors"
+            className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-cyan-500/60 font-mono w-48 md:w-64"
           />
         </div>
       </div>
 
-      {/* Stream Items List */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
-        {activeTab === 'events' ? (
-          sortedEvents.length > 0 ? (
-            sortedEvents.map((e, idx) => (
-              <EventRow key={e.event_id || idx} e={e} onClick={handleEventClick} />
-            ))
-          ) : (
-            <div className="flex flex-col items-center justify-center p-8 text-center space-y-2 border border-dashed border-cyan-500/20 bg-slate-950/40 rounded-lg font-mono">
-              <span className="text-2xl animate-pulse">📡</span>
-              <p className="text-xs text-slate-300 font-bold">NO MATCHING TELEMETRY EVENTS</p>
-              <span className="text-[10px] text-slate-500">Listening on active WebSocket feed & REST polling...</span>
-            </div>
-          )
-        ) : activeTab === 'scenarios' ? (
-          <>
-            <div className="flex items-center gap-1.5 pb-2 mb-1 border-b border-purple-500/20 font-mono text-[10px]">
-              <span className="text-slate-400 font-bold uppercase mr-1">STATUS FILTER:</span>
-              {[
-                { id: 'all', label: 'ALL' },
-                { id: 'confirmed', label: 'CONFIRMED' },
-                { id: 'hypothesis', label: 'HYPOTHESIS' },
-                { id: 'under_revise', label: 'UNDER REVISION' },
-              ].map(st => (
-                <button
-                  key={st.id}
-                  onClick={() => setScenarioStatus(st.id)}
-                  className={`px-2 py-0.5 rounded font-bold transition-all cursor-pointer ${
-                    scenarioStatus === st.id
-                      ? 'bg-purple-500/30 text-purple-300 border border-purple-400/50 glow-purple'
-                      : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
-                  }`}
-                >
-                  {st.label}
-                </button>
-              ))}
-            </div>
+      {/* Main Mode Tabs */}
+      <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-2">
+        <div className="flex items-center gap-2">
+          {mainTabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+                activeTab === tab.id
+                  ? 'bg-cyan-500/20 text-[#00f2fe] border border-cyan-500/40 shadow-[0_0_12px_rgba(0,242,254,0.25)]'
+                  : 'bg-slate-900/60 text-slate-400 border border-slate-800 hover:text-slate-200'
+              }`}
+            >
+              {tab.label}
+              <span className="px-1.5 py-0.2 rounded bg-slate-950 text-[10px] font-mono text-cyan-300 font-bold border border-cyan-500/20">
+                {tab.count}
+              </span>
+            </button>
+          ))}
+        </div>
 
-            {(scenarios || []).length > 0 ? (
-              (scenarios || []).map((s, idx) => (
-                <div
-                  key={s.scenario_id || s.correlation_id || idx}
-                  onClick={() => setSelectedScenario(s)}
-                  className="p-3.5 rounded-lg bg-slate-900/70 border border-purple-500/20 hover:border-purple-400/60 hover:bg-slate-900/90 cursor-pointer transition-all space-y-2"
-                >
-                  <div className="flex items-center justify-between font-mono">
-                    <span className="text-[10px] font-bold text-purple-400 uppercase tracking-wider flex items-center gap-1.5">
-                      <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-ping" />
-                      {s.status ? s.status.toUpperCase() : 'AI SYNTHESIZED SCENARIO'}
-                    </span>
-                    <span className="px-2 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold">
-                      CONFIDENCE {s.confidence_overall}%
-                    </span>
-                  </div>
-                  <h4 className="text-xs font-bold text-slate-100 font-sans">{s.headline || s.primary_entity_name}</h4>
-                  <p className="text-[11px] text-slate-300 line-clamp-2">{s.significance}</p>
-                </div>
-              ))
-            ) : (
-              <div className="flex flex-col items-center justify-center p-8 text-center space-y-2 border border-dashed border-purple-500/20 bg-slate-950/40 rounded-lg font-mono">
-                <span className="text-2xl animate-pulse">🧠</span>
-                <p className="text-xs text-purple-300 font-bold">NO SCENARIOS MATCHING STATUS '{scenarioStatus.toUpperCase()}'</p>
-                <span className="text-[10px] text-slate-500">LLM Reasoning Engine evaluating Bayesian recalibration loop...</span>
-              </div>
-            )}
-          </>
-        ) : (
-          (correlations || []).length > 0 ? (
-            (correlations || []).map((c, idx) => (
-              <CorrelationCard key={c.correlation_id || idx} c={c} />
-            ))
-          ) : (
-            <div className="flex flex-col items-center justify-center p-8 text-center space-y-2 border border-dashed border-amber-500/20 bg-slate-950/40 rounded-lg font-mono">
-              <span className="text-2xl animate-pulse">⚡</span>
-              <p className="text-xs text-amber-300 font-bold">NO RAW CORRELATION CLUSTERS</p>
-              <span className="text-[10px] text-slate-500">Rule correlation engine evaluating multi-domain triggers...</span>
-            </div>
-          )
+        {/* Sub-domain filters (Only visible in Live Stream tab) */}
+        {activeTab === 'events' && (
+          <div className="flex items-center gap-1 overflow-x-auto py-1 font-mono text-[11px]">
+            {domainTabs.map((d) => (
+              <button
+                key={d.id}
+                onClick={() => setSelectedDomain(d.id)}
+                className={`px-2.5 py-1 rounded transition-colors cursor-pointer font-bold ${
+                  selectedDomain === d.id
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                }`}
+              >
+                {d.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Scenario Status filter (Only visible in AI Scenarios tab) */}
+        {activeTab === 'scenarios' && (
+          <div className="flex items-center gap-1 font-mono text-[11px]">
+            {['all', 'HYPOTHESIS', 'CONFIRMED', 'MONITORING'].map((status) => (
+              <button
+                key={status}
+                onClick={() => setScenarioStatus(status)}
+                className={`px-2 py-0.5 rounded uppercase font-bold cursor-pointer ${
+                  scenarioStatus === status
+                    ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {status}
+              </button>
+            ))}
+          </div>
         )}
       </div>
 
-      {/* Deep Event Detail Modal */}
+      {/* TAB CONTENT: Live Stream */}
+      {activeTab === 'events' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          {sortedEvents.length === 0 ? (
+            <div className="col-span-full p-8 text-center bg-slate-950/60 rounded-xl border border-slate-800/80 font-mono text-slate-400 text-xs">
+              <span className="h-2 w-2 rounded-full bg-cyan-400 inline-block animate-ping mr-2" />
+              AWAITING LIVE DATA STREAM...
+            </div>
+          ) : (
+            sortedEvents.map((e) => (
+              <EventRow key={e.event_id} e={e} onClick={handleEventClick} />
+            ))
+          )}
+        </div>
+      )}
+
+      {/* TAB CONTENT: AI Scenarios */}
+      {activeTab === 'scenarios' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {(!scenarios || scenarios.length === 0) ? (
+            <div className="col-span-full p-8 text-center bg-slate-950/60 rounded-xl border border-slate-800/80 font-mono text-slate-400 text-xs">
+              NO ACTIVE SCENARIOS FOUND.
+            </div>
+          ) : (
+            scenarios.map((s) => (
+              <div
+                key={s.scenario_id}
+                onClick={() => setSelectedScenario(s)}
+                className="p-4 rounded-xl bg-[#0d0a18] border border-purple-500/20 hover:border-purple-500/60 transition-all cursor-pointer space-y-2 group glass-panel-hover font-mono"
+              >
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 font-bold uppercase border border-purple-500/40">
+                    {s.status || 'HYPOTHESIS'}
+                  </span>
+                  <span className="text-emerald-400 font-bold">
+                    CONFIDENCE: {s.confidence_overall}%
+                  </span>
+                </div>
+                <h3 className="text-xs font-bold text-slate-100 group-hover:text-purple-300 transition-colors font-sans line-clamp-2 leading-snug">
+                  {s.headline}
+                </h3>
+                <p className="text-[11px] text-slate-400 font-sans line-clamp-2 leading-tight">
+                  {s.narrative || s.description}
+                </p>
+                <div className="pt-2 flex items-center justify-between text-[10px] text-slate-400 border-t border-purple-500/10">
+                  <span>Entity: <span className="text-amber-300 font-bold">{s.primary_entity_name || 'Multi-Entity'}</span></span>
+                  <span>{new Date(s.updated_at || s.created_at).toLocaleTimeString()}</span>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* TAB CONTENT: Raw Correlations */}
+      {activeTab === 'correlations' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {(!correlations || correlations.length === 0) ? (
+            <div className="col-span-full p-8 text-center bg-slate-950/60 rounded-xl border border-slate-800/80 font-mono text-slate-400 text-xs">
+              NO CORRELATION CLUSTERS DETECTED YET.
+            </div>
+          ) : (
+            correlations.map((c) => (
+              <CorrelationCard key={c.correlation_id} c={c} />
+            ))
+          )}
+        </div>
+      )}
+
+      {/* Event Detail Forensic Inspector Modal */}
       {selectedEvent && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-[0_0_30px_rgba(0,242,254,0.2)] font-mono max-h-[85vh] overflow-y-auto">
@@ -499,6 +516,15 @@ export default function IntelligenceFeed() {
                 <span className="text-slate-400 block mb-0.5">EVENT HEADLINE:</span>
                 <p className="text-white font-bold font-sans text-sm">{formatEnglishHeadline(selectedEvent)}</p>
               </div>
+
+              {selectedEvent.summary && (
+                <div>
+                  <span className="text-slate-400 block mb-0.5">EXECUTIVE SUMMARY & AGENTIC CONTEXT:</span>
+                  <p className="text-slate-200 font-sans text-xs bg-slate-950 p-3 rounded-lg border border-cyan-500/20 leading-relaxed">
+                    {selectedEvent.summary}
+                  </p>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-2 bg-slate-950 p-3 rounded-lg border border-slate-800">
                 <div><span className="text-slate-400">EVENT ID:</span> <span className="text-cyan-400 font-bold block truncate">{selectedEvent.event_id}</span></div>
@@ -621,6 +647,6 @@ export default function IntelligenceFeed() {
           </div>
         </div>
       )}
-    </Card>
+    </div>
   );
 }

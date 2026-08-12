@@ -294,6 +294,9 @@ async def poll_cisa_kev(
     send_tasks = []
 
     # Loop through every vulnerability in the catalog
+    from datetime import timedelta
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=30)
+
     for vuln in vulns:
         cve_id = vuln.get("cveID", "")
         
@@ -308,11 +311,13 @@ async def poll_cisa_kev(
         ransomware_use = vuln.get("knownRansomwareCampaignUse", "Unknown")
 
         try:
-            # Convert the string date (e.g., "2024-03-15") into a standardized 
-            # UTC Python datetime object.
             occurred_at = datetime.strptime(added, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             occurred_at = datetime.now(timezone.utc)
+
+        # STRICT TEMPORAL FILTER: Drop legacy CVEs older than 30 days
+        if occurred_at < cutoff_dt:
+            continue
 
         event = RawEvent(
             source="cisa_kev",

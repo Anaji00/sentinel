@@ -230,7 +230,9 @@ async function fetchDirectPredictionEvents(limit = 25) {
             yesProb = parseFloat(rawPrices[0]) || 0.50;
             noProb = parseFloat(rawPrices[1]) || (1.0 - yesProb);
           }
-        } catch (e) {}
+        } catch (e) {
+          console.warn('[PolyMarket Outcome Price Parsing Warning]:', e);
+        }
 
         const vol = parseFloat(item.volume || market.volume || '0');
         events.push({

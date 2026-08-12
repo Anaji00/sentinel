@@ -76,7 +76,7 @@ export default function GlobalMap() {
             if (d3Select?.selection?.prototype && typeof d3Select.selection.prototype.interrupt !== 'function') {
                 d3Select.selection.prototype.interrupt = function () { return this; };
             }
-        }).catch(() => {});
+        }).catch((err) => console.debug('[d3-selection polyfill debug]:', err));
     }, []);
 
     // Real-time WebSocket Live Feed connection for all multi-domain events
@@ -118,15 +118,19 @@ export default function GlobalMap() {
 
         rawMaritime.forEach((e: any) => {
             const d = e.vessel_data || e.domain_data || e.raw_payload || {};
-            const mmsi = String(d.mmsi || e.primary_entity?.id || e.primary_entity_id || e.primary_entity_name || e.event_id || 'UNKNOWN');
-            const rawLat = e.latitude ?? d.latitude ?? d.lat ?? d.Position?.Latitude ?? d.position?.latitude ?? e.lat;
-            const rawLon = e.longitude ?? d.longitude ?? d.lon ?? d.Position?.Longitude ?? d.position?.longitude ?? e.lon;
+            const meta = d.MetaData || d.meta || {};
+            const pos = d.Message?.PositionReport || d.PositionReport || {};
+            
+            const mmsi = String(d.mmsi || meta.MMSI || e.primary_entity?.id || e.primary_entity_id || e.primary_entity_name || e.event_id || 'UNKNOWN');
+            
+            const rawLat = e.latitude ?? d.latitude ?? d.lat ?? pos.Latitude ?? meta.latitude ?? d.position?.latitude ?? e.lat;
+            const rawLon = e.longitude ?? d.longitude ?? d.lon ?? pos.Longitude ?? meta.longitude ?? d.position?.longitude ?? e.lon;
             let lat = parseFloat(String(rawLat));
             let lon = parseFloat(String(rawLon));
 
-            // Fallback realistic region coordinates if lat/lon missing
+            // Fallback realistic region coordinates if lat/lon missing or 0,0
             if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0)) {
-                const reg = (e.region || d.region || '').toLowerCase();
+                const reg = (e.region || d.region || meta.region || '').toLowerCase();
                 if (reg.includes('hormuz') || reg.includes('persian')) { lat = 26.5; lon = 56.2; }
                 else if (reg.includes('malacca') || reg.includes('singapore')) { lat = 1.3; lon = 103.8; }
                 else if (reg.includes('red sea') || reg.includes('mandeb')) { lat = 13.2; lon = 42.8; }
@@ -136,11 +140,13 @@ export default function GlobalMap() {
                 else { lat = 25.0; lon = 55.0; } // Default Arabian Sea/Persian Gulf transit
             }
 
-            const vtype = String(d.vessel_type || d.type || e.vessel_data?.vessel_type || '').toLowerCase();
-            const name = e.primary_entity_name || e.entity_name || d.name || e.primary_entity?.name || `VESSEL_${mmsi}`;
+            const vtype = String(d.vessel_type || d.type || meta.ShipType || e.vessel_data?.vessel_type || '').toLowerCase();
+            const name = e.primary_entity_name || e.entity_name || meta.ShipName || d.name || e.primary_entity?.name || `VESSEL_${mmsi}`;
             const nameUpper = name.toUpperCase();
-            const isTanker = vtype.includes('tanker') || vtype.includes('oil') || vtype.includes('lng') || vtype.includes('crude') || vtype.includes('petro') ||
-                nameUpper.includes('TANKER') || nameUpper.includes('OIL') || nameUpper.includes('CRUDE') || nameUpper.includes('PETRO') || nameUpper.includes('LNG') || nameUpper.includes('LPG') || nameUpper.includes('CHEM');
+            
+            const isTanker = vtype.includes('tanker') || vtype.includes('oil') || vtype.includes('lng') || vtype.includes('crude') || vtype.includes('petro') || vtype.includes('lpg') ||
+                nameUpper.includes('TANKER') || nameUpper.includes('OIL') || nameUpper.includes('CRUDE') || nameUpper.includes('PETRO') || nameUpper.includes('LNG') || nameUpper.includes('LPG') || nameUpper.includes('CHEM') ||
+                nameUpper.includes('VLCC') || nameUpper.includes('ULCC') || nameUpper.includes('AFRAMAX') || nameUpper.includes('SUEZMAX');
 
             vesselMap.set(mmsi, {
                 mmsi,
@@ -148,10 +154,10 @@ export default function GlobalMap() {
                 lat,
                 lon,
                 isTanker,
-                vessel_type: d.vessel_type || (isTanker ? 'Tanker' : 'Cargo Vessel'),
+                vessel_type: d.vessel_type || (isTanker ? 'Oil / Gas Tanker' : 'Cargo Vessel'),
                 anomaly: e.anomaly_score || 0.0,
-                speed: d.speed_knots || d.speed || 12.4,
-                heading: d.heading || 0,
+                speed: d.speed_knots || d.speed || (pos.Sog ? parseFloat(String(pos.Sog)) : 12.4),
+                heading: d.heading || pos.TrueHeading || 0,
                 region: e.region || 'International Shipping Lane',
                 nav_status: d.nav_status || 'Underway Using Engine',
             });

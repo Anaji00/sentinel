@@ -42,19 +42,36 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         };
 
         let pendingBatch: NormalizedEvent[] = [];
-        let rafId: number | null = null;
+        let flushTimer: NodeJS.Timeout | null = null;
 
         const flushBatch = () => {
           if (pendingBatch.length > 0) {
-            const batchToAdd = [...pendingBatch];
+            // Deduplicate high-frequency position reports (AIS vessels & ADS-B flights) by primary entity id
+            const positionMap = new Map<string, NormalizedEvent>();
+            const nonPositionEvents: NormalizedEvent[] = [];
+
+            for (const item of pendingBatch) {
+              const t = (item.type || '').toLowerCase();
+              const isHighFreqPos = t.includes('vessel_position') || t.includes('adsb_position') || t.includes('ais') || t.includes('adsb');
+              if (isHighFreqPos && item.primary_entity?.id) {
+                if (!positionMap.has(item.primary_entity.id)) {
+                  positionMap.set(item.primary_entity.id, item);
+                }
+              } else {
+                nonPositionEvents.push(item);
+              }
+            }
+
+            const batchToAdd = [...Array.from(positionMap.values()), ...nonPositionEvents];
             pendingBatch = [];
+
             setLiveEvents((prev) => {
               const combined = [...batchToAdd, ...prev];
               return combined.slice(0, MAX_LIVE_EVENTS);
             });
             useTelemetryStore.getState().updateTelemetry();
           }
-          rafId = null;
+          flushTimer = null;
         };
 
         ws.onmessage = (event) => {
@@ -72,8 +89,9 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
               pendingBatch.unshift(data);
 
-              if (!rafId) {
-                rafId = requestAnimationFrame(flushBatch);
+              // 1000ms sliding window buffer to reduce React re-render flooding from AIS/ADS-B telemetry
+              if (!flushTimer) {
+                flushTimer = setTimeout(flushBatch, 1000);
               }
             }
           } catch (e) {

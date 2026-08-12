@@ -21,6 +21,7 @@ export interface Scenario {
     headline: string;
     title?: string;
     description?: string;
+    narrative?: string;
     summary?: string;
     significance: string;
     confidence_overall: number;
@@ -29,6 +30,7 @@ export interface Scenario {
     recommended_monitoring?: string[];
     probability?: number;
     created_at: string;
+    updated_at?: string;
     primary_entity_name?: string;
     evidence_trail?: EvidenceItem[];
 }

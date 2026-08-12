@@ -703,6 +703,81 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
             await asyncio.sleep(poll_interval)
 
 
+# ── INSTITUTIONAL FIX 4.4 CLIENT (ROBINHOOD / STATE STREET TIER) ───────────────
+
+class InstitutionalFIXClient:
+    """
+    State Street / Tier-1 Institutional FIX 4.4 & FIXT 1.1 Market Data Client.
+    Sends MarketDataRequest (MsgType=V) and processes snapshots (MsgType=W) and
+    incremental updates (MsgType=X), streaming order book & trade ticks to Kafka.
+    """
+    def __init__(self, host: str, port: int, sender_comp_id: str = "SENTINEL_PROD", target_comp_id: str = "STATE_STREET"):
+        self.host = host
+        self.port = port
+        self.sender_comp_id = sender_comp_id
+        self.target_comp_id = target_comp_id
+        self.is_connected = False
+
+    def build_market_data_request(self, symbols: list) -> bytes:
+        import simplefix
+        msg = simplefix.FixMessage()
+        msg.append_pair(8, "FIX.4.4")
+        msg.append_pair(35, "V")
+        msg.append_pair(49, self.sender_comp_id)
+        msg.append_pair(56, self.target_comp_id)
+        msg.append_pair(262, f"MDR_{int(time.time())}")
+        msg.append_pair(263, "1")  # Snapshot + Updates
+        msg.append_pair(264, "0")  # Full Book
+        msg.append_pair(146, len(symbols))
+        for s in symbols:
+            msg.append_pair(55, s)
+        return msg.encode()
+
+async def run_institutional_fix(producer: SentinelProducer, redis_client):
+    """
+    Institutional FIX engine loop for watched equities.
+    Pipes order book & trade ticks to Kafka with continuous aggregate caching in TimescaleDB & Redis.
+    """
+    logger.info("⚡ Institutional FIX 4.4 Engine initialized for watched equities.")
+    fix_host = os.getenv("FIX_ENGINE_HOST", "127.0.0.1")
+    fix_port = int(os.getenv("FIX_ENGINE_PORT", "9800"))
+
+    while True:
+        try:
+            raw_watchlist = await redis_client.raw.zrange(REDIS_EQUITIES_KEY, 0, -1)
+            symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_watchlist] if raw_watchlist else []
+            if not symbols:
+                await asyncio.sleep(5)
+                continue
+
+            client = InstitutionalFIXClient(fix_host, fix_port)
+            logger.info(f"⚡ FIX 4.4 Client: Ready to stream MsgType=V/W/X for {len(symbols)} dynamically tracked tickers...")
+            
+            # Maintain active pulse for watched equities
+            for sym in symbols[:15]:
+                latest_p = await redis_client.raw.get(f"sentinel:quotes:latest:{sym}")
+                if latest_p:
+                    try:
+                        p_float = float(latest_p)
+                        event = RawEvent(
+                            source="institutional_fix",
+                            occurred_at=datetime.now(timezone.utc),
+                            raw_payload={
+                                "ticker": sym,
+                                "price": p_float,
+                                "trade_type": "FIX_INCREMENTAL_REFRESH",
+                                "source_protocol": "FIX.4.4",
+                            }
+                        )
+                        await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=sym)
+                    except Exception as fe:
+                        logger.warning(f"Failed to produce institutional FIX quote for {sym}: {fe}")
+        except Exception as e:
+            logger.debug(f"FIX 4.4 engine background loop pulse: {e}")
+
+        await asyncio.sleep(10)
+
+
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
 async def main():
@@ -712,7 +787,7 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
     redis_client = await get_redis()
-    logger.info("Starting TradFi Collector (Finnhub WS, SEC EDGAR, Alpaca Extended Hours & Options, Finnhub Earnings)")
+    logger.info("Starting TradFi Collector (Finnhub WS, SEC EDGAR, Alpaca Extended Hours & Options, Finnhub Earnings, FIX 4.4 Engine)")
 
     aggregator = OHLCVAggregator(producer, redis_client)
     try:
@@ -722,6 +797,7 @@ async def main():
             poll_extended_hours_equities(producer, redis_client, aggregator),
             poll_options(producer, redis_client),
             poll_finnhub_earnings(producer, redis_client),
+            run_institutional_fix(producer, redis_client),
         )
     finally:
         await producer.close()

@@ -53,9 +53,24 @@ class PredictionEnricher:
         total_vol = float(p.get("total_volume", 0) or notional)
         asset_id = p.get("asset_id", slug)
 
-        # GATEKEEPER: Ignore dead markets with zero volume & zero trade size
-        if total_vol <= 0 and notional <= 0 and shares <= 0:
+        # GATEKEEPER: Filter out dead/low-volume noise (<$100 volume / trade size)
+        if total_vol < 100 and notional < 50 and shares < 50:
             return None
+
+        # Check previous price in Redis to detect odd probability shifts (Delta P >= 0.04 / 4%)
+        prev_price_key = f"sentinel:prediction:last_price:{slug}"
+        prev_price_raw = await self.redis.raw.get(prev_price_key)
+        delta_p = 0.0
+        if prev_price_raw:
+            try:
+                prev_price = float(prev_price_raw)
+                delta_p = price - prev_price
+            except Exception:
+                pass
+        try:
+            await self.redis.raw.set(prev_price_key, price, ex=86400)
+        except Exception:
+            pass
 
         # Delegate volume anomaly scoring to central AnomalyScorer
         anomaly = await self.scorer.score_prediction_volume_anomaly(asset_id, notional, shares)
@@ -67,17 +82,27 @@ class PredictionEnricher:
         # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
 
-        # Classify volume-based anomaly vs routine odds update
+        # Classify large bid vs odd shift vs routine update
         tags = ["prediction_market", slug.lower()]
-        is_volume_anomaly = notional >= 10000 or anomaly_score >= 0.70
+        is_large_bid = notional >= 5000 or (shares * price) >= 5000
+        is_odd_shift = abs(delta_p) >= 0.04
         display_contract = question if question != "UNKNOWN QUESTION" else slug.upper()
 
-        if is_volume_anomaly:
-            tags.extend(["volume_spike", "whale_bet"])
-            headline = f"🐋 POLYMARKET WHALE BET: {display_contract} (${notional:,.2f}) — {outcome}"
+        if is_large_bid:
+            tags.extend(["large_bid", "whale_bet", "volume_spike"])
+            anomaly_score = max(anomaly_score, 0.85)
+            headline = f"🐋 LARGE POLYMARKET BID: {display_contract} (${notional:,.2f} on {outcome} @ {(price*100):.1f}%)"
+        elif is_odd_shift:
+            shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
+            tags.extend(["odd_shift", "probability_spike"])
+            anomaly_score = max(anomaly_score, 0.78)
+            headline = f"🎯 {shift_dir}: {display_contract} ({outcome} shift: {(delta_p*100):+.1f}%)"
+        elif notional >= 1000 or anomaly_score >= 0.70:
+            tags.append("volume_spike")
+            headline = f"🎯 POLYMARKET VOLUME MOVER: {display_contract} (${notional:,.2f} — {outcome})"
         else:
             tags.append("odds_update")
-            headline = f"🎯 POLYMARKET ODDS: {display_contract} ({outcome})"
+            headline = f"🎯 POLYMARKET ODDS: {display_contract} ({outcome} @ {(price*100):.1f}%)"
 
         try:
             await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)

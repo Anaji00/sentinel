@@ -30,6 +30,7 @@ from services.agents.supervisor import GraphSupervisor
 from services.agents.consensus_engine import ConsensusEngine
 from services.agents.adversarial_wargamer import AdversarialWargamerAgent
 from services.agents.edge_validator import EdgeValidatorAgent
+from services.agents.stock_correlation_agent import StockCorrelationAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
@@ -169,7 +170,7 @@ async def main():
         MacroIntelligenceEngine,
         agent_name="macro_intelligence_engine",
         input_topics=[
-            Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS,
+            Topics.RAW_NEWS, Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS,
             Topics.SYSTEM_HEARTBEAT, Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES,
             Topics.INSIDER_CLUSTERS
         ],
@@ -183,7 +184,7 @@ async def main():
         QuantTradingEngine,
         agent_name="quant_trading_engine",
         input_topics=[
-            Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS, Topics.SCENARIOS_GENERATED,
+            Topics.RAW_NEWS, Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.MACRO_DECOUPLING,
             Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT, Topics.RADAR_DECISIONS
         ],
@@ -211,7 +212,7 @@ async def main():
         RadarAgent,
         agent_name="radar_agent",
         input_topics=[
-            Topics.RAW_RADAR, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS,
+            Topics.RAW_NEWS, Topics.RAW_RADAR, Topics.ENRICHED_EVENTS, Topics.CORRELATIONS,
             Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT
         ],
         group_id="agent-radar-orchestrator",
@@ -224,7 +225,7 @@ async def main():
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
         input_topics=[
-            Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
+            Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES, Topics.MACRO_DECOUPLING,
             Topics.MACRO_ASSESSMENT, Topics.INSIDER_CLUSTERS
         ],
@@ -238,7 +239,7 @@ async def main():
         GraphSupervisor,
         agent_name="supervisor",
         input_topics=[
-            Topics.ONTOLOGY_PROPOSALS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS,
+            Topics.RAW_NEWS, Topics.ONTOLOGY_PROPOSALS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS,
             Topics.SCENARIOS_GENERATED
         ],
         group_id="supervisor-group",
@@ -251,7 +252,7 @@ async def main():
         ConsensusEngine,
         agent_name="consensus_engine",
         input_topics=[
-            Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE,
+            Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE,
             Topics.RULES_FEEDBACK, Topics.RULES_SYNTHESIZED, Topics.SYSTEM_HEARTBEAT,
             Topics.MACRO_ASSESSMENT, Topics.CORRELATIONS, Topics.INSIDER_CLUSTERS
         ],
@@ -265,7 +266,7 @@ async def main():
         AdversarialWargamerAgent,
         agent_name="adversarial_wargamer",
         input_topics=[
-            Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.SCENARIOS_GENERATED
+            Topics.RAW_NEWS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.SCENARIOS_GENERATED
         ],
         group_id="agent-adversarial-wargamer",
         shared_infra=shared_infra,
@@ -277,9 +278,21 @@ async def main():
         EdgeValidatorAgent,
         agent_name="edge_validator",
         input_topics=[
-            Topics.QUANT_DISCOVERIES, Topics.CORRELATIONS, Topics.INTEL_BRIEFS
+            Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.CORRELATIONS, Topics.INTEL_BRIEFS
         ],
         group_id="agent-edge-validator",
+        shared_infra=shared_infra,
+        model="qwen2.5:1.5b",
+        fallback_model="gemma3:1b",
+    )
+
+    stock_correlation_agent = build_agent(
+        StockCorrelationAgent,
+        agent_name="stock_correlation_agent",
+        input_topics=[
+            Topics.RAW_NEWS, Topics.ENRICHED_EVENTS, Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT, Topics.CORRELATIONS
+        ],
+        group_id="agent-stock-correlation",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
         fallback_model="gemma3:1b",
@@ -297,6 +310,7 @@ async def main():
         "consensus_engine":            consensus_engine,
         "adversarial_wargamer":        adversarial_wargamer,
         "edge_validator":              edge_validator_agent,
+        "stock_correlation_agent":     stock_correlation_agent,
 
         # Backwards-compatible Task Routing Aliases
         "yield_curve_agent":          macro_intelligence_engine,
@@ -309,9 +323,10 @@ async def main():
         "news_intel":                 knowledge_graph_engine,
         "ontology_master":            knowledge_graph_engine,
         "wargamer":                   adversarial_wargamer,
+        "stock_correlation":          stock_correlation_agent,
     }
 
-    logger.info(f"Consolidated Swarm built: 7 core engines live.")
+    logger.info(f"Consolidated Swarm built: 8 core engines live.")
     logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', 'llama3')}")
     logger.info("=" * 60)
 
@@ -328,6 +343,7 @@ async def main():
         ("consensus_engine", consensus_engine, "heavy"),
         ("adversarial_wargamer", adversarial_wargamer, "heavy"),
         ("edge_validator", edge_validator_agent, "fast"),
+        ("stock_correlation_agent", stock_correlation_agent, "fast"),
     ]
 
     active_agents = {

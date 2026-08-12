@@ -188,6 +188,7 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                         });
 
                         const isSanction = rel.includes('SANCTION') || targetId.includes('SANCTION');
+                        const isSympathy = rel.includes('SYMPATHY') || rel.includes('CORRELATED');
 
                         newEdges.push({
                             id: `e-${targetEntity}-${targetId}-${index}`,
@@ -195,8 +196,8 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                             target: targetId,
                             label: rel.replace(/_/g, ' '),
                             animated: true,
-                            style: { stroke: isSanction ? '#ef4444' : '#00f2fe', strokeWidth: 1.5 },
-                            labelStyle: { fill: '#67e8f9', fontWeight: 700, fontSize: 9 },
+                            style: { stroke: isSanction ? '#ef4444' : (isSympathy ? '#f59e0b' : '#00f2fe'), strokeWidth: isSympathy ? 2 : 1.5 },
+                            labelStyle: { fill: isSympathy ? '#fbbf24' : '#67e8f9', fontWeight: 700, fontSize: 9 },
                             labelBgStyle: { fill: '#06080d', color: '#00f2fe', fillOpacity: 0.85 },
                         });
                     });

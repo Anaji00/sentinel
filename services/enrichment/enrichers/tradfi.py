@@ -364,6 +364,12 @@ class TradFiEnricher:
             domain="tradfi",
             is_significant=anomaly >= 0.65,
         )
+        
+        summary_str = (
+            f"Institutional Market Intelligence for {ticker}: {direction_str} of ${notional:,.2f} at ${price:.2f} ({volume:,.0f} shares). "
+            f"Order Flow Imbalance: {ofi:+.2f}, VWAP: ${v_wap:.2f}, Kyle's Lambda: {k_lambda:.4f}, Amihud Illiquidity: {ami:.6f}. "
+            f"Anomaly Score: {anomaly:.2f}."
+        )
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
@@ -386,6 +392,7 @@ class TradFiEnricher:
                 index_membership=ref_data.get("index_membership", []) if ref_data else [],
             ),
             headline=f"🐋 {direction_str} | {ticker} ${notional/1e6:.2f}M | Anomaly: {anomaly:.2f}",
+            summary=summary_str,
             tags=tags,
             anomaly_score=anomaly,
             anomaly_breakdown=breakdown,
@@ -413,8 +420,7 @@ class TradFiEnricher:
             except Exception as e:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
-        if open_p == 0 or close_p == 0:
-            return []
+        if close_p <= 0 or volume <= 0: return None
 
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         if not is_watched:
@@ -467,7 +473,7 @@ class TradFiEnricher:
             
             entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
             direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
-            headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:.2f}% on ${notional/1e6:.1f}M vol"
+            headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:+.2f}% on ${notional/1e6:.1f}M vol"
     
             # Compute Parkinson volatility for the bar
             parkinson = quant_calc.parkinson_volatility([block["high"]], [block["low"]])
@@ -531,6 +537,8 @@ class TradFiEnricher:
                 domain="tradfi",
                 is_significant=anomaly >= 0.65,
             )
+            
+            bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson:.4f}. Anomaly Score: {anomaly:.2f}."
 
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
@@ -551,6 +559,7 @@ class TradFiEnricher:
                     close_price=block["close"]
                 ),
                 headline=headline,
+                summary=bar_summary,
                 tags=tags,
                 anomaly_score=anomaly,
                 anomaly_breakdown=breakdown,

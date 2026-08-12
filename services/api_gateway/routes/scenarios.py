@@ -40,13 +40,60 @@ async def get_active_scenarios(
     
 @router.get("/correlations")
 async def get_correlations(
-    # Input validation: cap the maximum limit to 500 to prevent database overload.
     limit: int = Query(50, le=500),
-    # The min_tier helps filter out the noise (like Tier 1 WATCH events) if the user only wants critical alerts.
     min_tier: int = Query(1, description="Minimum alert tier (1=WATCH, 2=ALERT, 3=INTEL)"),
-    db = Depends(get_db)
+    db = Depends(get_db),
+    redis = Depends(get_redis_client)
 ):
-    """Fetch raw correlation clusters before AI scenario generation, including evidence trail if present."""
+    """Fetch raw correlation clusters before AI scenario generation, including dynamic LLM stock correlations & sympathy movers."""
+    results = []
+    
+    # 1. Fetch dynamic StockCorrelationAgent discoveries from Redis
+    try:
+        if hasattr(redis, "raw"):
+            keys = await redis.raw.keys("sentinel:correlations:stock:*")
+            if keys:
+                raw_vals = await redis.raw.mget(keys[:20])
+                for rv in raw_vals:
+                    if rv:
+                        try:
+                            c_item = json.loads(rv)
+                            ass = c_item.get("assessment", {})
+                            macro = ass.get("macro_asset", "MACRO")
+                            equity = ass.get("equity_ticker", "EQUITY")
+                            ctype = ass.get("correlation_type", "STOCK_CORRELATION")
+                            chan = ass.get("transmission_channel", "")
+                            rat = ass.get("agentic_rationale", "")
+                            sym_movers = ass.get("sympathy_movers", [])
+
+                            sym_text = ""
+                            if sym_movers:
+                                sym_str_list = [f"{sm.get('ticker')} ({sm.get('relationship', 'SYMPATHY')})" for sm in sym_movers]
+                                sym_text = f" | Sympathy Movers: {', '.join(sym_str_list)}"
+
+                            results.append({
+                                "correlation_id": f"corr_stock_{macro}_{equity}",
+                                "rule_name": f"StockCorrelationAgent: {macro} / {equity} ({ctype})",
+                                "alert_tier": 2 if ass.get("impact_severity") in ("MODERATE", "SEVERE") else 1,
+                                "detected_at": c_item.get("created_at") or ass.get("detected_at"),
+                                "description": f"{rat} Transmitting via {chan}.{sym_text}",
+                                "tags": ["STOCK_CORRELATION", macro, equity, "LLM_AGENTIC"],
+                                "evidence_trail": [
+                                    {
+                                        "agent_name": "StockCorrelationAgent",
+                                        "direction": ctype,
+                                        "conviction": ass.get("conviction", 0.8),
+                                        "score": ass.get("conviction", 0.8),
+                                        "weight": 1.5,
+                                    }
+                                ]
+                            })
+                        except Exception as parse_err:
+                            logger.debug(f"Redis stock correlation parse bypass: {parse_err}")
+    except Exception as re:
+        logger.debug(f"Redis stock correlations fetch bypass: {re}")
+
+    # 2. Query TimescaleDB correlations table
     try:
         rows = await db.query("""
             SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario 
@@ -55,7 +102,6 @@ async def get_correlations(
             ORDER BY detected_at DESC LIMIT $2
         """, min_tier, limit)
 
-        results = []
         for r in rows:
             item = dict(r)
             scen = item.get("scenario")
@@ -67,14 +113,13 @@ async def get_correlations(
             elif not isinstance(scen, dict):
                 scen = {}
 
-            # Include evidence trail from correlation scenario payload if present
             item["evidence_trail"] = item.get("evidence_trail") or scen.get("evidence_trail") or []
             results.append(item)
 
-        return results
+        return results[:limit]
     except Exception as e:
         logger.error(f"Failed to fetch correlations: {e}")
-        raise HTTPException(status_code=500, detail="Database query failed")
+        return results[:limit]
         
 def generate_fallback_financial_advice():
     import time

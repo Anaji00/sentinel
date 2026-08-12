@@ -136,6 +136,16 @@ class CyberEnricher:
     async def enrich(self, raw: RawEvent) -> Optional[NormalizedEvent]:
         """Main entry point for enrichment."""
         await self.cyber_scorer.load_thresholds()
+        
+        # STRICT TEMPORAL FILTER: Drop historical legacy cyber events older than 30 days
+        if raw.occurred_at:
+            from datetime import timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            event_dt = raw.occurred_at if raw.occurred_at.tzinfo else raw.occurred_at.replace(tzinfo=timezone.utc)
+            if event_dt < cutoff:
+                logger.debug(f"Dropping stale cyber event from {raw.source}: {event_dt.isoformat()}")
+                return None
+
         src = raw.source
         
         if src in ("censys", "censys_monitor", "shadowserver_feed"): 

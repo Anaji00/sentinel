@@ -417,6 +417,43 @@ class MacroIntelligenceEngine(SentinelAgent):
         x_vec = [float(v) for v in raw_x]
         y_vec = [float(v) for v in raw_y]
 
+        # Dynamic Pearson Correlation Matrix calculation (Oil vs. Equities margin compression)
+        try:
+            x_arr = np.array(x_vec)
+            y_arr = np.array(y_vec)
+            x_returns = np.diff(np.log(np.maximum(1e-4, x_arr)))
+            y_returns = np.diff(np.log(np.maximum(1e-4, y_arr)))
+            if len(x_returns) >= 14:
+                corr_matrix = np.corrcoef(x_returns, y_returns)
+                pearson_corr = float(corr_matrix[0, 1])
+                if not np.isnan(pearson_corr) and pearson_corr <= -0.55:
+                    reasoning = f"Strong inverse correlation ({pearson_corr:.2f}) detected: Rising {macro_asset} (${x_vec[-1]:.2f}) is exerting margin pressure on {micro_ticker} (${y_vec[-1]:.2f})."
+                    logger.warning(f"🔴 DYNAMIC MACRO SHOCK | {reasoning}")
+                    await self.redis.raw.set(
+                        f"sentinel:macro:inverse_correlation:{macro_asset}:{micro_ticker}",
+                        json.dumps({
+                            "macro_asset": macro_asset,
+                            "equity_ticker": micro_ticker,
+                            "pearson_correlation": round(pearson_corr, 4),
+                            "macro_price": x_vec[-1],
+                            "equity_price": y_vec[-1],
+                            "context": reasoning,
+                            "detected_at": datetime.now(timezone.utc).isoformat()
+                        }),
+                        ex=3600
+                    )
+                    # Publish AgentBulletin
+                    safe_create_task(self.publish_bulletin(
+                        bulletin_type="alert",
+                        summary=f"Oil/Equity Decoupling ({macro_asset} vs {micro_ticker}): Pearson Corr {pearson_corr:.2f}",
+                        conviction=abs(pearson_corr),
+                        expected_direction="bearish",
+                        payload={"macro_asset": macro_asset, "equity": micro_ticker, "correlation": pearson_corr, "reasoning": reasoning},
+                        ttl_seconds=3600,
+                    ))
+        except Exception as corr_err:
+            logger.debug(f"Pearson correlation calculation error for {macro_asset}/{micro_ticker}: {corr_err}")
+
         # Use robust quant_calc Engle-Granger module
         eg_result = quant_calc.engle_granger_cointegration(x_vec, y_vec)
         if eg_result.get("is_cointegrated"):

@@ -70,10 +70,12 @@ async def get_entity_graph(
     """Find 1st-degree connections for a specific entity in Neo4j or dynamic TimescaleDB event graph."""
     try:
         query = """
-        MATCH (n:Entity)
-        WHERE toLower(n.id) = toLower($entity_id) OR toLower(n.name) = toLower($entity_id)
+        MATCH (n)
+        WHERE toLower(n.id) = toLower($entity_id) OR toLower(n.name) = toLower($entity_id) OR toLower(n.ticker) = toLower($entity_id)
         MATCH (n)-[r]-(connected)
-        RETURN n.name as source_name, n.type as source_type, type(r) as relationship, connected.id as target_id, connected.name as target_name, connected.type as target_type
+        RETURN coalesce(n.name, n.id) as source_name, coalesce(n.type, 'ENTITY') as source_type, 
+               type(r) as relationship, connected.id as target_id, coalesce(connected.name, connected.id) as target_name, 
+               coalesce(connected.type, 'ENTITY') as target_type
         LIMIT 50
         """
         connections = await graph.query(query, {"entity_id": entity_id})
@@ -85,7 +87,7 @@ async def get_entity_graph(
             FROM events
             WHERE (LOWER(primary_entity_id) LIKE $1 OR LOWER(primary_entity_name) LIKE $1 OR LOWER(region) LIKE $1)
             ORDER BY occurred_at DESC
-            LIMIT 12
+            LIMIT 25
             """
             search_param = f"%{entity_id.lower()}%"
             db_rows = await db.query(db_query, search_param)
@@ -137,8 +139,8 @@ async def get_shortest_path(
                 RETURN nodes(path) AS entities, relationships(path) AS relations
                 """
                 results = await graph.query(apoc_query, {"source_id": source_id, "target_id": target_id})
-            except Exception:
-                pass
+            except Exception as apoc_err:
+                logger.debug(f"APOC shortest path query bypass: {apoc_err}")
 
         if not results:
             # Dynamic fallback: query TimescaleDB co-occurrence events
