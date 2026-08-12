@@ -47,8 +47,9 @@ const ASSET_REGISTRY: AssetConfig[] = [
   { symbol: 'ETHUSD', title: 'ETHEREUM / USD PERPETUAL', subtitle: 'Smart Contract Platform Benchmark', category: 'crypto', color: '#6366f1', badgeText: 'CRYPTO MARK' },
 
   // Treasury Bonds
-  { symbol: 'US10Y', title: '10Y TREASURY YIELD RATE', subtitle: 'US Benchmark Sovereign Debt Yield %', category: 'bonds', color: '#10b981', badgeText: 'SOVEREIGN RATE' },
-  { symbol: 'US02Y', title: '2Y TREASURY YIELD RATE', subtitle: 'US Short-Term Policy Yield %', category: 'bonds', color: '#06b6d4', badgeText: 'POLICY RATE' },
+  { symbol: 'US30Y', title: '30Y TREASURY YIELD RATE', subtitle: 'US Long-Term Sovereign Debt Yield %', category: 'bonds', color: '#10b981', badgeText: 'LONG BOND RATE' },
+  { symbol: 'US10Y', title: '10Y TREASURY YIELD RATE', subtitle: 'US Benchmark Sovereign Debt Yield %', category: 'bonds', color: '#00f2fe', badgeText: 'SOVEREIGN RATE' },
+  { symbol: 'US02Y', title: '2Y TREASURY YIELD RATE', subtitle: 'US Short-Term Policy Yield %', category: 'bonds', color: '#a855f7', badgeText: 'POLICY RATE' },
   { symbol: 'TLT', title: 'iSHARES 20+ Y TREASURY BOND', subtitle: 'Long-Term Debt Duration ETF', category: 'bonds', color: '#14b8a6', badgeText: 'BOND ETF' },
 ];
 
@@ -216,7 +217,7 @@ export default function ChartsPage() {
 
   // Live polling every 3 seconds from backend market-series route
   const { data: marketData } = useSWR<MarketSeriesResponse>(
-    '/radar/market-series?symbols=SPY,QQQ,DJI,VIX,WTI,BRENT,BTCUSD,ETHUSD,TLT,US10Y,US02Y,GLD&limit=60',
+    '/radar/market-series?symbols=SPY,QQQ,DJI,VIX,WTI,BRENT,BTCUSD,ETHUSD,TLT,US30Y,US10Y,US02Y,GLD&limit=60',
     fetcher,
     { refreshInterval: 3000 }
   );
@@ -228,7 +229,7 @@ export default function ChartsPage() {
     { id: 'futures', label: 'STOCK FUTURES (SPY, QQQ, DJI, VIX)' },
     { id: 'commodities', label: 'ENERGY & COMMODITIES (WTI, BRENT, GLD)' },
     { id: 'crypto', label: 'CRYPTO MARK (BTC, ETH)' },
-    { id: 'bonds', label: 'TREASURY BONDS (10Y, 2Y, TLT)' },
+    { id: 'bonds', label: 'TREASURY BONDS (30Y, 10Y, 2Y, TLT)' },
   ];
 
   const filteredRegistry = useMemo(() => {

@@ -35,6 +35,7 @@ from shared.db import get_redis, get_timescale
 from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
 from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
+from shared.utils.streaming_detectors import FirstStoryDetector
 from shared.utils.tasks import safe_create_task
 
 _dynamic_rules_cache = {}

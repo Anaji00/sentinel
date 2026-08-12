@@ -198,7 +198,8 @@ async def main():
         agent_name="knowledge_graph_engine",
         input_topics=[
             Topics.RAW_NEWS, Topics.ENRICHED_EVENTS, Topics.UNKNOWN_ENTITIES,
-            Topics.CORRELATIONS, Topics.ONTOLOGY_PROPOSALS
+            Topics.CORRELATIONS, Topics.ONTOLOGY_PROPOSALS, Topics.QUANT_DISCOVERIES,
+            Topics.MACRO_ASSESSMENT, Topics.SCENARIOS_GENERATED
         ],
         group_id="agent-knowledge-graph",
         shared_infra=shared_infra,

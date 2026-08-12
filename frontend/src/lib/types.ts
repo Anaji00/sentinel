@@ -161,9 +161,15 @@ export interface SecurityData {
 
 export interface PredictionMarketData {
     ticker: string;
+    market_id?: string;
     title?: string;
+    question?: string;
+    outcome?: string;
     category?: string;
     total_volume?: number;
+    shares_traded?: number;
+    notional_usd?: number;
+    price_usd?: number;
     volume_24h?: number;
     yes_bid?: number;
     no_bid?: number;

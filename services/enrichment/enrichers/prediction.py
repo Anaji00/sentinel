@@ -37,10 +37,16 @@ class PredictionEnricher:
     async def _enrich_polymarket(self, raw, p) -> Optional[NormalizedEvent]:
         label = p.get("asset_label", "UNKNOWN | UNKNOWN | UNKNOWN")
         parts = label.split(" | ")
-        slug = parts[0] if len(parts) > 0 else label
-        question = parts[1] if len(parts) > 1 else "UNKNOWN QUESTION"
-        outcome = parts[2] if len(parts) > 2 else "UNKNOWN OUTCOME"
+        raw_slug = parts[0] if len(parts) > 0 else label
+        question = parts[1] if len(parts) > 1 and parts[1] != "UNKNOWN QUESTION" else p.get("question", "UNKNOWN QUESTION")
+        outcome = parts[2] if len(parts) > 2 else p.get("outcome_name", "UNKNOWN OUTCOME")
         
+        # Clean slug to avoid generic string splits like 'tradfi' or 'prediction_market'
+        if raw_slug.lower() in ("tradfi", "prediction_market", "prediction", "unknown"):
+            slug = p.get("ticker") or p.get("market_id") or (question[:30].replace(" ", "-") if question != "UNKNOWN QUESTION" else "PREDICTION-CONTRACT")
+        else:
+            slug = raw_slug
+
         notional = float(p.get("notional_usd", 0))
         shares = float(p.get("size_shares", 0))
         price = float(p.get("price", 0))
@@ -64,19 +70,22 @@ class PredictionEnricher:
         # Classify volume-based anomaly vs routine odds update
         tags = ["prediction_market", slug.lower()]
         is_volume_anomaly = notional >= 10000 or anomaly_score >= 0.70
+        display_contract = question if question != "UNKNOWN QUESTION" else slug.upper()
+
         if is_volume_anomaly:
             tags.extend(["volume_spike", "whale_bet"])
-            headline = f"🐋 POLYMARKET WHALE BET on {slug.upper()}: ${notional:,.2f} ({outcome})"
+            headline = f"🐋 POLYMARKET WHALE BET: {display_contract} (${notional:,.2f}) — {outcome}"
         else:
             tags.append("odds_update")
-            headline = f"🎯 POLYMARKET ODDS: {slug.upper()} ({outcome})"
+            headline = f"🎯 POLYMARKET ODDS: {display_contract} ({outcome})"
 
         try:
             await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
         except Exception:
             pass
         
-        entity = Entity(id=label, type=EntityType.INSTRUMENT, name=label)
+        entity_name = display_contract if display_contract != "UNKNOWN QUESTION" else slug
+        entity = Entity(id=slug, type=EntityType.INSTRUMENT, name=entity_name)
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,

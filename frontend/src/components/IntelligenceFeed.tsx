@@ -30,6 +30,9 @@ interface CorrelationCluster {
 // Helper to derive clean domain tag + icon
 function getDomainMeta(type: string): { label: string; icon: string; badgeStyle: string } {
     const t = (type || '').toLowerCase();
+    if (t.includes('pred') || t.includes('poly') || t.includes('kalshi')) {
+        return { label: 'PREDICTION', icon: '🎯', badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10' };
+    }
     if (t.includes('earnings')) {
         return { label: 'EARNINGS', icon: '📅', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
     }
@@ -39,17 +42,17 @@ function getDomainMeta(type: string): { label: string; icon: string; badgeStyle:
     if (t.includes('vessel') || t.includes('maritime') || t.includes('ais')) {
         return { label: 'MARITIME', icon: '🚢', badgeStyle: 'text-cyan-400 border-cyan-500/40 bg-cyan-500/10' };
     }
+    if (t.includes('flight') || t.includes('aviation') || t.includes('adsb')) {
+        return { label: 'AVIATION', icon: '✈️', badgeStyle: 'text-blue-400 border-blue-500/40 bg-blue-500/10' };
+    }
     if (t.includes('cyber') || t.includes('bgp') || t.includes('breach')) {
         return { label: 'CYBER', icon: '🔐', badgeStyle: 'text-rose-400 border-rose-500/40 bg-rose-500/10' };
     }
-    if (t.includes('market') || t.includes('tradfi') || t.includes('stock') || t.includes('equity') || t.includes('option')) {
-        return { label: 'TRADFI', icon: '📈', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
-    }
-    if (t.includes('crypto') || t.includes('token') || t.includes('wallet')) {
+    if (t.includes('crypto') || t.includes('token') || t.includes('wallet') || t.includes('blockchain') || t.includes('perp')) {
         return { label: 'CRYPTO', icon: '₿', badgeStyle: 'text-amber-400 border-amber-500/40 bg-amber-500/10' };
     }
-    if (t.includes('pred') || t.includes('poly') || t.includes('kalshi')) {
-        return { label: 'PREDICTION', icon: '🎯', badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10' };
+    if (t.includes('tradfi') || t.includes('stock') || t.includes('equity') || t.includes('option') || t.includes('market')) {
+        return { label: 'TRADFI', icon: '📈', badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' };
     }
     return { label: 'NEWS', icon: '📰', badgeStyle: 'text-slate-300 border-slate-700 bg-slate-800' };
 }
@@ -72,6 +75,21 @@ function getCleanSource(e: NormalizedEvent): string {
 
 // Helper to format clean English titles for events
 function formatEnglishHeadline(e: NormalizedEvent): string {
+    const rawHeadline = e.headline || '';
+    
+    // Sanitize any raw string split artifacts like 'tradfi | prediction_market' or 'tradfi - prediction market'
+    if (rawHeadline.includes('tradfi | prediction') || rawHeadline.includes('tradfi - prediction')) {
+        const cleaned = rawHeadline.replace(/tradfi\s*[|\-]\s*prediction_market/gi, 'Prediction Market');
+        return cleaned;
+    }
+    
+    if (e.prediction_market_data?.question) {
+        const pm = e.prediction_market_data;
+        const sideStr = pm.outcome ? ` (${pm.outcome})` : '';
+        const qUpper = (pm.question || '').toUpperCase();
+        return `🎯 PREDICTION MARKET: ${qUpper}${sideStr} — Notional: $${(pm.notional_usd || 0).toLocaleString()}`;
+    }
+
     const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || '';
     const isRawId = (str?: string) => !str || str.startsWith('Event ') || Boolean(str.match(/^[0-9a-f]{8}-[0-9a-f]{4}/i));
     
@@ -97,14 +115,14 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
     if (t.includes('cyber') || t.includes('bgp')) {
         return `BGP routing hijack anomaly on ${entityName || 'Network Target'}`;
     }
-    if (t.includes('tradfi') || t.includes('market')) {
-        return `Equity market volume anomaly on ${entityName || 'Ticker'}`;
-    }
-    if (t.includes('crypto')) {
-        return `Large cryptocurrency transaction for ${entityName || 'Asset'}`;
-    }
     if (t.includes('pred')) {
         return `Prediction market probability move for ${entityName || 'Contract'}`;
+    }
+    if (t.includes('crypto')) {
+        return `Cryptocurrency market anomaly on ${entityName || 'Asset'}`;
+    }
+    if (t.includes('tradfi') || t.includes('market')) {
+        return `Equity market volume anomaly on ${entityName || 'Ticker'}`;
     }
     
     return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Asset Target'}${regionStr}`;

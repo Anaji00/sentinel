@@ -463,6 +463,10 @@ services:
     container_name: sentinel-frontend
     ports:
       - "3000:3000"
+    environment:
+      - API_GATEWAY_URL=http://api-gateway:8000
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - API_GATEWAY_KEY=${API_GATEWAY_KEY:-sentinel-dev-key-2026}
     restart: always
     depends_on:
       api-gateway:

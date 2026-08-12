@@ -111,15 +111,17 @@ SYMBOL_YAF_MAP = {
     "WTI": "CL=F",
     "BRENT": "BZ=F",
     "GLD": "GLD",
+    "US30Y": "^TYX",
     "US10Y": "^TNX",
-    "US02Y": "2YR",
+    "US02Y": "2YY=X",
     "TLT": "TLT",
 }
 
-async def fetch_on_the_spot_historical(symbol: str, limit: int = 60):
+async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = None):
     """
     Fetches real authentic historical price series on the spot from public APIs
     if no events currently persist in TimescaleDB for the requested symbol.
+    Queries live Redis cache for latest collector quotes if external APIs are rate-limited.
     """
     symbol_upper = symbol.upper()
     
@@ -180,6 +182,22 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60):
     except Exception as e:
         logger.debug(f"Yahoo Finance historical fetch failed for {symbol}: {e}")
 
+    # 3. Check Live Redis Collector Cache for authentic price
+    if redis:
+        try:
+            cached_p = await redis.raw.get(f"sentinel:quotes:latest:{symbol_upper}")
+            if cached_p:
+                val = float(cached_p)
+                now_str = datetime.now(timezone.utc).isoformat()
+                return [{
+                    "timestamp": now_str,
+                    "price": val,
+                    "volume": 1000.0,
+                    "anomaly_score": 0.0
+                }]
+        except Exception as e:
+            logger.debug(f"Redis latest quote fetch failed for {symbol}: {e}")
+
     return []
 
 
@@ -187,7 +205,8 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60):
 async def get_market_series(
     symbols: Optional[str] = Query(None, description="Comma-separated symbols, e.g. TLT,IEF,SHY,BTCUSD,SPY,QQQ"),
     limit: int = Query(60, ge=10, le=300),
-    db = Depends(get_db)
+    db = Depends(get_db),
+    redis = Depends(get_redis_client)
 ):
     """Retrieve intraday price series & financial telemetry for Bond Yields, BTC, SPY, QQQ."""
     target_symbols = [s.strip().upper() for s in (symbols.split(",") if symbols else ["TLT", "IEF", "SHY", "BTCUSD", "SPY", "QQQ"])]
@@ -232,7 +251,7 @@ async def get_market_series(
     for sym in target_symbols:
         if sym not in series_data or len(series_data[sym]) < 5:
             missing_symbols.append(sym)
-            fetch_tasks.append(fetch_on_the_spot_historical(sym, limit))
+            fetch_tasks.append(fetch_on_the_spot_historical(sym, limit, redis))
 
     if fetch_tasks:
         results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
