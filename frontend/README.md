@@ -1,36 +1,44 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Sentinel Radar Dashboard (Frontend)
 
-## Getting Started
+The **Sentinel Frontend** is an enterprise, high-throughput tactical radar interface built with **Next.js 14**, **React**, **Deck.gl**, **Recharts**, and **TailwindCSS**. It renders real-time streaming telemetry, 3D geographic threat visualizations, quantitative financial risk models, AI agent swarm telemetry, and interactive graph exploration.
 
-First, run the development server:
+---
+
+## 🚀 Getting Started
+
+### 1. Installation & Local Development
+
+Run the development server locally:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open **`http://localhost:3000`** in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 🎨 Component & Dashboard Architecture
 
-## Learn More
+- **`GlobalMap.tsx`**: Deck.gl 3D Globe & Map supporting real-time AIS vessel positions, ADSB flight vectors, strategic trade chokepoints, and active geopolitical conflict theaters.
+- **`FinancialAdvisorAdvice.tsx`**: Interactive AI Financial Advisor dashboard with quarter-Kelly position sizing, VaR 95% / CVaR 99% portfolio metrics, RSI / EMA / ATR technical indicators, and single-click paper order execution via Alpaca execution bridge.
+- **`QuantRadarPanel.tsx`**: Real-time volume anomaly radar sweeps and watchlist management.
+- **`CryptoAnalytics.tsx`**: Perpetual swaps volatility and candle analytics.
+- **`DarkPoolFlowPanel.tsx`**: Options sweep flow and institutional dark pool tracking.
+- **`CyberIntelligencePanel.tsx`**: BGP hijacking alerts, IP threat scoring, and CVE mapping.
+- **`PredictionMarketPanel.tsx`**: Polymarket and Kalshi real-time odds probability streams.
+- **`OsintThreatMatrix.tsx`**: OSINT news intelligence and cross-domain entity correlation matrix.
+- **`GraphExplorer.tsx`**: Neo4j & TimescaleDB 2D/3D entity relationship graph viewer.
+- **`AgentSwarmTelemetry.tsx`**: Real-time agent decision log inspector and LLM model status HUD.
+- **`CommandCenterGrid.tsx`**: Multi-panel tactical command center grid.
+- **`SystemHealthHUD.tsx`**: Real-time WebSocket connection status, database latency, and time-zone HUD.
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## 🛠️ Environment Configuration
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Environment Variable | Description | Default |
+| :--- | :--- | :--- |
+| `NEXT_PUBLIC_API_URL` | Fast API Gateway REST URL | `http://localhost:8000` |
+| `API_GATEWAY_KEY` | Development API Key | `sentinel-dev-key-2026` |

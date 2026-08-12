@@ -1,0 +1,449 @@
+"""
+tests/test_quant_and_trading.py
+
+Consolidated Test Suite: Quantitative Math, Trading Engine, Financial Advisor, Market Microstructure & RefData.
+Combines:
+  - test_quant_calc.py
+  - test_quant_trading_engine.py
+  - test_financial_advisor.py
+  - test_quant_financial_advisor_correlation.py
+  - test_equities.py
+  - test_watched_equities_candles.py
+  - test_microstructure_and_refdata.py
+"""
+
+import math
+import asyncio
+import numpy as np
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone
+
+from shared.utils import quant_calc
+from shared.utils.equities import (
+    is_valid_primary_equity, fast_classify_equity, ALLOWED_CRYPTO_TOKENS, is_valid_primary_equity_async
+)
+from shared.utils.cyber_mapper import map_cve_to_equity
+from shared.utils.candles import evaluate_multi_timeframe, TIMEFRAMES_MINUTES, get_domain_tag
+from shared.models.events import NormalizedEvent, EventType, Entity, FinancialData, ScoreAdjustment
+from services.agents.quant_trading_engine import (
+    QuantTradingEngine, QuantTradingEngine as FinancialAdvisorAgent,
+    compute_ta_indicators, TradingSignal, FinancialAdviceBrief
+)
+
+
+# ── 1. VOLATILITY ESTIMATORS & QUANT MATH ────────────────────────────────────
+
+def test_ewma_volatility_math():
+    returns = [0.01, -0.02, 0.015, -0.005, 0.02, -0.01, 0.008]
+    vol_daily = quant_calc.ewma_volatility(returns, lam=0.94, annualize=False)
+    vol_annual = quant_calc.ewma_volatility(returns, lam=0.94, annualize=True)
+    assert vol_daily > 0.0
+    assert abs(vol_annual - vol_daily * math.sqrt(252)) < 1e-4
+
+def test_ewma_volatility_edge_cases():
+    assert quant_calc.ewma_volatility([]) == 0.0
+    assert quant_calc.ewma_volatility([0.01]) == 0.0
+
+def test_garch_volatility_math():
+    returns = [0.01, -0.02, 0.015, -0.005, 0.02, -0.01, 0.008, 0.012, -0.015]
+    vol = quant_calc.garch_volatility(returns, omega=1e-5, alpha=0.1, beta=0.85, annualize=False)
+    assert vol > 0.0
+
+def test_garch_volatility_edge_cases():
+    assert quant_calc.garch_volatility([]) == 0.0
+
+def test_parkinson_volatility_math():
+    highs = [102.0, 105.0, 104.0, 106.0, 108.0]
+    lows = [98.0, 101.0, 100.0, 102.0, 103.0]
+    vol = quant_calc.parkinson_volatility(highs, lows)
+    assert vol > 0.0
+
+def test_parkinson_volatility_invalid():
+    assert quant_calc.parkinson_volatility([], []) == 0.0
+    assert quant_calc.parkinson_volatility([100.0], [105.0]) == 0.0
+
+def test_yang_zhang_volatility_math():
+    opens = [100.0, 102.0, 103.0, 105.0]
+    highs = [103.0, 104.0, 106.0, 107.0]
+    lows = [99.0, 101.0, 102.0, 104.0]
+    closes = [102.0, 103.0, 105.0, 106.0]
+    vol = quant_calc.yang_zhang_volatility(opens, highs, lows, closes)
+    assert vol > 0.0
+
+
+# ── 2. POSITION SIZING & RISK METRICS ─────────────────────────────────────────
+
+def test_kelly_criterion_full_and_half():
+    f_full = quant_calc.kelly_criterion(win_probability=0.60, win_loss_ratio=2.0, half_kelly=False)
+    f_half = quant_calc.kelly_criterion(win_probability=0.60, win_loss_ratio=2.0, half_kelly=True)
+    assert abs(f_full - 0.40) < 1e-3
+    assert abs(f_half - 0.20) < 1e-3
+
+def test_kelly_criterion_negative_ev():
+    f_neg = quant_calc.kelly_criterion(win_probability=0.30, win_loss_ratio=1.0)
+    assert f_neg == 0.0
+
+def test_var_historical():
+    returns = [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05]
+    var_90 = quant_calc.var_historical(returns, confidence=0.90, position_value=10000.0)
+    assert var_90 > 0.0
+
+def test_cvar_historical():
+    returns = [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05]
+    var_90 = quant_calc.var_historical(returns, confidence=0.90, position_value=10000.0)
+    cvar_90 = quant_calc.cvar_historical(returns, confidence=0.90, position_value=10000.0)
+    assert cvar_90 >= var_90
+
+
+# ── 3. PERFORMANCE RATIOS & DRAWDOWN ──────────────────────────────────────────
+
+def test_sharpe_ratio():
+    returns = [0.01, 0.02, -0.005, 0.015, 0.01, -0.01, 0.025]
+    sr = quant_calc.sharpe_ratio(returns, risk_free_rate=0.02)
+    assert isinstance(sr, float)
+
+def test_max_drawdown():
+    prices = [100.0, 110.0, 120.0, 90.0, 105.0, 130.0, 80.0, 100.0]
+    mdd, peak, trough = quant_calc.max_drawdown(prices)
+    assert abs(mdd) > 0.30
+
+def test_calmar_ratio():
+    prices = [100.0, 110.0, 120.0, 90.0, 105.0, 130.0]
+    returns = [0.1, 0.09, -0.25, 0.166, 0.238]
+    cr = quant_calc.calmar_ratio(returns, prices)
+    assert cr > 0.0
+
+
+# ── 4. TIME SERIES & STATISTICAL TESTS ────────────────────────────────────────
+
+def test_augmented_dickey_fuller_stationary():
+    np.random.seed(42)
+    stationary = list(np.random.normal(0, 1, 100))
+    res = quant_calc.augmented_dickey_fuller(stationary)
+    assert res["is_stationary"] is True
+    assert res["adf_statistic"] < -2.86
+
+def test_engle_granger_cointegration_pair():
+    np.random.seed(42)
+    x = list(np.cumsum(np.random.normal(0, 1, 100)))
+    y = list(2.0 * np.array(x) + np.random.normal(0, 0.5, 100))
+    res = quant_calc.engle_granger_cointegration(x, y)
+    assert res["is_cointegrated"] is True
+    assert abs(res["beta"] - 2.0) < 0.2
+    assert res["critical_5pct"] < -3.30
+    assert res["adf_statistic"] < res["critical_5pct"]
+
+def test_granger_causality_pair():
+    np.random.seed(42)
+    x = np.random.normal(0, 1, 100)
+    y = np.zeros(100)
+    for i in range(1, 100):
+        y[i] = 0.8 * x[i - 1] + np.random.normal(0, 0.1)
+    res = quant_calc.granger_causality(list(x), list(y), max_lag=3)
+    assert res["x_granger_causes_y"] is True
+    assert res["degraded"] is False
+
+def test_granger_causality_degraded():
+    res = quant_calc.granger_causality([1.0, 2.0], [1.0, 2.0], max_lag=3)
+    assert res["degraded"] is True
+    assert res["x_granger_causes_y"] is False
+
+def test_hurst_exponent_bounds():
+    np.random.seed(42)
+    series = list(np.cumsum(np.random.normal(0, 1, 100)))
+    h = quant_calc.hurst_exponent(series)
+    assert 0.0 <= h <= 1.0
+
+
+# ── 5. MICROSTRUCTURE & LIQUIDITY METRICS ────────────────────────────────────
+
+def test_kyle_lambda():
+    price_changes = [0.5, -0.2, 0.8, -0.4, 0.3]
+    order_flows = [100.0, -50.0, 150.0, -80.0, 60.0]
+    kl = quant_calc.kyle_lambda(price_changes, order_flows)
+    assert kl >= 0.0
+
+def test_amihud_illiquidity():
+    returns = [0.02, -0.01, 0.03, -0.02]
+    volumes = [1_000_000, 800_000, 1_200_000, 900_000]
+    ami = quant_calc.amihud_illiquidity(returns, volumes)
+    assert ami > 0.0
+
+def test_cusum_change_detection():
+    np.random.seed(42)
+    series = list(np.random.normal(0, 1, 50)) + list(np.random.normal(5, 1, 50))
+    res = quant_calc.cusum_change_detection(series, threshold=4.0)
+    assert isinstance(res, list)
+    assert len(res) > 0
+
+def test_vwap_and_twap():
+    prices = [100.0, 102.0, 101.0, 103.0]
+    volumes = [100, 200, 150, 250]
+    v = quant_calc.vwap(prices, volumes)
+    t = quant_calc.twap(prices)
+    assert round(t, 2) == 101.50
+    assert v > 0.0
+
+
+# ── 6. CALIBRATION & ADVANCED QUANT METRICS ──────────────────────────────────
+
+def test_engle_granger_cointegration_small_spread_std():
+    np.random.seed(42)
+    x = list(np.linspace(100.0, 110.0, 100))
+    noise = np.random.normal(0, 1e-5, 100)
+    y = list(1.5 * np.array(x) + noise)
+    res = quant_calc.engle_granger_cointegration(x, y)
+    assert res["spread_std"] > 0.0
+    assert res["spread_std"] < 1e-3
+
+def test_black_litterman_optimization():
+    market_caps = {"AAPL": 3.0e12, "MSFT": 2.8e12, "NVDA": 2.5e12}
+    cov_matrix = [[0.04, 0.02, 0.025], [0.02, 0.035, 0.02], [0.025, 0.02, 0.05]]
+    views_matrix = [[1.0, 0.0, -1.0]]
+    view_returns = [0.05]
+    view_uncertainties = [0.01]
+
+    res = quant_calc.black_litterman_optimization(
+        market_caps=market_caps, cov_matrix=cov_matrix, views_matrix=views_matrix,
+        view_returns=view_returns, view_uncertainties=view_uncertainties,
+    )
+    assert "expected_returns" in res
+    assert "optimal_weights" in res
+    assert len(res["optimal_weights"]) == 3
+
+def test_garch_volatility_cone():
+    closes = [100.0 + i * 0.5 + ((-1) ** i) * 1.2 for i in range(50)]
+    highs = [c + 1.5 for c in closes]
+    lows = [c - 1.5 for c in closes]
+
+    cone = quant_calc.garch_volatility_cone(closes, highs, lows, horizon_hours=24)
+    assert "cond_volatility_pct" in cone
+    assert cone["tp1_sigma_1_0"] > closes[-1]
+
+def test_microstructure_stop_distance():
+    mult_normal = quant_calc.microstructure_stop_distance(atr=2.5, ofi=0.1, kyle_lambda=0.2)
+    mult_tight = quant_calc.microstructure_stop_distance(atr=2.5, ofi=-0.70, kyle_lambda=2.5)
+    assert mult_normal == 1.5
+    assert mult_tight == 0.5
+
+def test_hawkes_risk_multiplier():
+    mult_low = quant_calc.hawkes_risk_multiplier(hawkes_intensity=1.2)
+    mult_high = quant_calc.hawkes_risk_multiplier(hawkes_intensity=3.5)
+    assert mult_low == 1.0
+    assert mult_high < 1.0
+
+def test_moving_average_distances():
+    closes = [100.0 + i * 0.5 for i in range(220)]
+    res = quant_calc.moving_average_distances(closes)
+    assert res["sma_20"] is not None
+    assert res["dist_sma_20_pct"] > 0
+    assert res["ma_alignment"] == "BULLISH_STACK"
+
+
+# ── 7. PRIMARY EQUITIES & ASSET CLASSIFICATION ────────────────────────────────
+
+def test_clean_primary_equities():
+    valid_tickers = ["AAPL", "NVDA", "MSFT", "INTC", "TSLA", "PLTR", "AMZN", "GOOGL", "META"]
+    for ticker in valid_tickers:
+        assert is_valid_primary_equity(ticker) is True
+        res = fast_classify_equity(ticker)
+        assert res["is_primary_equity"] is True
+        assert res["asset_class"] == "PRIMARY_COMMON_EQUITY"
+
+def test_btc_crypto_exception():
+    for token in ALLOWED_CRYPTO_TOKENS:
+        assert is_valid_primary_equity(token) is True
+        res = fast_classify_equity(token)
+        assert res["is_primary_equity"] is True
+
+def test_single_stock_leveraged_etfs_exclusion():
+    leveraged_tickers = ["IONZ", "IONU", "IOND", "NVDL", "TSLL", "TSLZ", "AAPU", "MSTZ"]
+    for ticker in leveraged_tickers:
+        assert is_valid_primary_equity(ticker) is False
+        res = fast_classify_equity(ticker)
+        assert res["is_primary_equity"] is False
+
+def test_yieldmax_option_funds_exclusion():
+    yieldmax_tickers = ["NVDY", "CONY", "TSLY", "AMZY", "MSTY", "APLY"]
+    for ticker in yieldmax_tickers:
+        assert is_valid_primary_equity(ticker) is False
+
+def test_broad_leveraged_etfs_exclusion():
+    broad_leveraged = ["TQQQ", "SQQQ", "SOXL", "SOXS", "UPRO", "SPXU", "FNGU", "BULZ"]
+    for ticker in broad_leveraged:
+        assert is_valid_primary_equity(ticker) is False
+
+def test_volatility_etns_exclusion():
+    vol_etns = ["UVXY", "SVIX", "UVIX", "VIXY", "VXX"]
+    for ticker in vol_etns:
+        assert is_valid_primary_equity(ticker) is False
+
+
+# ── 8. QUANT TRADING ENGINE & CVE MAPPER ──────────────────────────────────────
+
+def test_map_cve_to_equity():
+    ticker, risk_type = map_cve_to_equity("CVE-2026-16812", vendor_name="microsoft")
+    assert ticker == "MSFT"
+    assert risk_type == "DIRECT_VENDOR_VULNERABILITY"
+
+    ticker, risk_type = map_cve_to_equity("CVE-2026-16812", vendor_name="Palo Alto Networks")
+    assert ticker == "PANW"
+
+    ticker, risk_type = map_cve_to_equity("CVE-2026-16812", vendor_name="unknown_home_router")
+    assert ticker is None
+
+def test_quant_engine_rejects_unmapped_cve():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw.exists = AsyncMock(return_value=0)
+        agent = QuantTradingEngine(
+            agent_name="quant_trading", input_topics=["events.enriched"],
+            redis_client=redis_mock, db_client=MagicMock(), neo4j_client=MagicMock(),
+            producer=AsyncMock(), consumer=AsyncMock(), dlq=AsyncMock()
+        )
+        agent._process_peer_discovery = AsyncMock()
+        agent._process_trading_advisory = AsyncMock()
+
+        unmapped_cve_msg = {
+            "agent_run_id": "quant_CVE-2026-16812_x",
+            "trigger": {"ticker": "CVE-2026-16812", "anomaly_score": 0.7},
+            "primary_entity": {"id": "CVE-2026-16812"}
+        }
+        result = await agent.handle(unmapped_cve_msg)
+        assert result is None
+        agent._process_peer_discovery.assert_not_called()
+
+    asyncio.run(run_test())
+
+def test_quant_engine_positive_path_real_ticker():
+    async def run_test():
+        redis_mock = MagicMock()
+        redis_mock.raw.exists = AsyncMock(return_value=0)
+        agent = QuantTradingEngine(
+            agent_name="quant_trading", input_topics=["events.enriched"],
+            redis_client=redis_mock, db_client=MagicMock(), neo4j_client=MagicMock(),
+            producer=AsyncMock(), consumer=AsyncMock(), dlq=AsyncMock()
+        )
+        agent._process_peer_discovery = AsyncMock(return_value={"discovery": "ok"})
+        agent._process_trading_advisory = AsyncMock(return_value={"advisory": "ok"})
+
+        real_ticker_msg = {
+            "agent_run_id": "quant_NVDA_1",
+            "trigger": {"ticker": "NVDA", "anomaly_score": 0.75},
+            "primary_entity": {"id": "NVDA"}
+        }
+        result = await agent.handle(real_ticker_msg)
+        assert result == {"advisory": "ok"}
+
+    asyncio.run(run_test())
+
+
+# ── 9. FINANCIAL ADVISOR TA & SCHEDULED REVIEW ────────────────────────────────
+
+def test_compute_ta_indicators_mathematics():
+    closes = [10.0 + i for i in range(20)]
+    highs = [c + 0.5 for c in closes]
+    lows = [c - 0.5 for c in closes]
+    indicators = compute_ta_indicators(closes, highs, lows)
+
+    assert "rsi" in indicators
+    assert indicators["rsi"] > 50.0
+    assert abs(indicators["fib_levels"]["0.500"] - 19.5) < 1e-5
+
+def test_financial_advisor_scheduled_review():
+    async def run_test():
+        redis_mock = MagicMock()
+        db_mock = MagicMock()
+        db_mock.execute = AsyncMock()
+        neo_mock = MagicMock()
+        prod_mock = AsyncMock()
+        cons_mock = AsyncMock()
+        dlq_mock = AsyncMock()
+
+        redis_mock.raw.zrange = AsyncMock(return_value=[b"AAPL", b"BTC-USD"])
+        redis_mock.raw.get = AsyncMock(return_value=None)
+        redis_mock.raw.set = AsyncMock()
+        redis_mock.raw.lrange = AsyncMock(return_value=[])
+        redis_mock.raw.zadd = AsyncMock()
+        redis_mock.raw.exists = AsyncMock(return_value=0)
+
+        agent = FinancialAdvisorAgent(
+            agent_name="financial_advisor", input_topics=["heartbeat"],
+            redis_client=redis_mock, db_client=db_mock, neo4j_client=neo_mock,
+            producer=prod_mock, consumer=cons_mock, dlq=dlq_mock,
+        )
+        closes = [100.0 + i for i in range(20)]
+        agent._fetch_prices = AsyncMock(return_value=(closes, [c + 1.0 for c in closes], [c - 1.0 for c in closes]))
+        agent.fetch_global_context = AsyncMock(return_value="macro context info")
+
+        mock_brief = FinancialAdviceBrief(
+            market_regime="Mean-Reverting",
+            highest_conviction_plays=[
+                TradingSignal(
+                    ticker="BTC-USD", action="BUY", trade_type="Scalp/Buy",
+                    entry_level=64000.0, target_price=68000.0, stop_loss=62000.0,
+                    risk_reward_ratio=2.0, kelly_allocation_pct=10.0, conviction_score=0.85,
+                    quantitative_rationale="Asymmetric EV support setup near Fib cluster."
+                )
+            ]
+        )
+        agent._execute_with_telemetry = AsyncMock(return_value=mock_brief)
+        agent.write_agent_memory = AsyncMock()
+
+        res = await agent.run_scheduled_review()
+        assert res is not None
+
+    asyncio.run(run_test())
+
+
+# ── 10. WATCHED EQUITIES CANDLES & MICROSTRUCTURE ─────────────────────────────
+
+def test_get_domain_tag():
+    assert get_domain_tag("crypto", "BTCUSDT") == "CRYPTO"
+    assert get_domain_tag("tradfi", "AAPL") == "EQUITY"
+    assert get_domain_tag("tradfi", "CL=F") == "MACRO"
+
+class DummyScorer:
+    async def score_market_candle(self, domain, asset, features):
+        return 0.40
+
+    async def check_watchlist(self, asset, watchlist_type):
+        return asset == "AAPL"
+
+def test_evaluate_multi_timeframe_watched_equities():
+    async def run_test():
+        redis = MagicMock()
+        redis.raw = AsyncMock()
+        redis.raw.get = AsyncMock(return_value=None)
+        redis.raw.set = AsyncMock()
+        redis.raw.lrange = AsyncMock(return_value=[])
+
+        scorer = DummyScorer()
+
+        results = await evaluate_multi_timeframe(
+            redis, scorer, domain="tradfi", asset="AAPL",
+            ts=datetime.now(timezone.utc), open_p=150.0, high_p=152.0, low_p=149.0, close_p=151.5, volume=10000.0
+        )
+        assert isinstance(results, list)
+        assert len(TIMEFRAMES_MINUTES) == 6
+
+    asyncio.run(run_test())
+
+def test_ohlcv_aggregator_vwap():
+    trades = [(100.0, 10), (102.0, 20), (99.0, 30)]
+    prices = [p for p, _ in trades]
+    volumes = [v for _, v in trades]
+    qc_vwap = quant_calc.vwap(prices, volumes)
+    assert qc_vwap == 100.1667
+
+def test_score_adjustment_provenance_schema():
+    event = NormalizedEvent(
+        type=EventType.EQUITY_BLOCK, occurred_at="2026-08-09T22:00:00Z", source="finnhub_equities",
+        primary_entity=Entity(id="AAPL", name="Apple Inc."),
+        financial_data=FinancialData(ticker="AAPL", sector="Technology"),
+        anomaly_score=0.85,
+        score_adjustments=[ScoreAdjustment(reason="watchlist_boost", delta=0.15)]
+    )
+    assert len(event.score_adjustments) == 1
+    assert event.score_adjustments[0].reason == "watchlist_boost"

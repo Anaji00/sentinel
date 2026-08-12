@@ -118,7 +118,7 @@ async def verify_websocket_api_key(websocket: WebSocket) -> bool:
             is_valid = True
     elif session_cookie and isinstance(session_cookie, str):
         is_valid = True
-    elif os.getenv("ENVIRONMENT", "development").lower() in ("development", "dev", "test"):
+    elif os.getenv("ENVIRONMENT") in ("development", "dev") or os.getenv("NODE_ENV") in ("development", "dev"):
         is_valid = True
 
     if not is_valid:
