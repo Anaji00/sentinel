@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import feedparser
+import time
 import websockets
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -123,6 +124,51 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
 
 class OHLCVAggregator:
     """Builds true Open, High, Low, Close, Volume candles and stores them in Redis and Kafka."""
+
+    LUA_AGGREGATE_SCRIPT = """
+    local key = KEYS[1]
+    local ts = ARGV[1]
+    local open = tonumber(ARGV[2])
+    local high = tonumber(ARGV[3])
+    local low = tonumber(ARGV[4])
+    local close = tonumber(ARGV[5])
+    local volume = tonumber(ARGV[6])
+    local max_len = tonumber(ARGV[7])
+
+    local latest = redis.call("LRANGE", key, 0, 0)
+    if #latest == 0 then
+        -- No previous candle, push new
+        local new_candle = '{"ts":"' .. ts .. '","o":' .. open .. ',"h":' .. high .. ',"l":' .. low .. ',"c":' .. close .. ',"v":' .. volume .. '}'
+        redis.call("LPUSH", key, new_candle)
+    else
+        local c = cjson.decode(latest[1])
+        if c.ts == ts then
+            -- Same interval, update
+            c.h = math.max(c.h, high)
+            c.l = math.min(c.l, low)
+            c.c = close
+            c.v = c.v + volume
+            redis.call("LSET", key, 0, cjson.encode(c))
+        else
+            -- New interval, push
+            local new_candle = '{"ts":"' .. ts .. '","o":' .. open .. ',"h":' .. high .. ',"l":' .. low .. ',"c":' .. close .. ',"v":' .. volume .. '}'
+            redis.call("LPUSH", key, new_candle)
+            redis.call("LTRIM", key, 0, max_len - 1)
+        end
+    end
+    return 1
+    """
+
+    TIMEFRAMES = {
+        "5m": {"minutes": 5, "retention": 1000},
+        "10m": {"minutes": 10, "retention": 1000},
+        "15m": {"minutes": 15, "retention": 1000},
+        "1h": {"minutes": 60, "retention": 1000},
+        "4h": {"minutes": 240, "retention": 1000},
+        "1d": {"minutes": 1440, "retention": 500},
+        "1w": {"minutes": 10080, "retention": 260},
+    }
+
     def __init__(self, producer: SentinelProducer, redis_client):
         self.producer = producer
         self.redis_client = redis_client
@@ -173,10 +219,36 @@ class OHLCVAggregator:
                     await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
                     count += 1
                     try:
+                        # Store 1m base candle
                         redis_list_key = f"sentinel:candles:1m:{ticker}"
                         candle_json = json.dumps({"ts": now.isoformat(), **candle})
                         pipe.lpush(redis_list_key, candle_json)
                         pipe.ltrim(redis_list_key, 0, 1439)
+                        
+                        # Aggregate higher timeframes atomically via Lua script
+                        for tf, cfg in self.TIMEFRAMES.items():
+                            minutes = cfg["minutes"]
+                            # Calculate floored interval timestamp
+                            if tf == "1w":
+                                # Align to Monday start of week
+                                days_since_monday = now.weekday()
+                                interval_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
+                            elif tf == "1d":
+                                interval_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                            else:
+                                total_minutes = now.hour * 60 + now.minute
+                                floored_minutes = (total_minutes // minutes) * minutes
+                                interval_dt = now.replace(hour=floored_minutes // 60, minute=floored_minutes % 60, second=0, microsecond=0)
+                            
+                            interval_ts = interval_dt.isoformat()
+                            tf_key = f"sentinel:candles:{tf}:{ticker}"
+                            
+                            pipe.eval(
+                                self.LUA_AGGREGATE_SCRIPT, 
+                                1, tf_key, 
+                                interval_ts, data["O"], data["H"], data["L"], data["C"], data["V"], cfg["retention"]
+                            )
+
                     except Exception as e:
                         logger.debug(f"Redis cache pipeline warning for {ticker}: {e}")
 

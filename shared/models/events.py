@@ -156,6 +156,10 @@ class PredictionMarketData(BaseModel):
    outcome_prices: Optional[dict] = None
    probability_delta_24h: Optional[float] = None
 
+   @property
+   def price(self) -> float:
+       return self.price_usd
+
 class CryptoData(BaseModel):
     pair: str
     trade_type: str

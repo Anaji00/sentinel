@@ -386,7 +386,8 @@ def test_financial_advisor_scheduled_review():
                     risk_reward_ratio=2.0, kelly_allocation_pct=10.0, conviction_score=0.85,
                     quantitative_rationale="Asymmetric EV support setup near Fib cluster."
                 )
-            ]
+            ],
+            general_hedging_strategy="Delta-hedging with out-of-the-money puts."
         )
         agent._execute_with_telemetry = AsyncMock(return_value=mock_brief)
         agent.write_agent_memory = AsyncMock()

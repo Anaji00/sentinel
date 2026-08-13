@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
+import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Activity, Radio } from 'lucide-react';
 
 interface SeriesPoint {
@@ -22,15 +23,55 @@ interface MarketSeriesResponse {
 export default function BondYieldsChart() {
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
+  // Real-time WebSocket stream ticks
+  const liveTradfiEvents = useLiveEvents('tradfi');
+
   const { data } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=US30Y,US10Y,US02Y,TLT,IEF&limit=50',
     fetcher,
     { refreshInterval: 3000 }
   );
 
-  const us30ySeries = data?.series?.['US30Y'] || [];
-  const us10ySeries = data?.series?.['US10Y'] || [];
-  const us02ySeries = data?.series?.['US02Y'] || [];
+  const base30Y = data?.series?.['US30Y'] || data?.series?.['US30'] || [];
+  const base10Y = data?.series?.['US10Y'] || [];
+  const base2Y = data?.series?.['US02Y'] || data?.series?.['US2Y'] || data?.series?.['2Y'] || [];
+
+  // Merge live ticks from WebSocket stream
+  const us30ySeries = useMemo(() => {
+    const list = [...base30Y];
+    liveTradfiEvents.forEach(e => {
+      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym.includes('30') || sym.includes('TYX')) {
+        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+      }
+    });
+    return list.slice(-50);
+  }, [base30Y, liveTradfiEvents]);
+
+  const us10ySeries = useMemo(() => {
+    const list = [...base10Y];
+    liveTradfiEvents.forEach(e => {
+      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym.includes('10') || sym.includes('TNX')) {
+        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+      }
+    });
+    return list.slice(-50);
+  }, [base10Y, liveTradfiEvents]);
+
+  const us02ySeries = useMemo(() => {
+    const list = [...base2Y];
+    liveTradfiEvents.forEach(e => {
+      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym.includes('2') || sym.includes('2YY') || sym.includes('IRX')) {
+        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+      }
+    });
+    return list.slice(-50);
+  }, [base2Y, liveTradfiEvents]);
 
   const hasData = us30ySeries.length > 0 || us10ySeries.length > 0 || us02ySeries.length > 0;
 

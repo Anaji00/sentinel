@@ -128,6 +128,23 @@ class DynamicAnomalyScorer:
         # First Story Detection for news novelty scoring
         self._fsd = FirstStoryDetector(window_size=500)
 
+    async def load_thresholds(self):
+        """Loads dynamic ML thresholds from Redis cache."""
+        import time, json
+        now = time.time()
+        if self._thresholds_cache and (now - self._thresholds_last_loaded < self._thresholds_ttl):
+            return self._thresholds_cache
+
+        try:
+            if self.redis and hasattr(self.redis, "raw"):
+                raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
+                if raw_cfg:
+                    self._thresholds_cache = json.loads(raw_cfg)
+                    self._thresholds_last_loaded = now
+        except Exception as e:
+            logger.debug(f"Could not load custom ML thresholds: {e}")
+        return self._thresholds_cache
+
         # BGP graph-topology feature extractor
         self._bgp_extractor = BGPGraphFeatureExtractor(neo4j_client=neo4j_client)
 
@@ -590,11 +607,19 @@ class DynamicAnomalyScorer:
         res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
         return res["score"]
 
-    async def score_prediction_volume_anomaly(self, asset_id: str, notional: float, volume_delta: float = 0.0) -> float:
+    async def score_prediction_anomaly(
+        self, 
+        asset_id: str, 
+        notional: float, 
+        delta_p: float = 0.0, 
+        yes_val: float = 0.0, 
+        no_val: float = 0.0
+    ) -> Dict[str, float]:
         """
-        Centralized prediction market anomaly scorer.
-        Evaluates trade size & volume delta, computes rolling Z-scores,
-        and applies an automatic +0.25 anomaly boost if Z-score > 2.0.
+        Centralized dynamic prediction market anomaly scorer.
+        Evaluates trade size/notional, probability change (delta_p), and YES/NO bid sizes.
+        Computes dynamic rolling Z-scores for volume surges and probability shifts.
+        Returns dict with 'score', 'z_score_volume', and 'z_score_prob'.
         """
         config = {"divisor": 100_000.0}
         try:
@@ -603,19 +628,48 @@ class DynamicAnomalyScorer:
         except Exception:
             pass
 
-        val_to_score = max(notional, volume_delta)
-        res = await self.score_event("prediction_market_trade", asset_id, [val_to_score / config["divisor"], 0.0, 0.0, 0.0, 0.0])
-        score = res.get("score", 0.0)
+        # Multi-dimensional feature vector: [normalized_notional, abs(delta_p)*10, yes_val/1000, no_val/1000, 0]
+        feat = [
+            notional / config["divisor"],
+            abs(delta_p) * 10.0,
+            yes_val / 1000.0,
+            no_val / 1000.0,
+            0.0
+        ]
+        res = await self.score_event("prediction_market_trade", asset_id, feat)
+        rrcf_score = res.get("score", 0.0)
 
-        # Dynamic rolling Z-score normalization in Redis
+        # Dynamic rolling Z-scores in Redis
+        z_vol = 0.0
+        z_prob = 0.0
         try:
-            norm_val = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "volume_surge", val_to_score)
-            if norm_val > 2.0:
-                score += 0.25
+            if notional > 0:
+                z_vol = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "volume", notional)
+            if abs(delta_p) > 0:
+                z_prob = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "prob_shift", abs(delta_p))
         except Exception:
             pass
 
-        return min(1.0, score)
+        # Purely dynamic combined score based on RRCF and max Z-score significance
+        max_z = max(z_vol, z_prob)
+        if max_z > 3.0:
+            z_boost = min(0.35, (max_z - 3.0) * 0.1)
+        elif max_z > 1.5:
+            z_boost = (max_z - 1.5) * 0.05
+        else:
+            z_boost = 0.0
+
+        final_score = min(1.0, max(rrcf_score, z_boost))
+
+        return {
+            "score": round(final_score, 4),
+            "z_score_volume": round(z_vol, 2),
+            "z_score_prob": round(z_prob, 2),
+        }
+
+    async def score_prediction_volume_anomaly(self, asset_id: str, notional: float, volume_delta: float = 0.0) -> float:
+        res = await self.score_prediction_anomaly(asset_id, max(notional, volume_delta))
+        return res["score"]
         
     async def check_watchlist(self, entity_id: str, watchlist_type: str) -> bool:
         """

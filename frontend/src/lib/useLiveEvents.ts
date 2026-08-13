@@ -27,6 +27,63 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
     let isMounted = true;
     let reconnectTimer: NodeJS.Timeout | null = null;
+    let directWs: WebSocket | null = null;
+
+    function connectDirectExchangeFallback() {
+      if (!isMounted || directWs) return;
+      try {
+        const cbWs = new WebSocket('wss://ws-feed.exchange.coinbase.com');
+        directWs = cbWs;
+
+        cbWs.onopen = () => {
+          cbWs.send(JSON.stringify({
+            type: 'subscribe',
+            product_ids: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+            channels: ['ticker']
+          }));
+          useTelemetryStore.getState().setConnected(true);
+        };
+
+        cbWs.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data && data.type === 'ticker' && data.product_id && data.price) {
+              const price = parseFloat(data.price);
+              const sym = data.product_id.replace('-', '');
+              const eventId = `direct-cb-${data.product_id}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+              
+              if (seenIds.current.has(eventId)) return;
+              seenIds.current.add(eventId);
+
+              const normEvent: NormalizedEvent = {
+                event_id: eventId,
+                type: 'crypto_spot',
+                occurred_at: data.time || new Date().toISOString(),
+                source: 'Coinbase Direct Exchange WS (Backend Offline)',
+                headline: `⚡ LIVE TRADE FEED: ${data.product_id} @ $${price.toLocaleString()}`,
+                summary: `Direct exchange ticker stream for ${data.product_id} price $${price.toLocaleString()}.`,
+                primary_entity: { id: sym, name: data.product_id, type: 'crypto' },
+                financial_data: { ticker: sym, current_price: price },
+                crypto_data: { pair: data.product_id, price: price },
+                anomaly_score: 0.15,
+                tags: ['crypto', 'live_stream', sym.toLowerCase()],
+              };
+
+              setLiveEvents((prev) => [normEvent, ...prev].slice(0, MAX_LIVE_EVENTS));
+              useTelemetryStore.getState().updateTelemetry();
+            }
+          } catch (e) {
+            console.debug('Error parsing direct exchange WS msg:', e);
+          }
+        };
+
+        cbWs.onerror = () => {
+          useTelemetryStore.getState().setConnected(false);
+        };
+      } catch (e) {
+        console.debug('Direct exchange WS fallback error:', e);
+      }
+    }
 
     function connect() {
       if (!isMounted) return;
@@ -39,6 +96,10 @@ export function useLiveEvents(selectedDomain: string = 'all') {
           backoffRef.current = RECONNECT_INITIAL_MS;
           useTelemetryStore.getState().setConnected(true);
           useTelemetryStore.getState().updateTelemetry();
+          if (directWs) {
+            directWs.close();
+            directWs = null;
+          }
         };
 
         let pendingBatch: NormalizedEvent[] = [];
@@ -101,11 +162,13 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
         ws.onerror = () => {
           useTelemetryStore.getState().setConnected(false);
+          connectDirectExchangeFallback();
         };
 
         ws.onclose = () => {
           if (isMounted) {
             useTelemetryStore.getState().setConnected(false);
+            connectDirectExchangeFallback();
             // Exponential backoff with cap
             reconnectTimer = setTimeout(connect, backoffRef.current);
             backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
@@ -114,6 +177,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
       } catch (err) {
         console.warn('WebSocket connection fallback to polling:', err);
         useTelemetryStore.getState().setConnected(false);
+        connectDirectExchangeFallback();
       }
     }
 
@@ -122,6 +186,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     return () => {
       isMounted = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (directWs) directWs.close();
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.onerror = null;

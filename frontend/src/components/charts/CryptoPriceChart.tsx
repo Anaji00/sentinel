@@ -32,20 +32,23 @@ export default function CryptoPriceChart() {
     { refreshInterval: 3000 }
   );
 
-  const basePoints = data?.series?.['BTCUSD'] || [];
+  const basePoints = data?.series?.['BTCUSD'] || data?.series?.['BTC'] || data?.series?.['BTCUSDT'] || [];
   
   // Merge live ticks from WebSocket stream if available
   const mergedSeries = useMemo(() => {
     const list = [...basePoints];
     liveCryptoEvents.forEach(e => {
-      const price = e.crypto_data?.price || e.crypto_data?.mark_price || e.financial_data?.current_price;
-      if (price) {
-        list.push({
-          timestamp: e.occurred_at,
-          price: price,
-          volume: e.crypto_data?.volume || 1000,
-          anomaly_score: e.anomaly_score
-        });
+      const sym = (e.crypto_data?.pair || e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym.includes('BTC')) {
+        const price = e.crypto_data?.price || e.crypto_data?.mark_price || e.financial_data?.current_price;
+        if (price && price > 10000) {
+          list.push({
+            timestamp: e.occurred_at,
+            price: price,
+            volume: e.crypto_data?.volume || 1000,
+            anomaly_score: e.anomaly_score
+          });
+        }
       }
     });
     return list.slice(-60);

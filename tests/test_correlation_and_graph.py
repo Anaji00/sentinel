@@ -158,3 +158,17 @@ def test_merge_graph_triples_accepts_valid_triple():
     valid_triple = GraphTriple(subject="US Navy", predicate="LOCATED_IN", object="Red Sea", confidence=0.85)
     asyncio.run(engine._merge_graph_triples([valid_triple]))
     mock_neo4j.query.assert_called_once()
+
+def test_stock_correlation_agent_handles_none_payloads():
+    async def run_test():
+        from services.agents.stock_correlation_agent import StockCorrelationAgent
+        agent = StockCorrelationAgent.__new__(StockCorrelationAgent)
+        agent.redis = MagicMock()
+
+        res1 = await agent.handle_message(None)
+        assert res1 is None
+
+        res2 = await agent.handle_message({"financial_data": None, "primary_entity": None})
+        assert res2 is None
+
+    asyncio.run(run_test())

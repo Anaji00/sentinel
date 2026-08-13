@@ -92,9 +92,21 @@ Sentinel is composed of **29 modular services & containers** orchestrated via Do
   - **Heavy Analytical Tier (`agents-heavy` - `qwen2.5:7b`)**: Deep reasoning for Quant Research, Macro Strategy, Yield Curve Rates, Volatility Surfaces, and Graph Supervision.
   - **Fast Operational Tier (`agents-fast` - `qwen2.5:1.5b` / `gemma3:1b` fallback)**: Ultra-fast routing, headline NER extraction, and concept taxonomy management.
 
-### 5. Auxiliary Workers & Web Gateway
+### 5. Auxiliary Workers & Tactical Radar Dashboard (`frontend` & `services/gateway`)
 - **`api-gateway`**: High-performance FastAPI gateway handling REST queries, rate limiting, authentication, Prometheus metrics, and real-time WebSockets.
-- **`frontend`**: Next.js 14 Radar Dashboard with Deck.gl 3D Globe map, real-time telemetry HUD, and interactive analytics panels.
+- **`frontend` (Sentinel Radar Dashboard)**: Tactical radar interface built with **Next.js 14**, **React**, **Deck.gl**, **Recharts**, and **TailwindCSS**. Renders real-time streaming telemetry, 3D geographic threat visualizations, quantitative financial risk models, AI agent swarm telemetry, and interactive graph exploration.
+  - **`GlobalMap.tsx`**: Deck.gl 3D Globe & Map supporting real-time AIS vessel positions, ADSB flight vectors, strategic trade chokepoints, and active geopolitical conflict theaters.
+  - **`FinancialAdvisorAdvice.tsx`**: Interactive AI Financial Advisor dashboard with quarter-Kelly position sizing, VaR 95% / CVaR 99% portfolio metrics, RSI / EMA / ATR technical indicators, and single-click paper order execution via Alpaca execution bridge.
+  - **`QuantRadarPanel.tsx`**: Real-time volume anomaly radar sweeps and watchlist management.
+  - **`CryptoAnalytics.tsx`**: Perpetual swaps volatility and candle analytics.
+  - **`DarkPoolFlowPanel.tsx`**: Options sweep flow and institutional dark pool tracking.
+  - **`CyberIntelligencePanel.tsx`**: BGP hijacking alerts, IP threat scoring, and CVE mapping.
+  - **`PredictionMarketPanel.tsx`**: Polymarket and Kalshi real-time odds probability streams.
+  - **`OsintThreatMatrix.tsx`**: OSINT news intelligence and cross-domain entity correlation matrix.
+  - **`GraphExplorer.tsx`**: Neo4j & TimescaleDB 2D/3D entity relationship graph viewer.
+  - **`AgentSwarmTelemetry.tsx`**: Real-time agent decision log inspector and LLM model status HUD.
+  - **`CommandCenterGrid.tsx`**: Multi-panel tactical command center grid.
+  - **`SystemHealthHUD.tsx`**: Real-time WebSocket connection status, database latency, and time-zone HUD.
 - **`alert_manager`**: Escalation router delivering high-severity correlation alerts via PagerDuty, Webhooks, Telegram, and Slack.
 - **`dlq-worker`**: Dead-letter queue listener handling failed message retries and quarantine analysis.
 - **`telemetry-worker`**: Operational health metrics, container status telemetry, and Redis PubSub heartbeats.
@@ -199,7 +211,26 @@ docker compose down -v
 
 ---
 
-### 3. API Gateway & Operational Inspection
+### 3. Frontend Local Development & Configuration
+
+```bash
+# Navigate to frontend directory and install dependencies
+cd frontend
+npm install
+
+# Start local Next.js development server (runs on http://localhost:3000)
+npm run dev
+```
+
+#### **Frontend Environment Variables (`frontend/.env.local`)**
+| Environment Variable | Description | Default Value |
+| :--- | :--- | :--- |
+| `NEXT_PUBLIC_API_URL` | Fast API Gateway REST & WS Endpoint | `http://localhost:8000` |
+| `API_GATEWAY_KEY` | Development API Authentication Key | `sentinel-dev-key-2026` |
+
+---
+
+### 4. API Gateway & Operational Inspection
 
 ```bash
 # System Health Inspection (TimescaleDB, Neo4j, Redis)
@@ -241,7 +272,7 @@ npx wscat -c "ws://localhost:8000/api/v1/events/ws/live-feed?api_key={APIKEY}"
 
 ---
 
-### 4. Database & Storage Debugging Commands
+### 5. Database & Storage Debugging Commands
 
 #### **TimescaleDB (PostgreSQL)**
 ```bash
@@ -277,20 +308,22 @@ docker exec -it sentinel-redis redis-cli
 
 ---
 
-### 5. Automated Test Suite (248 Passing Tests)
+### 6. Automated Test Suite (116 Passing Tests Across 7 Consolidated Modules)
 
 Run the full pytest suite covering all microservices, risk engines, and API endpoints:
 
 ```bash
-# Run complete test suite (248 tests across 40 modules)
+# Run complete consolidated test suite
 python -m pytest
 
-# Run with verbose output and print statements
-python -m pytest -v -s
-
 # Run specific domain test module
-python -m pytest tests/test_quant_trading_engine.py
-python -m pytest tests/test_security_hardening.py
+python -m pytest tests/test_quant_and_trading.py
+python -m pytest tests/test_domain_enrichers.py
+python -m pytest tests/test_anomaly_detection.py
+python -m pytest tests/test_correlation_and_graph.py
+python -m pytest tests/test_reasoning_swarm.py
+python -m pytest tests/test_api_gateway.py
+python -m pytest tests/test_system_and_security.py
 ```
 
 ---
@@ -301,7 +334,7 @@ python -m pytest tests/test_security_hardening.py
 | :--- | :--- | :--- |
 | **Web Dashboard** | `http://localhost:3000` | Public Web UI |
 | **Grafana Monitoring** | `http://localhost:3001` | Admin (`admin / admin`) |
-| **API Gateway** | `http://localhost:8000` | Header `X-API-KEY: sentinel-dev-key-2026` |
+| **API Gateway** | `http://localhost:8000` | Header `X-API-KEY: {APIKEY}` |
 | **Prometheus Server** | `http://localhost:9090` | Public Monitoring UI |
 | **Prometheus Metrics** | `http://localhost:8000/metrics` | Unauthenticated Scraper |
 | **JSON Metrics Summary** | `http://localhost:8000/metrics/json` | Unauthenticated |

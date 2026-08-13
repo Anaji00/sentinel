@@ -15,7 +15,7 @@ logger = logging.getLogger("api-gateway.auth")
 
 import time
 
-API_KEY = resolve_env_var("API_GATEWAY_KEY", "sentinel-dev-key-2026", warn_on_fallback=True)
+API_KEY = os.getenv("API_GATEWAY_KEY") or os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or ""
 
 async def check_rate_limit(redis_client, identity_key: str, max_tokens: int = 120, refill_rate_per_sec: float = 10.0) -> bool:
     """Redis-backed token bucket rate limiter per key/session/IP."""
@@ -72,7 +72,7 @@ async def verify_api_key(request: Request = None):
     is_valid = False
     identity = "anonymous"
 
-    if api_key:
+    if api_key and API_KEY:
         if hmac.compare_digest(api_key.encode("utf-8"), API_KEY.encode("utf-8")):
             is_valid = True
             identity = f"apikey:{api_key[:8]}"
@@ -80,8 +80,12 @@ async def verify_api_key(request: Request = None):
         # Validated server-side via Next.js proxy or cookie presence
         is_valid = True
         identity = f"cookie:{session_cookie[:16]}"
-    elif os.getenv("ENVIRONMENT") == "development" or os.getenv("NODE_ENV") == "development":
-        # Dev fallback for local developer ergonomics
+    elif (
+        (os.getenv("ENVIRONMENT") in ("development", "dev") or 
+         os.getenv("NODE_ENV") in ("development", "dev") or 
+         os.getenv("SENTINEL_ENV") in ("development", "dev", "local")) and not API_KEY
+    ):
+        # Dev fallback for local developer ergonomics when no key is set
         is_valid = True
         identity = "dev-client"
 
@@ -101,24 +105,28 @@ async def verify_api_key(request: Request = None):
 
 async def verify_websocket_api_key(websocket: WebSocket) -> bool:
     """Validate API key or session cookie on a WebSocket handshake BEFORE calling accept()."""
-    cookies_map = getattr(websocket, "cookies", None)
-    session_cookie = cookies_map.get("sentinel_session") if isinstance(cookies_map, dict) else None
+    cookies_map = getattr(websocket, "cookies", {})
+    session_cookie = cookies_map.get("sentinel_session") if hasattr(cookies_map, "get") else None
 
-    headers_map = getattr(websocket, "headers", None)
-    query_params_map = getattr(websocket, "query_params", None)
+    headers_map = getattr(websocket, "headers", {})
+    query_params_map = getattr(websocket, "query_params", {})
 
-    api_key_header = headers_map.get("X-API-KEY") if isinstance(headers_map, dict) else None
-    api_key_query = query_params_map.get("api_key") if isinstance(query_params_map, dict) else None
+    api_key_header = (headers_map.get("X-API-KEY") or headers_map.get("x-api-key")) if hasattr(headers_map, "get") else None
+    api_key_query = query_params_map.get("api_key") if hasattr(query_params_map, "get") else None
 
     api_key = api_key_header or api_key_query
 
     is_valid = False
-    if api_key and isinstance(api_key, str):
+    if api_key and isinstance(api_key, str) and API_KEY:
         if hmac.compare_digest(api_key.encode("utf-8"), API_KEY.encode("utf-8")):
             is_valid = True
     elif session_cookie and isinstance(session_cookie, str):
         is_valid = True
-    elif os.getenv("ENVIRONMENT") in ("development", "dev") or os.getenv("NODE_ENV") in ("development", "dev"):
+    elif (
+        (os.getenv("ENVIRONMENT") in ("development", "dev") or 
+         os.getenv("NODE_ENV") in ("development", "dev") or 
+         os.getenv("SENTINEL_ENV") in ("development", "dev", "local")) and not API_KEY
+    ):
         is_valid = True
 
     if not is_valid:

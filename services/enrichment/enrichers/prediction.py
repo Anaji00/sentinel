@@ -4,8 +4,8 @@ services/enrichment/enrichers/prediction.py
 ENTERPRISE PREDICTION MARKET ENRICHER & VOLATILITY SCORER
 =========================================================
 Enriches PolyMarket & Kalshi prediction events.
-Ignores zero-volume markets, delegates Z-score anomaly scoring to AnomalyScorer,
-and structures full PredictionMarketData models for the Probability Radar Matrix.
+Dynamically tracks probability shifts (Delta P) and YES/NO bid sizes.
+Delegates statistical Z-score and RRCF anomaly scoring to AnomalyScorer.
 """
 
 import asyncio
@@ -41,7 +41,6 @@ class PredictionEnricher:
         question = parts[1] if len(parts) > 1 and parts[1] != "UNKNOWN QUESTION" else p.get("question", "UNKNOWN QUESTION")
         outcome = parts[2] if len(parts) > 2 else p.get("outcome_name", "UNKNOWN OUTCOME")
         
-        # Clean slug to avoid generic string splits like 'tradfi' or 'prediction_market'
         if raw_slug.lower() in ("tradfi", "prediction_market", "prediction", "unknown"):
             slug = p.get("ticker") or p.get("market_id") or (question[:30].replace(" ", "-") if question != "UNKNOWN QUESTION" else "PREDICTION-CONTRACT")
         else:
@@ -53,51 +52,65 @@ class PredictionEnricher:
         total_vol = float(p.get("total_volume", 0) or notional)
         asset_id = p.get("asset_id", slug)
 
-        # GATEKEEPER: Filter out dead/low-volume noise (<$100 volume / trade size)
-        if total_vol < 100 and notional < 50 and shares < 50:
+        # Gatekeeper: Ignore zero/noise updates (<$5 total volume or trade size)
+        if total_vol <= 0 and notional <= 0 and shares <= 0:
             return None
 
-        # Check previous price in Redis to detect odd probability shifts (Delta P >= 0.04 / 4%)
-        prev_price_key = f"sentinel:prediction:last_price:{slug}"
-        prev_price_raw = await self.redis.raw.get(prev_price_key)
+        yes_prob = p.get("yes_probability")
+        no_prob = p.get("no_probability")
+        
+        # Track previous probabilities in Redis to compute dynamic delta_p
         delta_p = 0.0
-        if prev_price_raw:
-            try:
-                prev_price = float(prev_price_raw)
-                delta_p = price - prev_price
-            except Exception:
-                pass
         try:
-            await self.redis.raw.set(prev_price_key, price, ex=86400)
+            prev_price_key = f"sentinel:prediction:last_price:{slug}"
+            prev_price_raw = await self.redis.raw.get(prev_price_key)
+            if prev_price_raw:
+                delta_p = price - float(prev_price_raw)
+            await self.redis.raw.set(prev_price_key, str(price), ex=86400)
         except Exception:
             pass
 
-        # Delegate volume anomaly scoring to central AnomalyScorer
-        anomaly = await self.scorer.score_prediction_volume_anomaly(asset_id, notional, shares)
+        # Identify YES vs NO side bid/trade value
+        clean_outcome = outcome.strip().lower()
+        if "yes" in clean_outcome or clean_outcome in ("true", "1", "outcome 0"):
+            yes_val = notional
+            no_val = 0.0
+        elif "no" in clean_outcome or clean_outcome in ("false", "0", "outcome 1"):
+            no_val = notional
+            yes_val = 0.0
+        else:
+            yes_val = notional * (float(yes_prob or price or 0.5))
+            no_val = notional * (float(no_prob or (1.0 - price) or 0.5))
 
-        # Frequency boost for high activity
-        f_boost = await self.scorer.track_frequency(slug, "prediction_market")
-        anomaly_score = min(1.0, anomaly + f_boost)
+        # Dynamic anomaly scoring via central AnomalyScorer (RRCF + Z-scores)
+        anomaly_res = await self.scorer.score_prediction_anomaly(
+            asset_id=asset_id,
+            notional=notional,
+            delta_p=delta_p,
+            yes_val=yes_val,
+            no_val=no_val
+        )
+        
+        anomaly_score = anomaly_res.get("score", 0.0)
+        z_vol = anomaly_res.get("z_score_volume", 0.0)
+        z_prob = anomaly_res.get("z_score_prob", 0.0)
 
         # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
 
-        # Classify large bid vs odd shift vs routine update
+        # Classify tags and headlines purely based on dynamic Z-score and RRCF significance
         tags = ["prediction_market", slug.lower()]
-        is_large_bid = notional >= 5000 or (shares * price) >= 5000
-        is_odd_shift = abs(delta_p) >= 0.04
         display_contract = question if question != "UNKNOWN QUESTION" else slug.upper()
 
-        if is_large_bid:
+        if z_vol >= 2.5 or (notional > 0 and anomaly_score >= 0.75):
             tags.extend(["large_bid", "whale_bet", "volume_spike"])
-            anomaly_score = max(anomaly_score, 0.85)
-            headline = f"🐋 LARGE POLYMARKET BID: {display_contract} (${notional:,.2f} on {outcome} @ {(price*100):.1f}%)"
-        elif is_odd_shift:
+            side_str = "YES" if yes_val > no_val else ("NO" if no_val > yes_val else outcome.upper())
+            headline = f"🐋 LARGE POLYMARKET BID ({side_str}): {display_contract} (${notional:,.2f} @ {(price*100):.1f}%)"
+        elif z_prob >= 2.5 or (abs(delta_p) > 0 and anomaly_score >= 0.65):
             shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
             tags.extend(["odd_shift", "probability_spike"])
-            anomaly_score = max(anomaly_score, 0.78)
             headline = f"🎯 {shift_dir}: {display_contract} ({outcome} shift: {(delta_p*100):+.1f}%)"
-        elif notional >= 1000 or anomaly_score >= 0.70:
+        elif anomaly_score >= 0.50:
             tags.append("volume_spike")
             headline = f"🎯 POLYMARKET VOLUME MOVER: {display_contract} (${notional:,.2f} — {outcome})"
         else:
@@ -108,7 +121,7 @@ class PredictionEnricher:
             await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
         except Exception:
             pass
-        
+
         entity_name = display_contract if display_contract != "UNKNOWN QUESTION" else slug
         entity = Entity(id=slug, type=EntityType.INSTRUMENT, name=entity_name)
 
@@ -127,53 +140,88 @@ class PredictionEnricher:
                 shares_traded=shares,
                 price_usd=price,
                 total_volume=total_vol,
-                yes_probability=p.get("yes_probability"),
-                no_probability=p.get("no_probability"),
+                yes_probability=yes_prob,
+                no_probability=no_prob,
                 category=p.get("category") or "Macro & Geopolitics",
                 resolution_date=p.get("resolution_date")
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=max(0.15, anomaly_score),
+            anomaly_score=anomaly_score,
         )
-    
+
     async def _enrich_kalshi(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = p.get("ticker", "UNKNOWN")
         title = p.get("title", "Unknown Market")
         price = float(p.get("yes_bid") or p.get("no_bid") or p.get("price") or 0.0)
         current_vol = float(p.get("total_volume", 0))
 
-        # GATEKEEPER: Ignore dead Kalshi markets with zero volume
+        # Gatekeeper: Ignore dead Kalshi markets with zero volume
         if current_vol <= 0 and float(p.get("yes_bid") or 0) <= 0 and float(p.get("no_bid") or 0) <= 0:
             return None
 
-        # Stateful volume delta calculation using Redis
+        yes_bid = float(p.get("yes_bid") or 0.0)
+        no_bid = float(p.get("no_bid") or 0.0)
+        yes_prob = float(p.get("yes_probability") or 0.5)
+        no_prob = float(p.get("no_probability") or 0.5)
+
+        # Stateful volume & probability delta calculation using Redis
+        delta_vol = 0.0
+        delta_p = 0.0
         try:
-            redis_key = f"sentinel:kalshi:vol:{ticker}"
-            last_vol_str = await self.redis.raw.get(redis_key)
-            last_vol = float(last_vol_str) if last_vol_str else current_vol
-            await self.redis.raw.set(redis_key, str(current_vol), ex=86400)  # 24h expiry
+            vol_key = f"sentinel:kalshi:vol:{ticker}"
+            prob_key = f"sentinel:kalshi:prob:{ticker}"
+
+            last_vol_str = await self.redis.raw.get(vol_key)
+            last_prob_str = await self.redis.raw.get(prob_key)
+
+            if last_vol_str:
+                delta_vol = max(0.0, current_vol - float(last_vol_str))
+            else:
+                delta_vol = current_vol
+
+            if last_prob_str:
+                delta_p = yes_prob - float(last_prob_str)
+
+            await self.redis.raw.set(vol_key, str(current_vol), ex=86400)
+            await self.redis.raw.set(prob_key, str(yes_prob), ex=86400)
         except Exception:
-            last_vol = current_vol
+            delta_vol = current_vol
 
-        delta = max(0.0, current_vol - last_vol)
-        notional_usd = delta * price if delta > 0 else current_vol * price
-        
-        # Delegate volume anomaly scoring to central AnomalyScorer
-        anomaly_score = await self.scorer.score_prediction_volume_anomaly(ticker, notional_usd, delta)
+        notional_usd = delta_vol * price if delta_vol > 0 else current_vol * price
+        yes_val = yes_bid * delta_vol
+        no_val = no_bid * delta_vol
 
-        # Frequency boost for high activity
-        f_boost = await self.scorer.track_frequency(ticker, "prediction_market")
-        anomaly_score = min(1.0, anomaly_score + f_boost)
+        # Dynamic anomaly scoring via central AnomalyScorer
+        anomaly_res = await self.scorer.score_prediction_anomaly(
+            asset_id=ticker,
+            notional=notional_usd,
+            delta_p=delta_p,
+            yes_val=yes_val,
+            no_val=no_val
+        )
+
+        anomaly_score = anomaly_res.get("score", 0.0)
+        z_vol = anomaly_res.get("z_score_volume", 0.0)
+        z_prob = anomaly_res.get("z_score_prob", 0.0)
 
         # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
 
-        is_volume_anomaly = delta >= 50000 or notional_usd >= 25000 or anomaly_score >= 0.70
+        # Classify tags and headlines dynamically
         tags = ["kalshi_prediction", ticker.lower()]
-        if is_volume_anomaly:
+
+        if z_vol >= 2.5 or (notional_usd > 0 and anomaly_score >= 0.75):
             tags.extend(["volume_spike", "whale_bet"])
-            headline = f"🚨 KALSHI VOLUME SPIKE: {ticker} (+${notional_usd:,.2f})"
+            side = "YES" if yes_bid >= no_bid else "NO"
+            headline = f"🚨 KALSHI WHALE BID ({side}): {ticker} (+${notional_usd:,.2f})"
+        elif z_prob >= 2.5 or (abs(delta_p) > 0 and anomaly_score >= 0.65):
+            shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
+            tags.extend(["odd_shift", "probability_spike"])
+            headline = f"🎯 KALSHI {shift_dir}: {ticker} ({title} shift: {(delta_p*100):+.1f}%)"
+        elif anomaly_score >= 0.50:
+            tags.append("volume_spike")
+            headline = f"🎯 KALSHI VOLUME MOVER: {ticker} (+${notional_usd:,.2f})"
         else:
             tags.append("odds_update")
             headline = f"🎯 KALSHI ODDS: {ticker} ({title})"
@@ -184,7 +232,7 @@ class PredictionEnricher:
             await self.redis.raw.sadd("sentinel:kalshi:watched_tickers", ticker)
         except Exception:
             pass
-            
+
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
             type=EventType.PREDICTION_MARKET_TRADE,
@@ -195,19 +243,19 @@ class PredictionEnricher:
                 market_id=ticker,
                 ticker=ticker,
                 question=title,
-                outcome="Volume Spike" if is_volume_anomaly else "Market Odds",
-                shares_traded=delta,
+                outcome="Volume Spike" if (z_vol >= 2.5 or anomaly_score >= 0.70) else "Market Odds",
+                shares_traded=delta_vol,
                 notional_usd=notional_usd,
                 price_usd=price,
                 total_volume=current_vol,
                 yes_bid=p.get("yes_bid"),
                 no_bid=p.get("no_bid"),
-                yes_probability=p.get("yes_probability"),
-                no_probability=p.get("no_probability"),
+                yes_probability=yes_prob,
+                no_probability=no_prob,
                 category=p.get("category") or "Macro & Fed Rates",
                 resolution_date=p.get("resolution_date")
             ),
             headline=headline,
             tags=tags,
-            anomaly_score=max(0.15, anomaly_score),
+            anomaly_score=anomaly_score,
         )

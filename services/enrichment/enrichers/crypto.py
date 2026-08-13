@@ -92,6 +92,18 @@ class CryptoEnricher:
             parsed_events.append((raw, p, asset, side, price, qty, notional))
             trades_for_scoring.append((asset, notional, qty))
             
+            # Cache latest quote for live stream APIs
+            try:
+                if self.redis and hasattr(self.redis, "raw") and price > 0:
+                    clean_asset = asset.replace("USDT", "").replace("USD", "").upper()
+                    pipe = self.redis.raw.pipeline()
+                    pipe.set(f"sentinel:quotes:latest:{clean_asset}", str(price), ex=3600)
+                    pipe.set(f"sentinel:quotes:latest:{clean_asset}USD", str(price), ex=3600)
+                    pipe.set(f"sentinel:quotes:latest:{clean_asset}USDT", str(price), ex=3600)
+                    asyncio.create_task(pipe.execute())
+            except Exception:
+                pass
+            
         if not parsed_events: return []
         
         scores = await self.scorer.score_crypto_trade_batch(trades_for_scoring)

@@ -210,10 +210,15 @@ function AssetSparklineCard({
   );
 }
 
+import { useLiveEvents } from '@/lib/useLiveEvents';
+
 export default function ChartsPage() {
   const [activeTab, setActiveTab] = useState<string>('all');
   const [expandedAsset, setExpandedAsset] = useState<AssetConfig | null>(null);
   const [timeframe, setTimeframe] = useState<string>('1D');
+
+  // Real-time WebSocket live events (works with backend WS or Coinbase Direct Exchange WS fallback when backend is offline)
+  const liveEvents = useLiveEvents('all');
 
   // Live polling every 3 seconds from backend market-series route
   const { data: marketData } = useSWR<MarketSeriesResponse>(
@@ -222,7 +227,46 @@ export default function ChartsPage() {
     { refreshInterval: 3000 }
   );
 
-  const seriesMap = marketData?.series || {};
+  const baseSeriesMap = marketData?.series || {};
+
+  // Merge real-time WebSocket ticks into series map dynamically
+  const seriesMap = useMemo(() => {
+    const map: Record<string, SeriesPoint[]> = {};
+    
+    // 1. Base series from fetcher / public APIs
+    Object.keys(baseSeriesMap).forEach(key => {
+      map[key] = [...(baseSeriesMap[key] || [])];
+    });
+
+    // 2. Real-time WebSocket ticks
+    liveEvents.forEach(e => {
+      const rawSym = (e.crypto_data?.pair || e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase().replace('-', '');
+      const price = e.crypto_data?.price || e.financial_data?.current_price || e.financial_data?.underlying_price;
+
+      if (rawSym && price && price > 0) {
+        const canonicalKeys = [rawSym];
+        if (rawSym.includes('BTC')) canonicalKeys.push('BTCUSD', 'BTCUSDT', 'BTC');
+        if (rawSym.includes('ETH')) canonicalKeys.push('ETHUSD', 'ETHUSDT', 'ETH');
+        if (rawSym.includes('30') || rawSym.includes('TYX')) canonicalKeys.push('US30Y', 'US30', '30YR');
+        if (rawSym.includes('2') || rawSym.includes('2YY') || rawSym.includes('SHY')) canonicalKeys.push('US02Y', 'US2Y', '2YR');
+
+        canonicalKeys.forEach(k => {
+          if (!map[k]) map[k] = [];
+          const lastPt = map[k][map[k].length - 1];
+          if (!lastPt || lastPt.timestamp !== e.occurred_at) {
+            map[k] = [...map[k], {
+              timestamp: e.occurred_at,
+              price: price,
+              volume: e.crypto_data?.volume || e.financial_data?.volume || 1000,
+              anomaly_score: e.anomaly_score || 0.0
+            }].slice(-60);
+          }
+        });
+      }
+    });
+
+    return map;
+  }, [baseSeriesMap, liveEvents]);
 
   const categoryTabs = [
     { id: 'all', label: 'ALL MARKET FEEDS' },

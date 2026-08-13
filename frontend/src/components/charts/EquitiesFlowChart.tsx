@@ -7,6 +7,8 @@ import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { TrendingUp, BarChart2, Radio } from 'lucide-react';
 
+import { useLiveEvents } from '../../lib/useLiveEvents';
+
 interface SeriesPoint {
   timestamp: string;
   price: number;
@@ -23,14 +25,41 @@ export default function EquitiesFlowChart() {
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [activeSeries, setActiveSeries] = useState<'both' | 'spy' | 'qqq'>('both');
 
+  // Real-time WebSocket stream ticks
+  const liveTradfiEvents = useLiveEvents('tradfi');
+
   const { data } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=SPY,QQQ&limit=60',
     fetcher,
     { refreshInterval: 3000 }
   );
 
-  const spySeries = data?.series?.['SPY'] || [];
-  const qqqSeries = data?.series?.['QQQ'] || [];
+  const baseSPY = data?.series?.['SPY'] || [];
+  const baseQQQ = data?.series?.['QQQ'] || [];
+
+  const spySeries = useMemo(() => {
+    const list = [...baseSPY];
+    liveTradfiEvents.forEach(e => {
+      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym === 'SPY') {
+        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+      }
+    });
+    return list.slice(-60);
+  }, [baseSPY, liveTradfiEvents]);
+
+  const qqqSeries = useMemo(() => {
+    const list = [...baseQQQ];
+    liveTradfiEvents.forEach(e => {
+      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+      if (sym === 'QQQ') {
+        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+      }
+    });
+    return list.slice(-60);
+  }, [baseQQQ, liveTradfiEvents]);
 
   const hasData = spySeries.length > 0 || qqqSeries.length > 0;
 

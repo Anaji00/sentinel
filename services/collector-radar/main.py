@@ -45,8 +45,8 @@ class QuantRadar:
         self.redis = redis_client
     
     async def _get_baseline(self, ticker: str) -> Tuple[float, float]:
-        mean_key = f"sentinel:radar:mean:{ticker}"
-        var_key = f"sentinel:radar:var:{ticker}"
+        mean_key = f"sentinel:radar:1m_mean:{ticker}"
+        var_key = f"sentinel:radar:1m_var:{ticker}"
 
         mean = float(await self.redis.raw.get(mean_key) or 0.0)
         var = float(await self.redis.raw.get(var_key) or 0.0)
@@ -58,8 +58,8 @@ class QuantRadar:
         new_var = (alpha * (current_vol - mean)**2) + ((1 - alpha) * var)
 
         pipe = self.redis.raw.pipeline()
-        pipe.set(f"sentinel:radar:mean:{ticker}", new_mean)
-        pipe.set(f"sentinel:radar:var:{ticker}", new_var)
+        pipe.set(f"sentinel:radar:1m_mean:{ticker}", new_mean)
+        pipe.set(f"sentinel:radar:1m_var:{ticker}", new_var)
         await pipe.execute()
 
     async def evaluate_volume(self, ticker:str, current_vol: float, current_price: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
@@ -175,11 +175,13 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
         for ticker, snap in snapshots.items():
             if not snap or not isinstance(snap, dict):
                 continue
+            minute_bar = snap.get("minuteBar") or {}
             daily_bar = snap.get("dailyBar") or {}
             prev_daily_bar = snap.get("prevDailyBar") or {}
 
-            volume = daily_bar.get("v", 0)
-            close_price = daily_bar.get("c", 0) or prev_daily_bar.get("c", 0)
+            # Use minuteBar for interval volume to evaluate 1-minute spikes
+            volume = minute_bar.get("v", 0)
+            close_price = minute_bar.get("c", 0) or daily_bar.get("c", 0) or prev_daily_bar.get("c", 0)
 
             if volume == 0 or close_price == 0:
                 continue

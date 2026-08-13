@@ -393,7 +393,8 @@ async def main():
                                 e.summary = f"Cryptocurrency Intelligence for {cd.symbol} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
                             elif e.prediction_market_data:
                                 pm = e.prediction_market_data
-                                e.summary = f"Prediction Market Intelligence for contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm.price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
+                                pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)
+                                e.summary = f"Prediction Market Intelligence for contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
                             elif e.vessel_data:
                                 vd = e.vessel_data
                                 e.summary = f"AIS Maritime position fix for {vd.vessel_type or 'Vessel'} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."

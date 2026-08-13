@@ -55,31 +55,70 @@ class StockCorrelationAgent(SentinelAgent):
     into the Neo4j Knowledge Graph.
     """
 
-    def __init__(self, kafka_producer=None, redis_client=None, neo4j_client=None):
+    def __init__(
+        self,
+        agent_name: str = "stock_correlation_agent",
+        input_topics: Optional[List[str]] = None,
+        redis_client=None,
+        db_client=None,
+        neo4j_client=None,
+        producer=None,
+        consumer=None,
+        dlq=None,
+        model: str = "qwen2.5:1.5b",
+        fallback_model: Optional[str] = "gemma3:1b",
+    ):
         super().__init__(
-            name="StockCorrelationAgent",
-            description="Agentic reasoning engine for dynamic stock, cross-asset correlation & sympathy mover discovery",
-            subscribed_topics=[
+            agent_name=agent_name,
+            input_topics=input_topics or [
+                Topics.RAW_NEWS,
                 Topics.ENRICHED_EVENTS,
                 Topics.QUANT_DISCOVERIES,
                 Topics.MACRO_ASSESSMENT,
+                Topics.CORRELATIONS,
             ],
-            kafka_producer=kafka_producer,
             redis_client=redis_client,
+            db_client=db_client,
             neo4j_client=neo4j_client,
+            producer=producer,
+            consumer=consumer,
+            dlq=dlq,
+            model=model,
+            fallback_model=fallback_model,
         )
+
+    @property
+    def output_topic(self) -> str:
+        return Topics.CORRELATIONS
+
+    async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return await self.handle_message(message)
 
     async def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Main reasoning loop for incoming events and tick updates.
         """
+        if not isinstance(message, dict):
+            return None
+
         event_type = message.get("type", "")
         source = message.get("source", "")
-        ticker = message.get("ticker") or message.get("primary_entity_id") or ""
 
-        # Extract underlying financial or headline payload
-        fd = message.get("financial_data", {})
-        ticker = ticker or fd.get("ticker", "")
+        # Safely extract primary entity or ticker
+        primary_entity = message.get("primary_entity")
+        primary_entity_id = ""
+        if isinstance(primary_entity, dict):
+            primary_entity_id = primary_entity.get("id", "") or primary_entity.get("name", "")
+        elif isinstance(primary_entity, str):
+            primary_entity_id = primary_entity
+
+        ticker = message.get("ticker") or message.get("primary_entity_id") or primary_entity_id or ""
+
+        # Extract underlying financial or headline payload safely
+        fd = message.get("financial_data")
+        if isinstance(fd, dict):
+            ticker = ticker or fd.get("ticker", "")
+
         if not ticker:
             return None
 
@@ -89,7 +128,7 @@ class StockCorrelationAgent(SentinelAgent):
             if not quote_keys or len(quote_keys) < 2:
                 return None
 
-            clean_tickers = [k.decode().split(":")[-1] for k in quote_keys if isinstance(k, bytes)]
+            clean_tickers = [k.decode().split(":")[-1] if isinstance(k, bytes) else str(k).split(":")[-1] for k in quote_keys]
             if len(clean_tickers) < 2:
                 return None
 
@@ -104,7 +143,7 @@ class StockCorrelationAgent(SentinelAgent):
                         pass
 
             # Identify macro/commodity assets vs equities dynamically
-            macro_assets = [t for t in price_map if any(m in t for m in ["WTI", "BRENT", "CL=F", "US10Y", "US02Y", "GLD", "VIX", "OIL"])]
+            macro_assets = [t for t in price_map if any(m in t for m in ["WTI", "BRENT", "CL=F", "US10Y", "US02Y", "US2Y", "US30Y", "US30", "SHY", "TLT", "GLD", "VIX", "OIL"])]
             equities = [t for t in price_map if t not in macro_assets]
 
             if not macro_assets or not equities:
@@ -136,13 +175,16 @@ class StockCorrelationAgent(SentinelAgent):
             3. Provide a clear agentic rationale, conviction, and impact severity without hardcoded assumptions.
             """
 
-            brief: DynamicCorrelationAssessment = await self._execute_with_telemetry(
+            brief: Optional[DynamicCorrelationAssessment] = await self._execute_with_telemetry(
                 message=message,
                 system_prompt="You are SENTINEL Stock Correlation & Sympathy Engine. Perform agentic macro-to-equity correlation analysis and identify sympathy movers. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=DynamicCorrelationAssessment,
                 temperature=0.2,
             )
+
+            if not brief:
+                return None
 
             logger.info(
                 f"🧠 Stock Correlation Agent Reasoning | {brief.macro_asset} vs {brief.equity_ticker} | "

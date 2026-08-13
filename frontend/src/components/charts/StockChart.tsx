@@ -32,7 +32,11 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
     { refreshInterval: 3000 }
   );
 
-  const rawSeries = data?.series?.[cleanTicker] || [];
+  const rawSeries = data?.series?.[cleanTicker] ||
+    data?.series?.[cleanTicker.replace('USD', '')] ||
+    data?.series?.[`${cleanTicker}USD`] ||
+    data?.series?.[cleanTicker === '2YR' ? 'US02Y' : cleanTicker === '30YR' ? 'US30Y' : cleanTicker] ||
+    [];
   const hasData = rawSeries.length > 0;
 
   const currentPrice = rawSeries[rawSeries.length - 1]?.price ?? null;

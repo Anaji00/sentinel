@@ -33,7 +33,7 @@ from shared.utils.logging import setup_sentinel_logging
 
 logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
-ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL")
+ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL") or os.getenv("ETH_WSS_URL")
 WHALE_THRESHOLD_USD = 250_000
 
 # Coinbase Advanced Trade WebSocket URI
