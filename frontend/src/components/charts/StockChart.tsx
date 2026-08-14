@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
@@ -54,13 +54,16 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
   const maxPrice = hasData ? Math.max(...rawSeries.map(p => p.price)) * 1.002 : 100;
   const priceRange = Math.max(0.0001, maxPrice - minPrice);
 
-  const points = rawSeries.map((pt, i) => {
-    const x = padding + (i / Math.max(1, rawSeries.length - 1)) * (svgWidth - padding * 2);
-    const y = svgHeight - padding - ((pt.price - minPrice) / priceRange) * (svgHeight - padding * 2);
-    return { x, y, pt };
-  });
-
-  const pathD = points.reduce((acc, p, i) => `${acc} ${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`, '');
+  const { points, pathD } = useMemo(() => {
+    if (!hasData) return { points: [], pathD: '' };
+    const pts = rawSeries.map((pt, i) => {
+      const x = padding + (i / Math.max(1, rawSeries.length - 1)) * (svgWidth - padding * 2);
+      const y = svgHeight - padding - ((pt.price - minPrice) / priceRange) * (svgHeight - padding * 2);
+      return { x, y, pt };
+    });
+    const d = pts.reduce((acc, p, i) => `${acc} ${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`, '');
+    return { points: pts, pathD: d };
+  }, [rawSeries, hasData, minPrice, priceRange, svgWidth, svgHeight, padding]);
 
   return (
     <Card

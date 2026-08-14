@@ -112,12 +112,7 @@ export default function FinancialAdvisorAdvice() {
   const brief = data?.brief;
   const plays = brief?.highest_conviction_plays || [];
   const metrics = brief?.portfolio_metrics;
-  const blAllocations = brief?.black_litterman_allocations || [
-    { ticker: 'NVDA', target_weight_pct: 35.0, expected_return_pct: 18.5, equilibrium_weight_pct: 25.0 },
-    { ticker: 'BTC-USD', target_weight_pct: 30.0, expected_return_pct: 22.0, equilibrium_weight_pct: 20.0 },
-    { ticker: 'AAPL', target_weight_pct: 20.0, expected_return_pct: 12.4, equilibrium_weight_pct: 35.0 },
-    { ticker: 'TSLA', target_weight_pct: 15.0, expected_return_pct: 8.2, equilibrium_weight_pct: 20.0 },
-  ];
+  const blAllocations = brief?.black_litterman_allocations || [];
 
   const filteredPlays = useMemo(() => {
     return plays.filter((p) => {
@@ -202,19 +197,19 @@ export default function FinancialAdvisorAdvice() {
         <div className="grid grid-cols-4 gap-2 bg-[#06080d] p-2.5 rounded-xl border border-cyan-500/20 text-[10px]">
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">PORTFOLIO VaR (95%)</span>
-            <span className="text-cyan-400 font-bold">{metrics?.var_95_pct ? `${metrics.var_95_pct}%` : '2.15%'}</span>
+            <span className="text-cyan-400 font-bold">{metrics?.var_95_pct !== undefined ? `${metrics.var_95_pct}%` : '--'}</span>
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">SHARPE RATIO</span>
-            <span className="text-emerald-400 font-bold">{metrics?.sharpe_ratio ? `${metrics.sharpe_ratio}x` : '2.45x'}</span>
+            <span className="text-emerald-400 font-bold">{metrics?.sharpe_ratio !== undefined ? `${metrics.sharpe_ratio}x` : '--'}</span>
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">CASH BUFFER</span>
-            <span className="text-amber-400 font-bold">{metrics?.recommended_cash_pct ? `${metrics.recommended_cash_pct}%` : '15.0%'}</span>
+            <span className="text-amber-400 font-bold">{metrics?.recommended_cash_pct !== undefined ? `${metrics.recommended_cash_pct}%` : '--'}</span>
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">HAWKES FACTOR</span>
-            <span className="text-purple-400 font-bold">{metrics?.hawkes_risk_factor ? `${metrics.hawkes_risk_factor}x` : '1.0x'}</span>
+            <span className="text-purple-400 font-bold">{metrics?.hawkes_risk_factor !== undefined ? `${metrics.hawkes_risk_factor}x` : '--'}</span>
           </div>
         </div>
 

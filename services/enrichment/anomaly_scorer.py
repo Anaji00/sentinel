@@ -128,6 +128,11 @@ class DynamicAnomalyScorer:
         # First Story Detection for news novelty scoring
         self._fsd = FirstStoryDetector(window_size=500)
 
+        # BGP graph-topology feature extractor
+        self._bgp_extractor = BGPGraphFeatureExtractor(neo4j_client=neo4j_client)
+
+        logger.info("⚡ Per-domain streaming anomaly detectors & ModelRegistry initialized (8 domain RRCFs + Conformal Z + Kalman + Hawkes + FSD + BGP)")
+
     async def load_thresholds(self):
         """Loads dynamic ML thresholds from Redis cache."""
         import time, json
@@ -144,11 +149,6 @@ class DynamicAnomalyScorer:
         except Exception as e:
             logger.debug(f"Could not load custom ML thresholds: {e}")
         return self._thresholds_cache
-
-        # BGP graph-topology feature extractor
-        self._bgp_extractor = BGPGraphFeatureExtractor(neo4j_client=neo4j_client)
-
-        logger.info("⚡ Per-domain streaming anomaly detectors & ModelRegistry initialized (8 domain RRCFs + Conformal Z + Kalman + Hawkes + FSD + BGP)")
 
     async def _get_thresholds_config(self, key: str) -> dict:
         import time

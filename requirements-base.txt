@@ -13,3 +13,4 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 yfinance==0.2.44
 pyahocorasick==2.0.0
+simplefix==1.0.12

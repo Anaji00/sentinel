@@ -327,7 +327,7 @@ export default function IntelligenceFeed() {
     setFullEventDetail(null);
     setIsLoadingDetail(true);
     try {
-      const response = await apiClient.get(`/events/${event.event_id}`);
+      const response = await apiClient.get(`/events/${encodeURIComponent(event.event_id)}`);
       setFullEventDetail(response.data);
     } catch (err) {
       console.warn("Could not fetch deep event detail from hypertable, using live payload fallback:", err);

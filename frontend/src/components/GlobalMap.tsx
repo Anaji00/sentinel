@@ -39,6 +39,53 @@ const FINANCIAL_EXCHANGES = [
     { name: "Riyadh Tadawul", symbol: "TADAWUL", lon: 46.7133, lat: 24.7136, region: "Crude Oil & Saudi Aramco", keyTickers: ["2222.SR", "1150.SR"] },
 ];
 
+const REGION_COORDINATES_MAP: Record<string, [number, number]> = {
+    // Strategic Regional Centroids matched against backend classify_region() strings
+    "strait of hormuz": [26.5, 56.5],
+    "persian gulf": [26.0, 52.0],
+    "gulf of oman": [24.5, 58.5],
+    "iranian territorial": [27.0, 52.5],
+    "iran airspace": [32.4, 53.6],
+    "strait of malacca": [2.5, 101.4],
+    "singapore": [1.3, 103.8],
+    "bab-el-mandeb": [12.6, 43.3],
+    "red sea": [18.0, 40.0],
+    "gulf of aden": [12.5, 48.0],
+    "suez canal": [30.0, 32.5],
+    "taiwan strait": [24.0, 119.5],
+    "taiwan adiz": [24.0, 121.5],
+    "south china sea": [14.0, 114.0],
+    "east china sea": [29.0, 125.0],
+    "black sea": [43.5, 34.2],
+    "ukrainian waters": [46.0, 31.0],
+    "ukraine airspace": [48.3, 31.1],
+    "bosphorus strait": [41.1, 29.0],
+    "north korean waters": [39.0, 128.0],
+    "north korea adiz": [39.0, 127.5],
+    "panama canal": [9.1, -79.6],
+    "israeli territorial": [32.0, 34.5],
+    "israeli airspace": [31.5, 35.0],
+    "syrian territorial": [35.5, 35.5],
+    "syrian airspace": [35.0, 38.0],
+    "yemeni airspace": [15.5, 47.5],
+    "russian airspace": [55.7, 37.6],
+    "barents sea": [72.0, 35.0],
+    "caspian sea": [41.8, 50.8],
+    "somali territorial": [3.0, 47.0],
+    "poland": [52.2, 21.0],
+};
+
+function resolveRegionFallback(regionName: string, defaultLat = 25.0, defaultLon = 55.0): [number, number] {
+    if (!regionName) return [defaultLat, defaultLon];
+    const rLower = regionName.toLowerCase().trim();
+    for (const [key, coords] of Object.entries(REGION_COORDINATES_MAP)) {
+        if (rLower.includes(key) || key.includes(rLower)) {
+            return coords;
+        }
+    }
+    return [defaultLat, defaultLon];
+}
+
 /**
  * Deterministic Golden-Angle Spiral Anti-Collision Helper
  * Prevents co-located vessels or flights from stacking directly on top of each other.
@@ -46,8 +93,8 @@ const FINANCIAL_EXCHANGES = [
 function applySpatialAntiCollision<T extends { lat: number; lon: number }>(items: T[]): T[] {
     const positionCounts = new Map<string, number>();
     return items.map((item) => {
-        // Quantize position key to ~1.5km grid (~0.015 deg)
-        const gridKey = `${item.lat.toFixed(2)},${item.lon.toFixed(2)}`;
+        // Quantize position key to ~10m grid (~0.0001 deg) to only deconflict exact pixel overlaps
+        const gridKey = `${item.lat.toFixed(4)},${item.lon.toFixed(4)}`;
         const count = positionCounts.get(gridKey) || 0;
         positionCounts.set(gridKey, count + 1);
 
@@ -55,9 +102,9 @@ function applySpatialAntiCollision<T extends { lat: number; lon: number }>(items
             return item;
         }
 
-        // Apply a subtle golden-angle spiral offset
+        // Apply a subtle micro golden-angle spiral offset (~200m) to preserve geodetic position accuracy
         const angle = count * 2.39996; // Golden angle in radians
-        const radius = 0.22 * Math.sqrt(count); // Radial offset step in degrees
+        const radius = 0.002 * Math.sqrt(count); // Micro radial offset step in degrees (~200 meters)
         const offsetLat = Math.sin(angle) * radius;
         const offsetLon = Math.cos(angle) * radius * 1.15;
 
@@ -68,6 +115,29 @@ function applySpatialAntiCollision<T extends { lat: number; lon: number }>(items
         };
     });
 }
+
+const StaticWorldBase = React.memo(function StaticWorldBase() {
+    return (
+        <Geographies geography={geoUrl}>
+            {({ geographies }: { geographies: any[] }) =>
+                geographies.map((geo: any) => (
+                    <Geography
+                        key={geo.rsmKey}
+                        geography={geo}
+                        fill="#0f172a"
+                        stroke="#1e293b"
+                        strokeWidth={0.5}
+                        style={{
+                            default: { outline: "none" },
+                            hover: { fill: "#1e293b", outline: "none" },
+                            pressed: { outline: "none" },
+                        }}
+                    />
+                ))
+            }
+        </Geographies>
+    );
+});
 
 export default function GlobalMap() {
     // D3 selection polyfill
@@ -123,21 +193,27 @@ export default function GlobalMap() {
             
             const mmsi = String(d.mmsi || meta.MMSI || e.primary_entity?.id || e.primary_entity_id || e.primary_entity_name || e.event_id || 'UNKNOWN');
             
-            const rawLat = e.latitude ?? d.latitude ?? d.lat ?? pos.Latitude ?? meta.latitude ?? d.position?.latitude ?? e.lat;
-            const rawLon = e.longitude ?? d.longitude ?? d.lon ?? pos.Longitude ?? meta.longitude ?? d.position?.longitude ?? e.lon;
-            let lat = parseFloat(String(rawLat));
-            let lon = parseFloat(String(rawLon));
+            const parseValidCoord = (candidates: any[], maxBound: number): number | null => {
+                for (const c of candidates) {
+                    if (c !== null && c !== undefined && c !== '') {
+                        const n = parseFloat(String(c));
+                        if (!isNaN(n) && n !== 0 && Math.abs(n) <= maxBound) {
+                            return n;
+                        }
+                    }
+                }
+                return null;
+            };
 
-            // Fallback realistic region coordinates if lat/lon missing or 0,0
-            if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0)) {
-                const reg = (e.region || d.region || meta.region || '').toLowerCase();
-                if (reg.includes('hormuz') || reg.includes('persian')) { lat = 26.5; lon = 56.2; }
-                else if (reg.includes('malacca') || reg.includes('singapore')) { lat = 1.3; lon = 103.8; }
-                else if (reg.includes('red sea') || reg.includes('mandeb')) { lat = 13.2; lon = 42.8; }
-                else if (reg.includes('suez')) { lat = 29.9; lon = 32.5; }
-                else if (reg.includes('taiwan')) { lat = 23.8; lon = 119.8; }
-                else if (reg.includes('black sea')) { lat = 43.5; lon = 34.2; }
-                else { lat = 25.0; lon = 55.0; } // Default Arabian Sea/Persian Gulf transit
+            let lat = parseValidCoord([e.latitude, d.latitude, d.lat, pos.Latitude, meta.latitude, d.position?.latitude, e.lat], 90);
+            let lon = parseValidCoord([e.longitude, d.longitude, d.lon, pos.Longitude, meta.longitude, d.position?.longitude, e.lon], 180);
+
+            // Fallback realistic region coordinates ONLY if lat/lon are missing, using backend emitted region
+            if (lat === null || lon === null) {
+                const reg = String(e.region || d.region || meta.region || e.vessel_data?.region || '');
+                const [fLat, fLon] = resolveRegionFallback(reg, 25.0, 55.0);
+                lat = fLat;
+                lon = fLon;
             }
 
             const vtype = String(d.vessel_type || d.type || meta.ShipType || e.vessel_data?.vessel_type || '').toLowerCase();
@@ -194,18 +270,27 @@ export default function GlobalMap() {
         rawAviation.forEach((e: any) => {
             const d = e.flight_data || e.domain_data || e.raw_payload || {};
             const icao24 = String(d.icao24 || e.primary_entity?.id || e.primary_entity_id || e.event_id || 'UNKNOWN').toUpperCase();
-            const rawLat = e.latitude ?? d.latitude ?? d.lat;
-            const rawLon = e.longitude ?? d.longitude ?? d.lon;
-            let lat = parseFloat(String(rawLat));
-            let lon = parseFloat(String(rawLon));
+            const parseValidCoord = (candidates: any[], maxBound: number): number | null => {
+                for (const c of candidates) {
+                    if (c !== null && c !== undefined && c !== '') {
+                        const n = parseFloat(String(c));
+                        if (!isNaN(n) && n !== 0 && Math.abs(n) <= maxBound) {
+                            return n;
+                        }
+                    }
+                }
+                return null;
+            };
 
-            // Fallback realistic region coordinates if lat/lon missing
-            if (isNaN(lat) || isNaN(lon) || (lat === 0 && lon === 0)) {
-                const reg = (e.region || d.region || '').toLowerCase();
-                if (reg.includes('taiwan')) { lat = 24.2; lon = 121.0; }
-                else if (reg.includes('ukraine') || reg.includes('poland')) { lat = 50.4; lon = 30.5; }
-                else if (reg.includes('iran') || reg.includes('gulf')) { lat = 32.4; lon = 53.6; }
-                else { lat = 38.8; lon = -77.0; } // US East Coast Air Corridor
+            let lat = parseValidCoord([e.latitude, d.latitude, d.lat], 90);
+            let lon = parseValidCoord([e.longitude, d.longitude, d.lon], 180);
+
+            // Fallback realistic region coordinates ONLY if lat/lon are missing, using backend emitted region
+            if (lat === null || lon === null) {
+                const reg = String(e.region || d.region || e.flight_data?.region || '');
+                const [fLat, fLon] = resolveRegionFallback(reg, 38.8, -77.0);
+                lat = fLat;
+                lon = fLon;
             }
 
             const callsign = d.callsign || e.primary_entity_name || e.entity_name || `FLT_${icao24}`;
@@ -459,24 +544,7 @@ export default function GlobalMap() {
 
             {/* Interactive World Map Canvas */}
             <ComposableMap projection="geoMercator" projectionConfig={{ scale: 110 }} className="w-full h-full">
-                <Geographies geography={geoUrl}>
-                    {({ geographies }: { geographies: any[] }) =>
-                        geographies.map((geo: any) => (
-                            <Geography
-                                key={geo.rsmKey}
-                                geography={geo}
-                                fill="#0f172a"
-                                stroke="#1e293b"
-                                strokeWidth={0.5}
-                                style={{
-                                    default: { outline: "none" },
-                                    hover: { fill: "#1e293b", outline: "none" },
-                                    pressed: { outline: "none" },
-                                }}
-                            />
-                        ))
-                    }
-                </Geographies>
+                <StaticWorldBase />
 
                 {/* 1. Maritime Chokepoints Layer */}
                 {showChokepoints && GLOBAL_CHOKEPOINTS.map((m) => (

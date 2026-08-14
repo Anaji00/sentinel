@@ -144,7 +144,7 @@ async function fetchDirectCryptoEvents(limit = 25) {
       if (Array.isArray(items)) {
         const topSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'SUIUSDT', 'NEARUSDT'];
         const filtered = items.filter((item: any) => topSymbols.includes(item.symbol));
-        
+
         return filtered.map((item: any) => {
           const fundingRate = parseFloat(item.lastFundingRate || '0');
           const markPrice = parseFloat(item.markPrice || '0');
@@ -306,8 +306,9 @@ export const fetcher = async (url: string) => {
   // Handle market-series endpoint
   if (normalizedUrl.includes('/radar/market-series')) {
     const dummyUrl = new URL(normalizedUrl, 'http://localhost:8000/api/v1');
-    const symbolsParam = dummyUrl.searchParams.get('symbols') || 'SPY,QQQ,BTCUSD';
-    const targetSymbols = symbolsParam.split(',').map((s) => s.trim().toUpperCase());
+    const symbolsParam = dummyUrl.searchParams.get('symbols');
+    if (!symbolsParam) return { symbols: [], series: {} };
+    const targetSymbols = symbolsParam.split(',').map((s: string) => s.trim().toUpperCase()).filter(Boolean);
     const limit = parseInt(dummyUrl.searchParams.get('limit') || '60', 10);
 
     const seriesData: Record<string, any[]> = data?.series || {};

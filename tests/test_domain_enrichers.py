@@ -333,3 +333,17 @@ def test_sanctions_rebuild_and_fuzzy_matching():
 
     flags2 = check_sanctions("Clean Vessel", mmsi="422123456")
     assert "sanctions_adjacent_flag_state" in flags2
+
+@pytest.mark.parametrize("mmsi, expected_flag", [
+    ("613000123", "sanctions_adjacent_flag_state"), # Cameroon
+    ("625000456", "sanctions_adjacent_flag_state"), # Gabon
+    ("511000789", "sanctions_adjacent_flag_state"), # Palau
+    ("670000111", "sanctions_adjacent_flag_state"), # Zanzibar
+    ("666000222", "sanctions_adjacent_flag_state"), # Eswatini
+    ("422000333", "sanctions_adjacent_flag_state"), # Iran
+    ("273000444", "sanctions_adjacent_flag_state"), # Russia
+])
+def test_shadow_fleet_foc_mmsi_prefixes(mmsi, expected_flag):
+    flags = check_sanctions("Generic Cargo", mmsi=mmsi)
+    assert expected_flag in flags
+

@@ -172,7 +172,8 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
 
     prefix = (mmsi or "")[:3]
     # High risk: Iran (422), DPRK (442, 445, 447, 619), Russia (273), Syria (468), Cuba (323), Venezuela (775)
-    if prefix in ("422", "442", "445", "447", "619", "273", "468", "323", "775"):
+    # High-risk shadow fleet FoCs: Cameroon (613), Gabon (625), Palau (511), Zanzibar/Tanzania (670), Eswatini (666)
+    if prefix in ("422", "442", "445", "447", "619", "273", "468", "323", "775", "613", "625", "511", "670", "666"):
         flags.append("sanctions_adjacent_flag_state")
 
     return flags

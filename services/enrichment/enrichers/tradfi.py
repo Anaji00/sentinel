@@ -79,6 +79,12 @@ class TradFiEnricher:
                 # We don't usually call this anymore since enrich_batch handles it, but just in case
                 res = await self._enrich_equity_trade_batch([raw])
                 return res[0] if res else None
+        elif source == "nyfed_sofr":
+            r_val = p.get("risk_free_rate", 0.045)
+            await self.redis_client.raw.set("sentinel:macro:sofr_rate", str(r_val), ex=86400)
+            await self.redis_client.raw.set("sentinel:macro:risk_free_rate", str(r_val), ex=86400)
+            logger.info(f"🏛️ SOFR Enricher: Updated live Federal Reserve risk-free rate in Redis: {r_val}")
+            return None
         elif source == "sec_form4":
             return await self._enrich_insider(raw, p)
         elif source == "alpaca_options":

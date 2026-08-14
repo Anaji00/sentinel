@@ -118,3 +118,22 @@ def test_payload_readability_and_summaries():
     summary_text = event.to_readable_summary()
     assert "[OPTIONS_FLOW]" in summary_text
     assert "Apple Inc." in summary_text
+
+
+def test_covered_call_endpoint():
+    import os
+    from fastapi.testclient import TestClient
+    from services.api_gateway.routes.main import app
+    api_key = os.getenv("API_GATEWAY_KEY") or os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or "dev-secret-key"
+    headers = {"X-API-Key": api_key}
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/radar/options/covered-calls?ticker=NVDA&z_score=2.8&current_price=130.0",
+            headers=headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["strategy"] == "COVERED_CALL_OVERLAY"
+        assert data["ticker"] == "NVDA"
+        assert data["recommended_strike"] > 130.0
+        assert "risk_free_rate_note" in data

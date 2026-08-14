@@ -19,9 +19,11 @@ first, because a position can be in both "Strait of Hormuz" AND
 "Persian Gulf". We want the most specific match.
 """
 
+import os
 import logging
 import json
 from typing import Optional, Tuple
+import numpy as np
 
 logger = logging.getLogger("shared.regions")
 
@@ -40,11 +42,27 @@ _tree = None
 
 _fallback_boxes = []
 
+def _flatten_coords(coords):
+    for c in coords:
+        if isinstance(c, (list, tuple)) and len(c) >= 2 and isinstance(c[0], (int, float)):
+            yield c
+        elif isinstance(c, (list, tuple)):
+            yield from _flatten_coords(c)
+
 def _init_spatial_index():
     global _tree
     
+    base_dir = os.path.dirname(__file__)
+    candidates = [
+        os.path.abspath(os.path.join(base_dir, "..", "..", "regions.geojson")),
+        os.path.abspath(os.path.join(base_dir, "..", "regions.geojson")),
+        os.path.abspath(os.path.join(base_dir, "regions.geojson")),
+        "regions.geojson",
+    ]
+    geojson_path = next((p for p in candidates if os.path.exists(p)), "regions.geojson")
+
     try:
-        with open("regions.geojson", "r") as f:
+        with open(geojson_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             for feature in data.get("features", []):
                 name = feature["properties"].get("name", "Unknown")
@@ -54,17 +72,18 @@ def _init_spatial_index():
                     _polygons.append(geom)
                     _polygon_names.append(name)
                 else:
-                    # Manual bounding box fallback from GeoJSON
-                    coords = feature["geometry"]["coordinates"][0]
-                    lons = [c[0] for c in coords]
-                    lats = [c[1] for c in coords]
-                    _fallback_boxes.append((name, min(lats), max(lats), min(lons), max(lons)))
+                    # Manual bounding box fallback from GeoJSON supporting both Polygon and MultiPolygon
+                    raw_coords = list(_flatten_coords(feature["geometry"]["coordinates"]))
+                    if raw_coords:
+                        lons = [c[0] for c in raw_coords]
+                        lats = [c[1] for c in raw_coords]
+                        _fallback_boxes.append((name, min(lats), max(lats), min(lons), max(lons)))
                     
         if HAS_SHAPELY and _polygons:
             _tree = STRtree(_polygons)
             
     except Exception as e:
-        logger.error(f"Failed to load spatial data from regions.geojson: {e}")
+        logger.error(f"Failed to load spatial data from {geojson_path}: {e}")
 
 _init_spatial_index()
 
@@ -77,9 +96,10 @@ def classify_region(lat: float, lon: float) -> Optional[str]:
     """
     if _tree is not None:
         p = Point(lon, lat)
-        # STRtree query is highly optimized and returns indices of matching envelopes
+        # STRtree query is highly optimized and returns indices or geometries depending on Shapely version
         indices = _tree.query(p)
-        for idx in indices:
+        for item in indices:
+            idx = item if isinstance(item, (int, np.integer)) else _polygons.index(item)
             # Do the final, exact point-in-polygon math
             if _polygons[idx].contains(p):
                 return _polygon_names[idx]
@@ -180,7 +200,7 @@ def get_region_sensitivity_multiplier(region: Optional[str]) -> float:
     
 # ── VESSEL AIS DECODE HELPERS ─────────────────────────────────────────────────
  
-# AIS NavigationalStatus codes → human readable
+# AIS NavigationalStatus codes → human readable (ITU-R M.1371-5 Standard)
 NAVIGATIONAL_STATUS = {
     0:  "UnderWayUsingEngine",
     1:  "Anchored",
@@ -191,6 +211,12 @@ NAVIGATIONAL_STATUS = {
     6:  "Aground",
     7:  "EngagedInFishing",
     8:  "UnderWaySailing",
+    9:  "ReservedHSC",
+    10: "ReservedWIG",
+    11: "TowingAstern",
+    12: "PushingAheadTowingAlongside",
+    13: "ReservedFuture",
+    14: "AIS-SART Active",
     15: "Undefined",
 }
 

@@ -133,20 +133,22 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
     """
     symbol_upper = symbol.upper().strip()
     
-    # 1. Check Crypto symbols via Binance Public KLines API (Zero Auth Required)
-    if any(c in symbol_upper for c in ("BTC", "ETH", "SOL")) or symbol_upper.endswith("USDT") or symbol_upper.endswith("USD"):
-        clean_base = symbol_upper.replace("USDT", "").replace("USD", "").strip()
-        pair = f"{clean_base}USDT" if clean_base else "BTCUSDT"
-        url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&limit={limit}"
+    # 1. Check Crypto symbols via Coinbase Public Exchange Candles API (US-compliant, zero auth)
+    if any(c in symbol_upper for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK")) or symbol_upper.endswith("USDT") or symbol_upper.endswith("USD"):
+        clean_base = symbol_upper.replace("USDT", "").replace("USD", "").strip() or "BTC"
+        pair = f"{clean_base}-USD"
+        url = f"https://api.exchange.coinbase.com/products/{pair}/candles?granularity=60"
+        headers = {"User-Agent": "Mozilla/5.0"}
         try:
             timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
-                        klines = await resp.json()
+                        raw_candles = await resp.json()
                         pts = []
-                        for k in klines:
-                            ts_str = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc).isoformat()
+                        # Coinbase returns [time, low, high, open, close, volume] ordered newest to oldest
+                        for k in reversed(raw_candles[:limit]):
+                            ts_str = datetime.fromtimestamp(k[0], tz=timezone.utc).isoformat()
                             close_p = float(k[4])
                             vol = float(k[5])
                             pts.append({
@@ -158,7 +160,7 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
                         if pts:
                             return pts
         except Exception as e:
-            logger.debug(f"Binance historical fetch failed for {symbol}: {e}")
+            logger.debug(f"Coinbase historical candle fetch failed for {symbol}: {e}")
 
     # 2. Check Equities, Commodities, Yields via Yahoo Finance v8 Chart API
     yf_symbol = SYMBOL_YAF_MAP.get(symbol_upper, symbol_upper)
@@ -359,3 +361,35 @@ async def get_radar_candles(
         "count": len(candles),
         "candles": candles
     }
+
+
+@router.get("/options/covered-calls")
+async def get_covered_call_recommendations(
+    ticker: str = Query("NVDA"),
+    z_score: float = Query(2.8),
+    current_price: float = Query(130.0),
+    target_delta: float = Query(0.30),
+    dte_days: int = Query(30),
+    redis = Depends(get_redis_client)
+):
+    """Generates a closed-form Black-Scholes covered-call recommendation (§3.4 Phase 3 Flagship Feature)."""
+    from shared.utils import quant_calc
+    
+    live_iv = None
+    if redis:
+        try:
+            raw_iv = await redis.raw.get(f"sentinel:options:iv:{ticker}")
+            if raw_iv:
+                live_iv = float(raw_iv)
+        except Exception:
+            pass
+
+    rec = quant_calc.generate_covered_call_recommendation(
+        ticker=ticker,
+        current_price=current_price,
+        z_score=z_score,
+        target_delta=target_delta,
+        dte_days=dte_days,
+        live_iv=live_iv
+    )
+    return rec or {"status": "GATED_OR_INVALID", "message": f"Covered call overlay requires CAGG Z >= 2.5 or valid ticker (Z={z_score})"}

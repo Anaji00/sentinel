@@ -86,11 +86,12 @@ class SmartMoneyConvergence(BaseModel):
     conviction_boost: float = 0.0
 
 class PortfolioMetrics(BaseModel):
-    var_95_pct: float = 2.15
-    cvar_99_pct: float = 3.80
-    sharpe_ratio: float = 2.45
-    recommended_cash_pct: float = 15.0
-    hawkes_risk_factor: float = 1.0
+    var_95_pct: Optional[float] = None
+    cvar_99_pct: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    recommended_cash_pct: Optional[float] = None
+    hawkes_risk_factor: Optional[float] = None
+    metrics_source: str = "QUANT_ENGINE_SERVER"
 
 class TradingSignal(BaseModel):
     ticker: str
@@ -118,6 +119,7 @@ class FinancialAdviceBrief(BaseModel):
     portfolio_metrics: PortfolioMetrics = Field(default_factory=PortfolioMetrics)
     black_litterman_allocations: List[BlackLittermanAllocation] = Field(default_factory=list)
     highest_conviction_plays: List[TradingSignal] = Field(default_factory=list)
+    covered_call_overlays: List[Dict[str, Any]] = Field(default_factory=list)
     general_hedging_strategy: str
 
 
@@ -618,6 +620,38 @@ Return raw JSON matching schema:"""
 
                 # Hard clamp Kelly allocation to server-calculated half-Kelly limit
                 play.kelly_allocation_pct = round(min(max(0.0, float(play.kelly_allocation_pct)), max_kelly_pct), 2)
+
+            # Evaluate closed-form Covered Call recommendation if CAGG Z-score >= +2.5
+            z_score = 0.0
+            if len(returns) >= 20:
+                mean_ret = float(np.mean(returns[-20:]))
+                std_ret = float(np.std(returns[-20:]))
+                if std_ret > 1e-6:
+                    z_score = (returns[-1] - mean_ret) / std_ret
+
+            live_iv = None
+            raw_iv = await self.redis.raw.get(f"sentinel:options:iv:{ticker}")
+            if raw_iv:
+                try:
+                    live_iv = float(raw_iv)
+                except Exception:
+                    pass
+
+            raw_watchlist = await self.redis.raw.zrange("sentinel:watchlist:equities", 0, -1)
+            watched_set = {s.decode() if isinstance(s, bytes) else str(s) for s in raw_watchlist} if raw_watchlist else None
+
+            cc_rec = quant_calc.generate_covered_call_recommendation(
+                ticker=ticker,
+                current_price=current_price,
+                z_score=z_score,
+                target_delta=0.30,
+                dte_days=30,
+                live_iv=live_iv,
+                realized_volatility=ewma_vol,
+                watched_equities=watched_set
+            )
+            if cc_rec:
+                brief.covered_call_overlays.append(cc_rec)
 
             res_payload = {
                 "agent": self.name,

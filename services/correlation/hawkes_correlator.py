@@ -126,6 +126,9 @@ class HawkesMLE:
             grad_alpha = [[0.0] * self.D for _ in range(self.D)]
             grad_beta = 0.0
 
+            import bisect
+            cutoff_window = 5.0 / max(1e-6, self.beta)
+
             for j in range(self.D):
                 stream_j = streams[j]
                 n_j = len(stream_j)
@@ -139,17 +142,24 @@ class HawkesMLE:
                 for k_idx, t_k in enumerate(stream_j):
                     # Compute λ_j(t_k) for log-likelihood
                     lam = self.mu[j]
+                    
+                    # Pre-calculate active historical event slices per domain using binary search
+                    active_slices = {}
                     for i in range(self.D):
+                        stream_i = streams[i]
+                        if not stream_i:
+                            continue
+                        idx_end = bisect.bisect_left(stream_i, t_k)
+                        idx_start = bisect.bisect_left(stream_i, t_k - cutoff_window)
+                        if idx_start < idx_end:
+                            active_slices[i] = stream_i[idx_start:idx_end]
+
+                    for i, prev_ts_list in active_slices.items():
                         alpha_ij = self.alpha[i][j]
                         if alpha_ij <= 0:
                             continue
-                        # Sum kernel contributions from domain i events before t_k
-                        for t_prev in streams[i]:
-                            if t_prev >= t_k:
-                                break
+                        for t_prev in prev_ts_list:
                             dt = t_k - t_prev
-                            if dt > 5.0 / max(1e-6, self.beta):
-                                continue
                             kernel = math.exp(-self.beta * dt)
                             lam += alpha_ij * kernel
 
@@ -161,14 +171,10 @@ class HawkesMLE:
                         grad_mu[j] += inv_lam
 
                         # Gradient w.r.t. α_ij and β
-                        for i in range(self.D):
+                        for i, prev_ts_list in active_slices.items():
                             alpha_ij = self.alpha[i][j]
-                            for t_prev in streams[i]:
-                                if t_prev >= t_k:
-                                    break
+                            for t_prev in prev_ts_list:
                                 dt = t_k - t_prev
-                                if dt > 5.0 / max(1e-6, self.beta):
-                                    continue
                                 kernel = math.exp(-self.beta * dt)
                                 grad_alpha[i][j] += inv_lam * kernel
                                 if alpha_ij > 0:
@@ -505,12 +511,15 @@ class CrossDomainHawkesCorrelator:
         total = sum(len(v) for v in streams.values())
         if total < self.MIN_EVENTS_FOR_FIT and self._db:
             try:
-                rows = await self._db.query("""
+                rows = await self._db.query(
+                    """
                     SELECT type AS event_type, occurred_at
                     FROM events
-                    WHERE occurred_at > NOW() - INTERVAL '%s hours'
+                    WHERE occurred_at > NOW() - ($1::integer * INTERVAL '1 hour')
                     ORDER BY occurred_at ASC
-                """ % self.FIT_WINDOW_HOURS)
+                    """,
+                    int(self.FIT_WINDOW_HOURS)
+                )
 
                 streams = {d: [] for d in SENTINEL_DOMAINS}
                 for row in rows:

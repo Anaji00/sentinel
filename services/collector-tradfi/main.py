@@ -780,7 +780,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
 class InstitutionalFIXClient:
     """
     State Street / Tier-1 Institutional FIX 4.4 & FIXT 1.1 Market Data Client.
-    Sends MarketDataRequest (MsgType=V) and processes snapshots (MsgType=W) and
+    Sends Logon (MsgType=A) & MarketDataRequest (MsgType=V) and processes snapshots (MsgType=W) and
     incremental updates (MsgType=X), streaming order book & trade ticks to Kafka.
     """
     def __init__(self, host: str, port: int, sender_comp_id: str = "SENTINEL_PROD", target_comp_id: str = "STATE_STREET"):
@@ -790,17 +790,32 @@ class InstitutionalFIXClient:
         self.target_comp_id = target_comp_id
         self.is_connected = False
 
+    def build_logon(self) -> bytes:
+        import simplefix
+        msg = simplefix.FixMessage()
+        msg.append_pair(8, "FIX.4.4")
+        msg.append_pair(35, "A")  # Logon
+        msg.append_pair(49, self.sender_comp_id)
+        msg.append_pair(56, self.target_comp_id)
+        msg.append_pair(34, "1")  # MsgSeqNum
+        msg.append_pair(52, datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3])
+        msg.append_pair(98, "0")  # EncryptMethod: None
+        msg.append_pair(108, "30") # HeartBtInt: 30s
+        return msg.encode()
+
     def build_market_data_request(self, symbols: list) -> bytes:
         import simplefix
         msg = simplefix.FixMessage()
         msg.append_pair(8, "FIX.4.4")
-        msg.append_pair(35, "V")
+        msg.append_pair(35, "V")  # MarketDataRequest
         msg.append_pair(49, self.sender_comp_id)
         msg.append_pair(56, self.target_comp_id)
+        msg.append_pair(34, "2")
+        msg.append_pair(52, datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3])
         msg.append_pair(262, f"MDR_{int(time.time())}")
         msg.append_pair(263, "1")  # Snapshot + Updates
         msg.append_pair(264, "0")  # Full Book
-        msg.append_pair(146, len(symbols))
+        msg.append_pair(146, str(len(symbols)))
         for s in symbols:
             msg.append_pair(55, s)
         return msg.encode()
@@ -808,11 +823,23 @@ class InstitutionalFIXClient:
 async def run_institutional_fix(producer: SentinelProducer, redis_client):
     """
     Institutional FIX engine loop for watched equities.
-    Pipes order book & trade ticks to Kafka with continuous aggregate caching in TimescaleDB & Redis.
+    Connects to real institutional FIX venue via TCP socket. If no venue is configured,
+    idles in standby mode (publishing zero synthetic quotes to maintain true provenance).
     """
     logger.info("⚡ Institutional FIX 4.4 Engine initialized for watched equities.")
-    fix_host = os.getenv("FIX_ENGINE_HOST", "127.0.0.1")
-    fix_port = int(os.getenv("FIX_ENGINE_PORT", "9800"))
+    fix_host = os.getenv("FIX_ENGINE_HOST")
+    fix_port_str = os.getenv("FIX_ENGINE_PORT", "9800")
+    enable_fix = os.getenv("ENABLE_FIX_CLIENT", "false").lower() in ("true", "1", "yes")
+
+    if not fix_host or not enable_fix:
+        logger.info("⚡ FIX 4.4 Engine: No active venue configured (ENABLE_FIX_CLIENT=false). Standby mode active (zero synthetic provenance).")
+        while True:
+            await asyncio.sleep(60)
+
+    try:
+        fix_port = int(fix_port_str)
+    except ValueError:
+        fix_port = 9800
 
     while True:
         try:
@@ -823,29 +850,51 @@ async def run_institutional_fix(producer: SentinelProducer, redis_client):
                 continue
 
             client = InstitutionalFIXClient(fix_host, fix_port)
-            logger.info(f"⚡ FIX 4.4 Client: Ready to stream MsgType=V/W/X for {len(symbols)} dynamically tracked tickers...")
-            
-            # Maintain active pulse for watched equities
-            for sym in symbols[:15]:
-                latest_p = await redis_client.raw.get(f"sentinel:quotes:latest:{sym}")
-                if latest_p:
-                    try:
-                        p_float = float(latest_p)
-                        event = RawEvent(
-                            source="institutional_fix",
-                            occurred_at=datetime.now(timezone.utc),
-                            raw_payload={
-                                "ticker": sym,
-                                "price": p_float,
-                                "trade_type": "FIX_INCREMENTAL_REFRESH",
-                                "source_protocol": "FIX.4.4",
-                            }
-                        )
-                        await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=sym)
-                    except Exception as fe:
-                        logger.warning(f"Failed to produce institutional FIX quote for {sym}: {fe}")
+            logger.info(f"⚡ FIX 4.4 Client connecting to {fix_host}:{fix_port} for {len(symbols)} symbols...")
+            reader, writer = await asyncio.open_connection(fix_host, fix_port)
+            client.is_connected = True
+
+            # Send FIX Logon & MarketDataRequest
+            writer.write(client.build_logon())
+            await writer.drain()
+            await asyncio.sleep(0.5)
+
+            writer.write(client.build_market_data_request(symbols))
+            await writer.drain()
+
+            while client.is_connected:
+                raw_data = await reader.read(4096)
+                if not raw_data:
+                    break
+                import simplefix
+                parser = simplefix.FixParser()
+                parser.append_buffer(raw_data)
+                while True:
+                    fix_msg = parser.get_message()
+                    if fix_msg is None:
+                        break
+                    msg_type = fix_msg.get(35)
+                    sym_tag = fix_msg.get(55)
+                    price_tag = fix_msg.get(270) or fix_msg.get(44)
+                    if sym_tag and price_tag:
+                        try:
+                            sym = sym_tag.decode() if isinstance(sym_tag, bytes) else str(sym_tag)
+                            p_val = float(price_tag)
+                            event = RawEvent(
+                                source="institutional_fix",
+                                occurred_at=datetime.now(timezone.utc),
+                                raw_payload={
+                                    "ticker": sym,
+                                    "price": p_val,
+                                    "msg_type": msg_type.decode() if isinstance(msg_type, bytes) else str(msg_type),
+                                    "source_protocol": "FIX.4.4",
+                                }
+                            )
+                            await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=sym)
+                        except Exception as fe:
+                            logger.warning(f"Error parsing FIX message: {fe}")
         except Exception as e:
-            logger.debug(f"FIX 4.4 engine background loop pulse: {e}")
+            logger.debug(f"FIX 4.4 engine connection loop: {e}")
 
         await asyncio.sleep(10)
 

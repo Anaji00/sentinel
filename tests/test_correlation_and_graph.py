@@ -62,30 +62,28 @@ def test_cross_domain_excitation_forecasts():
 
 # ── 2. SOFT CORRELATOR RETRY & RECOVERY ──────────────────────────────────────
 
-def test_soft_correlator_retry_loop_recovery():
-    async def run_test():
-        ollama = AsyncMock()
-        correlator = SoftCorrelator(ollama)
-        assert correlator.is_enabled is False
+@pytest.mark.anyio
+async def test_soft_correlator_retry_loop_recovery():
+    ollama = AsyncMock()
+    correlator = SoftCorrelator(ollama)
+    assert correlator.is_enabled is False
 
-        call_count = 0
-        class MockAsyncQdrantClient:
-            def __init__(self, host=None, port=None): pass
-            async def collection_exists(self, collection_name):
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1: raise RuntimeError("Qdrant connection failed")
-                return True
+    call_count = 0
+    class MockAsyncQdrantClient:
+        def __init__(self, host=None, port=None): pass
+        async def collection_exists(self, collection_name):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1: raise RuntimeError("Qdrant connection failed")
+            return True
 
-        with patch("sentence_transformers.SentenceTransformer", return_value=MagicMock()):
-            with patch("qdrant_client.AsyncQdrantClient", MockAsyncQdrantClient):
-                await correlator._load()
-                assert correlator.is_enabled is False
-                if correlator._retry_task:
-                    await asyncio.sleep(0.05)
-                assert correlator.get_status()["model_loaded"] is True
-
-    asyncio.run(run_test())
+    with patch.dict("sys.modules", {"sentence_transformers": MagicMock()}):
+        with patch("qdrant_client.AsyncQdrantClient", MockAsyncQdrantClient):
+            await correlator._load()
+            assert correlator.is_enabled is False
+            if correlator._retry_task:
+                await asyncio.sleep(0.05)
+            assert correlator.get_status()["model_loaded"] is True
 
 
 # ── 3. CORRELATION CLUSTERS & PRIMARY ENTITIES ────────────────────────────────

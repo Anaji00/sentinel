@@ -241,6 +241,62 @@ def test_moving_average_distances():
     assert res["ma_alignment"] == "BULLISH_STACK"
 
 
+def test_black_scholes_pricing_and_greeks():
+    S, K, T, r, sigma = 100.0, 100.0, 30 / 365.0, 0.045, 0.30
+    call_p = quant_calc.black_scholes_call_price(S, K, T, r, sigma)
+    put_p = quant_calc.black_scholes_put_price(S, K, T, r, sigma)
+    assert call_p > 0.0
+    assert put_p > 0.0
+    
+    greeks_call = quant_calc.black_scholes_greeks(S, K, T, r, sigma, "call")
+    assert 0.45 <= greeks_call["delta"] <= 0.55
+    assert greeks_call["gamma"] > 0.0
+
+def test_black_scholes_delta_inversion():
+    S, T, r, sigma, target_delta = 100.0, 30 / 365.0, 0.045, 0.30, 0.30
+    strike = quant_calc.black_scholes_delta_inversion_strike(S, T, r, sigma, target_delta=target_delta, option_type="call")
+    assert strike > S
+    greeks = quant_calc.black_scholes_greeks(S, strike, T, r, sigma, "call")
+    assert abs(greeks["delta"] - target_delta) < 0.02
+
+def test_covered_call_recommendation_engine():
+    # 1. Gated on Z >= 2.5 and valid ticker
+    rec_nvda = quant_calc.generate_covered_call_recommendation(
+        ticker="NVDA", current_price=130.0, z_score=2.8, target_delta=0.30, dte_days=30, live_iv=0.45
+    )
+    assert rec_nvda is not None
+    assert rec_nvda["recommended_strike"] > 130.0
+    assert rec_nvda["iv_source"] == "OPTIONS_SWEEP_IV"
+    assert rec_nvda["greeks"]["delta"] > 0.0
+
+    # 2. Gate check: Z < 2.5 returns None
+    rec_low_z = quant_calc.generate_covered_call_recommendation(
+        ticker="NVDA", current_price=130.0, z_score=1.8
+    )
+    assert rec_low_z is None
+
+    # 3. Gate check: Unwatched ticker when watched_equities provided returns None
+    rec_unwatched = quant_calc.generate_covered_call_recommendation(
+        ticker="UNWATCHED_TICKER", current_price=10.0, z_score=3.0, watched_equities={"AAPL", "NVDA"}
+    )
+    assert rec_unwatched is None
+
+    # 4. Fallback IV provenance check
+    rec_fallback = quant_calc.generate_covered_call_recommendation(
+        ticker="AAPL", current_price=220.0, z_score=2.6, live_iv=None, realized_volatility=0.22
+    )
+    assert rec_fallback is not None
+    assert rec_fallback["iv_source"] == "REALIZED_VOLATILITY_FALLBACK"
+
+    # 5. Watched equities custom universe scoping check
+    rec_watched = quant_calc.generate_covered_call_recommendation(
+        ticker="CUSTOM_TICKER", current_price=50.0, z_score=2.9, watched_equities={"CUSTOM_TICKER"}
+    )
+    assert rec_watched is not None
+    assert rec_watched["ticker"] == "CUSTOM_TICKER"
+
+
+
 # ── 7. PRIMARY EQUITIES & ASSET CLASSIFICATION ────────────────────────────────
 
 def test_clean_primary_equities():
@@ -448,3 +504,17 @@ def test_score_adjustment_provenance_schema():
     )
     assert len(event.score_adjustments) == 1
     assert event.score_adjustments[0].reason == "watchlist_boost"
+
+@pytest.mark.parametrize("target_delta, option_type, S, r, sigma, T", [
+    (0.50, "call", 100.0, 0.05, 0.20, 1.0),
+    (0.25, "call", 100.0, 0.05, 0.30, 0.5),
+    (0.75, "call", 100.0, 0.02, 0.15, 2.0),
+    (0.50, "put",  100.0, 0.05, 0.20, 1.0),
+    (0.25, "put",  100.0, 0.05, 0.30, 0.5),
+    (0.75, "put",  100.0, 0.02, 0.15, 2.0),
+])
+def test_black_scholes_delta_inversion_grid(target_delta, option_type, S, r, sigma, T):
+    strike = quant_calc.black_scholes_delta_inversion_strike(S=S, T=T, r=r, sigma=sigma, target_delta=target_delta, option_type=option_type)
+    assert strike > 0.0
+    assert not np.isnan(strike)
+

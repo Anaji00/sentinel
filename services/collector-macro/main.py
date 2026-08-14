@@ -220,16 +220,80 @@ async def fetch_yfinance_single(ticker: str) -> dict:
         return {}
 
 
+async def fetch_live_sofr_rate(session: aiohttp.ClientSession) -> dict:
+    """
+    Tier 1 Official Live SOFR Rate Collector via Federal Reserve Bank of New York API.
+    Fallback: 13-Week T-Bill Yield (^IRX) via yfinance.
+    """
+    nyfed_url = "https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json"
+    try:
+        async with session.get(nyfed_url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                ref_rates = data.get("refRates", [])
+                if ref_rates:
+                    pct = float(ref_rates[0].get("percentRate", 0.0))
+                    if pct > 0:
+                        return {
+                            "rate_pct": pct,
+                            "rate_decimal": round(pct / 100.0, 5),
+                            "effective_date": ref_rates[0].get("effectiveDate", ""),
+                            "provider": "Federal Reserve Bank of New York (SOFR)",
+                            "source_type": "LIVE_FED_SOFR"
+                        }
+    except Exception as e:
+        logger.debug(f"NY Fed SOFR fetch bypass: {e}")
+
+    # Fallback: 13-Week T-Bill (^IRX)
+    yf_res = await fetch_yfinance_single("^IRX")
+    if yf_res and yf_res.get("close", 0.0) > 0.0:
+        pct = yf_res["close"]
+        return {
+            "rate_pct": pct,
+            "rate_decimal": round(pct / 100.0, 5),
+            "effective_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "provider": "Treasury 13-Week T-Bill (^IRX)",
+            "source_type": "LIVE_TBILL_YIELD"
+        }
+
+    return {
+        "rate_pct": 4.5,
+        "rate_decimal": 0.045,
+        "effective_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "provider": "Default Parametric Rate",
+        "source_type": "PARAMETRIC_FALLBACK"
+    }
+
+
 async def fetch_and_publish(producer: SentinelProducer):
     logger.info("Fetching real macro market quotes across 3-Tier API provider chain...")
     tickers = list(MACRO_TICKERS.keys())
     now = datetime.now(timezone.utc).isoformat()
     published = 0
 
-    # 1. Fetch Alpaca snapshots for all ETF proxies simultaneously
-    alpaca_quotes = await fetch_alpaca_quotes(tickers)
-    if alpaca_quotes:
-        logger.info(f"✅ Alpaca API returned real quotes for {len(alpaca_quotes)} instruments.")
+    async with aiohttp.ClientSession() as session:
+        # Fetch and publish live SOFR / Risk-Free Rate
+        sofr_data = await fetch_live_sofr_rate(session)
+        sofr_event = {
+            "source": "nyfed_sofr",
+            "raw_payload": {
+                "ticker": "SOFR",
+                "rate_pct": sofr_data["rate_pct"],
+                "risk_free_rate": sofr_data["rate_decimal"],
+                "effective_date": sofr_data["effective_date"],
+                "provider": sofr_data["provider"],
+                "source_type": sofr_data["source_type"]
+            },
+            "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"sofr_{int(time.time())}")),
+            "occurred_at": now,
+        }
+        await producer.send(Topics.RAW_TRADFI, sofr_event, key="SOFR")
+        logger.info(f"🏛️ Live Risk-Free Rate (SOFR) Published: {sofr_data['rate_pct']}% ({sofr_data['rate_decimal']}) via {sofr_data['provider']}")
+
+        # 1. Fetch Alpaca snapshots for all ETF proxies simultaneously
+        alpaca_quotes = await fetch_alpaca_quotes(tickers)
+        if alpaca_quotes:
+            logger.info(f"✅ Alpaca API returned real quotes for {len(alpaca_quotes)} instruments.")
 
     async with aiohttp.ClientSession() as session:
         for ticker in tickers:
