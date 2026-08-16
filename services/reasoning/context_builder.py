@@ -13,6 +13,8 @@ Output is a structured dict that scenario_generator.py passes to Claude.
 """
 
 import json
+import time
+import math
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
@@ -171,19 +173,26 @@ class ContextBuilder:
         """
         Batches and parallelizes Neo4j graph lookup for entities.
         Fetches up to 3 hops of relationships and active flags in just 2 parallel database round-trips.
+        Applies edge staleness decay weighting (§3.6) to prioritize recent statistical and verified edges.
         """
         if not entity_ids:
             return []
         
         targets = list(dict.fromkeys(entity_ids))[:5]
+        now_ts = time.time()
         
         try:
             neo4j_client = await get_neo4j()
             rel_task = neo4j_client.query("""
                 MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
-                MATCH (v)-[r*1..3]->(n)
-                RETURN coalesce(v.name, v.mmsi, v.id) as entity_id, type(r[0]) as rel, coalesce(n.name, n.mmsi, n.id) as connected,
-                       labels(n) as labels
+                MATCH (v)-[r*1..3]-(n)
+                RETURN coalesce(v.name, v.mmsi, v.id) as entity_id,
+                       type(r[0]) as rel,
+                       coalesce(n.name, n.mmsi, n.id) as connected,
+                       labels(n) as labels,
+                       coalesce(r[0].weight, 1.0) as weight,
+                       coalesce(r[0].confidence, 0.8) as confidence,
+                       coalesce(r[0].last_updated, r[0].updated_at, 0) as last_updated
                 LIMIT 100
             """, {"ids": targets})
             
@@ -201,10 +210,24 @@ class ContextBuilder:
             rel_by_entity = {}
             for r in (rel_rows or []):
                 ent = r["entity_id"]
-                rel_by_entity.setdefault(ent, []).append(r)
+                raw_updated = r.get("last_updated") or 0
+                # If updated_at is epoch ms vs epoch s
+                updated_s = (raw_updated / 1000.0) if raw_updated > 1e11 else float(raw_updated)
+                
+                # Exponential decay: 30-day half-life decay factor
+                age_days = max(0.0, (now_ts - updated_s) / 86400.0) if updated_s > 0 else 60.0
+                decay_factor = math.exp(-0.693 * age_days / 30.0) if age_days < 365.0 else 0.05
+                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", 0.8))
+                decayed_weight = round(base_weight * decay_factor, 4)
+                
+                r_enriched = dict(r)
+                r_enriched["decayed_weight"] = decayed_weight
+                rel_by_entity.setdefault(ent, []).append(r_enriched)
                 
             for ent, relationships in rel_by_entity.items():
-                results.append({"entity_id": ent, "relationships": relationships})
+                # Sort relationships by decayed weight descending
+                sorted_rels = sorted(relationships, key=lambda x: x.get("decayed_weight", 0.0), reverse=True)
+                results.append({"entity_id": ent, "relationships": sorted_rels})
                 
             flags_by_entity = {}
             for r in (flag_rows or []):

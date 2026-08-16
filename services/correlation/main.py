@@ -31,10 +31,11 @@ from shared.utils.ollama import OllamaClient
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
-from shared.db import get_redis, get_timescale
+from shared.db import get_redis, get_timescale, get_neo4j
 from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
 from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
+from services.correlation.statistical_discovery import StatisticalDiscoveryEngine
 from shared.utils.streaming_detectors import FirstStoryDetector
 from shared.utils.tasks import safe_create_task
 
@@ -246,11 +247,18 @@ async def main():
 
     redis_client = await get_redis()
     db_client = await get_timescale()
+    neo4j_client = await get_neo4j()
     
     rule_listener_task = safe_create_task(_listen_for_rule_updates(redis_client), name="correlation-rule-listener")
     
     store    = EventStore(redis_client, db_client)
     producer = SentinelProducer()
+    discovery_engine = StatisticalDiscoveryEngine(
+        db_client=db_client,
+        redis_client=redis_client,
+        neo4j_client=neo4j_client,
+        producer=producer,
+    )
     consumer = SentinelConsumer(
         topics=[Topics.ENRICHED_EVENTS],
         group_id="correlation-engine",
@@ -534,7 +542,47 @@ async def main():
                 logger.error(f"Hawkes refit loop error: {e}")
             await asyncio.sleep(hawkes_correlator.REFIT_INTERVAL)
 
+    # Background task: Periodic Statistical Correlation & Granger Discovery (§4.1, §4.2)
+    async def _statistical_discovery_loop():
+        await asyncio.sleep(30)
+        while True:
+            try:
+                discoveries = await discovery_engine.discover_pairwise_correlations()
+                if discoveries:
+                    logger.info(f"📊 Statistical Discovery Job completed: evaluated {len(discoveries)} candidate pairs.")
+            except Exception as e:
+                logger.error(f"Statistical discovery loop error: {e}")
+            await asyncio.sleep(300)
+
+    # Background task: Periodic Intra-TradFi Sector Hawkes Contagion (§4.3)
+    async def _sector_hawkes_loop():
+        await asyncio.sleep(60)
+        while True:
+            try:
+                res = await discovery_engine.discover_sector_hawkes_contagion()
+                excitations = res.get("significant_excitations", [])
+                if excitations:
+                    logger.info(f"⚡ Intra-TradFi Sector Hawkes Job: discovered {len(excitations)} significant sector excitations.")
+            except Exception as e:
+                logger.error(f"Sector Hawkes loop error: {e}")
+            await asyncio.sleep(600)
+
+    # Background task: Periodic Threshold Calibration (§4.4)
+    async def _threshold_calibration_loop():
+        await asyncio.sleep(15)
+        while True:
+            try:
+                calibrated = await discovery_engine.run_threshold_calibration()
+                if calibrated:
+                    logger.info(f"🎯 Scheduled Threshold Calibration complete: min_corr={calibrated.get('min_correlation_coef')}")
+            except Exception as e:
+                logger.error(f"Threshold calibration loop error: {e}")
+            await asyncio.sleep(1800)
+
     asyncio.create_task(_hawkes_refit_loop())
+    asyncio.create_task(_statistical_discovery_loop())
+    asyncio.create_task(_sector_hawkes_loop())
+    asyncio.create_task(_threshold_calibration_loop())
 
     try:
         while True:

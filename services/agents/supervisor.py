@@ -1,3 +1,10 @@
+"""
+services/agents/supervisor.py
+
+Centralized Governance Supervisor for Knowledge Graph.
+Consumes Topics.ONTOLOGY_PROPOSALS and acts as the single authorized gateway to Neo4j.
+"""
+
 import asyncio
 import json
 import logging
@@ -6,31 +13,16 @@ import re
 from typing import List, Dict, Any, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
+from shared.models.ontology import (
+    VALID_PREDICATES,
+    ALLOWED_NODE_LABELS,
+    is_valid_predicate,
+    normalize_predicate,
+    is_valid_node_label,
+)
 
 logger = logging.getLogger("agent.supervisor")
 
-# ── SECURITY AUDIT (§3.4) ────────────────────────────────────────────────────
-# Cypher injection surface: All non-parameterizable Cypher elements (labels,
-# relation types) are regex-whitelisted (^[A-Za-z0-9]+$) before f-string
-# interpolation. All property values use query parameters ($name, $id, etc.).
-# ALLOWED_RELATIONS is a fixed allowlist — LLM-derived relation types MUST
-# match this set or be rejected.
-#
-# Concurrency: Agent dispatch uses _dispatch_semaphore (default: 5 inflight
-# tasks, configurable via AGENT_CONCURRENCY env var). This limits Ollama
-# concurrency to prevent thread pool starvation. If §3.2/§3.3 increase
-# proposal volume, monitor this bound and adjust AGENT_CONCURRENCY
-# accordingly. The semaphore is in base.py SentinelAgent.__init__.
-# ─────────────────────────────────────────────────────────────────────────────
-
-ALLOWED_RELATIONS = {
-    "RELATED_TO", "CONTROLS", "ALLIED_WITH", "OWNS", "COMPETES_WITH", 
-    "HAS_EXPOSURE_IN", "CORRELATED_WITH", "SUPPLIES", "PURCHASES_FROM", 
-    "COMMODITY_EXPOSURE", "MACRO_CORRELATED", "SANCTIONS_TARGET", 
-    "FLAGGED_BY", "SUBSIDIARY_OF", "ADJACENT_TO", "ATTACKED", 
-    "TARGETED_BY", "REGISTERED_IN", "EMPLOYS", "POSITIVE_EXPOSURE_TO", 
-    "INVERSE_EXPOSURE_TO"
-}
 
 class GraphSupervisor(SentinelAgent):
     def __init__(self, *args, **kwargs):
@@ -42,10 +34,10 @@ class GraphSupervisor(SentinelAgent):
 
     async def handle(self, message: Any) -> Optional[Dict[str, Any]]:
         if isinstance(message, list):
-            res = await self.execute_batch_proposals(message)
+            await self.execute_batch_proposals(message)
             return {"agent": self.name, "action": "batch_commit", "proposals_processed": len(message)}
         elif isinstance(message, dict):
-            res = await self.execute_proposal(message)
+            await self.execute_proposal(message)
             return {"agent": self.name, "action": "single_commit", "entity_id": message.get("entity_id")}
         return None
 
@@ -75,7 +67,7 @@ class GraphSupervisor(SentinelAgent):
             eid = p.get("entity_id")
             if eid:
                 entity_ids.add(eid)
-            tid = p.get("data", {}).get("target_id")
+            tid = p.get("data", {}).get("target_id") or p.get("data", {}).get("sympathy_ticker")
             if tid:
                 entity_ids.add(tid)
 
@@ -98,56 +90,95 @@ class GraphSupervisor(SentinelAgent):
                     continue
 
                 if action == "MERGE_ONTOLOGY_NODE":
-                    label = data.get("label", "UnknownEntity")
-                    if not re.match(r"^[A-Za-z0-9]+$", label):
-                        label = "UnknownEntity"
+                    raw_label = data.get("label", "Entity")
+                    label = raw_label if is_valid_node_label(raw_label) else "Entity"
                     if label not in nodes_by_label:
                         nodes_by_label[label] = []
                     nodes_by_label[label].append({
-                        "name": entity_id,
-                        "domain": data.get("primary_domain"),
-                        "concepts": data.get("macro_concepts"),
+                        "name": str(entity_id).upper(),
+                        "domain": data.get("primary_domain", "financial"),
+                        "concepts": data.get("macro_concepts", []),
                         "sanctions": data.get("sanctions_risk"),
-                        "confidence": data.get("confidence")
+                        "sector": data.get("sector"),
+                        "industry": data.get("industry"),
+                        "confidence": float(data.get("confidence", 1.0))
                     })
-                elif action == "LINK_ENTITY":
-                    relation = data.get("relation_type", "RELATED_TO").upper()
-                    if relation in ALLOWED_RELATIONS:
-                        source_label = data.get("source_label", "Entity")
-                        target_label = data.get("target_label", "Entity")
-                        # Sanitize labels to prevent Cypher injection via f-string interpolation
-                        if not re.match(r"^[A-Za-z0-9]+$", source_label):
-                            source_label = "Entity"
-                        if not re.match(r"^[A-Za-z0-9]+$", target_label):
-                            target_label = "Entity"
+
+                elif action in ("LINK_ENTITY", "ADD_SYMPATHY_EDGE"):
+                    relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
+                    if is_valid_predicate(relation):
+                        raw_src = data.get("source_label", "Entity")
+                        raw_tgt = data.get("target_label", "Entity")
+                        source_label = raw_src if is_valid_node_label(raw_src) else "Entity"
+                        target_label = raw_tgt if is_valid_node_label(raw_tgt) else "Entity"
+                        
+                        target_id = data.get("target_id") or data.get("sympathy_ticker")
+                        if not target_id:
+                            continue
+
                         rel_key = (source_label, relation, target_label)
                         if rel_key not in links_by_relation:
                             links_by_relation[rel_key] = []
+                        
+                        props = data.get("properties", {})
                         links_by_relation[rel_key].append({
-                            "id": entity_id,
-                            "target_id": data.get("target_id"),
-                            "weight": data.get("weight", 1.0)
+                            "id": str(entity_id).upper(),
+                            "target_id": str(target_id).upper(),
+                            "weight": float(data.get("weight", props.get("weight", 1.0))),
+                            "confidence": float(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                            "relationship": data.get("relationship", props.get("relationship", "")),
+                            "direction": data.get("direction", props.get("direction", "lead")),
+                            "method": props.get("method", ""),
+                            "window": props.get("window", ""),
+                            "coefficient": float(props.get("coefficient", 0.0)),
+                            "p_value": float(props.get("p_value", 0.0)),
+                            "lag": int(props.get("lag", 0)),
+                            "f_stat": float(props.get("f_stat", 0.0)),
+                            "branching_ratio": float(props.get("branching_ratio", 0.0)),
+                            "half_life": float(props.get("half_life", 0.0)),
                         })
 
+            # Commit Node batches
             for label, batch in nodes_by_label.items():
                 cypher = f"""
                 UNWIND $batch AS row
                 MERGE (e:{label} {{name: row.name}})
+                ON CREATE SET e.id = row.name, e.created_at = timestamp()
                 SET e.primary_domain = row.domain,
                     e.macro_concepts = row.concepts,
                     e.sanctions_risk = row.sanctions,
+                    e.sector = row.sector,
+                    e.industry = row.industry,
                     e.confidence = row.confidence,
-                    e.updated_at = datetime()
+                    e.updated_at = timestamp(),
+                    e.last_updated = timestamp()
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
 
+            # Commit Relationship batches
             for (source_label, relation, target_label), batch in links_by_relation.items():
                 cypher = f"""
                 UNWIND $batch AS row
                 MERGE (a:{source_label} {{name: row.id}})
+                ON CREATE SET a.id = row.id, a.created_at = timestamp()
                 MERGE (b:{target_label} {{name: row.target_id}})
+                ON CREATE SET b.id = row.target_id, b.created_at = timestamp()
                 MERGE (a)-[r:{relation}]->(b)
-                SET r.weight = row.weight, r.updated_at = datetime()
+                ON CREATE SET r.created_at = timestamp()
+                SET r.weight = row.weight,
+                    r.confidence = row.confidence,
+                    r.relationship = row.relationship,
+                    r.direction = row.direction,
+                    r.method = row.method,
+                    r.window = row.window,
+                    r.coefficient = row.coefficient,
+                    r.p_value = row.p_value,
+                    r.lag = row.lag,
+                    r.f_stat = row.f_stat,
+                    r.branching_ratio = row.branching_ratio,
+                    r.half_life = row.half_life,
+                    r.updated_at = timestamp(),
+                    r.last_updated = timestamp()
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
 
@@ -161,19 +192,13 @@ class GraphSupervisor(SentinelAgent):
                 await self.release_lock(eid)
 
     async def execute_proposal(self, payload: dict):
-        """Maps trusted JSON structs to Cypher queries.
-
-        Note: Cypher does not support parameterizing labels or relation
-        types.  Non-parameterizable elements (labels, relation types) are
-        strictly regex-whitelisted (``^[A-Za-z0-9]+$``) and validated
-        prior to f-string interpolation, while all property values and
-        identifiers are passed via query parameters.
-        """
+        """Maps trusted JSON structs to Cypher queries with centralized validation."""
         entity_id = payload.get("entity_id")
         action = payload.get("action") 
         data = payload.get("data", {})
         
-        if not entity_id or not action: return
+        if not entity_id or not action:
+            return
 
         if not await self.acquire_lock(entity_id):
             logger.warning(f"Lock timeout for entity {entity_id}. Dropping proposal.")
@@ -181,65 +206,107 @@ class GraphSupervisor(SentinelAgent):
 
         try:
             if action == "MERGE_ONTOLOGY_NODE":
-                label = data.get("label", "UnknownEntity")
-                if not re.match(r"^[A-Za-z0-9]+$", label): label = "UnknownEntity"
+                raw_label = data.get("label", "Entity")
+                label = raw_label if is_valid_node_label(raw_label) else "Entity"
 
                 cypher = f"""
                 MERGE (e:{label} {{name: $name}})
+                ON CREATE SET e.id = $name, e.created_at = timestamp()
                 SET e.primary_domain = $domain,
                     e.macro_concepts = $concepts,
                     e.sanctions_risk = $sanctions,
+                    e.sector = $sector,
+                    e.industry = $industry,
                     e.confidence = $confidence,
-                    e.updated_at = datetime()
+                    e.updated_at = timestamp(),
+                    e.last_updated = timestamp()
                 """
                 await self.neo4j.execute(cypher, {
-                    "name": entity_id, "domain": data.get("primary_domain"),
-                    "concepts": data.get("macro_concepts"), "sanctions": data.get("sanctions_risk"),
-                    "confidence": data.get("confidence")
+                    "name": str(entity_id).upper(),
+                    "domain": data.get("primary_domain", "financial"),
+                    "concepts": data.get("macro_concepts", []),
+                    "sanctions": data.get("sanctions_risk"),
+                    "sector": data.get("sector"),
+                    "industry": data.get("industry"),
+                    "confidence": float(data.get("confidence", 1.0))
                 })
-                logger.debug(f"✅ Created/Updated Node: {entity_id}")
+                logger.debug(f"✅ Created/Updated Node: {entity_id} ({label})")
 
-            elif action == "LINK_ENTITY":
-                target_id = data.get("target_id")
-                source_label = data.get("source_label", "Entity")
-                target_label = data.get("target_label", "Entity")
-                relation = data.get("relation_type", "RELATED_TO").upper()
-
-                # Sanitize labels — Cypher labels cannot be parameterized
-                if not re.match(r"^[A-Za-z0-9]+$", source_label):
-                    source_label = "Entity"
-                if not re.match(r"^[A-Za-z0-9]+$", target_label):
-                    target_label = "Entity"
-                
-                if relation not in ALLOWED_RELATIONS:
-                    logger.warning(f"Rejected invalid LLM graph relation type: {relation}")
+            elif action in ("LINK_ENTITY", "ADD_SYMPATHY_EDGE"):
+                target_id = data.get("target_id") or data.get("sympathy_ticker")
+                if not target_id:
                     return
 
+                raw_src = data.get("source_label", "Entity")
+                raw_tgt = data.get("target_label", "Entity")
+                source_label = raw_src if is_valid_node_label(raw_src) else "Entity"
+                target_label = raw_tgt if is_valid_node_label(raw_tgt) else "Entity"
+
+                relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
+                
+                if not is_valid_predicate(relation):
+                    logger.warning(f"Rejected unauthorized graph predicate: {relation}")
+                    return
+
+                props = data.get("properties", {})
                 cypher = f"""
                 MERGE (a:{source_label} {{name: $id}})
+                ON CREATE SET a.id = $id, a.created_at = timestamp()
                 MERGE (b:{target_label} {{name: $target_id}})
+                ON CREATE SET b.id = $target_id, b.created_at = timestamp()
                 MERGE (a)-[r:{relation}]->(b)
-                SET r.weight = $weight, r.updated_at = datetime()
+                ON CREATE SET r.created_at = timestamp()
+                SET r.weight = $weight,
+                    r.confidence = $confidence,
+                    r.relationship = $relationship,
+                    r.direction = $direction,
+                    r.method = $method,
+                    r.window = $window,
+                    r.coefficient = $coefficient,
+                    r.p_value = $p_value,
+                    r.lag = $lag,
+                    r.f_stat = $f_stat,
+                    r.branching_ratio = $branching_ratio,
+                    r.half_life = $half_life,
+                    r.updated_at = timestamp(),
+                    r.last_updated = timestamp()
                 """
-                await self.neo4j.execute(cypher, {"id": entity_id, "target_id": target_id, "weight": data.get("weight", 1.0)})
-                logger.debug(f"✅ Created Edge: {entity_id} -[{relation}]-> {target_id}")
+                await self.neo4j.execute(cypher, {
+                    "id": str(entity_id).upper(),
+                    "target_id": str(target_id).upper(),
+                    "weight": float(data.get("weight", props.get("weight", 1.0))),
+                    "confidence": float(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                    "relationship": str(data.get("relationship", props.get("relationship", ""))),
+                    "direction": str(data.get("direction", props.get("direction", "lead"))),
+                    "method": str(props.get("method", "")),
+                    "window": str(props.get("window", "")),
+                    "coefficient": float(props.get("coefficient", 0.0)),
+                    "p_value": float(props.get("p_value", 0.0)),
+                    "lag": int(props.get("lag", 0)),
+                    "f_stat": float(props.get("f_stat", 0.0)),
+                    "branching_ratio": float(props.get("branching_ratio", 0.0)),
+                    "half_life": float(props.get("half_life", 0.0)),
+                })
+                logger.debug(f"✅ Created/Updated Edge: {entity_id} -[{relation}]-> {target_id}")
 
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
-                label = data.get("label", "Entity")
-                # Sanitize label — Cypher labels cannot be parameterized
-                if not re.match(r"^[A-Za-z0-9]+$", label):
-                    label = "Entity"
-                if not tags: return
+                raw_label = data.get("label", "Entity")
+                label = raw_label if is_valid_node_label(raw_label) else "Entity"
+                if not tags:
+                    return
 
                 cypher = f"""
                 MERGE (e:{label} {{name: $id}})
+                ON CREATE SET e.id = $id, e.created_at = timestamp()
                 WITH e, coalesce(e.tags, []) + $new_tags AS all_tags
                 UNWIND all_tags AS tag
                 WITH e, collect(distinct tag) AS unique_tags
-                SET e.tags = unique_tags, e.updated_at = datetime()
+                SET e.tags = unique_tags,
+                    e.updated_at = timestamp(),
+                    e.last_updated = timestamp()
                 """
-                await self.neo4j.execute(cypher, {"id": entity_id, "new_tags": tags})
+                await self.neo4j.execute(cypher, {"id": str(entity_id).upper(), "new_tags": tags})
                 logger.debug(f"✅ Added {len(tags)} tags to {entity_id}")
 
             else:
@@ -250,6 +317,7 @@ class GraphSupervisor(SentinelAgent):
             raise
         finally:
             await self.release_lock(entity_id)
+
 
 async def start_supervisor():
     logger.info("🛡️ Graph Supervisor Online. Protecting Neo4j state.")
@@ -279,6 +347,7 @@ async def start_supervisor():
         dlq=dlq,
     )
     await supervisor.run()
+
 
 if __name__ == "__main__":
     asyncio.run(start_supervisor())

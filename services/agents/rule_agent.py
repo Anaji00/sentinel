@@ -39,8 +39,7 @@ class RuleSynthesizerAgent(SentinelAgent):
     
     @property
     def output_topic(self) -> str:
-        # Not used because handle() returns None, but required by ABC
-        return "agents.rules.synthesized"
+        return Topics.RULES_SYNTHESIZED
 
     async def handle(self, message: dict) -> None:
         """
@@ -113,16 +112,19 @@ Synthesize up to 3 JSON correlation rules for the SENTINEL evaluation engine.
                 for rule in response.rules:
                     rule_json = json.dumps(rule.model_dump())
                     
-                    # Store in HASH mapping rule_id -> rule_json
+                    # Store in HASH mapping rule_id -> rule_json (7-day auto-expiry timestamp included)
                     await self.redis.raw.hset("sentinel:correlation:dynamic_rules", rule.rule_id, rule_json)
                     
-                    # Publish for hot-reloading
+                    # Publish for hot-reloading in correlation engine
                     await self.redis.raw.publish("sentinel:correlation:rule_updates", rule_json)
                     
                     self.logger.info(f"Deployed new synthetic rule: {rule.rule_id} - {rule.rule_name}")
                     
-                    # Emit Telemetry
                     if self._producer:
+                        # 1. Publish to RULES_SYNTHESIZED
+                        await self._producer.send(Topics.RULES_SYNTHESIZED, rule.model_dump(), key=rule.rule_id)
+
+                        # 2. Emit Telemetry
                         await self._producer.send("agents.telemetry", {
                             "agent": "rule_synthesizer",
                             "event": "rule_created",
@@ -130,7 +132,29 @@ Synthesize up to 3 JSON correlation rules for the SENTINEL evaluation engine.
                             "rule_name": rule.rule_name,
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
-                    
+
+                        # 3. Route discovered entity correlations through governed ONTOLOGY_PROPOSALS (§3.7)
+                        rule_tags = [t.upper() for t in (rule.tags or []) if len(t) <= 10]
+                        if len(rule_tags) >= 2:
+                            for i in range(len(rule_tags) - 1):
+                                prop = {
+                                    "entity_id": rule_tags[i],
+                                    "action": "LINK_ENTITY",
+                                    "data": {
+                                        "target_id": rule_tags[i+1],
+                                        "source_label": "Company",
+                                        "target_label": "Company",
+                                        "relation_type": "MACRO_CORRELATED",
+                                        "weight": 0.85,
+                                        "confidence": 0.80,
+                                        "properties": {
+                                            "rule_id": rule.rule_id,
+                                            "rule_name": rule.rule_name,
+                                            "alert_tier": rule.alert_tier,
+                                        }
+                                    }
+                                }
+                                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, prop, key=rule_tags[i])
         except Exception as e:
             self.logger.error(f"Failed to synthesize rules: {e}")
 

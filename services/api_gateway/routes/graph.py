@@ -7,6 +7,8 @@ and connection paths between different entities (like vessels, companies, and co
 """
 
 import logging
+import time
+import math
 from fastapi import APIRouter, HTTPException, Depends
 from services.api_gateway.dependencies import get_graph, get_db
 
@@ -64,21 +66,100 @@ async def get_graph_entities(
 @router.get("/entity/{entity_id}")
 async def get_entity_graph(
     entity_id: str, 
+    hops: int = 1,
     graph = Depends(get_graph),
     db = Depends(get_db)
 ):
-    """Find 1st-degree connections for a specific entity in Neo4j or dynamic TimescaleDB event graph."""
+    """Find 1st or 2nd-degree connections with edge staleness decay weighting and statistical metadata (§3.6, §8.1, §9.1)."""
+    hops = max(1, min(2, hops))
     try:
-        query = """
-        MATCH (n)
-        WHERE toLower(n.id) = toLower($entity_id) OR toLower(n.name) = toLower($entity_id) OR toLower(n.ticker) = toLower($entity_id)
-        MATCH (n)-[r]-(connected)
-        RETURN coalesce(n.name, n.id) as source_name, coalesce(n.type, 'ENTITY') as source_type, 
-               type(r) as relationship, connected.id as target_id, coalesce(connected.name, connected.id) as target_name, 
-               coalesce(connected.type, 'ENTITY') as target_type
-        LIMIT 50
-        """
-        connections = await graph.query(query, {"entity_id": entity_id})
+        if hops == 1:
+            query = """
+            MATCH (n)
+            WHERE toLower(n.id) = toLower($entity_id) OR toLower(n.name) = toLower($entity_id) OR toLower(n.ticker) = toLower($entity_id)
+            MATCH (n)-[r]-(connected)
+            RETURN coalesce(n.name, n.id) as source_name, coalesce(n.type, head(labels(n)), 'ENTITY') as source_type, 
+                   type(r) as relationship, connected.id as target_id, coalesce(connected.name, connected.id) as target_name, 
+                   coalesce(connected.type, head(labels(connected)), 'ENTITY') as target_type,
+                   coalesce(r.weight, 1.0) as weight,
+                   coalesce(r.confidence, 0.8) as confidence,
+                   coalesce(r.last_updated, r.updated_at, 0) as last_updated,
+                   r.coefficient as coefficient,
+                   r.p_value as p_value,
+                   r.lag as lag,
+                   r.f_stat as f_stat,
+                   r.branching_ratio as branching_ratio,
+                   r.method as method,
+                   r.window as window,
+                   1 as hop_level
+            LIMIT 60
+            """
+        else:
+            query = """
+            MATCH (n)
+            WHERE toLower(n.id) = toLower($entity_id) OR toLower(n.name) = toLower($entity_id) OR toLower(n.ticker) = toLower($entity_id)
+            MATCH path = (n)-[r*1..2]-(connected)
+            UNWIND relationships(path) as rel
+            WITH startNode(rel) as sn, endNode(rel) as tn, rel, length(path) as path_len
+            RETURN DISTINCT coalesce(sn.name, sn.id) as source_name, coalesce(sn.type, head(labels(sn)), 'ENTITY') as source_type,
+                   type(rel) as relationship, coalesce(tn.id, tn.name) as target_id, coalesce(tn.name, tn.id) as target_name,
+                   coalesce(tn.type, head(labels(tn)), 'ENTITY') as target_type,
+                   coalesce(rel.weight, 1.0) as weight,
+                   coalesce(rel.confidence, 0.8) as confidence,
+                   coalesce(rel.last_updated, rel.updated_at, 0) as last_updated,
+                   rel.coefficient as coefficient,
+                   rel.p_value as p_value,
+                   rel.lag as lag,
+                   rel.f_stat as f_stat,
+                   rel.branching_ratio as branching_ratio,
+                   rel.method as method,
+                   rel.window as window,
+                   path_len as hop_level
+            LIMIT 120
+            """
+        records = await graph.query(query, {"entity_id": entity_id})
+        now_ts = time.time()
+        connections = []
+
+        if records:
+            seen_edges = set()
+            for r in records:
+                s_name = r.get("source_name")
+                t_name = r.get("target_name")
+                rel = r.get("relationship")
+                edge_sig = (s_name, rel, t_name)
+                if edge_sig in seen_edges:
+                    continue
+                seen_edges.add(edge_sig)
+
+                raw_updated = r.get("last_updated") or 0
+                updated_s = (raw_updated / 1000.0) if raw_updated > 1e11 else float(raw_updated)
+                age_days = max(0.0, (now_ts - updated_s) / 86400.0) if updated_s > 0 else 60.0
+                decay_factor = math.exp(-0.693 * age_days / 30.0) if age_days < 365.0 else 0.05
+                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", 0.8))
+                decayed_weight = round(base_weight * decay_factor, 4)
+
+                conn_obj = {
+                    "source_name": s_name,
+                    "source_type": r.get("source_type"),
+                    "relationship": rel,
+                    "target_id": r.get("target_id"),
+                    "target_name": t_name,
+                    "target_type": r.get("target_type"),
+                    "weight": float(r.get("weight", 1.0)),
+                    "confidence": float(r.get("confidence", 0.8)),
+                    "last_updated": updated_s,
+                    "decayed_weight": decayed_weight,
+                    "hop_level": r.get("hop_level", 1),
+                }
+                # Attach statistical properties if present
+                for stat_field in ("coefficient", "p_value", "lag", "f_stat", "branching_ratio", "method", "window"):
+                    if r.get(stat_field) is not None:
+                        conn_obj[stat_field] = r[stat_field]
+
+                connections.append(conn_obj)
+            # Sort by decayed weight descending
+            connections.sort(key=lambda x: x.get("decayed_weight", 0.0), reverse=True)
 
         # Dynamic fallback: if Neo4j returns empty, synthesize real connections from recent hypertable events
         if not connections:
@@ -92,7 +173,6 @@ async def get_entity_graph(
             search_param = f"%{entity_id.lower()}%"
             db_rows = await db.query(db_query, search_param)
             
-            connections = []
             for r in db_rows:
                 target_name = r.get("primary_entity_name") or r.get("primary_entity_id")
                 if target_name and target_name.upper() != entity_id.upper():
@@ -102,13 +182,18 @@ async def get_entity_graph(
                         "relationship": rel_type,
                         "target_id": r.get("primary_entity_id") or target_name,
                         "target_name": target_name,
-                        "target_type": "VESSEL" if "vessel" in rel_type.lower() else ("INFRASTRUCTURE" if "bgp" in rel_type.lower() or "cyber" in rel_type.lower() else "ENTITY")
+                        "target_type": "VESSEL" if "vessel" in rel_type.lower() else ("INFRASTRUCTURE" if "bgp" in rel_type.lower() or "cyber" in rel_type.lower() else "ENTITY"),
+                        "weight": 1.0,
+                        "confidence": 0.8,
+                        "last_updated": now_ts,
+                        "decayed_weight": 0.8,
+                        "hop_level": 1,
                     })
                     
-        return {"entity_id": entity_id, "connections": connections}
+        return {"entity_id": entity_id, "hops": hops, "connections": connections}
     except Exception as e:
         logger.error(f"Error fetching entity graph: {e}")
-        return {"entity_id": entity_id, "connections": []}
+        return {"entity_id": entity_id, "hops": hops, "connections": []}
     
 
 @router.get("/shortest-path")

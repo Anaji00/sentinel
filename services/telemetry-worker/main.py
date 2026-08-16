@@ -22,9 +22,21 @@ from shared.utils.logging import setup_sentinel_logging, ThrottledLogger
 logger = setup_sentinel_logging("telemetry-worker", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 throttled_logger = ThrottledLogger(logger, default_interval_sec=10.0)
 
-from shared.kafka import SentinelConsumer, Topics
-from shared.db import get_timescale
+from shared.kafka import SentinelConsumer, SentinelProducer, Topics
+from shared.db import get_timescale, get_redis
 from shared.utils.metrics import MetricsCollector
+
+try:
+    from drift_scheduler import ModelDriftScheduler
+except ImportError:
+    try:
+        from services.telemetry_worker.drift_scheduler import ModelDriftScheduler
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("drift_scheduler", Path(__file__).parent / "drift_scheduler.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ModelDriftScheduler = mod.ModelDriftScheduler
 
 async def init_db(db):
     await db.execute("""
@@ -108,6 +120,32 @@ async def main():
     db = await get_timescale()
     await init_db(db)
     
+    redis_client = None
+    try:
+        redis_client = await get_redis()
+    except Exception as re:
+        logger.warning(f"Redis unavailable for drift scheduler: {re}")
+
+    producer = SentinelProducer()
+    await producer.start()
+
+    # ── WIRE MODEL DRIFT SCHEDULER (§6.1, §6.2) ──────────────────────────────
+    drift_scheduler = ModelDriftScheduler(
+        redis_client=redis_client,
+        producer=producer,
+        check_interval_sec=3600,
+    )
+    drift_task = asyncio.create_task(drift_scheduler.start())
+
+    # Regression Guard: Confirm background task is running (§6.2)
+    await asyncio.sleep(0.05)
+    if drift_task.done() and drift_task.exception():
+        logger.error(f"❌ ModelDriftScheduler failed to launch: {drift_task.exception()}")
+        raise RuntimeError(f"ModelDriftScheduler startup failure: {drift_task.exception()}")
+    
+    logger.info("🛡️ ModelDriftScheduler startup regression guard passed: background task is active.")
+    MetricsCollector.set_gauge("drift_scheduler_active", 1.0)
+    
     consumer = SentinelConsumer(
         topics=[Topics.TELEMETRY, Topics.AGENTS_PREDICTIONS],
         group_id="telemetry-worker-group",
@@ -120,7 +158,11 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        drift_scheduler.stop()
+        drift_task.cancel()
         await consumer.close()
+        await producer.flush()
+        await producer.close()
 
 if __name__ == "__main__":
     if sys.platform == "win32":

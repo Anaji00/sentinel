@@ -181,6 +181,17 @@ class TimescaleClient:
             async with conn.transaction():
                 await conn.execute(sql, *params)
 
+    async def execute_without_transaction(self, sql: str, *params):
+        """
+        Executes SQL statements without wrapping them in an explicit transaction block.
+        Required for TimescaleDB Continuous Aggregates (CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous))
+        and background policy management functions which cannot run inside a transaction block.
+        """
+        if len(params) == 1 and isinstance(params[0], tuple):
+            params = params[0]
+        async with self._pool.acquire() as conn:
+            await conn.execute(sql, *params)
+
     async def execute_many(self, sql: str, rows: List[tuple]):
         """High-performance batch execution."""
         async with self._pool.acquire() as conn:

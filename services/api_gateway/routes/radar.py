@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends, Query
-from services.api_gateway.dependencies import get_db, get_redis_client
+from services.api_gateway.dependencies import get_db, get_db_optional, get_redis_client, get_redis_optional
 
 logger = logging.getLogger("api-gateway.radar")
 
@@ -101,6 +101,7 @@ async def get_radar_sweeps_status(redis = Depends(get_redis_client)):
 
 import aiohttp
 import asyncio
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 SYMBOL_YAF_MAP = {
@@ -118,11 +119,8 @@ SYMBOL_YAF_MAP = {
     "US10Y": "^TNX",
     "10YR": "^TNX",
     "10Y": "^TNX",
-    "US2Y": "SHY",
-    "US02Y": "SHY",
-    "2Y": "SHY",
-    "2YR": "SHY",
     "TLT": "TLT",
+    "SHY": "SHY",
 }
 
 async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = None):
@@ -132,8 +130,116 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
     Queries live Redis cache for latest collector quotes if external APIs are rate-limited.
     """
     symbol_upper = symbol.upper().strip()
+
+    # 1. Check 2-Year Treasury Yields via authentic live feeds (US Treasury Par-Yield API / FRED DGS2 / CBOE 2YY)
+    if symbol_upper in ("US02Y", "US2Y", "2Y", "2YR", "DGS2"):
+        # Tier 1: US Department of the Treasury Daily Par-Yield Curve API (primary official source)
+        try:
+            now_year = datetime.now(timezone.utc).year
+            url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={now_year}"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        xml_text = await resp.text()
+                        tree = ET.fromstring(xml_text)
+                        ns = {
+                            'atom': 'http://www.w3.org/2005/Atom',
+                            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata',
+                            'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices'
+                        }
+                        entries = tree.findall('.//atom:entry', ns)
+                        pts = []
+                        for entry in entries:
+                            content = entry.find('atom:content', ns)
+                            if content is not None:
+                                props = content.find('m:properties', ns)
+                                if props is not None:
+                                    d_elem = props.find('d:NEW_DATE', ns)
+                                    y_elem = props.find('d:BC_2YEAR', ns)
+                                    if d_elem is not None and y_elem is not None and y_elem.text:
+                                        try:
+                                            val = float(y_elem.text)
+                                            pts.append({
+                                                "timestamp": d_elem.text,
+                                                "price": round(val, 3),
+                                                "volume": 1000.0,
+                                                "anomaly_score": 0.0,
+                                                "provider": "US Department of the Treasury (Par Yield)",
+                                                "source_type": "LIVE_US_TREASURY_2Y"
+                                            })
+                                        except ValueError:
+                                            pass
+                        if pts:
+                            return pts[-limit:]
+        except Exception as e:
+            logger.debug(f"US Treasury 2Y yield live fetch failed: {e}")
+
+        # Tier 2: Secondary Labeled Market Source: CBOE 2-Year Treasury Note Yield (2YY=F)
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/2YY=F?range=5d&interval=5m"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        chart = data.get("chart", {}).get("result", [])[0]
+                        timestamps = chart.get("timestamp", [])
+                        indicators = chart.get("indicators", {}).get("quote", [])[0]
+                        closes = indicators.get("close", [])
+                        volumes = indicators.get("volume", [])
+                        pts = []
+                        for t, c, v in zip(timestamps, closes, volumes):
+                            if c is not None:
+                                ts_str = datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+                                raw_p = float(c)
+                                if raw_p > 0:
+                                    pts.append({
+                                        "timestamp": ts_str,
+                                        "price": round(raw_p, 3),
+                                        "volume": float(v or 1000),
+                                        "anomaly_score": 0.0,
+                                        "provider": "CBOE 2-Year Treasury Note Yield (2YY=F)",
+                                        "source_type": "SECONDARY_MARKET_YIELD"
+                                    })
+                        if pts:
+                            return pts[-limit:]
+        except Exception as e:
+            logger.debug(f"Secondary 2Y yield fetch failed: {e}")
+
+        # Tier 3: Live Redis Cache
+        if redis:
+            try:
+                for rk in (symbol_upper, "US02Y", "US2Y", "2YR", "2Y"):
+                    cached_p = await redis.raw.get(f"sentinel:quotes:latest:{rk}")
+                    if cached_p:
+                        val = float(cached_p)
+                        now_str = datetime.now(timezone.utc).isoformat()
+                        return [{
+                            "timestamp": now_str,
+                            "price": val,
+                            "volume": 1000.0,
+                            "anomaly_score": 0.0,
+                            "provider": "Sentinel Redis Cache",
+                            "source_type": "CACHED_QUOTE"
+                        }]
+            except Exception as e:
+                logger.debug(f"Redis latest quote fetch failed for {symbol}: {e}")
+
+        # Tier 4: Explicitly Labeled Parametric Fallback (never unlabeled fabrication)
+        now_str = datetime.now(timezone.utc).isoformat()
+        return [{
+            "timestamp": now_str,
+            "price": 4.15,
+            "volume": 1000.0,
+            "anomaly_score": 0.0,
+            "provider": "Parametric Baseline Yield",
+            "source_type": "PARAMETRIC_FALLBACK"
+        }]
     
-    # 1. Check Crypto symbols via Coinbase Public Exchange Candles API (US-compliant, zero auth)
+    # 2. Check Crypto symbols via Coinbase Public Exchange Candles API (US-compliant, zero auth)
     if any(c in symbol_upper for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK")) or symbol_upper.endswith("USDT") or symbol_upper.endswith("USD"):
         clean_base = symbol_upper.replace("USDT", "").replace("USD", "").strip() or "BTC"
         pair = f"{clean_base}-USD"
@@ -162,7 +268,7 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
         except Exception as e:
             logger.debug(f"Coinbase historical candle fetch failed for {symbol}: {e}")
 
-    # 2. Check Equities, Commodities, Yields via Yahoo Finance v8 Chart API
+    # 3. Check Equities, Commodities, Yields via Yahoo Finance v8 Chart API
     yf_symbol = SYMBOL_YAF_MAP.get(symbol_upper, symbol_upper)
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}?range=1d&interval=5m"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -179,15 +285,13 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
                     volumes = indicators.get("volume", [])
 
                     pts = []
-                    is_2y_yield = symbol_upper in ("US02Y", "US2Y", "2Y", "2YR") and yf_symbol == "SHY"
                     for t, c, v in zip(timestamps, closes, volumes):
                         if c is not None:
                             ts_str = datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
                             raw_p = float(c)
-                            calc_price = round(max(0.5, (82.5 - raw_p) * 0.35 + 4.0), 2) if is_2y_yield else round(raw_p, 2)
                             pts.append({
                                 "timestamp": ts_str,
-                                "price": calc_price,
+                                "price": round(raw_p, 2),
                                 "volume": float(v or 1000),
                                 "anomaly_score": 0.0
                             })
@@ -196,7 +300,7 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
     except Exception as e:
         logger.debug(f"Yahoo Finance historical fetch failed for {symbol}: {e}")
 
-    # 3. Check Live Redis Collector Cache for authentic price
+    # 4. Check Live Redis Collector Cache for authentic price
     if redis:
         try:
             cached_p = await redis.raw.get(f"sentinel:quotes:latest:{symbol_upper}")
@@ -297,22 +401,23 @@ async def get_market_series(
         "symbols": target_symbols,
         "series": series_data
     }
-
 import json
 from fastapi import HTTPException
 
 @router.get("/candles/{ticker}")
-async def get_radar_candles(
+async def get_candles(
     ticker: str,
-    timeframe: str = Query("1m", description="Options: 1m, 5m, 10m, 15m, 1h, 4h, 1d, 1w"),
+    timeframe: str = Query("1m", description="Options: 1m, 5m, 10m, 15m, 30m, 1h, 4h, 1d, 1w, 1M"),
     limit: int = Query(100, ge=1, le=1000),
-    redis = Depends(get_redis_client)
+    db = Depends(get_db_optional),
+    redis = Depends(get_redis_optional)
 ):
     """
     Retrieve aggregated OHLCV candlesticks for a specific ticker across multiple timeframes.
-    These are constructed in real-time by the TradFi collector.
+    Redis/Lua multi-timeframe aggregator serves the low-latency hot cache (§2.5).
+    TimescaleDB Continuous Aggregates (tradfi_bars_*) serve as durable fallback and historical source of truth.
     """
-    valid_timeframes = {"1m", "5m", "10m", "15m", "1h", "4h", "1d", "1w"}
+    valid_timeframes = {"1m", "5m", "10m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"}
     if timeframe not in valid_timeframes:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe. Must be one of: {valid_timeframes}")
         
@@ -338,6 +443,7 @@ async def get_radar_candles(
         if a not in ticker_candidates:
             ticker_candidates.append(a)
 
+    # 1. Hot path: Query Redis multi-timeframe cache
     if redis:
         try:
             for t_cand in ticker_candidates:
@@ -354,7 +460,44 @@ async def get_radar_candles(
                         break
         except Exception as e:
             logger.warning(f"Error fetching candles for {ticker} from Redis: {e}")
-            
+
+    # 2. Durable fallback: Query TimescaleDB Continuous Aggregates (§2.1, §2.3, §2.5)
+    if not candles and db:
+        try:
+            cagg_map = {
+                "1m": ("tradfi_bars", "time"),
+                "5m": ("tradfi_bars_5m", "bucket_time"),
+                "15m": ("tradfi_bars_15m", "bucket_time"),
+                "1h": ("tradfi_bars_1h", "bucket_time"),
+                "1d": ("tradfi_bars_1d", "bucket_time"),
+                "1w": ("tradfi_bars_1w", "bucket_time"),
+                "1M": ("tradfi_bars_1mth", "bucket_time"),
+            }
+            if timeframe in cagg_map:
+                table_name, time_col = cagg_map[timeframe]
+                rows = await db.query(
+                    f"""
+                    SELECT {time_col} as ts, open, high, low, close, volume
+                    FROM {table_name}
+                    WHERE ticker = $1
+                    ORDER BY {time_col} DESC
+                    LIMIT $2;
+                    """,
+                    ticker, limit
+                )
+                for r in rows:
+                    candles.append({
+                        "ts": r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else str(r["ts"]),
+                        "open": float(r["open"]),
+                        "high": float(r["high"]),
+                        "low": float(r["low"]),
+                        "close": float(r["close"]),
+                        "volume": float(r["volume"]),
+                        "ticker": ticker
+                    })
+        except Exception as db_err:
+            logger.debug(f"TimescaleDB CAGG fallback for {ticker} {timeframe}: {db_err}")
+
     return {
         "ticker": ticker,
         "timeframe": timeframe,
@@ -366,15 +509,56 @@ async def get_radar_candles(
 @router.get("/options/covered-calls")
 async def get_covered_call_recommendations(
     ticker: str = Query("NVDA"),
-    z_score: float = Query(2.8),
-    current_price: float = Query(130.0),
+    z_score: Optional[float] = Query(None, description="CAGG Z-score. If omitted, queries tradfi_bars_5m_zscore view."),
+    current_price: Optional[float] = Query(None, description="Current spot price of underlying equity"),
     target_delta: float = Query(0.30),
     dte_days: int = Query(30),
-    redis = Depends(get_redis_client)
+    db = Depends(get_db_optional),
+    redis = Depends(get_redis_optional)
 ):
     """Generates a closed-form Black-Scholes covered-call recommendation (§3.4 Phase 3 Flagship Feature)."""
     from shared.utils import quant_calc
+    from fastapi import HTTPException
     
+    # If z_score is omitted, query the durable TimescaleDB continuous aggregate Z-score view (§2.3, §2.6)
+    if z_score is None:
+        if db:
+            try:
+                row = await db.query_one(
+                    """
+                    SELECT z_score FROM tradfi_bars_5m_zscore 
+                    WHERE ticker = $1 
+                    ORDER BY bucket_time DESC 
+                    LIMIT 1;
+                    """,
+                    ticker.upper()
+                )
+                if row and row.get("z_score") is not None:
+                    z_score = float(row["z_score"])
+            except Exception as e:
+                logger.debug(f"Failed to query Z-score view for {ticker}: {e}")
+        if z_score is None:
+            z_score = 2.8  # Fallback default when database is uninitialized or in cold start
+
+    # If current_price is omitted or non-positive, look up real cached price from Redis
+    if current_price is None or current_price <= 0:
+        if redis:
+            try:
+                for cand in (ticker.upper(), ticker):
+                    raw_p = await redis.raw.get(f"sentinel:quotes:latest:{cand}")
+                    if raw_p:
+                        current_price = float(raw_p)
+                        break
+            except Exception as e:
+                logger.debug(f"Redis latest quote fetch failed for {ticker}: {e}")
+
+    # Return explicit error if no live price is available
+    if current_price is None or current_price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No live price cached for '{ticker}'. 'current_price' query parameter required."
+        )
+
     live_iv = None
     if redis:
         try:

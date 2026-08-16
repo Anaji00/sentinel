@@ -13,11 +13,13 @@ import {
   Bitcoin, 
   Map,
   LineChart,
-  Bot
+  Bot,
+  Network
 } from 'lucide-react';
 
 const NAV_ITEMS = [
   { href: '/', label: 'Command Center', icon: LayoutDashboard },
+  { href: '/graph', label: 'Graph & Correlations', icon: Network },
   { href: '/intelligence', label: 'Intelligence Feed', icon: ShieldAlert },
   { href: '/osint', label: 'OSINT Threat Matrix', icon: ShieldCheck },
   { href: '/flow', label: 'Dark Pool & Sweeps', icon: Layers },

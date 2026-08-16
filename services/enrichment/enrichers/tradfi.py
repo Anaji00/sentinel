@@ -29,10 +29,11 @@ FORM4_CODES = {
 
 class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
-    def __init__(self, scorer, redis_client, graph_writer):
+    def __init__(self, scorer, redis_client, graph_writer, db=None):
         self.scorer = scorer
         self.redis_client = redis_client
         self.graph = graph_writer
+        self.db = db
 
     async def enrich_batch(self, events: list) -> list:
         if not events: return []
@@ -260,29 +261,32 @@ class TradFiEnricher:
             "data": {"label": "Company", "primary_domain": "financial", "confidence": anomaly}
         }, key=ticker)
 
-        # Attach reference data (sector, industry, exchange) from daily cache
+        # Attach reference data (sector, industry, exchange) from daily cache & promote to graph (§8.1)
         ref_data = None
         try:
             from services.enrichment.ref_data import get_reference_data
             ref_data = await get_reference_data(self.redis_client, ticker)
-            if ref_data:
-                sector = ref_data.get("sector", "")
-                if sector:
-                    # Emit deterministic SECTOR_PEER edge
-                    await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                        "entity_id": ticker,
-                        "action": "MERGE_SECTOR_EDGE",
-                        "data": {"sector": sector, "edge_type": "SECTOR_PEER"}
-                    }, key=ticker)
-                # Emit INDEX_CO_MEMBER edges for each index this ticker belongs to
-                for idx in ref_data.get("index_membership", []):
-                    await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                        "entity_id": ticker,
-                        "action": "MERGE_INDEX_EDGE",
-                        "data": {"index": idx, "edge_type": "INDEX_CO_MEMBER"}
-                    }, key=ticker)
+            if ref_data and self.graph:
+                await self.graph.upsert_equity(
+                    ticker=ticker,
+                    data={
+                        "sector": ref_data.get("sector"),
+                        "industry": ref_data.get("industry"),
+                        "indices": ref_data.get("index_membership", []),
+                        "confidence": anomaly,
+                    }
+                )
         except Exception as e:
-            logger.debug(f"Ref data lookup failed for {ticker}: {e}")
+            logger.debug(f"Ref data lookup/graph promotion failed for {ticker}: {e}")
+
+        # Populate active statistical correlation IDs (§8.2)
+        stat_corr_ids = []
+        try:
+            raw_corr_ids = await self.redis_client.raw.smembers(f"sentinel:correlation:active_ids:{ticker}")
+            if raw_corr_ids:
+                stat_corr_ids = [c.decode() if isinstance(c, bytes) else str(c) for c in raw_corr_ids]
+        except Exception as e:
+            logger.debug(f"Statistical correlation IDs lookup failed for {ticker}: {e}")
 
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
@@ -404,6 +408,7 @@ class TradFiEnricher:
             anomaly_breakdown=breakdown,
             market_microstructure=micro,
             score_adjustments=score_adjustments,
+            correlation_ids=stat_corr_ids,
         )
 
     async def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
@@ -427,6 +432,32 @@ class TradFiEnricher:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
         if close_p <= 0 or volume <= 0: return None
+
+        # Unconditionally persist closed bar to durable TimescaleDB tradfi_bars hypertable (§2.1, §2.4)
+        ts = raw.occurred_at or datetime.now(timezone.utc)
+        session_tag = p.get("session", "REGULAR")
+        try:
+            db_conn = self.db
+            if db_conn is None:
+                from shared.db import get_timescale
+                db_conn = await get_timescale()
+            if db_conn:
+                await db_conn.execute(
+                    """
+                    INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (ticker, time) DO UPDATE 
+                    SET open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        session = EXCLUDED.session;
+                    """,
+                    ticker, ts, open_p, high_p, low_p, close_p, volume, session_tag
+                )
+        except Exception as bar_err:
+            logger.debug(f"Failed to persist tradfi_bars for {ticker}: {bar_err}")
 
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         if not is_watched:
@@ -546,6 +577,15 @@ class TradFiEnricher:
             
             bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson:.4f}. Anomaly Score: {anomaly:.2f}."
 
+            # Populate active statistical correlation IDs (§8.2)
+            stat_corr_ids = []
+            try:
+                raw_corr_ids = await self.redis_client.raw.smembers(f"sentinel:correlation:active_ids:{ticker}")
+                if raw_corr_ids:
+                    stat_corr_ids = [c.decode() if isinstance(c, bytes) else str(c) for c in raw_corr_ids]
+            except Exception:
+                pass
+
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
@@ -571,6 +611,7 @@ class TradFiEnricher:
                 anomaly_breakdown=breakdown,
                 market_microstructure=micro,
                 score_adjustments=bar_adjustments,
+                correlation_ids=stat_corr_ids,
             ))
             
         return events

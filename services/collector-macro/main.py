@@ -40,6 +40,18 @@ load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, Topics
 
+try:
+    from economic_calendar import EconomicCalendarCollector
+except ImportError:
+    try:
+        from services.collector_macro.economic_calendar import EconomicCalendarCollector
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("economic_calendar", Path(__file__).parent / "economic_calendar.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        EconomicCalendarCollector = mod.EconomicCalendarCollector
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("feed.macro")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -295,7 +307,6 @@ async def fetch_and_publish(producer: SentinelProducer):
         if alpaca_quotes:
             logger.info(f"✅ Alpaca API returned real quotes for {len(alpaca_quotes)} instruments.")
 
-    async with aiohttp.ClientSession() as session:
         for ticker in tickers:
             try:
                 q = {}
@@ -365,6 +376,21 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
 
+    calendar_collector = EconomicCalendarCollector(producer=producer, poll_interval_sec=120)
+
+    async def _calendar_polling_loop():
+        logger.info("📅 Economic Calendar polling loop initialized.")
+        while True:
+            try:
+                events = await calendar_collector.poll_and_publish()
+                if events:
+                    logger.info(f"📊 Published {len(events)} new economic calendar release events.")
+            except Exception as ce:
+                logger.error(f"Economic calendar poll error: {ce}")
+            await asyncio.sleep(calendar_collector.poll_interval_sec)
+
+    calendar_task = asyncio.create_task(_calendar_polling_loop())
+
     try:
         while True:
             try:
@@ -374,6 +400,8 @@ async def main():
 
             await asyncio.sleep(POLL_INTERVAL)
     finally:
+        calendar_task.cancel()
+        await calendar_collector.close()
         await producer.flush()
         await producer.close()
 

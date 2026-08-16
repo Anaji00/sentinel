@@ -163,21 +163,51 @@ class StockCorrelationAgent(SentinelAgent):
             cross_context = await self.get_cross_agent_context(ticker=target_equity, limit=2)
             cross_block = f"\n- Cross-Agent Memory:\n{cross_context}" if cross_context else ""
 
+            # ── QUERY REAL EMPIRICAL CORRELATIONS FROM NEO4J GRAPH (§7.2) ──
+            empirical_links = []
+            if self.neo4j:
+                try:
+                    neo_res = await self.neo4j.query("""
+                        MATCH (e) WHERE toUpper(e.name) = $ticker OR toUpper(e.id) = $ticker
+                        MATCH (e)-[r:STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES|SYMPATHY_MOVER|MEMBER_OF|CUSTOMER_OF|SUPPLIER_TO|COMPETES_WITH]-(p)
+                        RETURN coalesce(p.name, p.id) AS peer_id,
+                               type(r) AS rel,
+                               coalesce(r.coefficient, r.weight, 1.0) AS coef,
+                               coalesce(r.p_value, 0.05) AS p_val,
+                               coalesce(r.lag, 1) AS lag,
+                               coalesce(r.f_stat, 0.0) AS f_stat
+                        LIMIT 10
+                    """, {"ticker": target_equity.upper()})
+                    for nr in (neo_res or []):
+                        empirical_links.append(
+                            f"{nr['peer_id']} [Relationship: {nr['rel']}, Coef: {nr['coef']}, p-val: {nr['p_val']}, lag: {nr['lag']}]"
+                        )
+                except Exception as ne:
+                    logger.debug(f"Neo4j empirical correlation lookup bypass: {ne}")
+
+            empirical_block = (
+                f"\n- Grounded Empirical Statistics & Graph Links (Computed Deterministically):\n  - "
+                + "\n  - ".join(empirical_links)
+                if empirical_links
+                else "\n- Grounded Empirical Statistics: Live continuous correlation matrix active."
+            )
+
             user_prompt = f"""
-            Analyze the dynamic real-time market relationship between macro asset {target_macro} (${price_map.get(target_macro, 0):.2f}) and equity {target_equity} (${price_map.get(target_equity, 0):.2f}).
+            Analyze the real-time market relationship between macro asset {target_macro} (${price_map.get(target_macro, 0):.2f}) and equity {target_equity} (${price_map.get(target_equity, 0):.2f}).
             Recent Market Event: {headline}
             Active Market Universe Tickers: {', '.join(clean_tickers[:15])}
+            {empirical_block}
             {cross_block}
 
             Task Requirements:
-            1. Synthesize the dynamic correlation mechanism (e.g. rising crude oil compressing profit margins, rate yields putting pressure on tech valuations, or safe-haven rotation).
-            2. Identify 1-3 SYMPATHY MOVERS (sector peers, competitors, suppliers, or cross-asset hedges) from the active market universe or broader market that will react in sympathy with {target_equity}.
-            3. Provide a clear agentic rationale, conviction, and impact severity without hardcoded assumptions.
+            1. Synthesize the causal economic transmission mechanism explaining WHY the empirically measured correlation between {target_macro} and {target_equity} exists (e.g. input cost pressure, discount rate repricing, margin squeeze, or FX translation).
+            2. For each SYMPATHY MOVER, explain the business causality and structural transmission link (supply chain dependence, shared customer base, sector multiple contagion, or competitor displacement).
+            3. Ground your explanation directly in the empirical statistics provided above, maintaining high analytical precision.
             """
 
             brief: Optional[DynamicCorrelationAssessment] = await self._execute_with_telemetry(
                 message=message,
-                system_prompt="You are SENTINEL Stock Correlation & Sympathy Engine. Perform agentic macro-to-equity correlation analysis and identify sympathy movers. Return ONLY raw JSON.",
+                system_prompt="You are SENTINEL Stock Correlation & Sympathy Engine. Explain the causal economic mechanisms behind real, computed statistical correlations and identify sympathy transmission paths. Return ONLY raw JSON.",
                 user_prompt=user_prompt,
                 schema=DynamicCorrelationAssessment,
                 temperature=0.2,
@@ -191,53 +221,37 @@ class StockCorrelationAgent(SentinelAgent):
                 f"Type: {brief.correlation_type} | Sympathy Movers: {len(brief.sympathy_movers)} | Conviction: {brief.conviction:.2f}"
             )
 
-            # ── KNOWLEDGE GRAPH EXPANSION FOR SYMPATHY MOVERS ──────────────
-            if brief.sympathy_movers and self.neo4j:
+            # ── KNOWLEDGE GRAPH GOVERNED PROPOSALS FOR SYMPATHY MOVERS (§3.3) ──
+            if brief.sympathy_movers and self.producer:
                 for sm in brief.sympathy_movers:
                     try:
-                        cypher_query = """
-                        MERGE (a:Entity {id: $primary_id})
-                        ON CREATE SET a.name = $primary_id, a.type = 'EQUITY'
-                        MERGE (b:Entity {id: $sympathy_id})
-                        ON CREATE SET b.name = $sympathy_id, b.type = 'EQUITY'
-                        MERGE (a)-[r:SYMPATHY_MOVER]->(b)
-                        SET r.relationship = $relationship,
-                            r.direction = $direction,
-                            r.conviction = $conviction,
-                            r.reasoning = $reasoning,
-                            r.updated_at = datetime()
-                        """
-                        await self.neo4j.query(cypher_query, {
-                            "primary_id": brief.equity_ticker,
-                            "sympathy_id": sm.ticker,
-                            "relationship": sm.relationship,
-                            "direction": sm.direction,
-                            "conviction": sm.conviction,
-                            "reasoning": sm.reasoning,
-                        })
-                        logger.info(f"🕸️ Knowledge Graph Sympathy Edge: ({brief.equity_ticker}) -[:SYMPATHY_MOVER]-> ({sm.ticker}) [{sm.relationship}]")
-                    except Exception as kg_err:
-                        logger.debug(f"Knowledge Graph sympathy edge insertion error: {kg_err}")
-
-                    # Push ontology proposal to Kafka for system-wide awareness
-                    if self.producer:
-                        try:
-                            await self.producer.send(
-                                Topics.ONTOLOGY_PROPOSALS,
-                                {
-                                    "entity_id": brief.equity_ticker,
-                                    "action": "ADD_SYMPATHY_EDGE",
-                                    "data": {
-                                        "primary_ticker": brief.equity_ticker,
-                                        "sympathy_ticker": sm.ticker,
+                        await self.producer.send(
+                            Topics.ONTOLOGY_PROPOSALS,
+                            {
+                                "entity_id": brief.equity_ticker,
+                                "action": "LINK_ENTITY",
+                                "data": {
+                                    "target_id": sm.ticker,
+                                    "source_label": "Company",
+                                    "target_label": "Company",
+                                    "relation_type": "SYMPATHY_MOVER",
+                                    "weight": float(sm.conviction or 1.0),
+                                    "confidence": float(sm.conviction or 1.0),
+                                    "relationship": sm.relationship,
+                                    "direction": sm.direction,
+                                    "properties": {
                                         "relationship": sm.relationship,
+                                        "direction": sm.direction,
                                         "conviction": sm.conviction,
+                                        "reasoning": sm.reasoning,
                                     }
-                                },
-                                key=brief.equity_ticker,
-                            )
-                        except Exception as ge:
-                            logger.warning(f"Failed to publish sympathy edge proposal for {sm.ticker}: {ge}")
+                                }
+                            },
+                            key=brief.equity_ticker,
+                        )
+                        logger.info(f"🕸️ Emitted governed sympathy edge proposal: ({brief.equity_ticker}) -[:SYMPATHY_MOVER]-> ({sm.ticker}) [{sm.relationship}]")
+                    except Exception as ge:
+                        logger.warning(f"Failed to publish sympathy edge proposal for {sm.ticker}: {ge}")
 
             # Publish correlation discovery to Kafka & Redis
             payload = {

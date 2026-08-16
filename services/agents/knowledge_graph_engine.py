@@ -22,11 +22,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
-VALID_PREDICATES = {
-    "OPERATES_IN", "OWNED_BY", "AFFILIATED_WITH", "SANCTIONED_BY",
-    "TARGETS", "CONFLICTS_WITH", "SUPPLIES", "LOCATED_IN", "RELATED_TO",
-    "POSITIVE_EXPOSURE_TO", "INVERSE_EXPOSURE_TO", "COMMODITY_EXPOSURE"
-}
+from shared.models.ontology import VALID_PREDICATES, is_valid_predicate
 
 
 class IntelEntity(BaseModel):
@@ -320,7 +316,6 @@ class KnowledgeGraphEngine(SentinelAgent):
             return None
 
     # ── ENTITY CLASSIFICATION ──────────────────────────────────────────────────
-
     async def _classify_and_merge_entity(self, entity_name: str, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         cache_key = f"sentinel:ontology:entity:{entity_name.lower()}"
         cached = await self.redis.raw.get(cache_key)
@@ -338,21 +333,19 @@ class KnowledgeGraphEngine(SentinelAgent):
                 temperature=0.1,
             )
 
-            # Write directly to Neo4j
-            neo4j_client = await get_neo4j()
-            query = """
-            MERGE (e:Entity {id: $id})
-            SET e.name = $name,
-                e.primary_domain = $domain,
-                e.type = $type,
-                e.classified_at = timestamp()
-            """
-            await neo4j_client.query(query, {
-                "id": entity_name.upper(),
-                "name": entity_name,
-                "domain": classification.primary_domain,
-                "type": classification.suggested_label.lower(),
-            })
+            # Route through governed ONTOLOGY_PROPOSALS channel (§3.3)
+            if self._producer:
+                proposal = {
+                    "entity_id": entity_name.upper(),
+                    "action": "MERGE_ONTOLOGY_NODE",
+                    "data": {
+                        "label": classification.suggested_label,
+                        "primary_domain": classification.primary_domain,
+                        "macro_concepts": classification.macro_concepts,
+                        "confidence": classification.confidence,
+                    }
+                }
+                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=entity_name.upper())
 
             data = classification.model_dump()
             await self.redis.raw.set(cache_key, json.dumps(data), ex=604800)
@@ -365,37 +358,34 @@ class KnowledgeGraphEngine(SentinelAgent):
     # ── GRAPH TRIPLE MERGING ───────────────────────────────────────────────────
 
     async def _merge_graph_triples(self, triples: List[GraphTriple]) -> None:
-        try:
-            neo4j_client = self.neo4j
-            if neo4j_client is None:
-                from shared.db import get_neo4j
-                neo4j_client = await get_neo4j()
+        """Emits governed relationship proposals to Topics.ONTOLOGY_PROPOSALS (§3.3)."""
+        if not self._producer or not triples:
+            return
 
+        try:
             for t in triples:
-                if t.predicate not in VALID_PREDICATES:
+                if not is_valid_predicate(t.predicate):
                     continue
                 if t.subject.strip().lower() == t.object.strip().lower():
                     continue
                 if len(t.subject) > 80 or len(t.object) > 80:
                     continue
 
-                query = f"""
-                MERGE (a:Entity {{id: $subj}})
-                SET a.type = $subj_type
-                MERGE (b:Entity {{id: $obj}})
-                SET b.type = $obj_type
-                MERGE (a)-[r:{t.predicate}]->(b)
-                SET r.confidence = $conf, r.last_updated = timestamp()
-                """
-                await neo4j_client.query(query, {
-                    "subj": t.subject.upper(),
-                    "subj_type": getattr(t, 'subject_type', 'entity'),
-                    "obj": t.object.upper(),
-                    "obj_type": getattr(t, 'object_type', 'entity'),
-                    "conf": t.confidence,
-                })
+                proposal = {
+                    "entity_id": t.subject.upper(),
+                    "action": "LINK_ENTITY",
+                    "data": {
+                        "target_id": t.object.upper(),
+                        "source_label": getattr(t, 'subject_type', 'Entity'),
+                        "target_label": getattr(t, 'object_type', 'Entity'),
+                        "relation_type": t.predicate,
+                        "weight": 1.0,
+                        "confidence": t.confidence,
+                    }
+                }
+                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=t.subject.upper())
         except Exception as e:
-            logger.error(f"Failed to merge graph triples into Neo4j: {e}")
+            logger.error(f"Failed to emit graph triples to ONTOLOGY_PROPOSALS: {e}")
 
     async def get_entity_centrality(self, entity_id: str) -> float:
         """

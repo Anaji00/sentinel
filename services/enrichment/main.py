@@ -196,7 +196,7 @@ async def main():
     aviation = AviationEnricher(scorer, redis, graph, resolver)
     news = NewsEnricher(scorer, redis, graph)
     cyber = CyberEnricher(scorer, redis, graph)
-    tradfi = TradFiEnricher(scorer, redis, graph)
+    tradfi = TradFiEnricher(scorer, redis, graph, db=timescale)
     crypto = CryptoEnricher(scorer, redis, graph)
     prediction = PredictionEnricher(scorer, redis, graph)
     

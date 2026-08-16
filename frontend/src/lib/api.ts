@@ -45,11 +45,12 @@ const SYMBOL_YAF_MAP: Record<string, string> = {
   US30: "^TYX",
   US30Y: "^TYX",
   US10Y: "^TNX",
-  US2Y: "SHY",
-  US02Y: "SHY",
-  "2Y": "SHY",
-  "2YR": "SHY",
+  US2Y: "2YY=F",
+  US02Y: "2YY=F",
+  "2Y": "2YY=F",
+  "2YR": "2YY=F",
   TLT: "TLT",
+  SHY: "SHY",
 };
 
 /**
@@ -105,16 +106,14 @@ async function fetchDirectAuthenticSeries(symbol: string, limit = 60) {
           const volumes = chart.indicators?.quote?.[0]?.volume || [];
 
           const pts = [];
-          const is2YYield = ['US02Y', 'US2Y', '2Y', '2YR'].includes(symbolUpper) && yfSymbol === 'SHY';
 
           for (let i = 0; i < timestamps.length; i++) {
             if (closes[i] !== null && closes[i] !== undefined) {
               const rawP = parseFloat(closes[i]);
-              const calcPrice = is2YYield ? Number(Math.max(0.5, (82.5 - rawP) * 0.35 + 4.0).toFixed(2)) : Number(rawP.toFixed(2));
 
               pts.push({
                 timestamp: new Date(timestamps[i] * 1000).toISOString(),
-                price: calcPrice,
+                price: Number(rawP.toFixed(2)),
                 volume: parseFloat(volumes[i] || '1000'),
                 anomaly_score: 0.0,
               });

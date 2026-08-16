@@ -42,6 +42,7 @@ class EventType(str, Enum):
     CRYPTO_PERP_FUNDING = "crypto_perp_funding"
     EARNINGS_REPORT = "earnings_report"
     EARNINGS_SURPRISE = "earnings_surprise"
+    MACRO_RELEASE = "macro_release"
     CUSTOM = "custom"
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
@@ -211,6 +212,19 @@ class FinancialData(BaseModel):
     industry: Optional[str] = None
     index_membership: List[str] = Field(default_factory=list)
     market_cap_tier: Optional[str] = None
+
+class MacroReleaseData(BaseModel):
+    indicator: str                # e.g., "CPI", "CORE_CPI", "NFP", "UNEMPLOYMENT", "FOMC_RATE_DECISION", "GDP", "ISM_MANUFACTURING_PMI", "PCE", "CORE_PCE"
+    country: str = "US"
+    period: Optional[str] = None  # e.g., "2026-07" or "Q2-2026"
+    actual: Optional[float] = None
+    forecast: Optional[float] = None # expected / consensus
+    previous: Optional[float] = None # prior release
+    surprise: Optional[float] = None # actual - forecast
+    surprise_pct: Optional[float] = None
+    unit: Optional[str] = None    # "%", "k", "bps", "index"
+    impact_bias: Optional[str] = None # "HAWKISH", "DOVISH", "INFLATIONARY", "DISINFLATIONARY", "EXPANSIONARY", "CONTRACTIONARY"
+    raw_source: Optional[str] = None
 
 class SecurityData(BaseModel):
     breach_type: Optional[str] = None
@@ -433,6 +447,7 @@ class NormalizedEvent(BaseModel):
     betting_data: Optional[BettingData] = None
     prediction_market_data: Optional[PredictionMarketData] = None
     crypto_data: Optional[CryptoData] = None
+    macro_data: Optional[MacroReleaseData] = None
 
     tags: List[str] = Field(default_factory=list) 
     named_entities: List[str] = Field(default_factory=list) 
@@ -500,6 +515,7 @@ class NormalizedEvent(BaseModel):
             EventType.CRYPTO_TRADE, EventType.MARKET_CANDLE, EventType.MARKET_ANOMALY,           
             EventType.CRYPTO_LIQUIDATION, EventType.PREDICTION_MARKET_TRADE, EventType.CRYPTO_TRANSFER,
             EventType.CRYPTO_PERP_FUNDING, EventType.EARNINGS_REPORT, EventType.EARNINGS_SURPRISE,
+            EventType.MACRO_RELEASE,
         ]
     
     def to_summary(self) -> str:

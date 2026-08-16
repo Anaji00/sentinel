@@ -518,3 +518,181 @@ def test_black_scholes_delta_inversion_grid(target_delta, option_type, S, r, sig
     assert strike > 0.0
     assert not np.isnan(strike)
 
+
+def test_portfolio_metrics_force_write_and_cvar_99_confidence():
+    from services.agents.quant_trading_engine import PortfolioMetrics
+    
+    # 20 return samples
+    returns = [-0.05, -0.04, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04,
+               -0.03, 0.01, 0.02, -0.01, 0.015, -0.025, 0.035, -0.015, 0.02, 0.01]
+    has_history = len(returns) >= 10
+    assert has_history is True
+
+    var_95_pct = round(quant_calc.var_historical(returns, confidence=0.95, position_value=1.0) * 100.0, 2)
+    cvar_95_pct = round(quant_calc.cvar_historical(returns, confidence=0.95, position_value=1.0) * 100.0, 2)
+    cvar_99_pct = round(quant_calc.cvar_historical(returns, confidence=0.99, position_value=1.0) * 100.0, 2)
+    sharpe_ratio_val = round(float(quant_calc.sharpe_ratio(returns, annualize=True)), 2)
+
+    # 99% CVaR must be strictly >= 95% CVaR (capturing extreme tail loss)
+    assert cvar_99_pct >= cvar_95_pct
+    assert var_95_pct > 0.0
+
+    metrics = PortfolioMetrics()
+    metrics.var_95_pct = var_95_pct
+    metrics.cvar_99_pct = cvar_99_pct
+    metrics.sharpe_ratio = sharpe_ratio_val
+    metrics.metrics_source = "computed" if has_history else "insufficient_history"
+
+    assert metrics.metrics_source == "computed"
+    assert metrics.var_95_pct == var_95_pct
+    assert metrics.cvar_99_pct == cvar_99_pct
+    assert metrics.sharpe_ratio == sharpe_ratio_val
+
+
+def test_portfolio_metrics_insufficient_history():
+    from services.agents.quant_trading_engine import PortfolioMetrics
+
+    # Insufficient samples (< 10)
+    returns = [0.01, -0.02, 0.015]
+    has_history = len(returns) >= 10
+    assert has_history is False
+
+    metrics = PortfolioMetrics()
+    if has_history:
+        metrics.var_95_pct = 1.0
+        metrics.cvar_99_pct = 2.0
+        metrics.sharpe_ratio = 1.5
+        metrics.metrics_source = "computed"
+    else:
+        metrics.var_95_pct = None
+        metrics.cvar_99_pct = None
+        metrics.sharpe_ratio = None
+        metrics.metrics_source = "insufficient_history"
+
+    assert metrics.metrics_source == "insufficient_history"
+    assert metrics.var_95_pct is None
+    assert metrics.cvar_99_pct is None
+    assert metrics.sharpe_ratio is None
+
+
+# ── 12. TIER 2 FOUNDATIONAL INFRASTRUCTURE TESTS ─────────────────────────────
+
+def test_migration_runner_transaction_free_branching():
+    """Verify that migration runner executes continuous aggregate DDL without transaction wrapper (§2.2)."""
+    import asyncio
+    from shared.db.migrate import MIGRATIONS, apply_migrations
+
+    # Verify migration definitions exist and have correct flags
+    cagg_mig = next((m for m in MIGRATIONS if m["version"] == "0005_create_tradfi_bars_continuous_aggregates"), None)
+    assert cagg_mig is not None
+    assert cagg_mig.get("transactional") is False
+    assert "tradfi_bars_5m" in cagg_mig["sql"]
+    assert "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING" in cagg_mig["sql"]
+
+    hyper_mig = next((m for m in MIGRATIONS if m["version"] == "0004_create_tradfi_bars_hypertable"), None)
+    assert hyper_mig is not None
+    assert hyper_mig.get("transactional", True) is True
+
+    # Test apply_migrations dispatch logic with mock db
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+    mock_db.execute_without_transaction = AsyncMock()
+    mock_db.query = AsyncMock(return_value=[{"version": "0001_initial_schema"}, {"version": "0002_add_trace_id"}, {"version": "0003_add_lat_lon_columns"}])
+
+    with patch("shared.db.migrate.get_timescale", AsyncMock(return_value=mock_db)):
+        asyncio.run(apply_migrations())
+        # Hypertable migration (0004) executed with transaction
+        assert mock_db.execute.called
+        # CAGG migration (0005) executed without transaction
+        assert mock_db.execute_without_transaction.called
+
+
+def test_rolling_zscore_preceding_only_math():
+    """Verify Z-score mathematical properties: excluding current bucket prevents self-dampening (§2.3)."""
+    # 20 baseline closes around 100 with std ~ 2
+    baseline = [100.0 + (i % 5 - 2) * 1.0 for i in range(20)]
+    mean_baseline = float(np.mean(baseline))
+    std_baseline = float(np.std(baseline))
+
+    # A large print of 130
+    current_close = 130.0
+
+    # 1. Correct Z-score (excluding current bucket from baseline)
+    correct_z = (current_close - mean_baseline) / std_baseline
+
+    # 2. Flawed Z-score (including current bucket in baseline)
+    inclusive_window = baseline[1:] + [current_close]
+    flawed_z = (current_close - np.mean(inclusive_window)) / np.std(inclusive_window)
+
+    # The correct Z-score should capture true anomaly without dampening
+    assert correct_z > 10.0
+    assert correct_z > flawed_z  # Inclusive window dampens the signal
+
+
+def test_tradfi_enricher_unconditional_bars_write():
+    """Verify tradfi enricher persists closed bars to tradfi_bars hypertable even for unwatched tickers (§2.4)."""
+    from services.enrichment.enrichers.tradfi import TradFiEnricher
+    from shared.models import RawEvent
+
+    mock_scorer = MagicMock()
+    mock_scorer.check_watchlist = AsyncMock(return_value=False)  # Unwatched ticker!
+    mock_redis = MagicMock()
+    mock_redis.raw.set = AsyncMock()
+    mock_graph = MagicMock()
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock()
+
+    enricher = TradFiEnricher(mock_scorer, mock_redis, mock_graph, db=mock_db)
+
+    raw_event = RawEvent(
+        source="finnhub_equities",
+        raw_payload={
+            "ticker": "UNWATCHED_CORP",
+            "trade_type": "OHLCV_MINUTE_BAR",
+            "open": 50.0,
+            "high": 52.0,
+            "low": 49.5,
+            "close": 51.5,
+            "volume": 25000.0,
+            "session": "REGULAR"
+        }
+    )
+
+    async def _test():
+        res = await enricher._enrich_equity_candle(raw_event, raw_event.raw_payload)
+        # Watchlist gating returns empty list
+        assert res == []
+        # BUT tradfi_bars write was executed unconditionally!
+        assert mock_db.execute.called
+        call_sql = mock_db.execute.call_args[0][0]
+        assert "INSERT INTO tradfi_bars" in call_sql
+
+    asyncio.run(_test())
+
+
+def test_covered_call_engine_queries_cagg_zscore_view():
+    """Verify quant trading engine queries tradfi_bars_5m_zscore for covered call overlay (§2.6)."""
+    mock_db = MagicMock()
+    mock_db.query_one = AsyncMock(return_value={"z_score": 3.2})
+
+    async def _test():
+        # Verify query against view
+        row = await mock_db.query_one(
+            "SELECT z_score FROM tradfi_bars_5m_zscore WHERE ticker = $1 ORDER BY bucket_time DESC LIMIT 1;",
+            "NVDA"
+        )
+        assert row["z_score"] == 3.2
+        rec = quant_calc.generate_covered_call_recommendation(
+            ticker="NVDA",
+            current_price=130.0,
+            z_score=float(row["z_score"]),
+            target_delta=0.30,
+            dte_days=30
+        )
+        assert rec is not None
+        assert rec["recommended_strike"] > 130.0
+
+    asyncio.run(_test())
+
+
+

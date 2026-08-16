@@ -49,10 +49,12 @@ async def fetch_and_cache_reference_data(
     redis_client,
     symbol: str,
     session=None,
+    graph_writer=None,
 ) -> Optional[Dict[str, Any]]:
     """
     Fetch reference data for a single symbol from Finnhub /stock/profile2
-    and cache it in Redis. Returns the cached data dict or None on failure.
+    and cache it in Redis. Emits structural graph proposals (Company, Sector, Index)
+    via GraphWriter when provided (§8.1).
     
     NOT designed for hot-path usage — call from daily batch jobs only.
     """
@@ -130,6 +132,20 @@ async def fetch_and_cache_reference_data(
             pipe.set(f"sentinel:mcap:{symbol}", str(mcap_b), ex=REFDATA_TTL)
         await pipe.execute()
 
+        # Promote to Knowledge Graph via GraphWriter (§8.1)
+        if graph_writer:
+            try:
+                await graph_writer.upsert_equity(
+                    ticker=symbol,
+                    data={
+                        "sector": sector,
+                        "industry": industry,
+                        "indices": ref_data.get("index_membership", []),
+                    }
+                )
+            except Exception as ge:
+                logger.debug(f"GraphWriter promotion failed for {symbol}: {ge}")
+
         logger.debug(f"Cached ref data for {symbol}: sector={sector}, exchange={exchange}, type={asset_type}")
         return ref_data
 
@@ -165,10 +181,10 @@ async def get_reference_data(redis_client, symbol: str) -> Optional[Dict[str, An
     return None
 
 
-async def fetch_index_constituents(redis_client, session=None):
+async def fetch_index_constituents(redis_client, session=None, graph_writer=None):
     """
-    Fetch constituents for major US indices from Finnhub /index/constituents
-    and cache a reverse map: ticker → list of index labels.
+    Fetch constituents for major US indices from Finnhub /index/constituents,
+    cache reverse map in Redis, and emit MEMBER_OF graph proposals (§8.1).
     
     Designed for daily batch usage only. Rate-limited with 500ms delay between calls.
     """
@@ -212,7 +228,7 @@ async def fetch_index_constituents(redis_client, session=None):
 
             await asyncio.sleep(0.5)  # Rate limit between index calls
 
-        # Cache each ticker's index membership in Redis
+        # Cache each ticker's index membership in Redis & promote to graph
         if reverse_map:
             pipe = redis_client.raw.pipeline()
             for ticker, indices in reverse_map.items():
@@ -224,6 +240,22 @@ async def fetch_index_constituents(redis_client, session=None):
             await pipe.execute()
             logger.info(f"Cached index membership for {len(reverse_map)} tickers across {len(INDEX_SYMBOLS)} indices")
 
+            if graph_writer:
+                for ticker, indices in reverse_map.items():
+                    for idx in indices:
+                        try:
+                            await graph_writer.upsert_index(idx)
+                            await graph_writer.link_entities(
+                                source_id=ticker.upper(),
+                                relation_type="MEMBER_OF",
+                                target_id=str(idx).upper(),
+                                properties={"weight": 1.0},
+                                source_label="Company",
+                                target_label="Index"
+                            )
+                        except Exception as ge:
+                            logger.debug(f"Graph index link failed for {ticker} -> {idx}: {ge}")
+
     except Exception as e:
         logger.error(f"Index constituents batch fetch failed: {e}")
     finally:
@@ -231,7 +263,7 @@ async def fetch_index_constituents(redis_client, session=None):
             await session.close()
 
 
-async def refresh_watchlist_reference_data(redis_client, session=None):
+async def refresh_watchlist_reference_data(redis_client, session=None, graph_writer=None):
     """
     Batch-refresh reference data for all symbols on the active equity watchlist.
     Intended to be called once per day from a scheduled job.
@@ -254,12 +286,12 @@ async def refresh_watchlist_reference_data(redis_client, session=None):
             session = aiohttp.ClientSession()
 
         try:
-            # Fetch index constituents first (populates index_membership cache)
-            await fetch_index_constituents(redis_client, session)
+            # Fetch index constituents first (populates index_membership cache & graph)
+            await fetch_index_constituents(redis_client, session, graph_writer=graph_writer)
 
             success_count = 0
             for symbol in symbols:
-                result = await fetch_and_cache_reference_data(redis_client, symbol, session)
+                result = await fetch_and_cache_reference_data(redis_client, symbol, session, graph_writer=graph_writer)
                 if result:
                     success_count += 1
                 # Rate limit: 250ms between Finnhub calls

@@ -75,6 +75,7 @@ interface PortfolioMetrics {
   recommended_cash_pct?: number;
   max_drawdown_est?: number;
   hawkes_risk_factor?: number;
+  metrics_source?: string;
 }
 
 interface AdviceBrief {
@@ -138,10 +139,12 @@ export default function FinancialAdvisorAdvice() {
           stop_loss: signal.stop_loss,
           position_size_usd: positionUsd,
           kelly_allocation_pct: signal.kelly_allocation_pct,
+          conviction_score: signal.conviction_score,
+          trade_type: signal.trade_type || 'Quantitative Breakout',
         }),
       });
       const data = await res.json();
-      const orderId = data.order_id || `paper_${signal.ticker.toLowerCase()}_${Date.now()}`;
+      const orderId = data.order_id || `ORD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
       setToastMessage(
         `⚡ EXECUTED [${orderId}]: ${signal.action} ${signal.ticker} @ $${signal.entry_level} | Sized $${positionUsd.toLocaleString()} (${signal.kelly_allocation_pct}% Kelly) via ${data.broker || 'Alpaca Paper API v2'}`
       );
@@ -155,7 +158,7 @@ export default function FinancialAdvisorAdvice() {
 
   const modalCalculations = useMemo(() => {
     if (!selectedPlay) return null;
-    const kellyPct = selectedPlay.kelly_allocation_pct || 5.0;
+    const kellyPct = selectedPlay.kelly_allocation_pct ?? 5.0;
     const posSizeUsd = portfolioCapital * (kellyPct / 100.0);
     const shares = selectedPlay.entry_level > 0 ? posSizeUsd / selectedPlay.entry_level : 0;
     const riskPerShare = Math.abs(selectedPlay.entry_level - selectedPlay.stop_loss);
@@ -197,11 +200,11 @@ export default function FinancialAdvisorAdvice() {
         <div className="grid grid-cols-4 gap-2 bg-[#06080d] p-2.5 rounded-xl border border-cyan-500/20 text-[10px]">
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">PORTFOLIO VaR (95%)</span>
-            <span className="text-cyan-400 font-bold">{metrics?.var_95_pct !== undefined ? `${metrics.var_95_pct}%` : '--'}</span>
+            <span className="text-cyan-400 font-bold">{metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? `${metrics.var_95_pct}%` : '--'}</span>
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">SHARPE RATIO</span>
-            <span className="text-emerald-400 font-bold">{metrics?.sharpe_ratio !== undefined ? `${metrics.sharpe_ratio}x` : '--'}</span>
+            <span className="text-emerald-400 font-bold">{metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? `${metrics.sharpe_ratio}x` : '--'}</span>
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
             <span className="text-slate-500 block">CASH BUFFER</span>

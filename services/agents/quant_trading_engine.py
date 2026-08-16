@@ -91,7 +91,7 @@ class PortfolioMetrics(BaseModel):
     sharpe_ratio: Optional[float] = None
     recommended_cash_pct: Optional[float] = None
     hawkes_risk_factor: Optional[float] = None
-    metrics_source: str = "QUANT_ENGINE_SERVER"
+    metrics_source: str = "insufficient_history"
 
 class TradingSignal(BaseModel):
     ticker: str
@@ -196,6 +196,32 @@ class QuantTradingEngine(SentinelAgent):
     Combines peer discovery, SEC Form 4 insider flow tracking, quantitative risk modeling
     (VaR/CVaR, Half-Kelly), and technical trading signal generation in a single pass.
     """
+
+    def __init__(
+        self,
+        agent_name: str = "quant_trading_engine",
+        input_topics: Optional[List[str]] = None,
+        redis_client=None,
+        db_client=None,
+        neo4j_client=None,
+        producer=None,
+        consumer=None,
+        dlq=None,
+        model: str = "llama3",
+        fallback_model: Optional[str] = None,
+    ):
+        super().__init__(
+            agent_name=agent_name,
+            input_topics=input_topics or [Topics.ENRICHED_EVENTS, Topics.CORRELATIONS, Topics.RAW_TRADFI],
+            redis_client=redis_client,
+            db_client=db_client,
+            neo4j_client=neo4j_client,
+            producer=producer,
+            consumer=consumer,
+            dlq=dlq,
+            model=model,
+            fallback_model=fallback_model,
+        )
 
     @property
     def output_topic(self) -> str:
@@ -499,9 +525,14 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 
         # Risk calculations: EWMA Volatility, VaR, CVaR, Empirical Half-Kelly
         returns = list(np.diff(closes) / closes[:-1]) if len(closes) > 1 else [0.0]
+        has_history = len(returns) >= 10
         ewma_vol = quant_calc.ewma_volatility(returns, annualize=True)
         var_95 = quant_calc.var_historical(returns, confidence=0.95, position_value=10_000)
         cvar_95 = quant_calc.cvar_historical(returns, confidence=0.95, position_value=10_000)
+        cvar_99 = quant_calc.cvar_historical(returns, confidence=0.99, position_value=10_000)
+        var_95_pct = round(quant_calc.var_historical(returns, confidence=0.95, position_value=1.0) * 100.0, 2)
+        cvar_99_pct = round(quant_calc.cvar_historical(returns, confidence=0.99, position_value=1.0) * 100.0, 2)
+        sharpe_ratio_val = round(float(quant_calc.sharpe_ratio(returns, annualize=True)), 2)
 
         # Empirical Win Probability (W) & Payoff Ratio (R) from scorecard
         card = await self.get_scorecard()
@@ -543,15 +574,48 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             }
         }
 
-        # Fetch validated graph exposure correlations for ticker (§3.4, Task 4)
+        # ── 1-HOP GRAPH CONTEXT PRE-CHECKS (§7.3) ──
         graph_correlations = []
+        graph_context = {
+            "sector": None,
+            "industry": None,
+            "index_membership": [],
+            "supply_chain": [],
+            "competitors": [],
+            "correlated_entities": [],
+        }
         try:
             neo4j_client = self.neo4j or await get_neo4j()
             if neo4j_client:
+                # 1. 1-hop structural relationships (Sector, Index, Supply Chain, Competitors)
+                struct_query = """
+                MATCH (inst) WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
+                OPTIONAL MATCH (inst)-[:OPERATES_IN]->(s:Sector)
+                OPTIONAL MATCH (inst)-[:MEMBER_OF]->(idx:Index)
+                OPTIONAL MATCH (inst)-[:SUPPLIER_TO|CUSTOMER_OF|SUPPLIES]-(sc:Entity)
+                OPTIONAL MATCH (inst)-[:COMPETES_WITH]-(comp:Entity)
+                RETURN coalesce(s.name, s.id) AS sector,
+                       collect(DISTINCT coalesce(idx.name, idx.id)) AS indices,
+                       collect(DISTINCT coalesce(sc.name, sc.id)) AS supply_chain,
+                       collect(DISTINCT coalesce(comp.name, comp.id)) AS competitors
+                """
+                struct_rows = await neo4j_client.query(struct_query, {"ticker": ticker.upper()})
+                if struct_rows and struct_rows[0]:
+                    sr = struct_rows[0]
+                    if sr.get("sector"):
+                        graph_context["sector"] = sr["sector"]
+                    if sr.get("indices"):
+                        graph_context["index_membership"] = [x for x in sr["indices"] if x]
+                    if sr.get("supply_chain"):
+                        graph_context["supply_chain"] = [x for x in sr["supply_chain"] if x]
+                    if sr.get("competitors"):
+                        graph_context["competitors"] = [x for x in sr["competitors"] if x]
+
+                # 2. Exposure & statistical correlations
                 graph_query = """
-                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO*1..2]-(inst:Entity {id: $ticker})
-                WHERE ALL(rel IN r WHERE coalesce(rel.confidence, 0.0) >= 0.6)
-                RETURN DISTINCT e.id AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, 0.6) AS confidence
+                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES*1..2]-(inst:Entity)
+                WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
+                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, 0.6) AS confidence
                 LIMIT 5
                 """
                 rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper()})
@@ -560,9 +624,22 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                         f"{r['correlated_entity']} -[{r['predicate']}]-> {ticker} (confidence: {r['confidence']:.2f})"
                         for r in rows if r.get("correlated_entity")
                     ]
+                    graph_context["correlated_entities"] = [r['correlated_entity'] for r in rows if r.get("correlated_entity")]
         except Exception as e:
-            logger.debug(f"Graph exposure lookup for {ticker} bypass: {e}")
+            logger.debug(f"Graph context lookup for {ticker} bypass: {e}")
 
+        # Ground prompt with 1-hop topology
+        graph_topo_lines = []
+        if graph_context["sector"]:
+            graph_topo_lines.append(f"Sector: {graph_context['sector']}")
+        if graph_context["index_membership"]:
+            graph_topo_lines.append(f"Indices: {', '.join(graph_context['index_membership'])}")
+        if graph_context["supply_chain"]:
+            graph_topo_lines.append(f"Supply Chain Linkages: {', '.join(graph_context['supply_chain'])}")
+        if graph_context["competitors"]:
+            graph_topo_lines.append(f"Key Competitors: {', '.join(graph_context['competitors'])}")
+
+        graph_topo_block = ("\n        GRAPH TOPOLOGY & EXPOSURES:\n        - " + "\n        - ".join(graph_topo_lines) + "\n") if graph_topo_lines else ""
         graph_block = f"\n        VALIDATED GRAPH CORRELATIONS:\n        - " + "\n        - ".join(graph_correlations) + "\n" if graph_correlations else ""
 
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=3)
@@ -577,7 +654,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         user_prompt = f"""=== FINANCIAL ADVISORY & RISK EVALUATION ===
 Target Instrument: {ticker} | Macro Regime: {rates_regime}
 Risk Indicators: {json.dumps(indicators_data, separators=(',', ':'), default=str)}
-{graph_block}{cross_block}{earnings_block}{funding_block}
+{graph_topo_block}{graph_block}{cross_block}{earnings_block}{funding_block}
 HARD RISK CONSTRAINTS (MANDATORY):
 - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
 - Max Half-Kelly Allocation: {kelly_pct * 100:.1f}% (Set kelly_allocation_pct <= {kelly_pct * 100:.1f}%)
@@ -621,13 +698,31 @@ Return raw JSON matching schema:"""
                 # Hard clamp Kelly allocation to server-calculated half-Kelly limit
                 play.kelly_allocation_pct = round(min(max(0.0, float(play.kelly_allocation_pct)), max_kelly_pct), 2)
 
-            # Evaluate closed-form Covered Call recommendation if CAGG Z-score >= +2.5
+            # Evaluate closed-form Covered Call recommendation if CAGG Z-score >= +2.5 (§2.3, §2.6)
             z_score = 0.0
-            if len(returns) >= 20:
-                mean_ret = float(np.mean(returns[-20:]))
-                std_ret = float(np.std(returns[-20:]))
-                if std_ret > 1e-6:
-                    z_score = (returns[-1] - mean_ret) / std_ret
+            try:
+                from shared.db import get_timescale
+                db = self.db or await get_timescale()
+                if db:
+                    row = await db.query_one(
+                        """
+                        SELECT z_score FROM tradfi_bars_5m_zscore 
+                        WHERE ticker = $1 
+                        ORDER BY bucket_time DESC 
+                        LIMIT 1;
+                        """,
+                        ticker.upper()
+                    )
+                    if row and row.get("z_score") is not None:
+                        z_score = float(row["z_score"])
+            except Exception as z_err:
+                logger.debug(f"CAGG Z-score view lookup for {ticker} fallback: {z_err}")
+                # Fallback to in-memory preceding window during cold start or offline db
+                if len(returns) >= 20:
+                    mean_ret = float(np.mean(returns[-21:-1])) if len(returns) > 20 else float(np.mean(returns[:-1]))
+                    std_ret = float(np.std(returns[-21:-1])) if len(returns) > 20 else float(np.std(returns[:-1]))
+                    if std_ret > 1e-6:
+                        z_score = (returns[-1] - mean_ret) / std_ret
 
             live_iv = None
             raw_iv = await self.redis.raw.get(f"sentinel:options:iv:{ticker}")
@@ -653,11 +748,27 @@ Return raw JSON matching schema:"""
             if cc_rec:
                 brief.covered_call_overlays.append(cc_rec)
 
+            # Force-write PortfolioMetrics from real computed values (§1.6, §1.7, §1.8)
+            if not brief.portfolio_metrics:
+                brief.portfolio_metrics = PortfolioMetrics()
+
+            if has_history:
+                brief.portfolio_metrics.var_95_pct = var_95_pct
+                brief.portfolio_metrics.cvar_99_pct = cvar_99_pct
+                brief.portfolio_metrics.sharpe_ratio = sharpe_ratio_val
+                brief.portfolio_metrics.metrics_source = "computed"
+            else:
+                brief.portfolio_metrics.var_95_pct = None
+                brief.portfolio_metrics.cvar_99_pct = None
+                brief.portfolio_metrics.sharpe_ratio = None
+                brief.portfolio_metrics.metrics_source = "insufficient_history"
+
             res_payload = {
                 "agent": self.name,
                 "agent_run_id": f"fin_{ticker}_{int(time.time())}",
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "brief": brief.model_dump(),
+                "graph_context": graph_context,
             }
 
             await self.redis.raw.set("sentinel:financial:advice:latest", json.dumps(res_payload), ex=86400)

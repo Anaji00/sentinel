@@ -775,7 +775,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
             await asyncio.sleep(poll_interval)
 
 
-# ── INSTITUTIONAL FIX 4.4 CLIENT (ROBINHOOD / STATE STREET TIER) ───────────────
+# ── INSTITUTIONAL FIX 4.4 CLIENT ──────────
 
 class InstitutionalFIXClient:
     """

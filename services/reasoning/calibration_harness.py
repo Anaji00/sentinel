@@ -92,16 +92,28 @@ class ThresholdCalibrationHarness:
         """
         Grid-searches optimal thresholds and saves recommendations to Redis.
         """
+        default_config = {
+            "z_score_threshold": 1.5,
+            "similarity_threshold": 0.72,
+            "vix_bounds": {"calm": 15.0, "elevated": 25.0, "extreme": 35.0},
+            "min_correlation_coef": 0.65,
+            "max_p_value": 0.05,
+            "min_granger_f_stat": 3.84,
+            "min_hawkes_branching_ratio": 0.25,
+            "min_cointegration_p_value": 0.05,
+            "calibrated_at": datetime.now(timezone.utc).isoformat(),
+            "sample_count": 0,
+        }
+
         outcomes = await self.fetch_historical_outcomes()
         if not outcomes:
             logger.info("No empirical outcome history available for calibration. Returning default thresholds.")
-            default_config = {
-                "z_score_threshold": 1.5,
-                "similarity_threshold": 0.72,
-                "vix_bounds": {"calm": 15.0, "elevated": 25.0, "extreme": 35.0},
-                "calibrated_at": datetime.now(timezone.utc).isoformat(),
-                "sample_count": 0,
-            }
+            if self.redis:
+                try:
+                    await self.redis.raw.set("sentinel:calibration:latest", json.dumps(default_config), ex=86400 * 7)
+                    await self.redis.raw.set("sentinel:calibration:correlation_thresholds", json.dumps(default_config), ex=86400 * 7)
+                except Exception as e:
+                    logger.warning(f"Failed to persist default thresholds to Redis: {e}")
             return default_config
 
         z_grid = [1.0, 1.25, 1.5, 1.75, 2.0]
@@ -123,6 +135,11 @@ class ThresholdCalibrationHarness:
             "z_score_threshold": round(best_z, 2),
             "similarity_threshold": round(best_sim, 2),
             "vix_bounds": {"calm": 15.0, "elevated": 25.0, "extreme": 35.0},
+            "min_correlation_coef": round(max(0.55, min(0.85, best_sim * 0.90)), 2),
+            "max_p_value": 0.05,
+            "min_granger_f_stat": 3.84,
+            "min_hawkes_branching_ratio": 0.25,
+            "min_cointegration_p_value": 0.05,
             "best_f1_score": round(best_f1, 4),
             "sample_count": len(outcomes),
             "calibrated_at": datetime.now(timezone.utc).isoformat(),
@@ -131,10 +148,11 @@ class ThresholdCalibrationHarness:
         if self.redis:
             try:
                 await self.redis.raw.set("sentinel:calibration:latest", json.dumps(calibrated), ex=86400 * 7)
+                await self.redis.raw.set("sentinel:calibration:correlation_thresholds", json.dumps(calibrated), ex=86400 * 7)
             except Exception as e:
                 logger.warning(f"Failed to persist calibrated thresholds to Redis: {e}")
 
-        logger.info(f"🎯 Threshold calibration complete | Z-Threshold: {best_z} | Sim-Threshold: {best_sim} | F1: {best_f1:.3f}")
+        logger.info(f"🎯 Threshold calibration complete | Z-Threshold: {best_z} | Sim-Threshold: {best_sim} | Min-Corr: {calibrated['min_correlation_coef']} | F1: {best_f1:.3f}")
         return calibrated
 
 

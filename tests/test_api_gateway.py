@@ -39,8 +39,65 @@ def test_api_gateway_metrics_endpoints_bypass_auth():
 
 def test_api_gateway_protected_endpoint_requires_auth():
     client = TestClient(app)
+    # 1. No credentials -> 403
     res = client.get("/api/v1/events/recent")
     assert res.status_code == 403
+
+    # 2. Forged / random cookie string -> 403 (Fixes 1.1 authentication bypass)
+    client.cookies.set("sentinel_session", "fake_unverified_session_cookie")
+    res_fake = client.get("/api/v1/events/recent")
+    assert res_fake.status_code == 403
+
+    # 3. Expired JWT token cookie -> 403
+    from services.api_gateway.dependencies import create_jwt_token, verify_session_token, verify_websocket_api_key
+    expired_jwt = create_jwt_token({"sub": "admin@sentinel.io"}, expires_in_seconds=-3600)
+    client.cookies.set("sentinel_session", expired_jwt)
+    res_expired = client.get("/api/v1/events/recent")
+    assert res_expired.status_code == 403
+
+    # 4. Valid JWT token cookie -> 200 (or passes auth dependency)
+    valid_jwt = create_jwt_token({"sub": "admin@sentinel.io"}, expires_in_seconds=3600)
+    is_valid, sub = verify_session_token(valid_jwt)
+    assert is_valid is True
+    assert sub == "admin@sentinel.io"
+
+    # 5. Invalid / forged secret JWT -> False
+    forged_jwt = create_jwt_token({"sub": "admin@sentinel.io"}, secret="wrong-secret-key")
+    is_forged_valid, _ = verify_session_token(forged_jwt)
+    assert is_forged_valid is False
+
+def test_websocket_auth_cryptographic_verification():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from services.api_gateway.dependencies import verify_websocket_api_key, create_jwt_token
+
+    async def _run():
+        # 1. Unauthenticated websocket
+        ws_unauth = MagicMock()
+        ws_unauth.cookies = {}
+        ws_unauth.headers = {}
+        ws_unauth.query_params = {}
+        ws_unauth.close = AsyncMock()
+        assert await verify_websocket_api_key(ws_unauth) is False
+        ws_unauth.close.assert_called_with(code=4003, reason="Invalid API key or session cookie")
+
+        # 2. Forged cookie websocket -> rejected
+        ws_forged = MagicMock()
+        ws_forged.cookies = {"sentinel_session": "forged_random_cookie_token"}
+        ws_forged.headers = {}
+        ws_forged.query_params = {}
+        ws_forged.close = AsyncMock()
+        assert await verify_websocket_api_key(ws_forged) is False
+
+        # 3. Valid JWT session cookie websocket -> accepted
+        valid_jwt = create_jwt_token({"sub": "ws_client@sentinel.io"}, expires_in_seconds=3600)
+        ws_valid = MagicMock()
+        ws_valid.cookies = {"sentinel_session": valid_jwt}
+        ws_valid.headers = {}
+        ws_valid.query_params = {}
+        assert await verify_websocket_api_key(ws_valid) is True
+
+    asyncio.run(_run())
 
 
 # ── 2. ROUTE HELPERS & ENTITY NORMALIZATION ──────────────────────────────────
@@ -121,15 +178,22 @@ def test_payload_readability_and_summaries():
 
 
 def test_covered_call_endpoint():
-    import os
+    from unittest.mock import AsyncMock
     from fastapi.testclient import TestClient
     from services.api_gateway.routes.main import app
-    api_key = os.getenv("API_GATEWAY_KEY") or os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or "dev-secret-key"
-    headers = {"X-API-Key": api_key}
-    with TestClient(app) as client:
+    from services.api_gateway.dependencies import get_redis_optional, get_db_optional, create_jwt_token
+
+    client = TestClient(app)
+    client.cookies.set("sentinel_session", create_jwt_token({"sub": "admin@sentinel.io"}))
+
+    mock_redis = AsyncMock()
+    mock_redis.raw.get.return_value = None
+    app.dependency_overrides[get_redis_optional] = lambda: mock_redis
+
+    try:
+        # 1. Explicit current_price supplied -> succeeds
         response = client.get(
-            "/api/v1/radar/options/covered-calls?ticker=NVDA&z_score=2.8&current_price=130.0",
-            headers=headers
+            "/api/v1/radar/options/covered-calls?ticker=NVDA&z_score=2.8&current_price=130.0"
         )
         assert response.status_code == 200
         data = response.json()
@@ -137,3 +201,108 @@ def test_covered_call_endpoint():
         assert data["ticker"] == "NVDA"
         assert data["recommended_strike"] > 130.0
         assert "risk_free_rate_note" in data
+
+        # 2. current_price omitted & not in Redis -> returns HTTP 400 explicit error (no fabricated default)
+        mock_redis.raw.get.side_effect = lambda k: None
+        err_res = client.get(
+            "/api/v1/radar/options/covered-calls?ticker=NVDA&z_score=2.8"
+        )
+        assert err_res.status_code == 400
+        assert "No live price cached" in err_res.json()["detail"]
+
+        # 3. current_price omitted & found in Redis cache -> retrieves cached price and succeeds
+        mock_redis.raw.get.side_effect = lambda k: "135.5" if "quotes" in k else None
+        cached_res = client.get(
+            "/api/v1/radar/options/covered-calls?ticker=NVDA&z_score=2.8"
+        )
+        assert cached_res.status_code == 200
+        assert cached_res.json()["underlying_price"] == 135.5
+    finally:
+        app.dependency_overrides.pop(get_redis_optional, None)
+
+
+def test_fetch_on_the_spot_historical_2y_yield():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from services.api_gateway.routes.radar import fetch_on_the_spot_historical
+
+    async def _run():
+        mock_redis = AsyncMock()
+        mock_redis.raw.get.return_value = None
+
+        # Fetch for 2Y Treasury Yield symbols
+        pts = await fetch_on_the_spot_historical("US2Y", limit=10, redis=mock_redis)
+        assert isinstance(pts, list)
+        assert len(pts) > 0
+        p = pts[-1]
+        assert "price" in p
+        assert "provider" in p
+        assert "source_type" in p
+        # Ensure yield is realistic (e.g. 1% to 10%)
+        assert 0.5 <= p["price"] <= 15.0
+
+    asyncio.run(_run())
+
+
+def test_candles_multi_timeframe_and_cagg_fallback():
+    from services.api_gateway.dependencies import get_redis_optional, get_db_optional, create_jwt_token
+    client = TestClient(app)
+    client.cookies.set("sentinel_session", create_jwt_token({"sub": "admin@sentinel.io"}))
+
+    # 1. Multi-timeframe invalid timeframe validation
+    inv_res = client.get("/api/v1/radar/candles/NVDA?timeframe=invalid_tf")
+    assert inv_res.status_code == 400
+
+    # 2. Database CAGG fallback when Redis is empty
+    mock_redis = MagicMock()
+    mock_redis.raw.lrange = AsyncMock(return_value=[])  # Cold cache
+
+    mock_db = MagicMock()
+    mock_db.query = AsyncMock(return_value=[
+        {"ts": datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), "open": 130.0, "high": 132.0, "low": 129.5, "close": 131.5, "volume": 50000.0}
+    ])
+
+    app.dependency_overrides[get_redis_optional] = lambda: mock_redis
+    app.dependency_overrides[get_db_optional] = lambda: mock_db
+
+    try:
+        for tf in ["1m", "5m", "15m", "1h", "1d", "1w", "1M"]:
+            res = client.get(f"/api/v1/radar/candles/NVDA?timeframe={tf}&limit=10")
+            assert res.status_code == 200
+            data = res.json()
+            assert data["ticker"] == "NVDA"
+            assert data["timeframe"] == tf
+            assert data["count"] == 1
+            assert data["candles"][0]["close"] == 131.5
+    finally:
+        app.dependency_overrides.pop(get_redis_optional, None)
+        app.dependency_overrides.pop(get_db_optional, None)
+
+
+def test_covered_calls_zscore_view_lookup():
+    from services.api_gateway.dependencies import get_redis_optional, get_db_optional, create_jwt_token
+    client = TestClient(app)
+    client.cookies.set("sentinel_session", create_jwt_token({"sub": "admin@sentinel.io"}))
+
+    mock_redis = MagicMock()
+    mock_redis.raw.get = AsyncMock(side_effect=lambda k: "130.0" if "quotes" in k else None)
+
+    mock_db = MagicMock()
+    mock_db.query_one = AsyncMock(return_value={"z_score": 3.1})
+
+    app.dependency_overrides[get_redis_optional] = lambda: mock_redis
+    app.dependency_overrides[get_db_optional] = lambda: mock_db
+
+    try:
+        # Omit z_score -> triggers query against tradfi_bars_5m_zscore view (§2.6)
+        res = client.get("/api/v1/radar/options/covered-calls?ticker=NVDA")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["strategy"] == "COVERED_CALL_OVERLAY"
+        assert data["ticker"] == "NVDA"
+        assert data["underlying_price"] == 130.0
+    finally:
+        app.dependency_overrides.pop(get_redis_optional, None)
+        app.dependency_overrides.pop(get_db_optional, None)
+
+

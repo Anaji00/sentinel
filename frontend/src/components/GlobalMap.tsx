@@ -231,7 +231,7 @@ export default function GlobalMap() {
                 lon,
                 isTanker,
                 vessel_type: d.vessel_type || (isTanker ? 'Oil / Gas Tanker' : 'Cargo Vessel'),
-                anomaly: e.anomaly_score || 0.0,
+                anomaly: e.anomaly_score ?? 0.0,
                 speed: d.speed_knots || d.speed || (pos.Sog ? parseFloat(String(pos.Sog)) : 12.4),
                 heading: d.heading || pos.TrueHeading || 0,
                 region: e.region || 'International Shipping Lane',
@@ -307,7 +307,7 @@ export default function GlobalMap() {
                 squawk: squawk || '1200',
                 isEmergency,
                 origin_country: d.origin_country || e.country_code || 'US',
-                anomaly: e.anomaly_score || 0.1,
+                anomaly: e.anomaly_score ?? 0.0,
                 headline: e.headline,
             });
         });
@@ -327,7 +327,7 @@ export default function GlobalMap() {
         (tradfiEvents || []).forEach((e: any) => {
             const d = e.financial_data || e.domain_data || {};
             const ticker = d.ticker || e.primary_entity_name || 'MARKET';
-            const anomaly = e.anomaly_score || 0.5;
+            const anomaly = e.anomaly_score ?? 0.0;
 
             // Map ticker to an exchange hub
             let matchedExchange = FINANCIAL_EXCHANGES.find(ex => ex.keyTickers.includes(ticker)) || FINANCIAL_EXCHANGES[0];
