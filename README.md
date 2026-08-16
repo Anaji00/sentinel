@@ -58,121 +58,73 @@
 
 ---
 
-## 🛠️ Microservices & Component Directory
+## 🛠️ Microservices & Subsystem Architecture
 
 Sentinel is composed of **29 modular services & containers** orchestrated via Docker Compose and communicating over Kafka and Redis:
 
 ### 1. Ingestion Collectors (`services/collector-*`)
-| Collector | Source / Protocol | Ingested Telemetry & Responsibilities |
-| :--- | :--- | :--- |
-| **`collector-tradfi`** | WebSocket / REST | Streaming US equity quotes, order book depth, dark pool block prints, and options flow sweeps with OCC symbol parsing (`AAPL240816C00220000`). |
-| **`collector-macro`** | Polling / NY Fed / BLS / BEA | Live Federal Reserve SOFR risk-free rate, 12 macro proxy instruments (Crude, Brent, Gold, Yields, Indexes), and **Economic Calendar Collector** (`economic_calendar.py`) capturing CPI, NFP, FOMC, GDP, and PMI with surprise & bias calculations (`EventType.MACRO_RELEASE`). |
-| **`collector-ais`** | WebSocket (AISStream) | Global maritime vessel positions, MMSI identifiers, navigation status, speed over ground (SOG), and geographic coordinates. |
-| **`collector-adsb`** | REST / Beast Protocol | Aircraft state vectors tracking military, commercial, emergency squawks (7700/7600/7500), and flight route deviations. |
-| **`collector-crypto`** | WebSocket (Binance/Coinbase) | High-frequency perpetual swaps, funding rates, open interest, and liquidation volume spikes. |
-| **`collector-cyber`** | REST (BGPStream / NVD / IPQS) | BGP routing hijack anomalies, IP threat scores, and CVE vulnerability disclosures mapped to affected public tickers. |
-| **`collector-prediction`** | REST / WS (Polymarket / Kalshi) | Real-time event contract probability odds, market liquidity, and rapid sentiment shifts. |
-| **`collector-news`** | RSS / NewsAPI | Breaking global news headlines, OSINT feeds, and geopolitical dispatches. |
-| **`collector-radar`** | Internal Stream Aggregator | Cross-domain anomaly radar aggregator consolidating domain metrics into normalized real-time telemetry. |
+- **`collector-tradfi`**: Streaming US equity quotes, order book depth, dark pool prints, and options flow with OCC standardized contract parsing (`AAPL240816C00220000`).
+- **`collector-macro`**: Live Federal Reserve SOFR risk-free rate polling, 12 macro proxy instruments (Crude, Brent, NatGas, Gold, Silver, Yields, Indexes), and **Economic Calendar Collector** ingesting scheduled releases (CPI, Core CPI, NFP, Unemployment, FOMC Rate Decisions, GDP, ISM Manufacturing PMI, PCE) with automated surprise and directional bias calculations (`EventType.MACRO_RELEASE`).
+- **`collector-ais`**: Real-time WebSocket tracking global maritime vessel positions, MMSI identifiers, navigation status, SOG, and coordinates.
+- **`collector-adsb`**: Aircraft state vector ingestion tracking military, commercial, and emergency squawk flights.
+- **`collector-crypto`**: High-frequency perpetual swaps, candle volatility, and volume anomaly tracking across major crypto exchanges.
+- **`collector-cyber`**: BGP routing hijack anomalies, IP threat scores, and CVE vulnerability telemetry with equity ticker resolution.
+- **`collector-prediction`**: Real-time contract odds and liquidity streams from Polymarket and Kalshi.
+- **`collector-news`**: RSS/API breaking news ingestion and OSINT headline normalization.
+- **`collector-radar`**: Cross-domain anomaly radar aggregator consolidating domain metrics into unified streams.
 
----
+### 2. Enrichment & Threat Intelligence (`services/enrichment`)
+- **OCC Option Contract Parser**: Extracts ticker, ISO expiry (`YYYY-MM-DD`), option side (`CALL`/`PUT`), and strike price ($) from 21-character OCC contract symbols.
+- **Unsupervised Spatial Anomaly Detection**: IsolationForest & ONNX ML models evaluate deviations in vessel behavior, flight vectors, volume spikes, and network routes.
+- **PostGIS Spatial Indexing**: Explicit longitude and latitude column mapping into PostgreSQL hypertables with spatial point indexing (SRID 4326).
+- **Sanctions & Compliance Screening**: Direct cross-referencing against OFAC Specially Designated Nationals (SDN) and watchlists.
+- **Spatial Chokepoint Indexing**: Automatic geo-fencing against strategic maritime bottlenecks (Strait of Hormuz, Bab-el-Mandeb, Suez Canal, Taiwan Strait, Malacca Strait) and active geopolitical conflict theaters.
+- **Graph & Payload Promotion**: Reference data (sector, industry, index membership) is promoted to Neo4j via `GraphWriter` into `Topics.ONTOLOGY_PROPOSALS`, and active statistical correlation IDs (`corr:stat:{A}:{B}`, `granger:{A}:{B}:lag{L}`) are stamped onto enriched events.
 
-### 2. Enrichment & Threat Intelligence Subsystem (`services/enrichment`)
-| Module | File | Core Capabilities & Algorithms |
-| :--- | :--- | :--- |
-| **Enrichment Engine** | `main.py` | High-throughput Kafka consumer routing raw events through specialized domain enrichers and anomaly scorers. |
-| **Anomaly Scorer** | `anomaly_scorer.py` | Multi-domain `IsolationForest` ML scoring, Hawkes cross-domain intensity boosting, and rolling microstructure estimators. |
-| **Reference Data** | `ref_data.py` | Caches company fundamentals (sector, industry, market cap tier, index co-membership) and promotes nodes/edges to Neo4j via `GraphWriter`. |
-| **Entity Resolution** | `entity_resolver.py` | Cross-domain entity resolution linking MMSI, ICAO, Ticker, ASN, and OFAC identifiers into unified `Entity` objects. |
-| **Graph Writer** | `graph_writer.py` | Universal write path emitting `MERGE_ONTOLOGY_NODE`, `LINK_ENTITY`, `upsert_equity()`, and `upsert_index()` to `Topics.ONTOLOGY_PROPOSALS`. |
-| **AIS Gap Detector** | `gap_detector.py` | Tracks maritime transponder disabling ("dark ship" anomalies) near sanctions zones and strategic trade bottlenecks. |
-| **Aviation Gap Detector** | `aviation_gap_detector.py` | Detects emergency transponder dropouts and suspicious flight pattern deviations in contested airspaces. |
-| **Sanctions Engine** | `ofac_sync.py` | Direct synchronization with OFAC Specially Designated Nationals (SDN) watchlists with fuzzy name matching. |
-| **Database Writer** | `db_writer.py` | Asynchronous batch writer persisting normalized events and PostGIS spatial points (SRID 4326) into TimescaleDB. |
+### 3. Correlation & Storage Engines (`services/correlation` & `shared/db`)
+- **TimescaleDB Multi-Timeframe Continuous Aggregates**: Durable `tradfi_bars` hypertable with automated continuous aggregates across `5m`, `10m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w`, and `1mo` buckets and rolling 20-period continuous Z-score views.
+- **Statistical Correlation Discovery Engine**: Scheduled topology-guided pairwise discovery computing rolling Pearson ($r, p$), Spearman, bidirectional Granger causality ($F$-statistic, optimal lag), and Engle-Granger cointegration.
+- **Cross-Sector Hawkes Point Process**: `IntraTradFiHawkesCorrelator` modeling mutual cross-sector volatility contagion across 11 GICS sector ETFs.
+- **Dynamic Threshold Calibration**: Real-time percentile calibration harness updating empirical significance cutoffs in Redis (zero hardcoded thresholds).
+- **Unified Graph Governance & 30-Day Staleness Decay**: Centralized `VALID_PREDICATES` whitelist, single-write path via `GraphWriter` $\rightarrow$ `Topics.ONTOLOGY_PROPOSALS`, and continuous exponential edge decay ($w_{\text{effective}} = w_{\text{base}} \cdot e^{-\lambda \Delta t}$, $t_{1/2}=30\text{d}$).
+- **Qdrant Vector Database**: Computes 384-dimensional embeddings (`all-MiniLM-L6-v2`) to cluster cross-domain events by semantic context.
+- **Redis In-Memory Bus**: PubSub stream broadcasting, rate-limiting token buckets, quote caching, and active correlation ID indexing.
 
-#### **Domain Enrichers (`services/enrichment/enrichers/`)**
-- **`tradfi.py`**: Microstructure calculations (Kyle's $\lambda$, Amihud illiquidity, Order Flow Imbalance, VWAP), SOFR risk-free rate caching, active statistical `correlation_ids` linking, and durable `tradfi_bars` hypertable persistence.
-- **`crypto.py`**: Volume-to-open-interest ratios, funding rate dislocation, and perpetual contract liquidation cascades.
-- **`cyber.py`**: ASN-to-equity ticker resolution, BGP route hijack classification, and CVE exploitability scoring.
-- **`maritime.py`**: Geofencing against strategic chokepoints (Hormuz, Bab-el-Mandeb, Suez, Malacca, Taiwan Strait) and speed anomaly detection.
-- **`aviation.py`**: Emergency squawk categorization and restricted airspace boundary crossing detection.
-- **`prediction.py`**: Probability swing momentum and liquidity-adjusted sentiment shift estimation.
-- **`news.py`**: NLP named entity recognition (NER), geopolitical tag resolution, and sentiment polarity scoring.
+### 4. Quantitative Engine & Reasoning Swarm (`services/agents` & `services/reasoning`)
+- **Quantitative Trading Engine**: Server-side deterministic trade signal enforcement:
+  - Entry level verified against current market quote.
+  - ATR-based stop loss calculation ($1.5 \times \text{ATR}$) and conviction-tiered Risk/Reward multipliers.
+  - Empirical half-Kelly allocation clamping ($K_{\text{max}}$).
+  - 1-hop Neo4j topology pre-checks (`sector`, `indices`, `supply_chain`, `correlations`) attached to advisory briefs.
+- **Options & Quant Math Engine**: Black-Scholes pricing and analytical Greeks ($\Delta, \Gamma, \Theta, \mathcal{V}, \rho$), Brent-Dekker numerical IV root finding, and covered call overlay optimization.
+- **Grounded StockCorrelationAgent**: Queries empirical correlation matrices and Granger causality statistics from Neo4j/Redis first, prompting the LLM exclusively to explain economic transmission mechanisms.
+- **Macro Intelligence Engine**: Cointegration pair analysis via Engle-Granger tests, yield curve spread tracking, and z-score anomaly detection.
+- **ContextBuilder**: Non-exclusion bidirectional 3-hop graph traversal capturing statistical, structural, and regulatory relationships with recency decay weighting.
+- **Consensus Engine**: Subjective logic opinion fusion ($b, d, u, a$) across multi-agent predictions.
+- **LLM Reasoning Swarm (`agents-heavy` & `agents-fast`)**:
+  - **Heavy Analytical Tier (`agents-heavy` - `qwen2.5:7b`)**: Deep reasoning for Quant Research, Macro Strategy, Yield Curve Rates, Volatility Surfaces, and Graph Supervision.
+  - **Fast Operational Tier (`agents-fast` - `qwen2.5:1.5b` / `gemma3:1b` fallback)**: Ultra-fast routing, headline NER extraction, and concept taxonomy management.
 
----
+### 5. API Gateway & Tactical Radar Dashboard (`frontend` & `services/api_gateway`)
+- **`api-gateway`**: High-performance FastAPI gateway with **cryptographic HMAC-SHA256 & JWT session-cookie verification**, rate limiting, Prometheus metrics, and multi-hop graph query endpoints (`/api/v1/graph/entity/{id}?hops=1|2`).
+- **`frontend` (Sentinel Radar Dashboard)**: Next.js 14 interface with React, Deck.gl, Recharts, and TailwindCSS across 11 dedicated operational surfaces:
+  - **`/` (Command Center)**: Unified situational intelligence HUD.
+  - **`/graph` (Knowledge Graph & Empirical Correlation Explorer)**: 1-hop and 2-hop subgraph explorer with **epistemic edge differentiation** (dashed animated lines for empirical statistical edges vs solid neon lines for structural/index edges vs solid red for sanctions) and an **Edge Epistemic Inspector Drawer** detailing raw vs decayed weight, $r$, $p$, lag, $F$-stat, and Hawkes $\eta$.
+  - **`/intelligence`**: Multi-domain real-time event intelligence feed.
+  - **`/osint`**: Global geopolitical OSINT threat matrix.
+  - **`/flow`**: Institutional dark pool prints and options sweeps.
+  - **`/agents`**: AI agent swarm decision logs and telemetry status HUD.
+  - **`/macro`**: Macroeconomic indicators, yield curve spreads, and economic calendar releases.
+  - **`/options`**: Options flow analytics and volatility surfaces.
+  - **`/crypto`**: Crypto perpetuals, funding rates, and volume spikes.
+  - **`/charts`**: High-frequency multi-asset technical charts.
+  - **`/map`**: Deck.gl 3D global globe and tactical map.
 
-### 3. Correlation & Statistical Discovery Engine (`services/correlation`)
-| Module | File | Responsibilities & Mathematical Models |
-| :--- | :--- | :--- |
-| **Statistical Discovery** | `statistical_discovery.py` | Scheduled topology-guided pairwise discovery reading from TimescaleDB CAGGs: rolling Pearson ($r, p$), Spearman, bidirectional Granger causality ($F$-statistic, optimal lag), and active Redis ID indexing (`sentinel:correlation:active_ids:{ticker}`). |
-| **Hawkes Point Process** | `hawkes_correlator.py` | Multivariate self-exciting point process modeling cross-domain contagion and calculating Hawkes branching ratios ($\eta$). |
-| **Sector Hawkes** | `sector_hawkes.py` | `IntraTradFiHawkesCorrelator` tracking mutual volatility excitation across 11 GICS sector ETFs. |
-| **Semantic Correlator** | `soft_correlator.py` | Qdrant vector database client generating 384-dimensional embeddings (`all-MiniLM-L6-v2`) for cross-domain semantic narrative clustering. |
-| **Cascade Engine** | `cascade.py` | Evaluates downstream propagation time windows and systemic contagion risks across correlated entities. |
-| **Event Store** | `event_store.py` | In-memory rolling event ring buffers for high-frequency analytical window queries. |
-
----
-
-### 4. AI Reasoning Swarm & Autonomous Agents (`services/agents` & `services/reasoning`)
-| Agent / Module | File | Operational Role & AI Tier |
-| :--- | :--- | :--- |
-| **Quant Trading Engine** | `quant_trading_engine.py` | Deterministic trade signal validation: current quote verification, ATR stop loss ($1.5 \times \text{ATR}$), conviction Risk/Reward tiers, empirical half-Kelly sizing, 1-hop Neo4j topology checks, and Alpaca paper order execution. |
-| **Macro Intelligence** | `macro_intelligence_engine.py` | Engle-Granger cointegration testing ($y_t - \beta x_t - \alpha$), yield curve inversion monitoring (2Y/10Y/30Y), and dynamic decoupling z-score detection. |
-| **Stock Correlation Agent**| `stock_correlation_agent.py` | Empirically grounded agent: queries Neo4j/Redis correlation matrices first and uses LLMs exclusively to synthesize causal transmission rationales. |
-| **Adversarial Wargamer** | `adversarial_wargamer.py` | Geopolitical red-teaming, black swan simulation, and supply chain fragility stress testing. |
-| **Knowledge Graph Engine** | `knowledge_graph_engine.py` | Evaluates graph topology, synthesizes entity connections, and routes proposals through Kafka. |
-| **Consensus Engine** | `consensus_engine.py` | Subjective logic opinion fusion ($b, d, u, a$) reconciling multi-agent confidence and uncertainty. |
-| **Edge Validator** | `edge_validator.py` | Validates proposed graph edges against the centralized `VALID_PREDICATES` whitelist before persistence. |
-| **Radar Agent** | `radar_agent.py` | Cross-domain threshold monitoring, multi-stream anomaly synthesis, and priority alerting. |
-| **Context Builder** | `context_builder.py` | Non-exclusion bidirectional 3-hop graph traversal (`MATCH (v)-[r*1..3]-(n)`) with 30-day exponential recency decay weighting. |
-| **Scenario Generator** | `scenario_generator.py` | LLM-driven predictive scenario synthesis modeling strategic and market outcomes. |
-| **Calibration Harness** | `calibration_harness.py` | Dynamic percentile threshold calibration updating Redis cutoffs (zero hardcoded static numbers). |
-
-#### **LLM Reasoning Swarm Tiers**
-- **Heavy Analytical Tier (`agents-heavy` - `qwen2.5:7b`)**: Complex reasoning for Quant Research, Macro Strategy, Yield Curve Analysis, and Graph Supervision.
-- **Fast Operational Tier (`agents-fast` - `qwen2.5:1.5b` / `gemma3:1b` fallback)**: High-speed triage, routing, headline NER extraction, and concept taxonomy management.
-
----
-
-### 5. Shared Infrastructure & Quantitative Math (`shared/`)
-| Directory / Module | Core Functionality |
-| :--- | :--- |
-| **`shared/utils/quant_calc.py`** | Black-Scholes analytical Greeks ($\Delta, \Gamma, \Theta, \mathcal{V}, \rho$), Brent-Dekker numerical IV root finding, covered call overlays, dynamic Kelly criterion, Kyle's $\lambda$, Amihud illiquidity, Order Flow Imbalance (OFI), Parkinson volatility, and VaR 95% / CVaR 99%. |
-| **`shared/utils/streaming_detectors.py`**| Welford online variance, CUSUM change-point detectors, EWMA volatility ($\lambda=0.94$), and rolling z-score monitors. |
-| **`shared/utils/model_registry.py`** | Scikit-Learn and ONNX model registry managing IsolationForest anomaly detector pipelines. |
-| **`shared/utils/ollama.py`** | Resilient Ollama HTTP client with SHA-256 prompt response caching, automatic retries, and fallback model tier routing. |
-| **`shared/utils/regions.py`** | Geographic definitions for strategic trade chokepoints and active geopolitical conflict theaters. |
-| **`shared/utils/cyber_mapper.py`** | Autonomous System Number (ASN) to public equity ticker lookup and mapping engine. |
-| **`shared/utils/sanctions.py`** | OFAC SDN name normalization and fuzzy identity matching algorithms. |
-| **`shared/utils/candles.py`** | Multi-timeframe OHLCV candle aggregator and resampler (`5m` to `1mo`). |
-| **`shared/models/`** | Strongly-typed Pydantic schemas: `events.py` (`NormalizedEvent`, `FinancialData`, `MacroReleaseData`), `financial.py`, `graph.py`, `reasoning.py`. |
-| **`shared/db/`** | Database pools and migration runners for TimescaleDB (PostgreSQL), Neo4j (Cypher), Qdrant, and Redis. |
-| **`shared/kafka/`** | Kafka topic definitions (`Topics.RAW_*`, `Topics.ENRICHED_EVENTS`, `Topics.ONTOLOGY_PROPOSALS`), producer and consumer wrappers. |
-
----
-
-### 6. Auxiliary Workers, Observability & ML-Ops
-- **`telemetry-worker` (`services/telemetry-worker`)**: Container metrics, Redis heartbeats, and **`ModelDriftScheduler`** computing Population Stability Index (PSI) and Kolmogorov-Smirnov (KS) drift statistics on rolling 24-hour ONNX distributions, triggering retraining via `Topics.MODEL_RETRAIN_REQUESTS`.
-- **`dlq-worker` (`services/dlq-worker`)**: Dead-letter queue consumer handling poison-pill message quarantine and automated retries.
-- **`alert_manager` (`services/alert_manager`)**: Multi-channel escalation router dispatching alerts via PagerDuty, Slack, Telegram, and Webhooks.
-- **`api-gateway` (`services/api_gateway`)**: FastAPI gateway with cryptographic HMAC/JWT session auth, rate limiting, Prometheus metrics, and multi-hop graph endpoints (`/api/v1/graph/entity/{id}?hops=1|2`).
-- **`prometheus` & `grafana`**: Infrastructure monitoring, operational latency dashboards, and scrape metrics.
-
----
-
-### 7. Frontend Radar Dashboard (`frontend/`)
-Built with **Next.js 14**, **React**, **Deck.gl**, **Recharts**, and **TailwindCSS** across 11 dedicated operational surfaces:
-- **`/` (Command Center)**: Consolidated situational awareness and real-time alerts HUD.
-- **`/graph` (Knowledge Graph & Empirical Correlation Explorer)**: Interactive 1-hop and 2-hop graph explorer with **epistemic edge differentiation** (dashed animated lines for empirical statistical edges vs solid neon lines for structural/index edges vs solid red for sanctions) and an **Edge Epistemic Inspector Drawer** detailing raw vs decayed weight, $r$, $p$, lag, $F$-stat, and Hawkes $\eta$.
-- **`/intelligence`**: High-frequency streaming multi-domain event intelligence feed.
-- **`/osint`**: Global geopolitical OSINT threat matrix and cross-domain entity correlations.
-- **`/flow`**: Institutional dark pool block prints and options sweeps flow.
-- **`/agents`**: AI agent swarm telemetry, decision audit logs, and LLM health inspector.
-- **`/macro`**: Macroeconomic indicator matrix, yield curve inversion tracker, and economic calendar releases.
-- **`/options`**: Options flow analytics and volatility surface visualizations.
-- **`/crypto`**: Crypto perpetuals volatility, funding rates, and liquidation metrics.
-- **`/charts`**: High-frequency multi-asset technical charts with volume indicators.
-- **`/map`**: Deck.gl 3D global globe rendering real-time AIS vessel vectors, ADSB flights, and strategic chokepoints.
+### 6. Observability, ML-Ops & Infrastructure
+- **`ModelDriftScheduler` (`services/telemetry-worker`)**: Computes Population Stability Index (PSI) and Kolmogorov-Smirnov (KS) statistics on rolling 24-hour ONNX anomaly distributions, automatically dispatching retrain triggers to `Topics.MODEL_RETRAIN_REQUESTS` when $\text{PSI} \ge 0.25$ or $\text{KS} \ge 0.05$.
+- **`alert_manager`**: Escalation router delivering alerts via PagerDuty, Webhooks, Telegram, and Slack.
+- **`prometheus` & `grafana`**: Time-series metrics collection server and operational monitoring dashboards.
+- **`kafka-ui`**: Web UI for inspecting Kafka topics, partitions, and message offsets.
 
 ---
 
@@ -287,16 +239,16 @@ python -m pytest tests/test_payload_and_graph_promotion.py
 | :--- | :--- | :--- |
 | **Web Dashboard** | `http://localhost:3000` | Public Web UI |
 | **Knowledge Graph Explorer** | `http://localhost:3000/graph` | Interactive 1–2 Hop Graph Explorer |
-| **Grafana Monitoring** | `http://localhost:3001` | Admin (`admin / admin`) |
+| **Grafana Monitoring** | `http://localhost:3001` | Configured via `.env` |
 | **API Gateway** | `http://localhost:8000` | Header `X-API-KEY: ${API_KEY}` / HMAC Session |
-| **Prometheus Server** | `http://localhost:9090` | Public Monitoring UI |
+| **Prometheus Server** | `http://localhost:9090` | Configured via `.env` |
 | **Prometheus Metrics** | `http://localhost:8000/metrics` | Unauthenticated Scraper |
 | **WebSocket Live Feed** | `ws://localhost:8000/api/v1/events/ws/live-feed` | Query Param `?api_key=` or Header |
 | **Ollama LLM Engine** | `http://localhost:11434` | Local LLM REST API |
-| **Kafka UI Manager** | `http://localhost:8080` | Public Admin UI |
-| **Kafka Broker** | `localhost:9092` | Plaintext (`PLAINTEXT://localhost:9092`) |
+| **Kafka UI Manager** | `http://localhost:8080` | Configured via `.env` |
+| **Kafka Broker** | `localhost:9092` | Configured via `.env` |
 | **Neo4j Graph Browser** | `http://localhost:7474` (Bolt: `7687`) | Configured via `.env` |
-| **Qdrant Dashboard** | `http://localhost:6333/dashboard` | Public Vector UI |
+| **Qdrant Dashboard** | `http://localhost:6333/dashboard` | Configured via `.env` |
 | **TimescaleDB PostgreSQL** | `localhost:5432` | Configured via `.env` |
 | **Redis Bus** | `localhost:6379` | Configured via `.env` |
 
