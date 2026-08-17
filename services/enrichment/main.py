@@ -24,6 +24,7 @@ from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent, CrossDomainSignal
 from shared.db import get_redis, get_timescale, get_neo4j
 from shared.db.bootstrap import bootstrap_database
+from shared.utils.heartbeat import start_heartbeat_task
 
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
 from services.enrichment.db_writer import DBWriter
@@ -205,8 +206,9 @@ async def main():
     consumer = SentinelConsumer(
         topics=[
             Topics.RAW_MARITIME, Topics.RAW_AVIATION, Topics.RAW_NEWS, 
-            Topics.RAW_CYBER, Topics.RAW_TRADFI, Topics.RAW_CRYPTO, 
-            Topics.RAW_PREDICTION, Topics.RAW_RADAR
+            Topics.RAW_SOCIAL, Topics.RAW_FILINGS, Topics.RAW_CYBER, 
+            Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.RAW_PREDICTION, 
+            Topics.RAW_RADAR
         ],
         group_id="enrichment-service",
     )
@@ -230,6 +232,9 @@ async def main():
     }
     heartbeat_task = safe_create_task(_heartbeat_loop(heartbeat_state), name="enrichment-heartbeat")
 
+    # §1.1 Universal heartbeat — shared telemetry for data-health dashboard
+    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "enrichment"))
+
     logger.info("Enrichment Pipeline LIVE. Listening for raw telemetry...")
     
     try:
@@ -246,6 +251,8 @@ async def main():
                     Topics.RAW_MARITIME: enrichers_tuple[0],
                     Topics.RAW_AVIATION: enrichers_tuple[1],
                     Topics.RAW_NEWS: enrichers_tuple[2],
+                    Topics.RAW_SOCIAL: enrichers_tuple[2],
+                    Topics.RAW_FILINGS: enrichers_tuple[4],
                     Topics.RAW_CYBER: enrichers_tuple[3],
                     Topics.RAW_TRADFI: enrichers_tuple[4],
                     Topics.RAW_CRYPTO: enrichers_tuple[5],
@@ -509,6 +516,7 @@ async def main():
         logger.critical(f"Fatal error in main loop: {e}", exc_info=True)
     finally:
         heartbeat_task.cancel()
+        hb_shared_task.cancel()
         gap_task.cancel()
         try:
             await asyncio.gather(gap_task, heartbeat_task, return_exceptions=True)

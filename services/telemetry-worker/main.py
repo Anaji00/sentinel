@@ -25,6 +25,7 @@ throttled_logger = ThrottledLogger(logger, default_interval_sec=10.0)
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale, get_redis
 from shared.utils.metrics import MetricsCollector
+from shared.utils.heartbeat import start_heartbeat_task
 
 try:
     from drift_scheduler import ModelDriftScheduler
@@ -152,12 +153,16 @@ async def main():
         auto_offset_reset="latest",
     )
     await consumer.start()
+
+    # §1.1 Universal heartbeat
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "telemetry-worker"))
     
     try:
         await process_telemetry(consumer, db)
     except asyncio.CancelledError:
         pass
     finally:
+        hb_task.cancel()
         drift_scheduler.stop()
         drift_task.cancel()
         await consumer.close()

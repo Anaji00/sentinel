@@ -25,6 +25,7 @@ import numpy as np
 from shared.kafka import SentinelProducer, Topics
 from shared.models.ontology import is_valid_predicate
 from shared.utils import quant_calc
+from shared.utils.feature_flags import FeatureFlagManager
 from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS_SECTORS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
 
@@ -76,6 +77,7 @@ class StatisticalDiscoveryEngine:
         self.candidate_tickers = candidate_tickers or DEFAULT_WATCHLIST_TICKERS
         self.sector_hawkes = IntraTradFiHawkesCorrelator()
         self.calibrator = ThresholdCalibrationHarness(db_client=self.db, redis_client=self.redis)
+        self.flags = FeatureFlagManager(redis_client=self.redis)
 
     # ── 1. CANDIDATE PAIR GENERATION (§4.1) ────────────────────────────────────
 
@@ -295,7 +297,7 @@ class StatisticalDiscoveryEngine:
                                 logger.debug(f"Failed to cache correlation ID in Redis: {re}")
 
                     # B. Directional Granger Causality Edge (A -> B)
-                    if gc_ab.get("x_granger_causes_y"):
+                    if gc_ab.get("x_granger_causes_y") and await self.flags.is_enabled("granger_causality", ticker=ticker_a):
                         f_stat = float(gc_ab.get("f_statistic", 0.0))
                         p_val = float(gc_ab.get("p_value", 0.01))
                         lag = int(gc_ab.get("optimal_lag", 1))
@@ -333,7 +335,7 @@ class StatisticalDiscoveryEngine:
                                 logger.debug(f"Failed to cache Granger ID in Redis: {re}")
 
                     # C. Directional Granger Causality Edge (B -> A)
-                    if gc_ba.get("x_granger_causes_y"):
+                    if gc_ba.get("x_granger_causes_y") and await self.flags.is_enabled("granger_causality", ticker=ticker_b):
                         f_stat = float(gc_ba.get("f_statistic", 0.0))
                         p_val = float(gc_ba.get("p_value", 0.01))
                         lag = int(gc_ba.get("optimal_lag", 1))
@@ -382,6 +384,10 @@ class StatisticalDiscoveryEngine:
         Gathers sector price movement / anomaly timestamps across the 11 GICS sectors,
         fits the IntraTradFiHawkesCorrelator, and writes HAWKES_EXCITES graph edges.
         """
+        if not await self.flags.is_enabled("hawkes_contagion"):
+            logger.info("Hawkes contagion discovery disabled via feature flag.")
+            return {"fit_summary": {}, "significant_excitations": []}
+
         now = time.time()
         sector_event_streams: Dict[str, List[float]] = {s: [] for s in GICS_SECTORS}
 

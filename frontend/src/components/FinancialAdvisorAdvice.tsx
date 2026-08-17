@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
+import ExplainabilityModal from './ExplainabilityModal';
 
 interface TechnicalIndicators {
   rsi?: number;
@@ -93,6 +94,7 @@ interface AdviceResponse {
 
 export default function FinancialAdvisorAdvice() {
   const [selectedPlay, setSelectedPlay] = useState<TradingSignal | null>(null);
+  const [explainingSignal, setExplainingSignal] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [portfolioCapital, setPortfolioCapital] = useState<number>(100000);
   const [filterCategory, setFilterCategory] = useState<'ALL' | 'BUY' | 'SELL' | 'SMART_MONEY'>('ALL');
@@ -511,23 +513,41 @@ export default function FinancialAdvisorAdvice() {
             </div>
 
             {/* Action Buttons */}
-            <div className="flex items-center gap-2 pt-2">
+            <div className="flex flex-col gap-2 pt-2">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleExecuteOrder(selectedPlay)}
+                  className="flex-1 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 font-extrabold text-xs hover:from-emerald-400 hover:to-teal-300 transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <span>⚡</span>
+                  <span>CONFIRM ORDER DISPATCH</span>
+                </button>
+                <button
+                  onClick={() => setSelectedPlay(null)}
+                  className="py-3 px-4 rounded-xl bg-slate-900 text-slate-300 border border-slate-700 text-xs font-bold hover:bg-slate-800 cursor-pointer"
+                >
+                  CANCEL
+                </button>
+              </div>
+
               <button
-                onClick={() => handleExecuteOrder(selectedPlay)}
-                className="flex-1 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 font-extrabold text-xs hover:from-emerald-400 hover:to-teal-300 transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2"
+                onClick={() => setExplainingSignal(selectedPlay.ticker)}
+                className="w-full py-2 rounded-xl bg-cyan-950/40 border border-cyan-500/40 text-cyan-300 text-xs font-bold hover:bg-cyan-900/50 transition-colors cursor-pointer flex items-center justify-center gap-2"
               >
-                <span>⚡</span>
-                <span>CONFIRM ORDER DISPATCH</span>
-              </button>
-              <button
-                onClick={() => setSelectedPlay(null)}
-                className="py-3 px-4 rounded-xl bg-slate-900 text-slate-300 border border-slate-700 text-xs font-bold hover:bg-slate-800 cursor-pointer"
-              >
-                CANCEL
+                <span>🔍</span>
+                <span>EXPLAIN COMPUTATION & MODEL CARD</span>
               </button>
             </div>
           </div>
         </div>
+      )}
+
+      {/* Model Explainability Modal */}
+      {explainingSignal && (
+        <ExplainabilityModal
+          signalId={explainingSignal}
+          onClose={() => setExplainingSignal(null)}
+        />
       )}
     </Card>
   );

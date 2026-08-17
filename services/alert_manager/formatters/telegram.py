@@ -18,9 +18,16 @@ TIER_EMOJI = {
 }
 
 def _escape(text: str) -> str:
-    """Escape special chars for Telegram MarkdownV2."""
+    """Escape special chars for Telegram MarkdownV2 plain text."""
     special = r"_*[]()~`>#+-=|{}.!\\"
     return re.sub(f"([{re.escape(special)}])", r"\\\1", str(text))
+
+def _escape_code(text: str) -> str:
+    """
+    Escape ONLY backtick and backslash for text enclosed in code spans `...`
+    per official Telegram Bot API MarkdownV2 specification.
+    """
+    return str(text).replace("\\", "\\\\").replace("`", "\\`")
 
 def format_correlation(cluster: CorrelationCluster) -> str:
     """Format a CorrelationCluster as a Telegram alert message."""
@@ -46,20 +53,20 @@ def format_correlation(cluster: CorrelationCluster) -> str:
             anomaly_str = tag.replace("trigger_anomaly_", "")
             break
 
-    anomaly_suffix = f" \\(Anomaly: {anomaly_str}\\)" if anomaly_str else ""
+    anomaly_suffix = f" \\(Anomaly: {_escape(anomaly_str)}\\)" if anomaly_str else ""
 
     lines = [
         f"{emoji} {domain_emoji}*\\[{_escape(tier)}\\] {_escape(cluster.rule_name)}*{anomaly_suffix}",
         "",
         _escape(cluster.description),
         "",
-        f"🏷 Tags: `{_escape(', '.join(cluster.tags[:6]))}`",
+        f"🏷 Tags: `{_escape_code(', '.join(cluster.tags[:6]))}`",
         f"📅 {_escape(cluster.detected_at.strftime('%Y-%m-%d %H:%M UTC'))}",
-        f"🆔 `{_escape(cluster.correlation_id[:8])}`",
+        f"🆔 `{_escape_code(cluster.correlation_id[:8])}`",
     ]
 
     if cluster.entity_ids:
-        lines.append(f"👥 Entities: `{_escape(', '.join(cluster.entity_ids[:3]))}`")
+        lines.append(f"👥 Entities: `{_escape_code(', '.join(cluster.entity_ids[:3]))}`")
 
     return "\n".join(lines)
 
@@ -78,9 +85,14 @@ def format_scenario(scenario: Scenario) -> str:
     ]
 
     for i, h in enumerate(scenario.hypotheses[:3], 1):
-        label       = h.get("label", f"Scenario {i}")
-        probability = h.get("probability", "?")
-        mechanism   = h.get("mechanism", "")
+        if isinstance(h, dict):
+            label       = h.get("label", f"Scenario {i}")
+            probability = h.get("probability", "?")
+            mechanism   = h.get("mechanism", "")
+        else:
+            label       = getattr(h, "label", f"Scenario {i}")
+            probability = getattr(h, "probability", "?")
+            mechanism   = getattr(h, "mechanism", "")
         # Truncate mechanism to 150 chars to avoid 4096-char Telegram limit overflow
         truncated_mechanism = mechanism[:150] + "..." if len(mechanism) > 150 else mechanism
         lines += [
@@ -106,7 +118,7 @@ def format_intel_brief(brief: dict) -> str:
     
     lines = [
         f"{sev_emoji} *INTELLIGENCE BRIEF \\(Severity: {severity}/5\\)*",
-        f"🤖 Agent: `{_escape(agent_name)}`",
+        f"🤖 Agent: `{_escape_code(agent_name)}`",
         "",
         f"*{_escape(headline)}*",
         "",
@@ -118,7 +130,7 @@ def format_intel_brief(brief: dict) -> str:
     if b.get("geographic_hotspots"):
         lines.append(f"🌍 *Hotspots:* {_escape(', '.join(b['geographic_hotspots']))}")
     if b.get("financial_instruments_affected"):
-        lines.append(f"💰 *Affected Assets:* `{_escape(', '.join(b['financial_instruments_affected']))}`")
+        lines.append(f"💰 *Affected Assets:* `{_escape_code(', '.join(b['financial_instruments_affected']))}`")
         
     entities = b.get("entities", [])
     if entities:

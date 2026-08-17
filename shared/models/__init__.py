@@ -38,3 +38,9 @@ from .ontology import (
     normalize_predicate,
     is_valid_node_label,
 )
+
+from .provenance import (
+    ProvenanceSourceType,
+    ProvenanceEnvelope,
+    ProvenanceMixin,
+)

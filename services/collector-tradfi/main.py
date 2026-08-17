@@ -36,6 +36,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symbol
 from shared.utils.logging import setup_sentinel_logging
+from shared.utils.heartbeat import start_heartbeat_task
 
 logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -266,7 +267,7 @@ class OHLCVAggregator:
 
 # ── FINNHUB EQUITIES (WEBSOCKET - REGULAR MARKET HOURS) ───────────────────────
 
-async def stream_equities(producer: SentinelProducer, redis_client, aggregator: OHLCVAggregator):
+async def stream_equities(producer: SentinelProducer, redis_client, aggregator: OHLCVAggregator, watchlist_sync_event: asyncio.Event = None):
     if not FINNHUB_API_KEY:
         logger.error("FINNHUB_API_KEY missing. Cannot stream Finnhub equities.")
         return
@@ -275,7 +276,11 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
     msg_counter = {"trades": 0}
 
     async def sync_subscriptions(ws):
-        """Watches Redis and dynamically subscribes/unsubscribes using Finnhub JSON formats."""
+        """Watches Redis and dynamically subscribes/unsubscribes using Finnhub JSON formats.
+        
+        §0.3 — Instant repointing: if watchlist_sync_event is set, we wake immediately
+        instead of sleeping the full 60s poll interval.
+        """
         current_subs = set()
 
         while True:
@@ -284,6 +289,7 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                 decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
                 desired_subs = {t.upper() for t in decoded_tickers if is_valid_primary_equity(t)}
 
+                # §0.2 — Finnhub 50-ticker clamp (hard validation)
                 if len(desired_subs) > 50:
                     logger.warning("Watchlist exceeds Finnhub limit (50). Truncating %d symbols.", len(desired_subs) - 50)
                     desired_subs = set(list(desired_subs)[:50])
@@ -307,7 +313,17 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                 )
             except Exception as e:
                 logger.error("Sync Task Error: %s", e, exc_info=True)
-            await asyncio.sleep(60)
+
+            # §0.3 — Wait up to 60s, but wake instantly if PubSub triggers the event
+            if watchlist_sync_event:
+                try:
+                    await asyncio.wait_for(watchlist_sync_event.wait(), timeout=60)
+                    watchlist_sync_event.clear()
+                    logger.info("⚡ Instant watchlist sync triggered via PubSub")
+                except asyncio.TimeoutError:
+                    pass  # Normal 60s poll interval
+            else:
+                await asyncio.sleep(60)
 
     async def flush_aggregator():
         """Timer task to flush the minute-bar buffer."""
@@ -899,6 +915,33 @@ async def run_institutional_fix(producer: SentinelProducer, redis_client):
         await asyncio.sleep(10)
 
 
+# ── PUBSUB WATCHLIST SYNC LISTENER (§0.3) ─────────────────────────────────────
+
+async def _watchlist_pubsub_listener(redis_client, sync_event: asyncio.Event):
+    """Subscribes to sentinel:collector:watchlist_sync PubSub channel.
+    
+    When the API gateway mutates the watchlist, it publishes to this channel.
+    We set the sync_event so stream_equities wakes immediately and repoints the
+    Finnhub WebSocket subscriptions without waiting for the 60s poll cycle.
+    """
+    pubsub = redis_client.raw.pubsub()
+    await pubsub.subscribe("sentinel:collector:watchlist_sync")
+    logger.info("🔔 Watchlist PubSub listener active on sentinel:collector:watchlist_sync")
+
+    try:
+        while True:
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if msg and msg.get("type") == "message":
+                logger.info(f"📡 Watchlist sync signal received: {msg.get('data', b'').decode() if isinstance(msg.get('data'), bytes) else msg.get('data')}")
+                sync_event.set()
+            await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await pubsub.unsubscribe("sentinel:collector:watchlist_sync")
+        await pubsub.close()
+
+
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
 async def main():
@@ -911,16 +954,28 @@ async def main():
     logger.info("Starting TradFi Collector (Finnhub WS, SEC EDGAR, Alpaca Extended Hours & Options, Finnhub Earnings, FIX 4.4 Engine)")
 
     aggregator = OHLCVAggregator(producer, redis_client)
+
+    # §0.3 — Shared event for instant watchlist repointing
+    watchlist_sync_event = asyncio.Event()
+
+    # §1.1 — Universal heartbeat
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-tradfi"))
+
+    # §0.3 — PubSub listener for instant watchlist sync
+    pubsub_task = asyncio.create_task(_watchlist_pubsub_listener(redis_client, watchlist_sync_event))
+
     try:
         await asyncio.gather(
             run_polling(producer, redis_client),
-            stream_equities(producer, redis_client, aggregator),
+            stream_equities(producer, redis_client, aggregator, watchlist_sync_event),
             poll_extended_hours_equities(producer, redis_client, aggregator),
             poll_options(producer, redis_client),
             poll_finnhub_earnings(producer, redis_client),
             run_institutional_fix(producer, redis_client),
         )
     finally:
+        hb_task.cancel()
+        pubsub_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

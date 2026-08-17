@@ -39,6 +39,8 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, Topics
+from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 try:
     from economic_calendar import EconomicCalendarCollector
@@ -376,7 +378,22 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
 
+    redis_client = None
+    try:
+        redis_client = await get_redis()
+    except Exception as re:
+        logger.warning(f"Redis unavailable for heartbeat: {re}")
+
+    # §1.1 Universal heartbeat
+    hb_task = None
+    if redis_client:
+        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-macro"))
+
     calendar_collector = EconomicCalendarCollector(producer=producer, poll_interval_sec=120)
+
+    from services.collector_macro.freight import poll_freight_indices
+    from services.collector_macro.regulatory import poll_federal_register, RegulatoryDeduplicator
+    reg_dedup = RegulatoryDeduplicator(redis_client)
 
     async def _calendar_polling_loop():
         logger.info("📅 Economic Calendar polling loop initialized.")
@@ -389,7 +406,34 @@ async def main():
                 logger.error(f"Economic calendar poll error: {ce}")
             await asyncio.sleep(calendar_collector.poll_interval_sec)
 
+    async def _freight_polling_loop():
+        logger.info("🚢 Supply Chain & Freight Shipping Rate loop initialized.")
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while True:
+                try:
+                    count = await poll_freight_indices(session, producer, redis_client)
+                    logger.info(f"🚢 Freight Index Poll: Refreshed {count} benchmarks (BDI, FBX, Harpex).")
+                except Exception as fe:
+                    logger.debug(f"Freight poll notice: {fe}")
+                await asyncio.sleep(180)
+
+    async def _regulatory_polling_loop():
+        logger.info("🏛️ Federal Register & Regulatory Policy loop initialized.")
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while True:
+                try:
+                    count = await poll_federal_register(session, producer, reg_dedup)
+                    if count > 0:
+                        logger.info(f"🏛️ Regulatory Policy Poll: Ingested {count} new rules/notices.")
+                except Exception as re_err:
+                    logger.debug(f"Regulatory poll notice: {re_err}")
+                await asyncio.sleep(300)
+
     calendar_task = asyncio.create_task(_calendar_polling_loop())
+    freight_task = asyncio.create_task(_freight_polling_loop())
+    reg_task = asyncio.create_task(_regulatory_polling_loop())
 
     try:
         while True:
@@ -400,7 +444,11 @@ async def main():
 
             await asyncio.sleep(POLL_INTERVAL)
     finally:
+        if hb_task:
+            hb_task.cancel()
         calendar_task.cancel()
+        freight_task.cancel()
+        reg_task.cancel()
         await calendar_collector.close()
         await producer.flush()
         await producer.close()

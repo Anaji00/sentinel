@@ -77,9 +77,29 @@ ALLOWED_NODE_LABELS: Set[str] = {
     "Person",
     "Organization",
     "Government",
+    "RegulatoryAction",
+    "SupplyChainMetric",
+    "InstitutionalFiler",
     "Flag",
     "UnknownEntity"
 }
+
+
+# ── ANTI-SURVEILLANCE ARCHITECTURAL BOUNDARY (§2.5) ─────────────────────────
+# Sentinel is an open intelligence capability for markets, infrastructure, and
+# corporate governance — NOT a mass surveillance system over private citizens.
+PROHIBITED_DATA_CATEGORIES: Set[str] = {
+    "mobile_carrier_location",
+    "consumer_device_telemetry",
+    "facial_recognition",
+    "biometric_surveillance",
+    "private_citizen_communications",
+    "personal_credit_surveillance",
+}
+
+def validate_data_boundary_compliance(category: str) -> bool:
+    """Returns True if the data category complies with Sentinel's anti-surveillance perimeter."""
+    return category.lower() not in PROHIBITED_DATA_CATEGORIES
 
 
 # ── STATISTICAL PREDICATES METADATA ─────────────────────────────────────────

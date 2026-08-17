@@ -34,6 +34,7 @@ logger = logging.getLogger("alert-manager")
 from shared.kafka import SentinelConsumer, Topics
 from shared.models import CorrelationCluster, AlertTier, Scenario
 from shared.db import get_timescale, get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 from services.alert_manager.formatters.telegram import format_correlation, format_scenario, format_intel_brief
 from services.alert_manager.formatters.webhook import format_generic
@@ -150,7 +151,7 @@ class AlertManager:
 
     async def _send_telegram(self, text: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.debug("Telegram not configured")
+            logger.warning("Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is unset in environment (.env)")
             return False
 
         for attempt in range(3):
@@ -168,7 +169,8 @@ class AlertManager:
                         logger.debug("Telegram message sent")
                         return True
                     elif resp.status == 400:
-                        logger.warning("Telegram MarkdownV2 parse failed (400). Retrying with plain text fallback...")
+                        raw_error = await resp.text()
+                        logger.warning(f"Telegram API 400 error: {raw_error}. Retrying with plain-text fallback...")
                         clean_text = text.replace("\\", "").replace("*", "").replace("_", "").replace("`", "")
                         async with self._session.post(
                             f"{TELEGRAM_API}/sendMessage",
@@ -181,7 +183,7 @@ class AlertManager:
                             if retry_resp.status == 200:
                                 logger.info("✅ Telegram message delivered via plain-text fallback")
                                 return True
-                            logger.error(f"Telegram fallback {retry_resp.status}: {(await retry_resp.text())[:200]}")
+                            logger.error(f"Telegram plain-text fallback failed ({retry_resp.status}): {(await retry_resp.text())[:200]}")
                             return False
                     elif resp.status == 429:
                         retry_after = int((await resp.json()).get("parameters", {}).get("retry_after", 30))
@@ -227,6 +229,9 @@ async def main():
     
     async with aiohttp.ClientSession(connector=connector) as session:
         manager = AlertManager(session, db_client, redis_client)
+
+        # §1.1 Universal heartbeat — silent alert pipeline death is catastrophic
+        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "alert_manager"))
         try:
             while True:
                 batches = await consumer.get_batch(timeout_ms=1000)
@@ -252,6 +257,7 @@ async def main():
         except asyncio.CancelledError:
             pass
         finally:
+            hb_task.cancel()
             await consumer.close()
 
 if __name__ == "__main__":

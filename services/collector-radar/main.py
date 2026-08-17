@@ -28,6 +28,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.equities import is_valid_primary_equity
 
 from regime import MarketRegime
@@ -245,6 +246,9 @@ async def main():
     state = {"total_evaluated": 0, "total_anomalies": 0, "polls": 0}
     heartbeat_task = asyncio.create_task(heartbeat_loop(state))
 
+    # §1.1 Universal heartbeat
+    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-radar"))
+
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         universe = await fetch_tradable_universe(session)
@@ -260,6 +264,7 @@ async def main():
                 await asyncio.sleep(max(0, 60.0 - elapsed))
         finally:
             heartbeat_task.cancel()
+            hb_shared_task.cancel()
             await producer.close()
 
 if __name__ == "__main__":

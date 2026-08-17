@@ -23,6 +23,11 @@ class EventType(str, Enum):
     FUTURES_COT = "futures_cot"
     PRICE_ANOMALY = "price_anomaly"
     INSIDER_TRADE = "insider_trade"
+    INSIDER_CLUSTER = "insider_cluster"
+    FILING = "filing"
+    THIRTEEN_F = "thirteen_f"
+    REGULATORY_EVENT = "regulatory_event"
+    SUPPLY_CHAIN_METRIC = "supply_chain_metric"
     EQUITY_BLOCK = "equity_block"          
     CRYPTO_TRADE = "crypto_trade"          
     MARKET_CANDLE = "market_candle"        
@@ -225,6 +230,66 @@ class MacroReleaseData(BaseModel):
     unit: Optional[str] = None    # "%", "k", "bps", "index"
     impact_bias: Optional[str] = None # "HAWKISH", "DOVISH", "INFLATIONARY", "DISINFLATIONARY", "EXPANSIONARY", "CONTRACTIONARY"
     raw_source: Optional[str] = None
+
+class FilingData(BaseModel):
+    ticker: Optional[str] = None
+    cik: Optional[str] = None
+    company_name: Optional[str] = None
+    form_type: str = "8-K"
+    filing_date: Optional[str] = None
+    report_date: Optional[str] = None
+    acceptance_time: Optional[str] = None
+    items: List[str] = Field(default_factory=list)
+    primary_doc_url: Optional[str] = None
+    accession_number: Optional[str] = None
+    is_material_8k: bool = False
+    description: Optional[str] = None
+
+class ThirteenFPosition(BaseModel):
+    ticker: Optional[str] = None
+    cusip: Optional[str] = None
+    issuer_name: str
+    class_title: Optional[str] = "COM"
+    market_value_usd: float = 0.0
+    shares: float = 0.0
+    weight_pct: float = 0.0
+    change_type: str = "MAINTAINED"  # "NEW", "INCREASED", "DECREASED", "EXITED"
+    change_pct: Optional[float] = 0.0
+
+class ThirteenFData(BaseModel):
+    filer_id: str
+    filer_name: str
+    manager_name: Optional[str] = None
+    cik: str
+    report_period: str
+    total_value_usd: float = 0.0
+    holdings_count: int = 0
+    top_holdings: List[ThirteenFPosition] = Field(default_factory=list)
+    new_positions_count: int = 0
+    exited_positions_count: int = 0
+    filing_url: Optional[str] = None
+
+class RegulatoryData(BaseModel):
+    agency: str
+    action_type: str = "RULE"  # "RULE", "PROPOSED_RULE", "NOTICE", "EXECUTIVE_ORDER", "TARIFF"
+    title: str
+    document_number: Optional[str] = None
+    publication_date: Optional[str] = None
+    effective_date: Optional[str] = None
+    affected_sectors: List[str] = Field(default_factory=list)
+    affected_tickers: List[str] = Field(default_factory=list)
+    cfr_references: List[str] = Field(default_factory=list)
+    regulation_url: Optional[str] = None
+
+class SupplyChainData(BaseModel):
+    index_name: str
+    category: str = "FREIGHT"
+    current_value: float = 0.0
+    previous_value: Optional[float] = None
+    change_14d_pct: Optional[float] = None
+    route_corridor: Optional[str] = None
+    vessel_class: Optional[str] = None
+    anomaly_flag: bool = False
 
 class SecurityData(BaseModel):
     breach_type: Optional[str] = None
@@ -448,6 +513,10 @@ class NormalizedEvent(BaseModel):
     prediction_market_data: Optional[PredictionMarketData] = None
     crypto_data: Optional[CryptoData] = None
     macro_data: Optional[MacroReleaseData] = None
+    filing_data: Optional[FilingData] = None
+    thirteen_f_data: Optional[ThirteenFData] = None
+    regulatory_data: Optional[RegulatoryData] = None
+    supply_chain_data: Optional[SupplyChainData] = None
 
     tags: List[str] = Field(default_factory=list) 
     named_entities: List[str] = Field(default_factory=list) 

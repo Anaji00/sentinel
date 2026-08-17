@@ -94,6 +94,10 @@ class TradFiEnricher:
             return await self._enrich_quant_radar(raw, p)
         elif source == "finnhub_earnings":
             return await self._enrich_earnings_calendar(raw, p)
+        elif source in ("sec_edgar", "collector_filings"):
+            return await self._enrich_sec_filing(raw, p)
+        elif source == "sec_edgar_13f":
+            return await self._enrich_13f_filing(raw, p)
             
         return None
 
@@ -945,4 +949,93 @@ class TradFiEnricher:
             headline=headline,
             tags=tags,
             anomaly_score=round(anomaly, 3),
+        )
+
+    async def _enrich_sec_filing(self, raw, p) -> Optional[NormalizedEvent]:
+        """Enriches SEC EDGAR 8-K, 10-K, 10-Q, S-1 corporate filings."""
+        ticker = (p.get("ticker") or "").upper().strip()
+        form_type = p.get("form_type", "8-K")
+        company_name = p.get("company_name", ticker)
+        is_8k = p.get("is_material_8k", False) or form_type.startswith("8-K")
+        items = p.get("items", [])
+        doc_url = p.get("primary_doc_url", "")
+        f_date = p.get("filing_date", "")
+
+        tags = list(p.get("tags", []))
+        tags.extend(["corporate_disclosure", "sec_edgar", f"form:{form_type}"])
+        if is_8k:
+            tags.extend(["material_event", "ground_truth"])
+
+        anomaly = 0.85 if is_8k else 0.45
+        headline = p.get("title") or f"📄 SEC FILING: {company_name} ({ticker}) filed Form {form_type}"
+        summary = p.get("summary") or f"SEC filing {form_type} for {company_name} ({ticker}) on {f_date}."
+
+        entity = Entity(id=ticker or company_name, type=EntityType.COMPANY, name=company_name)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.FILING,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            source_reliability=0.99,
+            primary_entity=entity,
+            filing_data=FilingData(
+                ticker=ticker,
+                cik=p.get("cik"),
+                company_name=company_name,
+                form_type=form_type,
+                filing_date=f_date,
+                report_date=p.get("report_date"),
+                items=items,
+                primary_doc_url=doc_url,
+                accession_number=p.get("accession_number"),
+                is_material_8k=is_8k,
+                description=summary,
+            ),
+            headline=headline,
+            summary=summary,
+            url=doc_url,
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
+        )
+
+    async def _enrich_13f_filing(self, raw, p) -> Optional[NormalizedEvent]:
+        """Enriches quarterly 13F institutional portfolio filings."""
+        filer_name = p.get("filer_name", "Institutional Manager")
+        manager_name = p.get("manager_name", filer_name)
+        filer_id = p.get("filer_id", "institutional")
+        total_val = float(p.get("total_value_usd", 0.0))
+        pos_count = int(p.get("positions_count", 0))
+        period = p.get("report_period", "Current Quarter")
+
+        tags = list(p.get("tags", []))
+        tags.extend(["institutional_holdings", "13f_report", f"filer:{filer_id}"])
+
+        headline = f"🏛️ 13F REPORT: {manager_name} ({filer_name}) filed portfolio for {period}"
+        summary = f"Institutional 13F-HR filing for {filer_name} ({manager_name}). Total Portfolio Value: ${total_val/1e9:.2f}B across {pos_count} holdings."
+
+        entity = Entity(id=filer_id, type=EntityType.ORGANIZATION, name=filer_name)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.THIRTEEN_F,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            source_reliability=0.99,
+            primary_entity=entity,
+            thirteen_f_data=ThirteenFData(
+                filer_id=filer_id,
+                filer_name=filer_name,
+                manager_name=manager_name,
+                cik=p.get("cik", ""),
+                report_period=period,
+                total_value_usd=total_val,
+                holdings_count=pos_count,
+            ),
+            headline=headline,
+            summary=summary,
+            tags=tags,
+            anomaly_score=0.60,
         )

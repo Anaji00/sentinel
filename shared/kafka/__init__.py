@@ -109,9 +109,11 @@ class Topics:
     RAW_CRYPTO     = "events.raw.crypto"
     RAW_PREDICTION = "events.raw.prediction"
     RAW_NEWS = "events.raw.news"
+    RAW_SOCIAL = "events.raw.social"
     RAW_AVIATION = "events.raw.aviation"
     RAW_CYBER = "events.raw.cyber"
     RAW_RADAR            = "events.raw.radar"
+    RAW_FILINGS = "events.raw.filings"
     SCENARIOS_GENERATED = "scenarios.generated"
     INTEL_BRIEFS         = "agents.intel.briefs"         # NewsIntelAgent output
     QUANT_DISCOVERIES    = "agents.quant.discoveries"    # QuantResearcherAgent output
@@ -150,7 +152,7 @@ class Topics:
     # get stuck in a loop trying to process it forever.
     DLQ = "dead.letter"
 
-    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_AVIATION, RAW_CYBER, RAW_RADAR]
+    ALL_RAW = [RAW_MARITIME, RAW_TRADFI, RAW_CRYPTO, RAW_PREDICTION, RAW_NEWS, RAW_SOCIAL, RAW_FILINGS, RAW_AVIATION, RAW_CYBER, RAW_RADAR]
 
 
 # ── SERIALIZATION ─────────────────────────────────────────────────────────────

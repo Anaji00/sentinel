@@ -27,6 +27,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -305,6 +306,10 @@ async def main():
     producer = SentinelProducer()
     await producer.start()
     redis_client = await get_redis()
+    
+    # §1.1 Universal heartbeat
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-prediction"))
+
     try:
         await asyncio.gather(
             stream_polymarket(producer, redis_client),
@@ -314,6 +319,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down prediction collector...")
     finally:
+        hb_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

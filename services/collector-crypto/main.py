@@ -28,12 +28,16 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 from shared.utils.logging import setup_sentinel_logging
 
 logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
-ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL") or os.getenv("ETH_WSS_URL")
+ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL") or os.getenv("ETH_WSS_URL") or "wss://ethereum-rpc.publicnode.com"
+ARB_WSS_URL = os.getenv("ARB_RPC_WSS_URL") or os.getenv("ARB_WSS_URL") or "wss://arbitrum-one-rpc.publicnode.com"
+BASE_WSS_URL = os.getenv("BASE_RPC_WSS_URL") or os.getenv("BASE_WSS_URL") or "wss://base-rpc.publicnode.com"
+
 WHALE_THRESHOLD_USD = 250_000
 
 # Coinbase Advanced Trade WebSocket URI
@@ -414,23 +418,23 @@ async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
 
 # ── 5. ON-CHAIN WHALE TRACKING ────────────────────────────────────────────────
 
-async def stream_onchain_whales(producer: SentinelProducer, redis_client):
-    from shared.utils.websocket import ResilientWebSocketClient
-    if not ETH_WSS_URL: 
-        logger.warning("ETH_RPC_WSS_URL missing. On-chain tracking disabled.")
-        return
-        
-    CONTRACTS = ["0xdac17f958d2ee523a2206206994597c13d831ec7", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"]
-    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# ── 5. MULTI-CHAIN ON-CHAIN WHALE TRACKING (§1.2) ───────────────────────────
 
+async def _stream_chain_whales(chain_name: str, wss_url: str, contracts_map: dict, producer: SentinelProducer, redis_client):
+    from shared.utils.websocket import ResilientWebSocketClient
+    if not wss_url:
+        return
+
+    contracts = list(contracts_map.keys())
+    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     msg_count = 0
 
     async def on_connect(ws):
         await ws.send(json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", 
-            "params": ["logs", {"address": CONTRACTS, "topics": [TRANSFER_TOPIC]}]
+            "params": ["logs", {"address": contracts, "topics": [TRANSFER_TOPIC]}]
         }))
-        logger.info("Connected to Ethereum RPC Whale Tracker")
+        logger.info(f"Connected to {chain_name.upper()} RPC Whale Tracker ({len(contracts)} contracts)")
 
     async def on_message(raw_msg):
         nonlocal msg_count
@@ -439,7 +443,17 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
             if log and log.get("data") != "0x" and len(log.get("topics", [])) >= 3:
                 sender = "0x" + log["topics"][1][26:]
                 receiver = "0x" + log["topics"][2][26:]
-                amount_usd = int(log["data"], 16) / (10 ** 6)
+                addr_lower = log.get("address", "").lower()
+                token_meta = contracts_map.get(addr_lower, {"symbol": "TOKEN", "decimals": 6})
+                decimals = token_meta["decimals"]
+                symbol = token_meta["symbol"]
+
+                raw_val = int(log["data"], 16)
+                amount = raw_val / (10 ** decimals)
+                
+                # Approximate USD value for stablecoins vs WBTC/ETH
+                multiplier = 65000.0 if "BTC" in symbol else (3000.0 if "ETH" in symbol else 1.0)
+                amount_usd = amount * multiplier
                 
                 is_sender_suspect, is_receiver_suspect = await asyncio.gather(
                     redis_client.raw.sismember("sentinel:watched:wallets", sender),
@@ -448,33 +462,156 @@ async def stream_onchain_whales(producer: SentinelProducer, redis_client):
                 is_suspect = is_sender_suspect or is_receiver_suspect
 
                 msg_count += 1
-                if msg_count % 500 == 0:
-                    logger.info(f"💓 ETH Heartbeat: Evaluated {msg_count} Stablecoin transfers.")
+                if msg_count % 250 == 0:
+                    logger.info(f"💓 {chain_name.upper()} Heartbeat: Evaluated {msg_count} transfers.")
 
                 if amount_usd >= WHALE_THRESHOLD_USD or is_suspect:
-                    token = "USDT" if log.get("address").lower() == CONTRACTS[0] else "USDC"
                     event = RawEvent(
-                        source="ethereum_rpc", occurred_at=datetime.now(timezone.utc),
+                        source=f"{chain_name}_rpc",
+                        occurred_at=datetime.now(timezone.utc),
                         raw_payload={
-                            "asset": token, "trade_type": "WHALE_TRANSFER", "notional_usd": amount_usd, 
-                            "sender_wallet": sender, "receiver_wallet": receiver, "is_suspect_wallet": is_suspect
+                            "asset": symbol,
+                            "chain": chain_name,
+                            "trade_type": "WHALE_TRANSFER",
+                            "amount": amount,
+                            "notional_usd": round(amount_usd, 2),
+                            "sender_wallet": sender,
+                            "receiver_wallet": receiver,
+                            "is_suspect_wallet": is_suspect,
                         }
                     )
-                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=token)
+                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
         except Exception as e:
-            logger.error(f"Error handling Ethereum logs WS message: {e}")
+            logger.debug(f"Error parsing {chain_name} log message: {e}")
 
     client = ResilientWebSocketClient(
-        url=ETH_WSS_URL,
-        name="Ethereum_Whales",
+        url=wss_url,
+        name=f"{chain_name}_Whales",
         ping_interval=30.0,
         on_connect=on_connect,
         on_message=on_message
     )
     await client.start()
-
     while True:
         await asyncio.sleep(3600)
+
+
+async def stream_onchain_whales(producer: SentinelProducer, redis_client):
+    """Monitors whale transfers across Ethereum, Arbitrum, and Base."""
+    eth_contracts = {
+        "0xdac17f958d2ee523a2206206994597c13d831ec7": {"symbol": "USDT", "decimals": 6},
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {"symbol": "USDC", "decimals": 6},
+        "0x6b175474e89094c44da98b954eedeac495271d0f": {"symbol": "DAI", "decimals": 18},
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": {"symbol": "WBTC", "decimals": 8},
+    }
+    arb_contracts = {
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": {"symbol": "USDT", "decimals": 6},
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831": {"symbol": "USDC", "decimals": 6},
+        "0x912ce59144191c1204e64559fe8253a0e49e6548": {"symbol": "ARB", "decimals": 18},
+    }
+    base_contracts = {
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {"symbol": "USDC", "decimals": 6},
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": {"symbol": "cbBTC", "decimals": 8},
+    }
+
+    try:
+        await asyncio.gather(
+            _stream_chain_whales("ethereum", ETH_WSS_URL, eth_contracts, producer, redis_client),
+            _stream_chain_whales("arbitrum", ARB_WSS_URL, arb_contracts, producer, redis_client),
+            _stream_chain_whales("base", BASE_WSS_URL, base_contracts, producer, redis_client),
+        )
+    except Exception as e:
+        logger.debug(f"Multi-chain whale runner notice: {e}")
+
+
+# ── 6. CROSS-EXCHANGE DIVERGENCE ENGINE (§1.3) ───────────────────────────────
+
+async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_client):
+    """
+    Monitors cross-exchange perpetual funding rate and mark price divergences
+    between Binance, Bybit, and Kraken/Coinbase.
+    """
+    import aiohttp
+    ASSETS = ["BTC", "ETH", "SOL"]
+    logger.info("⚡ Cross-Exchange Funding & Basis Divergence Engine Online.")
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 1. Fetch Binance Funding Rates
+                binance_rates = {}
+                try:
+                    async with session.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for item in data:
+                                sym = item.get("symbol", "")
+                                for a in ASSETS:
+                                    if sym == f"{a}USDT":
+                                        binance_rates[a] = {
+                                            "funding_rate": float(item.get("lastFundingRate", 0)),
+                                            "mark_price": float(item.get("markPrice", 0)),
+                                        }
+                except Exception as be:
+                    logger.debug(f"Binance rate fetch warning: {be}")
+
+                # 2. Fetch Bybit Linear Tickers
+                bybit_rates = {}
+                try:
+                    async with session.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10) as resp:
+                        if resp.status == 200:
+                            b_data = await resp.json()
+                            for item in b_data.get("result", {}).get("list", []):
+                                sym = item.get("symbol", "")
+                                for a in ASSETS:
+                                    if sym == f"{a}USDT":
+                                        bybit_rates[a] = {
+                                            "funding_rate": float(item.get("fundingRate", 0)),
+                                            "mark_price": float(item.get("markPrice", 0)),
+                                        }
+                except Exception as ye:
+                    logger.debug(f"Bybit rate fetch warning: {ye}")
+
+                # 3. Compare divergences
+                for asset in ASSETS:
+                    b_info = binance_rates.get(asset)
+                    by_info = bybit_rates.get(asset)
+                    if b_info and by_info:
+                        f_binance = b_info["funding_rate"]
+                        f_bybit = by_info["funding_rate"]
+                        funding_diff_bps = abs(f_binance - f_bybit) * 10000.0
+
+                        p_binance = b_info["mark_price"]
+                        p_bybit = by_info["mark_price"]
+                        price_spread_pct = abs(p_binance - p_bybit) / p_binance * 100.0 if p_binance > 0 else 0.0
+
+                        # Flag significant divergence (> 3.0 bps funding spread or > 0.35% price basis)
+                        if funding_diff_bps >= 3.0 or price_spread_pct >= 0.35:
+                            event = RawEvent(
+                                source="crypto_divergence",
+                                occurred_at=datetime.now(timezone.utc),
+                                raw_payload={
+                                    "asset": asset,
+                                    "trade_type": "CROSS_EXCHANGE_FUNDING_DIVERGENCE",
+                                    "binance_funding_rate": f_binance,
+                                    "bybit_funding_rate": f_bybit,
+                                    "funding_spread_bps": round(funding_diff_bps, 2),
+                                    "price_spread_pct": round(price_spread_pct, 4),
+                                    "binance_price": p_binance,
+                                    "bybit_price": p_bybit,
+                                    "divergence_score": min(1.0, 0.40 + (funding_diff_bps / 20.0)),
+                                }
+                            )
+                            await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=asset)
+                            logger.info(
+                                f"⚡ Cross-Venue Divergence Detected | {asset} | "
+                                f"Funding Spread: {funding_diff_bps:.1f} bps (Binance {f_binance*100:.4f}% vs Bybit {f_bybit*100:.4f}%)"
+                            )
+
+        except Exception as e:
+            logger.debug(f"Cross exchange divergence loop notice: {e}")
+
+        await asyncio.sleep(60)
 
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
@@ -485,24 +622,26 @@ async def main():
     logger.info("=" * 60)
     
     producer = SentinelProducer()
-    
-    # Correctly await Kafka and Redis initialization
     await producer.start()
     redis_client = await get_redis()
     
+    # §1.1 Universal heartbeat
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-crypto"))
+
     try:
-        # Run all WebSocket streams and REST pollers concurrently 
+        # Run all WebSocket streams, multi-chain whale trackers, and divergence engines concurrently
         await asyncio.gather(
             stream_coinbase_market_data(producer),
             stream_binance_liquidations(producer),
             stream_binance_funding_rates(producer, redis_client),
             poll_binance_open_interest(producer, redis_client),
             stream_onchain_whales(producer, redis_client),
+            stream_cross_exchange_divergence(producer, redis_client),
         )
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
-        # Await the socket closures safely
+        hb_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

@@ -28,7 +28,8 @@ logger = setup_sentinel_logging("dlq-worker", level=getattr(logging, os.getenv("
 batch_logger = BatchLogger(logger, "dlq-worker", flush_interval_sec=10.0)
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
-from shared.db import get_timescale
+from shared.db import get_timescale, get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 # --- SECRETS & CONFIG ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -166,6 +167,7 @@ async def main():
     logger.info("=" * 60)
 
     db = await get_timescale()
+    redis_client = await get_redis()
     
     producer = SentinelProducer()
     await producer.start()
@@ -176,6 +178,9 @@ async def main():
         auto_offset_reset="earliest", # Always process from the beginning of failures
     )
     await consumer.start()
+
+    # §1.1 Universal heartbeat — silent DLQ death is catastrophic
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "dlq-worker"))
     
     connector = aiohttp.TCPConnector(limit=5)
     
@@ -183,6 +188,7 @@ async def main():
         async with aiohttp.ClientSession(connector=connector) as session:
             await _consume_loop(consumer, db, session, producer)
     finally:
+        hb_task.cancel()
         await producer.close()
         await consumer.close()
 

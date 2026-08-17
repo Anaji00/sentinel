@@ -29,6 +29,7 @@ from shared.utils.tasks import safe_create_task
 import numpy as np
 from shared.utils.equities import is_valid_primary_equity_async
 from shared.db import get_neo4j
+from shared.utils.feature_flags import FeatureFlagManager
 
 logger = logging.getLogger("agent.quant_trading")
 
@@ -222,6 +223,7 @@ class QuantTradingEngine(SentinelAgent):
             model=model,
             fallback_model=fallback_model,
         )
+        self.flags = FeatureFlagManager(self.redis)
 
     @property
     def output_topic(self) -> str:
@@ -317,6 +319,9 @@ class QuantTradingEngine(SentinelAgent):
         if not ticker:
             return None
 
+        if not await self.flags.is_enabled("insider_clustering", ticker=ticker):
+            return None
+
         code = str(raw.get("transaction_code", "P")).upper()
         notional = float(raw.get("notional_usd", 0.0))
         is_buyer = code in ("P", "M", "X")
@@ -375,6 +380,9 @@ class QuantTradingEngine(SentinelAgent):
     # ── SUB-ENGINE 2: QUANT PEER DISCOVERY ───────────────────────────────────
 
     async def _process_peer_discovery(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
+        if not await self.flags.is_enabled("peer_discovery", ticker=ticker):
+            return None
+
         dedup_key = f"quant_discovery:{ticker}:{int(time.time() // 1800)}"
         if await self.is_recently_processed(dedup_key, window_seconds=1800):
             return None
@@ -735,18 +743,24 @@ Return raw JSON matching schema:"""
             raw_watchlist = await self.redis.raw.zrange("sentinel:watchlist:equities", 0, -1)
             watched_set = {s.decode() if isinstance(s, bytes) else str(s) for s in raw_watchlist} if raw_watchlist else None
 
-            cc_rec = quant_calc.generate_covered_call_recommendation(
-                ticker=ticker,
-                current_price=current_price,
-                z_score=z_score,
-                target_delta=0.30,
-                dte_days=30,
-                live_iv=live_iv,
-                realized_volatility=ewma_vol,
-                watched_equities=watched_set
-            )
-            if cc_rec:
-                brief.covered_call_overlays.append(cc_rec)
+            # Evaluate closed-form Covered Call recommendation if flag enabled and CAGG Z-score >= +2.5 (§2.3, §2.6, §B.3)
+            if await self.flags.is_enabled("covered_calls", ticker=ticker):
+                cc_rec = quant_calc.generate_covered_call_recommendation(
+                    ticker=ticker,
+                    current_price=current_price,
+                    z_score=z_score,
+                    target_delta=0.30,
+                    dte_days=30,
+                    live_iv=live_iv,
+                    realized_volatility=ewma_vol,
+                    watched_equities=watched_set
+                )
+                if cc_rec:
+                    brief.covered_call_overlays.append(cc_rec)
+
+            # Gate Black-Litterman allocations on feature flag (§B.3)
+            if not await self.flags.is_enabled("black_litterman", ticker=ticker):
+                brief.black_litterman_allocations = []
 
             # Force-write PortfolioMetrics from real computed values (§1.6, §1.7, §1.8)
             if not brief.portfolio_metrics:
@@ -932,3 +946,153 @@ Return raw JSON matching schema:"""
         except Exception:
             pass
         return ""
+
+    # ── 7. STATISTICAL INSIDER CLUSTER ENGINE (§1.4) ──────────────────────────
+
+    async def _process_insider_form4(self, message: Dict[str, Any], raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Processes SEC Form 4 insider transactions, records them in a rolling 14-day
+        window, and evaluates multi-executive buying cluster significance.
+        """
+        trig = message.get("trigger") or {}
+        pe = message.get("primary_entity") or {}
+        sec_data = message.get("security_data") or raw.get("security_data") or {}
+
+        ticker = str(
+            raw.get("ticker") or
+            raw.get("symbol") or
+            trig.get("ticker") or
+            pe.get("id") or
+            sec_data.get("ticker") or
+            ""
+        ).upper().strip()
+
+        if not ticker or ticker == "UNKNOWN":
+            return None
+
+        # Extract transaction parameters
+        insider_name = str(
+            raw.get("insider_name") or
+            raw.get("filer_name") or
+            raw.get("reporting_owner") or
+            trig.get("insider_name") or
+            "Corporate Insider"
+        ).strip()
+
+        title = str(
+            raw.get("title") or
+            raw.get("officer_title") or
+            raw.get("relationship") or
+            "Executive/Director"
+        ).strip()
+
+        tx_code = str(raw.get("transaction_code") or raw.get("trade_type") or "P").upper()
+        is_buy = tx_code in ("P", "PURCHASE", "BUY", "ACQUISITION")
+        tx_type = "BUY" if is_buy else "SELL"
+
+        shares = float(raw.get("shares") or raw.get("qty") or raw.get("shares_transacted") or 1000.0)
+        price = float(raw.get("price") or raw.get("price_per_share") or raw.get("transaction_price") or 0.0)
+        total_usd = float(raw.get("total_value_usd") or raw.get("notional_usd") or (shares * price))
+
+        now_ts = time.time()
+        tx_record = {
+            "ticker": ticker,
+            "insider_name": insider_name,
+            "title": title,
+            "tx_type": tx_type,
+            "shares": shares,
+            "price": price,
+            "total_usd": total_usd,
+            "timestamp": now_ts,
+        }
+
+        # 1. Append to rolling 14-day sorted set in Redis
+        rolling_key = f"sentinel:insider:trades:{ticker}"
+        try:
+            raw_redis = getattr(self.redis, "raw", self.redis)
+            pipe = raw_redis.pipeline()
+            pipe.zadd(rolling_key, {json.dumps(tx_record): now_ts})
+            # Prune transactions older than 14 days
+            cutoff = now_ts - (14 * 86400)
+            pipe.zremrangebyscore(rolling_key, 0, cutoff)
+            await pipe.execute()
+
+            # 2. Fetch all active transactions within the rolling window
+            raw_items = await raw_redis.zrange(rolling_key, 0, -1)
+            all_trades = []
+            for item in raw_items:
+                try:
+                    val = item.decode("utf-8") if isinstance(item, bytes) else str(item)
+                    all_trades.append(json.loads(val))
+                except Exception:
+                    pass
+
+            # 3. Evaluate cluster conditions
+            buy_trades = [t for t in all_trades if t.get("tx_type") == "BUY"]
+            unique_buyers = list(set(t.get("insider_name") for t in buy_trades if t.get("insider_name")))
+            
+            total_buy_usd = sum(t.get("total_usd", 0) for t in buy_trades)
+            total_sell_usd = sum(t.get("total_usd", 0) for t in all_trades if t.get("tx_type") == "SELL")
+            net_buy_usd = max(0.0, total_buy_usd - total_sell_usd)
+
+            # Statistical Significance Gate: >= 2 distinct buyers and >= $250k net bought
+            if len(unique_buyers) >= 2 and net_buy_usd >= 250_000.0:
+                import math
+                cluster_z = min(4.5, round(math.sqrt(len(unique_buyers)) * math.log10(1.0 + (net_buy_usd / 100_000.0)), 2))
+                cluster_score = min(1.0, round(0.65 + (cluster_z / 10.0), 3))
+
+                cluster_id = f"CLUSTER-INSIDER-{ticker}-{int(now_ts)}"
+                cluster_payload = {
+                    "cluster_id": cluster_id,
+                    "ticker": ticker,
+                    "insider_count": len(unique_buyers),
+                    "unique_buyers": unique_buyers,
+                    "net_buy_usd": round(net_buy_usd, 2),
+                    "total_buy_usd": round(total_buy_usd, 2),
+                    "trades_count": len(all_trades),
+                    "cluster_z_score": cluster_z,
+                    "anomaly_score": cluster_score,
+                    "window_days": 14,
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                # Store active cluster in Redis
+                await raw_redis.set(f"sentinel:insider:clusters:{ticker}", json.dumps(cluster_payload), ex=86400 * 7)
+
+                # Publish to Topics.INSIDER_CLUSTERS
+                if hasattr(self, "producer") and self.producer:
+                    await self.producer.send(Topics.INSIDER_CLUSTERS, cluster_payload, key=ticker)
+
+                # Publish Quant Bulletin
+                safe_create_task(
+                    self.publish_bulletin(
+                        bulletin_type="insider_cluster",
+                        summary=(
+                            f"👔 INSIDER CLUSTER: {len(unique_buyers)} executives net bought ${net_buy_usd/1e6:.2f}M {ticker} "
+                            f"(Z={cluster_z:.2f}, Score={cluster_score:.2f})"
+                        ),
+                        ticker=ticker,
+                        conviction=cluster_score,
+                        expected_direction="up",
+                        payload=cluster_payload,
+                        ttl_seconds=86400,
+                    ),
+                    name=f"insider-cluster-bulletin-{ticker}"
+                )
+
+                logger.info(
+                    f"👔 STATISTICAL INSIDER CLUSTER DETECTED | {ticker} | "
+                    f"{len(unique_buyers)} Insiders | Net Buy: ${net_buy_usd/1e6:.2f}M | Z-Score: {cluster_z:.2f}"
+                )
+
+                return {
+                    "agent": self.name,
+                    "action": "INSIDER_CLUSTER_DETECTED",
+                    "cluster": cluster_payload,
+                }
+
+        except Exception as e:
+            logger.error(f"Error evaluating insider cluster for {ticker}: {e}", exc_info=True)
+
+        return None
+

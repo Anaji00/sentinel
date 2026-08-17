@@ -38,6 +38,7 @@ from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
 from services.correlation.statistical_discovery import StatisticalDiscoveryEngine
 from shared.utils.streaming_detectors import FirstStoryDetector
 from shared.utils.tasks import safe_create_task
+from shared.utils.heartbeat import start_heartbeat_task
 
 _dynamic_rules_cache = {}
 
@@ -250,6 +251,9 @@ async def main():
     neo4j_client = await get_neo4j()
     
     rule_listener_task = safe_create_task(_listen_for_rule_updates(redis_client), name="correlation-rule-listener")
+
+    # §1.1 Universal heartbeat
+    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "correlation"))
     
     store    = EventStore(redis_client, db_client)
     producer = SentinelProducer()
@@ -667,6 +671,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        hb_task.cancel()
         await producer.close()
         await consumer.close()
         await session.close()

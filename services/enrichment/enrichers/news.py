@@ -297,7 +297,7 @@ class NewsEnricher:
         # Hawkes cross-domain intensity excitation boost
         if hasattr(self.scorer, "get_hawkes_intensity"):
             hawkes_ratio = self.scorer.get_hawkes_intensity("news")
-            if hawkes_ratio and hawkes_ratio > 1.2:
+            if hawkes_ratio and isinstance(hawkes_ratio, (int, float)) and hawkes_ratio > 1.2:
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
                 anomaly = min(1.0, anomaly + hawkes_boost)
 
@@ -349,10 +349,15 @@ class NewsEnricher:
             type=entity_type,
             name=primary_name
         )
+
+        source_type = p.get("source_type") or ("primary_social" if getattr(raw, "source", "") in ("telegram", "reddit", "twitter", "social") else "wire")
+        tags.append(f"source_type:{source_type}")
+
+        event_type = EventType.SOCIAL_SIGNAL if source_type == "primary_social" else EventType.HEADLINE
     
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
-            type=EventType.HEADLINE,
+            type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
             source_reliability=reliability,

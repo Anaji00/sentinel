@@ -40,6 +40,7 @@ from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 from shared.utils.ollama import OllamaClient
 from shared.utils.tasks import safe_create_task
+from shared.utils.heartbeat import start_heartbeat_task
 
 async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
@@ -155,6 +156,9 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
             )
 
     heartbeat_task = safe_create_task(_heartbeat(), name="reasoning-heartbeat")
+
+    # §1.1 Universal heartbeat — shared telemetry for data-health dashboard
+    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "reasoning"))
     
     sem = asyncio.Semaphore(3)
 
@@ -222,6 +226,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         pass
     finally:
         heartbeat_task.cancel()
+        hb_shared_task.cancel()
         await consumer.close()
         await producer.close()
         logger.info(f"Final — clusters: {_processed}  scenarios: {_scenarios}  errors: {_errors}")

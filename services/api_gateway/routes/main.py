@@ -27,7 +27,26 @@ logger = logging.getLogger("api-gateway-main")
 
 from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
-from services.api_gateway.routes import system, scenarios, events, graph, radar, agents
+from services.api_gateway.routes import (
+    system,
+    scenarios,
+    events,
+    graph,
+    radar,
+    agents,
+    flags,
+    backtest,
+    explain,
+    health,
+    watchlists,
+    audit,
+    cases,
+    portfolio,
+    reports,
+    filings,
+    methodology,
+    sovereignty,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -93,6 +112,18 @@ app.include_router(events.router)
 app.include_router(graph.router)
 app.include_router(radar.router)
 app.include_router(agents.router)
+app.include_router(flags.router)
+app.include_router(backtest.router)
+app.include_router(explain.router)
+app.include_router(health.router)
+app.include_router(watchlists.router)
+app.include_router(audit.router)
+app.include_router(cases.router)
+app.include_router(portfolio.router)
+app.include_router(reports.router)
+app.include_router(filings.router)
+app.include_router(methodology.router)
+app.include_router(sovereignty.router)
 
 from fastapi.responses import PlainTextResponse
 from shared.utils.metrics import MetricsCollector

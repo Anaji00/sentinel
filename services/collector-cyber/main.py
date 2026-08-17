@@ -62,6 +62,8 @@ load_dotenv(ROOT / ".env")
 from shared.utils.logging import setup_sentinel_logging
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
+from shared.db import get_redis
+from shared.utils.heartbeat import start_heartbeat_task
 
 logger = setup_sentinel_logging("collector.cyber", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -545,11 +547,25 @@ async def main():
 
     producer = SentinelProducer()
     await producer.start()
+
+    redis_client = None
+    try:
+        redis_client = await get_redis()
+    except Exception as re:
+        logger.warning(f"Redis unavailable for heartbeat: {re}")
+
+    # §1.1 Universal heartbeat
+    hb_task = None
+    if redis_client:
+        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-cyber"))
+
     try:
         await collect(producer)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        if hb_task:
+            hb_task.cancel()
         await producer.close()
 
 
