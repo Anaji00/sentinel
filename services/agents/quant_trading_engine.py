@@ -770,11 +770,14 @@ Return raw JSON matching schema:"""
                 brief.portfolio_metrics.var_95_pct = var_95_pct
                 brief.portfolio_metrics.cvar_99_pct = cvar_99_pct
                 brief.portfolio_metrics.sharpe_ratio = sharpe_ratio_val
+                hawkes_factor = quant_calc.hawkes_risk_multiplier(hawkes_intensity=1.0)
+                brief.portfolio_metrics.hawkes_risk_factor = round(hawkes_factor, 3)
                 brief.portfolio_metrics.metrics_source = "computed"
             else:
                 brief.portfolio_metrics.var_95_pct = None
                 brief.portfolio_metrics.cvar_99_pct = None
                 brief.portfolio_metrics.sharpe_ratio = None
+                brief.portfolio_metrics.hawkes_risk_factor = None
                 brief.portfolio_metrics.metrics_source = "insufficient_history"
 
             res_payload = {

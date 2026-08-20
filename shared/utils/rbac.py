@@ -72,26 +72,32 @@ def parse_role(role_str: Optional[str], default: Role = Role.VIEWER) -> Role:
 
 def get_current_user_role(request: Request) -> Role:
     """
-    Extracts the user's role from request state, headers, or cookies.
-    1. If user authenticated via master API_KEY -> Role.ADMIN.
-    2. If request has 'X-User-Role' header -> parses role.
-    3. If JWT token contains 'role' or 'roles' -> parses role.
-    4. Fallback in development -> Role.ADMIN; in production -> Role.VIEWER.
+    Extracts the user's role from cryptographically verified request state.
+    1. If request.state has verified 'role' from signed session/token -> return role.
+    2. If user authenticated via master API_KEY (identity starts with 'apikey:') -> Role.ADMIN.
+    3. Fallback in development when no API key configured -> Role.ADMIN.
+    4. Fallback in production -> Role.VIEWER.
+    
+    Security note: X-User-Role header is strictly ignored to prevent client-side role spoofing.
     """
-    # 1. Check explicit header (gateway or upstream proxy)
-    role_hdr = request.headers.get("X-User-Role")
-    if role_hdr:
-        return parse_role(role_hdr)
+    # 1. Check cryptographically verified role on request state
+    if hasattr(request, "state"):
+        verified_role = getattr(request.state, "role", None)
+        if verified_role:
+            if isinstance(verified_role, Role):
+                return verified_role
+            return parse_role(verified_role)
 
-    # 2. Check cookie or auth identity if stored on request state
-    user_identity = getattr(request.state, "identity", None) if hasattr(request, "state") else None
-    if user_identity and isinstance(user_identity, str) and user_identity.startswith("apikey:"):
-        return Role.ADMIN
+        # 2. Check auth identity if stored on request state
+        user_identity = getattr(request.state, "identity", None)
+        if user_identity and isinstance(user_identity, str) and user_identity.startswith("apikey:"):
+            return Role.ADMIN
 
     # 3. Check for dev environment default
     import os
     env = os.getenv("ENVIRONMENT") or os.getenv("SENTINEL_ENV") or "production"
-    if env.lower() in ("development", "dev", "local", "test"):
+    api_key_set = bool(os.getenv("API_GATEWAY_KEY") or os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY"))
+    if env.lower() in ("development", "dev", "local", "test") and not api_key_set:
         return Role.ADMIN
 
     return Role.VIEWER

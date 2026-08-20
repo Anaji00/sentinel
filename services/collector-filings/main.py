@@ -43,6 +43,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 try:
     from thirteen_f import (
         PROMINENT_FILERS,
+        fetch_live_13f_from_edgar,
         generate_curated_seed_13f,
         ThirteenFPortfolioReport,
     )
@@ -53,6 +54,7 @@ except (ImportError, ModuleNotFoundError):
     thirteen_f_mod = importlib.util.module_from_spec(spec_tf)
     spec_tf.loader.exec_module(thirteen_f_mod)
     PROMINENT_FILERS = thirteen_f_mod.PROMINENT_FILERS
+    fetch_live_13f_from_edgar = thirteen_f_mod.fetch_live_13f_from_edgar
     generate_curated_seed_13f = thirteen_f_mod.generate_curated_seed_13f
     ThirteenFPortfolioReport = thirteen_f_mod.ThirteenFPortfolioReport
 
@@ -246,15 +248,26 @@ async def poll_company_filings(
     return new_count
 
 
-async def seed_prominent_13f_reports(producer: SentinelProducer, redis_client):
-    """Generates and publishes curated baseline 13F reports for prominent hedge funds."""
+async def seed_prominent_13f_reports(session: aiohttp.ClientSession, producer: SentinelProducer, redis_client: Any):
+    """
+    Dynamically fetches and parses official SEC EDGAR 13F-HR filings for prominent institutional managers.
+    Stores verified live holdings in Redis and emits events to Topics.RAW_FILINGS.
+    """
     if not redis_client:
         return
 
     raw_redis = getattr(redis_client, "raw", redis_client)
     for cik, meta in PROMINENT_FILERS.items():
         try:
-            report = generate_curated_seed_13f(cik)
+            report = None
+            if session:
+                report = await fetch_live_13f_from_edgar(session, cik, meta)
+
+            if not report:
+                # Disclose that live EDGAR is currently unreachable, do NOT publish fabricated live data
+                logger.info(f"Live SEC EDGAR 13F data currently unavailable for {meta['name']} (CIK {cik}).")
+                continue
+
             report_json = report.model_dump_json()
 
             # Store in Redis: latest report and list of prominent filers
@@ -266,7 +279,7 @@ async def seed_prominent_13f_reports(producer: SentinelProducer, redis_client):
                 if h.ticker:
                     await raw_redis.sadd(f"sentinel:13f:consensus:{h.ticker}:buyers", meta["manager"])
 
-            # Publish summary event to RAW_FILINGS
+            # Publish verified live event to RAW_FILINGS
             event = RawEvent(
                 source="sec_edgar_13f",
                 occurred_at=datetime.now(timezone.utc),
@@ -280,14 +293,15 @@ async def seed_prominent_13f_reports(producer: SentinelProducer, redis_client):
                     "positions_count": report.total_positions_count,
                     "top_holdings": [p.model_dump() for p in report.top_holdings],
                     "form_type": "13F-HR",
-                    "source_type": "primary_filing",
-                    "reliability": 0.99,
+                    "source_type": report.source_type,
+                    "is_synthetic": report.is_synthetic,
+                    "reliability": 0.99 if not report.is_synthetic else 0.0,
                     "tags": ["filing", "13f", f"filer:{report.filer_id}", "institutional_flow"],
                 }
             )
             await producer.send(Topics.RAW_FILINGS, event.model_dump(), key=report.filer_id)
         except Exception as e:
-            logger.debug(f"Error seeding 13F for {meta['name']}: {e}")
+            logger.warning(f"Error fetching live 13F for {meta['name']}: {e}")
 
 
 async def main():
@@ -305,12 +319,12 @@ async def main():
     # Universal 15s heartbeat
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-filings"))
 
-    # Initial 13F seed
-    await seed_prominent_13f_reports(producer, redis_client)
-
     connector = aiohttp.TCPConnector(limit=10)
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
+            # Fetch live 13F filings from SEC EDGAR on startup
+            await seed_prominent_13f_reports(session, producer, redis_client)
+
             cycle = 0
             while True:
                 cycle += 1

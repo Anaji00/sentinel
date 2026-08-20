@@ -57,13 +57,13 @@ def test_api_gateway_protected_endpoint_requires_auth():
 
     # 4. Valid JWT token cookie -> 200 (or passes auth dependency)
     valid_jwt = create_jwt_token({"sub": "admin@sentinel.io"}, expires_in_seconds=3600)
-    is_valid, sub = verify_session_token(valid_jwt)
+    is_valid, sub, *rest = verify_session_token(valid_jwt)
     assert is_valid is True
     assert sub == "admin@sentinel.io"
 
     # 5. Invalid / forged secret JWT -> False
     forged_jwt = create_jwt_token({"sub": "admin@sentinel.io"}, secret="wrong-secret-key")
-    is_forged_valid, _ = verify_session_token(forged_jwt)
+    is_forged_valid, *rest = verify_session_token(forged_jwt)
     assert is_forged_valid is False
 
 def test_websocket_auth_cryptographic_verification():
@@ -304,5 +304,94 @@ def test_covered_calls_zscore_view_lookup():
     finally:
         app.dependency_overrides.pop(get_redis_optional, None)
         app.dependency_overrides.pop(get_db_optional, None)
+
+
+def test_broker_execution_order_dispatch():
+    from services.api_gateway.dependencies import create_jwt_token, get_redis_client
+    client = TestClient(app)
+    client.cookies.set("sentinel_session", create_jwt_token({"sub": "admin@sentinel.io"}))
+
+    mock_redis = MagicMock()
+    mock_redis.raw.get = AsyncMock(return_value=None)
+    app.dependency_overrides[get_redis_client] = lambda: mock_redis
+
+    try:
+        order_payload = {
+            "ticker": "NVDA",
+            "action": "BUY",
+            "order_type": "Limit",
+            "entry_price": 220.0,
+            "target_price": 245.0,
+            "stop_loss": 210.0,
+            "position_size_usd": 10000.0,
+            "kelly_allocation_pct": 5.0,
+        }
+        res = client.post("/api/v1/trading/orders/execute", json=order_payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] in ("EXECUTIVE_FILLED", "SUBMITTED")
+        assert data["ticker"] == "NVDA"
+        assert data["action"] == "BUY"
+        assert data["units"] == round(10000.0 / 220.0, 2)
+        assert data["entry_price"] > 0
+        assert "broker" in data
+    finally:
+        app.dependency_overrides.pop(get_redis_client, None)
+
+
+def test_social_twitter_poller_rss_parsing():
+    import importlib.util
+    from pathlib import Path
+    root_dir = Path(__file__).resolve().parents[1]
+    soc_path = root_dir / "services" / "collector-social" / "main.py"
+    spec_soc = importlib.util.spec_from_file_location("collector_social", soc_path)
+    soc_mod = importlib.util.module_from_spec(spec_soc)
+    spec_soc.loader.exec_module(soc_mod)
+
+    poll_twitter_handle = soc_mod.poll_twitter_handle
+    SocialDeduplicator = soc_mod.SocialDeduplicator
+
+    rss_sample = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+        <channel>
+            <title>@sentdefender - X/Twitter RSS</title>
+            <item>
+                <title>Breaking: Shipping traffic through Bab el-Mandeb rerouting due to elevated drone threats.</title>
+                <description><![CDATA[Satellite analysis confirms commercial container carriers altering transit corridors.]]></description>
+                <link>https://x.com/sentdefender/status/1890000000000000001</link>
+                <guid>1890000000000000001</guid>
+            </item>
+        </channel>
+    </rss>"""
+
+    class MockResp:
+        status = 200
+        async def text(self):
+            return rss_sample
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def get(self, url, timeout=None):
+            return MockResp()
+
+    async def _run_test():
+        mock_redis = MagicMock()
+        mock_redis.raw.zscore = AsyncMock(return_value=None)
+        mock_redis.raw.pipeline = MagicMock(return_value=MagicMock(execute=AsyncMock()))
+        dedup = SocialDeduplicator(mock_redis)
+
+        mock_producer = MagicMock()
+        mock_producer.send = AsyncMock()
+
+        session = MockSession()
+        count = await poll_twitter_handle(session, mock_producer, dedup, "sentdefender", "geopolitical", 0.65)
+        assert count == 1
+        assert mock_producer.send.called
+
+    asyncio.run(_run_test())
+
 
 

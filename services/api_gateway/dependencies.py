@@ -15,17 +15,20 @@ from fastapi import Request, WebSocket, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from shared.utils.env_guard import resolve_env_var
 
+from shared.utils.secrets import get_secret
+from shared.utils.rbac import Role, parse_role
+
 logger = logging.getLogger("api-gateway.auth")
 
-API_KEY = os.getenv("API_GATEWAY_KEY") or os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or ""
-SESSION_SECRET = os.getenv("SESSION_SECRET") or os.getenv("JWT_SECRET") or os.getenv("API_GATEWAY_KEY") or "sentinel-secure-session-secret-key-2026"
+API_KEY = get_secret("API_GATEWAY_KEY", default=os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or "")
+SESSION_SECRET = get_secret("SESSION_SECRET", default=os.getenv("JWT_SECRET") or os.getenv("API_GATEWAY_KEY") or "sentinel-secure-session-secret-key-2026")
 
 
-def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_seconds: int = 86400) -> str:
+def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_seconds: int = 86400, role: str = "ANALYST") -> str:
     """
     Creates an RFC 7519 compliant HS256 JWT string.
     """
-    secret_key = secret or os.getenv("SESSION_SECRET") or os.getenv("JWT_SECRET") or os.getenv("API_GATEWAY_KEY") or SESSION_SECRET
+    secret_key = secret or get_secret("SESSION_SECRET", default=SESSION_SECRET)
     secret_bytes = secret_key.encode("utf-8")
 
     now = time.time()
@@ -34,6 +37,8 @@ def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_sec
         jwt_payload["iat"] = int(now)
     if "exp" not in jwt_payload:
         jwt_payload["exp"] = int(now + expires_in_seconds)
+    if "role" not in jwt_payload:
+        jwt_payload["role"] = role
 
     header = {"alg": "HS256", "typ": "JWT"}
     header_b64 = base64.urlsafe_b64encode(json.dumps(header, separators=(',', ':')).encode("utf-8")).rstrip(b"=").decode("utf-8")
@@ -47,7 +52,7 @@ def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_sec
     return f"{header_b64}.{payload_b64}.{signature}"
 
 
-def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Cryptographically verifies a session token independently of upstream proxies.
     Supports both:
@@ -55,18 +60,12 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
       2. 2-part HMAC-signed session tokens (base64url(payload).signature) from Next.js auth
     
     Performs constant-time signature verification and validates expiration timestamp.
-    Returns: (is_valid, user_identifier)
+    Returns: (is_valid, user_identifier, role_name)
     """
     if not token or not isinstance(token, str):
-        return False, None
+        return False, None, None
 
-    secret_key = (
-        secret or
-        os.getenv("SESSION_SECRET") or
-        os.getenv("JWT_SECRET") or
-        os.getenv("API_GATEWAY_KEY") or
-        SESSION_SECRET
-    )
+    secret_key = secret or get_secret("SESSION_SECRET", default=SESSION_SECRET)
     secret_bytes = secret_key.encode("utf-8")
     parts = token.strip().split(".")
 
@@ -80,7 +79,7 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
         expected_sig_hex = hmac.new(secret_bytes, signing_input, hashlib.sha256).hexdigest()
 
         if not (hmac.compare_digest(signature, expected_sig_b64) or hmac.compare_digest(signature, expected_sig_hex)):
-            return False, None
+            return False, None, None
 
         try:
             rem = len(payload_b64) % 4
@@ -93,12 +92,15 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
                 if exp_ts > 1e11:  # Epoch milliseconds
                     exp_ts /= 1000.0
                 if time.time() > exp_ts:
-                    return False, None
+                    return False, None, None
 
             sub = payload_json.get("sub") or payload_json.get("email") or payload_json.get("user") or "authenticated_user"
-            return True, str(sub)
+            role = payload_json.get("role") or payload_json.get("roles") or "ANALYST"
+            if isinstance(role, list) and role:
+                role = role[0]
+            return True, str(sub), str(role)
         except Exception:
-            return False, None
+            return False, None, None
 
     # 2. 2-part HMAC-signed session (payload.signature)
     elif len(parts) == 2:
@@ -108,13 +110,18 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
             padded = encoded_payload + ("=" * (4 - rem) if rem else "")
             payload_str = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
 
+            role = "ANALYST"
             if ":" in payload_str:
-                email, expires_str = payload_str.split(":", 1)
+                colon_parts = payload_str.split(":")
+                if len(colon_parts) >= 3:
+                    email, role, expires_str = colon_parts[0], colon_parts[1], colon_parts[2]
+                else:
+                    email, expires_str = colon_parts[0], colon_parts[1]
                 expires_at = float(expires_str)
                 if expires_at > 1e11:
                     expires_at /= 1000.0
                 if time.time() > expires_at:
-                    return False, None
+                    return False, None, None
             else:
                 email = payload_str
 
@@ -124,13 +131,13 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
             ).rstrip(b"=").decode("utf-8")
 
             if not (hmac.compare_digest(signature, expected_sig_hex) or hmac.compare_digest(signature, expected_sig_b64)):
-                return False, None
+                return False, None, None
 
-            return True, email or "session_user"
+            return True, email or "session_user", role
         except Exception:
-            return False, None
+            return False, None, None
 
-    return False, None
+    return False, None, None
 
 
 async def check_rate_limit(redis_client, identity_key: str, max_tokens: int = 120, refill_rate_per_sec: float = 10.0) -> bool:
@@ -183,20 +190,28 @@ async def verify_api_key(request: Request = None):
         return None
 
     session_cookie = request.cookies.get("sentinel_session") if hasattr(request, "cookies") else None
-    api_key = (request.headers.get("X-API-KEY") if hasattr(request, "headers") else None) or (request.query_params.get("api_key") if hasattr(request, "query_params") else None)
+    has_qs = hasattr(request, "scope") and isinstance(request.scope, dict) and "query_string" in request.scope
+    api_key_query = request.query_params.get("api_key") if has_qs else None
+    api_key = (request.headers.get("X-API-KEY") if hasattr(request, "headers") else None) or api_key_query
 
     is_valid = False
     identity = "anonymous"
+    user_role = Role.VIEWER
 
     if api_key and API_KEY:
         if hmac.compare_digest(api_key.encode("utf-8"), API_KEY.encode("utf-8")):
             is_valid = True
             identity = f"apikey:{api_key[:8]}"
+            user_role = Role.ADMIN
     elif session_cookie:
-        is_token_valid, user_ident = verify_session_token(session_cookie)
+        res = verify_session_token(session_cookie)
+        is_token_valid = res[0]
+        user_ident = res[1]
+        token_role = res[2] if len(res) > 2 else "ANALYST"
         if is_token_valid:
             is_valid = True
             identity = f"session:{user_ident}"
+            user_role = parse_role(token_role, default=Role.ANALYST)
         else:
             logger.warning(f"Rejected unverified/expired session cookie for path {path}")
     elif (
@@ -207,13 +222,20 @@ async def verify_api_key(request: Request = None):
         # Dev fallback for local developer ergonomics when no key is set
         is_valid = True
         identity = "dev-client"
+        user_role = Role.ADMIN
 
     if not is_valid:
         logger.warning(f"Failed authentication attempt for path {path}: Invalid or missing credentials.")
         raise HTTPException(status_code=403, detail="Could not validate API Key or Session Cookie")
 
+    # Attach verified identity and role to request state
+    if hasattr(request, "state"):
+        request.state.identity = identity
+        request.state.role = user_role
+
     # Rate limiting check
-    redis = getattr(request.app.state, "redis", None) if (hasattr(request, "app") and hasattr(request.app, "state")) else None
+    app = request.scope.get("app") if (hasattr(request, "scope") and isinstance(request.scope, dict)) else None
+    redis = getattr(app.state, "redis", None) if (app and hasattr(app, "state")) else None
     if redis:
         allowed = await check_rate_limit(redis, identity)
         if not allowed:
@@ -240,7 +262,7 @@ async def verify_websocket_api_key(websocket: WebSocket) -> bool:
         if hmac.compare_digest(api_key.encode("utf-8"), API_KEY.encode("utf-8")):
             is_valid = True
     elif session_cookie and isinstance(session_cookie, str):
-        is_token_valid, _ = verify_session_token(session_cookie)
+        is_token_valid, *rest = verify_session_token(session_cookie)
         if is_token_valid:
             is_valid = True
         else:

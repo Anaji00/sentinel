@@ -7,11 +7,23 @@ and raw correlation clusters from the TimescaleDB database.
 """
 
 import logging
-from typing import Optional
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Depends
 from services.api_gateway.dependencies import get_db, get_redis_client
 from pydantic import BaseModel
 import json
+
+from shared.broker.base import (
+    BrokerInterface,
+    OrderSide,
+    OrderType,
+    OrderStatus,
+)
+from shared.broker.paper import PaperBroker
+from shared.broker.alpaca import AlpacaBroker
 
 logger = logging.getLogger("api-gateway.scenarios")
 router = APIRouter(prefix="/api/v1", tags=["Intelligence"])
@@ -291,6 +303,15 @@ async def get_financial_advice(redis = Depends(get_redis_client)):
         logger.error(f"Failed to fetch financial advice: {e}")
         return generate_fallback_financial_advice()
 
+def get_execution_broker(redis_client=None) -> BrokerInterface:
+    """Factory to return AlpacaBroker when configured or Sentinel PaperBroker."""
+    alpaca_key = os.getenv("ALPACA_API_KEY")
+    alpaca_secret = os.getenv("ALPACA_SECRET_KEY")
+    if alpaca_key and alpaca_secret:
+        return AlpacaBroker(api_key=alpaca_key, secret_key=alpaca_secret, paper=True)
+    return PaperBroker(initial_cash=100_000.0, redis_client=redis_client)
+
+
 class OrderExecutionRequest(BaseModel):
     ticker: str
     action: str
@@ -301,31 +322,56 @@ class OrderExecutionRequest(BaseModel):
     position_size_usd: float
     kelly_allocation_pct: float
 
+
 @router.post("/trading/orders/execute")
-async def execute_trade_order(order: OrderExecutionRequest):
+async def execute_trade_order(
+    order: OrderExecutionRequest,
+    redis = Depends(get_redis_client),
+):
     """
     Paper Trading & Broker Execution Bridge.
-    Validates trade risk constraints and dispatches paper bracket order.
+    Routes order execution directly through the shared BrokerInterface (PaperBroker or AlpacaBroker).
     """
-    import time
-    order_id = f"alpaca_paper_{order.ticker.lower()}_{int(time.time())}"
+    broker = get_execution_broker(redis_client=redis)
+    side = OrderSide.BUY if order.action.upper() == "BUY" else OrderSide.SELL
+    order_type = OrderType.LIMIT if (order.order_type or "").upper() == "LIMIT" else OrderType.MARKET
+
     shares = round(order.position_size_usd / max(0.01, order.entry_price), 2)
     max_risk = round(shares * abs(order.entry_price - order.stop_loss), 2)
     max_reward = round(shares * abs(order.target_price - order.entry_price), 2)
+    client_oid = f"sentinel_order_{order.ticker.lower()}_{int(time.time())}"
 
-    return {
-        "status": "EXECUTIVE_FILLED_PAPER",
-        "order_id": order_id,
-        "ticker": order.ticker,
-        "action": order.action,
-        "units": shares,
-        "notional_usd": order.position_size_usd,
-        "entry_price": order.entry_price,
-        "target_price": order.target_price,
-        "stop_loss": order.stop_loss,
-        "max_risk_usd": max_risk,
-        "max_reward_usd": max_reward,
-        "kelly_pct": order.kelly_allocation_pct,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "broker": "Alpaca Paper API v2",
-    }
+    try:
+        executed_order = await broker.submit_order(
+            symbol=order.ticker,
+            qty=shares,
+            side=side,
+            order_type=order_type,
+            limit_price=order.entry_price if order_type == OrderType.LIMIT else None,
+            stop_price=order.stop_loss,
+            estimated_market_price=order.entry_price,
+            client_order_id=client_oid,
+        )
+
+        fill_price = executed_order.filled_avg_price or order.entry_price
+        broker_label = "Alpaca Broker API v2" if isinstance(broker, AlpacaBroker) else "Sentinel PaperBroker"
+
+        return {
+            "status": "EXECUTIVE_FILLED" if executed_order.status == OrderStatus.FILLED else "SUBMITTED",
+            "order_id": executed_order.order_id or executed_order.client_order_id,
+            "ticker": executed_order.symbol,
+            "action": executed_order.side.value.upper(),
+            "units": executed_order.filled_qty or executed_order.qty,
+            "notional_usd": round(fill_price * shares, 2),
+            "entry_price": fill_price,
+            "target_price": order.target_price,
+            "stop_loss": order.stop_loss,
+            "max_risk_usd": max_risk,
+            "max_reward_usd": max_reward,
+            "kelly_pct": order.kelly_allocation_pct,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "broker": broker_label,
+        }
+    except Exception as e:
+        logger.error(f"Broker order execution failed for {order.ticker}: {e}")
+        raise HTTPException(status_code=400, detail=f"Broker execution failed: {str(e)}")

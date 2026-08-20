@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from shared.utils.rbac import require_role, Role
 from services.api_gateway.dependencies import get_redis_optional
 from shared.utils.feature_flags import FeatureFlagManager
 
@@ -33,19 +34,19 @@ class ResetFlagRequest(BaseModel):
     flag_name: str
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(require_role(Role.VIEWER))])
 async def get_feature_flags(redis=Depends(get_redis_optional)):
     """Returns the real-time operational status of all signal flags and master kill switch."""
     manager = FeatureFlagManager(redis)
     return await manager.get_all_flags()
 
 
-@router.post("/toggle")
+@router.post("/toggle", dependencies=[Depends(require_role(Role.ADMIN))])
 async def toggle_feature_flag(
     req: ToggleFlagRequest,
     redis=Depends(get_redis_optional),
 ):
-    """Updates a signal feature flag, rollout percentage, or ticker whitelist."""
+    """Updates a signal feature flag, rollout percentage, or ticker whitelist (ADMIN only)."""
     manager = FeatureFlagManager(redis)
     res = await manager.set_flag(
         flag_name=req.flag_name,
@@ -57,14 +58,14 @@ async def toggle_feature_flag(
     return {"status": "success", "flag": res}
 
 
-@router.post("/kill-switch")
+@router.post("/kill-switch", dependencies=[Depends(require_role(Role.ADMIN))])
 async def trip_kill_switch(
     req: KillSwitchRequest,
     redis=Depends(get_redis_optional),
 ):
     """
     Emergency kill switch: instantly shuts down a specific signal type or activates
-    the platform-wide MASTER kill switch.
+    the platform-wide MASTER kill switch (ADMIN only).
     """
     manager = FeatureFlagManager(redis)
     if req.flag_name.upper() == "MASTER":
@@ -75,12 +76,12 @@ async def trip_kill_switch(
         return {"status": "kill_switch_tripped", "details": res}
 
 
-@router.post("/reset")
+@router.post("/reset", dependencies=[Depends(require_role(Role.ADMIN))])
 async def reset_kill_switch(
     req: ResetFlagRequest,
     redis=Depends(get_redis_optional),
 ):
-    """Resets an emergency kill switch back to normal operational status."""
+    """Resets an emergency kill switch back to normal operational status (ADMIN only)."""
     manager = FeatureFlagManager(redis)
     res = await manager.reset_kill_switch(flag_name=req.flag_name)
     return {"status": "reset_complete", "details": res}

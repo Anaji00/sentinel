@@ -82,8 +82,22 @@ class PaperBroker(BrokerInterface):
         estimated_market_price: Optional[float] = None,
     ) -> Order:
         sym = symbol.upper()
-        # Simulated execution price (use limit price or estimated market price or fallback $150.0)
-        base_price = limit_price or estimated_market_price or 150.0
+        # Simulated execution price: use limit price, estimated price, existing position mark, or live Redis quote
+        existing_pos = self._positions.get(sym)
+        base_price = limit_price or estimated_market_price or (existing_pos.current_price if existing_pos else None)
+
+        if not base_price and self.redis:
+            try:
+                raw_redis = getattr(self.redis, "raw", self.redis)
+                quote_raw = await raw_redis.get(f"sentinel:quotes:latest:{sym}")
+                if quote_raw:
+                    quote_data = json.loads(quote_raw.decode("utf-8") if isinstance(quote_raw, bytes) else str(quote_raw))
+                    base_price = float(quote_data.get("price") or quote_data.get("close") or quote_data.get("last") or 0.0)
+            except Exception:
+                pass
+
+        if not base_price or base_price <= 0:
+            raise ValueError(f"Cannot execute paper order for {sym}: missing limit_price, estimated_market_price, or live quote.")
 
         # Apply slippage
         if side == OrderSide.BUY:

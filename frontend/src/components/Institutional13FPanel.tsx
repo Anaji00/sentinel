@@ -1,6 +1,6 @@
-"use client";
-
 import React, { useState, useEffect } from "react";
+import { ProvenanceBadge } from "./ProvenanceBadge";
+import { ProvenanceValue } from "./ProvenanceValue";
 
 interface Position {
   ticker?: string;
@@ -25,6 +25,8 @@ interface FilerSummary {
   holdings_count: number;
   top_10_concentration_pct: number;
   report_period: string;
+  is_synthetic?: boolean;
+  source_type?: string;
 }
 
 interface PortfolioReport extends FilerSummary {
@@ -34,6 +36,8 @@ interface PortfolioReport extends FilerSummary {
   decreased_positions: Position[];
   top_holdings: Position[];
   filing_url?: string;
+  is_synthetic?: boolean;
+  source_type?: string;
 }
 
 const DEFAULT_FILERS: FilerSummary[] = [
@@ -231,6 +235,10 @@ export const Institutional13FPanel: React.FC = () => {
           <div className="flex items-center gap-2">
             <span className="text-xl">🏛️</span>
             <h2 className="text-lg font-bold tracking-wide text-white">13F Institutional Intelligence & Ownership Flow</h2>
+            <ProvenanceBadge
+              sourceType={report?.source_type as any || (report?.is_synthetic ? "DISCLOSED_PLACEHOLDER" : "LIVE_MEASUREMENT")}
+              size="md"
+            />
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
             Quarterly SEC Form 13F-HR portfolio holdings & QoQ changes from premier asset managers
@@ -274,21 +282,33 @@ export const Institutional13FPanel: React.FC = () => {
       {report && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
-            <span className="text-[11px] text-slate-400 font-medium">Total Portfolio Value</span>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-slate-400 font-medium">Total Portfolio Value</span>
+              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "DISCLOSED_PLACEHOLDER" : "LIVE_MEASUREMENT")} size="sm" />
+            </div>
             <div className="text-base font-bold text-emerald-400 mt-0.5">
               ${(report.total_portfolio_value_usd / 1e9).toFixed(2)}B
             </div>
           </div>
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
-            <span className="text-[11px] text-slate-400 font-medium">Report Period</span>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-slate-400 font-medium">Report Period</span>
+              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "DISCLOSED_PLACEHOLDER" : "LIVE_MEASUREMENT")} size="sm" />
+            </div>
             <div className="text-base font-bold text-sky-400 mt-0.5">{report.report_period}</div>
           </div>
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
-            <span className="text-[11px] text-slate-400 font-medium">Holdings Count</span>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-slate-400 font-medium">Holdings Count</span>
+              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "DISCLOSED_PLACEHOLDER" : "LIVE_MEASUREMENT")} size="sm" />
+            </div>
             <div className="text-base font-bold text-slate-200 mt-0.5">{report.total_positions_count} positions</div>
           </div>
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
-            <span className="text-[11px] text-slate-400 font-medium">Top 10 Concentration</span>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-slate-400 font-medium">Top 10 Concentration</span>
+              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "DISCLOSED_PLACEHOLDER" : "LIVE_MEASUREMENT")} size="sm" />
+            </div>
             <div className="text-base font-bold text-purple-400 mt-0.5">{report.top_10_concentration_pct.toFixed(1)}%</div>
           </div>
         </div>

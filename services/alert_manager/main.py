@@ -105,6 +105,11 @@ class AlertManager:
 
     async def handle_scenario(self, scenario: Scenario):
         """Sends a follow-up intelligence briefing when the reasoning service finishes."""
+        dedup_key = f"alert:sent:scenario:{scenario.correlation_id}"
+        if await self._redis.raw.exists(dedup_key):
+            logger.debug(f"Deduplication skip: Scenario {scenario.correlation_id[:8]} already alerted")
+            return
+
         rule_name = "scenario"
         if not await self._check_rate_limit(rule_name):
             logger.warning(f"Rate limit reached for {rule_name} — sleeping 60s")
@@ -117,6 +122,7 @@ class AlertManager:
         success = await self._send_telegram(tg_text)
         if success:
             await self._record_alert_sent(rule_name)
+            await self._redis.raw.set(dedup_key, "1", ex=DEDUP_TTL)
             logger.info(f"!! [INTELLIGENCE_BRIEFING] Sent for correlation {scenario.correlation_id[:8]}")
         if WEBHOOK_URL:
             await self._send_webhook(scenario.model_dump(mode="json"))

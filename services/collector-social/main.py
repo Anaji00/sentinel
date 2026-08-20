@@ -240,6 +240,75 @@ async def poll_reddit_subreddit(
     return new_count
 
 
+# ── 3. CURATED X/TWITTER SYNDICATED POLLER ───────────────────────────────────
+
+async def poll_twitter_handle(
+    session: aiohttp.ClientSession,
+    producer: SentinelProducer,
+    dedup: SocialDeduplicator,
+    handle: str,
+    category: str,
+    reliability: float,
+) -> int:
+    """
+    Polls curated high-signal X/Twitter handles via public syndication/Nitter bridges.
+    Gracefully defers if upstream endpoints are unreachable or unconfigured.
+    """
+    new_count = 0
+    bridge_base = os.getenv("TWITTER_RSS_BRIDGE_URL", "https://nitter.net")
+    url = f"{bridge_base}/{handle}/rss"
+
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return 0
+            xml_text = await resp.text()
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+        items = root.findall(".//item")
+
+        for item in items[:10]:
+            title = (item.find("title").text if item.find("title") is not None else "").strip()
+            desc = (item.find("description").text if item.find("description") is not None else "").strip()
+            link = (item.find("link").text if item.find("link") is not None else f"https://x.com/{handle}").strip()
+            guid = (item.find("guid").text if item.find("guid") is not None else link).strip()
+
+            if not title and not desc:
+                continue
+
+            item_key = f"twitter:{handle}:{guid}"
+            if await dedup.is_seen(item_key):
+                continue
+
+            await dedup.mark_seen(item_key)
+
+            clean_text = re.sub(r"<[^>]+>", "", desc or title).strip()
+            event = RawEvent(
+                source="twitter",
+                occurred_at=datetime.now(timezone.utc),
+                raw_payload={
+                    "title": title or clean_text[:80],
+                    "summary": clean_text[:800],
+                    "url": link,
+                    "author": f"@{handle}",
+                    "platform": "twitter",
+                    "source_type": "primary_social",
+                    "category": category,
+                    "reliability": reliability,
+                    "epistemic_confidence": reliability,
+                    "tags": ["social", "twitter", f"@{handle}", category],
+                }
+            )
+            await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=handle)
+            new_count += 1
+
+    except Exception as e:
+        logger.debug(f"X/Twitter poll notice for @{handle}: {e}")
+
+    return new_count
+
+
 # ── MAIN ORCHESTRATION ───────────────────────────────────────────────────────
 
 async def collect_social_cycle(
@@ -247,7 +316,7 @@ async def collect_social_cycle(
     producer: SentinelProducer,
     dedup: SocialDeduplicator,
 ) -> int:
-    """Executes a full social polling cycle across Telegram and Reddit."""
+    """Executes a full social polling cycle across Telegram, Reddit, and curated X feeds."""
     tasks = []
 
     for channel, cat, rel in TELEGRAM_CHANNELS:
@@ -255,6 +324,9 @@ async def collect_social_cycle(
 
     for sub, cat, rel in REDDIT_SUBREDDITS:
         tasks.append(poll_reddit_subreddit(session, producer, dedup, sub, cat, rel))
+
+    for handle, cat, rel in TWITTER_HANDLES:
+        tasks.append(poll_twitter_handle(session, producer, dedup, handle, cat, rel))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     total_new = sum(r for r in results if isinstance(r, int))
@@ -264,7 +336,7 @@ async def collect_social_cycle(
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL Social & Primary-Source OSINT Collector")
-    logger.info(f"Telegram Channels: {len(TELEGRAM_CHANNELS)} | Subreddits: {len(REDDIT_SUBREDDITS)}")
+    logger.info(f"Telegram Channels: {len(TELEGRAM_CHANNELS)} | Subreddits: {len(REDDIT_SUBREDDITS)} | Curated X Feeds: {len(TWITTER_HANDLES)}")
     logger.info("=" * 60)
 
     producer = SentinelProducer()

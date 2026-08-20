@@ -6,6 +6,8 @@ import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import ExplainabilityModal from './ExplainabilityModal';
+import { ProvenanceBadge } from './ProvenanceBadge';
+import { ProvenanceValue } from './ProvenanceValue';
 
 interface TechnicalIndicators {
   rsi?: number;
@@ -200,21 +202,53 @@ export default function FinancialAdvisorAdvice() {
       <div className="p-3.5 space-y-3 flex-1 overflow-y-auto font-mono text-xs">
         {/* Portfolio Risk Telemetry HUD */}
         <div className="grid grid-cols-4 gap-2 bg-[#06080d] p-2.5 rounded-xl border border-cyan-500/20 text-[10px]">
-          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
-            <span className="text-slate-500 block">PORTFOLIO VaR (95%)</span>
-            <span className="text-cyan-400 font-bold">{metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? `${metrics.var_95_pct}%` : '--'}</span>
+          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500 block text-[9px]">PORTFOLIO VaR (95%)</span>
+              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+            </div>
+            <ProvenanceValue
+              value={metrics?.var_95_pct}
+              sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
+              format="percentage"
+              className="text-cyan-400 font-bold"
+            />
           </div>
-          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
-            <span className="text-slate-500 block">SHARPE RATIO</span>
-            <span className="text-emerald-400 font-bold">{metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? `${metrics.sharpe_ratio}x` : '--'}</span>
+          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500 block text-[9px]">SHARPE RATIO</span>
+              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+            </div>
+            <ProvenanceValue
+              value={metrics?.sharpe_ratio}
+              sourceType={metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
+              format="multiple"
+              className="text-emerald-400 font-bold"
+            />
           </div>
-          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
-            <span className="text-slate-500 block">CASH BUFFER</span>
-            <span className="text-amber-400 font-bold">{metrics?.recommended_cash_pct !== undefined ? `${metrics.recommended_cash_pct}%` : '--'}</span>
+          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500 block text-[9px]">CASH BUFFER</span>
+              <ProvenanceBadge sourceType={metrics?.recommended_cash_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+            </div>
+            <ProvenanceValue
+              value={metrics?.recommended_cash_pct}
+              sourceType={metrics?.recommended_cash_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
+              format="percentage"
+              className="text-amber-400 font-bold"
+            />
           </div>
-          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800">
-            <span className="text-slate-500 block">HAWKES FACTOR</span>
-            <span className="text-purple-400 font-bold">{metrics?.hawkes_risk_factor !== undefined ? `${metrics.hawkes_risk_factor}x` : '--'}</span>
+          <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500 block text-[9px]">HAWKES FACTOR</span>
+              <ProvenanceBadge sourceType={metrics?.hawkes_risk_factor !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+            </div>
+            <ProvenanceValue
+              value={metrics?.hawkes_risk_factor}
+              sourceType={metrics?.hawkes_risk_factor !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
+              format="multiple"
+              className="text-purple-400 font-bold"
+            />
           </div>
         </div>
 

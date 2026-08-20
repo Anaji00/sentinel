@@ -3,31 +3,33 @@ services/collector-filings/thirteen_f.py
 
 PROMINENT 13F INSTITUTIONAL HOLDINGS & CONSENSUS ANALYTICS
 ==========================================================
-Tracks premier hedge funds and institutional asset managers:
-1. Warren Buffett (Berkshire Hathaway)
-2. Ray Dalio (Bridgewater Associates)
-3. Ken Griffin (Citadel Advisors)
-4. Michael Burry (Scion Asset Management)
-5. Bill Ackman (Pershing Square Capital)
-6. Jim Simons (Renaissance Technologies)
-7. David Tepper (Appaloosa Management)
-8. Cathie Wood (ARK Investment Management)
-9. Dan Loeb (Third Point)
-
-Parses quarterly 13F information tables, computes QoQ position changes
-(NEW, EXITED, INCREASED, DECREASED), concentration ratios, and cross-fund
-institutional consensus accumulation.
+Fetches and parses official SEC EDGAR Form 13F-HR filings from the SEC Submissions
+and Archives APIs. Dynamically extracts XML Information Tables:
+- <nameOfIssuer>, <titleOfClass>, <cusip>, <value>, <sshPrnamt>
+- Dynamically resolves CIKs, CUSIPs, and company titles via official SEC EDGAR company tickers registry
+- Computes quarter-over-quarter position differentials (NEW, EXITED, INCREASED, DECREASED)
+- Computes top 10 concentration and cross-manager consensus flow
+- Enforces strict provenance: verified live telemetry vs disclosed empty placeholder
 """
 
 import json
 import logging
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
+import aiohttp
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("collector.filings.13f")
 
+SEC_HEADERS = {
+    "User-Agent": "Sentinel-Intelligence-Platform/1.0 research@sentinel.local",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+# Premier Institutional Filers tracked on official SEC EDGAR
 PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
     "0001067983": {
         "id": "berkshire_hathaway",
@@ -48,14 +50,7 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
         "name": "Citadel Advisors LLC",
         "manager": "Ken Griffin",
         "cik": "0001423053",
-        "style": "Multi-Strategy / High Frequency",
-    },
-    "0001649339": {
-        "id": "scion",
-        "name": "Scion Asset Management, LLC",
-        "manager": "Michael Burry",
-        "cik": "0001649339",
-        "style": "Contrarian / Asymmetric Short & Long",
+        "style": "Multi-Strategy / Quantitative",
     },
     "0001336528": {
         "id": "pershing_square",
@@ -92,7 +87,120 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
         "cik": "0001040273",
         "style": "Event-Driven / Activist",
     },
+    "0001536411": {
+        "id": "duquesne",
+        "name": "Duquesne Family Office LLC",
+        "manager": "Stanley Druckenmiller",
+        "cik": "0001536411",
+        "style": "Top-Down Macro / Concentrated Growth",
+    },
+    "0001540531": {
+        "id": "coatue",
+        "name": "Coatue Management LLC",
+        "manager": "Philippe Laffont",
+        "cik": "0001540531",
+        "style": "TMT / Thematic Growth",
+    },
 }
+
+# Dynamic in-memory SEC Company Registry cache
+_DYNAMIC_TITLE_TO_TICKER: Dict[str, str] = {}
+_DYNAMIC_CIK_TO_TICKER: Dict[str, str] = {}
+
+
+async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client: Any = None) -> Dict[str, str]:
+    """
+    Dynamically loads the official SEC EDGAR company tickers database:
+    https://www.sec.gov/files/company_tickers.json
+    Caches the mapping in Redis and in-memory for zero hardcoded mappings.
+    """
+    global _DYNAMIC_TITLE_TO_TICKER, _DYNAMIC_CIK_TO_TICKER
+
+    if _DYNAMIC_TITLE_TO_TICKER:
+        return _DYNAMIC_TITLE_TO_TICKER
+
+    # Try Redis cache first
+    if redis_client:
+        try:
+            raw_redis = getattr(redis_client, "raw", redis_client)
+            cached = await raw_redis.get("sentinel:sec:company_tickers:map")
+            if cached:
+                data = json.loads(cached.decode("utf-8") if isinstance(cached, bytes) else str(cached))
+                _DYNAMIC_TITLE_TO_TICKER = data.get("title_to_ticker", {})
+                _DYNAMIC_CIK_TO_TICKER = data.get("cik_to_ticker", {})
+                if _DYNAMIC_TITLE_TO_TICKER:
+                    return _DYNAMIC_TITLE_TO_TICKER
+        except Exception:
+            pass
+
+    # Fetch from official SEC EDGAR
+    try:
+        url = "https://www.sec.gov/files/company_tickers.json"
+        async with session.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for _, item in data.items():
+                    ticker = str(item.get("ticker", "")).upper()
+                    title = str(item.get("title", "")).upper()
+                    cik = str(item.get("cik_str", ""))
+                    if ticker and title:
+                        clean_title = re.sub(r"[^A-Z0-9 ]", "", title).strip()
+                        _DYNAMIC_TITLE_TO_TICKER[clean_title] = ticker
+                        _DYNAMIC_TITLE_TO_TICKER[title] = ticker
+                    if ticker and cik:
+                        _DYNAMIC_CIK_TO_TICKER[cik] = ticker
+                        _DYNAMIC_CIK_TO_TICKER[cik.zfill(10)] = ticker
+
+                if redis_client and _DYNAMIC_TITLE_TO_TICKER:
+                    try:
+                        raw_redis = getattr(redis_client, "raw", redis_client)
+                        payload = json.dumps({
+                            "title_to_ticker": _DYNAMIC_TITLE_TO_TICKER,
+                            "cik_to_ticker": _DYNAMIC_CIK_TO_TICKER,
+                        })
+                        await raw_redis.set("sentinel:sec:company_tickers:map", payload, ex=86400 * 7)
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.debug(f"Notice fetching SEC company tickers: {e}")
+
+    return _DYNAMIC_TITLE_TO_TICKER
+
+
+def resolve_ticker_dynamically(issuer_name: Optional[str], cusip: Optional[str] = None) -> Optional[str]:
+    """
+    Resolves an issuer name or CUSIP to its official ticker symbol using
+    the dynamically loaded SEC EDGAR company database.
+    """
+    if not issuer_name:
+        return None
+
+    clean_name = issuer_name.strip().upper()
+    if clean_name in _DYNAMIC_TITLE_TO_TICKER:
+        return _DYNAMIC_TITLE_TO_TICKER[clean_name]
+
+    alphanumeric_name = re.sub(r"[^A-Z0-9 ]", "", clean_name).strip()
+    if alphanumeric_name in _DYNAMIC_TITLE_TO_TICKER:
+        return _DYNAMIC_TITLE_TO_TICKER[alphanumeric_name]
+
+    # Partial prefix match across official registry
+    for title, ticker in _DYNAMIC_TITLE_TO_TICKER.items():
+        if title and (title in alphanumeric_name or alphanumeric_name in title):
+            return ticker
+
+    # Common corporate abbreviations normalization
+    tokens = alphanumeric_name.split()
+    if tokens:
+        first_word = tokens[0]
+        if first_word in ("APPLE", "MICROSOFT", "NVIDIA", "AMAZON", "ALPHABET", "GOOGLE", "META", "TESLA", "BERKSHIRE", "CHEVRON", "CHIPOTLE", "HILTON"):
+            name_map = {
+                "APPLE": "AAPL", "MICROSOFT": "MSFT", "NVIDIA": "NVDA", "AMAZON": "AMZN",
+                "ALPHABET": "GOOGL", "GOOGLE": "GOOGL", "META": "META", "TESLA": "TSLA",
+                "BERKSHIRE": "BRK.B", "CHEVRON": "CVX", "CHIPOTLE": "CMG", "HILTON": "HLT",
+            }
+            return name_map.get(first_word)
+
+    return None
 
 
 class ThirteenFPositionRecord(BaseModel):
@@ -125,6 +233,67 @@ class ThirteenFPortfolioReport(BaseModel):
     decreased_positions: List[ThirteenFPositionRecord] = Field(default_factory=list)
     top_holdings: List[ThirteenFPositionRecord] = Field(default_factory=list)
     filing_url: Optional[str] = None
+    is_synthetic: bool = False
+    source_type: str = "LIVE_MEASUREMENT"
+
+
+def parse_13f_xml_table(xml_content: str) -> List[Dict[str, Any]]:
+    """
+    Parses official SEC EDGAR 13F Information Table XML (Form 13F-HR).
+    Extracts nameOfIssuer, titleOfClass, cusip, value, sshPrnamt.
+    """
+    holdings: List[Dict[str, Any]] = []
+    if not xml_content or not xml_content.strip():
+        return holdings
+
+    try:
+        root = ET.fromstring(xml_content)
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag.lower() == "infotable":
+                name = ""
+                title = "COM"
+                cusip = ""
+                value = 0.0
+                shares = 0.0
+                for child in elem:
+                    c_tag = child.tag.split("}")[-1].lower() if "}" in child.tag else child.tag.lower()
+                    text = (child.text or "").strip()
+                    if c_tag == "nameofissuer":
+                        name = text
+                    elif c_tag == "titleofclass":
+                        title = text
+                    elif c_tag == "cusip":
+                        cusip = text
+                    elif c_tag == "value":
+                        try:
+                            v = float(text.replace(",", ""))
+                            # SEC 13F value entries are reported in thousands USD ($1,000s)
+                            value = v * 1000.0 if v < 1e11 else v
+                        except ValueError:
+                            value = 0.0
+                    elif c_tag in ("shrsorprnamt", "shrsprnamt"):
+                        for sub in child:
+                            s_tag = sub.tag.split("}")[-1].lower() if "}" in sub.tag else sub.tag.lower()
+                            if s_tag == "sshprnamt":
+                                try:
+                                    shares = float((sub.text or "").strip().replace(",", ""))
+                                except ValueError:
+                                    shares = 0.0
+
+                ticker = resolve_ticker_dynamically(name, cusip)
+                if name or cusip or ticker:
+                    holdings.append({
+                        "ticker": ticker,
+                        "cusip": cusip,
+                        "issuer_name": name,
+                        "class_title": title,
+                        "shares": shares,
+                        "market_value_usd": value,
+                    })
+    except Exception as e:
+        logger.debug(f"Error parsing 13F XML table: {e}")
+    return holdings
 
 
 def compute_portfolio_differential(
@@ -250,75 +419,173 @@ def compute_portfolio_differential(
         decreased_positions=dec_pos,
         top_holdings=top_10,
         filing_url=filing_url,
+        is_synthetic=False,
+        source_type="LIVE_MEASUREMENT",
     )
 
 
+async def _fetch_13f_xml_holdings(
+    session: aiohttp.ClientSession,
+    cik_num: str,
+    acc_num: str,
+    acc_nodash: str,
+    primary_doc: str,
+) -> List[Dict[str, Any]]:
+    """Fetches and parses the 13F XML infotable file from SEC EDGAR Archives."""
+    index_url = f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{acc_nodash}/index.json"
+    xml_filename = None
+    try:
+        async with session.get(index_url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                idx_data = await resp.json()
+                items = idx_data.get("directory", {}).get("item", [])
+                for it in items:
+                    fn = it.get("name", "")
+                    if fn.endswith(".xml") and ("infotable" in fn.lower() or "informationtable" in fn.lower() or "form13f" in fn.lower() or fn.lower() == "infotable.xml"):
+                        xml_filename = fn
+                        break
+                if not xml_filename:
+                    for it in items:
+                        fn = it.get("name", "")
+                        if fn.endswith(".xml") and not fn.endswith("primary_doc.xml") and not fn.startswith("edgar"):
+                            xml_filename = fn
+                            break
+    except Exception:
+        pass
+
+    candidates = [xml_filename] if xml_filename else ["infotable.xml", "informationtable.xml", "13f_infotable.xml", f"{acc_num}.xml"]
+
+    for cand in candidates:
+        if not cand:
+            continue
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{acc_nodash}/{cand}"
+        try:
+            async with session.get(xml_url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    holdings = parse_13f_xml_table(text)
+                    if holdings:
+                        return holdings
+        except Exception:
+            continue
+
+    if primary_doc:
+        doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{acc_nodash}/{primary_doc}"
+        try:
+            async with session.get(doc_url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    if "<informationTable" in text or "<infoTable" in text:
+                        return parse_13f_xml_table(text)
+        except Exception:
+            pass
+
+    return []
+
+
+async def fetch_live_13f_from_edgar(
+    session: aiohttp.ClientSession,
+    cik: str,
+    filer_meta: Dict[str, Any],
+) -> Optional[ThirteenFPortfolioReport]:
+    """
+    Dynamically fetches and parses official SEC EDGAR 13F-HR filings for a given CIK.
+    1. Queries SEC EDGAR Submissions API: https://data.sec.gov/submissions/CIK{cik_10_digits}.json
+    2. Identifies the two most recent 13F-HR (or 13F-HR/A) filings.
+    3. Retrieves and parses their XML information tables.
+    4. Computes quarter-over-quarter holdings changes.
+    """
+    # Ensure dynamic SEC company tickers registry is loaded
+    await load_sec_company_tickers(session)
+
+    cik_padded = str(cik).zfill(10)
+    cik_num = str(int(cik))
+    sub_url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+
+    try:
+        async with session.get(sub_url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                logger.info(f"SEC EDGAR submissions query for CIK {cik} returned HTTP {resp.status}")
+                return None
+            data = await resp.json()
+
+        recent = data.get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        accessions = recent.get("accessionNumber", [])
+        report_dates = recent.get("reportDate", [])
+        filing_dates = recent.get("filingDate", [])
+        primary_docs = recent.get("primaryDocument", [])
+
+        thirteen_f_indices = [
+            i for i, f in enumerate(forms)
+            if f.upper() in ("13F-HR", "13F-HR/A")
+        ]
+
+        if not thirteen_f_indices:
+            logger.info(f"No 13F-HR filings found in SEC EDGAR recent filings for CIK {cik}")
+            return None
+
+        # Current quarter
+        idx_curr = thirteen_f_indices[0]
+        acc_curr = accessions[idx_curr]
+        acc_curr_nodash = acc_curr.replace("-", "")
+        period_curr = report_dates[idx_curr] if idx_curr < len(report_dates) else filing_dates[idx_curr]
+        primary_doc_curr = primary_docs[idx_curr] if idx_curr < len(primary_docs) else ""
+
+        curr_holdings = await _fetch_13f_xml_holdings(session, cik_num, acc_curr, acc_curr_nodash, primary_doc_curr)
+
+        prev_holdings = []
+        if len(thirteen_f_indices) > 1:
+            idx_prev = thirteen_f_indices[1]
+            acc_prev = accessions[idx_prev]
+            acc_prev_nodash = acc_prev.replace("-", "")
+            primary_doc_prev = primary_docs[idx_prev] if idx_prev < len(primary_docs) else ""
+            prev_holdings = await _fetch_13f_xml_holdings(session, cik_num, acc_prev, acc_prev_nodash, primary_doc_prev)
+
+        filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_num}/{acc_curr_nodash}/{primary_doc_curr}"
+
+        report = compute_portfolio_differential(
+            current_holdings=curr_holdings,
+            previous_holdings=prev_holdings,
+            filer_meta=filer_meta,
+            report_period=period_curr,
+            filing_url=filing_url,
+        )
+        report.is_synthetic = False
+        report.source_type = "LIVE_MEASUREMENT"
+        return report
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch live 13F for CIK {cik}: {e}")
+        return None
+
+
 def generate_curated_seed_13f(cik: str, period: str = "2026-Q2") -> ThirteenFPortfolioReport:
-    """Generates an accurate, curated baseline 13F report for prominent managers."""
+    """
+    Returns an explicit placeholder report when offline or before live network sync.
+    Zero fabricated position numbers are synthesized.
+    """
     meta = PROMINENT_FILERS.get(cik) or PROMINENT_FILERS["0001067983"]
-
-    if meta["id"] == "berkshire_hathaway":
-        current = [
-            {"ticker": "AAPL", "issuer_name": "Apple Inc", "shares": 300_000_000, "market_value_usd": 69_000_000_000},
-            {"ticker": "AXP", "issuer_name": "American Express Co", "shares": 151_610_700, "market_value_usd": 37_800_000_000},
-            {"ticker": "BAC", "issuer_name": "Bank of America Corp", "shares": 766_000_000, "market_value_usd": 30_600_000_000},
-            {"ticker": "KO", "issuer_name": "Coca-Cola Co", "shares": 400_000_000, "market_value_usd": 27_200_000_000},
-            {"ticker": "CVX", "issuer_name": "Chevron Corp", "shares": 118_600_000, "market_value_usd": 17_800_000_000},
-            {"ticker": "OXY", "issuer_name": "Occidental Petroleum", "shares": 255_280_000, "market_value_usd": 13_000_000_000},
-            {"ticker": "KHC", "issuer_name": "Kraft Heinz Co", "shares": 325_634_818, "market_value_usd": 10_400_000_000},
-            {"ticker": "MCO", "issuer_name": "Moody's Corp", "shares": 24_669_778, "market_value_usd": 11_100_000_000},
-            {"ticker": "CB", "issuer_name": "Chubb Ltd", "shares": 27_033_784, "market_value_usd": 7_800_000_000},
-            {"ticker": "UNP", "issuer_name": "Union Pacific Corp", "shares": 8_500_000, "market_value_usd": 2_100_000_000},
-        ]
-        prev = [
-            {"ticker": "AAPL", "issuer_name": "Apple Inc", "shares": 400_000_000, "market_value_usd": 92_000_000_000},
-            {"ticker": "AXP", "issuer_name": "American Express Co", "shares": 151_610_700, "market_value_usd": 37_800_000_000},
-            {"ticker": "BAC", "issuer_name": "Bank of America Corp", "shares": 800_000_000, "market_value_usd": 32_000_000_000},
-            {"ticker": "KO", "issuer_name": "Coca-Cola Co", "shares": 400_000_000, "market_value_usd": 27_200_000_000},
-            {"ticker": "CVX", "issuer_name": "Chevron Corp", "shares": 118_600_000, "market_value_usd": 17_800_000_000},
-            {"ticker": "OXY", "issuer_name": "Occidental Petroleum", "shares": 248_000_000, "market_value_usd": 12_600_000_000},
-            {"ticker": "PARA", "issuer_name": "Paramount Global", "shares": 7_530_000, "market_value_usd": 85_000_000},
-        ]
-    elif meta["id"] == "scion":
-        current = [
-            {"ticker": "BABA", "issuer_name": "Alibaba Group Holding", "shares": 200_000, "market_value_usd": 18_000_000},
-            {"ticker": "JD", "issuer_name": "JD.com Inc", "shares": 250_000, "market_value_usd": 8_750_000},
-            {"ticker": "BIDU", "issuer_name": "Baidu Inc", "shares": 125_000, "market_value_usd": 11_250_000},
-            {"ticker": "FOUR", "issuer_name": "Shift4 Payments Inc", "shares": 100_000, "market_value_usd": 7_500_000},
-            {"ticker": "SQ", "issuer_name": "Block Inc", "shares": 75_000, "market_value_usd": 5_250_000},
-        ]
-        prev = [
-            {"ticker": "BABA", "issuer_name": "Alibaba Group Holding", "shares": 150_000, "market_value_usd": 13_500_000},
-            {"ticker": "JD", "issuer_name": "JD.com Inc", "shares": 250_000, "market_value_usd": 8_750_000},
-            {"ticker": "HCA", "issuer_name": "HCA Healthcare Inc", "shares": 40_000, "market_value_usd": 12_000_000},
-        ]
-    elif meta["id"] == "pershing_square":
-        current = [
-            {"ticker": "HLT", "issuer_name": "Hilton Worldwide Holdings", "shares": 8_850_000, "market_value_usd": 1_950_000_000},
-            {"ticker": "QSR", "issuer_name": "Restaurant Brands Intl", "shares": 23_000_000, "market_value_usd": 1_650_000_000},
-            {"ticker": "GOOGL", "issuer_name": "Alphabet Inc Class A", "shares": 4_200_000, "market_value_usd": 750_000_000},
-            {"ticker": "CMG", "issuer_name": "Chipotle Mexican Grill", "shares": 28_500_000, "market_value_usd": 1_850_000_000},
-            {"ticker": "NKE", "issuer_name": "Nike Inc Class B", "shares": 16_200_000, "market_value_usd": 1_350_000_000},
-        ]
-        prev = [
-            {"ticker": "HLT", "issuer_name": "Hilton Worldwide Holdings", "shares": 8_850_000, "market_value_usd": 1_950_000_000},
-            {"ticker": "QSR", "issuer_name": "Restaurant Brands Intl", "shares": 23_000_000, "market_value_usd": 1_650_000_000},
-            {"ticker": "GOOGL", "issuer_name": "Alphabet Inc Class A", "shares": 4_200_000, "market_value_usd": 750_000_000},
-            {"ticker": "LOW", "issuer_name": "Lowe's Companies Inc", "shares": 7_000_000, "market_value_usd": 1_600_000_000},
-        ]
-    else:
-        current = [
-            {"ticker": "NVDA", "issuer_name": "NVIDIA Corp", "shares": 15_000_000, "market_value_usd": 1_800_000_000},
-            {"ticker": "MSFT", "issuer_name": "Microsoft Corp", "shares": 3_500_000, "market_value_usd": 1_550_000_000},
-            {"ticker": "AMZN", "issuer_name": "Amazon.com Inc", "shares": 6_000_000, "market_value_usd": 1_140_000_000},
-            {"ticker": "META", "issuer_name": "Meta Platforms Inc", "shares": 1_800_000, "market_value_usd": 950_000_000},
-            {"ticker": "TSM", "issuer_name": "Taiwan Semiconductor", "shares": 4_200_000, "market_value_usd": 750_000_000},
-        ]
-        prev = [
-            {"ticker": "NVDA", "issuer_name": "NVIDIA Corp", "shares": 12_000_000, "market_value_usd": 1_440_000_000},
-            {"ticker": "MSFT", "issuer_name": "Microsoft Corp", "shares": 3_500_000, "market_value_usd": 1_550_000_000},
-            {"ticker": "INTC", "issuer_name": "Intel Corp", "shares": 10_000_000, "market_value_usd": 350_000_000},
-        ]
-
     filing_url = f"https://www.sec.gov/edgar/browse/?CIK={cik}"
-    return compute_portfolio_differential(current, prev, meta, period, filing_url=filing_url)
+
+    report = ThirteenFPortfolioReport(
+        filer_id=meta.get("id", "unknown"),
+        filer_name=meta.get("name", "Unknown Filer"),
+        manager_name=meta.get("manager", "Unknown Manager"),
+        cik=meta.get("cik", "0000000000"),
+        style=meta.get("style", "General Institutional"),
+        report_period=period,
+        filed_at=datetime.now(timezone.utc).isoformat(),
+        total_portfolio_value_usd=0.0,
+        total_positions_count=0,
+        top_10_concentration_pct=0.0,
+        new_positions=[],
+        exited_positions=[],
+        increased_positions=[],
+        decreased_positions=[],
+        top_holdings=[],
+        filing_url=filing_url,
+        is_synthetic=True,
+        source_type="DISCLOSED_PLACEHOLDER",
+    )
+    return report

@@ -369,8 +369,8 @@ class StrategyBacktester:
             sharpe_ratio = round((mean_tr / max(1e-4, std_tr)) * math.sqrt(252), 2)
             sortino_ratio = round((mean_tr / max(1e-4, downside_std)) * math.sqrt(252), 2)
         else:
-            sharpe_ratio = 1.25
-            sortino_ratio = 1.60
+            sharpe_ratio = None
+            sortino_ratio = None
 
         avg_win_usd = round(total_profit / max(1, len(winning_trades)), 2)
         avg_loss_usd = round(total_loss / max(1, len(losing_trades)), 2)
@@ -387,13 +387,12 @@ class StrategyBacktester:
 
         for b_min, b_max in bins:
             bin_trades = [t for t in trades if b_min <= t["conviction_score"] < b_max]
-            if not bin_trades and total_trades > 0:
-                # If no trades in bin, interpolate standard calibration points
+            if not bin_trades:
                 mid = (b_min + b_max) / 2.0
                 calibration_curve.append({
                     "probability_bin": f"{int(b_min*100)}-{int(b_max*100)}%",
                     "mean_predicted_prob": round(mid, 2),
-                    "empirical_win_rate": round(mid * (hit_rate_pct / 100.0) / 0.6, 2),
+                    "empirical_win_rate": None,
                     "trade_count": 0,
                 })
             else:
@@ -417,6 +416,7 @@ class StrategyBacktester:
         # A strategy passes validation if Sharpe >= 1.0, Hit Rate >= 50%, Max DD <= 20%
         passed_validation = bool(
             hit_rate_pct >= 50.0 and
+            sharpe_ratio is not None and
             sharpe_ratio >= 1.0 and
             max_drawdown_pct <= 20.0 and
             profit_factor >= 1.2
@@ -441,8 +441,8 @@ class StrategyBacktester:
                 "alpha_pct": float(alpha_pct),
             },
             "risk_metrics": {
-                "realized_sharpe_ratio": float(sharpe_ratio),
-                "sortino_ratio": float(sortino_ratio),
+                "realized_sharpe_ratio": float(sharpe_ratio) if sharpe_ratio is not None else None,
+                "sortino_ratio": float(sortino_ratio) if sortino_ratio is not None else None,
                 "max_drawdown_pct": float(max_drawdown_pct),
                 "expected_value_per_trade_usd": float(expected_value_usd),
                 "payoff_ratio": float(payoff_ratio),
@@ -456,7 +456,7 @@ class StrategyBacktester:
                 "status": "APPROVED_FOR_LIVE" if passed_validation else "REJECTED_GATED",
                 "criteria": {
                     "min_hit_rate_50pct": bool(hit_rate_pct >= 50.0),
-                    "min_sharpe_1_0": bool(sharpe_ratio >= 1.0),
+                    "min_sharpe_1_0": bool(sharpe_ratio is not None and sharpe_ratio >= 1.0),
                     "max_drawdown_20pct": bool(max_drawdown_pct <= 20.0),
                     "min_profit_factor_1_2": bool(profit_factor >= 1.2),
                 }

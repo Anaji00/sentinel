@@ -42,7 +42,9 @@ thirteen_f_mod = importlib.util.module_from_spec(spec_tf)
 spec_tf.loader.exec_module(thirteen_f_mod)
 
 PROMINENT_FILERS = thirteen_f_mod.PROMINENT_FILERS
+parse_13f_xml_table = thirteen_f_mod.parse_13f_xml_table
 compute_portfolio_differential = thirteen_f_mod.compute_portfolio_differential
+fetch_live_13f_from_edgar = thirteen_f_mod.fetch_live_13f_from_edgar
 generate_curated_seed_13f = thirteen_f_mod.generate_curated_seed_13f
 
 freight_path = Path(__file__).resolve().parents[1] / "services" / "collector-macro" / "freight.py"
@@ -101,10 +103,8 @@ class MockRedis:
         return [item[0] for item in slice_items]
 
     async def zremrangebyscore(self, key, min_score, max_score):
-        z = self.zsets.get(key, {})
-        to_del = [k for k, v in z.items() if min_score <= v <= max_score]
-        for k in to_del:
-            del z[k]
+        if key in self.zsets:
+            self.zsets[key] = {k: v for k, v in self.zsets[key].items() if not (min_score <= v <= max_score)}
 
     async def sadd(self, key, member):
         if key not in self.sets:
@@ -114,13 +114,16 @@ class MockRedis:
     async def smembers(self, key):
         return self.sets.get(key, set())
 
+    async def publish(self, channel, message):
+        return 1
+
     def pipeline(self):
         return MockPipeline(self)
 
 
 class MockPipeline:
-    def __init__(self, mock_redis):
-        self.redis = mock_redis
+    def __init__(self, redis):
+        self.redis = redis
         self.ops = []
 
     def set(self, key, value, ex=None):
@@ -174,18 +177,56 @@ def test_sec_edgar_filings_collector():
 # ── 2. 13F INSTITUTIONAL HOLDINGS & DIFFERENTIAL TESTS (§2.1) ─────────────────
 
 def test_13f_portfolio_differential_and_consensus():
-    filer_meta = PROMINENT_FILERS["0001067983"]  # Berkshire Hathaway
-    report = generate_curated_seed_13f("0001067983", "2026-Q2")
+    # 1. Real SEC EDGAR XML Infotable Parsing
+    sec_xml_sample = """<?xml version="1.0" encoding="UTF-8"?>
+    <informationTable xmlns="http://www.sec.gov/edgar/thirteenf/informationtable">
+        <infoTable>
+            <nameOfIssuer>APPLE INC</nameOfIssuer>
+            <titleOfClass>COM</titleOfClass>
+            <cusip>037833100</cusip>
+            <value>69000000</value>
+            <shrsOrPrnAmt>
+                <sshPrnamt>300000000</sshPrnamt>
+                <sshPrnamtType>SH</sshPrnamtType>
+            </shrsOrPrnAmt>
+            <investmentDiscretion>SOLE</investmentDiscretion>
+        </infoTable>
+        <infoTable>
+            <nameOfIssuer>MICROSOFT CORP</nameOfIssuer>
+            <titleOfClass>COM</titleOfClass>
+            <cusip>594918104</cusip>
+            <value>15500000</value>
+            <shrsOrPrnAmt>
+                <sshPrnamt>35000000</sshPrnamt>
+                <sshPrnamtType>SH</sshPrnamtType>
+            </shrsOrPrnAmt>
+            <investmentDiscretion>SOLE</investmentDiscretion>
+        </infoTable>
+    </informationTable>"""
+
+    holdings = parse_13f_xml_table(sec_xml_sample)
+    assert len(holdings) == 2
+    assert holdings[0]["ticker"] == "AAPL"
+    assert holdings[0]["shares"] == 300_000_000
+    assert holdings[0]["market_value_usd"] == 69_000_000_000
+    assert holdings[1]["ticker"] == "MSFT"
+    assert holdings[1]["shares"] == 35_000_000
+
+    # 2. Differential Computation Across Periods
+    prev_holdings = [
+        {"ticker": "AAPL", "cusip": "037833100", "issuer_name": "APPLE INC", "shares": 350_000_000, "market_value_usd": 80_500_000_000},
+        {"ticker": "GOOGL", "cusip": "02079K305", "issuer_name": "ALPHABET INC", "shares": 10_000_000, "market_value_usd": 1_800_000_000},
+    ]
+    filer_meta = PROMINENT_FILERS["0001067983"]
+    report = compute_portfolio_differential(holdings, prev_holdings, filer_meta, "2026-Q2")
 
     assert report.filer_id == "berkshire_hathaway"
-    assert report.manager_name == "Warren Buffett"
-    assert report.total_portfolio_value_usd > 200_000_000_000
-    assert len(report.top_holdings) > 0
-    assert report.top_10_concentration_pct > 70.0
-
-    # Verify positions have valid change_type
-    for pos in report.top_holdings:
-        assert pos.change_type in ("NEW", "INCREASED", "DECREASED", "EXITED", "MAINTAINED")
+    assert report.total_portfolio_value_usd == 84_500_000_000
+    assert report.is_synthetic is False
+    assert report.source_type == "LIVE_MEASUREMENT"
+    assert any(p.ticker == "MSFT" and p.change_type == "NEW" for p in report.new_positions)
+    assert any(p.ticker == "AAPL" and p.change_type == "DECREASED" for p in report.decreased_positions)
+    assert any(p.ticker == "GOOGL" and p.change_type == "EXITED" for p in report.exited_positions)
 
 
 from services.api_gateway.dependencies import create_jwt_token
@@ -200,32 +241,31 @@ def get_auth_cookies():
 def test_filings_api_gateway_routes():
     client = TestClient(app)
     cookies = get_auth_cookies()
-    headers = {"X-User-Role": "ANALYST"}
 
     # 1. Latest corporate filings
-    res_latest = client.get("/api/v1/filings/latest", cookies=cookies, headers=headers)
+    res_latest = client.get("/api/v1/filings/latest", cookies=cookies)
     assert res_latest.status_code == 200
     filings = res_latest.json()
     assert len(filings) > 0
     assert filings[0]["ticker"] in ("NVDA", "AAPL", "MSFT", "TSLA")
 
     # 2. Prominent 13F filers summary
-    res_prominent = client.get("/api/v1/filings/13f/prominent", cookies=cookies, headers=headers)
+    res_prominent = client.get("/api/v1/filings/13f/prominent", cookies=cookies)
     assert res_prominent.status_code == 200
     filers = res_prominent.json()
     assert len(filers) >= 6
     manager_names = [f["manager_name"] for f in filers]
     assert any("Buffett" in m for m in manager_names)
 
-    # 3. 13F portfolio detail for Scion (Michael Burry)
-    res_scion = client.get("/api/v1/filings/13f/scion", cookies=cookies, headers=headers)
-    assert res_scion.status_code == 200
-    scion_data = res_scion.json()
-    assert scion_data["manager_name"] == "Michael Burry"
-    assert len(scion_data["top_holdings"]) > 0
+    # 3. 13F portfolio detail for Berkshire Hathaway
+    res_berkshire = client.get("/api/v1/filings/13f/berkshire_hathaway", cookies=cookies)
+    assert res_berkshire.status_code == 200
+    berkshire_data = res_berkshire.json()
+    assert berkshire_data["manager_name"] == "Warren Buffett"
+    assert "total_portfolio_value_usd" in berkshire_data
 
     # 4. Consensus for ticker
-    res_consensus = client.get("/api/v1/filings/13f/consensus/NVDA", cookies=cookies, headers=headers)
+    res_consensus = client.get("/api/v1/filings/13f/consensus/NVDA", cookies=cookies)
     assert res_consensus.status_code == 200
     consensus_data = res_consensus.json()
     assert consensus_data["ticker"] == "NVDA"

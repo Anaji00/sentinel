@@ -228,12 +228,13 @@ curl -s http://localhost:8000/api/v1/financial/advice -H "X-API-KEY: ${API_KEY}"
 npx wscat -c "ws://localhost:8000/api/v1/events/ws/live-feed?api_key=${API_KEY}"
 ```
 
-### 3. Automated Test Suite (277 Passing Tests)
+### 3. Automated Test Suite (284 Passing Tests)
 ```bash
 # Run entire repository test suite
 python -m pytest tests/
 
-# Run targeted domain expansion & integrity modules
+# Run targeted security, domain expansion & integrity modules
+python -m pytest tests/test_rbac_security.py
 python -m pytest tests/test_telegram_formatting.py
 python -m pytest tests/test_integrity_layer.py
 python -m pytest tests/test_domain_expansion.py

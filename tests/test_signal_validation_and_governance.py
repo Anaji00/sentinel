@@ -269,37 +269,58 @@ def test_explain_signal_endpoint():
 
 def test_api_gateway_feature_flags_routes():
     client = TestClient(app)
-    cookies = get_auth_cookies()
+    admin_cookies = {"sentinel_session": create_jwt_token({"sub": "admin-user"}, role="ADMIN")}
+    viewer_cookies = {"sentinel_session": create_jwt_token({"sub": "viewer-user"}, role="VIEWER")}
 
-    # 1. GET /api/v1/flags
-    res = client.get("/api/v1/flags", cookies=cookies)
+    # 1. GET /api/v1/flags allows VIEWER
+    res = client.get("/api/v1/flags", cookies=viewer_cookies)
     assert res.status_code == 200
     data = res.json()
     assert "signals" in data
     assert "covered_calls" in data["signals"]
 
-    # 2. POST /api/v1/flags/toggle
+    # 2. VIEWER cannot POST to /toggle, /kill-switch, /reset -> 403 Forbidden
+    res_toggle_denied = client.post(
+        "/api/v1/flags/toggle",
+        cookies=viewer_cookies,
+        json={"flag_name": "covered_calls", "enabled": True, "rollout_pct": 80.0},
+    )
+    assert res_toggle_denied.status_code == 403
+
+    res_kill_denied = client.post(
+        "/api/v1/flags/kill-switch",
+        cookies=viewer_cookies,
+        json={"flag_name": "crypto_liquidations", "reason": "Unauthorized attempt"},
+    )
+    assert res_kill_denied.status_code == 403
+
+    res_reset_denied = client.post(
+        "/api/v1/flags/reset",
+        cookies=viewer_cookies,
+        json={"flag_name": "crypto_liquidations"},
+    )
+    assert res_reset_denied.status_code == 403
+
+    # 3. ADMIN can POST to /toggle, /kill-switch, /reset -> 200 OK
     res_toggle = client.post(
         "/api/v1/flags/toggle",
-        cookies=cookies,
+        cookies=admin_cookies,
         json={"flag_name": "covered_calls", "enabled": True, "rollout_pct": 80.0},
     )
     assert res_toggle.status_code == 200
     assert res_toggle.json()["status"] == "success"
 
-    # 3. POST /api/v1/flags/kill-switch
     res_kill = client.post(
         "/api/v1/flags/kill-switch",
-        cookies=cookies,
+        cookies=admin_cookies,
         json={"flag_name": "crypto_liquidations", "reason": "Operator test emergency"},
     )
     assert res_kill.status_code == 200
     assert res_kill.json()["status"] == "kill_switch_tripped"
 
-    # 4. POST /api/v1/flags/reset
     res_reset = client.post(
         "/api/v1/flags/reset",
-        cookies=cookies,
+        cookies=admin_cookies,
         json={"flag_name": "crypto_liquidations"},
     )
     assert res_reset.status_code == 200
@@ -327,3 +348,41 @@ def test_api_gateway_backtest_routes():
     assert res_all.status_code == 200
     assert isinstance(res_all.json(), list)
     assert len(res_all.json()) > 0
+
+
+def test_backtester_non_fabrication_on_empty_bins_and_insufficient_trades():
+    """Verify backtester returns None for Sharpe and calibration when data is insufficient."""
+    mock_redis = MockRedis()
+    backtester = StrategyBacktester(redis_client=mock_redis)
+
+    # Flat line price series -> zero trading triggers
+    flat_bars = [
+        {
+            "timestamp": f"2026-01-01T{i:02d}:00:00Z",
+            "open": 100.0,
+            "high": 100.05,
+            "low": 99.95,
+            "close": 100.0,
+            "volume": 1000,
+            "vwap": 100.0,
+        }
+        for i in range(30)
+    ]
+    rep = backtester.backtest_strategy(ticker="FLAT", bars=flat_bars, strategy_type="covered_call")
+    assert rep["risk_metrics"]["realized_sharpe_ratio"] is None
+    assert rep["risk_metrics"]["sortino_ratio"] is None
+
+    # Calibration curve empty bins must have empirical_win_rate = None
+    for b in rep["calibration_curve"]:
+        assert b["trade_count"] == 0
+        assert b["empirical_win_rate"] is None
+
+
+@pytest.mark.anyio
+async def test_paper_broker_missing_price_raises_error():
+    """Verify PaperBroker rejects orders without explicit limit/market price and no position."""
+    from shared.broker.paper import PaperBroker
+    from shared.broker.base import OrderSide
+    broker = PaperBroker(initial_cash=10000.0)
+    with pytest.raises(ValueError, match="missing limit_price"):
+        await broker.submit_order(symbol="NVDA", qty=10, side=OrderSide.BUY)
