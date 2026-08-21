@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { verifySessionToken } from '../../auth/login/route';
 
 const BACKEND_URL = process.env.API_GATEWAY_URL || 'http://localhost:8000';
-const API_GATEWAY_KEY = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || 'sentinel-dev-key-2026';
+const API_GATEWAY_KEY = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
 
 async function handleProxy(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   // Check auth session

@@ -84,7 +84,7 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
                 <h3 className="text-sm font-bold tracking-wider text-slate-100 uppercase">
                   Explain Computation & Model Card
                 </h3>
-                <Badge variant="cyan">AUDIT TRAIL</Badge>
+                <Badge variant="live">AUDIT TRAIL</Badge>
               </div>
               <p className="text-[11px] text-slate-400">
                 Target: <span className="text-cyan-300 font-semibold">{data?.entity || eventId || signalId || 'SYSTEM_SIGNAL'}</span>
@@ -174,7 +174,7 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
                   <Clock className="w-4 h-4 text-amber-400" />
                   Score Derivation Timeline
                 </span>
-                <Badge variant="outline">4 STEPS</Badge>
+                <Badge variant="neutral">4 STEPS</Badge>
               </div>
 
               <div className="space-y-2">

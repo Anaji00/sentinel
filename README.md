@@ -48,23 +48,27 @@
         └───────────────────────────────────────┬───────────────────────────────────────┘
                                                 │
                                                 ▼
-                          [ FASTAPI GATEWAY ] ──► [ NEXT.JS RADAR DASHBOARD ]
-                       (HMAC/JWT Auth, /graph)      (3D Deck.gl, Graph & Radar HUDs)
-                                                │
-                                                ▼
-                                   [ OBSERVABILITY & ML-OPS ]
-                       (Prometheus, Grafana, Model Drift PSI/KS Scheduler)
+                           [ FASTAPI GATEWAY ] ──► [ NEXT.JS RADAR DASHBOARD ]
+                        (HMAC/JWT Auth, /graph)      (3D Deck.gl, Graph & Radar HUDs)
+                                                 │
+                                                 ▼
+                             [ NGINX TLS INGRESS (port 443) ]
+                    (HTTP→HTTPS 301, HSTS, TLSv1.2/1.3, Security Headers)
+                                                 │
+                                                 ▼
+                                    [ OBSERVABILITY & ML-OPS ]
+                        (Prometheus, Grafana, Model Drift PSI/KS Scheduler)
 ```
 
 ---
 
 ## 🛠️ Microservices & Subsystem Architecture
 
-Sentinel is composed of **29 modular services & containers** orchestrated via Docker Compose and communicating over Kafka and Redis:
+Sentinel is composed of **30 modular services & containers** orchestrated via Docker Compose and communicating over Kafka and Redis:
 
 ### 1. Ingestion Collectors (`services/collector-*`)
 - **`collector-tradfi`**: Streaming US equity quotes, order book depth, dark pool prints, and options flow with OCC standardized contract parsing (`AAPL240816C00220000`).
-- **`collector-filings`**: Real-time **SEC EDGAR Corporate Filings** (Form 8-K material corporate disclosures, S-1/424B offerings, 10-K/10-Q periodic financials) with direct inline document URLs, and **13F Institutional Holdings & Consensus Flow** tracking prominent asset managers (Warren Buffett, Ray Dalio, Ken Griffin, Michael Burry, Bill Ackman, Cathie Wood).
+- **`collector-filings`**: Real-time **SEC EDGAR Corporate Filings** (Form 8-K material corporate disclosures, S-1/424B offerings, 10-K/10-Q periodic financials) with direct inline document URLs, and **13F Institutional Holdings** with live SEC EDGAR XML InfoTable parsing, dynamic company ticker registry loading (`company_tickers.json`), and Redis-cached CIK→ticker resolution.
 - **`collector-macro`**: Live Federal Reserve SOFR risk-free rate polling, 12 macro proxy instruments (Crude, Brent, NatGas, Gold, Silver, Yields, Indexes), **Economic Calendar Collector** ingesting scheduled releases (CPI, Core CPI, NFP, Unemployment, FOMC Rate Decisions, GDP, ISM Manufacturing PMI, PCE), **Supply Chain & Freight Index Poller** (Baltic Dry Index BDI, Container Freight Rates FBX/Harpex), and **Federal Register Regulatory Policy Tracker** (export controls, semiconductor policy, antitrust, Section 301 tariffs).
 - **`collector-social`**: Primary-source real-time OSINT & social signal ingestion from curated **Telegram public channels** (geopolitical/maritime), **Reddit subreddits** (financial/geopolitical), and breaking **X/Twitter** squawk handles, tagging events with `source_type: "primary_social"` and epistemic reliability weights.
 - **`collector-ais`**: Real-time WebSocket tracking global maritime vessel positions, MMSI identifiers, navigation status, SOG, and coordinates across coastal chokepoints.
@@ -127,18 +131,23 @@ Sentinel is composed of **29 modular services & containers** orchestrated via Do
   - **`/map`**: Deck.gl 3D global globe and tactical map.
 
 ### 6. Enterprise Governance, Security & Infrastructure
-- **Universal Heartbeat Coverage & Data Health Dashboard**: Structured 15s heartbeats across all 15 collectors and background workers (`collector-ais`, `collector-adsb`, `collector-tradfi`, `collector-radar`, `collector-macro`, `collector-crypto`, `collector-cyber`, `collector-news`, `collector-prediction`, `enrichment`, `correlation`, `reasoning`, `telemetry-worker`, `dlq-worker`, `alert_manager`) aggregated at `GET /api/v1/health/data` for real-time cluster liveness and degradation tracking.
+- **TLS Ingress Reverse Proxy**: Nginx-based TLS termination on port 443 with HTTP→HTTPS 301 redirect, `Strict-Transport-Security` (HSTS), `X-Frame-Options`, `X-Content-Type-Options`, modern TLSv1.2/1.3 cipher suites, and automated self-signed certificate bootstrapping for local development. All internal services are isolated behind the ingress with no direct host port exposure.
+- **Fail-Closed Secrets Management**: `shared/utils/secrets.py` centralizes all environment configuration with `required=True` enforcement — the gateway **refuses to start** without `SESSION_SECRET`. `resolve_env_var` permits hardcoded dev fallbacks **only** when `SENTINEL_ENV` is in the `SAFE_DEV_ENVS` whitelist (`dev`, `test`, `local`). Automated token masking in logs and health audits (`/api/v1/health/secrets`).
+- **Non-Root Container Execution**: All Python containers run as `sentinel` (UID 1001), preventing container-escape privilege escalation.
+- **Hardened Session Cookies**: `sentinel_session` cookie enforces `HttpOnly: true`, `Secure: true`, `SameSite: Strict`, and `Path: /`.
+- **Conditional CORS**: `allow_origin_regex` for localhost is restricted to `SAFE_DEV_ENVS` environments. In production, origins are explicitly enumerated via `CORS_ALLOWED_ORIGINS` with no open regex.
+- **Container Resource Limits**: CPU and memory limits enforced across all 30 services (`deploy.resources.limits`) — from Ollama (4 CPU / 8G) down to collectors (0.5 CPU / 512M) — preventing host starvation.
+- **Universal Heartbeat Coverage & Data Health Dashboard**: Structured 15s heartbeats across all 15 collectors and background workers aggregated at `GET /api/v1/health/data` for real-time cluster liveness and degradation tracking.
 - **Dynamic Watchlist Governance**: Real-time ticker registration in Redis (`sentinel:watched:equities`) with a hard **Finnhub 50-ticker clamp** and instant WebSocket repointing via Redis Pub/Sub (`sentinel:collector:watchlist_sync`), eliminating static ticker hardcoding.
-- **Centralized Zero-Leak Secrets Management**: `shared/utils/secrets.py` centralizes all environment configuration, providing typed access, secure fallback defaults, and automated token masking in logs and health audits (`/api/v1/health/secrets`).
-- **Role-Based Access Control (RBAC)**: Hierarchical access control (`ADMIN > ANALYST > VIEWER`) enforced across all API routes via the `require_role` FastAPI dependency.
+- **Role-Based Access Control (RBAC)**: Hierarchical access control (`ADMIN > ANALYST > VIEWER`) enforced across all API routes via the `require_role` FastAPI dependency, with cryptographic JWT session-cookie verification (no spoofable client headers).
 - **Immutable SHA-256 Hash-Chained Audit Ledger**: Cryptographically chained audit log (`shared/utils/audit_ledger.py`) guaranteeing non-repudiation for watchlist modifications, flag toggles, manual trades, and case updates, with automated tamper verification (`POST /api/v1/audit/verify`).
-- **Broker Abstraction Layer**: Clean separation of execution logic via `BrokerInterface` supporting `PaperBroker` (with realistic slippage and commission simulation) and `AlpacaBroker` (Paper & Live API v2).
+- **Broker Abstraction Layer**: Clean separation of execution logic via `BrokerInterface` supporting `PaperBroker` (with live Redis quote resolution, realistic slippage, and commission simulation) and `AlpacaBroker` (Paper & Live API v2).
 - **Investigation Case Management**: Analyst collaboration workspace (`shared/models/cases.py` & `/api/v1/cases`) enabling cross-domain evidence linking, severity escalation, and multi-agent notes.
 - **Executive Intelligence Reporting**: Automated markdown and brief synthesis engine (`ReportGenerator` & `/api/v1/reports/generate`) summarizing high-confidence anomalies and portfolio risk.
 - **`ModelDriftScheduler` (`services/telemetry-worker`)**: Computes Population Stability Index (PSI) and Kolmogorov-Smirnov (KS) statistics on rolling 24-hour ONNX anomaly distributions, automatically dispatching retrain triggers to `Topics.MODEL_RETRAIN_REQUESTS` when $\text{PSI} \ge 0.25$ or $\text{KS} \ge 0.05$.
 - **`alert_manager`**: Escalation router delivering alerts via PagerDuty, Webhooks, Telegram, and Slack.
-- **`prometheus` & `grafana`**: Time-series metrics collection server and operational monitoring dashboards.
-- **`kafka-ui`**: Web UI for inspecting Kafka topics, partitions, and message offsets.
+- **`prometheus` & `grafana`**: Time-series metrics collection and operational monitoring dashboards (port-isolated behind ingress, accessed via internal `sentinel-network`).
+- **`kafka-ui`**: Web UI for inspecting Kafka topics, partitions, and message offsets (internal network only).
 
 ---
 
@@ -185,7 +194,7 @@ docker exec -it sentinel-ollama ollama pull gemma3:1b
 docker compose up --build -d
 ```
 
-Access the dashboard at **`http://localhost:3000`**.
+Access the dashboard at **`https://localhost`** (Nginx TLS ingress auto-generates a self-signed certificate on first boot; mount production certs at `deploy/nginx/ssl/sentinel.crt` and `sentinel.key` for trusted HTTPS).
 
 ---
 
@@ -193,7 +202,7 @@ Access the dashboard at **`http://localhost:3000`**.
 
 ### 1. Docker Cluster Management
 ```bash
-# Start all 29 services in background
+# Start all 30 services in background
 docker compose up -d
 
 # Inspect health and container states
@@ -228,7 +237,7 @@ curl -s http://localhost:8000/api/v1/financial/advice -H "X-API-KEY: ${API_KEY}"
 npx wscat -c "ws://localhost:8000/api/v1/events/ws/live-feed?api_key=${API_KEY}"
 ```
 
-### 3. Automated Test Suite (284 Passing Tests)
+### 3. Automated Test Suite (292 Passing Tests)
 ```bash
 # Run entire repository test suite
 python -m pytest tests/
@@ -248,28 +257,36 @@ python -m pytest tests/test_statistical_discovery.py
 python -m pytest tests/test_macro_calendar.py
 python -m pytest tests/test_drift_scheduler.py
 python -m pytest tests/test_payload_and_graph_promotion.py
+python -m pytest tests/test_tier2_hardening.py
 ```
 
 ---
 
 ## 🌐 Service & Port Directory
 
-| Service | Host / Port | Authentication / Access |
+All public traffic is routed through the **Nginx TLS Ingress** on ports `80` (HTTP→HTTPS redirect) and `443` (TLS termination). Internal datastores and monitoring tools are isolated on the Docker `sentinel-network` with no direct host port exposure.
+
+| Service | Access | Authentication |
 | :--- | :--- | :--- |
-| **Web Dashboard** | `http://localhost:3000` | Public Web UI |
-| **Knowledge Graph Explorer** | `http://localhost:3000/graph` | Interactive 1–2 Hop Graph Explorer |
-| **Grafana Monitoring** | `http://localhost:3001` | Configured via `.env` |
-| **API Gateway** | `http://localhost:8000` | Header `X-API-KEY: ${API_KEY}` / HMAC Session |
-| **Prometheus Server** | `http://localhost:9090` | Configured via `.env` |
-| **Prometheus Metrics** | `http://localhost:8000/metrics` | Unauthenticated Scraper |
-| **WebSocket Live Feed** | `ws://localhost:8000/api/v1/events/ws/live-feed` | Query Param `?api_key=` or Header |
-| **Ollama LLM Engine** | `http://localhost:11434` | Local LLM REST API |
-| **Kafka UI Manager** | `http://localhost:8080` | Configured via `.env` |
-| **Kafka Broker** | `localhost:9092` | Configured via `.env` |
-| **Neo4j Graph Browser** | `http://localhost:7474` (Bolt: `7687`) | Configured via `.env` |
-| **Qdrant Dashboard** | `http://localhost:6333/dashboard` | Configured via `.env` |
-| **TimescaleDB PostgreSQL** | `localhost:5432` | Configured via `.env` |
-| **Redis Bus** | `localhost:6379` | Configured via `.env` |
+| **Web Dashboard** | `https://localhost/` | Signed `sentinel_session` cookie |
+| **Knowledge Graph Explorer** | `https://localhost/graph` | Interactive 1–2 Hop Graph Explorer |
+| **API Gateway (REST)** | `https://localhost/api/v1/...` | Header `X-API-KEY` / HMAC Session Cookie |
+| **WebSocket Live Feed** | `wss://localhost/ws/...` | Query Param `?api_key=` or Cookie |
+| **Prometheus Metrics** | `https://localhost/api/v1/health/metrics` | Scraped via internal network |
+
+### Internal Services (Docker `sentinel-network` only — no host port exposure)
+
+| Service | Internal Address | Purpose |
+| :--- | :--- | :--- |
+| **Grafana** | `grafana:3000` | Operational monitoring dashboards |
+| **Prometheus** | `prometheus:9090` | Time-series metrics collection |
+| **Ollama LLM** | `ollama:11434` | Local LLM inference engine |
+| **Kafka Broker** | `kafka:29092` | Event streaming backbone |
+| **Kafka UI** | `kafka-ui:8080` | Topic inspection |
+| **Neo4j** | `neo4j:7687` | Entity & correlation knowledge graph |
+| **TimescaleDB** | `timescaledb:5432` | Time-series OHLCV and event storage |
+| **Redis** | `redis:6379` | PubSub, caching, rate limiting |
+| **Qdrant** | `qdrant:6333` | Semantic vector embeddings |
 
 ---
 

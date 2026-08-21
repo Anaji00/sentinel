@@ -20,8 +20,16 @@ from shared.utils.rbac import Role, parse_role
 
 logger = logging.getLogger("api-gateway.auth")
 
-API_KEY = get_secret("API_GATEWAY_KEY", default=os.getenv("API_KEY") or os.getenv("SENTINEL_API_KEY") or "")
-SESSION_SECRET = get_secret("SESSION_SECRET", default=os.getenv("JWT_SECRET") or os.getenv("API_GATEWAY_KEY") or "sentinel-secure-session-secret-key-2026")
+# API key: gated dev fallback (resolve_env_var only returns the fallback when
+# SENTINEL_ENV is in the safe-dev whitelist; production raises). The literal is a
+# non-production placeholder, never a usable admin key in a real deployment.
+API_KEY = resolve_env_var("API_GATEWAY_KEY", "dev-only-key-replace-in-prod", warn_on_fallback=True)
+
+# Session signing secret: MUST be its own configured value. No string default and
+# no fallback to API_GATEWAY_KEY (reusing the API key to sign JWTs would let anyone
+# holding the API key forge sessions). Fails closed at startup if unset — the
+# frontend BFF signs cookies with the same SESSION_SECRET, so the two must match.
+SESSION_SECRET = get_secret("SESSION_SECRET", required=True)
 
 
 def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_seconds: int = 86400, role: str = "ANALYST") -> str:

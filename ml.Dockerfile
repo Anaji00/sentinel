@@ -32,5 +32,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     "libgeos-c*" \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user for runtime security
+RUN groupadd --gid 1001 sentinel && \
+    useradd --uid 1001 --gid sentinel --shell /bin/false --create-home sentinel
+
 COPY --from=builder /install /usr/local
-COPY . .
+COPY --chown=sentinel:sentinel . .
+
+USER sentinel

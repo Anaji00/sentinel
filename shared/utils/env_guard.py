@@ -12,7 +12,7 @@ Usage:
     from shared.utils.env_guard import resolve_env_var
 
     dsn = resolve_env_var("DATABASE_URL", "postgresql://sentinel:sentinel_local_dev@localhost:5432/sentinel")
-    api_key = resolve_env_var("API_GATEWAY_KEY", "sentinel-dev-key-2026", warn_on_fallback=True)
+    api_key = resolve_env_var("API_GATEWAY_KEY", "dev-only-key-replace-in-prod", warn_on_fallback=True)
 """
 
 import logging

@@ -91,18 +91,57 @@ app = FastAPI(
     dependencies=[Depends(verify_api_key)]
 )
 
-# CORS (Cross-Origin Resource Sharing):
-# Driven by CORS_ALLOWED_ORIGINS env var for spec compliance with allow_credentials=True
-raw_cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:8000")
-cors_origins = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
+from shared.utils.env_guard import SAFE_DEV_ENVS
+
+# Default localhost origins used only in dev/test environments.
+_DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "http://localhost:8000",
+]
+
+
+def build_cors_kwargs(sentinel_env: str, raw_cors_origins: str) -> dict:
+    """Build the CORSMiddleware kwargs for the given environment.
+
+    In dev/test environments (SAFE_DEV_ENVS), the open localhost regex is enabled
+    for developer agility. In production it is disabled to prevent an unauthorized
+    local process from pivoting against a user's authenticated browser session; the
+    allowlist must come explicitly from CORS_ALLOWED_ORIGINS.
+
+    Pure function of its inputs so the production branch can be tested directly.
+    """
+    env = (sentinel_env or "").lower().strip()
+    cors_origins = [o.strip() for o in raw_cors_origins.split(",") if o.strip()]
+
+    kwargs = {
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+
+    if env in SAFE_DEV_ENVS:
+        kwargs["allow_origins"] = cors_origins or list(_DEV_CORS_ORIGINS)
+        kwargs["allow_origin_regex"] = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
+    else:
+        if not cors_origins:
+            logger.warning(
+                "CORS: SENTINEL_ENV=%r is not a dev environment and "
+                "CORS_ALLOWED_ORIGINS is empty. All cross-origin browser requests "
+                "will be rejected. Set CORS_ALLOWED_ORIGINS explicitly.",
+                env,
+            )
+        kwargs["allow_origins"] = cors_origins
+        kwargs["allow_origin_regex"] = None
+
+    return kwargs
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    **build_cors_kwargs(os.getenv("SENTINEL_ENV", "dev"), os.getenv("CORS_ALLOWED_ORIGINS", "")),
 )
 
 # MODULAR ROUTING:

@@ -18,7 +18,11 @@ export function useLiveEvents(selectedDomain: string = 'all') {
   useEffect(() => {
     // Determine WebSocket URL dynamically based on current window location
     const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let baseHost = typeof window !== 'undefined' ? `${window.location.hostname}:8000` : 'localhost:8000';
+    // Default to the same origin the page is served from (through the ingress),
+    // NOT a hardcoded :8000 — the gateway port is not published to the host in the
+    // deployed stack, and http://...:8000 would be blocked as mixed content on HTTPS.
+    // NEXT_PUBLIC_WS_URL / NEXT_PUBLIC_API_URL remain explicit overrides.
+    let baseHost = typeof window !== 'undefined' ? window.location.host : 'localhost:8000';
     if (process.env.NEXT_PUBLIC_WS_URL) {
       baseHost = process.env.NEXT_PUBLIC_WS_URL.replace(/^wss?:\/\//, '').replace(/\/+$/, '');
     } else if (process.env.NEXT_PUBLIC_API_URL) {

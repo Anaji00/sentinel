@@ -205,48 +205,52 @@ export default function FinancialAdvisorAdvice() {
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between">
               <span className="text-slate-500 block text-[9px]">PORTFOLIO VaR (95%)</span>
-              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'computed_deterministic' : 'disclosed_placeholder'} />
             </div>
             <ProvenanceValue
               value={metrics?.var_95_pct}
-              sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
-              format="percentage"
+              provenance={{ source_type: metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'computed_deterministic' : 'disclosed_placeholder' }}
+              showBadge={false}
+              format="percent"
               className="text-cyan-400 font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between">
               <span className="text-slate-500 block text-[9px]">SHARPE RATIO</span>
-              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+              <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'computed_deterministic' : 'disclosed_placeholder'} />
             </div>
             <ProvenanceValue
               value={metrics?.sharpe_ratio}
-              sourceType={metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
-              format="multiple"
+              provenance={{ source_type: metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined ? 'computed_deterministic' : 'disclosed_placeholder' }}
+              showBadge={false}
+              format="number"
               className="text-emerald-400 font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between">
               <span className="text-slate-500 block text-[9px]">CASH BUFFER</span>
-              <ProvenanceBadge sourceType={metrics?.recommended_cash_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+              <ProvenanceBadge sourceType={metrics?.recommended_cash_pct !== undefined ? 'computed_deterministic' : 'disclosed_placeholder'} />
             </div>
             <ProvenanceValue
               value={metrics?.recommended_cash_pct}
-              sourceType={metrics?.recommended_cash_pct !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
-              format="percentage"
+              provenance={{ source_type: metrics?.recommended_cash_pct !== undefined ? 'computed_deterministic' : 'disclosed_placeholder' }}
+              showBadge={false}
+              format="percent"
               className="text-amber-400 font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between">
               <span className="text-slate-500 block text-[9px]">HAWKES FACTOR</span>
-              <ProvenanceBadge sourceType={metrics?.hawkes_risk_factor !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'} size="sm" />
+              <ProvenanceBadge sourceType={metrics?.hawkes_risk_factor !== undefined ? 'computed_deterministic' : 'disclosed_placeholder'} />
             </div>
             <ProvenanceValue
               value={metrics?.hawkes_risk_factor}
-              sourceType={metrics?.hawkes_risk_factor !== undefined ? 'COMPUTED_DETERMINISTIC' : 'DISCLOSED_PLACEHOLDER'}
-              format="multiple"
+              provenance={{ source_type: metrics?.hawkes_risk_factor !== undefined ? 'computed_deterministic' : 'disclosed_placeholder' }}
+              showBadge={false}
+              format="number"
               className="text-purple-400 font-bold"
             />
           </div>

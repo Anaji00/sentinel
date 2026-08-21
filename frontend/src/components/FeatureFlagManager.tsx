@@ -114,7 +114,7 @@ export default function FeatureFlagManager() {
               <h2 className="text-sm font-bold tracking-wider text-slate-100 uppercase">
                 Signal Governance & Kill Switches
               </h2>
-              <Badge variant={isMasterActive ? 'red' : 'emerald'}>
+              <Badge variant={isMasterActive ? 'anomaly' : 'success'}>
                 {isMasterActive ? 'EMERGENCY HALT' : 'OPERATIONAL'}
               </Badge>
             </div>
@@ -164,7 +164,7 @@ export default function FeatureFlagManager() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="font-bold text-xs text-slate-100">{key}</span>
-                    <Badge variant={flag.kill_switched ? 'red' : flag.enabled ? 'emerald' : 'amber'}>
+                    <Badge variant={flag.kill_switched ? 'anomaly' : flag.enabled ? 'success' : 'warning'}>
                       {flag.kill_switched ? 'KILLED' : flag.enabled ? 'ACTIVE' : 'DISABLED'}
                     </Badge>
                   </div>

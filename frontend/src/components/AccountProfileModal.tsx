@@ -15,7 +15,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
     email: 'vance@sentinel-quant.io',
     role: 'Managing Director, Quantitative Research',
     tier: 'INSTITUTIONAL',
-    apiKey: 'sentinel-dev-key-2026-x89f2a',
+    apiKey: '••••••••••••••••••••••',
     apiUsageMonth: 482190,
     apiQuotaMonth: 1000000,
     activeAgents: 8,

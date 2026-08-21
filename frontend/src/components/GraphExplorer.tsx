@@ -693,7 +693,7 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                     <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1">
                         <span className="flex items-center gap-1">
                             <Clock className="w-3 h-3 text-slate-500" />
-                            Recency Decay ($t_{{1/2}}=30\text{{d}}$)
+                            {'Recency Decay ($t_{1/2}=30\\text{d}$)'}
                         </span>
                         <span>Hop Level: {selectedEdge.hop_level || 1}</span>
                     </div>
