@@ -1,33 +1,5 @@
-'use client';
-
 import React from 'react';
-import dynamic from 'next/dynamic';
-import { PanelSkeleton } from '@/components/ui/Skeleton';
-
-const GraphExplorer = dynamic(() => import('@/components/GraphExplorer'), {
-  loading: () => <PanelSkeleton title="Loading Macro Knowledge Graph..." />,
-  ssr: false,
-});
-
-const FinancialAdvisorAdvice = dynamic(() => import('@/components/FinancialAdvisorAdvice'), {
-  loading: () => <PanelSkeleton title="Loading Macro Risk Advisor..." />,
-  ssr: false,
-});
-
-const BondYieldsChart = dynamic(() => import('@/components/charts/BondYieldsChart'), {
-  loading: () => <PanelSkeleton title="Loading Treasury Bond Yields..." />,
-  ssr: false,
-});
-
-const PredictionMarketPanel = dynamic(() => import('@/components/PredictionMarketPanel'), {
-  loading: () => <PanelSkeleton title="Loading Macro Prediction Markets..." />,
-  ssr: false,
-});
-
-const CyberIntelligencePanel = dynamic(() => import('@/components/CyberIntelligencePanel'), {
-  loading: () => <PanelSkeleton title="Loading Cyber Threat Panel..." />,
-  ssr: false,
-});
+import { GraphExplorerIsland, FinancialAdvisorAdviceIsland, BondYieldsChartIsland, PredictionMarketPanelIsland, CyberIntelligencePanelIsland } from './islands';
 
 export default function MacroPage() {
   return (
@@ -72,26 +44,26 @@ export default function MacroPage() {
 
       {/* Bond Yields Intraday Chart */}
       <div className="w-full">
-        <BondYieldsChart />
+        <BondYieldsChartIsland />
       </div>
 
       {/* Prediction Markets & Cyber Threat Grid */}
       <div className="grid grid-cols-12 gap-4">
         <div className="col-span-6 min-h-[450px]">
-          <PredictionMarketPanel />
+          <PredictionMarketPanelIsland />
         </div>
         <div className="col-span-6 min-h-[450px]">
-          <CyberIntelligencePanel />
+          <CyberIntelligencePanelIsland />
         </div>
       </div>
 
       {/* Graph & Advisor Grid */}
       <div className="grid grid-cols-12 gap-4 min-h-[450px]">
         <div className="col-span-8 flex flex-col bg-[#090d16] rounded-2xl border border-slate-800 overflow-hidden relative">
-          <GraphExplorer />
+          <GraphExplorerIsland />
         </div>
         <div className="col-span-4 flex flex-col bg-[#090d16] rounded-2xl border border-slate-800 overflow-hidden relative">
-          <FinancialAdvisorAdvice />
+          <FinancialAdvisorAdviceIsland />
         </div>
       </div>
 

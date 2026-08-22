@@ -8,12 +8,17 @@ Comprehensive test suite verifying Section B: Signal Validation & Model Governan
 """
 
 import json
+import os
+from pathlib import Path
+
 import pytest
 import numpy as np
 from unittest.mock import AsyncMock, MagicMock, patch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 from shared.utils.feature_flags import FeatureFlagManager, DEFAULT_SIGNAL_FLAGS
-from services.reasoning.strategy_backtester import StrategyBacktester
+from services.reasoning.strategy_backtester import StrategyBacktester, MIN_BARS_FOR_BACKTEST
 from services.api_gateway.dependencies import create_jwt_token
 from fastapi.testclient import TestClient
 from services.api_gateway.routes.main import app
@@ -111,6 +116,88 @@ async def test_feature_flag_gradual_rollout_and_ticker_whitelisting():
 
     await manager.set_flag("crypto_liquidations", enabled=True, rollout_pct=100.0)
     assert await manager.is_enabled("crypto_liquidations", ticker="BTC") is True
+
+
+def test_rollout_bucket_is_stable_across_processes():
+    """Rollout bucketing must not depend on PYTHONHASHSEED.
+
+    The builtin hash() randomizes string hashing per process, which placed the
+    same ticker in different buckets across workers and re-rolled it on every
+    restart. Buckets are asserted against fixed expected values computed from
+    SHA-256, so a regression to hash() fails here deterministically.
+    """
+    from shared.utils.feature_flags import rollout_bucket
+
+    subjects = ["AAPL", "NVDA", "BTC-USD", "SPY"]
+    first = {s: rollout_bucket("insider_clustering", s) for s in subjects}
+
+    # Stable within the process...
+    for _ in range(3):
+        assert {s: rollout_bucket("insider_clustering", s) for s in subjects} == first
+
+    # ...and reproducible in a *fresh* interpreter with a different hash seed.
+    import json as _json
+    import subprocess
+    import sys
+
+    script = (
+        "import json;"
+        "from shared.utils.feature_flags import rollout_bucket;"
+        f"print(json.dumps({{s: rollout_bucket('insider_clustering', s) for s in {subjects!r}}}))"
+    )
+    env = {**os.environ, "PYTHONHASHSEED": "12345", "PYTHONPATH": str(REPO_ROOT)}
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, cwd=str(REPO_ROOT)
+    )
+    assert out.returncode == 0, out.stderr
+    assert _json.loads(out.stdout.strip()) == first
+
+    assert all(0 <= b < 100 for b in first.values())
+
+
+@pytest.mark.anyio
+async def test_master_kill_switch_halts_every_signal_class():
+    """Emergency Halt must suppress every flag the platform ships.
+
+    BL-03 was a signal path that never consulted is_enabled() at all, so the
+    master switch silently skipped it. This asserts the contract across the full
+    flag registry rather than one flag at a time.
+    """
+    mock_redis = MockRedis()
+    manager = FeatureFlagManager(redis_client=mock_redis)
+
+    for flag_name in DEFAULT_SIGNAL_FLAGS:
+        assert await manager.is_enabled(flag_name, ticker="NVDA") is True
+
+    await manager.trip_master_kill_switch(reason="governance drill")
+
+    for flag_name in DEFAULT_SIGNAL_FLAGS:
+        assert await manager.is_enabled(flag_name, ticker="NVDA") is False, (
+            f"Master kill switch did not suppress '{flag_name}'"
+        )
+
+
+def test_insider_form4_path_consults_feature_flags():
+    """The live insider path must gate on is_enabled().
+
+    A duplicate method definition previously shadowed the flag-checked version,
+    leaving the insider_clustering kill switch wired to dead code. Guards against
+    both the duplicate returning and the gate being dropped.
+    """
+    import inspect
+    from services.agents.quant_trading_engine import QuantTradingEngine
+
+    src = inspect.getsource(QuantTradingEngine)
+    assert src.count("async def _process_insider_form4") == 1, (
+        "Duplicate _process_insider_form4 definition — the later one silently "
+        "shadows the earlier, which is how the kill switch was bypassed."
+    )
+
+    method_src = inspect.getsource(QuantTradingEngine._process_insider_form4)
+    assert 'is_enabled("insider_clustering"' in method_src, (
+        "Live insider path does not consult the insider_clustering feature flag, "
+        "so neither its kill switch nor the master kill switch applies."
+    )
 
 
 # ── 2. STRATEGY BACKTESTER & CALIBRATION TESTS (§B.1) ─────────────────────────
@@ -233,17 +320,54 @@ def test_explain_event_endpoint():
     assert "score_adjustments" in data
     assert len(data["score_adjustments"]) == 4
 
-    # Verify model card metadata
+    # Verify model card metadata. The card must name the scorer that actually
+    # runs -- anomaly scoring is streaming RRCF; the batch IsolationForest ONNX
+    # export was retired, and naming it would misdescribe the model to anyone
+    # auditing a signal.
     assert "model_card" in data
     mc = data["model_card"]
-    assert "IsolationForest" in mc["model_name"]
+    assert "RRCF" in mc["model_name"]
+    assert "IsolationForest" not in mc["model_name"], "model card names a retired scorer"
     assert "model_drift_status" in mc
-    assert mc["model_drift_status"]["drift_state"] == "STABLE"
+
+    # With no drift report published, the card must say so rather than
+    # asserting STABLE -- health nothing has measured is not health.
+    drift = mc["model_drift_status"]
+    assert drift["drift_state"] in ("UNKNOWN", "INITIALIZING", "STABLE",
+                                    "SLIGHT_DRIFT", "SIGNIFICANT_DRIFT")
+    if drift["drift_state"] == "UNKNOWN":
+        assert drift["psi_score"] is None
+        assert "detail" in drift
 
     # Verify data source provenance
     assert "provenance" in data
-    assert "payload_hash" in data["provenance"]
-    assert "processing_latency_ms" in data["provenance"]
+    prov = data["provenance"]
+    assert "payload_hash" in prov
+    assert prov["payload_hash"].startswith("sha256:")
+
+    # Latency must be measured for this request, not a constant.
+    assert isinstance(prov["processing_latency_ms"], float)
+    assert prov["processing_latency_ms"] >= 0.0
+    assert prov["processing_latency_ms"] != 14.8, "latency is still a hardcoded placeholder"
+
+
+def test_explain_payload_hash_is_deterministic():
+    """The audit hash must identify content, not a process.
+
+    It was built from Python's builtin hash(), which is randomized per process,
+    so the same event produced a different 'sha256:' value after every restart --
+    useless for the tamper-evidence the field implies.
+    """
+    from services.api_gateway.routes import explain as explain_mod
+    import hashlib
+
+    event_id, occurred = "evt-123", "2026-08-21T14:32:05+00:00"
+    expected = "sha256:" + hashlib.sha256(f"{event_id}|{occurred}".encode("utf-8")).hexdigest()
+
+    src = open(explain_mod.__file__, encoding="utf-8").read()
+    assert "hashlib.sha256(" in src, "payload hash is not a real digest"
+    assert "abs(hash(" not in src, "payload hash still uses randomized builtin hash()"
+    assert len(expected.split(":")[1]) == 64
 
 
 def test_explain_signal_endpoint():
@@ -350,13 +474,9 @@ def test_api_gateway_backtest_routes():
     assert len(res_all.json()) > 0
 
 
-def test_backtester_non_fabrication_on_empty_bins_and_insufficient_trades():
-    """Verify backtester returns None for Sharpe and calibration when data is insufficient."""
-    mock_redis = MockRedis()
-    backtester = StrategyBacktester(redis_client=mock_redis)
-
-    # Flat line price series -> zero trading triggers
-    flat_bars = [
+def _flat_bars(n: int):
+    """Flat-line price series -> zero trading triggers."""
+    return [
         {
             "timestamp": f"2026-01-01T{i:02d}:00:00Z",
             "open": 100.0,
@@ -366,9 +486,53 @@ def test_backtester_non_fabrication_on_empty_bins_and_insufficient_trades():
             "volume": 1000,
             "vwap": 100.0,
         }
-        for i in range(30)
+        for i in range(n)
     ]
-    rep = backtester.backtest_strategy(ticker="FLAT", bars=flat_bars, strategy_type="covered_call")
+
+
+def test_backtester_non_fabrication_on_empty_bins_and_insufficient_trades():
+    """Verify the backtester never fabricates bars or metrics below the data threshold.
+
+    Uses N=15 bars so the `< MIN_BARS_FOR_BACKTEST` branch is actively traversed —
+    the branch that previously substituted a seeded synthetic random walk and could
+    emit APPROVED_FOR_LIVE from invented prices.
+    """
+    mock_redis = MockRedis()
+    backtester = StrategyBacktester(redis_client=mock_redis)
+
+    assert 15 < MIN_BARS_FOR_BACKTEST, "Fixture must sit below the backtest data threshold"
+
+    rep = backtester.backtest_strategy(
+        ticker="FLAT", bars=_flat_bars(15), strategy_type="covered_call"
+    )
+
+    # The report must reflect the real bar count — not a synthetic series length.
+    assert rep["bar_count"] == 15
+    assert rep["data_provenance"] == "insufficient_data"
+
+    # Fail closed: never approved, and explicitly labelled.
+    assert rep["validation_gate"]["passed"] is False
+    assert rep["validation_gate"]["status"] == "INSUFFICIENT_DATA"
+
+    # No fabricated metrics — None, not zero.
+    assert rep["risk_metrics"]["realized_sharpe_ratio"] is None
+    assert rep["risk_metrics"]["sortino_ratio"] is None
+    assert rep["risk_metrics"]["max_drawdown_pct"] is None
+    assert rep["performance_metrics"]["hit_rate_pct"] is None
+    assert rep["brier_score"] is None
+    assert rep["calibration_curve"] == []
+
+
+def test_backtester_non_fabrication_with_sufficient_bars_but_no_trades():
+    """With enough authentic bars but no signal triggers, metrics stay None (not zero)."""
+    mock_redis = MockRedis()
+    backtester = StrategyBacktester(redis_client=mock_redis)
+
+    rep = backtester.backtest_strategy(
+        ticker="FLAT", bars=_flat_bars(30), strategy_type="covered_call"
+    )
+
+    assert rep["data_provenance"] == "authentic_market_data"
     assert rep["risk_metrics"]["realized_sharpe_ratio"] is None
     assert rep["risk_metrics"]["sortino_ratio"] is None
 

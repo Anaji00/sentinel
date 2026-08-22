@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { formatPercent } from '../lib/format';
 
 export type ProvenanceType =
   | "live_measurement"
@@ -44,7 +45,7 @@ export const ProvenanceBadge: React.FC<ProvenanceBadgeProps> = ({
       break;
     case "llm_inference":
       badgeStyle = "bg-purple-500/15 text-purple-400 border-purple-500/40";
-      label = confidence ? `Local AI (${(confidence * 100).toFixed(0)}%)` : "Local AI Inference";
+      label = confidence ? `Local AI (${formatPercent(confidence, { from: 'ratio', decimals: 0 })})` : "Local AI Inference";
       icon = "🧠";
       break;
     case "disclosed_placeholder":
@@ -57,7 +58,7 @@ export const ProvenanceBadge: React.FC<ProvenanceBadgeProps> = ({
   const tooltipContent = [
     methodology ? `Methodology: ${methodology}` : null,
     modelName ? `Engine: ${modelName}` : null,
-    confidence !== undefined && confidence !== null ? `Confidence: ${(confidence * 100).toFixed(1)}%` : null,
+    confidence !== undefined && confidence !== null ? `Confidence: ${formatPercent(confidence, { from: 'ratio', decimals: 1 })}` : null,
     dataInputs.length > 0 ? `Inputs: ${dataInputs.join(", ")}` : null,
   ]
     .filter(Boolean)

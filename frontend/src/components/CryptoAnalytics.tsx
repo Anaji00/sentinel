@@ -7,6 +7,8 @@ import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
 import { NormalizedEvent } from '../lib/types';
+import { DataGrid } from './ui/DataGrid';
+import { formatNumber, formatPercent } from '../lib/format';
 
 export default function CryptoAnalytics() {
   const [activeChain, setActiveChain] = useState<string>('all');
@@ -165,7 +167,7 @@ export default function CryptoAnalytics() {
                       <div className="bg-slate-950 p-1.5 rounded border border-purple-500/20">
                         <span className="text-slate-400 block text-[9px]">FUNDING RATE:</span>
                         <span className={`font-bold ${cd.funding_rate > 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {(cd.funding_rate * 100).toFixed(4)}% ({cd.basis_bps ? `${cd.basis_bps > 0 ? '+' : ''}${cd.basis_bps.toFixed(1)} bps basis` : 'N/A'})
+                          {formatPercent(cd.funding_rate, { from: 'ratio', decimals: 4 })} ({cd.basis_bps ? `${cd.basis_bps > 0 ? '+' : ''}${cd.basis_bps.toFixed(1)} bps basis` : 'N/A'})
                         </span>
                       </div>
                     )}
@@ -174,7 +176,7 @@ export default function CryptoAnalytics() {
                       <div className="bg-slate-950 p-1.5 rounded border border-cyan-500/20">
                         <span className="text-slate-400 block text-[9px]">OPEN INTEREST:</span>
                         <span className="text-cyan-300 font-bold">
-                          {cd.open_interest.toLocaleString()} tokens
+                          {formatNumber(cd.open_interest, { decimals: 0 })} tokens
                         </span>
                       </div>
                     )}
@@ -238,7 +240,7 @@ export default function CryptoAnalytics() {
                 <div className="p-3 bg-slate-950 rounded-xl border border-purple-500/30 space-y-2">
                   <span className="text-purple-300 font-bold block text-[11px]">CRYPTO DERIVATIVES TELEMETRY</span>
                   <div className="grid grid-cols-3 gap-2 text-[10px]">
-                    <div><span className="text-slate-400 block">Funding Rate:</span> <span className="text-white font-bold">{selectedEvent.crypto_data.funding_rate ? `${(selectedEvent.crypto_data.funding_rate * 100).toFixed(4)}%` : 'N/A'}</span></div>
+                    <div><span className="text-slate-400 block">Funding Rate:</span> <span className="text-white font-bold">{formatPercent(selectedEvent.crypto_data.funding_rate, { from: 'ratio', decimals: 4 })}</span></div>
                     <div><span className="text-slate-400 block">Mark Price:</span> <span className="text-white font-bold">{selectedEvent.crypto_data.mark_price ? `$${selectedEvent.crypto_data.mark_price.toLocaleString()}` : 'N/A'}</span></div>
                     <div><span className="text-slate-400 block">Index Price:</span> <span className="text-white font-bold">{selectedEvent.crypto_data.index_price ? `$${selectedEvent.crypto_data.index_price.toLocaleString()}` : 'N/A'}</span></div>
                     <div><span className="text-slate-400 block">Perp-Spot Basis:</span> <span className="text-cyan-300 font-bold">{selectedEvent.crypto_data.basis_bps ? `${selectedEvent.crypto_data.basis_bps.toFixed(2)} bps` : 'N/A'}</span></div>
@@ -248,10 +250,13 @@ export default function CryptoAnalytics() {
               )}
 
               <div>
-                <span className="text-amber-400 font-bold block mb-1 text-[10px]">RAW PAYLOAD SCHEMA:</span>
-                <pre className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-[10px] text-amber-200 overflow-x-auto max-h-40">
-                  {JSON.stringify(selectedEvent.crypto_data || selectedEvent.domain_data || selectedEvent.raw_payload || selectedEvent, null, 2)}
-                </pre>
+                <span className="text-amber-400 font-bold block mb-1 text-[10px]">EVENT DETAIL:</span>
+                <div className="max-h-40 overflow-y-auto">
+                  <DataGrid
+                    data={selectedEvent.crypto_data || selectedEvent.domain_data || selectedEvent}
+                    omit={['raw_payload']}
+                  />
+                </div>
               </div>
             </div>
 

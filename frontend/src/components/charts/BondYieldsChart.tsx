@@ -7,6 +7,7 @@ import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Activity, Radio } from 'lucide-react';
+import { formatBps, formatPercent } from '../../lib/format';
 
 interface SeriesPoint {
   timestamp: string;
@@ -95,9 +96,15 @@ export default function BondYieldsChart() {
     const p2: { x: number; y: number }[] = [];
     const combined: { time: string; y30: number | null; y10: number | null; y2: number | null; spread: number | null }[] = [];
 
-    const allPrices = [...us30ySeries.map(s => s.price), ...us10ySeries.map(s => s.price), ...us02ySeries.map(s => s.price)];
-    const minVal = Math.min(...allPrices) * 0.98 || 3.80;
-    const maxVal = Math.max(...allPrices) * 1.02 || 4.80;
+    const allPrices = [...us30ySeries.map(s => s.price), ...us10ySeries.map(s => s.price), ...us02ySeries.map(s => s.price)]
+      .filter((p): p is number => typeof p === 'number' && Number.isFinite(p));
+
+    // Guard the empty case explicitly. `Math.min(...[])` is Infinity, which is
+    // truthy, so an `|| fallback` never fires and the axis domain becomes
+    // [Infinity, -Infinity] -- every plotted coordinate then evaluates to NaN.
+    const hasPrices = allPrices.length > 0;
+    const minVal = hasPrices ? Math.min(...allPrices) * 0.98 : 0;
+    const maxVal = hasPrices ? Math.max(...allPrices) * 1.02 : 1;
     const height = 180;
     const width = 600;
 
@@ -161,7 +168,7 @@ export default function BondYieldsChart() {
             <span className="text-slate-400 block text-[10px] uppercase font-bold">30Y BOND YIELD (US30Y)</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className="text-emerald-400 font-extrabold text-base">
-                {latest30Y !== null ? `${latest30Y.toFixed(2)}%` : 'AWAITING FEED...'}
+                {latest30Y !== null ? formatPercent(latest30Y, { decimals: 2 }) : 'AWAITING FEED...'}
               </span>
               <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
             </div>
@@ -171,7 +178,7 @@ export default function BondYieldsChart() {
             <span className="text-slate-400 block text-[10px] uppercase font-bold">10Y TREASURY YIELD (US10Y)</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className="text-cyan-400 font-extrabold text-base">
-                {latest10Y !== null ? `${latest10Y.toFixed(2)}%` : 'AWAITING FEED...'}
+                {latest10Y !== null ? formatPercent(latest10Y, { decimals: 2 }) : 'AWAITING FEED...'}
               </span>
             </div>
           </div>
@@ -180,7 +187,7 @@ export default function BondYieldsChart() {
             <span className="text-slate-400 block text-[10px] uppercase font-bold">2Y TREASURY YIELD (US02Y)</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className="text-purple-400 font-extrabold text-base">
-                {latest2Y !== null ? `${latest2Y.toFixed(2)}%` : 'AWAITING FEED...'}
+                {latest2Y !== null ? formatPercent(latest2Y, { decimals: 2 }) : 'AWAITING FEED...'}
               </span>
             </div>
           </div>
@@ -189,7 +196,7 @@ export default function BondYieldsChart() {
             <span className="text-slate-400 block text-[10px] uppercase font-bold">2Y/10Y SPREAD</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className={`font-extrabold text-base ${spread2Y10Y !== null && spread2Y10Y < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                {spread2Y10Y !== null ? `${spread2Y10Y > 0 ? '+' : ''}${(spread2Y10Y * 100).toFixed(1)} bps` : 'AWAITING FEED...'}
+                {spread2Y10Y !== null ? formatBps(spread2Y10Y, { from: 'percent', decimals: 1 }) : 'AWAITING FEED...'}
               </span>
             </div>
           </div>

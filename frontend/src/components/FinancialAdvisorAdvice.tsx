@@ -8,6 +8,7 @@ import { Badge } from './ui/Badge';
 import ExplainabilityModal from './ExplainabilityModal';
 import { ProvenanceBadge } from './ProvenanceBadge';
 import { ProvenanceValue } from './ProvenanceValue';
+import { ABSENT, formatCurrency, formatNumber, formatPercent } from '../lib/format';
 
 interface TechnicalIndicators {
   rsi?: number;
@@ -79,6 +80,8 @@ interface PortfolioMetrics {
   max_drawdown_est?: number;
   hawkes_risk_factor?: number;
   metrics_source?: string;
+  risk_horizon?: string;
+  annualization_basis?: string;
 }
 
 interface AdviceBrief {
@@ -204,7 +207,9 @@ export default function FinancialAdvisorAdvice() {
         <div className="grid grid-cols-4 gap-2 bg-[#06080d] p-2.5 rounded-xl border border-cyan-500/20 text-[10px]">
           <div className="p-1.5 rounded bg-slate-950/80 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-slate-500 block text-[9px]">PORTFOLIO VaR (95%)</span>
+              <span className="text-slate-500 block text-[9px]" title={metrics?.annualization_basis || undefined}>
+                PORTFOLIO VaR (95%, {metrics?.risk_horizon || '—'})
+              </span>
               <ProvenanceBadge sourceType={metrics?.metrics_source === 'computed' && metrics?.var_95_pct !== undefined ? 'computed_deterministic' : 'disclosed_placeholder'} />
             </div>
             <ProvenanceValue
@@ -355,7 +360,7 @@ export default function FinancialAdvisorAdvice() {
                         🐳 SMART MONEY CONVERGENCE
                       </span>
                     )}
-                    {(p.microstructure_stop_multiplier || 1.5) < 1.0 && (
+                    {typeof p.microstructure_stop_multiplier === 'number' && p.microstructure_stop_multiplier < 1.0 && (
                       <span className="px-1.5 py-0.5 rounded text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
                         🚨 OFI STOP TIGHTENED ({p.microstructure_stop_multiplier}x ATR)
                       </span>
@@ -364,7 +369,7 @@ export default function FinancialAdvisorAdvice() {
 
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] text-slate-400">
-                      CONVICTION: <span className="text-emerald-400 font-bold">{((p.conviction_score || 0) * 100).toFixed(0)}%</span>
+                      CONVICTION: <span className="text-emerald-400 font-bold">{formatPercent(p.conviction_score, { from: 'ratio', decimals: 0 })}</span>
                     </span>
                     <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
                       KELLY {p.kelly_allocation_pct}%
@@ -456,7 +461,7 @@ export default function FinancialAdvisorAdvice() {
                 <div className="grid grid-cols-4 gap-2 text-[10px] pt-1 border-t border-slate-800">
                   <div>
                     <span className="text-slate-500 block">POSITION SIZE</span>
-                    <span className="text-cyan-400 font-bold">${Number(modalCalculations.posSizeUsd).toLocaleString()}</span>
+                    <span className="text-cyan-400 font-bold">{formatCurrency(Number(modalCalculations.posSizeUsd), { compact: false })}</span>
                   </div>
                   <div>
                     <span className="text-slate-500 block">UNITS / SHARES</span>
@@ -464,11 +469,11 @@ export default function FinancialAdvisorAdvice() {
                   </div>
                   <div>
                     <span className="text-slate-500 block">MAX RISK</span>
-                    <span className="text-rose-400 font-bold">-${Number(modalCalculations.maxRiskUsd).toLocaleString()}</span>
+                    <span className="text-rose-400 font-bold">{formatCurrency(-Number(modalCalculations.maxRiskUsd), { compact: false })}</span>
                   </div>
                   <div>
                     <span className="text-slate-500 block">TARGET PROFIT</span>
-                    <span className="text-emerald-400 font-bold">+${Number(modalCalculations.maxProfitUsd).toLocaleString()}</span>
+                    <span className="text-emerald-400 font-bold">{formatCurrency(Number(modalCalculations.maxProfitUsd), { compact: false, signed: true })}</span>
                   </div>
                 </div>
               )}
@@ -515,7 +520,7 @@ export default function FinancialAdvisorAdvice() {
               <div className="p-3 bg-slate-950 rounded-xl border border-amber-500/30 space-y-1.5 text-[10px]">
                 <div className="flex items-center justify-between text-amber-400 font-bold uppercase">
                   <span>GARCH(1,1) VOLATILITY CONE TRANCHE EXITS</span>
-                  <span>COND VOL: {selectedPlay.volatility_cone.cond_volatility_pct || 2.4}%</span>
+                  <span>COND VOL: {formatPercent(selectedPlay.volatility_cone.cond_volatility_pct, { decimals: 2 })}</span>
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   <div className="bg-slate-900 p-2 rounded border border-slate-800">
@@ -539,7 +544,7 @@ export default function FinancialAdvisorAdvice() {
               <div><span className="text-slate-400">ENTRY PRICE:</span> <span className="text-white font-bold">${selectedPlay.entry_level}</span></div>
               <div><span className="text-slate-400">TARGET PRICE:</span> <span className="text-emerald-400 font-bold">${selectedPlay.target_price}</span></div>
               <div><span className="text-slate-400">STOP LOSS:</span> <span className="text-rose-400 font-bold">${selectedPlay.stop_loss}</span></div>
-              <div><span className="text-slate-400">STOP MULTIPLIER:</span> <span className="text-amber-400 font-bold">{selectedPlay.microstructure_stop_multiplier || 1.5}x ATR</span></div>
+              <div><span className="text-slate-400">STOP MULTIPLIER:</span> <span className="text-amber-400 font-bold">{formatNumber(selectedPlay.microstructure_stop_multiplier, { decimals: 2 })}x ATR</span></div>
             </div>
 
             {/* Rationale */}

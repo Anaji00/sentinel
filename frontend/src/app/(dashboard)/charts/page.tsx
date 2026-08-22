@@ -258,7 +258,7 @@ export default function ChartsPage() {
               timestamp: e.occurred_at,
               price: price,
               volume: e.crypto_data?.volume || e.financial_data?.volume || 1000,
-              anomaly_score: e.anomaly_score || 0.0
+              anomaly_score: e.anomaly_score ?? 0
             }].slice(-60);
           }
         });

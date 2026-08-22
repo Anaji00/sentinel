@@ -7,6 +7,7 @@ import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Bitcoin, TrendingUp, Zap, Radio } from 'lucide-react';
+import { formatPercent } from '../../lib/format';
 
 interface SeriesPoint {
   timestamp: string;
@@ -112,7 +113,7 @@ export default function CryptoPriceChart() {
             <span className="text-slate-400 block text-[10px] uppercase font-bold">24H CHANGE</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className={`font-extrabold text-base ${priceChangePct !== null ? (isPositive ? 'text-emerald-400' : 'text-rose-400') : 'text-slate-400'}`}>
-                {priceChangePct !== null ? (isPositive ? `+${priceChangePct.toFixed(2)}%` : `${priceChangePct.toFixed(2)}%`) : 'AWAITING FEED...'}
+                {priceChangePct !== null ? formatPercent(priceChangePct, { decimals: 2, signed: true }) : 'AWAITING FEED...'}
               </span>
             </div>
           </div>

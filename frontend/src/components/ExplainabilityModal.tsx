@@ -1,5 +1,6 @@
 'use client';
 
+import { ABSENT, formatNumber, formatPercent } from '../lib/format';
 import React from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
@@ -24,13 +25,22 @@ interface ScoreAdjustment {
 }
 
 interface ProvenanceData {
-  source_collector: string;
+  source_collector: string | null;
   event_id: string;
-  ingest_timestamp: string;
+  ingest_timestamp: string | null;
   payload_hash: string;
   processing_latency_ms: number;
-  data_quality_score: number;
+  /** Null until a quality signal is actually measured. */
+  data_quality_score: number | null;
 }
+
+/** Mirrors the drift status published by the telemetry worker. */
+type DriftState =
+  | 'STABLE'
+  | 'SLIGHT_DRIFT'
+  | 'SIGNIFICANT_DRIFT'
+  | 'INITIALIZING'
+  | 'UNKNOWN';
 
 interface ModelCard {
   model_name: string;
@@ -39,12 +49,15 @@ interface ModelCard {
   features_used: string[];
   training_window: string;
   model_drift_status: {
-    psi_score: number;
-    ks_statistic: number;
-    drift_state: string;
-    last_evaluated: string;
+    /** Null when drift has not been evaluated -- absence, not stability. */
+    psi_score: number | null;
+    drift_state: DriftState;
+    psi_threshold?: number;
+    baseline_count?: number | null;
+    current_count?: number | null;
+    last_evaluated: string | null;
+    detail?: string;
   };
-  governance_status: string;
 }
 
 interface ExplainResponse {
@@ -111,27 +124,45 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
               <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3">
                 <div className="text-[10px] uppercase tracking-wider text-slate-400">Anomaly Score</div>
                 <div className="text-lg font-bold text-cyan-400 mt-1">
-                  {((data?.overall_anomaly_score || 0.85) * 100).toFixed(1)}%
+                  {formatPercent(data?.overall_anomaly_score, { from: 'ratio', decimals: 1 })}
                 </div>
-                <div className="text-[10px] text-emerald-400 flex items-center gap-1 mt-0.5">
-                  <CheckCircle className="w-3 h-3" /> Statistically Significant
-                </div>
+                {/* Significance comes from the backend, which applies the
+                    threshold. It was previously asserted unconditionally. */}
+                {data?.is_significant === true ? (
+                  <div className="text-[10px] text-emerald-400 flex items-center gap-1 mt-0.5">
+                    <CheckCircle className="w-3 h-3" /> Statistically Significant
+                  </div>
+                ) : data?.is_significant === false ? (
+                  <div className="text-[10px] text-slate-500 mt-0.5">Below significance threshold</div>
+                ) : (
+                  <div className="text-[10px] text-slate-500 mt-0.5">Significance not reported</div>
+                )}
               </div>
 
               <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3">
                 <div className="text-[10px] uppercase tracking-wider text-slate-400">Model Stability</div>
-                <div className="text-lg font-bold text-emerald-400 mt-1">
-                  {data?.model_card?.model_drift_status?.drift_state || 'STABLE'}
+                <div className={`text-lg font-bold mt-1 ${
+                  data?.model_card?.model_drift_status?.drift_state === 'STABLE'
+                    ? 'text-emerald-400'
+                    : data?.model_card?.model_drift_status?.drift_state === 'SIGNIFICANT_DRIFT'
+                    ? 'text-rose-400'
+                    : data?.model_card?.model_drift_status?.drift_state === 'SLIGHT_DRIFT'
+                    ? 'text-amber-400'
+                    : 'text-slate-400'
+                }`}>
+                  {data?.model_card?.model_drift_status?.drift_state ?? ABSENT}
                 </div>
                 <div className="text-[10px] text-slate-400 mt-0.5">
-                  PSI: {data?.model_card?.model_drift_status?.psi_score || 0.042} (Threshold 0.25)
+                  PSI: {formatNumber(data?.model_card?.model_drift_status?.psi_score, { decimals: 4 })}
+                  {' '}(Threshold {formatNumber(data?.model_card?.model_drift_status?.psi_threshold ?? 0.25, { decimals: 2 })})
                 </div>
               </div>
 
               <div className="bg-slate-950/60 border border-slate-800/80 rounded-xl p-3">
                 <div className="text-[10px] uppercase tracking-wider text-slate-400">Latency & Hash</div>
                 <div className="text-lg font-bold text-amber-400 mt-1">
-                  {data?.provenance?.processing_latency_ms || 14.8}ms
+                  {formatNumber(data?.provenance?.processing_latency_ms, { decimals: 2 })}
+                  <span className="text-xs text-slate-500 ml-0.5">ms</span>
                 </div>
                 <div className="text-[10px] text-slate-400 truncate mt-0.5" title={data?.provenance?.payload_hash}>
                   {data?.provenance?.payload_hash?.slice(0, 14)}...
@@ -214,8 +245,11 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
                   <Database className="w-4 h-4 text-emerald-400" />
                   Model Specification Card
                 </span>
-                <span className="text-[10px] text-emerald-400 font-semibold">
-                  {data?.model_card?.governance_status || 'VALIDATED'}
+                {/* Schema version, not a governance verdict. The card
+                    previously showed a hardcoded "VALIDATED" badge, which
+                    asserted an approval that no system in the platform grants. */}
+                <span className="text-[10px] text-slate-400 font-semibold">
+                  SCHEMA {data?.model_card?.feature_schema_version ?? ABSENT}
                 </span>
               </div>
 

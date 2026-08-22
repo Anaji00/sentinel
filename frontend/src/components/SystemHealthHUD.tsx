@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Activity, Database, Server, Shield, Cpu, X } from 'lucide-react';
+import { DataGrid } from './ui/DataGrid';
 
 interface SystemHealthResponse {
   status: string;
@@ -115,13 +116,8 @@ export default function SystemHealthHUD() {
                 <span className="text-[10px] text-purple-400 font-bold uppercase tracking-wider block flex items-center gap-1">
                   <Shield className="w-3.5 h-3.5" /> PROMETHEUS TELEMETRY SUMMARY
                 </span>
-                <div className="text-[10px] text-slate-300 space-y-1 max-h-32 overflow-y-auto">
-                  {Object.entries(metricsData).map(([key, val]) => (
-                    <div key={key} className="flex justify-between border-b border-slate-800/60 pb-0.5">
-                      <span className="text-slate-400 truncate max-w-[250px]">{key}</span>
-                      <span className="text-white font-bold">{typeof val === 'object' ? JSON.stringify(val) : String(val)}</span>
-                    </div>
-                  ))}
+                <div className="max-h-32 overflow-y-auto">
+                  <DataGrid data={metricsData} emptyLabel="No telemetry reported" />
                 </div>
               </div>
             )}

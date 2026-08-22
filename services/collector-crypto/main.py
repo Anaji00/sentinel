@@ -31,6 +31,7 @@ from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 
 from shared.utils.logging import setup_sentinel_logging
+from shared.utils.collector_metrics import CollectorMetrics
 
 logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -621,11 +622,15 @@ async def main():
     logger.info("SENTINEL CRYPTO COLLECTOR ONLINE (HYBRID EDITION)")
     logger.info("=" * 60)
     
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-crypto")
     await producer.start()
     redis_client = await get_redis()
     
     # §1.1 Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-crypto")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-crypto"))
 
     try:

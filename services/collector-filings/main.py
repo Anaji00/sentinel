@@ -39,6 +39,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
 
 try:
     from thirteen_f import (
@@ -310,13 +311,17 @@ async def main():
     logger.info(f"Prominent Institutional Filers: {len(PROMINENT_FILERS)}")
     logger.info("=" * 60)
 
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-filings")
     await producer.start()
 
     redis_client = await get_redis()
     dedup = FilingDeduplicator(redis_client)
 
     # Universal 15s heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-filings")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-filings"))
 
     connector = aiohttp.TCPConnector(limit=10)

@@ -30,6 +30,72 @@ logger = logging.getLogger("sentinel.quant_calc")
 # SECTION 1: VOLATILITY MODELS
 # ════════════════════════════════════════════════════════════════════════════════
 
+# Minutes of market activity per year, by asset class. Equities trade a 6.5-hour
+# RTH session on 252 days; crypto trades continuously; FX runs 24h on weekdays.
+_ACTIVE_MINUTES_PER_YEAR = {
+    "equity": 252 * 390,      # 98,280
+    "crypto": 365 * 1440,     # 525,600
+    "fx":     252 * 1440,     # 362,880
+}
+_SESSIONS_PER_YEAR = {"equity": 252, "crypto": 365, "fx": 252}
+
+_TIMEFRAME_MINUTES = {
+    "1m": 1, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
+    "1h": 60, "60m": 60, "4h": 240, "240m": 240,
+}
+
+
+def periods_per_year(timeframe: str, asset_class: str = "equity") -> float:
+    """Returns the number of *timeframe*-length bars in a trading year.
+
+    Annualizing a statistic requires a scaling factor matched to the sampling
+    frequency of the underlying series. Applying the daily convention (252) to
+    hourly bars understates an annualized Sharpe by roughly 2.5x for equities and
+    5.9x for crypto, so every annualized figure must be told what it is measuring.
+
+    Args:
+        timeframe: Sentinel timeframe label ("5m", "1h", "1d", "1w").
+        asset_class: One of "equity", "crypto", "fx". Unknown values fall back
+            to the equity calendar.
+
+    Returns:
+        Bars per year as a float.
+    """
+    ac = str(asset_class or "equity").strip().lower()
+    if ac not in _ACTIVE_MINUTES_PER_YEAR:
+        ac = "equity"
+
+    tf = str(timeframe or "1d").strip().lower()
+    sessions = _SESSIONS_PER_YEAR[ac]
+
+    if tf in ("1d", "d", "1day", "daily"):
+        return float(sessions)
+    if tf in ("1w", "w", "1week", "weekly"):
+        return 52.0
+    if tf in ("1mo", "1month", "monthly"):
+        return 12.0
+
+    minutes = _TIMEFRAME_MINUTES.get(tf)
+    if minutes is None:
+        # Bare minute counts ("60") and unlabelled inputs.
+        digits = "".join(ch for ch in tf if ch.isdigit())
+        minutes = int(digits) if digits else 0
+    if not minutes:
+        return float(sessions)
+
+    return _ACTIVE_MINUTES_PER_YEAR[ac] / float(minutes)
+
+
+def classify_asset_class(symbol: str) -> str:
+    """Maps a ticker to the calendar its returns follow: crypto, fx, or equity."""
+    s = str(symbol or "").upper().strip()
+    if s.endswith(("-USD", "USDT", "USDC", "BUSD", "/USD")) or s in ("BTC", "ETH"):
+        return "crypto"
+    if s in ("EURUSD", "GBPUSD", "USDJPY", "DXY") or (len(s) == 6 and s.isalpha()):
+        return "fx"
+    return "equity"
+
+
 def ewma_volatility(
     returns: List[float],
     lam: float = 0.94,
@@ -320,6 +386,35 @@ def cvar_historical(
     return round(abs(np.mean(tail)) * position_value, 4)
 
 
+def scale_var_to_horizon(var_value: float, from_periods: float, to_periods: float) -> float:
+    """Rescales a VaR/CVaR figure between sampling horizons via the square-root rule.
+
+    A VaR computed on hourly returns is a one-hour VaR. Presenting it where a
+    reader assumes a daily figure understates the risk by sqrt(bars_per_day).
+    Assumes i.i.d. returns — the standard approximation, and the same one implied
+    by sqrt-time annualization elsewhere in this module.
+
+    Args:
+        var_value: The VaR at the source horizon (positive number).
+        from_periods: Periods per year of the source series.
+        to_periods: Periods per year of the target horizon.
+    """
+    if from_periods <= 0 or to_periods <= 0:
+        return var_value
+    return var_value * math.sqrt(from_periods / to_periods)
+
+
+def horizon_label(timeframe: str) -> str:
+    """Human-readable risk horizon for a bar timeframe, e.g. '1-hour', '1-day'."""
+    tf = str(timeframe or "").strip().lower()
+    return {
+        "1m": "1-minute", "5m": "5-minute", "10m": "10-minute",
+        "15m": "15-minute", "30m": "30-minute", "1h": "1-hour",
+        "60m": "1-hour", "4h": "4-hour", "240m": "4-hour",
+        "1d": "1-day", "1w": "1-week",
+    }.get(tf, tf or "unknown")
+
+
 def max_drawdown(prices: List[float]) -> Tuple[float, int, int]:
     """
     Maximum drawdown: largest peak-to-trough decline in a price series.
@@ -384,6 +479,65 @@ def sharpe_ratio(
 # ════════════════════════════════════════════════════════════════════════════════
 # SECTION 3: STATISTICAL TESTS
 # ════════════════════════════════════════════════════════════════════════════════
+
+def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> Dict[str, Any]:
+    """
+    Benjamini-Hochberg false discovery rate control for a family of hypothesis tests.
+
+    Testing every pair in a universe at an uncorrected alpha guarantees false
+    positives in proportion to the family size: 351 pairs at alpha=0.05 yields
+    roughly 18 spurious findings per test type by construction. BH bounds the
+    expected proportion of false discoveries among those *reported* at alpha.
+
+    Sorts p-values ascending and finds the largest k where p_(k) <= (k/m) * alpha;
+    all tests with p at or below that value are rejected (declared significant).
+
+    Args:
+        p_values: The family of p-values. None entries are treated as 1.0
+                  (not significant) — a missing measurement is never a discovery.
+        alpha: Target false discovery rate.
+
+    Returns:
+        dict with ``rejected`` (bool per input, original order), ``adjusted``
+        (BH-adjusted q-values, original order), ``threshold`` (largest p rejected,
+        0.0 if none), and ``num_rejected``.
+    """
+    m = len(p_values)
+    if m == 0:
+        return {"rejected": [], "adjusted": [], "threshold": 0.0, "num_rejected": 0}
+
+    clean = [1.0 if (p is None or not math.isfinite(p)) else min(1.0, max(0.0, float(p))) for p in p_values]
+
+    order = sorted(range(m), key=lambda i: clean[i])
+
+    # Largest k (1-indexed) satisfying p_(k) <= (k/m) * alpha.
+    max_k = 0
+    for rank, idx in enumerate(order, start=1):
+        if clean[idx] <= (rank / m) * alpha:
+            max_k = rank
+
+    threshold = clean[order[max_k - 1]] if max_k > 0 else 0.0
+    rejected = [False] * m
+    for rank, idx in enumerate(order, start=1):
+        if rank <= max_k:
+            rejected[idx] = True
+
+    # Step-up adjusted q-values, enforced monotone non-decreasing from the largest.
+    adjusted = [1.0] * m
+    running_min = 1.0
+    for rank in range(m, 0, -1):
+        idx = order[rank - 1]
+        q = min(1.0, clean[idx] * m / rank)
+        running_min = min(running_min, q)
+        adjusted[idx] = round(running_min, 6)
+
+    return {
+        "rejected": rejected,
+        "adjusted": adjusted,
+        "threshold": round(threshold, 6),
+        "num_rejected": max_k,
+    }
+
 
 def augmented_dickey_fuller(series: List[float], max_lags: int = 10) -> Dict[str, Any]:
     """

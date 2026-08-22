@@ -212,21 +212,58 @@ class HawkesMLE:
         result["iterations"] = iteration + 1
         return result
 
+    def _spectral_radius(self, matrix, iterations: int = 50, tol: float = 1e-9) -> float:
+        """Dominant eigenvalue magnitude of a non-negative matrix, by power iteration.
+
+        The branching matrix has non-negative entries (excitation is never
+        inhibitory here), so Perron-Frobenius guarantees a real non-negative
+        dominant eigenvalue and power iteration converges to it.
+        """
+        n = self.D
+        if n == 0:
+            return 0.0
+
+        v = [1.0 / n] * n
+        eigenvalue = 0.0
+        for _ in range(iterations):
+            w = [sum(matrix[i][j] * v[j] for j in range(n)) for i in range(n)]
+            norm = math.sqrt(sum(x * x for x in w))
+            if norm < 1e-15:
+                return 0.0  # nilpotent / zero matrix: no excitation at all
+            w = [x / norm for x in w]
+            if max(abs(w[i] - v[i]) for i in range(n)) < tol:
+                v = w
+                eigenvalue = norm
+                break
+            v = w
+            eigenvalue = norm
+        return eigenvalue
+
     def _project_stationarity(self):
-        """Project α matrix so spectral radius of branching matrix < cap."""
-        # Branching matrix R_ij = α_ij / β
+        """Scale α so the branching matrix has spectral radius below the cap.
+
+        Stationarity of a multivariate Hawkes process requires ρ(R) < 1, where
+        R_ij = α_ij / β is the expected number of type-i events triggered by one
+        type-j event.
+
+        This previously used the Frobenius norm as a proxy. That is *safe* --
+        ρ(A) ≤ ‖A‖_F always -- but loose: for a dense DxD matrix the Frobenius
+        norm can exceed the spectral radius by up to a factor of √D, so the
+        projection scaled α down far more than stationarity required and the
+        model systematically understated contagion. Power iteration gives the
+        true ρ in a few dozen cheap passes over an 11x11 matrix.
+        """
         if self.beta < 1e-10:
             return
-        # Simple Frobenius norm bound as spectral radius proxy
-        # (for small D, this is conservative but cheap)
-        frob_sq = sum(
-            (self.alpha[i][j] / self.beta) ** 2
+
+        branching = [
+            [self.alpha[i][j] / self.beta for j in range(self.D)]
             for i in range(self.D)
-            for j in range(self.D)
-        )
-        frob = math.sqrt(frob_sq)
-        if frob > self.spectral_radius_cap:
-            scale = self.spectral_radius_cap / frob
+        ]
+        rho = self._spectral_radius(branching)
+
+        if rho > self.spectral_radius_cap:
+            scale = self.spectral_radius_cap / rho
             for i in range(self.D):
                 for j in range(self.D):
                     self.alpha[i][j] *= scale

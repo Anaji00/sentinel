@@ -7,7 +7,10 @@ import { useRouter } from 'next/navigation';
 export default function LoginPage() {
   const router = useRouter();
   const [authMode, setAuthMode] = useState<'credentials' | 'apikey'>('credentials');
-  const [email, setEmail] = useState('vance@sentinel-quant.io');
+  // Empty by default. Prefilling the configured admin address discloses a valid
+  // account name to anyone who loads the login page, and hardcodes one
+  // deployment's operator into the build.
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [isLoading, setIsLoading] = useState(false);

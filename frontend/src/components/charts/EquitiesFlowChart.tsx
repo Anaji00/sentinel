@@ -8,6 +8,7 @@ import { Badge } from '../ui/Badge';
 import { TrendingUp, BarChart2, Radio } from 'lucide-react';
 
 import { useLiveEvents } from '../../lib/useLiveEvents';
+import { formatPercent } from '../../lib/format';
 
 interface SeriesPoint {
   timestamp: string;
@@ -144,7 +145,7 @@ export default function EquitiesFlowChart() {
               </span>
               {spyPct !== null && (
                 <span className={`font-bold text-xs ${spyPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {spyPct >= 0 ? `+${spyPct.toFixed(2)}%` : `${spyPct.toFixed(2)}%`}
+                  {formatPercent(spyPct, { decimals: 2, signed: true })}
                 </span>
               )}
             </div>
@@ -158,7 +159,7 @@ export default function EquitiesFlowChart() {
               </span>
               {qqqPct !== null && (
                 <span className={`font-bold text-xs ${qqqPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {qqqPct >= 0 ? `+${qqqPct.toFixed(2)}%` : `${qqqPct.toFixed(2)}%`}
+                  {formatPercent(qqqPct, { decimals: 2, signed: true })}
                 </span>
               )}
             </div>

@@ -8,6 +8,8 @@ import { NormalizedEvent, Scenario } from '../lib/types';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
+import { DataGrid } from './ui/DataGrid';
+import { formatPercent } from '../lib/format';
 
 interface EvidenceContributor {
   agent_name: string;
@@ -137,12 +139,12 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
             <span className={`px-1.5 py-0.5 rounded border font-extrabold text-[9px] ${
               fd.eps_surprise_pct >= 0 ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
             }`}>
-              EPS {fd.eps_surprise_pct >= 0 ? '+' : ''}{fd.eps_surprise_pct.toFixed(1)}%
+              EPS {formatPercent(fd.eps_surprise_pct, { decimals: 1, signed: true })}
             </span>
           )}
           {cd.funding_rate !== undefined && (
             <span className="px-1.5 py-0.5 rounded border border-purple-500/40 bg-purple-500/20 text-purple-300 font-extrabold text-[9px]">
-              {(cd.funding_rate * 100).toFixed(4)}% RATE
+              {formatPercent(cd.funding_rate, { from: 'ratio', decimals: 4 })} RATE
             </span>
           )}
           <span className="text-slate-400 font-medium">
@@ -543,9 +545,9 @@ export default function IntelligenceFeed() {
                     Querying Hypertable event payload...
                   </div>
                 ) : (
-                  <pre className="p-3 bg-slate-950 rounded border border-slate-800 text-[10px] text-emerald-300 overflow-x-auto max-h-52 font-mono">
-                    {JSON.stringify(fullEventDetail || selectedEvent, null, 2)}
-                  </pre>
+                  <div className="max-h-64 overflow-y-auto">
+                  <DataGrid data={fullEventDetail || selectedEvent} omit={['raw_payload']} />
+                </div>
                 )}
               </div>
             </div>

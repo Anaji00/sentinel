@@ -58,6 +58,7 @@ logger = setup_sentinel_logging("collector.adsb", level=getattr(logging, os.gete
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 OPENSKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
@@ -285,11 +286,15 @@ async def main():
     logger.info(f"Auth: {'OAuth2' if OPENSKY_CLIENT_ID else 'Anonymous (400 credits/day)'}")
     logger.info("=" * 60)
  
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-adsb")
     await producer.start()
     hb_task = None
     try:
         redis = await get_redis()
+        # Throughput counters. The heartbeat proves this process is alive;
+        # these prove it is still producing.
+        metrics = CollectorMetrics("collector-adsb")
+        await metrics.start(redis)
         hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-adsb"))
         await collect(producer)
     except KeyboardInterrupt:

@@ -6,6 +6,7 @@ import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { TrendingUp, TrendingDown, Activity, RefreshCw } from 'lucide-react';
+import { formatPercent } from '../../lib/format';
 
 interface SeriesPoint {
   time: string;
@@ -71,7 +72,7 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
       badge={
         hasData ? (
           <Badge variant={isPositive ? 'live' : 'anomaly'} pulse>
-            {isPositive ? '+' : ''}{priceChangePct.toFixed(2)}%
+            {formatPercent(priceChangePct, { decimals: 2, signed: true })}
           </Badge>
         ) : (
           <Badge variant="warning" pulse>

@@ -50,6 +50,7 @@ from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 
 from shared.utils.logging import setup_sentinel_logging
+from shared.utils.collector_metrics import CollectorMetrics
 
 logger = setup_sentinel_logging("collector.ais", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -225,12 +226,16 @@ async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL AIS Collector..")
     logger.info(f"Zones: {len(WATCH_ZONES)}  |  Kafka: {os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')}")
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-ais")
     await producer.start()
     counter = MessageCounter()
     hb_task = None
     try:
         redis = await get_redis()
+        # Throughput counters. The heartbeat proves this process is alive;
+        # these prove it is still producing.
+        metrics = CollectorMetrics("collector-ais")
+        await metrics.start(redis)
         hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-ais"))
         await collect(producer, counter)
     except KeyboardInterrupt:

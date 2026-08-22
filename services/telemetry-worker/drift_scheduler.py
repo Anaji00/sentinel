@@ -20,10 +20,13 @@ from shared.utils.metrics import MetricsCollector
 
 logger = logging.getLogger("telemetry.drift_scheduler")
 
+# Where the latest drift evaluation is published for downstream consumers.
+DRIFT_REPORT_KEY = "sentinel:ml:drift_report"
+
 
 class ModelDriftScheduler:
     """
-    Periodic background scheduler for monitoring ONNX anomaly distribution drift.
+    Periodic background scheduler for monitoring anomaly distribution drift.
     """
 
     def __init__(self, redis_client=None, producer=None, check_interval_sec: int = 3600):
@@ -105,6 +108,21 @@ class ModelDriftScheduler:
                     )
                 except Exception as e:
                     logger.error(f"Failed to publish retrain trigger: {e}")
+
+        # Publish the report so consumers (model cards, explainability audit
+        # trails) can quote measured drift instead of a hardcoded placeholder.
+        # TTL slightly over two check intervals: a stale key means the scheduler
+        # stopped, and a consumer should report drift as unknown rather than
+        # keep showing the last value indefinitely.
+        if self.redis:
+            try:
+                await self.redis.raw.set(
+                    DRIFT_REPORT_KEY,
+                    json.dumps(report),
+                    ex=max(120, int(self.check_interval_sec * 2.5)),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish drift report: {e}")
 
         return report
 

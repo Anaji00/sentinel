@@ -6,8 +6,10 @@ services:
     container_name: sentinel-ingress
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      # Loopback only. Without the explicit 127.0.0.1 Docker publishes on
+      # every interface, including untrusted networks.
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     deploy:
@@ -30,6 +32,9 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
       KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok"
+      # Heap capped under the cgroup limit so the JVM garbage-collects
+      # instead of being OOM-killed by the kernel.
+      KAFKA_HEAP_OPTS: "-Xms128m -Xmx192m"
     volumes:
       - zookeeper_data:/var/lib/zookeeper/data
       - zookeeper_log:/var/lib/zookeeper/log
@@ -37,7 +42,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     healthcheck:
       test: echo ruok | nc localhost 2181 | grep imok
       interval: 10s
@@ -59,8 +64,14 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_MESSAGE_MAX_BYTES: 10485760
+      # 768m heap inside a 1.5G container leaves room for direct buffers,
+      # mmap'd log segments and JVM overhead.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx768m"
+      # Bound the log so an idle week cannot fill the volume.
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_LOG_RETENTION_BYTES: 2147483648
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
     volumes:
       - kafka_data:/var/lib/kafka/data
     deploy:
@@ -76,6 +87,7 @@ services:
       start_period: 30s
 
   kafka-ui:
+    profiles: ["obs"]
     image: provectuslabs/kafka-ui:latest
     container_name: sentinel-kafka-ui
     restart: unless-stopped
@@ -103,7 +115,21 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    command: postgres -c shared_preload_libraries=timescaledb
+    # Sized for the 2G cgroup limit. Without these Postgres uses compiled
+    # defaults and work_mem is allocated per sort node per connection --
+    # the classic way a cgroup-limited container still gets OOM-killed.
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=60
+      -c shared_buffers=512MB
+      -c effective_cache_size=1200MB
+      -c maintenance_work_mem=128MB
+      -c work_mem=8MB
+      -c max_worker_processes=8
+      -c max_parallel_workers=4
+      -c max_parallel_workers_per_gather=2
+      -c timescaledb.max_background_workers=4
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
       - ./shared/db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql
@@ -111,7 +137,9 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 2G
+          # Measured 143MiB. shared_buffers=512M is the real floor here,
+          # plus work_mem*max_connections worst case -- 1.5G covers both.
+          memory: 1.5G
     healthcheck:
       test: pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
       interval: 10s
@@ -237,6 +265,7 @@ services:
         condition: service_started
 
   reasoning:
+    profiles: ["agents"]
     build:
       context: .
       dockerfile: ml.Dockerfile
@@ -251,7 +280,8 @@ services:
       resources:
         limits:
           cpus: '1.5'
-          memory: 1.5G
+          # Measured 124MiB. Orchestrates via HTTP; holds nothing large.
+          memory: 512M
     depends_on:
       kafka:
         condition: service_healthy
@@ -263,6 +293,7 @@ services:
         condition: service_healthy
 
   collector-tradfi:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-tradfi
     command: python services/collector-tradfi/main.py
@@ -275,7 +306,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -283,6 +314,7 @@ services:
         condition: service_healthy
 
   collector-crypto:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-crypto
     command: python services/collector-crypto/main.py
@@ -295,7 +327,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -303,6 +335,7 @@ services:
         condition: service_healthy
 
   collector-prediction:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-prediction
     command: python services/collector-prediction/main.py
@@ -315,7 +348,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -323,20 +356,28 @@ services:
         condition: service_healthy
 
   ollama:
+    profiles: ["agents"]
     image: ollama/ollama:latest
     container_name: sentinel-ollama
     volumes:
       - ollama_data:/root/.ollama
     environment:
       - OLLAMA_FLASH_ATTENTION=1
-      - OLLAMA_NUM_PARALLEL=4
-      - OLLAMA_KEEP_ALIVE=-1
+      # One slot: this CPU serves ~3-5 tok/s, so four concurrent contexts
+      # quarter throughput and quadruple the KV cache.
+      - OLLAMA_NUM_PARALLEL=1
+      # Release the model after idle rather than pinning it in RAM forever.
+      - OLLAMA_KEEP_ALIVE=5m
+      # Both tiers must stay resident: agents-heavy and agents-fast request
+      # different models, and a value of 1 evicts/reloads on every alternating
+      # request -- far more costly than the memory it saves.
+      - OLLAMA_MAX_LOADED_MODELS=2
       - OLLAMA_KV_CACHE_TYPE=q8_0
     deploy:
       resources:
         limits:
-          cpus: '4.0'
-          memory: 8G
+          cpus: '6.0'
+          memory: 4G
     healthcheck:
       test: [ "CMD", "ollama", "list" ]
       interval: 10s
@@ -366,6 +407,7 @@ services:
       disable: true
 
   collector-cyber:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-cyber
     command: python services/collector-cyber/main.py
@@ -378,7 +420,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       redis:
         condition: service_healthy
@@ -386,6 +428,7 @@ services:
         condition: service_healthy
 
   collector-radar:
+    profiles: ["collectors"]
     build: .
     command: "python services/collector-radar/main.py"
     container_name: sentinel-radar
@@ -398,7 +441,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       redis:
         condition: service_healthy
@@ -406,6 +449,7 @@ services:
         condition: service_healthy
 
   collector-ais:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-ais
     command: python services/collector-ais/main.py
@@ -418,7 +462,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -426,6 +470,7 @@ services:
         condition: service_healthy
 
   collector-adsb:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-adsb
     command: python services/collector-adsb/main.py
@@ -438,7 +483,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -446,6 +491,7 @@ services:
         condition: service_healthy
 
   collector-news:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-news
     command: python services/collector-news/main.py
@@ -458,7 +504,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -466,6 +512,7 @@ services:
         condition: service_healthy
 
   collector-macro:
+    profiles: ["collectors"]
     build: .
     container_name: sentinel-macro
     command: python services/collector-macro/main.py
@@ -478,7 +525,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -498,7 +545,8 @@ services:
       resources:
         limits:
           cpus: '1.5'
-          memory: 1G
+          # Measured 185MiB serving live traffic.
+          memory: 768M
     healthcheck:
       test: [ "CMD", "python", "-c", "import os, urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': os.environ.get('API_GATEWAY_KEY','')}); urllib.request.urlopen(r)" ]
       interval: 10s
@@ -514,6 +562,7 @@ services:
         condition: service_healthy
 
   agents-fast:
+    profiles: ["agents"]
     build:
       context: .
       dockerfile: ml.Dockerfile
@@ -534,7 +583,8 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 2G
+          # Measured 550MiB (includes the SentenceTransformer encoder).
+          memory: 1G
     depends_on:
       kafka:
         condition: service_healthy
@@ -548,6 +598,7 @@ services:
         condition: service_healthy
 
   agents-heavy:
+    profiles: ["agents"]
     build:
       context: .
       dockerfile: ml.Dockerfile
@@ -556,7 +607,9 @@ services:
     env_file: .env
     environment:
       - AGENT_TIER_FILTER=heavy
-      - AGENT_MODEL=qwen2.5:7b
+      # 3b, not 7b: on a 15W Zen 2 part 7b yields ~3-5 tok/s, and keeping it
+      # resident alongside the fast tier exceeds the VM memory budget.
+      - AGENT_MODEL=qwen2.5:3b
       - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
       - OLLAMA_TIMEOUT=600.0
       - PYTHONWARNINGS=ignore::UserWarning
@@ -568,7 +621,11 @@ services:
       resources:
         limits:
           cpus: '2.5'
-          memory: 3G
+          # No in-process model weights: agents call ollama over HTTP.
+          # Measured 705MiB running alongside collectors. Agents hold no
+          # model weights -- those live in ollama -- so this is a Kafka
+          # consumer footprint. 1.25G retains ~1.8x headroom.
+          memory: 1.25G
     depends_on:
       kafka:
         condition: service_healthy
@@ -598,7 +655,9 @@ services:
       resources:
         limits:
           cpus: '1.0'
-          memory: 1G
+          # Measured 30MiB under live load. Next.js standalone does not
+          # grow with traffic; 512M retains ~17x headroom.
+          memory: 512M
     depends_on:
       api-gateway:
         condition: service_healthy
@@ -648,6 +707,7 @@ services:
         condition: service_healthy
 
   prometheus:
+    profiles: ["obs"]
     image: prom/prometheus:latest
     container_name: sentinel-prometheus
     restart: unless-stopped
@@ -664,6 +724,7 @@ services:
         condition: service_healthy
 
   grafana:
+    profiles: ["obs"]
     image: grafana/grafana:latest
     container_name: sentinel-grafana
     restart: unless-stopped

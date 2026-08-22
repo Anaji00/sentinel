@@ -195,6 +195,47 @@ ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS permanently_failed BOOLEAN DE
 
 -- Index for fast querying by topic and resolution status
 CREATE INDEX IF NOT EXISTS idx_failed_events_topic ON failed_events(original_topic, resolved);
+
+-- ── AUDIT LEDGER ──────────────────────────────────────────────────────────────
+-- Durable, append-only, SHA-256 hash-chained audit trail. This is the system of
+-- record for trade execution, governance changes, and watchlist mutations.
+-- Redis holds a read cache of the same entries; it is NOT the source of truth
+-- (it runs allkeys-lru and is therefore evictable).
+CREATE TABLE IF NOT EXISTS audit_ledger (
+    seq           BIGSERIAL PRIMARY KEY,
+    hash          TEXT NOT NULL UNIQUE,
+    -- UNIQUE makes chain forks structurally impossible: a given entry can have at
+    -- most one successor, so two concurrent appends reading the same head cannot
+    -- both commit. The loser retries against the new head.
+    prev_hash     TEXT NOT NULL UNIQUE,
+    timestamp     TIMESTAMPTZ NOT NULL,
+    actor         TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id   TEXT,
+    ip_address    TEXT,
+    details       JSONB
+);
+
+-- Chain traversal + chronological reads.
+CREATE INDEX IF NOT EXISTS audit_ledger_time_idx     ON audit_ledger(timestamp DESC);
+CREATE INDEX IF NOT EXISTS audit_ledger_actor_idx    ON audit_ledger(actor, timestamp DESC);
+CREATE INDEX IF NOT EXISTS audit_ledger_resource_idx ON audit_ledger(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS audit_ledger_prev_idx     ON audit_ledger(prev_hash);
+
+-- Append-only enforcement: the ledger's tamper-evidence depends on rows never
+-- being mutated or removed in place.
+CREATE OR REPLACE FUNCTION audit_ledger_forbid_mutation() RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_ledger is append-only; % is not permitted', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_ledger_no_update ON audit_ledger;
+CREATE TRIGGER audit_ledger_no_update
+    BEFORE UPDATE OR DELETE ON audit_ledger
+    FOR EACH ROW EXECUTE FUNCTION audit_ledger_forbid_mutation();
+
 -- ── VIEWS ─────────────────────────────────────────────────────────────────────
 
 -- VIEW (Virtual Table): INTERACTION

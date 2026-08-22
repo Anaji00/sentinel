@@ -3,8 +3,10 @@ scipy==1.12.0
 pandas==2.2.2
 spacy==3.7.1
 scikit-learn==1.3.2
-onnxruntime==1.18.1
-skl2onnx==1.16.0
+# onnxruntime / skl2onnx intentionally omitted. Sentinel scores anomalies with
+# streaming RRCF (shared/utils/streaming_detectors.py); no ONNX model is loaded
+# at runtime anywhere in the codebase. The only consumer was the deprecated
+# batch exporter scripts/train_models.py, which documents its own install step.
 sentence-transformers==2.5.1
 qdrant-client==1.9.0
 rrcf==0.4.4

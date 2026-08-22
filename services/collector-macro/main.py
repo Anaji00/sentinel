@@ -41,6 +41,7 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
 
 try:
     from economic_calendar import EconomicCalendarCollector
@@ -375,7 +376,7 @@ async def fetch_and_publish(producer: SentinelProducer):
 
 async def main():
     logger.info(f"Starting Real-Market Macro Feed... Tracking {len(MACRO_TICKERS)} instruments.")
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-macro")
     await producer.start()
 
     redis_client = None
@@ -387,12 +388,32 @@ async def main():
     # §1.1 Universal heartbeat
     hb_task = None
     if redis_client:
+        # Throughput counters. The heartbeat proves this process is alive;
+        # these prove it is still producing.
+        metrics = CollectorMetrics("collector-macro")
+        await metrics.start(redis_client)
         hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-macro"))
 
     calendar_collector = EconomicCalendarCollector(producer=producer, poll_interval_sec=120)
 
-    from services.collector_macro.freight import poll_freight_indices
-    from services.collector_macro.regulatory import poll_federal_register, RegulatoryDeduplicator
+    # Loaded by file path: this package directory is `collector-macro`, and a
+    # hyphen cannot appear in a Python module path, so `services.collector_macro`
+    # does not resolve however the files are laid out.
+    import importlib.util as _ilu
+
+    def _load_sibling(mod_name: str):
+        spec = _ilu.spec_from_file_location(
+            f"collector_macro_{mod_name}", str(Path(__file__).parent / f"{mod_name}.py")
+        )
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    _freight = _load_sibling("freight")
+    _regulatory = _load_sibling("regulatory")
+    poll_freight_indices = _freight.poll_freight_indices
+    poll_federal_register = _regulatory.poll_federal_register
+    RegulatoryDeduplicator = _regulatory.RegulatoryDeduplicator
     reg_dedup = RegulatoryDeduplicator(redis_client)
 
     async def _calendar_polling_loop():

@@ -43,6 +43,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -319,12 +320,16 @@ async def main():
     logger.info("SENTINEL  News Collector")
     logger.info(f"Feeds: {len(FEEDS)}  |  Poll interval: {POLL_INTERVAL}s")
     logger.info("=" * 60)
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-news")
     await producer.start()
 
     redis_client = await get_redis()
     
     # §1.1 Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-news")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-news"))
 
     try:

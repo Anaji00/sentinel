@@ -1,14 +1,7 @@
-'use client';
-
 import React from 'react';
-import dynamic from 'next/dynamic';
-import { PanelSkeleton } from '@/components/ui/Skeleton';
-import { Network, Activity, Cpu, Database, Zap } from 'lucide-react';
-
-const GraphExplorer = dynamic(() => import('@/components/GraphExplorer'), {
-  loading: () => <PanelSkeleton title="Initializing SENTINEL Knowledge Graph & Correlation Matrix..." />,
-  ssr: false,
-});
+import { Network, Activity, Cpu, Zap } from 'lucide-react';
+import { GraphExplorerIsland } from './islands';
+import { ServiceStatusBadges } from '@/components/ui/ServiceStatusBadges';
 
 export default function GraphPage() {
   return (
@@ -32,21 +25,8 @@ export default function GraphPage() {
           </div>
         </div>
 
-        {/* Live Status Badges */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <div className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/15 border border-emerald-500/30 rounded-lg text-emerald-400 text-xs font-bold">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            NEO4J LIVE
-          </div>
-          <div className="flex items-center gap-1.5 px-3 py-1 bg-cyan-500/15 border border-cyan-500/30 rounded-lg text-[#00f2fe] text-xs font-bold">
-            <Database className="w-3.5 h-3.5" />
-            TIMESCALE CAGG
-          </div>
-          <div className="flex items-center gap-1.5 px-3 py-1 bg-purple-500/15 border border-purple-500/30 rounded-lg text-purple-400 text-xs font-bold">
-            <Zap className="w-3.5 h-3.5" />
-            KAFKA SUPERVISED
-          </div>
-        </div>
+        {/* Live backend status, driven by the health endpoint */}
+        <ServiceStatusBadges />
       </div>
 
       {/* Epistemic Class Legend / KPI Strip */}
@@ -97,7 +77,7 @@ export default function GraphPage() {
 
       {/* Main Graph Explorer Interactive Surface */}
       <div className="flex-1 min-h-[650px] bg-[#090d16] border border-cyan-500/20 rounded-2xl overflow-hidden shadow-2xl p-2 sm:p-4">
-        <GraphExplorer />
+        <GraphExplorerIsland />
       </div>
     </div>
   );

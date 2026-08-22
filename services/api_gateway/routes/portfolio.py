@@ -17,9 +17,11 @@ from shared.broker import (
     OrderSide,
     OrderType,
     OrderStatus,
+    LiveTradingNotArmed,
 )
+from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.rbac import require_role, Role
-from shared.utils.audit_ledger import AuditLedger
+from shared.utils.audit_ledger import AuditLedger, AuditLedgerUnavailable
 from services.api_gateway.dependencies import get_redis_optional, get_db_optional
 
 logger = logging.getLogger("api-gateway.portfolio")
@@ -62,7 +64,7 @@ async def get_portfolio_positions(redis = Depends(get_redis_optional)):
     }
 
 
-@router.post("/orders", dependencies=[Depends(require_role(Role.ANALYST))])
+@router.post("/orders", dependencies=[Depends(require_role(Role.ADMIN))])
 async def submit_trade_order(
     req: OrderSubmissionRequest,
     request: Request,
@@ -71,9 +73,62 @@ async def submit_trade_order(
 ):
     """
     Submit a trade execution order through the active broker adapter.
-    Enforces RBAC and appends an immutable hash-chained audit record.
+
+    Order entry requires ADMIN: session cookies resolve to ANALYST by default, so
+    gating here at ANALYST made every authenticated session an order-entry
+    principal. Also honours the platform master kill switch and records a durable
+    audit entry before anything reaches the venue.
     """
-    broker = get_broker(redis_client=redis)
+    actor = getattr(request.state, "identity", "trader")
+    ledger = AuditLedger(redis_client=redis, db_client=db)
+
+    # Emergency Halt must stop order flow, not just signal generation.
+    flags = FeatureFlagManager(redis_client=redis)
+    if not await flags.is_enabled("order_execution"):
+        logger.warning(f"Order rejected — execution halted by kill switch (actor={actor}).")
+        raise HTTPException(
+            status_code=423,
+            detail="Order rejected: trade execution is currently halted by the "
+                   "platform kill switch.",
+        )
+
+    try:
+        broker = get_broker(redis_client=redis)
+    except LiveTradingNotArmed as e:
+        logger.error(f"Order rejected — live venue not armed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Order rejected: a live trading venue is configured but not "
+                   "armed. No order was placed.",
+        )
+
+    # Record intent BEFORE execution. If the ledger cannot durably record the
+    # order, the order must not be placed — an executed-but-unaudited trade is
+    # not a recoverable state, whereas a rejected order is.
+    try:
+        await ledger.record_entry(
+            actor=actor,
+            action=f"SUBMIT_{req.side.value}_ORDER",
+            resource_type="ORDER",
+            resource_id=req.client_order_id or f"{req.symbol.upper()}:{req.qty}",
+            details={
+                "symbol": req.symbol.upper(),
+                "qty": req.qty,
+                "side": req.side.value,
+                "order_type": req.order_type.value,
+                "limit_price": req.limit_price,
+                "stop_price": req.stop_price,
+                "phase": "intent",
+            },
+        )
+    except AuditLedgerUnavailable as e:
+        logger.error(f"Refusing order execution — audit ledger unavailable: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Order rejected: the audit ledger is unavailable, so this "
+                   "execution cannot be recorded. No order was placed.",
+        )
+
     try:
         order = await broker.submit_order(
             symbol=req.symbol,
@@ -84,9 +139,13 @@ async def submit_trade_order(
             stop_price=req.stop_price,
             client_order_id=req.client_order_id,
         )
+    except Exception as e:
+        logger.error(f"Order submission failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Order execution error: {str(e)}")
 
-        actor = getattr(request.state, "identity", "trader")
-        ledger = AuditLedger(redis_client=redis, db_client=db)
+    # Record the outcome. The trade has already executed at this point, so a
+    # ledger failure here is logged loudly but cannot un-place the order.
+    try:
         await ledger.record_entry(
             actor=actor,
             action=f"EXECUTE_{req.side.value}_ORDER",
@@ -99,14 +158,16 @@ async def submit_trade_order(
                 "order_type": req.order_type.value,
                 "status": order.status.value,
                 "filled_avg_price": order.filled_avg_price,
+                "phase": "execution",
             },
         )
+    except AuditLedgerUnavailable as e:
+        logger.critical(
+            "EXECUTED ORDER %s IS UNAUDITED — ledger write failed after execution: %s",
+            order.order_id, e,
+        )
 
-        return order.model_dump()
-
-    except Exception as e:
-        logger.error(f"Order submission failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Order execution error: {str(e)}")
+    return order.model_dump()
 
 
 @router.delete("/orders/{order_id}", dependencies=[Depends(require_role(Role.ANALYST))])

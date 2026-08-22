@@ -2,6 +2,7 @@
 
 import React from "react";
 import ProvenanceBadge, { ProvenanceType } from "./ProvenanceBadge";
+import { formatCurrency, formatNumber, formatPercent } from "../lib/format";
 
 export interface ProvenanceInfo {
   source_type: ProvenanceType;
@@ -53,22 +54,20 @@ export const ProvenanceValue: React.FC<ProvenanceValueProps> = ({
     );
   }
 
+  // Delegates to the canonical formatters rather than reimplementing them, so a
+  // provenance-wrapped value and a bare one render identically.
   let formatted = String(value);
   const numVal = typeof value === "number" ? value : parseFloat(String(value));
 
   if (!isNaN(numVal)) {
     if (format === "currency") {
-      if (Math.abs(numVal) >= 1e9) {
-        formatted = `$${(numVal / 1e9).toFixed(decimals)}B`;
-      } else if (Math.abs(numVal) >= 1e6) {
-        formatted = `$${(numVal / 1e6).toFixed(decimals)}M`;
-      } else {
-        formatted = `$${numVal.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
-      }
+      formatted = formatCurrency(numVal, { decimals });
     } else if (format === "percent") {
-      formatted = `${numVal.toFixed(decimals)}%`;
+      // Values reaching here are already scaled (the backend emits *_pct
+      // fields); a ratio would need `from: 'ratio'` at the call site.
+      formatted = formatPercent(numVal, { decimals });
     } else if (format === "number") {
-      formatted = numVal.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+      formatted = formatNumber(numVal, { decimals });
     }
   }
 

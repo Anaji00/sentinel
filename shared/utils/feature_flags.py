@@ -6,6 +6,7 @@ Enables instant platform-wide disabling or gradual rollouts of specific signal t
 (covered calls, Granger causality, Hawkes contagion, insider flow, etc.) without redeploying.
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -13,7 +14,30 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("shared.feature_flags")
 
+
+def rollout_bucket(flag_name: str, subject: str) -> int:
+    """Maps (flag, subject) to a stable bucket in [0, 100).
+
+    Uses SHA-256 rather than the builtin ``hash()``: Python randomizes string
+    hashing per process unless PYTHONHASHSEED is pinned, which would place the
+    same ticker in different buckets across workers and re-roll it on every
+    restart — making a canary unobservable and a rollout irreproducible.
+    """
+    digest = hashlib.sha256(f"{flag_name}:{subject}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % 100
+
 DEFAULT_SIGNAL_FLAGS = {
+    "order_execution": {
+        "description": "Broker order submission. Halting this stops trade execution "
+                       "at the gateway, independently of signal generation.",
+        "enabled": True,
+        "rollout_pct": 100.0,
+        "enabled_tickers": [],
+        "kill_switched": False,
+        "reason": "Default active",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "updated_by": "system",
+    },
     "covered_calls": {
         "description": "Closed-form covered call overlay recommendation engine",
         "enabled": True,
@@ -182,8 +206,7 @@ class FeatureFlagManager:
         rollout_pct = float(flag.get("rollout_pct", 100.0))
         if rollout_pct < 100.0:
             key_subject = ticker or user_id or flag_name
-            h = abs(hash(f"{flag_name}:{key_subject}")) % 100
-            if h >= rollout_pct:
+            if rollout_bucket(flag_name, key_subject) >= rollout_pct:
                 return False
 
         return True

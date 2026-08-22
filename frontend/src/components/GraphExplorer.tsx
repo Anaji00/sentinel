@@ -352,8 +352,10 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                             target: tName,
                             relationship: rel,
                             epistemicCategory: cat,
-                            weight: conn.weight || 1.0,
-                            confidence: conn.confidence || 0.8,
+                            // Nullable: an edge with no measured weight or
+                            // confidence must not be shown as a strong one.
+                            weight: conn.weight ?? null,
+                            confidence: conn.confidence ?? null,
                             decayed_weight: decayed,
                             last_updated: conn.last_updated || Date.now() / 1000,
                             coefficient: conn.coefficient,

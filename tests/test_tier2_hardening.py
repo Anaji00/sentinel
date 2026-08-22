@@ -9,6 +9,7 @@ Tier 2 Security & Infrastructure Hardening Tests:
 """
 
 import os
+import re
 import yaml
 from pathlib import Path
 import pytest
@@ -126,10 +127,15 @@ def test_docker_compose_port_isolation():
     services = compose_data.get("services", {})
     assert "ingress" in services, "Ingress reverse proxy service must be defined"
 
-    # Ingress must be the only service binding public web ports
-    ingress_ports = services["ingress"].get("ports", [])
-    assert "80:80" in ingress_ports
-    assert "443:443" in ingress_ports
+    # Ingress must be the only service binding web ports, and it must bind
+    # loopback explicitly. A bare "80:80" publishes on every interface, which on
+    # a laptop means the dashboard is reachable from any untrusted network the
+    # host joins.
+    ingress_ports = [str(p) for p in services["ingress"].get("ports", [])]
+    assert "127.0.0.1:80:80" in ingress_ports, f"ingress must bind loopback: {ingress_ports}"
+    assert "127.0.0.1:443:443" in ingress_ports, f"ingress must bind loopback: {ingress_ports}"
+    for p in ingress_ports:
+        assert p.startswith("127.0.0.1:"), f"ingress port {p!r} is not loopback-bound"
 
     # Internal services that MUST NOT have public host port mappings in production stack
     internal_services = [
@@ -181,3 +187,185 @@ def test_docker_compose_resource_limits():
             assert float(limits["cpus"]) >= 2.0, "agents-heavy requires at least 2.0 CPUs"
         elif svc_name == "timescaledb":
             assert float(limits["cpus"]) >= 2.0, "timescaledb requires at least 2.0 CPUs"
+
+
+# ── 5. RUNTIME MEMORY BOUNDING & DEPLOYMENT PROFILES ──────────────────────────
+
+def _compose():
+    with open(REPO_ROOT / "docker-compose.yml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _mib(v):
+    v = str(v).strip().upper()
+    return float(v[:-1]) * 1024 if v.endswith("G") else float(v[:-1])
+
+
+def test_jvm_services_have_internal_heap_caps():
+    """Kafka and Zookeeper must cap their heap below the cgroup limit.
+
+    A container memory limit alone does not bound a JVM: without -Xmx the heap
+    grows toward the cgroup ceiling and the kernel OOM-kills the process instead
+    of the JVM garbage-collecting. Neo4j is bounded via its own NEO4J_* settings.
+    """
+    services = _compose()["services"]
+
+    for name in ("kafka", "zookeeper"):
+        env = services[name].get("environment") or {}
+        heap = env.get("KAFKA_HEAP_OPTS")
+        assert heap, f"{name} has no KAFKA_HEAP_OPTS -- JVM heap is unbounded"
+
+        xmx = re.search(r"-Xmx(\d+)([mMgG])", heap)
+        assert xmx, f"{name} heap opts {heap!r} set no -Xmx"
+        heap_mib = float(xmx.group(1)) * (1024 if xmx.group(2).lower() == "g" else 1)
+
+        limit = _mib(services[name]["deploy"]["resources"]["limits"]["memory"])
+        assert heap_mib < limit, f"{name} heap {heap_mib}M >= cgroup limit {limit}M"
+        assert heap_mib <= limit * 0.75, (
+            f"{name} heap {heap_mib}M leaves too little headroom under {limit}M "
+            f"for direct buffers, mmap'd segments and JVM overhead"
+        )
+
+    # Neo4j bounds itself through its own configuration rather than heap opts.
+    neo = services["neo4j"].get("environment") or {}
+    assert neo.get("NEO4J_server_memory_heap_max__size")
+    assert neo.get("NEO4J_dbms_memory_pagecache_size")
+
+
+def test_postgres_memory_is_bounded():
+    """TimescaleDB must pin the settings that otherwise scale with connections."""
+    cmd = " ".join(str(_compose()["services"]["timescaledb"]["command"]).split())
+
+    for setting in ("max_connections", "shared_buffers", "work_mem",
+                    "effective_cache_size", "maintenance_work_mem"):
+        assert f"-c {setting}=" in cmd, f"postgres {setting} is unbounded"
+
+    limit = _mib(_compose()["services"]["timescaledb"]["deploy"]["resources"]["limits"]["memory"])
+    shared = re.search(r"-c shared_buffers=(\d+)MB", cmd)
+    assert shared and float(shared.group(1)) < limit * 0.5, (
+        "shared_buffers should stay well under half the container limit"
+    )
+
+
+def test_ollama_is_not_pinned_in_memory():
+    """The model must be released when idle, not held for the process lifetime."""
+    env = _compose()["services"]["ollama"].get("environment") or []
+    joined = " ".join(env) if isinstance(env, list) else " ".join(f"{k}={v}" for k, v in env.items())
+
+    assert "OLLAMA_KEEP_ALIVE=-1" not in joined, (
+        "KEEP_ALIVE=-1 pins the model in RAM permanently"
+    )
+    assert "OLLAMA_KEEP_ALIVE=" in joined, "KEEP_ALIVE must be set explicitly"
+
+    parallel = re.search(r"OLLAMA_NUM_PARALLEL=(\d+)", joined)
+    assert parallel and int(parallel.group(1)) <= 2, (
+        "CPU-only inference cannot serve many parallel contexts; each one "
+        "multiplies the KV cache and divides throughput"
+    )
+
+
+def test_deployment_profiles_fit_the_memory_budget():
+    """Each supported operating mode must fit inside the WSL2 allocation.
+
+    26 GiB is what .wslconfig grants the VM. Collectors and agents together
+    deliberately exceed it -- that is a hardware fact, surfaced as two named
+    modes rather than discovered as an OOM kill under load.
+    """
+    WSL_BUDGET_GIB = 26.0
+    services = _compose()["services"]
+
+    def ceiling(active):
+        total = 0.0
+        for name, svc in services.items():
+            profiles = svc.get("profiles")
+            if profiles and not any(p in active for p in profiles):
+                continue
+            limits = ((svc.get("deploy") or {}).get("resources") or {}).get("limits", {})
+            if limits.get("memory"):
+                total += _mib(limits["memory"])
+        return total / 1024
+
+    assert ceiling(set()) < WSL_BUDGET_GIB
+    assert ceiling({"collectors"}) < WSL_BUDGET_GIB, "analyst mode must fit"
+    assert ceiling({"collectors", "obs"}) < WSL_BUDGET_GIB
+    assert ceiling({"agents"}) < WSL_BUDGET_GIB, "reasoning mode must fit"
+
+    # Documented incompatibility -- asserted so it stays deliberate.
+    assert ceiling({"collectors", "agents", "obs"}) > WSL_BUDGET_GIB
+
+
+def test_llm_services_are_opt_in():
+    """The memory-dominant services must not start by default."""
+    services = _compose()["services"]
+    for name in ("ollama", "agents-heavy", "agents-fast", "reasoning"):
+        assert "agents" in (services[name].get("profiles") or []), (
+            f"{name} must be behind the 'agents' profile"
+        )
+    for name in ("prometheus", "grafana", "kafka-ui"):
+        assert "obs" in (services[name].get("profiles") or [])
+
+
+def test_no_unprofiled_service_depends_on_a_profiled_one():
+    """A default-start service depending on an opt-in one breaks `compose up`."""
+    services = _compose()["services"]
+    profiled = {n for n, s in services.items() if s.get("profiles")}
+
+    for name, svc in services.items():
+        if name in profiled:
+            continue
+        deps = svc.get("depends_on") or {}
+        for target in (deps if isinstance(deps, dict) else {d: None for d in deps}):
+            assert target not in profiled, (
+                f"{name} (always-on) depends on {target} (profiled) -- "
+                f"`docker compose up` fails without --profile"
+            )
+
+
+def test_ollama_keeps_every_tier_model_resident():
+    """MAX_LOADED_MODELS must cover the number of distinct models in use.
+
+    agents-heavy and agents-fast deliberately request different models. If Ollama
+    may hold fewer models than the tiers request, it evicts and reloads on every
+    alternating request -- on a CPU-only host, loading a multi-billion-parameter
+    model from disk costs far more than the memory the eviction saved.
+    """
+    services = _compose()["services"]
+
+    def env_of(name):
+        e = services[name].get("environment") or []
+        if isinstance(e, dict):
+            return {str(k): str(v) for k, v in e.items()}
+        return dict(kv.split("=", 1) for kv in e if "=" in kv)
+
+    tier_models = set()
+    for tier in ("agents-heavy", "agents-fast"):
+        env = env_of(tier)
+        assert env.get("AGENT_MODEL"), f"{tier} must pin AGENT_MODEL explicitly"
+        tier_models.add(env["AGENT_MODEL"])
+
+    ollama_env = env_of("ollama")
+    max_loaded = int(ollama_env["OLLAMA_MAX_LOADED_MODELS"])
+    assert max_loaded >= len(tier_models), (
+        f"{len(tier_models)} distinct tier models {sorted(tier_models)} but "
+        f"OLLAMA_MAX_LOADED_MODELS={max_loaded} -- this thrashes"
+    )
+
+
+def test_heavy_tier_model_fits_the_cpu_only_budget():
+    """The heavy tier must stay within what a CPU-only host can hold and serve.
+
+    A 7B model needs ~4.7G resident; alongside the 1.5B fast tier that exceeds
+    the ollama ceiling and pushes reasoning mode past the VM budget.
+    """
+    services = _compose()["services"]
+    env = services["agents-heavy"].get("environment") or []
+    env = dict(kv.split("=", 1) for kv in env if "=" in kv) if isinstance(env, list) else env
+
+    model = str(env.get("AGENT_MODEL", ""))
+    assert "7b" not in model.lower(), (
+        f"agents-heavy pinned to {model!r}: a 7B model on this CPU serves ~3-5 "
+        f"tok/s and cannot stay resident beside the fast tier within budget"
+    )
+
+    limit = _mib(services["ollama"]["deploy"]["resources"]["limits"]["memory"])
+    assert limit <= 5 * 1024, "ollama ceiling should reflect the smaller tier models"

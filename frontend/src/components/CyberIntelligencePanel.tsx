@@ -7,6 +7,7 @@ import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
 import { NormalizedEvent } from '../lib/types';
+import { DataGrid } from './ui/DataGrid';
 
 export default function CyberIntelligencePanel() {
   const [activeFilter, setActiveFilter] = useState<string>('all');
@@ -209,9 +210,9 @@ export default function CyberIntelligencePanel() {
 
               <div>
                 <span className="text-rose-400 font-bold block mb-1 text-[10px]">RAW THREAT PAYLOAD:</span>
-                <pre className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-[10px] text-rose-200 overflow-x-auto max-h-40">
-                  {JSON.stringify(selectedEvent.security_data || selectedEvent.domain_data || selectedEvent.raw_payload || selectedEvent, null, 2)}
-                </pre>
+                <div className="max-h-64 overflow-y-auto">
+                  <DataGrid data={selectedEvent.security_data || selectedEvent.domain_data || selectedEvent} omit={['raw_payload']} />
+                </div>
               </div>
             </div>
 

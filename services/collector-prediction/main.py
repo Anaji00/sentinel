@@ -28,6 +28,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -303,11 +304,15 @@ async def main():
     logger.info("SENTINEL PREDICTION MARKET COLLECTOR (STATELESS)")
     logger.info("=" * 60)
 
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-prediction")
     await producer.start()
     redis_client = await get_redis()
     
     # §1.1 Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-prediction")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-prediction"))
 
     try:

@@ -1,6 +1,17 @@
-# DEPRECATED: Batch retrained IsolationForest ONNX exporter.
-# Sentinel has migrated to online/streaming anomaly detection via Robust Random Cut Forest (RRCF)
-# in shared/utils/streaming_detectors.py. This script is preserved for historical baseline reference.
+# DEPRECATED -- NOT PART OF THE RUNNING SYSTEM.
+#
+# Batch IsolationForest -> ONNX exporter. Sentinel migrated to online/streaming
+# anomaly detection via Robust Random Cut Forest (RRCF) in
+# shared/utils/streaming_detectors.py. Nothing in services/ or shared/ imports
+# onnxruntime, and no .onnx artifact is loaded at runtime.
+#
+# Its dependencies are deliberately NOT in requirements-ml.txt, so shipping
+# images do not carry an inference runtime the platform never calls. To run this
+# script for historical baseline work, install them explicitly first:
+#
+#     pip install onnxruntime==1.18.1 skl2onnx==1.16.0
+#
+# This script is preserved for reference only. Do not wire it into a service.
 
 import os
 import sys

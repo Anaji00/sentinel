@@ -38,6 +38,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
 
 POLL_INTERVAL_SEC = 60
 DEDUP_TTL_DAYS = 14
@@ -339,13 +340,17 @@ async def main():
     logger.info(f"Telegram Channels: {len(TELEGRAM_CHANNELS)} | Subreddits: {len(REDDIT_SUBREDDITS)} | Curated X Feeds: {len(TWITTER_HANDLES)}")
     logger.info("=" * 60)
 
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-social")
     await producer.start()
 
     redis_client = await get_redis()
     dedup = SocialDeduplicator(redis_client)
 
     # §1.1 Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-social")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-social"))
 
     connector = aiohttp.TCPConnector(limit=20)

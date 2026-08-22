@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
+import { formatPercent } from '../lib/format';
 
 interface OsintItem {
   id: string;
@@ -165,7 +166,7 @@ export default function OsintThreatMatrix() {
                   ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                   : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
               }`}>
-                FSD NOVELTY: {(item.anomaly_score * 100).toFixed(0)}%
+                FSD NOVELTY: {formatPercent(item.anomaly_score, { from: 'ratio', decimals: 0 })}
               </span>
             </div>
 

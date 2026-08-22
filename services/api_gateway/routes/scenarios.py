@@ -24,6 +24,20 @@ from shared.broker.base import (
 )
 from shared.broker.paper import PaperBroker
 from shared.broker.alpaca import AlpacaBroker
+from shared.utils.serialization import to_dto
+
+# Client-facing shape of a correlation record. Keeps the response contract
+# independent of the `correlations` table layout.
+CORRELATION_FIELDS = (
+    "correlation_id",
+    "rule_name",
+    "alert_tier",
+    "detected_at",
+    "description",
+    "tags",
+    "scenario",
+    "evidence_trail",
+)
 
 logger = logging.getLogger("api-gateway.scenarios")
 router = APIRouter(prefix="/api/v1", tags=["Intelligence"])
@@ -126,7 +140,11 @@ async def get_correlations(
                 scen = {}
 
             item["evidence_trail"] = item.get("evidence_trail") or scen.get("evidence_trail") or []
-            results.append(item)
+
+            # Explicit field allowlist rather than spreading the row: the query
+            # selects from `correlations`, and a schema change there would
+            # otherwise silently start shipping new columns to the client.
+            results.append(to_dto(item, fields=CORRELATION_FIELDS))
 
         return results[:limit]
     except Exception as e:

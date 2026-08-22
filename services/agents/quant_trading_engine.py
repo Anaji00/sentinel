@@ -30,8 +30,20 @@ import numpy as np
 from shared.utils.equities import is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
+from shared.utils.candles import candle_cache_key
 
 logger = logging.getLogger("agent.quant_trading")
+
+# ── POSITION SIZING GUARDRAILS ────────────────────────────────────────────────
+# Kelly is a ceiling derived from two estimated quantities, not a target. These
+# bounds keep a short lucky streak or a thin backtest from producing a
+# concentration that no risk desk would sign off on.
+MIN_KELLY_SAMPLES = 30          # Predictions required before a win rate is trusted
+MIN_TRADES_FOR_PAYOFF = 20      # Closed trades required before a payoff ratio is trusted
+MAX_SINGLE_POSITION_PCT = 0.10  # Hard cap on any single position, independent of Kelly
+UNPROVEN_POSITION_PCT = 0.02    # Cap while the win rate is still below the sample floor
+DEFAULT_PAYOFF_RATIO = 1.0      # Assume no edge in payoff until measured
+MAX_PAYOFF_RATIO = 3.0          # Clamp outlier backtest payoffs from tiny samples
 
 
 # ── FORM 4 INSIDER MODELS ─────────────────────────────────────────────────────
@@ -93,6 +105,11 @@ class PortfolioMetrics(BaseModel):
     recommended_cash_pct: Optional[float] = None
     hawkes_risk_factor: Optional[float] = None
     metrics_source: str = "insufficient_history"
+    # A VaR figure without its horizon is unreadable — 1-hour and 1-day VaR on
+    # the same series differ by ~2.5x. Carried alongside the numbers so the UI
+    # can never present them bare.
+    risk_horizon: Optional[str] = None
+    annualization_basis: Optional[str] = None
 
 class TradingSignal(BaseModel):
     ticker: str
@@ -308,75 +325,6 @@ class QuantTradingEngine(SentinelAgent):
 
     # ── SUB-ENGINE 1: SEC FORM 4 INSIDER CLUSTERING ───────────────────────────
 
-    async def _process_insider_form4(self, message: Dict[str, Any], raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        ticker = (raw.get("ticker") or "").upper()
-        if not ticker:
-            title = raw.get("title", "")
-            match = re.search(r'\(\s*([A-Za-z]+)\s*\)', title)
-            if match:
-                ticker = match.group(1).upper()
-
-        if not ticker:
-            return None
-
-        if not await self.flags.is_enabled("insider_clustering", ticker=ticker):
-            return None
-
-        code = str(raw.get("transaction_code", "P")).upper()
-        notional = float(raw.get("notional_usd", 0.0))
-        is_buyer = code in ("P", "M", "X")
-        signed_notional = notional if is_buyer else -notional
-
-        # Aggregate 7-day insider flow in Redis
-        async with self.redis.raw.pipeline(transaction=True) as pipe:
-            pipe.rpush(f"sentinel:insider:flow:{ticker}", json.dumps({"code": code, "notional": signed_notional, "ts": time.time()}))
-            pipe.ltrim(f"sentinel:insider:flow:{ticker}", -50, -1)
-            pipe.expire(f"sentinel:insider:flow:{ticker}", 604800)
-            await pipe.execute()
-
-        raw_history = await self.redis.raw.lrange(f"sentinel:insider:flow:{ticker}", 0, -1)
-        total_net = sum(json.loads(h)["notional"] for h in raw_history if h)
-
-        if abs(total_net) < 100_000:
-            return None
-
-        sentiment = "Bullish Accumulation" if total_net > 0 else "Bearish Distribution"
-        c_suite = any(kw in str(raw).lower() for kw in ("ceo", "cfo", "director", "president", "officer"))
-
-        brief = InsiderClusterBrief(
-            ticker=ticker,
-            insider_sentiment=sentiment,
-            total_net_notional_usd=total_net,
-            c_suite_involvement=c_suite,
-            summary=f"C-Suite {sentiment} in {ticker}: net 7-day flow ${total_net/1e6:+.2f}M across {len(raw_history)} transactions.",
-        )
-
-        res_payload = {
-            "agent": self.name,
-            "agent_run_id": f"insider_{ticker}_{int(time.time())}",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "brief": brief.model_dump(),
-        }
-
-        await self.redis.raw.set(f"sentinel:insider:brief:{ticker}", json.dumps(res_payload["brief"]), ex=86400)
-        await self._producer.send(Topics.INSIDER_CLUSTERS, res_payload, key=ticker)
-
-        # Publish structured AgentBulletin
-        safe_create_task(
-            self.publish_bulletin(
-                bulletin_type="signal",
-                summary=brief.summary,
-                ticker=ticker,
-                conviction=0.75 if c_suite else 0.55,
-                expected_direction="up" if total_net > 0 else "down",
-                payload={"net_notional": total_net, "c_suite": c_suite},
-                ttl_seconds=86400,
-            ),
-            name=f"insider-bulletin-{ticker}"
-        )
-
-        return res_payload
-
     # ── SUB-ENGINE 2: QUANT PEER DISCOVERY ───────────────────────────────────
 
     async def _process_peer_discovery(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
@@ -531,26 +479,68 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         current_price = closes[-1]
         atr = indicators.get("atr", current_price * 0.02)
 
-        # Risk calculations: EWMA Volatility, VaR, CVaR, Empirical Half-Kelly
+        # Risk calculations: EWMA Volatility, VaR, CVaR, Empirical Half-Kelly.
+        # The series is sampled at PRICE_TIMEFRAME, so annualization and the VaR
+        # horizon are both derived from that frequency and the asset's calendar —
+        # never assumed daily.
         returns = list(np.diff(closes) / closes[:-1]) if len(closes) > 1 else [0.0]
         has_history = len(returns) >= 10
-        ewma_vol = quant_calc.ewma_volatility(returns, annualize=True)
+
+        asset_class = quant_calc.classify_asset_class(ticker)
+        bars_per_year = quant_calc.periods_per_year(self.PRICE_TIMEFRAME, asset_class)
+        daily_periods = quant_calc.periods_per_year("1d", asset_class)
+
+        ewma_vol = quant_calc.ewma_volatility(returns, annualize=True, trading_days=bars_per_year)
         var_95 = quant_calc.var_historical(returns, confidence=0.95, position_value=10_000)
         cvar_95 = quant_calc.cvar_historical(returns, confidence=0.95, position_value=10_000)
         cvar_99 = quant_calc.cvar_historical(returns, confidence=0.99, position_value=10_000)
-        var_95_pct = round(quant_calc.var_historical(returns, confidence=0.95, position_value=1.0) * 100.0, 2)
-        cvar_99_pct = round(quant_calc.cvar_historical(returns, confidence=0.99, position_value=1.0) * 100.0, 2)
-        sharpe_ratio_val = round(float(quant_calc.sharpe_ratio(returns, annualize=True)), 2)
 
-        # Empirical Win Probability (W) & Payoff Ratio (R) from scorecard
-        card = await self.get_scorecard()
-        if card.predictions_made >= 5:
+        # Express VaR/CVaR at a 1-day horizon — the convention a reader assumes
+        # when no horizon is stated — rather than the raw per-bar figure.
+        var_95_bar = quant_calc.var_historical(returns, confidence=0.95, position_value=1.0)
+        cvar_99_bar = quant_calc.cvar_historical(returns, confidence=0.99, position_value=1.0)
+        var_95_pct = round(
+            quant_calc.scale_var_to_horizon(var_95_bar, bars_per_year, daily_periods) * 100.0, 2
+        )
+        cvar_99_pct = round(
+            quant_calc.scale_var_to_horizon(cvar_99_bar, bars_per_year, daily_periods) * 100.0, 2
+        )
+        risk_horizon = "1-day"
+        sharpe_ratio_val = round(
+            float(quant_calc.sharpe_ratio(returns, annualize=True, trading_days=bars_per_year)), 2
+        )
+
+        # ── EMPIRICAL KELLY INPUTS ──────────────────────────────────────────────
+        # Kelly is acutely sensitive to both the win rate and the payoff ratio.
+        # An estimate from a handful of predictions against an *assumed* payoff
+        # produces concentrations no risk desk would approve, so both terms are
+        # sourced empirically and the output is capped independently.
+        # Conditioned on the prevailing regime where enough history exists. A
+        # hit rate earned under bull steepening is not evidence about the same
+        # strategy under inversion, but Kelly treats whatever it is given as the
+        # true win probability -- so pooling regimes biases every position size.
+        # Falls back to the strategy-wide, then global, card when a partition is
+        # too thin to estimate from.
+        card, card_source = await self.get_conditional_scorecard(
+            strategy="trading_advisory", min_samples=MIN_KELLY_SAMPLES
+        )
+        if card.predictions_made >= MIN_KELLY_SAMPLES:
             win_prob = min(0.85, max(0.35, card.predictions_correct / max(1, card.predictions_made)))
         else:
-            win_prob = 0.55  # Default baseline prior
+            # Below the sample floor the win rate is not yet measurable. Use the
+            # baseline prior and sit at the conservative allocation cap.
+            win_prob = 0.55
 
-        win_loss_ratio = 2.0  # 2:1 reward/risk payoff target
+        # Realized payoff ratio from the backtester, not the 2:1 aspiration.
+        win_loss_ratio = await self._fetch_realized_payoff_ratio(ticker)
+
         kelly_pct = quant_calc.kelly_criterion(win_prob, win_loss_ratio, half_kelly=True)
+
+        # Hard ceiling on single-position exposure, independent of Kelly. Applied
+        # before the stress check so the circuit breaker can only reduce it.
+        kelly_pct = min(kelly_pct, MAX_SINGLE_POSITION_PCT)
+        if card.predictions_made < MIN_KELLY_SAMPLES:
+            kelly_pct = min(kelly_pct, UNPROVEN_POSITION_PCT)
 
         # Macro risk sizing check & circuit breaker
         macro_regime_raw = await self.redis.raw.get("sentinel:macro:latest_rates_regime")
@@ -578,6 +568,10 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 "var_95_per_10k": var_95,
                 "cvar_95_per_10k": cvar_95,
                 "half_kelly_allocation_pct": round(kelly_pct * 100.0, 2),
+                # Which performance history the win rate came from, so a reader
+                # can tell a regime-conditioned estimate from a pooled one.
+                "kelly_basis": card_source,
+                "kelly_sample_count": card.predictions_made,
                 "fib_levels": indicators["fib_levels"],
             }
         }
@@ -773,12 +767,19 @@ Return raw JSON matching schema:"""
                 hawkes_factor = quant_calc.hawkes_risk_multiplier(hawkes_intensity=1.0)
                 brief.portfolio_metrics.hawkes_risk_factor = round(hawkes_factor, 3)
                 brief.portfolio_metrics.metrics_source = "computed"
+                brief.portfolio_metrics.risk_horizon = risk_horizon
+                brief.portfolio_metrics.annualization_basis = (
+                    f"{self.PRICE_TIMEFRAME} bars, {asset_class} calendar "
+                    f"({bars_per_year:.0f}/yr)"
+                )
             else:
                 brief.portfolio_metrics.var_95_pct = None
                 brief.portfolio_metrics.cvar_99_pct = None
                 brief.portfolio_metrics.sharpe_ratio = None
                 brief.portfolio_metrics.hawkes_risk_factor = None
                 brief.portfolio_metrics.metrics_source = "insufficient_history"
+                brief.portfolio_metrics.risk_horizon = None
+                brief.portfolio_metrics.annualization_basis = None
 
             res_payload = {
                 "agent": self.name,
@@ -848,8 +849,50 @@ Return raw JSON matching schema:"""
 
     # ── HELPER METHODS ────────────────────────────────────────────────────────
 
+    # Bar timeframe backing _fetch_prices. Every annualized or horizon-bearing
+    # statistic derived from those bars must be scaled with this, not assumed daily.
+    PRICE_TIMEFRAME = "1h"
+
+    async def _fetch_realized_payoff_ratio(self, ticker: str) -> float:
+        """Returns the realized average-win / average-loss ratio for *ticker*.
+
+        Prefers the backtester's measured payoff over an assumed target: Kelly
+        scales inversely with this term, so assuming 2.0 where realized is 1.0
+        roughly doubles the recommended stake. Falls back to a deliberately
+        conservative 1.0 when no validated backtest exists, which sizes down
+        rather than up in the absence of evidence.
+        """
+        if not self.redis:
+            return DEFAULT_PAYOFF_RATIO
+        try:
+            for strategy in ("momentum", "covered_call", "mean_reversion"):
+                raw = await self.redis.raw.get(
+                    f"sentinel:backtest:results:{strategy}_{ticker.lower()}"
+                )
+                if not raw:
+                    continue
+                report = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+
+                # Only trust a payoff ratio from a backtest built on real data
+                # with enough closed trades to be meaningful.
+                if report.get("data_provenance") != "authentic_market_data":
+                    continue
+                perf = report.get("performance_metrics") or {}
+                if int(perf.get("total_trades") or 0) < MIN_TRADES_FOR_PAYOFF:
+                    continue
+
+                payoff = (report.get("risk_metrics") or {}).get("payoff_ratio")
+                if payoff is None:
+                    continue
+                payoff_f = float(payoff)
+                if payoff_f > 0:
+                    return min(MAX_PAYOFF_RATIO, payoff_f)
+        except Exception as e:
+            logger.debug(f"Realized payoff lookup failed for {ticker}: {e}")
+        return DEFAULT_PAYOFF_RATIO
+
     async def _fetch_prices(self, ticker: str) -> Tuple[List[float], List[float], List[float]]:
-        key = f"sentinel:candles:1h:{ticker.upper()}"
+        key = candle_cache_key(ticker, self.PRICE_TIMEFRAME)
         raw = await self.redis.raw.lrange(key, 0, -1)
         closes, highs, lows = [], [], []
         for item in raw:
@@ -971,6 +1014,12 @@ Return raw JSON matching schema:"""
         ).upper().strip()
 
         if not ticker or ticker == "UNKNOWN":
+            return None
+
+        # Signal governance gate. is_enabled() also evaluates the platform-wide
+        # master kill switch, so this call is what makes Emergency Halt reach this
+        # signal class — without it the switch silently does nothing here.
+        if not await self.flags.is_enabled("insider_clustering", ticker=ticker):
             return None
 
         # Extract transaction parameters

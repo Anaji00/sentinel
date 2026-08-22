@@ -3,6 +3,7 @@
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
+import { ABSENT, formatCurrency, formatPercent } from '../lib/format';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
@@ -98,9 +99,21 @@ export default function PredictionMarketPanel() {
           {filteredEvents.length > 0 ? (
             filteredEvents.map((e, i) => {
               const pd: any = e.prediction_market_data || {};
-              const yesProb = pd.yes_probability !== undefined ? (pd.yes_probability * 100).toFixed(0) : '50';
-              const noProb = pd.no_probability !== undefined ? (pd.no_probability * 100).toFixed(0) : `${100 - Number(yesProb)}`;
-              const volumeStr = pd.total_volume ? `$${(pd.total_volume / 1e3).toFixed(0)}k Vol` : '$120k Vol';
+              // Probabilities and volume are reported only when quoted. A
+              // defaulted 50/50 book or a "$120k Vol" placeholder is a market
+              // claim the platform has not observed.
+              const yesPct = typeof pd.yes_probability === 'number' ? pd.yes_probability * 100 : null;
+              const noPct =
+                typeof pd.no_probability === 'number'
+                  ? pd.no_probability * 100
+                  : yesPct !== null
+                  ? 100 - yesPct
+                  : null;
+              const yesProb = formatPercent(yesPct, { decimals: 0 });
+              const noProb = formatPercent(noPct, { decimals: 0 });
+              const volumeStr = typeof pd.total_volume === 'number'
+                ? `${formatCurrency(pd.total_volume)} Vol`
+                : `${ABSENT} Vol`;
 
               return (
                 <div
@@ -129,12 +142,12 @@ export default function PredictionMarketPanel() {
                   {/* Probability Bar */}
                   <div className="mt-2.5 space-y-1">
                     <div className="flex justify-between text-[10px] font-bold">
-                      <span className="text-emerald-400">YES: {yesProb}%</span>
-                      <span className="text-rose-400">NO: {noProb}%</span>
+                      <span className="text-emerald-400">YES: {yesProb}</span>
+                      <span className="text-rose-400">NO: {noProb}</span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden flex border border-slate-800">
-                      <div className="bg-emerald-400 h-full" style={{ width: `${yesProb}%` }} />
-                      <div className="bg-rose-500 h-full" style={{ width: `${noProb}%` }} />
+                      <div className="bg-emerald-400 h-full" style={{ width: `${yesPct ?? 0}%` }} />
+                      <div className="bg-rose-500 h-full" style={{ width: `${noPct ?? 0}%` }} />
                     </div>
                   </div>
 
@@ -187,8 +200,8 @@ export default function PredictionMarketPanel() {
                 <div className="p-3 bg-slate-950 rounded-xl border border-purple-500/30 space-y-2">
                   <span className="text-purple-300 font-bold block text-[11px]">MARKET ODDS & VOLUME</span>
                   <div className="grid grid-cols-2 gap-2 text-[10px]">
-                    <div><span className="text-slate-400 block">YES Bid Probability:</span> <span className="text-emerald-400 font-bold">{selectedEvent.prediction_market_data.yes_probability ? `${(selectedEvent.prediction_market_data.yes_probability * 100).toFixed(1)}%` : 'N/A'}</span></div>
-                    <div><span className="text-slate-400 block">NO Bid Probability:</span> <span className="text-rose-400 font-bold">{selectedEvent.prediction_market_data.no_probability ? `${(selectedEvent.prediction_market_data.no_probability * 100).toFixed(1)}%` : 'N/A'}</span></div>
+                    <div><span className="text-slate-400 block">YES Bid Probability:</span> <span className="text-emerald-400 font-bold">{formatPercent(selectedEvent.prediction_market_data.yes_probability, { from: 'ratio', decimals: 1 })}</span></div>
+                    <div><span className="text-slate-400 block">NO Bid Probability:</span> <span className="text-rose-400 font-bold">{formatPercent(selectedEvent.prediction_market_data.no_probability, { from: 'ratio', decimals: 1 })}</span></div>
                     <div><span className="text-slate-400 block">Total Volume:</span> <span className="text-cyan-300 font-bold">{selectedEvent.prediction_market_data.total_volume ? `$${selectedEvent.prediction_market_data.total_volume.toLocaleString()}` : 'N/A'}</span></div>
                     <div><span className="text-slate-400 block">Resolution Date:</span> <span className="text-slate-200 font-bold">{selectedEvent.prediction_market_data.resolution_date || 'N/A'}</span></div>
                   </div>

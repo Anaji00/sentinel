@@ -33,6 +33,7 @@ from services.agents.edge_validator import EdgeValidatorAgent
 from services.agents.stock_correlation_agent import StockCorrelationAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
+from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -361,6 +362,30 @@ async def main():
             run_task_queue_worker(shared_infra["redis"], active_agents),
             name="task_queue_worker",
         )
+    )
+
+    # Register liveness for this tier. Every other service already does this;
+    # without it the agent tiers are invisible to the health system and the
+    # gateway has to guess at their status.
+    heartbeat_component = f"agents-{tier_filter}" if tier_filter != "all" else "agents"
+    tasks.append(
+        safe_create_task(
+            start_heartbeat_task(shared_infra["redis"], heartbeat_component),
+            name="agents_heartbeat",
+        )
+    )
+
+    # Publish the roster this process is actually running, so the gateway can
+    # report real agent composition instead of a hardcoded list.
+    await touch_heartbeat(
+        shared_infra["redis"],
+        heartbeat_component,
+        metadata={
+            "tier": tier_filter,
+            "model": os.getenv("AGENT_MODEL", ""),
+            "fallback_model": os.getenv("OLLAMA_FALLBACK_MODEL", ""),
+            "agents": sorted(active_agents.keys()),
+        },
     )
 
     logger.info(f"Swarm launched with AGENT_TIER_FILTER='{tier_filter}' ({len(tasks)-1} active agents).")

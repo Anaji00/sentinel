@@ -14,11 +14,59 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 
 from shared.utils import quant_calc
+from shared.utils.candles import candle_cache_key
 
 logger = logging.getLogger("reasoning.backtester")
+
+
+def _at(seq: List[Any], i: int) -> Any:
+    """Safe positional access — external feeds return ragged parallel arrays."""
+    return seq[i] if i < len(seq) else None
+
+
+def _coerce_bar(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Converts a cached candle dict into a bar, or None if a price field is absent.
+
+    Missing prices are dropped rather than defaulted, so a malformed cache entry
+    can never enter a backtest disguised as a real observation.
+    """
+    close = c.get("close")
+    if close is None:
+        return None
+    try:
+        close_f = float(close)
+        return {
+            "timestamp": c.get("timestamp") or c.get("ts") or datetime.now(timezone.utc).isoformat(),
+            "open": float(c.get("open", close_f)),
+            "high": float(c.get("high", close_f)),
+            "low": float(c.get("low", close_f)),
+            "close": close_f,
+            "volume": float(c.get("volume", 0.0)),
+            "vwap": float(c.get("vwap", close_f)),
+        }
+    except (TypeError, ValueError):
+        return None
+
+# Minimum authentic bars required to produce a statistically meaningful backtest.
+# Below this the engine reports INSUFFICIENT_DATA — it never interpolates or
+# synthesizes bars, because a validation verdict derived from invented prices is
+# worse than no verdict at all.
+MIN_BARS_FOR_BACKTEST = 25
+
+# Yahoo Finance interval strings keyed by Sentinel timeframe.
+_YF_INTERVAL_MAP = {
+    "5m": ("5m", "1mo"),
+    "10m": ("15m", "1mo"),
+    "15m": ("15m", "1mo"),
+    "30m": ("30m", "3mo"),
+    "1h": ("1h", "6mo"),
+    "4h": ("1h", "1y"),
+    "1d": ("1d", "2y"),
+}
 
 
 class StrategyBacktester:
@@ -75,25 +123,188 @@ class StrategyBacktester:
             except Exception as e:
                 logger.debug(f"TimescaleDB bar fetch for {ticker_upper} fallback: {e}")
 
-        # Fallback to Redis candles if DB is cold or unavailable
+        # 2. Redis candle cache. The key MUST carry the timeframe segment — every
+        #    writer in the platform emits `sentinel:candles:{tf}:{ticker}`.
         if not bars and self.redis:
             try:
-                raw_candles = await self.redis.raw.lrange(f"sentinel:candles:{ticker_upper}", 0, limit)
+                cache_key = candle_cache_key(ticker_upper, timeframe)
+                raw_candles = await self.redis.raw.lrange(cache_key, 0, limit)
                 for item in raw_candles:
                     c = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
-                    bars.append({
-                        "timestamp": c.get("timestamp", datetime.now(timezone.utc).isoformat()),
-                        "open": float(c.get("open", 100.0)),
-                        "high": float(c.get("high", 100.0)),
-                        "low": float(c.get("low", 100.0)),
-                        "close": float(c.get("close", 100.0)),
-                        "volume": float(c.get("volume", 1000.0)),
-                        "vwap": float(c.get("close", 100.0)),
-                    })
+                    bar = _coerce_bar(c)
+                    if bar:
+                        bars.append(bar)
             except Exception as e:
                 logger.debug(f"Redis candle fallback for {ticker_upper}: {e}")
 
+        # 3. External historical REST API for the missing window, then hydrate cache.
+        if not bars:
+            bars = await self._fetch_external_bars(ticker_upper, timeframe, limit)
+            if bars:
+                await self._hydrate_candle_cache(ticker_upper, timeframe, bars)
+
+        # 4. Defensive fallback: fail closed. No interpolation, no synthesis.
+        if not bars:
+            logger.warning(
+                "No authentic bars available for %s (%s) from TimescaleDB, Redis, or external API. "
+                "Failing closed — backtest will report INSUFFICIENT_DATA.",
+                ticker_upper,
+                timeframe,
+            )
+
         return bars
+
+    async def _fetch_external_bars(
+        self,
+        ticker: str,
+        timeframe: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetches authentic historical OHLCV bars from an external market data REST API.
+
+        Returns an empty list on any error or empty response — the caller fails
+        closed rather than substituting fabricated data.
+        """
+        interval, range_ = _YF_INTERVAL_MAP.get(timeframe, ("1h", "6mo"))
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+            f"?range={range_}&interval={interval}"
+        )
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "External bar fetch for %s returned HTTP %s.", ticker, resp.status
+                        )
+                        return []
+                    data = await resp.json(content_type=None)
+
+            results = (data.get("chart") or {}).get("result") or []
+            if not results:
+                return []
+
+            chart = results[0]
+            timestamps = chart.get("timestamp") or []
+            quote_blocks = ((chart.get("indicators") or {}).get("quote") or [])
+            if not timestamps or not quote_blocks:
+                return []
+
+            q = quote_blocks[0]
+            opens, highs = q.get("open") or [], q.get("high") or []
+            lows, closes = q.get("low") or [], q.get("close") or []
+            volumes = q.get("volume") or []
+
+            bars: List[Dict[str, Any]] = []
+            for i, ts in enumerate(timestamps):
+                o, h, l, c = (
+                    _at(opens, i), _at(highs, i), _at(lows, i), _at(closes, i)
+                )
+                # Skip gap bars rather than forward-filling them.
+                if None in (o, h, l, c):
+                    continue
+                bars.append({
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "open": float(o),
+                    "high": float(h),
+                    "low": float(l),
+                    "close": float(c),
+                    "volume": float(_at(volumes, i) or 0.0),
+                    "vwap": float(c),
+                })
+
+            if bars:
+                logger.info(
+                    "Hydrated %d authentic %s bars for %s from external API.",
+                    len(bars), timeframe, ticker,
+                )
+            return bars[-limit:]
+
+        except Exception as e:
+            logger.warning("External historical bar fetch failed for %s: %s", ticker, e)
+            return []
+
+    async def _hydrate_candle_cache(
+        self,
+        ticker: str,
+        timeframe: str,
+        bars: List[Dict[str, Any]],
+    ) -> None:
+        """Writes freshly fetched authentic bars into the Redis candle cache."""
+        if not self.redis or not bars:
+            return
+        try:
+            cache_key = candle_cache_key(ticker, timeframe)
+            pipe = self.redis.raw.pipeline()
+            pipe.delete(cache_key)
+            for bar in bars:
+                pipe.rpush(cache_key, json.dumps(bar))
+            pipe.ltrim(cache_key, 0, 999)
+            pipe.expire(cache_key, 3600)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug(f"Candle cache hydration skipped for {ticker}: {e}")
+
+    def _insufficient_data_report(
+        self,
+        ticker: str,
+        strategy_type: str,
+        initial_capital: float,
+        bar_count: int,
+    ) -> Dict[str, Any]:
+        """
+        Builds a fail-closed report for a strategy that could not be evaluated.
+
+        Every metric is None rather than zero: a zero Sharpe is a measurement, and
+        no measurement was made. The validation gate is explicitly not passed, so
+        this report can never be mistaken for an approval.
+        """
+        return {
+            "strategy_id": f"{strategy_type}_{ticker.lower()}",
+            "strategy_name": strategy_type.replace("_", " ").title(),
+            "ticker": ticker.upper(),
+            "backtested_at": datetime.now(timezone.utc).isoformat(),
+            "bar_count": int(bar_count),
+            "data_provenance": "insufficient_data",
+            "initial_capital_usd": float(initial_capital),
+            "final_capital_usd": None,
+            "performance_metrics": {
+                "total_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "hit_rate_pct": None,
+                "profit_factor": None,
+                "total_return_pct": None,
+                "benchmark_return_pct": None,
+                "alpha_pct": None,
+            },
+            "risk_metrics": {
+                "realized_sharpe_ratio": None,
+                "sortino_ratio": None,
+                "max_drawdown_pct": None,
+                "expected_value_per_trade_usd": None,
+                "payoff_ratio": None,
+                "avg_win_usd": None,
+                "avg_loss_usd": None,
+            },
+            "calibration_curve": [],
+            "brier_score": None,
+            "validation_gate": {
+                "passed": False,
+                "status": "INSUFFICIENT_DATA",
+                "reason": (
+                    f"{bar_count} authentic bars available; "
+                    f"{MIN_BARS_FOR_BACKTEST} required. No synthetic data substituted."
+                ),
+                "criteria": {},
+            },
+            "equity_curve": [],
+            "recent_trades": [],
+        }
 
     def backtest_strategy(
         self,
@@ -105,26 +316,19 @@ class StrategyBacktester:
         """
         Executes discrete chronological backtest across historical bars.
         """
-        if len(bars) < 25:
-            # Generate synthetic realistic random-walk price bars for cold start validation testing
-            closes_sim = [100.0]
-            np.random.seed(42)
-            for _ in range(max(100, 100 - len(bars))):
-                ret = np.random.normal(0.0005, 0.015)
-                closes_sim.append(round(closes_sim[-1] * (1.0 + ret), 2))
-
-            sim_bars = []
-            for i, c in enumerate(closes_sim):
-                sim_bars.append({
-                    "timestamp": f"2026-01-01T{i:02d}:00:00Z",
-                    "open": c * 0.998,
-                    "high": c * 1.008,
-                    "low": c * 0.992,
-                    "close": c,
-                    "volume": 50000,
-                    "vwap": c,
-                })
-            bars = sim_bars
+        if len(bars) < MIN_BARS_FOR_BACKTEST:
+            # Fail closed. A validation verdict computed from fabricated prices is
+            # indistinguishable downstream from a real one, so no verdict is issued.
+            logger.warning(
+                "Backtest for %s aborted: %d authentic bars available, %d required.",
+                ticker.upper(), len(bars), MIN_BARS_FOR_BACKTEST,
+            )
+            return self._insufficient_data_report(
+                ticker=ticker,
+                strategy_type=strategy_type,
+                initial_capital=initial_capital,
+                bar_count=len(bars),
+            )
 
         closes = [b["close"] for b in bars]
         highs = [b["high"] for b in bars]
@@ -428,6 +632,7 @@ class StrategyBacktester:
             "ticker": ticker.upper(),
             "backtested_at": datetime.now(timezone.utc).isoformat(),
             "bar_count": int(len(bars)),
+            "data_provenance": "authentic_market_data",
             "initial_capital_usd": float(initial_capital),
             "final_capital_usd": float(round(capital, 2)),
             "performance_metrics": {

@@ -233,7 +233,7 @@ async def main():
     heartbeat_task = safe_create_task(_heartbeat_loop(heartbeat_state), name="enrichment-heartbeat")
 
     # §1.1 Universal heartbeat — shared telemetry for data-health dashboard
-    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "enrichment"))
+    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis, "enrichment"))
 
     logger.info("Enrichment Pipeline LIVE. Listening for raw telemetry...")
     
@@ -369,9 +369,9 @@ async def main():
                                 fd = e.financial_data
                                 p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
                                 e.headline = f"📈 TRADFI MARKET EVENT: {fd.ticker}{p_str} (Anomaly: {e.anomaly_score:.2f})"
-                            elif e.crypto_data and e.crypto_data.symbol:
+                            elif e.crypto_data and e.crypto_data.pair:
                                 cd = e.crypto_data
-                                e.headline = f"₿ CRYPTO MARKET EVENT: {cd.symbol} @ ${cd.price:.2f} (Anomaly: {e.anomaly_score:.2f})"
+                                e.headline = f"₿ CRYPTO MARKET EVENT: {cd.pair} @ ${cd.price:.2f} (Anomaly: {e.anomaly_score:.2f})"
                             elif e.prediction_market_data:
                                 pm = e.prediction_market_data
                                 e.headline = f"🎯 PREDICTION MARKET EVENT: {pm.question or pm.ticker} ({pm.outcome})"
@@ -394,10 +394,10 @@ async def main():
                                 p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
                                 vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {fd.volume:,.0f} shares/contracts." if fd.premium_usd else ""
                                 e.summary = f"Institutional Market Intelligence for {fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
-                            elif e.crypto_data and e.crypto_data.symbol:
+                            elif e.crypto_data and e.crypto_data.pair:
                                 cd = e.crypto_data
                                 fr_str = f" Perpetual funding rate: {cd.funding_rate*100:.4f}%." if cd.funding_rate is not None else ""
-                                e.summary = f"Cryptocurrency Intelligence for {cd.symbol} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
+                                e.summary = f"Cryptocurrency Intelligence for {cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
                             elif e.prediction_market_data:
                                 pm = e.prediction_market_data
                                 pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)

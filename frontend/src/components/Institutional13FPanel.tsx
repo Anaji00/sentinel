@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { ProvenanceBadge } from "./ProvenanceBadge";
 import { ProvenanceValue } from "./ProvenanceValue";
+import { formatPercent } from '../lib/format';
 
 interface Position {
   ticker?: string;
@@ -308,7 +309,7 @@ export const Institutional13FPanel: React.FC = () => {
               <span className="text-[11px] text-slate-400 font-medium">Top 10 Concentration</span>
               <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "disclosed_placeholder" : "live_measurement")} />
             </div>
-            <div className="text-base font-bold text-purple-400 mt-0.5">{report.top_10_concentration_pct.toFixed(1)}%</div>
+            <div className="text-base font-bold text-purple-400 mt-0.5">{formatPercent(report.top_10_concentration_pct, { decimals: 1 })}</div>
           </div>
         </div>
       )}
@@ -404,7 +405,7 @@ export const Institutional13FPanel: React.FC = () => {
                     {pos.shares.toLocaleString()}
                   </td>
                   <td className="py-2.5 px-3 text-slate-300 font-medium">
-                    {pos.weight_pct.toFixed(2)}%
+                    {formatPercent(pos.weight_pct, { decimals: 2 })}
                   </td>
                   <td className="py-2.5 px-3">
                     {renderBadge(pos.change_type, pos.change_pct)}

@@ -1,0 +1,749 @@
+services:
+  ingress:
+    build:
+      context: ./deploy/nginx
+      dockerfile: Dockerfile
+    container_name: sentinel-ingress
+    restart: unless-stopped
+    ports:
+      # Loopback only. Without the explicit 127.0.0.1 Docker publishes on
+      # every interface, including untrusted networks.
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: sentinel-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok"
+      # Heap capped under the cgroup limit so the JVM garbage-collects
+      # instead of being OOM-killed by the kernel.
+      KAFKA_HEAP_OPTS: "-Xms128m -Xmx192m"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    healthcheck:
+      test: echo ruok | nc localhost 2181 | grep imok
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sentinel-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      # 768m heap inside a 1.5G container leaves room for direct buffers,
+      # mmap'd log segments and JVM overhead.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx768m"
+      # Bound the log so an idle week cannot fill the volume.
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_LOG_RETENTION_BYTES: 2147483648
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1.5G
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  kafka-ui:
+    profiles: ["obs"]
+    image: provectuslabs/kafka-ui:latest
+    container_name: sentinel-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: sentinel-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  timescaledb:
+    build:
+      context: .
+      dockerfile: Dockerfile.timescale
+    container_name: sentinel-timescaledb
+    restart: unless-stopped
+    environment:
+      # Interpolated from host .env variables.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Sized for the 2G cgroup limit. Without these Postgres uses compiled
+    # defaults and work_mem is allocated per sort node per connection --
+    # the classic way a cgroup-limited container still gets OOM-killed.
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=60
+      -c shared_buffers=512MB
+      -c effective_cache_size=1200MB
+      -c maintenance_work_mem=128MB
+      -c work_mem=8MB
+      -c max_worker_processes=8
+      -c max_parallel_workers=4
+      -c max_parallel_workers_per_gather=2
+      -c timescaledb.max_background_workers=4
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./shared/db/init.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+    healthcheck:
+      test: pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  neo4j:
+    image: neo4j:5.13
+    container_name: sentinel-neo4j
+    restart: unless-stopped
+    environment:
+      # Parameterized auth from .env.
+      NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      # Severely restrict APOC execution. Removes apoc.export.* and apoc.load.* # which are common attack vectors for Remote Code Execution / Host file exfiltration.
+      NEO4J_dbms_security_procedures_unrestricted: apoc.meta.*,apoc.algo.*,apoc.spatial.*,apoc.coll.*
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_dbms_memory_pagecache_size: 512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2G
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: sentinel-redis
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    volumes:
+      - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 768M
+    healthcheck:
+      test: redis-cli -a ${REDIS_PASSWORD:?REDIS_PASSWORD must be set} ping || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  migrator:
+    build: .
+    command: python shared/db/migrate.py
+    environment:
+      - PYTHONPATH=/app
+    env_file: .env
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  enrichment:
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-enrichment
+    command: python services/enrichment/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1.5G
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  correlation:
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-correlation
+    command: python services/correlation/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1.5G
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  reasoning:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-reasoning
+    command: python services/reasoning/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1.5G
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  collector-tradfi:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-tradfi
+    command: python services/collector-tradfi/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-crypto:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-crypto
+    command: python services/collector-crypto/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-prediction:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-prediction
+    command: python services/collector-prediction/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ollama:
+    profiles: ["agents"]
+    image: ollama/ollama:latest
+    container_name: sentinel-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_FLASH_ATTENTION=1
+      # One slot: this CPU serves ~3-5 tok/s, so four concurrent contexts
+      # quarter throughput and quadruple the KV cache.
+      - OLLAMA_NUM_PARALLEL=1
+      # Release the model after idle rather than pinning it in RAM forever.
+      - OLLAMA_KEEP_ALIVE=5m
+      # Both tiers must stay resident: agents-heavy and agents-fast request
+      # different models, and a value of 1 evicts/reloads on every alternating
+      # request -- far more costly than the memory it saves.
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 4G
+    healthcheck:
+      test: [ "CMD", "ollama", "list" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sentinel-qdrant
+    environment:
+      QDRANT__LOG_LEVEL: WARN
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    healthcheck:
+      disable: true
+
+  collector-cyber:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-cyber
+    command: python services/collector-cyber/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  collector-radar:
+    profiles: ["collectors"]
+    build: .
+    command: "python services/collector-radar/main.py"
+    container_name: sentinel-radar
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  collector-ais:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-ais
+    command: python services/collector-ais/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-adsb:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-adsb
+    command: python services/collector-adsb/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-news:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-news
+    command: python services/collector-news/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector-macro:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-macro
+    command: python services/collector-macro/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  api-gateway:
+    build: .
+    container_name: sentinel-api_gateway
+    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1G
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import os, urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': os.environ.get('API_GATEWAY_KEY','')}); urllib.request.urlopen(r)" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  agents-fast:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-agents-fast
+    command: python services/agents/main.py
+    env_file: .env
+    environment:
+      - AGENT_TIER_FILTER=fast
+      - AGENT_MODEL=qwen2.5:1.5b
+      - OLLAMA_FALLBACK_MODEL=gemma3:1b
+      - OLLAMA_TIMEOUT=600.0
+      - PYTHONWARNINGS=ignore::UserWarning
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1.5G
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  agents-heavy:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-agents-heavy
+    command: python services/agents/main.py
+    env_file: .env
+    environment:
+      - AGENT_TIER_FILTER=heavy
+      # 3b, not 7b: on a 15W Zen 2 part 7b yields ~3-5 tok/s, and keeping it
+      # resident alongside the fast tier exceeds the VM memory budget.
+      - AGENT_MODEL=qwen2.5:3b
+      - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
+      - OLLAMA_TIMEOUT=600.0
+      - PYTHONWARNINGS=ignore::UserWarning
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2.5'
+          # No in-process model weights: agents call ollama over HTTP.
+          memory: 2.5G
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sentinel-frontend
+    environment:
+      - API_GATEWAY_URL=http://api-gateway:8000
+      # NEXT_PUBLIC_API_URL intentionally unset: the browser reaches REST via the
+      # same-origin /api/proxy BFF and WebSockets via the same-origin ingress host.
+      # A hardcoded http://localhost:8000 here breaks both (port not published +
+      # mixed content on HTTPS). Set it only to an explicit public origin if needed.
+      - API_GATEWAY_KEY=${API_GATEWAY_KEY:?API_GATEWAY_KEY must be set}
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+
+  dlq-worker:
+    build: .
+    container_name: sentinel-dlq-worker
+    command: python services/dlq-worker/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
+  telemetry-worker:
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-telemetry-worker
+    command: python services/telemetry-worker/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    profiles: ["obs"]
+    image: prom/prometheus:latest
+    container_name: sentinel-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+
+  grafana:
+    profiles: ["obs"]
+    image: grafana/grafana:latest
+    container_name: sentinel-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+    volumes:
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    depends_on:
+      - prometheus
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+  timescaledb_data:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
+  ollama_data:
+  qdrant_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: sentinel-network

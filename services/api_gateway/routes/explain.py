@@ -6,8 +6,10 @@ Provides computation audit trails, factor attribution waterfall, step-by-step
 score adjustments, data provenance, and model stability metadata for any alert or signal.
 """
 
+import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,6 +17,80 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
 
 logger = logging.getLogger("api-gateway.explain")
+
+# Identity of the scorer that actually runs. Anomaly scoring migrated to
+# streaming RRCF (shared/utils/streaming_detectors.py); the batch
+# IsolationForest ONNX export was retired, and naming it here would misdescribe
+# the model to anyone auditing a signal.
+ACTIVE_MODEL_NAME = "RRCF-StreamingAnomaly-v1"
+ACTIVE_MODEL_FAMILY = (
+    "Robust Random Cut Forest (online) + Welford streaming variance + Hawkes contagion"
+)
+FEATURE_SCHEMA_VERSION = "v2.6"
+FEATURES_USED = (
+    "price_return_zscore",
+    "realized_volatility_ewma",
+    "order_flow_imbalance",
+    "kyle_lambda",
+    "amihud_illiquidity",
+    "parkinson_high_low_vol",
+)
+
+# Published by services/telemetry-worker/drift_scheduler.py.
+DRIFT_REPORT_KEY = "sentinel:ml:drift_report"
+
+# PSI convention: < 0.10 stable, 0.10-0.25 slight, >= 0.25 significant.
+PSI_SLIGHT = 0.10
+PSI_SIGNIFICANT = 0.25
+
+
+async def _read_drift_status(redis: Any) -> Dict[str, Any]:
+    """Returns measured drift, or an explicit unknown state.
+
+    The scheduler publishes under a TTL, so an absent key means drift is not
+    currently being evaluated. Reporting STABLE in that case would assert model
+    health that nothing has checked.
+    """
+    unknown = {
+        "psi_score": None,
+        "drift_state": "UNKNOWN",
+        "last_evaluated": None,
+        "detail": "No drift evaluation published; the drift scheduler may not be running.",
+    }
+    if not redis:
+        return unknown
+    try:
+        raw = await redis.raw.get(DRIFT_REPORT_KEY)
+        if not raw:
+            return unknown
+        report = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+    except Exception as e:
+        logger.warning(f"Could not read drift report: {e}")
+        return unknown
+
+    psi = report.get("psi")
+    if psi is None:
+        return unknown
+    if report.get("status") == "initializing":
+        return {
+            "psi_score": None,
+            "drift_state": "INITIALIZING",
+            "last_evaluated": report.get("timestamp"),
+            "detail": "Insufficient baseline history to evaluate drift.",
+        }
+
+    psi = float(psi)
+    state = "STABLE" if psi < PSI_SLIGHT else "SLIGHT_DRIFT" if psi < PSI_SIGNIFICANT else "SIGNIFICANT_DRIFT"
+    return {
+        "psi_score": round(psi, 4),
+        "drift_state": state,
+        "psi_threshold": PSI_SIGNIFICANT,
+        "baseline_count": report.get("baseline_count"),
+        "current_count": report.get("current_count"),
+        "last_evaluated": report.get("timestamp"),
+    }
+
+
 router = APIRouter(prefix="/api/v1/explain", tags=["Model Explainability & Audit Trail"])
 
 
@@ -28,6 +104,9 @@ async def explain_event_alert(
     Returns the complete mathematical factor attribution waterfall, score adjustments,
     data provenance, and model card for a specific event alert.
     """
+    # Measured, not asserted: reported as processing_latency_ms below.
+    _t0 = time.perf_counter()
+
     event = None
     if db:
         try:
@@ -100,37 +179,32 @@ async def explain_event_alert(
         {"step": 4, "action": "Final Clamped Anomaly Score", "score_before": round(anomaly_score * 0.83, 2), "delta": round(anomaly_score - (anomaly_score * 0.83), 2), "score_after": round(anomaly_score, 2), "reason": "Sigmoid normalization and threshold bounds"},
     ]
 
-    # Data source provenance
+    # Data source provenance. Values that are not measured are reported as null
+    # rather than as a plausible constant -- an audit trail that invents its own
+    # latency and quality figures cannot be used to audit anything.
     provenance = {
-        "source_collector": event.get("source", "collector-tradfi"),
+        "source_collector": event.get("source"),
         "event_id": event_id,
-        "ingest_timestamp": event.get("occurred_at", datetime.now(timezone.utc).isoformat()),
-        "payload_hash": f"sha256:{abs(hash(event_id)):016x}{abs(hash(str(event.get('occurred_at')))):016x}"[:64],
-        "processing_latency_ms": 14.8,
-        "data_quality_score": 0.98,
+        "ingest_timestamp": event.get("occurred_at"),
+        # Deterministic content hash. Python's builtin hash() is randomized per
+        # process, so the previous construction produced a different "hash" for
+        # the same event on every restart.
+        "payload_hash": "sha256:" + hashlib.sha256(
+            f"{event_id}|{event.get('occurred_at')}".encode("utf-8")
+        ).hexdigest(),
+        "processing_latency_ms": round((time.perf_counter() - _t0) * 1000.0, 2),
+        "data_quality_score": None,
     }
 
-    # Model Card Metadata (§B.2)
+    # Model Card Metadata (§B.2). Identity reflects the scorer that actually
+    # runs -- streaming RRCF, not the retired batch IsolationForest export.
     model_card = {
-        "model_name": "IsolationForest-SpatialMicrostructure-v2.1",
-        "model_family": "Ensemble (Unsupervised IsolationForest + Welford Streaming Variance + Hawkes Contagion)",
-        "feature_schema_version": "v2.6",
-        "features_used": [
-            "price_return_zscore",
-            "realized_volatility_ewma",
-            "order_flow_imbalance",
-            "kyle_lambda",
-            "amihud_illiquidity",
-            "parkinson_high_low_vol",
-        ],
-        "training_window": "Rolling 24-hour CAGG distribution",
-        "model_drift_status": {
-            "psi_score": 0.042,
-            "ks_statistic": 0.018,
-            "drift_state": "STABLE",
-            "last_evaluated": datetime.now(timezone.utc).isoformat(),
-        },
-        "governance_status": "VALIDATED_PRODUCTION",
+        "model_name": ACTIVE_MODEL_NAME,
+        "model_family": ACTIVE_MODEL_FAMILY,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "features_used": list(FEATURES_USED),
+        "training_window": "Online / streaming -- no batch training window",
+        "model_drift_status": await _read_drift_status(redis),
     }
 
     return {

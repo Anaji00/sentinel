@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
+import { formatNumber } from '../lib/format';
 
 interface FlowItem {
   id: string;
@@ -149,7 +150,7 @@ export default function DarkPoolFlowPanel() {
                 </td>
                 <td className="text-slate-300">${item.price.toFixed(2)}</td>
                 <td className="text-[10px] text-cyan-300/90 font-mono">
-                  {item.occ_symbol || `${item.size_shares.toLocaleString()} shares block`}
+                  {item.occ_symbol || `${formatNumber(item.size_shares, { decimals: 0 })} shares block`}
                 </td>
                 <td className="text-right text-[10px] text-slate-400">
                   {new Date(item.occurred_at).toLocaleTimeString()}

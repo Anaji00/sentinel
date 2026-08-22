@@ -1,8 +1,13 @@
 import logging
 from fastapi import APIRouter, Depends, Query
 from services.api_gateway.dependencies import get_db, get_db_optional, get_redis_client, get_redis_optional
+from shared.utils.serialization import score_dto, to_dto
 
 logger = logging.getLogger("api-gateway.radar")
+
+# Anomaly scores are unit-normalized [0,1]; this maps them onto a z-like scale
+# for display. Named rather than inlined so the relationship is auditable.
+Z_SCORE_SCALE = 4.5
 
 router = APIRouter(prefix="/api/v1/radar", tags=["Quantitative Radar"])
 
@@ -31,17 +36,21 @@ async def get_radar_anomalies(
             for r in rows:
                 t = r["ticker"] or "UNKNOWN"
                 e_name = r["entity_name"] or t
-                anomalies.append({
+                score = float(r["anomaly_score"] or 0.0)
+                # Rounded here rather than at render time: `score * 4.5` yields
+                # values like 2.6999999999999997, which reach the browser
+                # verbatim and are displayed as-is by any consumer that forgets.
+                anomalies.append(score_dto({
                     "event_id": r["event_id"],
                     "ticker": t,
                     "primary_entity_name": e_name,
                     "entity_name": e_name,
-                    "anomaly_score": float(r["anomaly_score"] or 0.0),
-                    "occurred_at": r["occurred_at"].isoformat() if hasattr(r["occurred_at"], "isoformat") else str(r["occurred_at"]),
-                    "z_score": float(r["anomaly_score"] or 0.0) * 4.5,
+                    "anomaly_score": score,
+                    "occurred_at": r["occurred_at"],
+                    "z_score": score * Z_SCORE_SCALE,
                     "region": r["region"] or "US Equities",
                     "details": r["domain_data"] or {}
-                })
+                }))
         except Exception as e:
             logger.warning(f"Error querying radar anomalies from DB: {e}")
 

@@ -1,0 +1,136 @@
+# Sentinel CI — runs the same gates `make verify` runs locally.
+#
+# Deliberately mirrors the local target rather than reimplementing it: a
+# pipeline that checks something different from what a developer runs produces
+# failures nobody can reproduce.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A newer push supersedes an in-flight run on the same ref.
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The stack fails closed. CI supplies throwaway values so imports resolve;
+      # SENTINEL_ENV=test keeps the platform in its safe-dev whitelist.
+      SENTINEL_ENV: test
+      SESSION_SECRET: ci-only-not-a-real-secret-000000
+      API_GATEWAY_KEY: ci-only-not-a-real-secret-111111
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-base.txt
+          pip install -r requirements-ml.txt
+          pip install pytest pytest-anyio pyyaml
+
+      - name: Run test suite
+        run: pytest tests/ -q --tb=short
+
+  frontend:
+    name: Frontend (tsc + vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: node_modules/.bin/tsc --noEmit
+
+      - name: Unit tests
+        run: node_modules/.bin/vitest run
+
+      - name: Production build
+        # next.config.ts sets no error-ignore flags, so this is a real gate:
+        # a type error here fails the frontend image build too.
+        run: npm run build
+        env:
+          SESSION_SECRET: ci-only-not-a-real-secret-000000
+          API_GATEWAY_KEY: ci-only-not-a-real-secret-111111
+
+  compose:
+    name: Compose validity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate every profile combination
+        # A profile that only fails when someone runs it is a deploy-time
+        # surprise; validating all of them here makes it a CI-time one.
+        run: |
+          set -e
+          cp .env.example .env
+          # Placeholder values: `docker compose config` interpolates ${VAR:?}
+          # and aborts on an empty one, so validity cannot be checked without them.
+          sed -i 's|^\([A-Z0-9_]*PASSWORD\)=$|\1=ci-placeholder-value|' .env
+          sed -i 's|^\([A-Z0-9_]*SECRET\)=$|\1=ci-placeholder-value|' .env
+          sed -i 's|^\([A-Z0-9_]*KEY\)=$|\1=ci-placeholder-value|' .env
+          for p in "" "--profile collectors" "--profile agents" "--profile obs" \
+                   "--profile collectors --profile agents --profile obs"; do
+            echo "validating: ${p:-default}"
+            docker compose $p config --quiet
+          done
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Advisory for now: these find pre-existing issues across a 46k-line
+    # codebase, and a gate that fails on day one gets disabled on day two.
+    # Flip to blocking once the existing findings are triaged.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks needs history to scan past commits
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependency vulnerabilities
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements-base.txt -r requirements-ml.txt || true
+
+      - name: Static security analysis
+        run: |
+          pip install bandit
+          bandit -r services/ shared/ -ll -x '**/test_*.py' || true
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -15,6 +15,7 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType, Crypto
 from shared.kafka import Topics
 from shared.utils import quant_calc
 import asyncio
+from shared.utils.metrics import MetricsCollector
 
 logger = logging.getLogger("enrichment.crypto")
 
@@ -101,8 +102,12 @@ class CryptoEnricher:
                     pipe.set(f"sentinel:quotes:latest:{clean_asset}USD", str(price), ex=3600)
                     pipe.set(f"sentinel:quotes:latest:{clean_asset}USDT", str(price), ex=3600)
                     asyncio.create_task(pipe.execute())
-            except Exception:
-                pass
+            except Exception as e:
+                # Quote cache write. Non-fatal for this event, but a persistent
+                # failure means every downstream consumer reads stale prices,
+                # so it is counted rather than discarded.
+                MetricsCollector.increment("enrichment_quote_cache_errors_total")
+                logger.warning("Quote cache write failed for %s: %s", asset, e)
             
         if not parsed_events: return []
         
@@ -378,8 +383,12 @@ class CryptoEnricher:
             pipe.set(ema_key, str(new_mean), ex=604800)
             pipe.set(var_key, str(new_var), ex=604800)
             await pipe.execute()
-        except Exception:
-            pass
+        except Exception as e:
+            # EMA baseline write. Losing this silently means the open-interest
+            # z-score is computed against a baseline that stopped updating --
+            # the detector keeps reporting, on stale statistics.
+            MetricsCollector.increment("enrichment_oi_baseline_errors_total")
+            logger.warning("Open-interest baseline update failed: %s", e)
 
         # Only emit as anomaly if OI z-score is significant
         oi_z_threshold = float(os.getenv("OI_ZSCORE_TRIGGER", "2.0"))

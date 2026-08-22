@@ -8,6 +8,23 @@ logger = logging.getLogger(__name__)
 
 TIMEFRAMES_MINUTES = [1, 5, 15, 30, 60, 240]
 
+# Canonical Redis key layout for OHLCV candle lists. Every producer and consumer
+# MUST route through this helper — divergent hand-built keys (e.g. omitting the
+# timeframe segment) silently miss and send callers down cold-start paths.
+CANDLE_KEY_PREFIX = "sentinel:candles"
+
+
+def candle_cache_key(asset: str, timeframe: str) -> str:
+    """Builds the canonical candle cache key: ``sentinel:candles:{tf}:{ASSET}``.
+
+    ``timeframe`` accepts either a Sentinel timeframe label ("5m", "1h", "1d") or
+    a bare minute count (5, 60), which is normalized to the minute-suffixed form.
+    """
+    tf = str(timeframe).strip().lower()
+    if tf.isdigit():
+        tf = f"{tf}m"
+    return f"{CANDLE_KEY_PREFIX}:{tf}:{str(asset).strip().upper()}"
+
 def get_domain_tag(domain: str, asset: str) -> str:
     """
     Dynamically determines the domain classification tag for structured logging & telemetry.
@@ -84,8 +101,8 @@ async def evaluate_multi_timeframe(
                 pipe.ltrim(history_not_key, 0, 14)
                 await pipe.execute()
                 
-                # Also store complete OHLCV bar object in sentinel:candles:{tf}m:{asset}
-                candles_tf_key = f"sentinel:candles:{tf}m:{asset}"
+                # Also store complete OHLCV bar object under the canonical candle key.
+                candles_tf_key = candle_cache_key(asset, tf)
                 await redis_client.raw.lpush(candles_tf_key, json.dumps(block))
                 await redis_client.raw.ltrim(candles_tf_key, 0, 199)
                 

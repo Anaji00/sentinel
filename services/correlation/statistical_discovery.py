@@ -28,8 +28,26 @@ from shared.utils import quant_calc
 from shared.utils.feature_flags import FeatureFlagManager
 from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS_SECTORS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
+from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistration
 
 logger = logging.getLogger("correlation.statistical_discovery")
+
+
+def _granger_p(gc_result: Dict[str, Any]) -> float:
+    """Extracts a Granger p-value, defaulting to 1.0 when absent.
+
+    A missing p-value means the test produced no measurement. Defaulting it to a
+    significant value would stamp an unmeasured relationship onto the graph as a
+    strong one, so the safe default is "not significant".
+    """
+    p = (gc_result or {}).get("p_value")
+    if p is None:
+        return 1.0
+    try:
+        val = float(p)
+    except (TypeError, ValueError):
+        return 1.0
+    return val if math.isfinite(val) else 1.0
 
 # Core candidate seed tickers (Tech / Semi / Defense / Energy / Macro Proxies)
 DEFAULT_WATCHLIST_TICKERS = [
@@ -78,6 +96,7 @@ class StatisticalDiscoveryEngine:
         self.sector_hawkes = IntraTradFiHawkesCorrelator()
         self.calibrator = ThresholdCalibrationHarness(db_client=self.db, redis_client=self.redis)
         self.flags = FeatureFlagManager(redis_client=self.redis)
+        self.survival = EdgeSurvivalTracker(redis_client=self.redis)
 
     # ── 1. CANDIDATE PAIR GENERATION (§4.1) ────────────────────────────────────
 
@@ -204,6 +223,9 @@ class StatisticalDiscoveryEngine:
         pairs = await self.build_candidate_pairs()
         thresholds = await self.get_calibrated_thresholds()
         discoveries: List[Dict[str, Any]] = []
+        # Parallel to `discoveries` by index; holds the context needed to emit an
+        # edge once family-wide FDR control has been applied.
+        pending: List[Dict[str, Any]] = []
 
         for ticker_a, ticker_b in pairs:
             try:
@@ -253,13 +275,74 @@ class StatisticalDiscoveryEngine:
                 }
                 discoveries.append(discovery)
 
+                # Defer emission until the whole family of tests is known, so
+                # false-discovery-rate control can be applied across the sweep.
+                pending.append({
+                    "ticker_a": ticker_a,
+                    "ticker_b": ticker_b,
+                    "r_pearson": r_pearson,
+                    "p_pearson": p_pearson,
+                    "gc_ab": gc_ab,
+                    "gc_ba": gc_ba,
+                    "min_len": min_len,
+                })
+
+            except Exception as e:
+                logger.debug(f"Pairwise statistical discovery error for {ticker_a}:{ticker_b}: {e}")
+
+        # ── FALSE DISCOVERY RATE CONTROL (§4.2) ────────────────────────────────
+        # Each scheduled sweep runs |pairs| x N tests. Screening each one at a raw
+        # alpha would promote roughly alpha * family_size spurious edges into the
+        # graph every cycle. BH bounds the expected false-discovery proportion
+        # among the edges actually emitted.
+        alpha = float(thresholds.get("max_p_value", 0.05))
+
+        pearson_bh = quant_calc.benjamini_hochberg(
+            [rec["p_pearson"] for rec in pending], alpha=alpha
+        )
+        # Both Granger directions form one family — they are the same test applied
+        # across the sweep, so their multiplicity is shared.
+        granger_ps: List[float] = []
+        for rec in pending:
+            granger_ps.append(_granger_p(rec["gc_ab"]))
+            granger_ps.append(_granger_p(rec["gc_ba"]))
+        granger_bh = quant_calc.benjamini_hochberg(granger_ps, alpha=alpha)
+
+        logger.info(
+            "FDR control (alpha=%.3f): Pearson %d/%d significant (q<=%.4f), "
+            "Granger %d/%d significant (q<=%.4f).",
+            alpha,
+            pearson_bh["num_rejected"], len(pending), pearson_bh["threshold"],
+            granger_bh["num_rejected"], len(granger_ps), granger_bh["threshold"],
+        )
+
+        for i, rec in enumerate(pending):
+            ticker_a, ticker_b = rec["ticker_a"], rec["ticker_b"]
+            r_pearson, p_pearson = rec["r_pearson"], rec["p_pearson"]
+            gc_ab, gc_ba, min_len = rec["gc_ab"], rec["gc_ba"], rec["min_len"]
+
+            pearson_significant = pearson_bh["rejected"][i]
+            pearson_q = pearson_bh["adjusted"][i]
+            gc_ab_significant = granger_bh["rejected"][2 * i]
+            gc_ab_q = granger_bh["adjusted"][2 * i]
+            gc_ba_significant = granger_bh["rejected"][2 * i + 1]
+            gc_ba_q = granger_bh["adjusted"][2 * i + 1]
+
+            # Annotate the returned discovery record with the correction outcome.
+            discoveries[i]["pearson_q_value"] = pearson_q
+            discoveries[i]["pearson_significant_fdr"] = bool(pearson_significant)
+            discoveries[i]["granger_ab_q_value"] = gc_ab_q
+            discoveries[i]["granger_ba_q_value"] = gc_ba_q
+            discoveries[i]["correction_method"] = "benjamini_hochberg"
+
+            try:
                 # ── GOVERNED GRAPH PROPOSAL EMISSION (§4.2, §5.2) ─────────────
                 if self.producer:
                     label_a = "MacroFactor" if ticker_a.startswith("MACRO:") else "Company"
                     label_b = "MacroFactor" if ticker_b.startswith("MACRO:") else "Company"
 
                     # A. Statistical Correlation Edge
-                    if abs(r_pearson) >= thresholds["min_correlation_coef"] and p_pearson <= thresholds["max_p_value"]:
+                    if abs(r_pearson) >= thresholds["min_correlation_coef"] and pearson_significant:
                         rel_type = "STATISTICALLY_CORRELATED_WITH"
                         await self.producer.send(
                             Topics.ONTOLOGY_PROPOSALS,
@@ -276,6 +359,8 @@ class StatisticalDiscoveryEngine:
                                     "properties": {
                                         "coefficient": round(r_pearson, 4),
                                         "p_value": round(p_pearson, 4),
+                                        "q_value": pearson_q,
+                                        "correction": "benjamini_hochberg",
                                         "method": "pearson",
                                         "window": f"{min_len}_bars",
                                     }
@@ -284,6 +369,20 @@ class StatisticalDiscoveryEngine:
                             key=ticker_a,
                         )
                         logger.info(f"📊 Statistical Correlation Link: {ticker_a} <-> {ticker_b} (r={r_pearson:.3f}, p={p_pearson:.4f})")
+
+                        # Register for out-of-sample re-test. Survival rate is
+                        # the only measure that distinguishes a discovery engine
+                        # from a discovery generator, and it needs the statistic
+                        # recorded at the moment the edge was believed.
+                        await self.survival.register(EdgeRegistration(
+                            edge_id=EdgeSurvivalTracker.edge_id(ticker_a, ticker_b, "pearson"),
+                            source=ticker_a, target=ticker_b,
+                            relation=rel_type, method="pearson",
+                            coefficient=round(r_pearson, 4),
+                            p_value=round(p_pearson, 6),
+                            q_value=pearson_q,
+                            window_bars=min_len,
+                        ))
                         
                         # Cache active correlation IDs in Redis for event enrichment linking (§8.2)
                         if self.redis:
@@ -297,9 +396,9 @@ class StatisticalDiscoveryEngine:
                                 logger.debug(f"Failed to cache correlation ID in Redis: {re}")
 
                     # B. Directional Granger Causality Edge (A -> B)
-                    if gc_ab.get("x_granger_causes_y") and await self.flags.is_enabled("granger_causality", ticker=ticker_a):
+                    if gc_ab.get("x_granger_causes_y") and gc_ab_significant and await self.flags.is_enabled("granger_causality", ticker=ticker_a):
                         f_stat = float(gc_ab.get("f_statistic", 0.0))
-                        p_val = float(gc_ab.get("p_value", 0.01))
+                        p_val = _granger_p(gc_ab)
                         lag = int(gc_ab.get("optimal_lag", 1))
                         await self.producer.send(
                             Topics.ONTOLOGY_PROPOSALS,
@@ -317,12 +416,21 @@ class StatisticalDiscoveryEngine:
                                         "lag": lag,
                                         "f_stat": round(f_stat, 4),
                                         "p_value": round(p_val, 4),
+                                        "q_value": gc_ab_q,
+                                        "correction": "benjamini_hochberg",
                                     }
                                 }
                             },
                             key=ticker_a,
                         )
                         logger.info(f"🎯 Granger Causality Link: {ticker_a} -[GRANGER_CAUSES (lag={lag})]-> {ticker_b}")
+                        await self.survival.register(EdgeRegistration(
+                            edge_id=EdgeSurvivalTracker.edge_id(ticker_a, ticker_b, "granger"),
+                            source=ticker_a, target=ticker_b,
+                            relation="GRANGER_CAUSES", method="granger",
+                            coefficient=round(f_stat, 4), p_value=round(p_val, 6),
+                            q_value=gc_ab_q, window_bars=min_len,
+                        ))
                         
                         if self.redis:
                             try:
@@ -335,9 +443,9 @@ class StatisticalDiscoveryEngine:
                                 logger.debug(f"Failed to cache Granger ID in Redis: {re}")
 
                     # C. Directional Granger Causality Edge (B -> A)
-                    if gc_ba.get("x_granger_causes_y") and await self.flags.is_enabled("granger_causality", ticker=ticker_b):
+                    if gc_ba.get("x_granger_causes_y") and gc_ba_significant and await self.flags.is_enabled("granger_causality", ticker=ticker_b):
                         f_stat = float(gc_ba.get("f_statistic", 0.0))
-                        p_val = float(gc_ba.get("p_value", 0.01))
+                        p_val = _granger_p(gc_ba)
                         lag = int(gc_ba.get("optimal_lag", 1))
                         await self.producer.send(
                             Topics.ONTOLOGY_PROPOSALS,
@@ -355,6 +463,8 @@ class StatisticalDiscoveryEngine:
                                         "lag": lag,
                                         "f_stat": round(f_stat, 4),
                                         "p_value": round(p_val, 4),
+                                        "q_value": gc_ba_q,
+                                        "correction": "benjamini_hochberg",
                                     }
                                 }
                             },

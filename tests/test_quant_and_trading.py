@@ -696,3 +696,193 @@ def test_covered_call_engine_queries_cagg_zscore_view():
 
 
 
+
+# ── BENJAMINI-HOCHBERG FALSE DISCOVERY RATE CONTROL (QM-07) ──────────────────
+
+def test_benjamini_hochberg_matches_published_example():
+    """Validates BH against the worked example in Benjamini & Hochberg (1995)."""
+    p = [0.0001, 0.0004, 0.0019, 0.0095, 0.0201, 0.0278, 0.0298,
+         0.0344, 0.0459, 0.3240, 0.4262, 0.5719, 0.6528, 0.7590, 1.000]
+    res = quant_calc.benjamini_hochberg(p, alpha=0.05)
+
+    assert res["num_rejected"] == 4
+    assert res["threshold"] == 0.0095
+    assert res["rejected"][:4] == [True, True, True, True]
+    assert not any(res["rejected"][4:])
+
+
+def test_benjamini_hochberg_suppresses_pure_noise():
+    """A family of uniform null p-values must yield (almost) no discoveries.
+
+    This is the QM-07 defect in miniature: screening ~1,750 pairwise tests at a
+    raw alpha=0.05 promotes ~88 spurious edges into the knowledge graph per
+    cycle. BH bounds the expected false-discovery proportion instead.
+    """
+    import random
+    random.seed(1)
+    nulls = [random.random() for _ in range(1000)]
+
+    uncorrected = sum(1 for p in nulls if p <= 0.05)
+    corrected = quant_calc.benjamini_hochberg(nulls, alpha=0.05)["num_rejected"]
+
+    assert uncorrected > 30, "Sanity: raw screening should admit many false positives"
+    assert corrected == 0, f"BH admitted {corrected} discoveries from pure noise"
+
+
+def test_benjamini_hochberg_retains_genuine_signal():
+    """FDR control must not suppress real effects buried in a large family.
+
+    BH bounds the expected *proportion* of false discoveries among rejections; it
+    does not guarantee that only true effects are rejected. So the assertions are
+    (a) every genuine signal is recovered, and (b) the false-discovery proportion
+    stays near the nominal alpha rather than the ~54 that raw screening admits.
+    """
+    import random
+    random.seed(7)
+    nulls = [random.random() for _ in range(1000)]
+    strong = [1e-8, 2e-8, 3e-8, 1e-7, 5e-7]
+
+    res = quant_calc.benjamini_hochberg(strong + nulls, alpha=0.05)
+
+    # (a) All genuine signals recovered.
+    assert all(res["rejected"][:len(strong)])
+
+    # (b) False discoveries bounded well below raw screening.
+    false_discoveries = sum(res["rejected"][len(strong):])
+    uncorrected = sum(1 for p in nulls if p <= 0.05)
+    assert false_discoveries < 5, f"FDR admitted {false_discoveries} false discoveries"
+    assert false_discoveries < uncorrected / 10
+
+
+def test_benjamini_hochberg_treats_missing_p_values_as_insignificant():
+    """A missing measurement must never be recorded as a discovery."""
+    res = quant_calc.benjamini_hochberg([None, float("nan"), 1e-9], alpha=0.05)
+    assert res["rejected"] == [False, False, True]
+    assert quant_calc.benjamini_hochberg([], alpha=0.05)["num_rejected"] == 0
+
+
+def test_granger_p_defaults_to_not_significant():
+    """A Granger result with no p-value must default to 1.0, not 0.01."""
+    from services.correlation.statistical_discovery import _granger_p
+
+    assert _granger_p({}) == 1.0
+    assert _granger_p({"p_value": None}) == 1.0
+    assert _granger_p({"p_value": "not-a-number"}) == 1.0
+    assert _granger_p({"p_value": float("inf")}) == 1.0
+    assert _granger_p({"p_value": 0.023}) == 0.023
+
+# ── ANNUALIZATION HORIZON (QM-05) ────────────────────────────────────────────
+
+def test_periods_per_year_matches_bar_frequency():
+    """Annualization factors must follow the bar frequency and asset calendar."""
+    # Equities: 252 sessions of 6.5 hours.
+    assert quant_calc.periods_per_year("1d", "equity") == 252
+    assert quant_calc.periods_per_year("1h", "equity") == 1638
+    assert quant_calc.periods_per_year("30m", "equity") == 3276
+    assert quant_calc.periods_per_year("1w", "equity") == 52
+
+    # Crypto trades continuously, so the same timeframe annualizes differently.
+    assert quant_calc.periods_per_year("1d", "crypto") == 365
+    assert quant_calc.periods_per_year("1h", "crypto") == 8760
+
+    # Unknown asset classes fall back to the equity calendar rather than 1.
+    assert quant_calc.periods_per_year("1h", "nonsense") == 1638
+
+
+def test_hourly_sharpe_is_not_annualized_as_daily():
+    """The QM-05 defect: hourly returns scaled by sqrt(252) understate Sharpe.
+
+    Asserts the corrected factor differs from the daily default by the expected
+    ratio, so a regression to the bare default is caught numerically.
+    """
+    import random
+    random.seed(3)
+    returns = [random.gauss(0.0004, 0.01) for _ in range(500)]
+
+    daily_assumption = quant_calc.sharpe_ratio(returns, annualize=True)  # default 252
+    hourly_correct = quant_calc.sharpe_ratio(
+        returns, annualize=True,
+        trading_days=quant_calc.periods_per_year("1h", "equity"),
+    )
+
+    assert hourly_correct != daily_assumption
+    ratio = hourly_correct / daily_assumption
+    assert abs(ratio - math.sqrt(1638 / 252)) < 0.01, f"unexpected scaling ratio {ratio}"
+
+
+def test_var_horizon_scaling():
+    """A per-bar VaR must be rescalable to the horizon it is presented at."""
+    hourly_var = 0.01
+    daily = quant_calc.scale_var_to_horizon(
+        hourly_var,
+        from_periods=quant_calc.periods_per_year("1h", "equity"),
+        to_periods=quant_calc.periods_per_year("1d", "equity"),
+    )
+    # 6.5 bars per session -> sqrt(6.5) ~= 2.55x larger at the daily horizon.
+    assert abs(daily / hourly_var - math.sqrt(6.5)) < 0.01
+    assert quant_calc.scale_var_to_horizon(0.01, 0, 252) == 0.01  # degenerate input
+    assert quant_calc.horizon_label("1h") == "1-hour"
+
+
+def test_classify_asset_class():
+    assert quant_calc.classify_asset_class("BTC-USD") == "crypto"
+    assert quant_calc.classify_asset_class("ETH-USD") == "crypto"
+    assert quant_calc.classify_asset_class("EURUSD") == "fx"
+    assert quant_calc.classify_asset_class("NVDA") == "equity"
+
+
+# ── POSITION SIZING GUARDRAILS (QM-06) ───────────────────────────────────────
+
+def test_kelly_position_caps_bound_a_lucky_streak():
+    """A short winning streak against an assumed payoff must not size huge.
+
+    Pre-fix, 4 correct calls out of 5 with an assumed 2:1 payoff produced a
+    half-Kelly allocation near 38% of the portfolio in one position.
+    """
+    from services.agents.quant_trading_engine import (
+        MAX_SINGLE_POSITION_PCT, UNPROVEN_POSITION_PCT,
+        MIN_KELLY_SAMPLES, DEFAULT_PAYOFF_RATIO,
+    )
+
+    # The raw arithmetic that produced the original oversizing.
+    lucky = quant_calc.kelly_criterion(0.80, 2.0, half_kelly=True)
+    assert lucky > 0.30, "sanity: the unbounded value really is that large"
+
+    # Caps bound it regardless of how favourable the estimate looks.
+    assert min(lucky, MAX_SINGLE_POSITION_PCT) <= 0.10
+    assert min(lucky, MAX_SINGLE_POSITION_PCT, UNPROVEN_POSITION_PCT) <= 0.02
+    assert MIN_KELLY_SAMPLES >= 30
+    assert DEFAULT_PAYOFF_RATIO == 1.0, "absent evidence must not assume a 2:1 edge"
+
+
+def test_kelly_shrinks_when_realized_payoff_is_worse_than_assumed():
+    """Kelly must fall when the measured payoff is below the old 2.0 assumption."""
+    assumed = quant_calc.kelly_criterion(0.60, 2.0, half_kelly=True)
+    realized = quant_calc.kelly_criterion(0.60, 1.0, half_kelly=True)
+    assert realized < assumed
+
+
+# ── LIVE TRADING ARMING (OPS-08) ─────────────────────────────────────────────
+
+def test_live_broker_requires_explicit_second_signal(monkeypatch):
+    """BROKER_TYPE alone must not be able to route orders to real capital."""
+    from shared.broker import get_broker, LiveTradingNotArmed, LIVE_TRADING_CONFIRMATION
+
+    monkeypatch.setenv("BROKER_TYPE", "alpaca_live")
+    monkeypatch.delenv("ALPACA_LIVE_CONFIRM", raising=False)
+    with pytest.raises(LiveTradingNotArmed):
+        get_broker()
+
+    # A wrong confirmation value is still refused.
+    monkeypatch.setenv("ALPACA_LIVE_CONFIRM", "yes")
+    with pytest.raises(LiveTradingNotArmed):
+        get_broker()
+
+    # Both signals present -> live venue.
+    monkeypatch.setenv("ALPACA_LIVE_CONFIRM", LIVE_TRADING_CONFIRMATION)
+    broker = get_broker()
+    assert getattr(broker, "paper", None) is False
+
+    # Default remains paper.
+    monkeypatch.setenv("BROKER_TYPE", "paper")
+    assert type(get_broker()).__name__ == "PaperBroker"

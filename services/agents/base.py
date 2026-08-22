@@ -7,7 +7,7 @@ import uuid
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -598,26 +598,120 @@ class SentinelAgent(ABC):
             self.logger.warning(f"Failed to record prediction: {e}")
             return ""
 
-    async def get_scorecard(self) -> AgentScorecard:
-        """Retrieves or initializes the agent's performance scorecard from Redis."""
+    async def current_regime(self) -> str:
+        """The prevailing market regime, or "unknown".
+
+        Published by the macro intelligence engine. Used to partition
+        performance history: a hit rate earned in a bull-steepening regime says
+        little about the same strategy under inversion, and Kelly sizing treats
+        whatever it is handed as the true win probability.
+        """
         try:
-            key = f"sentinel:agents:scorecard:{self.name}"
+            raw = await self.redis.raw.get("sentinel:macro:rates_regime:latest")
+            if not raw:
+                return "unknown"
+            brief = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            regime = brief.get("regime") or brief.get("rates_regime") or brief.get("state")
+            return str(regime).lower().strip().replace(" ", "_") if regime else "unknown"
+        except Exception as e:
+            self.logger.debug(f"Regime lookup failed: {e}")
+            return "unknown"
+
+    def _scorecard_key(self, strategy: Optional[str] = None, regime: Optional[str] = None) -> str:
+        """Redis key for a scorecard partition.
+
+        The unpartitioned key is preserved so existing history is not orphaned
+        and remains the fallback when a partition is too thin to trust.
+        """
+        if not strategy and not regime:
+            return f"sentinel:agents:scorecard:{self.name}"
+        return f"sentinel:agents:scorecard:{self.name}:{strategy or 'any'}:{regime or 'any'}"
+
+    async def get_scorecard(
+        self,
+        strategy: Optional[str] = None,
+        regime: Optional[str] = None,
+    ) -> AgentScorecard:
+        """Retrieves a performance scorecard, optionally partitioned.
+
+        With no arguments this returns the global card, unchanged. Passing a
+        strategy and/or regime returns performance conditioned on that context,
+        which is what a position sizer actually needs: pooling a macro equity
+        call with a crypto funding trade makes both denominators meaningless.
+        """
+        key = self._scorecard_key(strategy, regime)
+        try:
             raw = await self.redis.raw.get(key)
             if raw:
                 data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
                 return AgentScorecard(**data)
         except Exception as e:
-            self.logger.debug(f"Scorecard fetch failed: {e}")
+            self.logger.debug(f"Scorecard fetch failed for {key}: {e}")
         return AgentScorecard(agent_name=self.name)
+
+    async def get_conditional_scorecard(
+        self,
+        strategy: Optional[str] = None,
+        min_samples: int = 20,
+    ) -> Tuple[AgentScorecard, str]:
+        """Best available scorecard for the current regime, and its provenance.
+
+        Falls back deliberately rather than silently: a partition with fewer
+        than *min_samples* observations produces a win rate too noisy to size
+        on, so the broader card is used instead and the caller is told which it
+        got. Returns (card, source) where source is one of
+        "strategy_regime", "strategy", or "global".
+        """
+        regime = await self.current_regime()
+
+        if strategy and regime != "unknown":
+            card = await self.get_scorecard(strategy=strategy, regime=regime)
+            if card.predictions_made >= min_samples:
+                return card, "strategy_regime"
+
+        if strategy:
+            card = await self.get_scorecard(strategy=strategy)
+            if card.predictions_made >= min_samples:
+                return card, "strategy"
+
+        return await self.get_scorecard(), "global"
 
     async def update_scorecard(
         self,
         prediction_correct: bool,
         conviction: float,
+        strategy: Optional[str] = None,
     ) -> None:
-        """Updates the agent's scorecard with a verified prediction outcome."""
+        """Updates the agent's scorecard with a verified prediction outcome.
+
+        Writes both the global card and, when a strategy is named, the
+        strategy/regime partition. Without the partitioned write the conditional
+        cards would stay permanently empty and always fall back to global.
+        """
+        await self._apply_outcome(self._scorecard_key(), prediction_correct, conviction)
+
+        if strategy:
+            regime = await self.current_regime()
+            await self._apply_outcome(
+                self._scorecard_key(strategy=strategy), prediction_correct, conviction
+            )
+            if regime != "unknown":
+                await self._apply_outcome(
+                    self._scorecard_key(strategy=strategy, regime=regime),
+                    prediction_correct, conviction,
+                )
+
+    async def _apply_outcome(
+        self,
+        key: str,
+        prediction_correct: bool,
+        conviction: float,
+    ) -> None:
+        """Applies one outcome to the scorecard stored at *key*."""
         try:
-            card = await self.get_scorecard()
+            raw = await self.redis.raw.get(key)
+            card = (AgentScorecard(**json.loads(raw if isinstance(raw, str) else raw.decode("utf-8")))
+                    if raw else AgentScorecard(agent_name=self.name))
             card.predictions_made += 1
 
             if prediction_correct:
@@ -646,7 +740,6 @@ class SentinelAgent(ABC):
             card.consensus_weight = max(0.1, 1.0 - card.brier_score)
             card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
 
-            key = f"sentinel:agents:scorecard:{self.name}"
             await self.redis.raw.set(key, card.model_dump_json(), ex=604800)  # 7 day TTL
 
             if card.predictions_made % 10 == 0:

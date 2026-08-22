@@ -25,6 +25,8 @@ import sys
 
 import time
 from shared.utils.logging import suppress_noisy_loggers
+from shared.utils.metrics import MetricsCollector
+import time as _time
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -193,6 +195,9 @@ class SentinelProducer:
             compression_type="gzip",
         )
         self._started = False
+        # Retained for metric labelling, not only for the batch logger: every
+        # counter emitted from send() is attributed to this service.
+        self.service_name = service_name
         self.batch_logger = BatchKafkaLogger(service_name, flush_interval_sec=10.0)
         logger.warning(f"Kafka Producer -> {self._servers}")
 
@@ -230,8 +235,17 @@ class SentinelProducer:
                 headers=headers
             )
             self.batch_logger.log_produced(topic, 1)
+            # Throughput is counted here rather than at each call site: this is
+            # the single chokepoint every producer passes through, so one
+            # instrumentation point covers all eleven collectors and every
+            # downstream stage. A collector that stops producing shows up as a
+            # flat counter, which a heartbeat alone can never reveal.
+            MetricsCollector.increment(f"produced_total:{self.service_name}", 1)
+            MetricsCollector.increment(f"produced_by_topic:{self.service_name}:{topic}", 1)
+            MetricsCollector.set_gauge(f"last_produced_epoch:{self.service_name}", _time.time())
         except KafkaError as e:
             self.batch_logger.log_error(topic, type(e).__name__)
+            MetricsCollector.increment(f"produce_errors_total:{self.service_name}", 1)
             logger.error(f"Failed to send message to Kafka: {e}")
             raise
 

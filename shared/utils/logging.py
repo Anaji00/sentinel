@@ -199,6 +199,14 @@ def setup_sentinel_logging(service_name: str, level=logging.INFO):
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
     handler.setFormatter(SentinelConsoleFormatter())
+
+    # Credential redaction, on the handler rather than a named logger so it also
+    # covers third-party libraries. asyncpg and aioredis raise connection errors
+    # whose text embeds the full DSN, password included, and those reach disk
+    # through an ordinary logger.error(f"...: {e}").
+    from shared.utils.log_redaction import RedactingFilter
+    handler.addFilter(RedactingFilter())
+
     root.addHandler(handler)
 
     suppress_noisy_loggers(logging.WARNING)

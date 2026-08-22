@@ -50,6 +50,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.metrics import MetricsCollector
 
 # ── 2. PATH SETUP & SHARED MODULES ────────────────────────────────────────────
 # Dynamically set the project root so we can import our custom shared tools.
@@ -476,7 +478,13 @@ async def stream_bgp(producer: SentinelProducer):
                     await producer.send(Topics.RAW_CYBER, event.model_dump(), key=prefix)
 
         except json.JSONDecodeError:
-            pass
+            # One malformed frame is normal on a firehose. Every frame failing
+            # is an upstream format change, and only the counter distinguishes
+            # the two -- silently dropping both looks identical from outside.
+            # MetricsCollector is module-level, so this works from any scope --
+            # the CollectorMetrics instance is local to main().
+            MetricsCollector.increment("collector_rejected_total:collector-cyber")
+            MetricsCollector.increment("collector_rejected_reason:collector-cyber:json_decode")
         except Exception as e:
             logger.debug(f"BGP message error: {e}")
 
@@ -545,7 +553,7 @@ async def main():
     logger.info("          Censys (free tier, set CENSYS_API_ID + CENSYS_API_SECRET)")
     logger.info("=" * 60)
 
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-cyber")
     await producer.start()
 
     redis_client = None
@@ -557,6 +565,10 @@ async def main():
     # §1.1 Universal heartbeat
     hb_task = None
     if redis_client:
+        # Throughput counters. The heartbeat proves this process is alive;
+        # these prove it is still producing.
+        metrics = CollectorMetrics("collector-cyber")
+        await metrics.start(redis_client)
         hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-cyber"))
 
     try:

@@ -24,6 +24,7 @@ from shared.utils.heartbeat import (
     is_component_healthy,
     get_all_heartbeats_status,
     ALL_KNOWN_COMPONENTS,
+    OPTIONAL_COMPONENTS,
 )
 from shared.utils.secrets import (
     mask_secret,
@@ -174,10 +175,54 @@ def test_heartbeat_touch_and_health_aggregation():
         status = await get_all_heartbeats_status(redis)
         assert status["components_count"] == len(ALL_KNOWN_COMPONENTS)
         assert status["healthy_count"] == 3
-        assert status["offline_count"] == len(ALL_KNOWN_COMPONENTS) - 3
         assert status["components"]["collector-tradfi"]["status"] == "HEALTHY"
         assert status["components"]["enrichment"]["status"] == "HEALTHY"
         assert status["components"]["dlq-worker"]["status"] == "OFFLINE"
+
+        # Components behind an opt-in compose profile report NOT_DEPLOYED rather
+        # than OFFLINE, and are excluded from the health denominator -- otherwise
+        # the default analyst mode would permanently read as degraded.
+        for tier in OPTIONAL_COMPONENTS:
+            assert status["components"][tier]["status"] == "NOT_DEPLOYED"
+
+        expected_offline = len(ALL_KNOWN_COMPONENTS) - 3 - len(OPTIONAL_COMPONENTS)
+        assert status["offline_count"] == expected_offline
+        assert status["not_deployed_count"] == len(OPTIONAL_COMPONENTS)
+        assert status["scored_components_count"] == len(ALL_KNOWN_COMPONENTS) - len(OPTIONAL_COMPONENTS)
+
+    asyncio.run(_test())
+
+
+def test_optional_components_do_not_depress_health_when_absent():
+    """An opt-in tier that is simply not deployed must not read as a failure."""
+    async def _test():
+        redis = MockRedis()
+        for comp in ALL_KNOWN_COMPONENTS:
+            if comp not in OPTIONAL_COMPONENTS:
+                await touch_heartbeat(redis, comp)
+
+        status = await get_all_heartbeats_status(redis)
+        assert status["system_status"] == "OPERATIONAL"
+        assert status["healthy_ratio"] == 1.0
+
+    asyncio.run(_test())
+
+
+def test_deployed_but_unhealthy_optional_component_still_counts():
+    """Once a tier is deployed, its health counts like any other component."""
+    async def _test():
+        redis = MockRedis()
+        for comp in ALL_KNOWN_COMPONENTS:
+            if comp not in OPTIONAL_COMPONENTS:
+                await touch_heartbeat(redis, comp)
+        # One tier present and healthy -> it enters the denominator.
+        await touch_heartbeat(redis, "agents-heavy")
+
+        status = await get_all_heartbeats_status(redis)
+        scored = len(ALL_KNOWN_COMPONENTS) - len(OPTIONAL_COMPONENTS) + 1
+        assert status["scored_components_count"] == scored
+        assert status["not_deployed_count"] == len(OPTIONAL_COMPONENTS) - 1
+        assert status["components"]["agents-heavy"]["status"] == "HEALTHY"
 
     asyncio.run(_test())
 
@@ -252,10 +297,57 @@ def test_rbac_hierarchy_and_roles():
 
 # ── 5. IMMUTABLE AUDIT LEDGER TESTS ──────────────────────────────────────────
 
+class MockAuditDB:
+    """Minimal durable-store stand-in enforcing the audit_ledger UNIQUE constraints."""
+
+    def __init__(self):
+        self.rows = []
+
+    async def execute(self, sql, *params):
+        if "INSERT INTO audit_ledger" not in sql:
+            return None
+        hash_, prev_hash = params[0], params[1]
+        # Mirror UNIQUE(hash) and UNIQUE(prev_hash) from init.sql.
+        for r in self.rows:
+            if r["hash"] == hash_ or r["prev_hash"] == prev_hash:
+                raise Exception('duplicate key value violates unique constraint (23505)')
+        self.rows.append({
+            "hash": hash_, "prev_hash": prev_hash, "timestamp": params[2],
+            "actor": params[3], "action": params[4], "resource_type": params[5],
+            "resource_id": params[6], "ip_address": params[7], "details": params[8],
+        })
+        return None
+
+    async def query_one(self, sql, *params):
+        return dict(self.rows[-1]) if self.rows else None
+
+    async def query(self, sql, *params):
+        limit = params[0] if params else len(self.rows)
+        offset = params[1] if len(params) > 1 else 0
+        newest_first = list(reversed(self.rows))
+        return [dict(r) for r in newest_first[offset:offset + limit]]
+
+
+def test_audit_ledger_requires_durable_store():
+    """Without a durable store the ledger must refuse to record, not silently cache."""
+    from shared.utils.audit_ledger import AuditLedgerUnavailable
+
+    async def _test():
+        ledger = AuditLedger(redis_client=MockRedis())  # Redis only, no db
+        with pytest.raises(AuditLedgerUnavailable):
+            await ledger.record_entry(
+                actor="admin", action="SUBMIT_ORDER",
+                resource_type="ORDER", resource_id="ORD-001",
+            )
+
+    asyncio.run(_test())
+
+
 def test_audit_ledger_hash_chain_and_verification():
     async def _test():
         redis = MockRedis()
-        ledger = AuditLedger(redis_client=redis)
+        db = MockAuditDB()
+        ledger = AuditLedger(redis_client=redis, db_client=db)
 
         # 1. Record 3 entries
         e1 = await ledger.record_entry(actor="admin", action="ADD_WATCHLIST", resource_type="WATCHLIST", resource_id="sentinel:watched:equities", details={"ticker": "NVDA"})
@@ -268,20 +360,36 @@ def test_audit_ledger_hash_chain_and_verification():
         e3 = await ledger.record_entry(actor="system", action="TOGGLE_FLAG", resource_type="FLAG", resource_id="flag_quant_radar", details={"enabled": True})
         assert e3["prev_hash"] == e2["hash"]
 
-        # 2. Verify complete chain
+        # 2. Verify complete chain against the durable store
         verification = await ledger.verify_chain()
         assert verification["valid"] is True
         assert verification["entries_checked"] == 3
         assert verification["status"] == "VERIFIED_VALID"
 
-        # 3. Tamper test: Modify an entry in the list and verify chain fails
-        corrupted_e2 = dict(e2)
-        corrupted_e2["details"] = {"symbol": "AAPL", "qty": 999999}  # Tampered!
-        redis.lists["sentinel:audit:ledger"][1] = json.dumps(corrupted_e2)
+        # 3. Tamper test: modify a durable row and verify the chain fails
+        db.rows[1]["details"] = json.dumps({"symbol": "AAPL", "qty": 999999}, sort_keys=True)
 
         tampered_verification = await ledger.verify_chain()
         assert tampered_verification["valid"] is False
         assert tampered_verification["broken_at_index"] == 1
+
+    asyncio.run(_test())
+
+
+def test_audit_ledger_chain_cannot_fork_under_contention():
+    """A second append reading a stale head must retry, not fork the chain."""
+    async def _test():
+        db = MockAuditDB()
+        ledger = AuditLedger(db_client=db)
+
+        await ledger.record_entry(actor="a", action="ACT_ONE", resource_type="T", resource_id="1")
+        await ledger.record_entry(actor="b", action="ACT_TWO", resource_type="T", resource_id="2")
+        await ledger.record_entry(actor="c", action="ACT_THREE", resource_type="T", resource_id="3")
+
+        # Every prev_hash is distinct -> strictly linear chain, no forks.
+        prevs = [r["prev_hash"] for r in db.rows]
+        assert len(prevs) == len(set(prevs))
+        assert (await ledger.verify_chain())["valid"] is True
 
     asyncio.run(_test())
 

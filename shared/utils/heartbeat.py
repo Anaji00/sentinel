@@ -76,13 +76,23 @@ ALL_KNOWN_COMPONENTS = [
     "collector-cyber",
     "collector-news",
     "collector-prediction",
+    "collector-filings",
+    "collector-social",
     "enrichment",
     "correlation",
     "reasoning",
     "telemetry-worker",
     "dlq-worker",
     "alert_manager",
+    # LLM swarm tiers. These run behind the "agents" compose profile, so they
+    # are legitimately OFFLINE in analyst mode rather than failed.
+    "agents-heavy",
+    "agents-fast",
 ]
+
+# Components that only run under an opt-in compose profile. Absence is a
+# deployment mode, not a fault, so health scoring must not count them as failed.
+OPTIONAL_COMPONENTS = frozenset({"agents-heavy", "agents-fast"})
 
 async def get_all_heartbeats_status(redis_client: Any, custom_components: Optional[list] = None) -> dict:
     """
@@ -165,7 +175,22 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
             dead_count += 1
 
     total = len(components)
-    healthy_ratio = healthy_count / total if total > 0 else 0.0
+
+    # Components behind an opt-in compose profile are expected to be absent in
+    # deployment modes that do not run them. Counting them as failures would
+    # report the default analyst mode as permanently degraded, so they are
+    # excluded from the denominator when offline -- but still reported, and
+    # still counted against health if they are present and unhealthy.
+    not_deployed = {
+        c for c in components
+        if c in OPTIONAL_COMPONENTS and results.get(c, {}).get("status") == "OFFLINE"
+    }
+    for c in not_deployed:
+        results[c]["status"] = "NOT_DEPLOYED"
+    offline_count -= len(not_deployed)
+
+    scored_total = total - len(not_deployed)
+    healthy_ratio = healthy_count / scored_total if scored_total > 0 else 0.0
 
     if healthy_ratio >= 0.85:
         system_status = "OPERATIONAL"
@@ -178,6 +203,8 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
         "system_status": system_status,
         "healthy_ratio": round(healthy_ratio, 3),
         "components_count": total,
+        "scored_components_count": scored_total,
+        "not_deployed_count": len(not_deployed),
         "healthy_count": healthy_count,
         "degraded_count": degraded_count,
         "dead_count": dead_count,

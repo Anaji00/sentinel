@@ -208,17 +208,14 @@ export interface NormalizedEvent {
     raw_payload?: Record<string, any>;
 }
 
-export interface AccountProfile {
-    id: string;
-    name: string;
-    email: string;
-    role: string;
-    tier: 'INSTITUTIONAL' | 'SENTINEL_PRO' | 'ENTERPRISE';
-    apiKey: string;
-    apiUsageMonth: number;
-    apiQuotaMonth: number;
-    activeAgents: number;
-    watchlistCount: number;
-    notificationChannels: string[];
-    created_at: string;
+/**
+ * Authenticated identity as returned by /api/auth/session.
+ *
+ * Deliberately narrow: the platform has no subscription tier, no monthly API
+ * quota, and no per-user API key. An earlier shape modelled all three, which
+ * meant the account panel could only be populated by inventing them.
+ */
+export interface SessionIdentity {
+    email: string | null;
+    role: string | null;
 }

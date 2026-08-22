@@ -32,6 +32,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.equities import is_valid_primary_equity
 
 from regime import MarketRegime
+from shared.utils.collector_metrics import CollectorMetrics
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
@@ -236,7 +237,7 @@ async def main():
     if not ALPACA_API_KEY:
         logger.error("ALPACA_API_KEY is not set in environment. Radar collector exiting.")
         sys.exit(1)
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-radar")
     await producer.start()
     redis_client = await get_redis()
 
@@ -247,6 +248,10 @@ async def main():
     heartbeat_task = asyncio.create_task(heartbeat_loop(state))
 
     # §1.1 Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-radar")
+    await metrics.start(redis_client)
     hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-radar"))
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, family=socket.AF_INET)

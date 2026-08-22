@@ -37,6 +37,7 @@ from shared.db import get_redis
 from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symbol
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.collector_metrics import CollectorMetrics
 
 logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -948,7 +949,7 @@ async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL TradFi Service (Enterprise Multi-Session Edition)")
     logger.info("=" * 60)
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="collector-tradfi")
     await producer.start()
     redis_client = await get_redis()
     logger.info("Starting TradFi Collector (Finnhub WS, SEC EDGAR, Alpaca Extended Hours & Options, Finnhub Earnings, FIX 4.4 Engine)")
@@ -959,6 +960,10 @@ async def main():
     watchlist_sync_event = asyncio.Event()
 
     # §1.1 — Universal heartbeat
+    # Throughput counters. The heartbeat proves this process is alive;
+    # these prove it is still producing.
+    metrics = CollectorMetrics("collector-tradfi")
+    await metrics.start(redis_client)
     hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-tradfi"))
 
     # §0.3 — PubSub listener for instant watchlist sync

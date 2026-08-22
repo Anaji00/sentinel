@@ -1,3 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DEMONSTRATION FIXTURE — WRITES FABRICATED EVENTS. NOT FOR A LIVE SYSTEM.
+#
+# The events below are invented: TANKER_HORMUZ_01 does not exist, the anomaly
+# scores were chosen by hand, and the coordinates are illustrative. They are
+# written to the same `events` table real ingestion writes to, carrying
+# `source: "collector.ais"`, which makes them indistinguishable from
+# measurements once inserted.
+#
+# That directly contradicts the platform's zero-fabrication rule, which the
+# enrichment, backtest, and display layers all enforce. It is retained only as
+# a UI fixture for developing panels without a running collector fleet.
+#
+# For a genuinely populated first run, use the real backfill instead:
+#
+#     python scripts/bootstrap.py --days 90     (or: make bootstrap)
+#
+# It fetches actual historical bars from the same upstreams the collectors
+# poll, so nothing invented reaches the database.
+#
+# Every row this script writes is prefixed `evt_` and can be removed with:
+#     DELETE FROM events WHERE event_id LIKE 'evt\_%' ESCAPE '';
+# ─────────────────────────────────────────────────────────────────────────────
+
 import asyncio
 import os
 import sys

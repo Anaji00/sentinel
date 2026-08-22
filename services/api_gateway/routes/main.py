@@ -29,6 +29,8 @@ from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
     system,
+    search,
+    integrations,
     scenarios,
     events,
     graph,
@@ -163,21 +165,29 @@ app.include_router(reports.router)
 app.include_router(filings.router)
 app.include_router(methodology.router)
 app.include_router(sovereignty.router)
+app.include_router(search.router)
+app.include_router(integrations.router)
 
 from fastapi.responses import PlainTextResponse
 from shared.utils.metrics import MetricsCollector
-from services.api_gateway.dependencies import get_redis_client
+from services.api_gateway.dependencies import get_redis_client, get_redis_optional
 
 @app.get("/metrics", include_in_schema=False)
 @app.get("/api/v1/metrics", include_in_schema=False)
-async def root_metrics():
-    """Prometheus metrics endpoint scrapers hit at GET /metrics."""
-    return PlainTextResponse(MetricsCollector.to_prometheus_format(), media_type="text/plain")
+async def root_metrics(redis = Depends(get_redis_optional)):
+    """Prometheus scrape target (deploy/prometheus.yml points here).
+
+    Delegates to the aggregating implementation so the scrape reflects every
+    Sentinel process, not just this one. Rendering only the gateway's own
+    process-local counters here would silently discard the collector, enrichment
+    and correlation metrics that the aggregation layer exists to surface.
+    """
+    return await system.get_system_metrics(redis)
 
 @app.get("/metrics/json", include_in_schema=False)
-async def root_metrics_json():
-    """JSON summary metrics endpoint."""
-    return MetricsCollector.get_summary()
+async def root_metrics_json(redis = Depends(get_redis_optional)):
+    """JSON summary, aggregated across services."""
+    return await system.get_system_metrics_json(redis)
 
 from fastapi import FastAPI, Depends, Request
 
