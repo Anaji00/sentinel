@@ -107,13 +107,33 @@ export function useLiveEvents(selectedDomain: string = 'all') {
           useTelemetryStore.getState().setConnected(false);
         };
 
-        ws.onclose = () => {
-          if (isMounted) {
-            useTelemetryStore.getState().setConnected(false);
-            // Exponential backoff with cap
+        ws.onclose = (event) => {
+          if (!isMounted) return;
+          useTelemetryStore.getState().setConnected(false);
+
+          // The gateway refuses the handshake before accepting it, so an
+          // unauthenticated browser sees an abnormal close (1006) rather than
+          // the server's 4003 policy code. Retrying on that forever is what left
+          // the dashboard reading "CONNECTING..." when the real cause was a
+          // missing session. Ask the session endpoint directly instead of
+          // inferring from a close code that never arrives.
+          void (async () => {
+            if (!isMounted) return;
+            try {
+              const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
+              if (!res.ok) {
+                useTelemetryStore.getState().setAuthRequired(true);
+                return; // Reconnecting cannot succeed until the user signs in.
+              }
+              useTelemetryStore.getState().setAuthRequired(false);
+            } catch {
+              // Session check itself failed: treat as a transient network fault
+              // and fall through to the normal backoff.
+            }
+            if (!isMounted) return;
             reconnectTimer = setTimeout(connect, backoffRef.current);
             backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
-          }
+          })();
         };
       } catch (err) {
         console.warn('WebSocket connection fallback to polling:', err);

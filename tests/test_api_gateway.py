@@ -332,9 +332,18 @@ def test_broker_execution_order_dispatch():
         assert data["status"] in ("EXECUTIVE_FILLED", "SUBMITTED")
         assert data["ticker"] == "NVDA"
         assert data["action"] == "BUY"
-        assert data["units"] == round(10000.0 / 220.0, 2)
+        # Whole shares: a protected order goes to the venue as a bracket, and
+        # brackets are rejected on fractional quantities. The previous
+        # assertion (45.45) encoded a quantity no broker would accept.
+        assert data["units"] == float(int(10000.0 / 220.0))
         assert data["entry_price"] > 0
         assert "broker" in data
+        # The profit target must be what the broker accepted. It used to be
+        # echoed straight back from the request while no take-profit leg was
+        # ever submitted, so a filled position had no exit.
+        assert data["bracket_submitted"] is True
+        assert data["target_price"] == 245.0
+        assert data["stop_loss"] == 210.0
     finally:
         app.dependency_overrides.pop(get_redis_client, None)
 

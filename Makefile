@@ -92,10 +92,18 @@ test: ## Backend + frontend test suites
 	PYTHONPATH=. python -m pytest tests/ -q
 	cd frontend && node_modules/.bin/vitest run
 
-verify: ## Full gate: types, tests, compose validity
+verify: ## Full gate: types, tests, production build, compose validity
 	cd frontend && node_modules/.bin/tsc --noEmit
+	# Enum members and payload fields that do not exist raise only on the one
+	# runtime path that touches them -- SecurityData.severity took enrichment
+	# down while every test stayed green. Static, so it cannot be missed.
+	PYTHONPATH=. python scripts/check_model_refs.py
 	PYTHONPATH=. python -m pytest tests/ -q --tb=short
 	cd frontend && node_modules/.bin/vitest run
+	# `tsc` does not check the Server/Client Component boundary -- a component
+	# using hooks without "use client" typechecks cleanly and fails only here,
+	# which is exactly how a latent build break reached a docker build.
+	cd frontend && SESSION_SECRET=build-only API_GATEWAY_KEY=build-only npm run build
 	$(COMPOSE) --profile collectors --profile agents --profile obs config --quiet
 	@echo "verify: all gates passed"
 

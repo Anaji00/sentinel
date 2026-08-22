@@ -15,12 +15,24 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from shared.models import NormalizedEvent, EventType, Entity, EntityType
+from shared.models import NormalizedEvent, EventType, Entity, EntityType, FlightData
 from shared.utils.regions import classify_region
 from shared.utils.sanctions import check_sanctions
 from shared.kafka import Topics
 
 logger = logging.getLogger("enrichment.aviation")
+
+
+def _as_float(v) -> Optional[float]:
+    """OpenSky sends nulls and occasional strings; a bad field must not drop a fix."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 
 SQUAWK_LABELS = {
     "7500": "hijacking",
@@ -93,6 +105,8 @@ class AviationEnricher:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned), score_res in zip(parsed, scoring_results):
+            speed = _as_float(p.get("velocity") or p.get("speed"))
+            heading = _as_float(p.get("true_track") or p.get("heading"))
             if isinstance(score_res, Exception):
                 logger.error(f"Scoring error for flight {icao24}: {score_res}")
                 score, is_watched = 0.10, False
@@ -135,6 +149,24 @@ class AviationEnricher:
             cc = country[:2].upper() if len(country) >= 2 else None
             headline = f"Aviation Alert: {callsign or icao24} | {SQUAWK_LABELS.get(squawk, 'Emergency Alert')}" if (is_emerg or is_sanctioned or anomaly >= 0.50) else f"Flight {callsign or icao24} position in {region or 'global airspace'}"
 
+            # Typed aviation payload. Without this the flight_data column stays
+            # NULL on every flight event, so /api/v1/events/aviation returns
+            # nothing while tens of thousands of positions are ingested -- the
+            # domain is invisible to the API and the map. FlightData was defined
+            # in the schema but constructed nowhere in the codebase.
+            flight_data = FlightData(
+                icao24=icao24,
+                callsign=callsign or None,
+                origin_country=country or None,
+                baro_altitude_m=_as_float(p.get("baro_altitude")),
+                geo_altitude_m=_as_float(p.get("geo_altitude")),
+                velocity_ms=speed,
+                true_track=heading,
+                vertical_rate=_as_float(p.get("vertical_rate")),
+                on_ground=bool(p["on_ground"]) if p.get("on_ground") is not None else None,
+                squawk=squawk or None,
+            )
+
             event = NormalizedEvent(
                 event_id=raw.event_id,
                 trace_id=raw.trace_id,
@@ -154,6 +186,7 @@ class AviationEnricher:
                 headline=headline,
                 tags=tags,
                 anomaly_score=anomaly,
+                flight_data=flight_data,
             )
             results.append(event)
 

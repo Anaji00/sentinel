@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
+FRONTEND = REPO / "frontend" / "src"
 
 
 def _read(rel: str) -> str:
@@ -333,3 +334,38 @@ def test_frontend_integrations_panel_collects_no_keys():
     assert "type=\"password\"" not in tsx
     # It names the variables to set, without ever handling their values.
     assert "missing_env_vars" in tsx
+
+
+# ── REACT SERVER COMPONENT BOUNDARY ──────────────────────────────────────────
+
+def test_every_component_using_hooks_declares_use_client():
+    """`tsc` does not check this boundary; only `next build` does.
+
+    A component calling useState/useEffect without the directive typechecks
+    cleanly and fails at build time with an opaque import-trace error -- which
+    is how a latent break reached a docker build.
+    """
+    import re as _re
+
+    hook = _re.compile(r"\buse(State|Effect|Memo|Ref|Callback|SWR|Reducer|Context)\b")
+    offenders = []
+    for path in list((FRONTEND / "components").rglob("*.tsx")) + list((FRONTEND / "app").rglob("*.tsx")):
+        text = path.read_text(encoding="utf-8")
+        if not hook.search(text):
+            continue
+        head = "\n".join(text.split("\n")[:3])
+        if "use client" not in head:
+            offenders.append(str(path.relative_to(FRONTEND)))
+
+    assert not offenders, (
+        "components use React hooks without a 'use client' directive:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_verify_target_runs_the_production_build():
+    """tsc + vitest alone let an RSC boundary error through to docker build."""
+    mk = _read("Makefile")
+    verify = mk[mk.index("verify:"):]
+    verify = verify[:verify.index("\n\n")] if "\n\n" in verify else verify
+    assert "npm run build" in verify, "make verify does not run the production build"

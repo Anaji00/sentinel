@@ -6,12 +6,20 @@ services:
     container_name: sentinel-ingress
     restart: unless-stopped
     ports:
-      # Loopback only. Without the explicit 127.0.0.1 Docker publishes on
-      # every interface, including untrusted networks.
-      - "127.0.0.1:80:80"
-      - "127.0.0.1:443:443"
+      # Loopback by default: without an explicit address Docker publishes on
+      # every interface, including untrusted networks. A public deployment must
+      # opt in with SENTINEL_BIND=0.0.0.0, which is also required for Let's
+      # Encrypt to reach the ACME challenge path on port 80.
+      - "${SENTINEL_BIND:-127.0.0.1}:80:80"
+      - "${SENTINEL_BIND:-127.0.0.1}:443:443"
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Certificates live on the host, not inside the image. Without this a real
+      # certificate is destroyed on every container recreate and silently
+      # replaced by a fresh self-signed one.
+      - ./deploy/nginx/ssl:/etc/nginx/ssl
+      # ACME webroot: certbot writes the challenge token here, nginx serves it.
+      - ./deploy/nginx/certbot:/var/www/certbot
     deploy:
       resources:
         limits:
@@ -366,8 +374,10 @@ services:
       # One slot: this CPU serves ~3-5 tok/s, so four concurrent contexts
       # quarter throughput and quadruple the KV cache.
       - OLLAMA_NUM_PARALLEL=1
-      # Release the model after idle rather than pinning it in RAM forever.
-      - OLLAMA_KEEP_ALIVE=5m
+      # Pinned deliberately. A cold load costs ~15s on CPU and the agent
+      # tiers are called in bursts, so residency is worth 2.9 GB of the
+      # ~16 GB headroom. Set to a duration (e.g. 5m) to reclaim it instead.
+      - OLLAMA_KEEP_ALIVE=-1
       # Both tiers must stay resident: agents-heavy and agents-fast request
       # different models, and a value of 1 evicts/reloads on every alternating
       # request -- far more costly than the memory it saves.
@@ -535,7 +545,13 @@ services:
   api-gateway:
     build: .
     container_name: sentinel-api_gateway
-    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --reload
+    # No --reload: the source tree is bind-mounted, so the reloader watched every
+    # file under ./services and restarted the gateway whenever an unrelated
+    # service was edited. Its shutdown then hung on a background task
+    # ("Waiting for background tasks to complete"), leaving the gateway pinned
+    # at ~90% CPU and timing out /health while the container still reported
+    # running. Restart explicitly to pick up code changes.
+    command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 15
     env_file: .env
     volumes:
       - ./services:/app/services
@@ -574,6 +590,7 @@ services:
       - AGENT_MODEL=qwen2.5:1.5b
       - OLLAMA_FALLBACK_MODEL=gemma3:1b
       - OLLAMA_TIMEOUT=600.0
+      - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
     volumes:
       - ./services:/app/services
@@ -612,6 +629,7 @@ services:
       - AGENT_MODEL=qwen2.5:3b
       - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
       - OLLAMA_TIMEOUT=600.0
+      - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
     volumes:
       - ./services:/app/services
@@ -650,6 +668,23 @@ services:
       # A hardcoded http://localhost:8000 here breaks both (port not published +
       # mixed content on HTTPS). Set it only to an explicit public origin if needed.
       - API_GATEWAY_KEY=${API_GATEWAY_KEY:?API_GATEWAY_KEY must be set}
+      # The login route mints the sentinel_session cookie with this secret and
+      # the API gateway verifies it with the same one -- they MUST match. It was
+      # absent from this container, so /api/auth/login failed closed with
+      # "Authentication is not configured" (HTTP 500), no cookie was ever issued,
+      # and every WebSocket handshake was rejected 403 -- the dashboard sat on
+      # "stream connecting..." forever.
+      - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET must be set and match the gateway}
+      # The login route compares submitted credentials against these. They were
+      # absent from this container, so the password branch was skipped entirely
+      # and every sign-in returned 401 "Invalid corporate credentials" even when
+      # the credentials were correct. This service enumerates its environment
+      # explicitly (no env_file), so anything the app reads must be listed here.
+      - ADMIN_EMAIL=${ADMIN_EMAIL:?ADMIN_EMAIL must be set}
+      # ADMIN_PASSWORD is deliberately NOT passed here any more. Passwords are
+      # verified by the gateway against scrypt hashes in the users table, so no
+      # password secret needs to exist in the public-facing web process.
+      - SENTINEL_ENV=${SENTINEL_ENV:-production}
     restart: always
     deploy:
       resources:

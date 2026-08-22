@@ -131,11 +131,28 @@ def test_docker_compose_port_isolation():
     # loopback explicitly. A bare "80:80" publishes on every interface, which on
     # a laptop means the dashboard is reachable from any untrusted network the
     # host joins.
+    # The bind address is parameterised so a public deployment can opt in, but
+    # the *default* must stay loopback: an operator who never sets the variable
+    # must not end up exposed. Assert the resolved default rather than a literal.
     ingress_ports = [str(p) for p in services["ingress"].get("ports", [])]
-    assert "127.0.0.1:80:80" in ingress_ports, f"ingress must bind loopback: {ingress_ports}"
-    assert "127.0.0.1:443:443" in ingress_ports, f"ingress must bind loopback: {ingress_ports}"
-    for p in ingress_ports:
-        assert p.startswith("127.0.0.1:"), f"ingress port {p!r} is not loopback-bound"
+
+    def _default_host(mapping: str) -> str:
+        """Resolves ${VAR:-default}:container:host to the host it binds by default."""
+        m = re.match(r"^\$\{[A-Z_][A-Z0-9_]*:-([^}]*)\}:", mapping)
+        if m:
+            return m.group(1)
+        return mapping.rsplit(":", 2)[0] if mapping.count(":") >= 2 else ""
+
+    published = {mapping.rsplit(":", 1)[0].rsplit(":", 1)[-1]: mapping for mapping in ingress_ports}
+    assert any(m.endswith(":80:80") for m in ingress_ports), f"ingress must publish 80: {ingress_ports}"
+    assert any(m.endswith(":443:443") for m in ingress_ports), f"ingress must publish 443: {ingress_ports}"
+    for mapping in ingress_ports:
+        host = _default_host(mapping)
+        assert host == "127.0.0.1", (
+            f"ingress port {mapping!r} defaults to {host!r}, not loopback. A bare "
+            f"'80:80' or a 0.0.0.0 default publishes on every interface, which on a "
+            f"laptop means the dashboard is reachable from any untrusted network."
+        )
 
     # Internal services that MUST NOT have public host port mappings in production stack
     internal_services = [
@@ -247,20 +264,52 @@ def test_postgres_memory_is_bounded():
     )
 
 
-def test_ollama_is_not_pinned_in_memory():
-    """The model must be released when idle, not held for the process lifetime."""
-    env = _compose()["services"]["ollama"].get("environment") or []
-    joined = " ".join(env) if isinstance(env, list) else " ".join(f"{k}={v}" for k, v in env.items())
+def _env_of(service: str) -> str:
+    env = _compose()["services"][service].get("environment") or []
+    return " ".join(env) if isinstance(env, list) else " ".join(f"{k}={v}" for k, v in env.items())
 
-    assert "OLLAMA_KEEP_ALIVE=-1" not in joined, (
-        "KEEP_ALIVE=-1 pins the model in RAM permanently"
-    )
+
+def test_ollama_residency_is_declared_explicitly():
+    """Residency must be a stated decision, whichever way it goes.
+
+    Originally this asserted the model must NOT be pinned, because the stack was
+    over-committed and 8 GB of ollama was a third of the VM. After right-sizing
+    the ceilings against measured usage there is ~16 GB of headroom, and pinning
+    became the better trade: a cold load costs ~15s on CPU and the agent tiers
+    are called in bursts. What must hold in either case is that the value is
+    explicit rather than defaulted.
+    """
+    joined = _env_of("ollama")
     assert "OLLAMA_KEEP_ALIVE=" in joined, "KEEP_ALIVE must be set explicitly"
 
     parallel = re.search(r"OLLAMA_NUM_PARALLEL=(\d+)", joined)
     assert parallel and int(parallel.group(1)) <= 2, (
         "CPU-only inference cannot serve many parallel contexts; each one "
         "multiplies the KV cache and divides throughput"
+    )
+
+
+def test_keep_alive_is_consistent_between_server_and_clients():
+    """A per-request keep_alive silently overrides the server setting.
+
+    shared/utils/ollama.py hardcoded `"keep_alive": -1`, so the container's
+    OLLAMA_KEEP_ALIVE was inoperative and the declared config did not describe
+    the running system. The client now reads the same variable.
+    """
+    server = re.search(r"OLLAMA_KEEP_ALIVE=(\S+)", _env_of("ollama"))
+    assert server, "ollama declares no keep-alive"
+
+    for tier in ("agents-heavy", "agents-fast"):
+        client = re.search(r"OLLAMA_KEEP_ALIVE=(\S+)", _env_of(tier))
+        assert client, f"{tier} does not declare a keep-alive"
+        assert client.group(1) == server.group(1), (
+            f"{tier} asks for keep_alive={client.group(1)} while the server is "
+            f"configured for {server.group(1)}"
+        )
+
+    src = (REPO_ROOT / "shared" / "utils" / "ollama.py").read_text(encoding="utf-8")
+    assert '"keep_alive": -1' not in src, (
+        "client hardcodes keep_alive, overriding whatever the server declares"
     )
 
 
@@ -290,8 +339,16 @@ def test_deployment_profiles_fit_the_memory_budget():
     assert ceiling({"collectors", "obs"}) < WSL_BUDGET_GIB
     assert ceiling({"agents"}) < WSL_BUDGET_GIB, "reasoning mode must fit"
 
-    # Documented incompatibility -- asserted so it stays deliberate.
-    assert ceiling({"collectors", "agents", "obs"}) > WSL_BUDGET_GIB
+    # Collectors and agents together previously exceeded the budget, and this
+    # asserted the incompatibility to keep it deliberate. Ceilings were then
+    # right-sized against measured usage -- frontend 30MiB of 1G, timescaledb
+    # 143MiB of 2G, agents-heavy 705MiB of 2.5G -- and every mode now fits.
+    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB, (
+        "collectors and agents must co-exist"
+    )
+    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB, (
+        "the full stack including observability must fit"
+    )
 
 
 def test_llm_services_are_opt_in():

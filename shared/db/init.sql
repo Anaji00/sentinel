@@ -236,6 +236,59 @@ CREATE TRIGGER audit_ledger_no_update
     BEFORE UPDATE OR DELETE ON audit_ledger
     FOR EACH ROW EXECUTE FUNCTION audit_ledger_forbid_mutation();
 
+-- ── ACCOUNTS & SUBSCRIPTIONS ──────────────────────────────────────────────────
+-- The platform previously had no user model: one account came from ADMIN_EMAIL
+-- and ADMIN_PASSWORD in the environment, and nothing in the schema referenced a
+-- user at all. A subscription needs someone to belong to, so accounts come
+-- first.
+--
+-- Note what is NOT stored here: no card number, no CVC, no billing address.
+-- Stripe holds all of that. This table keeps only the identifiers needed to ask
+-- Stripe about a subscription, which keeps the platform out of PCI scope.
+CREATE TABLE IF NOT EXISTS users (
+    id              BIGSERIAL PRIMARY KEY,
+    email           TEXT NOT NULL UNIQUE,
+    -- scrypt output plus its parameters and salt, never a reversible form.
+    password_hash   TEXT NOT NULL,
+    display_name    TEXT,
+    role            TEXT NOT NULL DEFAULT 'VIEWER',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at   TIMESTAMPTZ,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+
+    -- Stripe linkage. Nullable: an account exists before it ever pays.
+    stripe_customer_id      TEXT UNIQUE,
+    stripe_subscription_id  TEXT,
+
+    -- Cached subscription state, refreshed by webhook. Authoritative enough to
+    -- gate a request without calling Stripe on every page load; Stripe remains
+    -- the source of truth and a webhook reconciles drift.
+    subscription_status     TEXT NOT NULL DEFAULT 'none',
+    subscription_tier       TEXT NOT NULL DEFAULT 'free',
+    subscription_ends_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS users_email_idx     ON users(LOWER(email));
+CREATE INDEX IF NOT EXISTS users_stripe_id_idx ON users(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS users_tier_idx      ON users(subscription_tier, subscription_status);
+
+-- Every subscription state change Stripe reports, kept append-only.
+-- A cached status on `users` answers "can this request proceed"; this table
+-- answers "why does this account have the access it has", which is the question
+-- that matters during a billing dispute.
+CREATE TABLE IF NOT EXISTS subscription_events (
+    id                BIGSERIAL PRIMARY KEY,
+    user_id           BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    stripe_event_id   TEXT UNIQUE,   -- idempotency: Stripe retries deliveries
+    event_type        TEXT NOT NULL,
+    status_before     TEXT,
+    status_after      TEXT,
+    occurred_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    payload           JSONB
+);
+
+CREATE INDEX IF NOT EXISTS sub_events_user_idx ON subscription_events(user_id, occurred_at DESC);
+
 -- ── VIEWS ─────────────────────────────────────────────────────────────────────
 
 -- VIEW (Virtual Table): INTERACTION

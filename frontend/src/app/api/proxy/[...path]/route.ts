@@ -26,8 +26,22 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   const targetUrl = `${BACKEND_URL.replace(/\/+$/, '')}/${pathStr}${search}`;
 
   const headers = new Headers(req.headers);
-  headers.set('X-API-KEY', API_GATEWAY_KEY);
   headers.delete('host');
+
+  // Forward the caller's own session rather than the operator's master key.
+  // Attaching X-API-KEY unconditionally made every signed-in visitor
+  // indistinguishable from the operator at the gateway -- ADMIN role, and
+  // exempt from any subscription gate, because the gateway checks the API key
+  // before the session cookie. The cookie is already a credential the gateway
+  // accepts, so it is what should identify the user. The master key is used
+  // only where there is no session to forward (health checks and similar).
+  const hasSession = Boolean(cookie?.value && verifySessionToken(cookie.value).valid);
+  if (hasSession) {
+    headers.delete('X-API-KEY');
+    headers.delete('x-api-key');
+  } else {
+    headers.set('X-API-KEY', API_GATEWAY_KEY);
+  }
 
   try {
     const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await req.arrayBuffer();

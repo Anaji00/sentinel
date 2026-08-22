@@ -475,3 +475,65 @@ def test_guarded_helpers_require_a_source_name():
     assert sig.parameters["source"].default is inspect.Parameter.empty, (
         "source must be required; a default would let call sites share one breaker by accident"
     )
+
+
+# ── DATA STARVATION DETECTION ────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_starvation_watch_flags_a_connected_but_silent_source():
+    """The AIS failure mode: connected, subscribed, zero messages, no error.
+
+    No exception, no restart, a healthy heartbeat, and an empty panel that looks
+    exactly like a quiet market.
+    """
+    m = CollectorMetrics("collector-silent")
+    await m.start(None)
+
+    task = asyncio.create_task(
+        m.watch_for_starvation(expect_within_sec=0.05, check_interval_sec=0.05, source="test-feed")
+    )
+    await asyncio.sleep(0.15)
+    task.cancel()
+
+    assert M._GAUGE_METRICS.get("collector_starved:collector-silent") == 1.0
+
+
+@pytest.mark.anyio
+async def test_a_flowing_collector_is_not_flagged_as_starved():
+    """The watcher must not cry wolf while data is actually arriving.
+
+    Uses a generous freshness window so the assertion tests the branch logic
+    rather than the scheduler: a tight window would make any single record go
+    stale between checks, which is correct behaviour but not what is under test.
+    """
+    m = CollectorMetrics("collector-flowing")
+    await m.start(None)
+    m.ingested(1)  # data has arrived and is recent
+
+    task = asyncio.create_task(
+        m.watch_for_starvation(expect_within_sec=30.0, check_interval_sec=0.05)
+    )
+    await asyncio.sleep(0.15)
+    task.cancel()
+
+    assert M._GAUGE_METRICS.get("collector_starved:collector-flowing") == 0.0
+
+
+@pytest.mark.anyio
+async def test_never_received_is_distinguished_from_went_quiet():
+    """An inactive credential and a quiet upstream need different responses."""
+    import inspect
+    src = inspect.getsource(CollectorMetrics.watch_for_starvation)
+    assert "self._ingested == 0" in src, "does not special-case never-received"
+    assert "logger.error" in src and "logger.warning" in src, (
+        "never-received and went-quiet must not share a log level"
+    )
+
+
+@pytest.mark.anyio
+async def test_starvation_watch_survives_internal_errors():
+    """Telemetry must never take down the collector it observes."""
+    import inspect
+    src = inspect.getsource(CollectorMetrics.watch_for_starvation)
+    assert "except asyncio.CancelledError" in src
+    assert "logger.debug" in src, "an internal error must not escape the watcher"

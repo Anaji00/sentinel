@@ -257,9 +257,30 @@ async def main():
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         universe = await fetch_tradable_universe(session)
+        # A collector that connects and then evaluates nothing is the hardest
+        # failure to see: no exception, no restart, a healthy heartbeat, an empty
+        # panel indistinguishable from a quiet market.
+        asyncio.create_task(metrics.watch_for_starvation(source="alpaca"))
+        refresh_every = 60          # cycles; one cycle is ~60s
         try:
             while True:
                 t0 = asyncio.get_event_loop().time()
+                # The universe was fetched once at startup. A transient 503 or a
+                # missing ALPACA_SECRET_KEY therefore stranded this process
+                # permanently: it polled an empty list forever while reporting
+                # total_evaluated=0 as though the market were simply quiet.
+                # Re-acquire until it succeeds, then refresh hourly so listings
+                # and delistings are picked up.
+                if not universe or state["polls"] % refresh_every == 0:
+                    refreshed = await fetch_tradable_universe(session)
+                    if refreshed:
+                        universe = refreshed
+                    elif not universe:
+                        logger.error(
+                            "Radar universe is empty -- Alpaca rejected the credentials "
+                            "(check ALPACA_API_KEY and ALPACA_SECRET_KEY). Retrying next cycle; "
+                            "no symbols are being evaluated until this resolves."
+                        )
                 alpha, z_threshold = await regime.get_dynamic_thresholds()
                 logger.info(f"Starting radar evaluation cycle | dynamic thresholds: alpha={alpha:.4f}, z_threshold={z_threshold:.2f}")
                 await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state)

@@ -1,3 +1,5 @@
+"use client";
+
 import React, { useState, useEffect } from "react";
 import { ProvenanceBadge } from "./ProvenanceBadge";
 import { ProvenanceValue } from "./ProvenanceValue";

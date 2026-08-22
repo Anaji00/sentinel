@@ -64,6 +64,7 @@ class EntityType(str, Enum):
     INFRASTRUCTURE = "infrastructure"
     MEDIA_SOURCE = "media_source"
     VULNERABILITY = "vulnerability"
+    WALLET = "wallet"
     UNKNOWN = "unknown"
 
 class AlertTier(str, Enum):

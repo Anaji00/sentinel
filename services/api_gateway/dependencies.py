@@ -181,6 +181,25 @@ async def check_rate_limit(redis_client, identity_key: str, max_tokens: int = 12
         logger.debug(f"Rate limit check warning: {e}")
         return True
 
+
+def client_address(request) -> str:
+    """Best-effort source address, honouring the ingress proxy headers.
+
+    Behind nginx every request appears to originate from the proxy, so
+    throttling on the socket address would put all callers in one bucket.
+    """
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        real = headers.get("X-Real-IP") or headers.get("x-real-ip")
+        if real:
+            return real.strip()
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None) or "unknown"
+
+
 async def verify_api_key(request: Request = None):
     """Global dependency to lock down HTTP routes via API Key or cryptographically signed session cookie.
     
@@ -195,6 +214,17 @@ async def verify_api_key(request: Request = None):
         return None
     path = getattr(getattr(request, "url", None), "path", "")
     if path in ("/metrics", "/metrics/json", "/health") or path.startswith("/api/v1/health"):
+        return None
+    # Login must be reachable without credentials -- it is where credentials are
+    # presented. It carries its own per-source throttling rather than relying on
+    # the check below, which only runs for callers who are already authenticated.
+    # Note this exempts the login path only; /api/v1/auth/account stays protected.
+    if path in ("/api/v1/auth/login", "/api/v1/auth/login/"):
+        return None
+    # Stripe calls the webhook directly and cannot present our API key or a
+    # session cookie. It is authenticated by HMAC signature over the raw body
+    # inside the handler instead, which is strictly stronger than a shared key.
+    if path in ("/api/v1/billing/webhook", "/api/v1/billing/webhook/"):
         return None
 
     session_cookie = request.cookies.get("sentinel_session") if hasattr(request, "cookies") else None
@@ -232,7 +262,33 @@ async def verify_api_key(request: Request = None):
         identity = "dev-client"
         user_role = Role.ADMIN
 
+    # Resolved once: needed to throttle failed authentication as well as
+    # successful callers.
+    app = request.scope.get("app") if (hasattr(request, "scope") and isinstance(request.scope, dict)) else None
+    redis = getattr(app.state, "redis", None) if (app and hasattr(app, "state")) else None
+
     if not is_valid:
+        # Unauthenticated callers were never throttled: the rate-limit check sat
+        # below this raise, so a stranger could guess keys as fast as the network
+        # allowed. Failed attempts are now bucketed by source address, with a far
+        # tighter budget than authenticated traffic -- roughly 12 per minute
+        # sustained after a burst of 20.
+        if redis:
+            allowed = await check_rate_limit(
+                redis,
+                f"authfail:{client_address(request)}",
+                max_tokens=20,
+                refill_rate_per_sec=0.2,
+            )
+            if not allowed:
+                logger.warning(
+                    "Rate-limited repeated failed authentication from %s on %s",
+                    client_address(request), path,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed authentication attempts. Try again shortly.",
+                )
         logger.warning(f"Failed authentication attempt for path {path}: Invalid or missing credentials.")
         raise HTTPException(status_code=403, detail="Could not validate API Key or Session Cookie")
 
@@ -242,14 +298,65 @@ async def verify_api_key(request: Request = None):
         request.state.role = user_role
 
     # Rate limiting check
-    app = request.scope.get("app") if (hasattr(request, "scope") and isinstance(request.scope, dict)) else None
-    redis = getattr(app.state, "redis", None) if (app and hasattr(app, "state")) else None
     if redis:
         allowed = await check_rate_limit(redis, identity)
         if not allowed:
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Please slow down requests.")
 
     return identity
+
+
+
+def require_pro(feature: str):
+    """Dependency factory gating a paid feature behind an active subscription.
+
+    Entitlement is read from the account row rather than the session cookie, so
+    a cancellation takes effect on the next request instead of whenever the
+    cookie happens to expire. Named features rather than inline tier checks, so
+    every gate in the system is enumerable in one place (accounts.PRO_FEATURES).
+    """
+    from fastapi import Request as _Request
+
+    async def _gate(request: _Request):
+        from shared.utils.accounts import PRO_FEATURES, account_from_row
+
+        if feature not in PRO_FEATURES:
+            # A typo in a gate name must not silently grant access.
+            raise HTTPException(status_code=500, detail=f"Unknown gated feature {feature!r}.")
+
+        identity = getattr(getattr(request, "state", None), "identity", "") or ""
+        # An API key is the operator's own credential, not a subscriber session;
+        # it is already restricted to ADMIN and is not paywalled.
+        if identity.startswith("apikey:") or identity == "dev-client":
+            return True
+
+        email = identity.split("session:", 1)[1] if identity.startswith("session:") else None
+        app = request.scope.get("app") if isinstance(getattr(request, "scope", None), dict) else None
+        db = getattr(app.state, "db", None) if (app and hasattr(app, "state")) else None
+        if not email or db is None:
+            raise HTTPException(status_code=403, detail="Sign in to use this feature.")
+
+        row = await db.query_one(
+            """
+            SELECT id, email, password_hash, display_name, role, is_active,
+                   subscription_tier, subscription_status, subscription_ends_at,
+                   stripe_customer_id
+            FROM users WHERE email = $1
+            """,
+            email.strip().lower(),
+        )
+        if not row or not account_from_row(row).can_use(feature):
+            raise HTTPException(
+                status_code=402,   # Payment Required: the client renders an upgrade prompt.
+                detail={
+                    "error": "subscription_required",
+                    "feature": feature,
+                    "message": "This feature is part of Sentinel Pro.",
+                },
+            )
+        return True
+
+    return _gate
 
 
 async def verify_websocket_api_key(websocket: WebSocket) -> bool:

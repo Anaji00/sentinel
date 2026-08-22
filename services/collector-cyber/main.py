@@ -42,12 +42,13 @@ import json
 import logging
 import os
 import sys
+import itertools
 import time
 import websockets
 from base64 import b64encode
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from shared.utils.collector_metrics import CollectorMetrics
@@ -433,15 +434,81 @@ async def poll_ransomware(
 
 # ── RIPE RIS — BGP STREAM ─────────────────────────────────────────────────────
 
+
+# ── BGP origin baseline ───────────────────────────────────────────────────────
+# prefix -> origin AS last seen announcing it.
+#
+# The collector previously emitted a RawEvent for *every* announcement with
+# is_hijack hardcoded False and as_name empty. The enricher drops anything that
+# is neither a hijack nor a high-value org, so 100% of BGP events were discarded:
+# not one ripe_ris row has ever reached the database, while the firehose burned
+# CPU and Kafka throughput continuously.
+#
+# A prefix appearing from an origin AS other than the one previously seen is the
+# classic hijack signal, and it is rare -- which turns a ~2,000/sec firehose into
+# a low-volume stream of events that actually mean something.
+_BGP_ORIGIN_BASELINE: Dict[str, Tuple[str, ...]] = {}
+_BGP_BASELINE_MAX = 250_000
+# Origins remembered per prefix. A prefix legitimately announced by several ASes
+# -- anycast, multihoming -- is normal and common; tracking a set rather than a
+# single value is what separates "new origin" from "one of its usual origins".
+_MAX_ORIGINS_PER_PREFIX = 4
+
+
+def _bgp_origin_change(prefix: str, origin_as: str) -> Optional[str]:
+    """Returns a previously seen origin AS when a genuinely new one appears.
+
+    Returns None for a first sighting (learning is not a hijack) and for any
+    origin already known for this prefix.
+
+    That second case matters more than it looks. Alerting on every change of
+    origin flags normal MOAS churn as an attack: measured against live RIS data
+    it produced 2,882 events from only 120 prefixes in twenty minutes, one
+    prefix alone accounting for 571 -- the same pair of ASes oscillating. Each
+    origin now alerts once, so a multihomed prefix goes quiet after its origins
+    are known, while an origin never seen before still fires.
+
+    Memory is bounded: the global table is ~1M prefixes and this process runs
+    under a 384M ceiling.
+    """
+    known = _BGP_ORIGIN_BASELINE.get(prefix)
+    if known is None:
+        _BGP_ORIGIN_BASELINE[prefix] = (origin_as,)
+        if len(_BGP_ORIGIN_BASELINE) > _BGP_BASELINE_MAX:
+            # dicts preserve insertion order, so this evicts the earliest first-seen.
+            for k in list(itertools.islice(_BGP_ORIGIN_BASELINE, _BGP_BASELINE_MAX // 4)):
+                _BGP_ORIGIN_BASELINE.pop(k, None)
+        return None
+    if origin_as in known:
+        return None
+    previous = known[-1]
+    _BGP_ORIGIN_BASELINE[prefix] = (known + (origin_as,))[-_MAX_ORIGINS_PER_PREFIX:]
+    return previous
+
+
 async def stream_bgp(producer: SentinelProducer):
     from shared.utils.websocket import ResilientWebSocketClient
 
     async def on_connect(ws):
-        await ws.send(json.dumps({
-            "type": "ris_subscribe",
-            "data": {"type": "UPDATE", "require": "announcements"},
-        }))
-        logger.info("Sent subscription payload to RIPE RIS BGP stream.")
+        # Unfiltered, this subscribes to the entire global BGP announcement
+        # firehose from every RIS collector -- thousands of frames per second,
+        # each fanning out to as many as 15 Kafka sends. No client-side change
+        # survives that: the connection died on its own keepalive every ~40s and
+        # never stayed up long enough to deliver sustained data.
+        #
+        # Binding to a single collector host is the documented way to take a
+        # representative view at a fraction of the volume. rrc00 is the multihop
+        # collector in Amsterdam and sees a broad slice of the global table.
+        # Set RIS_HOST="" to deliberately take the full firehose.
+        sub = {"type": "UPDATE", "require": "announcements"}
+        ris_host = os.getenv("RIS_HOST", "rrc00").strip()
+        if ris_host:
+            sub["host"] = ris_host
+        await ws.send(json.dumps({"type": "ris_subscribe", "data": sub}))
+        logger.info(
+            "Sent subscription payload to RIPE RIS BGP stream (host=%s).",
+            ris_host or "ALL",
+        )
 
     async def on_message(raw_msg):
         try:
@@ -460,6 +527,14 @@ async def stream_bgp(producer: SentinelProducer):
 
             for ann in announcements[:5]:
                 for prefix in (ann.get("prefixes") or [])[:3]:
+                    previous_origin = _bgp_origin_change(prefix, origin_as)
+                    if previous_origin is None:
+                        # Unchanged, or first sight. Routine routing churn is not
+                        # an event -- emitting it produced millions of records the
+                        # enricher then discarded.
+                        continue
+
+                    MetricsCollector.increment("collector_bgp_origin_change:collector-cyber")
                     event = RawEvent(
                         source="ripe_ris",
                         occurred_at=datetime.fromtimestamp(
@@ -470,8 +545,14 @@ async def stream_bgp(producer: SentinelProducer):
                             "origin_as":    origin_as,
                             "peer_as":      peer_as,
                             "path":         path,
-                            "is_hijack":    False,
-                            "as_name":      "",
+                            # The enricher reads `as_path`, not `path`; sending only
+                            # `path` meant AS-path novelty scoring never saw a path.
+                            "as_path":      path,
+                            "is_hijack":    True,
+                            "previous_origin_as": previous_origin,
+                            # `as_name` is deliberately omitted rather than sent
+                            # empty: the enricher falls back to f"AS{origin}" via
+                            # .get default, which an empty string defeats.
                             "country_code": "",
                         },
                     )
@@ -491,8 +572,15 @@ async def stream_bgp(producer: SentinelProducer):
     client = ResilientWebSocketClient(
         url=RIPE_RIS_URL,
         name="RIPE_RIS_BGP",
-        ping_interval=20.0,
-        ping_timeout=10.0,
+        # RIPE RIS Live is a high-volume BGP feed and on_message runs inline with
+        # the read loop (JSON decode, dedup, Kafka produce). Under that load a
+        # 10s pong deadline expired ~43 times in 30 minutes: the client itself
+        # sent 1011 "keepalive ping timeout" and reconnected in a permanent flap,
+        # so the stream was never up long enough to deliver sustained data.
+        # A longer deadline tolerates event-loop scheduling delay without hiding
+        # a genuinely dead peer.
+        ping_interval=30.0,
+        ping_timeout=45.0,
         on_connect=on_connect,
         on_message=on_message
     )

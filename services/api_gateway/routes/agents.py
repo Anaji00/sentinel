@@ -1,7 +1,7 @@
 import json
 import logging
 from fastapi import APIRouter, Depends, Query
-from services.api_gateway.dependencies import get_redis_client
+from services.api_gateway.dependencies import get_redis_client, require_pro
 from shared.utils.heartbeat import get_all_heartbeats_status
 
 logger = logging.getLogger("api-gateway.agents")
@@ -11,7 +11,8 @@ AGENT_TIER_COMPONENTS = ["agents-heavy", "agents-fast"]
 
 router = APIRouter(prefix="/api/v1/agents", tags=["Agentic Intelligence"])
 
-@router.get("/processes")
+# The agent swarm itself is the paid tier.
+@router.get("/processes", dependencies=[Depends(require_pro("reasoning"))])
 async def get_agent_processes(redis = Depends(get_redis_client)):
     """Report the LLM swarm's real composition, liveness, and recent decisions.
 

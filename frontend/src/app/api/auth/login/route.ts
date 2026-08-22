@@ -1,39 +1,56 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
-// Admin authentication secret and password configuration.
 // Fail closed: no hardcoded secret defaults. SESSION_SECRET must match the API
-// gateway's SESSION_SECRET (the gateway verifies the cookie this route mints), and
-// ADMIN_PASSWORD must be injected from a real secret store. If either is unset the
-// login endpoint refuses to authenticate rather than trusting a public default.
+// gateway's SESSION_SECRET, because the gateway verifies the cookie this route
+// mints. Passwords are no longer compared here -- the gateway checks them against
+// scrypt hashes in the users table -- so no password secret lives in this process.
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'vance@sentinel-quant.io';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
-function signSessionToken(email: string, expiresAt: number): string {
-  const payload = `${email}:${expiresAt}`;
+// The token carries the account's role. Without it the gateway falls back to
+// ANALYST for every session, which is why the BFF used to attach the operator's
+// master API key to proxied calls instead -- making every signed-in visitor an
+// admin and rendering any subscription gate decorative.
+function signSessionToken(email: string, role: string, expiresAt: number): string {
+  const payload = `${email}:${role}:${expiresAt}`;
   const hmac = crypto.createHmac('sha256', SESSION_SECRET as string).update(payload).digest('hex');
   return `${Buffer.from(payload).toString('base64url')}.${hmac}`;
 }
 
-export function verifySessionToken(token: string): { valid: boolean; email?: string } {
+export function verifySessionToken(token: string): { valid: boolean; email?: string; role?: string } {
   try {
     if (!SESSION_SECRET) return { valid: false };
     const [encodedPayload, signature] = token.split('.');
     if (!encodedPayload || !signature) return { valid: false };
 
     const payload = Buffer.from(encodedPayload, 'base64url').toString('utf8');
-    const [email, expiresAtStr] = payload.split(':');
+    // `email:role:expiresAt`, falling back to the older `email:expiresAt` so
+    // cookies minted before roles were carried keep working until they expire.
+    const segments = payload.split(':');
+    let email: string, role: string, expiresAtStr: string;
+    if (segments.length >= 3) {
+      [email, role, expiresAtStr] = segments;
+    } else {
+      [email, expiresAtStr] = segments;
+      role = 'ANALYST';
+    }
     const expiresAt = parseInt(expiresAtStr, 10);
 
     if (isNaN(expiresAt) || Date.now() > expiresAt) return { valid: false };
 
     const expectedHmac = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedHmac))) {
+    // Length-mismatched buffers make timingSafeEqual throw, which the catch
+    // below would turn into a plain `invalid` -- check first so the comparison
+    // is reached only when it can be constant-time.
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedHmac);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
       return { valid: false };
     }
 
-    return { valid: true, email };
+    return { valid: true, email, role };
   } catch (e) {
     return { valid: false };
   }
@@ -56,6 +73,8 @@ export async function POST(req: NextRequest) {
     const gatewayKey = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
 
     let isAuthenticated = false;
+    let sessionEmail = ADMIN_EMAIL;
+    let account: Record<string, unknown> | null = null;
 
     if (apiKey) {
       // Only accept an API-key login when a gateway key is actually configured,
@@ -63,11 +82,36 @@ export async function POST(req: NextRequest) {
       if (gatewayKey && apiKey === gatewayKey) {
         isAuthenticated = true;
       }
-    } else if (email && password && ADMIN_PASSWORD) {
-      const emailMatch = email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
-      const passwordMatch = password === ADMIN_PASSWORD;
-      if (emailMatch && passwordMatch) {
-        isAuthenticated = true;
+    } else if (email && password) {
+      // Credentials are verified by the gateway against scrypt hashes in the
+      // users table. This route used to compare a plaintext ADMIN_PASSWORD held
+      // in the environment of a public-facing web process, which allowed exactly
+      // one account, could not be rotated per user, and carried no role or tier.
+      // The BFF's remaining job is to mint the session cookie on success.
+      try {
+        const upstream = await fetch(`${API_GATEWAY_URL}/api/v1/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+          cache: 'no-store',
+        });
+        if (upstream.ok) {
+          const payload = await upstream.json();
+          isAuthenticated = payload?.success === true;
+          account = payload?.user ?? null;
+          if (account?.email) sessionEmail = String(account.email);
+        } else if (upstream.status === 429) {
+          // Surface throttling rather than reporting it as a bad password.
+          return NextResponse.json(
+            { success: false, error: 'Too many sign-in attempts. Try again in a few minutes.' },
+            { status: 429 },
+          );
+        }
+      } catch (e) {
+        return NextResponse.json(
+          { success: false, error: 'Authentication service unreachable' },
+          { status: 503 },
+        );
       }
     }
 
@@ -80,11 +124,12 @@ export async function POST(req: NextRequest) {
 
     // Issue a 24-hour signed session cookie
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-    const sessionToken = signSessionToken(ADMIN_EMAIL, expiresAt);
+    const sessionRole = String((account?.role as string) || 'ANALYST');
+    const sessionToken = signSessionToken(sessionEmail, sessionRole, expiresAt);
 
     const response = NextResponse.json({
       success: true,
-      user: { email: ADMIN_EMAIL, role: 'admin' },
+      user: account ?? { email: sessionEmail, role: 'admin' },
     });
 
     const isProduction = process.env.NODE_ENV === 'production' || process.env.SENTINEL_ENV === 'production';

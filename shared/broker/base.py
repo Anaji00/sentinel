@@ -54,6 +54,11 @@ class Order(BaseModel):
     order_type: OrderType = OrderType.MARKET
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
+    # Set only when a bracket was actually submitted. The API previously echoed
+    # the caller's target_price as though it were part of the executed order
+    # while no take-profit leg was ever sent.
+    take_profit_price: Optional[float] = None
+    is_bracket: bool = False
     status: OrderStatus = OrderStatus.PENDING
     filled_qty: float = 0.0
     filled_avg_price: Optional[float] = None
@@ -102,6 +107,8 @@ class BrokerInterface(ABC):
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
+        estimated_market_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
     ) -> Order:
         """Submit a new trade order."""
         pass

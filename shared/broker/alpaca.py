@@ -121,9 +121,24 @@ class AlpacaBroker(BrokerInterface):
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
+        estimated_market_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
     ) -> Order:
         if not self.api_key or not self.secret_key:
             raise RuntimeError("Alpaca API credentials missing")
+
+        # estimated_market_price is accepted for interface parity with
+        # PaperBroker, which needs a reference price to simulate a fill. A live
+        # venue determines its own fill price, so it is deliberately not sent:
+        # promoting it to limit_price would turn a market order into a limit
+        # order and could leave the position unfilled.
+
+        # A protective stop and a profit target are legs of a bracket, not fields
+        # on a plain order. Sending limit_price together with stop_price is
+        # rejected outright -- 422 "limit orders require no stop price" -- so
+        # every protected order failed, and take_profit_price was never
+        # transmitted at all even though the API reported it back to the caller.
+        is_bracket = take_profit_price is not None and stop_price is not None
 
         payload = {
             "symbol": symbol.upper(),
@@ -134,10 +149,23 @@ class AlpacaBroker(BrokerInterface):
         }
         if limit_price is not None:
             payload["limit_price"] = str(limit_price)
-        if stop_price is not None:
-            payload["stop_price"] = str(stop_price)
         if client_order_id:
             payload["client_order_id"] = client_order_id
+
+        if is_bracket:
+            # Alpaca rejects bracket and OCO orders on fractional quantities.
+            whole_qty = int(qty)
+            if whole_qty < 1:
+                raise ValueError(
+                    f"Bracket order for {symbol} requires at least 1 whole share "
+                    f"(qty={qty}); fractional brackets are rejected by the venue."
+                )
+            payload["qty"] = str(whole_qty)
+            payload["order_class"] = "bracket"
+            payload["take_profit"] = {"limit_price": str(take_profit_price)}
+            payload["stop_loss"] = {"stop_price": str(stop_price)}
+        elif stop_price is not None:
+            payload["stop_price"] = str(stop_price)
 
         async with aiohttp.ClientSession(headers=self.headers) as session:
             async with session.post(f"{self.base_url}/orders", json=payload, timeout=10) as resp:
@@ -151,6 +179,9 @@ class AlpacaBroker(BrokerInterface):
                         qty=float(data.get("qty", qty)),
                         order_type=order_type,
                         limit_price=limit_price,
+                        stop_price=stop_price,
+                        take_profit_price=take_profit_price if is_bracket else None,
+                        is_bracket=is_bracket,
                         status=OrderStatus.PENDING,
                         submitted_at=datetime.now(timezone.utc),
                     )

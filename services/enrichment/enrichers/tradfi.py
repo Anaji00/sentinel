@@ -1015,7 +1015,7 @@ class TradFiEnricher:
         headline = f"🏛️ 13F REPORT: {manager_name} ({filer_name}) filed portfolio for {period}"
         summary = f"Institutional 13F-HR filing for {filer_name} ({manager_name}). Total Portfolio Value: ${total_val/1e9:.2f}B across {pos_count} holdings."
 
-        entity = Entity(id=filer_id, type=EntityType.ORGANIZATION, name=filer_name)
+        entity = Entity(id=filer_id, type=EntityType.COMPANY, name=filer_name)
 
         return NormalizedEvent(
             event_id=raw.event_id,

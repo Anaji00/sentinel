@@ -50,6 +50,9 @@ class CollectorMetrics:
         self._ingested = 0
         self._rejected = 0
         self._errors = 0
+        # None until the first record arrives, so the watcher can tell
+        # "never received anything" from "received some, now quiet".
+        self._last_ingest_at: Optional[float] = None
 
     async def start(self, redis_client: Any = None) -> None:
         """Bind Redis so these counters reach the gateway's /metrics."""
@@ -70,6 +73,7 @@ class CollectorMetrics:
         if count <= 0:
             return
         self._ingested += count
+        self._last_ingest_at = time.time()
         MetricsCollector.increment(f"collector_ingested_total:{self.name}", count)
         MetricsCollector.set_gauge(f"collector_last_success_epoch:{self.name}", time.time())
 
@@ -92,6 +96,70 @@ class CollectorMetrics:
         self._errors += count
         MetricsCollector.increment(f"collector_upstream_errors_total:{self.name}", count)
         MetricsCollector.increment(f"collector_upstream_error_source:{self.name}:{source}", count)
+
+    async def watch_for_starvation(
+        self,
+        expect_within_sec: float = 300.0,
+        check_interval_sec: float = 60.0,
+        source: str = "upstream",
+    ) -> None:
+        """Logs loudly when a connected source stops producing.
+
+        A collector that connects successfully and then receives nothing is the
+        hardest failure to notice: no exception, no restart, a healthy heartbeat,
+        and an empty panel that looks identical to a quiet market. The AIS
+        collector sat in exactly this state -- "Subscribed" and then silence for
+        an hour, because the upstream accepts an inactive API key without ever
+        returning an error.
+
+        Run this as a background task alongside the ingest loop:
+
+            asyncio.create_task(metrics.watch_for_starvation(source="aisstream"))
+
+        It never raises and never exits on its own: the collector should keep
+        trying, but the operator should be told it is trying in vain.
+        """
+        import asyncio
+
+        started = time.time()
+        warned = False
+
+        while True:
+            try:
+                await asyncio.sleep(check_interval_sec)
+                idle = time.time() - (self._last_ingest_at or started)
+
+                if self._ingested == 0 and idle >= expect_within_sec:
+                    if not warned:
+                        logger.error(
+                            "%s has received NOTHING from %s in %.0fs despite a "
+                            "successful connection. The credential may be inactive, "
+                            "or the subscription may match no data. This is not a "
+                            "quiet period -- zero messages have ever arrived.",
+                            self.name, source, idle,
+                        )
+                        warned = True
+                    MetricsCollector.set_gauge(f"collector_starved:{self.name}", 1.0)
+
+                elif self._ingested > 0 and idle >= expect_within_sec:
+                    logger.warning(
+                        "%s has produced nothing for %.0fs (%d records total). "
+                        "The upstream may have gone quiet or stopped.",
+                        self.name, idle, self._ingested,
+                    )
+                    MetricsCollector.set_gauge(f"collector_starved:{self.name}", 1.0)
+
+                else:
+                    if warned:
+                        logger.info("%s is receiving data again.", self.name)
+                        warned = False
+                    MetricsCollector.set_gauge(f"collector_starved:{self.name}", 0.0)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Telemetry must never take down the collector it observes.
+                logger.debug("Starvation watch error for %s: %s", self.name, e)
 
     @property
     def reject_ratio(self) -> Optional[float]:

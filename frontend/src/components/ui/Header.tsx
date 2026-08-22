@@ -13,6 +13,8 @@ export const Header: React.FC = () => {
   const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
 
   const isConnected = useTelemetryStore((state) => state.isConnected);
+  // Distinct from "connecting": the feed was refused for lack of a session.
+  const authRequired = useTelemetryStore((state) => state.authRequired);
 
   useEffect(() => {
     const updateClock = () => {
@@ -85,11 +87,20 @@ export const Header: React.FC = () => {
       <div className="hidden 2xl:flex items-center gap-4 bg-[#080d1a]/90 px-4 py-2 rounded-xl border border-[#00f2fe]/30 backdrop-blur-md shadow-[0_0_15px_rgba(0,242,254,0.1)] font-mono shrink-0">
         <div className="flex items-center gap-3.5 text-xs whitespace-nowrap">
           <span className="flex items-center gap-2 text-slate-300">
-            <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+            <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-ping' : authRequired ? 'bg-rose-400' : 'bg-amber-400'}`} />
             <span className="text-[10px] text-slate-400 uppercase tracking-widest font-bold">STREAM:</span>
-            <span className={isConnected ? 'text-emerald-400 font-extrabold text-[11px]' : 'text-amber-400 font-extrabold text-[11px]'}>
-              {isConnected ? 'LIVE (24/7)' : 'CONNECTING...'}
-            </span>
+            {authRequired ? (
+              <a
+                href="/login"
+                className="text-rose-400 font-extrabold text-[11px] underline underline-offset-2 hover:text-rose-300"
+              >
+                SIGN IN TO STREAM
+              </a>
+            ) : (
+              <span className={isConnected ? 'text-emerald-400 font-extrabold text-[11px]' : 'text-amber-400 font-extrabold text-[11px]'}>
+                {isConnected ? 'LIVE (24/7)' : 'CONNECTING...'}
+              </span>
+            )}
           </span>
           <span className="text-slate-800">|</span>
           <span className="text-[11px] text-amber-300 font-bold flex items-center gap-1.5">

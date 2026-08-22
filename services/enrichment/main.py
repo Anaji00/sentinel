@@ -127,6 +127,96 @@ async def _attach_cross_domain_signals(events: list, redis_client):
         logger.debug(f"Cross-domain signal attachment warning: {e}")
 
 
+
+# Display-text formatting. Extracted from the batch loop because it is cosmetic
+# and must never be able to halt ingestion: SecurityData.severity/.vector/.product
+# and FlightData.altitude_ft/.ground_speed_kts were referenced here but do not
+# exist on those models, so the AttributeError escaped the batch loop and killed
+# the enrichment service outright. Cyber events were produced by the tens of
+# thousands and never reached the database. Out here it is unit-testable against
+# the real models, so a renamed field fails in CI instead of in production.
+
+def _cvss_severity(score: Optional[float]) -> str:
+    """CVSS v3 qualitative band. SecurityData carries a score, not a label."""
+    if score is None:
+        return "UNSCORED"
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    if score > 0.0:
+        return "LOW"
+    return "NONE"
+
+
+def _m_to_ft(meters: Optional[float]) -> float:
+    """Altitudes are stored SI (`*_m`); aviation reads in feet."""
+    return (meters or 0.0) * 3.28084
+
+
+def _ms_to_kts(ms: Optional[float]) -> float:
+    """Velocities are stored SI (`*_ms`); aviation reads in knots."""
+    return (ms or 0.0) * 1.94384
+
+
+def apply_display_text(e) -> None:
+    """Fills in a human-readable headline and summary when either is missing."""
+    ent_name = e.primary_entity.name if (e.primary_entity and e.primary_entity.name) else (e.primary_entity.id if e.primary_entity else str(e.type))
+
+    # 1. Headline clarity enforcement
+    if not e.headline or len(e.headline) < 5 or e.headline.startswith("UNKNOWN"):
+        if e.financial_data and e.financial_data.ticker:
+            fd = e.financial_data
+            p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
+            e.headline = f"📈 TRADFI MARKET EVENT: {fd.ticker}{p_str} (Anomaly: {e.anomaly_score:.2f})"
+        elif e.crypto_data and e.crypto_data.pair:
+            cd = e.crypto_data
+            e.headline = f"₿ CRYPTO MARKET EVENT: {cd.pair} @ ${cd.price:.2f} (Anomaly: {e.anomaly_score:.2f})"
+        elif e.prediction_market_data:
+            pm = e.prediction_market_data
+            e.headline = f"🎯 PREDICTION MARKET EVENT: {pm.question or pm.ticker} ({pm.outcome})"
+        elif e.vessel_data:
+            vd = e.vessel_data
+            e.headline = f"🚢 MARITIME AIS FIX: {ent_name} (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}"
+        elif e.flight_data:
+            fl = e.flight_data
+            e.headline = f"✈️ AVIATION ADSB FIX: Flight {fl.callsign or ent_name} (ICAO: {fl.icao24}) @ {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f}ft"
+        elif e.security_data:
+            sec = e.security_data
+            e.headline = f"🔐 CYBER THREAT DETECTED: {sec.cve_id or ent_name} ({_cvss_severity(sec.cvss_score)})"
+        else:
+            e.headline = f"🎯 SENTINEL INTELLIGENCE EVENT: {ent_name} [{e.source}]"
+
+    # 2. Executive summary clarity enforcement
+    if not e.summary or len(e.summary) < 15:
+        if e.financial_data and e.financial_data.ticker:
+            fd = e.financial_data
+            p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
+            vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {fd.volume:,.0f} shares/contracts." if fd.premium_usd else ""
+            e.summary = f"Institutional Market Intelligence for {fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
+        elif e.crypto_data and e.crypto_data.pair:
+            cd = e.crypto_data
+            fr_str = f" Perpetual funding rate: {cd.funding_rate*100:.4f}%." if cd.funding_rate is not None else ""
+            e.summary = f"Cryptocurrency Intelligence for {cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
+        elif e.prediction_market_data:
+            pm = e.prediction_market_data
+            pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)
+            e.summary = f"Prediction Market Intelligence for contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
+        elif e.vessel_data:
+            vd = e.vessel_data
+            e.summary = f"AIS Maritime position fix for {vd.vessel_type or 'Vessel'} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."
+        elif e.flight_data:
+            fl = e.flight_data
+            e.summary = f"ADS-B Aviation position fix for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f} ft, Ground speed: {_ms_to_kts(fl.velocity_ms):,.0f} knots. Anomaly score: {e.anomaly_score:.2f}."
+        elif e.security_data:
+            sec = e.security_data
+            e.summary = f"Cyber Threat Intelligence disclosure for {sec.cve_id or ent_name}. Severity: {_cvss_severity(sec.cvss_score)}, Vector: {sec.exposure_type or 'Network'}. Target org: {sec.affected_org or 'Unknown'}. Anomaly score: {e.anomaly_score:.2f}."
+        else:
+            e.summary = f"Sentinel Multi-Domain Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}. Provenance tags: {', '.join(e.tags or [])}."
+
+
 async def _heartbeat_loop(state: dict):
     """Periodic heartbeat for operational visibility."""
     while True:
@@ -361,58 +451,13 @@ async def main():
 
                     # Ensure 100% of payloads carry rich human-readable headlines & executive summaries
                     for e in batch_to_write:
-                        ent_name = e.primary_entity.name if (e.primary_entity and e.primary_entity.name) else (e.primary_entity.id if e.primary_entity else str(e.type))
-                        
-                        # 1. Headline clarity enforcement
-                        if not e.headline or len(e.headline) < 5 or e.headline.startswith("UNKNOWN"):
-                            if e.financial_data and e.financial_data.ticker:
-                                fd = e.financial_data
-                                p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
-                                e.headline = f"📈 TRADFI MARKET EVENT: {fd.ticker}{p_str} (Anomaly: {e.anomaly_score:.2f})"
-                            elif e.crypto_data and e.crypto_data.pair:
-                                cd = e.crypto_data
-                                e.headline = f"₿ CRYPTO MARKET EVENT: {cd.pair} @ ${cd.price:.2f} (Anomaly: {e.anomaly_score:.2f})"
-                            elif e.prediction_market_data:
-                                pm = e.prediction_market_data
-                                e.headline = f"🎯 PREDICTION MARKET EVENT: {pm.question or pm.ticker} ({pm.outcome})"
-                            elif e.vessel_data:
-                                vd = e.vessel_data
-                                e.headline = f"🚢 MARITIME AIS FIX: {ent_name} (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}"
-                            elif e.flight_data:
-                                fl = e.flight_data
-                                e.headline = f"✈️ AVIATION ADSB FIX: Flight {fl.callsign or ent_name} (ICAO: {fl.icao24}) @ {fl.altitude_ft or 0}ft"
-                            elif e.security_data:
-                                sec = e.security_data
-                                e.headline = f"🔐 CYBER THREAT DETECTED: {sec.cve_id or ent_name} ({sec.severity or 'ELEVATED'})"
-                            else:
-                                e.headline = f"🎯 SENTINEL INTELLIGENCE EVENT: {ent_name} [{e.source}]"
-
-                        # 2. Executive summary clarity enforcement
-                        if not e.summary or len(e.summary) < 15:
-                            if e.financial_data and e.financial_data.ticker:
-                                fd = e.financial_data
-                                p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
-                                vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {fd.volume:,.0f} shares/contracts." if fd.premium_usd else ""
-                                e.summary = f"Institutional Market Intelligence for {fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
-                            elif e.crypto_data and e.crypto_data.pair:
-                                cd = e.crypto_data
-                                fr_str = f" Perpetual funding rate: {cd.funding_rate*100:.4f}%." if cd.funding_rate is not None else ""
-                                e.summary = f"Cryptocurrency Intelligence for {cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
-                            elif e.prediction_market_data:
-                                pm = e.prediction_market_data
-                                pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)
-                                e.summary = f"Prediction Market Intelligence for contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
-                            elif e.vessel_data:
-                                vd = e.vessel_data
-                                e.summary = f"AIS Maritime position fix for {vd.vessel_type or 'Vessel'} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."
-                            elif e.flight_data:
-                                fl = e.flight_data
-                                e.summary = f"ADS-B Aviation position fix for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {fl.altitude_ft or 0} ft, Ground speed: {fl.ground_speed_kts or 0} knots. Anomaly score: {e.anomaly_score:.2f}."
-                            elif e.security_data:
-                                sec = e.security_data
-                                e.summary = f"Cyber Threat Intelligence disclosure for {sec.cve_id or ent_name}. Severity: {sec.severity or 'ELEVATED'}, Vector: {sec.vector or 'Network'}. Target product: {sec.product or 'System'}. Anomaly score: {e.anomaly_score:.2f}."
-                            else:
-                                e.summary = f"Sentinel Multi-Domain Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}. Provenance tags: {', '.join(e.tags or [])}."
+                        try:
+                            apply_display_text(e)
+                        except Exception as exc:  # cosmetics must not stop the pipeline
+                            logger.warning(
+                                "Display-text formatting failed for event %s: %s",
+                                getattr(e, "event_id", "?"), exc,
+                            )
 
                 for enriched in batch_to_write:
                     entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"

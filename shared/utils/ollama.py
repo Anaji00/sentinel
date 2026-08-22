@@ -29,6 +29,12 @@ logger = logging.getLogger("sentinel.ollama")
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
+
+# How long ollama holds a model in RAM after a request. Mirrors the server-side
+# OLLAMA_KEEP_ALIVE so the client does not contradict it. "-1" pins the model
+# permanently, which is the right trade on a CPU-only host with memory to spare:
+# a cold load costs ~15s, and the agent tiers are called in bursts.
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 # Dynamic timeout: Enforce 1200 seconds (20 mins) to allow local CPU/GPU heavy LLM inference completion
 _raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "1200.0"))
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))
@@ -441,7 +447,12 @@ class OllamaClient:
             "model": resolved_model,
             "prompt": clean_prompt,
             "stream": False,
-            "keep_alive": -1,  # Keep model permanently loaded
+            # Residency is a deployment decision, not a per-request one. This
+            # was hardcoded to -1, which silently overrode the server's
+            # OLLAMA_KEEP_ALIVE and pinned every model forever regardless of
+            # what the container was configured with. Deferring to the server
+            # makes the declared config the operative one.
+            "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
                 "num_predict": min(num_predict or 384, 512) if is_small_model else min(num_predict or 512, 1024),

@@ -550,7 +550,7 @@ class CryptoEnricher:
                     "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "RELATED_TO", "weight": anomaly}
                 }, key=sender)
 
-        entity = Entity(id=wallet, type=EntityType.ORGANIZATION, name=f"Wallet_{wallet[:6]}")
+        entity = Entity(id=wallet, type=EntityType.WALLET, name=f"Wallet_{wallet[:6]}")
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,

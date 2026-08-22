@@ -78,14 +78,26 @@ async def get_domain_events(
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
         else:
+            # `target_column` comes from the fixed DOMAIN_TO_COLUMN mapping, never
+            # from the request, so interpolating it carries no injection risk.
             target_column = DOMAIN_TO_COLUMN[domain]
+
+            # Restrict to rows that actually belong to this domain. Without this
+            # the endpoint projected the domain column but filtered on nothing,
+            # so /events/maritime returned the newest events of ANY type -- news
+            # headlines with an empty domain_data -- and the map had no
+            # coordinates to plot even though vessel rows existed.
+            domain_sql = (
+                f"{where_sql} AND {target_column} IS NOT NULL "
+                f"AND {target_column}::text NOT IN ('{{}}', 'null')"
+            )
             query = f"""
                 SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, 
                        COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude, 
                        COALESCE(longitude, ST_X(coordinates::geometry)) as longitude, 
-                       COALESCE({target_column}, '{{}}'::jsonb) as domain_data
+                       {target_column} as domain_data
                 FROM events 
-                WHERE {where_sql}
+                WHERE {domain_sql}
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
 

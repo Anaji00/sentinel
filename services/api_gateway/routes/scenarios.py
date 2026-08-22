@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Depends
-from services.api_gateway.dependencies import get_db, get_redis_client
+from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
 from pydantic import BaseModel
 import json
 
@@ -42,7 +42,10 @@ CORRELATION_FIELDS = (
 logger = logging.getLogger("api-gateway.scenarios")
 router = APIRouter(prefix="/api/v1", tags=["Intelligence"])
 
-@router.get("/scenarios")
+# Generated scenario briefs are LLM output: the one surface with real marginal
+# cost per request, which is what makes it the natural paid boundary. The
+# analyst platform below it stays free.
+@router.get("/scenarios", dependencies=[Depends(require_pro("scenarios"))])
 async def get_active_scenarios(
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None, description="e.g., HYPOTHESIS, CONFIRMED, UNDER_REVISE, DENIED"),
@@ -322,11 +325,26 @@ async def get_financial_advice(redis = Depends(get_redis_client)):
         return generate_fallback_financial_advice()
 
 def get_execution_broker(redis_client=None) -> BrokerInterface:
-    """Factory to return AlpacaBroker when configured or Sentinel PaperBroker."""
+    """Returns the live broker only when execution is explicitly enabled.
+
+    Credentials alone must not route orders to a real venue. The same Alpaca key
+    is used for market data -- the radar collector needs it for the tradable
+    universe -- so selecting the live broker merely because a key exists meant
+    configuring a data feed silently switched order execution from simulation to
+    a real brokerage account. Live execution now requires ENABLE_LIVE_BROKER.
+    """
+    live_enabled = os.getenv("ENABLE_LIVE_BROKER", "").strip().lower() in ("1", "true", "yes", "on")
     alpaca_key = os.getenv("ALPACA_API_KEY")
-    alpaca_secret = os.getenv("ALPACA_SECRET_KEY")
-    if alpaca_key and alpaca_secret:
-        return AlpacaBroker(api_key=alpaca_key, secret_key=alpaca_secret, paper=True)
+    alpaca_secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET")
+    if live_enabled and alpaca_key and alpaca_secret:
+        # Paper unless explicitly turned off, so enabling execution cannot reach
+        # a funded account by omission.
+        paper = os.getenv("ALPACA_PAPER", "true").strip().lower() not in ("0", "false", "no", "off")
+        logger.warning(
+            "Live broker execution ENABLED (paper=%s) -- orders route to Alpaca, not the simulator.",
+            paper,
+        )
+        return AlpacaBroker(api_key=alpaca_key, secret_key=alpaca_secret, paper=paper)
     return PaperBroker(initial_cash=100_000.0, redis_client=redis_client)
 
 
@@ -354,7 +372,18 @@ async def execute_trade_order(
     side = OrderSide.BUY if order.action.upper() == "BUY" else OrderSide.SELL
     order_type = OrderType.LIMIT if (order.order_type or "").upper() == "LIMIT" else OrderType.MARKET
 
-    shares = round(order.position_size_usd / max(0.01, order.entry_price), 2)
+    # Whole shares: a protected order is submitted as a bracket, and brackets
+    # are rejected on fractional quantities. Rounding to 2dp produced orders the
+    # venue would not accept.
+    shares = float(int(order.position_size_usd / max(0.01, order.entry_price)))
+    if shares < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"position_size_usd {order.position_size_usd} buys less than one share of "
+                f"{order.ticker} at {order.entry_price}. Increase the position size."
+            ),
+        )
     max_risk = round(shares * abs(order.entry_price - order.stop_loss), 2)
     max_reward = round(shares * abs(order.target_price - order.entry_price), 2)
     client_oid = f"sentinel_order_{order.ticker.lower()}_{int(time.time())}"
@@ -367,6 +396,9 @@ async def execute_trade_order(
             order_type=order_type,
             limit_price=order.entry_price if order_type == OrderType.LIMIT else None,
             stop_price=order.stop_loss,
+            # The profit target was previously echoed back in the response but
+            # never sent to the broker, so a filled position had no exit.
+            take_profit_price=order.target_price,
             estimated_market_price=order.entry_price,
             client_order_id=client_oid,
         )
@@ -382,8 +414,10 @@ async def execute_trade_order(
             "units": executed_order.filled_qty or executed_order.qty,
             "notional_usd": round(fill_price * shares, 2),
             "entry_price": fill_price,
-            "target_price": order.target_price,
-            "stop_loss": order.stop_loss,
+            # Report what the broker actually accepted, not what was requested.
+            "target_price": executed_order.take_profit_price,
+            "stop_loss": executed_order.stop_price,
+            "bracket_submitted": executed_order.is_bracket,
             "max_risk_usd": max_risk,
             "max_reward_usd": max_reward,
             "kelly_pct": order.kelly_allocation_pct,

@@ -80,6 +80,7 @@ class PaperBroker(BrokerInterface):
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
         estimated_market_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
     ) -> Order:
         sym = symbol.upper()
         # Simulated execution price: use limit price, estimated price, existing position mark, or live Redis quote
@@ -116,6 +117,9 @@ class PaperBroker(BrokerInterface):
             order_type=order_type,
             limit_price=limit_price,
             stop_price=stop_price,
+            # Recorded so the simulator reports the same shape as a live bracket.
+            take_profit_price=take_profit_price,
+            is_bracket=take_profit_price is not None and stop_price is not None,
             status=OrderStatus.FILLED,
             filled_qty=qty,
             filled_avg_price=fill_price,

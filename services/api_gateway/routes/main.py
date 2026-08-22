@@ -28,6 +28,8 @@ logger = logging.getLogger("api-gateway-main")
 from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
+    auth,
+    billing,
     system,
     search,
     integrations,
@@ -62,6 +64,9 @@ async def lifespan(app: FastAPI):
     app.state.db = await get_timescale()
     app.state.neo4j = await get_neo4j()
     app.state.redis = await get_redis()
+    # Migrates the single environment-defined operator into the accounts table so
+    # authentication can stop comparing a plaintext ADMIN_PASSWORD.
+    await auth.ensure_admin_account(app.state.db)
     yield
     # CLEANUP: Gracefully close all database connections on shutdown.
     logger.info("Shutting down — closing database connections...")
@@ -147,6 +152,8 @@ app.add_middleware(
 )
 
 # MODULAR ROUTING:
+app.include_router(auth.router)
+app.include_router(billing.router)
 app.include_router(system.router)
 app.include_router(scenarios.router)
 app.include_router(events.router)

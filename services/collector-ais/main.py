@@ -198,7 +198,9 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                             raw_payload=data,
                         )
                         await producer.send(Topics.RAW_MARITIME, event.model_dump(mode="json"), key=mmsi)
+                        metrics.ingested()
                     except json.JSONDecodeError as e:
+                        metrics.rejected("json_decode")
                         logger.error(f"Failed to decode AIS message: {e}")
                     except Exception as e:
                         logger.error(f"Error processing AIS message: {e}", exc_info=True)
@@ -236,6 +238,11 @@ async def main():
         # these prove it is still producing.
         metrics = CollectorMetrics("collector-ais")
         await metrics.start(redis)
+        # AISStream accepts an inactive API key without ever returning an error:
+        # the socket opens, the subscription is acknowledged, and no message ever
+        # arrives. Nothing in the connect path can detect that, so the absence
+        # of data is what has to be watched.
+        asyncio.create_task(metrics.watch_for_starvation(source="aisstream"))
         hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-ais"))
         await collect(producer, counter)
     except KeyboardInterrupt:
