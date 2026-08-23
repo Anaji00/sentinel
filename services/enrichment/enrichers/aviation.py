@@ -101,6 +101,7 @@ class AviationEnricher:
         scoring_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
 
         results = []
+        graph_tasks = []
         pipe = self.redis.raw.pipeline()
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -189,6 +190,20 @@ class AviationEnricher:
                 flight_data=flight_data,
             )
             results.append(event)
+
+            # The aviation enricher never touched the knowledge graph, which is
+            # why it held a single Aircraft node against ~7,000 flight events per
+            # ten minutes. Registration country and region are observed here, so
+            # the aircraft arrives connected rather than as an orphan.
+            if self.graph is not None:
+                graph_tasks.append(self.graph.upsert_aircraft(icao24, {
+                    "callsign": callsign,
+                    "origin_country": country,
+                    "region": region,
+                }))
+
+        if graph_tasks:
+            await asyncio.gather(*graph_tasks, return_exceptions=True)
 
         await pipe.execute()
         return results

@@ -51,14 +51,25 @@ def price_id() -> str:
     return (os.getenv("STRIPE_PRICE_ID") or "").strip()
 
 
+def billing_enabled() -> bool:
+    """Master switch for taking money.
+
+    Payments are off until the deployment can actually carry paying users. This
+    is separate from having credentials on purpose: the same Stripe account may
+    be configured for testing long before the product should charge anyone, and
+    a key appearing in the environment must never be enough to start billing.
+    """
+    return (os.getenv("BILLING_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def is_configured() -> bool:
     """True when checkout can actually be created.
 
     Billing endpoints answer 503 rather than 500 when this is false, so a
-    deployment that simply has not set up Stripe yet reports "not enabled"
-    instead of looking broken.
+    deployment that has not enabled payments reports "not enabled" instead of
+    looking broken, and the client offers the waitlist instead of checkout.
     """
-    return bool(secret_key() and price_id())
+    return bool(billing_enabled() and secret_key() and price_id())
 
 
 def _flatten(payload: Dict[str, Any], prefix: str = "") -> List[Tuple[str, str]]:

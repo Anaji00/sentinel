@@ -129,15 +129,36 @@ export default function IntegrationsPanel() {
           <div className="space-y-2">
             <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-amber-400 font-bold">
               <AlertTriangle className="w-3.5 h-3.5" />
-              Unconfigured — coverage is reduced
+              {data.needs_attention.some((n) =>
+                data.integrations.some((i) => i.key === n.key && i.required)
+              )
+                ? 'Action needed — something is blocked'
+                : 'Unconfigured — coverage is reduced'}
             </div>
-            {data.needs_attention.map((item) => (
+            {data.needs_attention.map((item) => {
+              // A required integration is a different kind of problem: the
+              // others narrow coverage, this one blocks people. Email delivery
+              // is the case that matters -- without it nobody can confirm an
+              // address or recover a password.
+              const isRequired = data.integrations.some(
+                (i) => i.key === item.key && i.required
+              );
+              return (
               <div
                 key={item.key}
-                className="p-2.5 bg-slate-950/70 border border-amber-500/25 rounded-xl space-y-1.5"
+                className={`p-2.5 bg-slate-950/70 border rounded-xl space-y-1.5 ${
+                  isRequired ? 'border-rose-500/50' : 'border-amber-500/25'
+                }`}
               >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="font-bold text-slate-200">{item.label}</span>
+                  <span className="font-bold text-slate-200">
+                    {item.label}
+                    {isRequired && (
+                      <span className="ml-2 px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 text-[9px] font-black tracking-widest align-middle">
+                        REQUIRED
+                      </span>
+                    )}
+                  </span>
                   {item.signup_url && (
                     <a
                       href={item.signup_url}
@@ -164,7 +185,8 @@ export default function IntegrationsPanel() {
                   ))}
                 </div>
               </div>
-            ))}
+              );
+            })}
             <p className="text-[10px] text-slate-500 leading-relaxed pt-1">{data.guidance}</p>
           </div>
         )}

@@ -18,6 +18,7 @@ export default function SubscriptionPanel() {
   const [status, setStatus] = useState<BillingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [joined, setJoined] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -45,6 +46,25 @@ export default function SubscriptionPanel() {
       window.location.href = body.url;
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Something went wrong. Nothing was charged.');
+      setBusy(false);
+    }
+  };
+
+  const joinWaitlist = async () => {
+    if (!status) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/proxy/api/v1/billing/waitlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: status.email }),
+      });
+      if (!res.ok) throw new Error('Could not add you to the list. Try again.');
+      setJoined(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not add you to the list.');
+    } finally {
       setBusy(false);
     }
   };
@@ -101,7 +121,7 @@ export default function SubscriptionPanel() {
 
         {error && <p className="text-sm text-rose-400">{error}</p>}
 
-        <div className="flex gap-3 pt-1">
+        <div className="flex flex-wrap gap-3 pt-1 items-center">
           {!status.has_pro && status.billing_enabled && (
             <button
               onClick={() => go('checkout')}
@@ -111,6 +131,26 @@ export default function SubscriptionPanel() {
               {busy ? 'Opening Stripe…' : 'Upgrade to Pro'}
             </button>
           )}
+
+          {/* Payments are switched off until there are enough people waiting to
+              justify a host that can carry them. Capturing the interest is the
+              point: it is the number that decides when to turn billing on. */}
+          {!status.has_pro && !status.billing_enabled && (
+            joined ? (
+              <p className="text-sm text-emerald-400">
+                You are on the list. We will email you when Pro opens.
+              </p>
+            ) : (
+              <button
+                onClick={joinWaitlist}
+                disabled={busy}
+                className="px-4 py-2 rounded bg-cyan-500 text-slate-950 text-sm font-bold hover:bg-cyan-400 disabled:opacity-50"
+              >
+                {busy ? 'Adding…' : 'Notify me when Pro opens'}
+              </button>
+            )
+          )}
+
           {status.manageable && (
             <button
               onClick={() => go('portal')}
@@ -119,11 +159,6 @@ export default function SubscriptionPanel() {
             >
               Manage subscription
             </button>
-          )}
-          {!status.billing_enabled && !status.has_pro && (
-            <p className="text-sm text-slate-500">
-              Billing is not enabled on this deployment.
-            </p>
           )}
         </div>
       </div>

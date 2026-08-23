@@ -35,12 +35,26 @@ from services.api_gateway.dependencies import (
     get_redis_optional,
 )
 from shared.utils.accounts import (
+    MIN_PASSWORD_LENGTH,
     account_from_row,
     hash_password,
     is_valid_email,
     needs_rehash,
     normalize_email,
     verify_password,
+)
+from shared.utils.auth_tokens import (
+    TokenPurpose,
+    expiry_for,
+    generate_token,
+    hash_token,
+    is_expired,
+)
+from shared.utils.mailer import (
+    is_configured as mailer_configured,
+    reset_email,
+    send_email,
+    verification_email,
 )
 
 logger = logging.getLogger("api-gateway.auth")
@@ -224,3 +238,304 @@ async def ensure_admin_account(db) -> None:
         # Never block startup on seeding: the gateway still serves everything
         # that does not require an account.
         logger.error("Could not seed operator account: %s", e)
+
+
+# ── Open signup ───────────────────────────────────────────────────────────────
+#
+# Anyone may create an account and gets the free tier immediately: the whole
+# analyst platform, every domain, the knowledge graph, all dashboards. The email
+# address is a claim until it is confirmed, so verification gates only the two
+# things that actually trust the mailbox -- being charged, and resetting a
+# password. Blocking sign-in until confirmation would cost real users for no
+# security gain, because nothing sensitive is reachable with a fresh account.
+
+_SIGNUP_BURST = 5
+_SIGNUP_REFILL_PER_SEC = 0.02      # ~1 per minute sustained, after a burst of 5
+
+
+class SignupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=1024)
+    display_name: Optional[str] = Field(default=None, max_length=120)
+
+
+class TokenRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=512)
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=512)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+def _public_base_url() -> str:
+    return (os.getenv("PUBLIC_BASE_URL") or "https://localhost").rstrip("/")
+
+
+async def _issue_token(db, user_id: int, purpose: TokenPurpose) -> str:
+    """Creates a single-use token and returns the plaintext to email.
+
+    Any outstanding token for the same purpose is consumed first, so requesting
+    a new link silently invalidates the old one. Without that, every resend
+    leaves another working key to the account lying in an inbox.
+    """
+    await db.execute(
+        """
+        UPDATE auth_tokens SET consumed_at = NOW()
+         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL
+        """,
+        user_id, purpose.value,
+    )
+    token, token_hash = generate_token()
+    await db.execute(
+        """
+        INSERT INTO auth_tokens (user_id, token_hash, purpose, expires_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        user_id, token_hash, purpose.value, expiry_for(purpose),
+    )
+    return token
+
+
+async def _consume_token(db, token: str, purpose: TokenPurpose) -> Optional[int]:
+    """Validates and burns a token, returning its user id.
+
+    Looked up by hash, because the plaintext is never stored. Returns None for
+    anything unusable -- unknown, wrong purpose, already used, or expired -- so
+    callers cannot accidentally distinguish those cases for an attacker.
+    """
+    row = await db.query_one(
+        """
+        SELECT id, user_id, expires_at, consumed_at
+          FROM auth_tokens WHERE token_hash = $1 AND purpose = $2
+        """,
+        hash_token(token), purpose.value,
+    )
+    if not row or row.get("consumed_at") is not None:
+        return None
+    if is_expired(row.get("expires_at")):
+        return None
+    # Marked consumed in the same statement that checks it is unconsumed, so two
+    # concurrent submissions of the same link cannot both succeed.
+    burned = await db.query_one(
+        """
+        UPDATE auth_tokens SET consumed_at = NOW()
+         WHERE id = $1 AND consumed_at IS NULL
+         RETURNING user_id
+        """,
+        row["id"],
+    )
+    return int(burned["user_id"]) if burned else None
+
+
+async def _send_verification(db, user_id: int, email: str) -> bool:
+    token = await _issue_token(db, user_id, TokenPurpose.VERIFY_EMAIL)
+    link = f"{_public_base_url()}/verify?token={token}"
+    subject, text, html = verification_email(link)
+    return await send_email(email, subject, text, html)
+
+
+@router.post("/signup", status_code=201)
+async def signup(
+    body: SignupRequest,
+    request: Request,
+    db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
+):
+    """Creates a free-tier account and emails a confirmation link.
+
+    The response is identical whether or not the address was already registered.
+    Saying "that email is taken" turns signup into a membership oracle: anyone
+    could test a list of addresses against the service. An address that already
+    has an account instead receives mail saying so.
+    """
+    email = normalize_email(body.email)
+
+    if redis:
+        allowed = await check_rate_limit(
+            redis, f"signup:{client_address(request)}",
+            max_tokens=_SIGNUP_BURST, refill_rate_per_sec=_SIGNUP_REFILL_PER_SEC,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many sign-up attempts from this address. Try again shortly.",
+            )
+
+    if not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="That does not look like an email address.")
+    if len(body.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Choose a password of at least {MIN_PASSWORD_LENGTH} characters.",
+        )
+    if db is None:
+        raise HTTPException(status_code=503, detail="Sign-up is temporarily unavailable.")
+
+    # Telling someone to check their inbox when the deployment cannot send mail
+    # leaves them waiting for a link that will never arrive. The claim is only
+    # made when it is true.
+    mail_works = mailer_configured()
+    generic = {
+        "success": True,
+        "email_sent": mail_works,
+        "message": (
+            "Check your email to confirm your address. Your free account is ready to use."
+            if mail_works else
+            "Your free account is ready -- sign in now. Email confirmation is not "
+            "available on this deployment yet, so there is nothing to confirm."
+        ),
+    }
+
+    existing = await db.query_one("SELECT id, email FROM users WHERE email = $1", email)
+    if existing:
+        # Do not create, do not error. Tell the owner of the address instead.
+        await send_email(
+            email,
+            "Someone tried to create a Sentinel account with your email",
+            "An account already exists for this address.\n\n"
+            f"If that was you, sign in at {_public_base_url()}/login "
+            "or use the password reset link there.\n\n"
+            "If it was not you, nothing has changed and no action is needed.\n",
+        )
+        return generic
+
+    try:
+        row = await db.query_one(
+            """
+            INSERT INTO users (email, password_hash, display_name, role, subscription_tier)
+            VALUES ($1, $2, $3, 'VIEWER', 'free')
+            ON CONFLICT (email) DO NOTHING
+            RETURNING id
+            """,
+            email, hash_password(body.password), (body.display_name or "").strip() or None,
+        )
+    except Exception as e:
+        logger.error("Could not create account for %s: %s", email, e)
+        raise HTTPException(status_code=503, detail="Sign-up is temporarily unavailable.")
+
+    if not row:
+        # Lost a race with a concurrent signup for the same address.
+        return generic
+
+    user_id = int(row["id"])
+    logger.info("Created free-tier account %s (%s)", user_id, email)
+    await _send_verification(db, user_id, email)
+    return generic
+
+
+@router.post("/verify")
+async def verify_email(body: TokenRequest, db=Depends(get_db_optional)):
+    """Confirms an address from an emailed link."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Verification is temporarily unavailable.")
+    user_id = await _consume_token(db, body.token, TokenPurpose.VERIFY_EMAIL)
+    if user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="That confirmation link is invalid or has expired. Request a new one.",
+        )
+    await db.execute(
+        "UPDATE users SET email_verified = TRUE, email_verified_at = NOW() WHERE id = $1",
+        user_id,
+    )
+    logger.info("Confirmed email for account %s", user_id)
+    return {"success": True, "message": "Your email is confirmed."}
+
+
+@router.post("/resend-verification")
+async def resend_verification(
+    body: EmailRequest,
+    request: Request,
+    db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
+):
+    """Issues a fresh confirmation link, invalidating any previous one."""
+    email = normalize_email(body.email)
+    if redis:
+        allowed = await check_rate_limit(
+            redis, f"resend:{client_address(request)}",
+            max_tokens=3, refill_rate_per_sec=0.02,
+        )
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Try again in a few minutes.")
+    generic = {"success": True, "message": "If that address needs confirming, a new link is on its way."}
+    if db is None:
+        return generic
+    row = await db.query_one("SELECT id, email_verified FROM users WHERE email = $1", email)
+    if row and not row.get("email_verified"):
+        await _send_verification(db, int(row["id"]), email)
+    return generic
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    body: EmailRequest,
+    request: Request,
+    db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
+):
+    """Emails a reset link when the address is both known and confirmed.
+
+    Unconfirmed addresses are skipped deliberately: sending a reset link to an
+    address nobody has proven they control would let a mistyped signup hand out
+    access to whoever actually owns that mailbox.
+    """
+    email = normalize_email(body.email)
+    if redis:
+        allowed = await check_rate_limit(
+            redis, f"forgot:{client_address(request)}",
+            max_tokens=3, refill_rate_per_sec=0.02,
+        )
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Try again in a few minutes.")
+
+    generic = {"success": True, "message": "If that address has an account, a reset link is on its way."}
+    if db is None:
+        return generic
+
+    row = await db.query_one(
+        "SELECT id, email_verified, is_active FROM users WHERE email = $1", email
+    )
+    if row and row.get("email_verified") and row.get("is_active", True):
+        token = await _issue_token(db, int(row["id"]), TokenPurpose.RESET_PASSWORD)
+        subject, text, html = reset_email(f"{_public_base_url()}/reset?token={token}")
+        await send_email(email, subject, text, html)
+    return generic
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetRequest, db=Depends(get_db_optional)):
+    """Sets a new password from a reset link."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Password reset is temporarily unavailable.")
+    if len(body.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Choose a password of at least {MIN_PASSWORD_LENGTH} characters.",
+        )
+    user_id = await _consume_token(db, body.token, TokenPurpose.RESET_PASSWORD)
+    if user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="That reset link is invalid or has expired. Request a new one.",
+        )
+    await db.execute(
+        "UPDATE users SET password_hash = $1 WHERE id = $2",
+        hash_password(body.password), user_id,
+    )
+    # Any other outstanding reset link is now void: a password change is exactly
+    # when a link sitting in a compromised inbox must stop working.
+    await db.execute(
+        """
+        UPDATE auth_tokens SET consumed_at = NOW()
+         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL
+        """,
+        user_id, TokenPurpose.RESET_PASSWORD.value,
+    )
+    logger.info("Password reset completed for account %s", user_id)
+    return {"success": True, "message": "Your password has been changed. Sign in with it now."}

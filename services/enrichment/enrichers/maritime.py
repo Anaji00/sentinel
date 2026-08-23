@@ -168,11 +168,14 @@ class MaritimeEnricher:
         
         # Batch graph updates
         graph_tasks = []
-        for (_, _, mmsi, _, _, _, _, _, _, vessel, flags, vtype, _) in results:
+        for (_, _, mmsi, _, _, _, _, _, region, vessel, flags, vtype, _) in results:
             graph_tasks.append(self.graph.upsert_vessel(mmsi, {
                 "name": vessel.get("name", ""),
                 "vessel_type": vtype,
                 "flag_state": vessel.get("flag_state", ""),
+                # Region was already computed for the event; passing it here is
+                # what lets the vessel be joined to anything in the graph.
+                "region": region,
                 "flags": flags,
             }))
             

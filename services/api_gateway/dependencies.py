@@ -219,7 +219,20 @@ async def verify_api_key(request: Request = None):
     # presented. It carries its own per-source throttling rather than relying on
     # the check below, which only runs for callers who are already authenticated.
     # Note this exempts the login path only; /api/v1/auth/account stays protected.
-    if path in ("/api/v1/auth/login", "/api/v1/auth/login/"):
+    # Every endpoint a person reaches before they have credentials. Each carries
+    # its own per-source throttling, because the check further down only runs for
+    # callers who are already authenticated. /api/v1/auth/account is deliberately
+    # NOT here -- reading an account requires being signed in.
+    _PUBLIC_AUTH_PATHS = (
+        "/api/v1/auth/login",
+        "/api/v1/auth/signup",
+        "/api/v1/auth/verify",
+        "/api/v1/auth/resend-verification",
+        "/api/v1/auth/forgot-password",
+        "/api/v1/auth/reset-password",
+        "/api/v1/billing/waitlist",
+    )
+    if path.rstrip("/") in _PUBLIC_AUTH_PATHS:
         return None
     # Stripe calls the webhook directly and cannot present our API key or a
     # session cookie. It is authenticated by HMAC signature over the raw body

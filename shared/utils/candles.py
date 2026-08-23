@@ -2,10 +2,13 @@ import json
 import logging
 import math
 from typing import List, Tuple, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+# What the crypto aggregator computes per candle close. Each entry costs a
+# structural-inference pass, so this list is deliberately short; the equity
+# collector maintains its own wider set (10m, 1d, 1w) for tickers.
 TIMEFRAMES_MINUTES = [1, 5, 15, 30, 60, 240]
 
 # Canonical Redis key layout for OHLCV candle lists. Every producer and consumer
@@ -13,16 +16,59 @@ TIMEFRAMES_MINUTES = [1, 5, 15, 30, 60, 240]
 # timeframe segment) silently miss and send callers down cold-start paths.
 CANDLE_KEY_PREFIX = "sentinel:candles"
 
+# One label per duration. Passing a bare minute count used to be normalised to
+# "{n}m", so 60 became "60m" while every consumer asked for "1h" -- the same
+# timeframe stored under two different keys depending on how the caller spelled
+# it. Crypto producers pass minutes and equity producers pass labels, so hourly
+# and four-hourly candles existed for equities and were unreachable for crypto:
+# `sentinel:candles:1h:BTCUSDT` never existed, only `...:60m:BTCUSDT`.
+_MINUTES_TO_LABEL = {
+    1: "1m", 5: "5m", 10: "10m", 15: "15m", 30: "30m",
+    60: "1h", 240: "4h", 1440: "1d", 10080: "1w",
+}
+
+# Spellings that mean the same duration. Readers consult these so candles cached
+# under the old naming stay reachable until they age out of their retention.
+_LABEL_ALIASES = {
+    "60m": "1h", "1hr": "1h", "h1": "1h",
+    "240m": "4h", "4hr": "4h", "h4": "4h",
+    "1440m": "1d", "24h": "1d", "d1": "1d",
+    "10080m": "1w", "7d": "1w",
+}
+
+
+# The one timeframe where case carries meaning: "1M" is a month and "1m" is a
+# minute. Lower-casing before comparison silently turns a request for monthly
+# candles into minute candles -- a 43,200x difference returned without error.
+_CASE_SENSITIVE = {"1M"}
+
+
+def normalize_timeframe(timeframe) -> str:
+    """Resolves any accepted spelling of a timeframe to its canonical label."""
+    raw = str(timeframe).strip()
+    if raw in _CASE_SENSITIVE:
+        return raw
+    tf = raw.lower()
+    if tf.isdigit():
+        minutes = int(tf)
+        return _MINUTES_TO_LABEL.get(minutes, f"{minutes}m")
+    return _LABEL_ALIASES.get(tf, tf)
+
+
+def timeframe_aliases(timeframe) -> List[str]:
+    """Every key spelling a reader should try, canonical form first."""
+    canonical = normalize_timeframe(timeframe)
+    alternates = [raw for raw, target in _LABEL_ALIASES.items() if target == canonical]
+    return [canonical] + alternates
+
 
 def candle_cache_key(asset: str, timeframe: str) -> str:
     """Builds the canonical candle cache key: ``sentinel:candles:{tf}:{ASSET}``.
 
-    ``timeframe`` accepts either a Sentinel timeframe label ("5m", "1h", "1d") or
-    a bare minute count (5, 60), which is normalized to the minute-suffixed form.
+    ``timeframe`` accepts a label ("5m", "1h", "1d"), a legacy spelling ("60m",
+    "240m") or a bare minute count (5, 60). All of them resolve to one key.
     """
-    tf = str(timeframe).strip().lower()
-    if tf.isdigit():
-        tf = f"{tf}m"
+    tf = normalize_timeframe(timeframe)
     return f"{CANDLE_KEY_PREFIX}:{tf}:{str(asset).strip().upper()}"
 
 def get_domain_tag(domain: str, asset: str) -> str:
@@ -205,3 +251,49 @@ async def evaluate_multi_timeframe(
             anomalous_frames.append((tf, block, features, anomaly))
             
     return anomalous_frames
+
+def normalize_candle(raw: Dict[str, Any], ticker: str = "") -> Dict[str, Any]:
+    """Renders a cached candle in one shape regardless of which producer wrote it.
+
+    The two aggregators emit different schemas. The crypto path writes
+    ``{bucket_id, open, high, low, close, volume}`` while the equity collector's
+    Lua script writes ``{ts, o, h, l, c, v}``. The API returned whichever it
+    found untouched, so a chart reading ``ts`` and ``open`` got nulls for crypto
+    and a client reading ``o`` got nulls for equities -- each rendering as an
+    empty series next to perfectly good data.
+
+    ``bucket_id`` is preferred over ``start_ts`` for the timestamp: it is the
+    bucket boundary, whereas start_ts records when the bucket was first written.
+    """
+    def _first(*keys):
+        for k in keys:
+            if k in raw and raw[k] is not None:
+                return raw[k]
+        return None
+
+    ts = None
+    bucket = _first("bucket_id", "bucket")
+    if bucket is not None:
+        try:
+            ts = datetime.fromtimestamp(int(bucket), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            ts = None
+    if ts is None:
+        ts = _first("ts", "start_ts", "time", "timestamp")
+
+    def _num(*keys):
+        v = _first(*keys)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "ts": ts,
+        "open": _num("open", "o"),
+        "high": _num("high", "h"),
+        "low": _num("low", "l"),
+        "close": _num("close", "c"),
+        "volume": _num("volume", "v") or 0.0,
+        "ticker": (raw.get("ticker") or ticker or "").upper() or None,
+    }

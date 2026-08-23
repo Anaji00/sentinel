@@ -118,9 +118,72 @@ def test_past_due_still_grants_access():
     assert _tier_for("past_due") == Tier.PRO.value
 
 
-def test_is_configured_requires_both_key_and_price(monkeypatch):
+def test_credentials_alone_do_not_enable_billing(monkeypatch):
+    """Payments are off until explicitly switched on.
+
+    Keys often exist long before a product should charge anyone -- during
+    testing, or while a deployment is still being sized. A key appearing in the
+    environment must never be enough on its own to start taking money.
+    """
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_1")
+    monkeypatch.delenv("BILLING_ENABLED", raising=False)
+    assert stripe_client.is_configured() is False, "billing enabled without the switch"
+
+
+def test_switch_alone_does_not_enable_billing(monkeypatch):
+    """Nor can the switch enable checkout without credentials to charge against."""
+    monkeypatch.setenv("BILLING_ENABLED", "true")
+    monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
     monkeypatch.delenv("STRIPE_PRICE_ID", raising=False)
     assert stripe_client.is_configured() is False
+
+
+def test_switch_plus_credentials_enables_billing(monkeypatch):
+    monkeypatch.setenv("BILLING_ENABLED", "true")
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test")
     monkeypatch.setenv("STRIPE_PRICE_ID", "price_1")
     assert stripe_client.is_configured() is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "maybe"])
+def test_switch_is_off_for_anything_but_an_explicit_yes(monkeypatch, value):
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test")
+    monkeypatch.setenv("STRIPE_PRICE_ID", "price_1")
+    monkeypatch.setenv("BILLING_ENABLED", value)
+    assert stripe_client.is_configured() is False
+
+
+# ── entitlement against serialised timestamps ────────────────────────────────
+
+def test_has_pro_handles_the_iso_string_the_database_returns():
+    """`subscription_ends_at` arrives as text, not a datetime.
+
+    Comparing it to `datetime.now()` raises, so an active subscriber with a
+    period end would have crashed every entitlement check the first time one
+    existed.
+    """
+    from datetime import datetime, timedelta, timezone
+    from shared.utils.accounts import account_from_row
+
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+
+    base = dict(id=1, email="a@b.co", display_name=None, role="VIEWER", is_active=True,
+                subscription_tier="pro", subscription_status="active",
+                stripe_customer_id="cus_1")
+
+    assert account_from_row({**base, "subscription_ends_at": future}).has_pro is True
+    assert account_from_row({**base, "subscription_ends_at": past}).has_pro is False
+    assert account_from_row({**base, "subscription_ends_at": None}).has_pro is True
+
+
+def test_public_dict_serialises_a_string_end_date_without_crashing():
+    from datetime import datetime, timedelta, timezone
+    from shared.utils.accounts import account_from_row
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    row = dict(id=1, email="a@b.co", display_name=None, role="VIEWER", is_active=True,
+               subscription_tier="pro", subscription_status="active",
+               stripe_customer_id="cus_1", subscription_ends_at=future)
+    out = account_from_row(row).to_public_dict()
+    assert out["subscription_ends_at"].startswith(future[:10])

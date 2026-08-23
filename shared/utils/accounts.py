@@ -122,6 +122,31 @@ def is_valid_email(email: str) -> bool:
     return bool(_EMAIL_RE.match(normalize_email(email)))
 
 
+
+def coerce_utc(value: Any) -> Optional[datetime]:
+    """Normalises a timestamp from a database row into an aware UTC datetime.
+
+    The Timescale helper serialises every datetime to an ISO string before a row
+    reaches application code, so `row["expires_at"]` is text, not a datetime.
+    Comparing that to `datetime.now()` raises, and reading `.tzinfo` off it
+    raises -- which is exactly how email verification failed with a 500 while the
+    token itself was perfectly valid.
+
+    Returns None for anything unparseable, so callers can fail closed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
 # ── Tiers ────────────────────────────────────────────────────────────────────
 
 class Tier(str, Enum):
@@ -188,12 +213,9 @@ class Account:
             return False
         if self.subscription_status not in ACTIVE_STATUSES:
             return False
-        if self.subscription_ends_at is not None:
-            ends = self.subscription_ends_at
-            if ends.tzinfo is None:
-                ends = ends.replace(tzinfo=timezone.utc)
-            if ends < datetime.now(timezone.utc):
-                return False
+        ends = coerce_utc(self.subscription_ends_at)
+        if ends is not None and ends < datetime.now(timezone.utc):
+            return False
         return True
 
     def can_use(self, feature: str) -> bool:
@@ -210,7 +232,7 @@ class Account:
             "has_pro": self.has_pro,
             "subscription_status": self.subscription_status,
             "subscription_ends_at": (
-                self.subscription_ends_at.isoformat() if self.subscription_ends_at else None
+                ends.isoformat() if (ends := coerce_utc(self.subscription_ends_at)) else None
             ),
             "pro_features": sorted(PRO_FEATURES),
             "free_limits": FREE_TIER_LIMITS,

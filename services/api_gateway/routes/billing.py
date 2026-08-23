@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional
 from shared.utils import stripe_client
@@ -315,3 +315,65 @@ async def stripe_webhook(request: Request, db=Depends(get_db_optional)):
         "Applied %s for account %s: %s -> %s", event_type, user_id, status_before, status_after
     )
     return {"received": True}
+
+
+# ── Waitlist (billing switched off) ───────────────────────────────────────────
+#
+# Payments are deliberately off until there is enough demand to justify a host
+# that can carry paying users. Rather than deleting the Stripe integration, it is
+# held behind an explicit switch: commented-out code stops being type-checked,
+# stops being tested, and quietly rots against the rest of the codebase, so
+# turning it back on months later means debugging it again. This way the tests
+# still run against it and enabling payments is a config change.
+#
+# Meanwhile the interest is worth capturing, because "how many people would pay"
+# is exactly the number that decides when to provision that host.
+
+
+class WaitlistRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+@router.post("/waitlist", status_code=201)
+async def join_waitlist(
+    body: WaitlistRequest,
+    request: Request,
+    db=Depends(get_db_optional),
+):
+    """Registers interest in the paid tier while billing is switched off.
+
+    Public, because someone may want the paid tier before they have an account.
+    Where a matching account exists the row is linked to it, so a later
+    announcement can address people by account rather than by raw address.
+    """
+    email = normalize_email(body.email)
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="That does not look like an email address.")
+    if db is None:
+        raise HTTPException(status_code=503, detail="Temporarily unavailable.")
+
+    user = await db.query_one("SELECT id FROM users WHERE email = $1", email)
+    try:
+        await db.execute(
+            """
+            INSERT INTO pro_waitlist (user_id, email) VALUES ($1, $2)
+            ON CONFLICT (email) DO NOTHING
+            """,
+            int(user["id"]) if user else None, email,
+        )
+    except Exception as e:
+        logger.error("Could not record waitlist interest: %s", e)
+        raise HTTPException(status_code=503, detail="Temporarily unavailable.")
+
+    # Identical response whether or not the address was already on the list, for
+    # the same reason signup does not disclose existing accounts.
+    return {"success": True, "message": "You are on the list. We will email you when Pro opens."}
+
+
+@router.get("/waitlist/count")
+async def waitlist_count(db=Depends(get_db_optional)):
+    """How many people are waiting. This is the number that decides when to scale."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Account store unavailable.")
+    row = await db.query_one("SELECT count(*) AS n FROM pro_waitlist")
+    return {"waiting": int((row or {}).get("n") or 0)}

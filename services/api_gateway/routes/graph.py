@@ -9,7 +9,9 @@ and connection paths between different entities (like vessels, companies, and co
 import logging
 import time
 import math
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Depends, Query
 from services.api_gateway.dependencies import get_graph, get_db
 
 logger = logging.getLogger("api-gateway.graph")
@@ -17,25 +19,43 @@ router = APIRouter(prefix="/api/v1/graph", tags=["Graph Analysis"])
 
 @router.get("/entities")
 async def get_graph_entities(
+    limit: int = Query(50, ge=1, le=500),
     graph = Depends(get_graph),
     db = Depends(get_db)
 ):
-    """Retrieve all active entities registered in the Neo4j Knowledge Graph or TimescaleDB."""
+    """Entities available to explore, most connected first.
+
+    Ordering by connectivity rather than name is what makes this list usable:
+    alphabetically the graph begins with hundreds of `0x0000...` wallet
+    addresses that are indistinguishable in a dropdown, so the explorer opened
+    on fifty unusable choices.
+    """
     try:
         query = """
-        MATCH (n:Entity)
-        RETURN n.id as id, coalesce(n.name, n.id) as name, coalesce(n.type, 'ENTITY') as type
-        ORDER BY n.name ASC
-        LIMIT 50
+        MATCH (n)-[r]-()
+        WITH n, count(r) AS degree
+        RETURN coalesce(n.id, n.name) AS id,
+               coalesce(n.name, n.id)  AS name,
+               labels(n)[0]            AS type,
+               degree
+        ORDER BY degree DESC
+        LIMIT $limit
         """
-        records = await graph.query(query)
+        records = await graph.query(query, {"limit": limit})
         entities = []
         if records:
             for r in records:
+                eid = r.get("id") or r.get("name")
+                if not eid or any(e["id"] == eid for e in entities):
+                    continue        # the same node can arrive twice from a multi-match
                 entities.append({
-                    "id": r.get("id") or r.get("name"),
-                    "name": r.get("name") or r.get("id"),
-                    "type": r.get("type", "ENTITY")
+                    "id": eid,
+                    "name": _display_name(r.get("name") or eid),
+                    # The label carries the type. A "type" property does not
+                    # exist on these nodes, so coalescing to it made every
+                    # entity report as "ENTITY" regardless of what it was.
+                    "type": r.get("type") or "Entity",
+                    "degree": int(r.get("degree") or 0),
                 })
         
         # Dynamic fallback to TimescaleDB events if Neo4j returns empty
@@ -45,9 +65,9 @@ async def get_graph_entities(
             FROM events
             WHERE primary_entity_id IS NOT NULL AND primary_entity_id != ''
             ORDER BY primary_entity_name ASC
-            LIMIT 50
+            LIMIT $1
             """
-            db_rows = await db.query(db_query)
+            db_rows = await db.query(db_query, limit)
             for r in db_rows:
                 e_id = r.get("id") or r.get("name")
                 e_name = r.get("name") or e_id
@@ -250,4 +270,141 @@ async def get_shortest_path(
         return {"path": results}
     except Exception as e:
         logger.error(f"Error fetching shortest path: {e}")
-        return {"message": "No path found", "path": []}
+        return {"message": "No path found", "path": []}
+
+
+@router.get("/network")
+async def get_graph_network(
+    limit: int = Query(60, ge=5, le=300),
+    label: Optional[str] = Query(None, description="Restrict to one node label, e.g. Vessel"),
+    min_degree: int = Query(1, ge=0),
+    graph=Depends(get_graph),
+):
+    """An overview of the graph: the most connected nodes and the edges between them.
+
+    The explorer previously had no way to show anything until the user picked an
+    entity, and the picker was filled from an alphabetical scan -- which on this
+    dataset means fifty near-identical `0x0000...` wallet addresses. A knowledge
+    graph that opens empty and offers only unreadable choices reads as broken
+    even though 19,000 nodes and 13,000 relationships are sitting behind it.
+
+    Nodes are ranked by degree, so the view opens on the hubs that actually
+    organise the graph. Only edges whose endpoints are both in the returned set
+    are included: an edge pointing at a node that was not returned renders as a
+    line into empty space.
+    """
+    try:
+        label_filter = ""
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "min_degree": min_degree,
+            # Enough to show a hub's structure without importing its whole
+            # neighbourhood; the total is bounded independently.
+            "neighbour_cap": 8,
+            "total_cap": limit * 10,
+        }
+        if label and label.isalnum():
+            # Interpolated because a label cannot be parameterised in Cypher.
+            # Constrained to alphanumerics above so nothing else can be injected.
+            label_filter = f":{label}"
+
+        # Filtering to one label and returning only those nodes yields a view
+        # with no edges at all: a vessel is connected to its flag state and its
+        # region, never to another vessel. The neighbours are what make the
+        # selection a graph rather than a list, so they come back with it.
+        node_query = f"""
+        MATCH (n{label_filter})-[r]-()
+        WITH n, count(r) AS degree
+        WHERE degree >= $min_degree
+        // A second WITH: in a Cypher WITH clause ORDER BY must precede WHERE,
+        // so the ranking cannot share the clause that filters on the aggregate.
+        WITH n, degree ORDER BY degree DESC LIMIT $limit
+        // Neighbours are capped per seed. Without this a single hub -- the
+        // busiest wallet here has degree 4,603 -- drags its entire neighbourhood
+        // in and a request for 10 nodes returns ten thousand, which no client
+        // can lay out and no person can read.
+        CALL {{
+            WITH n
+            MATCH (n)-[]-(nb)
+            RETURN nb LIMIT $neighbour_cap
+        }}
+        WITH collect(DISTINCT n) AS seeds, collect(DISTINCT nb) AS neighbours
+        UNWIND (seeds + neighbours) AS m
+        WITH DISTINCT m
+        RETURN coalesce(m.id, m.name, elementId(m)) AS id,
+               coalesce(m.name, m.id, 'unnamed')    AS name,
+               labels(m)[0]                          AS type,
+               size([(m)--() | 1])                   AS degree
+        ORDER BY degree DESC
+        LIMIT $total_cap
+        """
+        node_rows = await graph.query(node_query, params) or []
+
+        nodes = []
+        seen = set()
+        for r in node_rows:
+            nid = r.get("id")
+            if not nid or nid in seen:
+                continue
+            seen.add(nid)
+            nodes.append({
+                "id": nid,
+                "name": _display_name(r.get("name") or nid),
+                "type": r.get("type") or "Entity",
+                "degree": int(r.get("degree") or 0),
+            })
+
+        edges = []
+        if nodes:
+            edge_query = """
+            MATCH (a)-[r]->(b)
+            WHERE coalesce(a.id, a.name) IN $ids AND coalesce(b.id, b.name) IN $ids
+            RETURN coalesce(a.id, a.name) AS source,
+                   coalesce(b.id, b.name) AS target,
+                   type(r)                AS relationship,
+                   coalesce(r.weight, 1.0) AS weight
+            LIMIT 1000
+            """
+            edge_rows = await graph.query(edge_query, {"ids": [n["id"] for n in nodes]}) or []
+            for r in edge_rows:
+                if r.get("source") and r.get("target"):
+                    edges.append({
+                        "source": r["source"],
+                        "target": r["target"],
+                        "relationship": r.get("relationship") or "RELATED_TO",
+                        "weight": float(r.get("weight") or 1.0),
+                    })
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "labels": await _available_labels(graph),
+        }
+    except Exception as e:
+        logger.error(f"Error building graph network view: {e}")
+        # Empty rather than a 500: the explorer degrades to its manual search.
+        return {"nodes": [], "edges": [], "node_count": 0, "edge_count": 0, "labels": []}
+
+
+async def _available_labels(graph) -> List[str]:
+    """Node labels present in the graph, so the client can offer real filters."""
+    try:
+        rows = await graph.query("CALL db.labels() YIELD label RETURN label ORDER BY label")
+        return [r["label"] for r in (rows or []) if r.get("label")]
+    except Exception:
+        return []
+
+
+def _display_name(raw: str) -> str:
+    """Makes a 42-character hex address readable without hiding what it is.
+
+    Wallet addresses dominate this graph by node count. Rendered in full they
+    are indistinguishable from one another at a glance -- every one starts with
+    the same run of zeroes -- which is what made the entity picker unusable.
+    """
+    value = str(raw)
+    if value.lower().startswith("0x") and len(value) > 20:
+        return f"{value[:8]}…{value[-6:]}"
+    return value

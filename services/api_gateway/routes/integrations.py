@@ -112,6 +112,29 @@ INTEGRATIONS: List[Integration] = [
         signup_url="https://core.telegram.org/bots#botfather",
         without_it="Social OSINT ingestion is limited to RSS wire services.",
     ),
+    # Not a data source, but the platform is unusable to strangers without it.
+    # Open signup means every new account waits on a confirmation link, and a
+    # forgotten password has no recovery path at all. Marked required because
+    # this is the one integration whose absence blocks people rather than
+    # narrowing coverage.
+    Integration(
+        "smtp", "Email delivery — sign-up and password reset", "accounts",
+        ["SMTP_HOST", "SMTP_FROM"], required=True, free_tier=True,
+        signup_url="https://resend.com/",
+        without_it="Confirmation and password-reset links are written to the "
+                   "gateway log instead of being sent. Usable for local "
+                   "development; with open signup, nobody can confirm an "
+                   "address or recover an account.",
+    ),
+    Integration(
+        "stripe", "Stripe — subscriptions", "billing",
+        ["STRIPE_SECRET_KEY", "STRIPE_PRICE_ID", "STRIPE_WEBHOOK_SECRET"],
+        free_tier=True,
+        signup_url="https://dashboard.stripe.com/register",
+        without_it="Payments stay switched off and the account page offers a "
+                   "waitlist instead of checkout. Note BILLING_ENABLED must "
+                   "also be set: credentials alone never start billing.",
+    ),
 ]
 
 # Sources that need no key at all. Listed so the absence of an entry above is

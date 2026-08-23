@@ -4,24 +4,47 @@ import { verifySessionToken } from '../../auth/login/route';
 const BACKEND_URL = process.env.API_GATEWAY_URL || 'http://localhost:8000';
 const API_GATEWAY_KEY = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
 
+// Endpoints a person reaches before they have a session: creating an account,
+// confirming an address, recovering a password, registering interest in the paid
+// tier. Requiring a session here would make signup impossible. Each of these is
+// public and per-source throttled on the gateway, so forwarding them
+// unauthenticated is exactly what should happen.
+const PUBLIC_PATHS = [
+  'api/v1/auth/signup',
+  'api/v1/auth/login',
+  'api/v1/auth/verify',
+  'api/v1/auth/resend-verification',
+  'api/v1/auth/forgot-password',
+  'api/v1/auth/reset-password',
+  'api/v1/billing/waitlist',
+];
+
+function isPublicPath(pathStr: string): boolean {
+  const clean = pathStr.replace(/^\/+|\/+$/g, '');
+  return PUBLIC_PATHS.includes(clean);
+}
+
 async function handleProxy(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   // Check auth session
   const cookie = req.cookies.get('sentinel_session');
   const isDev = process.env.NODE_ENV !== 'production';
 
-  if (!cookie || !cookie.value) {
-    if (!isDev && !req.nextUrl.pathname.includes('/health')) {
-      return NextResponse.json({ error: 'Unauthorized session' }, { status: 401 });
-    }
-  } else {
-    const { valid } = verifySessionToken(cookie.value);
-    if (!valid && !isDev && !req.nextUrl.pathname.includes('/health')) {
-      return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
-    }
-  }
-
   const { path } = await context.params;
   const pathStr = (path || []).join('/');
+  const publicPath = isPublicPath(pathStr);
+
+  if (!publicPath) {
+    if (!cookie || !cookie.value) {
+      if (!isDev && !req.nextUrl.pathname.includes('/health')) {
+        return NextResponse.json({ error: 'Unauthorized session' }, { status: 401 });
+      }
+    } else {
+      const { valid } = verifySessionToken(cookie.value);
+      if (!valid && !isDev && !req.nextUrl.pathname.includes('/health')) {
+        return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
+      }
+    }
+  }
   const search = req.nextUrl.search;
   const targetUrl = `${BACKEND_URL.replace(/\/+$/, '')}/${pathStr}${search}`;
 
@@ -35,8 +58,10 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   // before the session cookie. The cookie is already a credential the gateway
   // accepts, so it is what should identify the user. The master key is used
   // only where there is no session to forward (health checks and similar).
+  // A public path is forwarded with no credential at all: it must be handled as
+  // an anonymous caller, never as the operator.
   const hasSession = Boolean(cookie?.value && verifySessionToken(cookie.value).valid);
-  if (hasSession) {
+  if (hasSession || publicPath) {
     headers.delete('X-API-KEY');
     headers.delete('x-api-key');
   } else {

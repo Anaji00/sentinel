@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+from shared.utils.candles import candle_cache_key
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
@@ -222,7 +223,7 @@ class OHLCVAggregator:
                     count += 1
                     try:
                         # Store 1m base candle
-                        redis_list_key = f"sentinel:candles:1m:{ticker}"
+                        redis_list_key = candle_cache_key(ticker, "1m")
                         candle_json = json.dumps({"ts": now.isoformat(), **candle})
                         pipe.lpush(redis_list_key, candle_json)
                         pipe.ltrim(redis_list_key, 0, 1439)
@@ -243,7 +244,10 @@ class OHLCVAggregator:
                                 interval_dt = now.replace(hour=floored_minutes // 60, minute=floored_minutes % 60, second=0, microsecond=0)
                             
                             interval_ts = interval_dt.isoformat()
-                            tf_key = f"sentinel:candles:{tf}:{ticker}"
+                            # Canonical helper, not a hand-built key. Building
+                            # it inline here is what let this producer's
+                            # vocabulary drift from the crypto producer's.
+                            tf_key = candle_cache_key(ticker, tf)
                             
                             pipe.eval(
                                 self.LUA_AGGREGATE_SCRIPT, 

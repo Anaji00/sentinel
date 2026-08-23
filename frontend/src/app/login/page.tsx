@@ -164,6 +164,17 @@ export default function LoginPage() {
           </button>
         </form>
 
+        {/* Open signup: the platform is free to join, so the way in belongs on
+            the sign-in page rather than behind it. */}
+        <div className="flex items-center justify-between text-xs pt-1">
+          <Link href="/forgot" className="text-slate-400 hover:text-cyan-400">
+            Forgot password?
+          </Link>
+          <Link href="/signup" className="text-cyan-400 hover:text-cyan-300 font-bold">
+            Create a free account
+          </Link>
+        </div>
+
         {/* Development Quick Navigation Bypass */}
         <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px]">
           <span className="text-slate-500">DEV MODE ACTIVE</span>

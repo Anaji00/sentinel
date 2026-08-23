@@ -3,6 +3,14 @@ from fastapi import APIRouter, Depends, Query
 from services.api_gateway.dependencies import get_db, get_db_optional, get_redis_client, get_redis_optional
 from shared.utils.serialization import score_dto, to_dto
 
+from shared.utils.candles import (
+    CANDLE_KEY_PREFIX,
+    candle_cache_key,
+    normalize_candle,
+    normalize_timeframe,
+    timeframe_aliases,
+)
+
 logger = logging.getLogger("api-gateway.radar")
 
 # Anomaly scores are unit-normalized [0,1]; this maps them onto a z-like scale
@@ -455,14 +463,25 @@ async def get_candles(
     # 1. Hot path: Query Redis multi-timeframe cache
     if redis:
         try:
-            for t_cand in ticker_candidates:
-                key = f"sentinel:candles:{timeframe}:{t_cand}"
+            # Both spellings of the same duration are tried. Producers disagreed
+            # -- equities wrote "1h"/"4h" and crypto wrote "60m"/"240m" -- so
+            # asking for 1h on a crypto pair found nothing and the chart came
+            # back empty with a 200.
+            # Built literally, not through candle_cache_key: that helper
+            # normalises every alias back to the canonical label, so routing the
+            # alternates through it produced the same key each time and the
+            # legacy spelling was never actually queried.
+            key_candidates = [
+                f"{CANDLE_KEY_PREFIX}:{tf_alias}:{t_cand.upper()}"
+                for t_cand in ticker_candidates
+                for tf_alias in timeframe_aliases(timeframe)
+            ]
+            for key in key_candidates:
                 raw_candles = await redis.raw.lrange(key, 0, limit - 1)
                 if raw_candles:
                     for rc in raw_candles:
                         try:
-                            c = json.loads(rc)
-                            candles.append(c)
+                            candles.append(normalize_candle(json.loads(rc), ticker))
                         except Exception:
                             pass
                     if candles:
@@ -473,6 +492,9 @@ async def get_candles(
     # 2. Durable fallback: Query TimescaleDB Continuous Aggregates (§2.1, §2.3, §2.5)
     if not candles and db:
         try:
+            # Only these have continuous aggregates. 10m, 30m and 4h are served
+            # from the Redis aggregator alone; there is no durable fallback for
+            # them, which is worth knowing when a chart is empty.
             cagg_map = {
                 "1m": ("tradfi_bars", "time"),
                 "5m": ("tradfi_bars_5m", "bucket_time"),
@@ -482,6 +504,7 @@ async def get_candles(
                 "1w": ("tradfi_bars_1w", "bucket_time"),
                 "1M": ("tradfi_bars_1mth", "bucket_time"),
             }
+            timeframe = normalize_timeframe(timeframe)
             if timeframe in cagg_map:
                 table_name, time_col = cagg_map[timeframe]
                 rows = await db.query(

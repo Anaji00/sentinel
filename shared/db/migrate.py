@@ -239,6 +239,53 @@ MIGRATIONS = [
             FROM rolling_stats;
         """,
         "transactional": False
+    },
+    {
+        "version": "0006_account_email_verification",
+        "sql": """
+            -- Open signup means the address on an account is a claim until it is
+            -- proven. An unverified account still gets the free tier immediately
+            -- -- the whole analyst platform -- but cannot be charged and cannot
+            -- reset a password, because both of those trust the mailbox.
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+
+            -- Existing accounts predate verification. The operator seeded from
+            -- environment credentials is trusted by construction; marking it
+            -- verified avoids locking the owner out of their own deployment.
+            UPDATE users SET email_verified = TRUE, email_verified_at = NOW()
+             WHERE role = 'ADMIN' AND email_verified = FALSE;
+
+            -- One table for both purposes. Tokens are stored as a SHA-256 digest
+            -- and never in the form that was emailed: a database read must not
+            -- yield a working password-reset link for every account.
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id           BIGSERIAL PRIMARY KEY,
+                user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash   TEXT NOT NULL UNIQUE,
+                purpose      TEXT NOT NULL CHECK (purpose IN ('verify_email', 'reset_password')),
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at   TIMESTAMPTZ NOT NULL,
+                consumed_at  TIMESTAMPTZ
+            );
+
+            CREATE INDEX IF NOT EXISTS auth_tokens_user_idx ON auth_tokens(user_id, purpose);
+            -- Expiry sweeps scan on this.
+            CREATE INDEX IF NOT EXISTS auth_tokens_expiry_idx ON auth_tokens(expires_at)
+                WHERE consumed_at IS NULL;
+
+            -- Interest in the paid tier while billing is switched off. Kept
+            -- separate from `users` so that turning payments on later is a
+            -- config change and not a data migration.
+            CREATE TABLE IF NOT EXISTS pro_waitlist (
+                id          BIGSERIAL PRIMARY KEY,
+                user_id     BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                email       TEXT NOT NULL UNIQUE,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                notified_at TIMESTAMPTZ
+            );
+        """,
+        "transactional": True
     }
 ]
 

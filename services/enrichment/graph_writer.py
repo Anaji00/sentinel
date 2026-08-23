@@ -57,6 +57,27 @@ class GraphWriter:
                     "data": {"tags": flags, "label": "Vessel"}
                 }
                 await self.producer.send(Topics.ONTOLOGY_PROPOSALS, tag_proposal, key=str(mmsi))
+
+            # Nodes without edges are not a graph. Every vessel was written as an
+            # isolated node -- 3,462 of them, none connected to anything -- while
+            # flag_state and region arrived in `data` and were discarded here.
+            # These are observed facts, not inferences, so they belong at ingest
+            # rather than waiting on the reasoning tier to guess them.
+            flag_state = (data.get("flag_state") or "").strip()
+            if flag_state:
+                await self.link_entities(
+                    mmsi, "REGISTERED_IN", flag_state,
+                    properties={"confidence": 1.0, "source": "ais"},
+                    source_label="Vessel", target_label="Flag",
+                )
+
+            region = (data.get("region") or "").strip()
+            if region:
+                await self.link_entities(
+                    mmsi, "LOCATED_IN", region,
+                    properties={"confidence": 1.0, "source": "ais"},
+                    source_label="Vessel", target_label="Region",
+                )
         except Exception as e:
             logger.error(f"Failed to route vessel {mmsi} to Supervisor: {e}")
 
@@ -78,6 +99,22 @@ class GraphWriter:
                 }
             }
             await self.producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=str(icao24))
+
+            origin_country = (data.get("origin_country") or "").strip()
+            if origin_country:
+                await self.link_entities(
+                    icao24, "REGISTERED_IN", origin_country,
+                    properties={"confidence": 1.0, "source": "adsb"},
+                    source_label="Aircraft", target_label="Flag",
+                )
+
+            region = (data.get("region") or "").strip()
+            if region:
+                await self.link_entities(
+                    icao24, "LOCATED_IN", region,
+                    properties={"confidence": 1.0, "source": "adsb"},
+                    source_label="Aircraft", target_label="Region",
+                )
         except Exception as e:
             logger.error(f"Failed to route aircraft {icao24} to Supervisor: {e}")
 

@@ -259,7 +259,10 @@ def test_pages_are_server_components_unless_they_need_interactivity():
 
     # Pages that legitimately need client execution: real user interaction,
     # form state, or a canvas/WebGL visualizer.
-    allowed = {"charts", "methodology", "login", "map"}
+    # The auth pages are forms end to end -- the interaction *is* the page, so
+    # there is no widget to split into an islands.tsx. Same category as login.
+    allowed = {"charts", "methodology", "login", "map",
+               "signup", "verify", "reset", "forgot"}
     for p in client_pages:
         assert p.parent.name in allowed, (
             f"{p.relative_to(FRONTEND)} is a client component; if only a widget "
