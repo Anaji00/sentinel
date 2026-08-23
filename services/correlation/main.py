@@ -337,7 +337,7 @@ async def main():
         except Exception as pub_err:
             logger.debug(f"Failed to stream correlation live: {pub_err}")
 
-    async def _process_correlation_event(event: NormalizedEvent):
+    async def _process_correlation_event(event: NormalizedEvent, precomputed_embedding=None):
         nonlocal corr_fired, processed
         try:
             # 1. Evaluate Geopolitical Cascade Engine
@@ -438,8 +438,29 @@ async def main():
                     skip_soft_correlation = True
                     logger.debug(f"Story dedup: skipping soft correlation for low-novelty event (novelty={novelty:.2f}): {headline_text[:80]}")
 
+            # Routine telemetry is not worth embedding. The enricher already
+            # capped these at 0.15 and marked them uninteresting; putting them
+            # through the encoder spends ~945ms of CPU asking whether one
+            # position fix is semantically like another. Measured, this is about
+            # two thirds of the stream.
+            if event.anomaly_score is not None and event.anomaly_score <= 0.15:
+                skip_soft_correlation = True
+
             # 4. Soft embedding correlation (with conformal threshold + story dedup)
-            embedding = await soft_correlator.embed_event(event)
+            #
+            # Embedding happens *after* the decision to skip. It used to run
+            # first, so a skipped event still paid the full encoder cost and the
+            # result was then thrown away -- the most expensive call on the hot
+            # path, made unconditionally.
+            # The batch pass above will normally have supplied this. The
+            # single-event call remains as a fallback for anything it could not
+            # encode, so one bad event cannot silently drop the rest.
+            if skip_soft_correlation:
+                embedding = None
+            elif precomputed_embedding is not None:
+                embedding = precomputed_embedding
+            else:
+                embedding = await soft_correlator.embed_event(event)
             if embedding and not skip_soft_correlation:
                 await soft_correlator.store(event, embedding)
 
@@ -629,7 +650,22 @@ async def main():
                     if all_events:
                         await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)
                         
-                        tasks = [_process_correlation_event(e) for e in representative_events.values()]
+                        # Encode the batch in one pass before dispatching. The
+                        # encoder dominates this path and is roughly twice as
+                        # fast per event batched as called one at a time; the
+                        # events are already in hand, so there is no reason to
+                        # ask for them one by one. Routine telemetry is excluded
+                        # here for the same reason it is skipped below.
+                        to_embed = [
+                            e for e in representative_events.values()
+                            if e.anomaly_score is None or e.anomaly_score > 0.15
+                        ]
+                        precomputed = await soft_correlator.embed_events(to_embed) if to_embed else {}
+
+                        tasks = [
+                            _process_correlation_event(e, precomputed.get(str(e.event_id)))
+                            for e in representative_events.values()
+                        ]
                         
                         # 1. Pause assigned partitions to prevent new messages and allow heartbeats
                         assigned = consumer._c.assignment()

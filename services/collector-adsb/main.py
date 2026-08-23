@@ -91,7 +91,14 @@ MACRO_REGIONS = [
     ("Asia Pacific",           1.0, 26.0, 103.0, 123.0),
 ]
 
-POLL_INTERVAL = 60 if not OPENSKY_CLIENT_ID else 30
+# Aviation is an anomaly feed, not a tracking feed. At a 30s sweep it produced
+# 1,108 events/min -- more than the entire enrichment tier could consume (12/s)
+# on its own, starving news, filings and market data behind a queue of routine
+# position fixes that the enricher itself caps at 0.15 anomaly and treats as
+# uninteresting. Five minutes still catches what this platform acts on:
+# emergency squawks, sanctioned operators, and dark-flight gaps (which read
+# `aircraft:last_seen`, held for 24h, so a longer sweep does not blind them).
+POLL_INTERVAL = int(os.getenv("ADSB_POLL_INTERVAL_SEC", "300"))
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
 class OpenSkyAuth:

@@ -155,6 +155,17 @@ class EntityClassification(BaseModel):
     reasoning: str
 
 
+# Actions the GraphSupervisor consumes off the shared ontology topic. Listed
+# here so this engine can tell a command apart from an observation; keep in step
+# with the branches in services/agents/supervisor.py.
+_SUPERVISOR_GRAPH_ACTIONS = frozenset({
+    "MERGE_ONTOLOGY_NODE",
+    "LINK_ENTITY",
+    "ADD_SYMPATHY_EDGE",
+    "ADD_TAGS",
+})
+
+
 class KnowledgeGraphEngine(SentinelAgent):
     """
     Unified Knowledge Graph Engine.
@@ -183,6 +194,20 @@ class KnowledgeGraphEngine(SentinelAgent):
             if entity_name and not (message.get("headline") or raw.get("headline") or raw.get("title")):
                 return await self._classify_and_merge_entity(str(entity_name), message)
 
+        # ── 1b. GOVERNANCE COMMANDS ARE NOT INTELLIGENCE ──────────────────────
+        # Graph mutations bound for the supervisor share this topic. They are
+        # commands -- "merge this node", "link these two" -- carrying no prose to
+        # extract triples from. Because they have no headline, the fallback below
+        # fabricated one ("Intelligence update for entity X") and the missing
+        # anomaly_score defaulted to 0.50, above the skip threshold, so every one
+        # of them bought a full LLM round trip to reason about a placeholder.
+        #
+        # Measured: 338 of 335 recently processed messages were that synthesized
+        # headline -- effectively the entire inference budget -- while the
+        # consumer sat 144,000 messages behind and losing ground.
+        if str(message.get("action", "")).upper() in _SUPERVISOR_GRAPH_ACTIONS:
+            return None
+
         # ── 2. NEWS INTEL & GRAPH TRIPLE EXTRACTION HANDLER ───────────────────
         headline = (
             message.get("headline")
@@ -196,20 +221,33 @@ class KnowledgeGraphEngine(SentinelAgent):
             or raw.get("hypothesis")
         )
         if not headline:
-            ent = message.get("primary_entity") or message.get("ticker") or message.get("entity_id") or raw.get("entity_id")
-            if ent:
-                headline = f"Intelligence update for entity {ent}"
-            else:
-                return None
+            # No prose means nothing to extract. Synthesizing a headline from an
+            # id gave the model a sentence with no information in it, so anything
+            # it returned was invention rather than extraction.
+            return None
 
         raw_anomaly = message.get("anomaly_score") if message.get("anomaly_score") is not None else raw.get("anomaly_score")
         anomaly_score = float(raw_anomaly) if raw_anomaly is not None else 0.50
         if anomaly_score < 0.20:
             return None
 
+        # Cheap peek before any expensive preparation. This topic carries the
+        # whole pipeline's output -- tens of thousands of events an hour -- and
+        # every one of them was paying a Redis read, a Redis write and several
+        # context queries only to be shed at the inference call. Peeking here
+        # does not claim the slot; the atomic claim still happens in the base
+        # class, so two agents cannot both conclude the model is free.
+        #
+        # It also has to come before mark_processed: marking a message as seen
+        # and then shedding it burns its dedup key for an hour, so the same
+        # headline is suppressed later when capacity is actually available.
+        if not await self._inference_budget.is_available():
+            return None
+
         dedup_key = f"news_intel:{hash(headline)}:{int(time.time() // 3600)}"
         if await self.is_recently_processed(dedup_key, window_seconds=3600):
             return None
+
         await self.mark_processed(dedup_key, window_seconds=3600)
 
         logger.info(f"🌐 KNOWLEDGE GRAPH | Processing Graph Triples & Intel | Headline: '{headline[:60]}...'")

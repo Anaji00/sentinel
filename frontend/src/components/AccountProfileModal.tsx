@@ -47,12 +47,24 @@ const Field: React.FC<{ label: string; value: React.ReactNode; tone?: string; hi
   </div>
 );
 
+type TabKey = 'overview' | 'access' | 'integrations' | 'telemetry';
+
+const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
+  { key: 'overview', label: 'OVERVIEW' },
+  { key: 'access', label: 'ACCESS & LIMITS' },
+  { key: 'integrations', label: 'DATA SOURCES' },
+  { key: 'telemetry', label: 'PLATFORM STATUS' },
+];
+
 export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen, onClose }) => {
   const [identity, setIdentity] = useState<SessionIdentity | null>(null);
   const [platform, setPlatform] = useState<PlatformSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'overview' | 'access' | 'integrations' | 'telemetry'>('overview');
+  const [activeTab, setActiveTab] = useState<TabKey>('overview');
+  // The session endpoint used to report every user as 'admin'; it now returns
+  // the role carried in the signed token, so this is a real check.
+  const isOperator = (identity?.role || '').toUpperCase() === 'ADMIN';
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -164,12 +176,12 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
 
         {/* Tabs */}
         <div className="flex border-b border-slate-800 bg-slate-950/50">
-          {([
-            ['overview', 'OVERVIEW'],
-            ['access', 'ACCESS & LIMITS'],
-            ['integrations', 'DATA SOURCES'],
-            ['telemetry', 'PLATFORM STATUS'],
-          ] as const).map(([key, label]) => (
+          {/* Data sources is operator configuration -- which upstreams are set up
+              and which environment variables are missing. That is reconnaissance
+              about the deployment rather than a product feature, so the tab is
+              not offered to ordinary accounts. The gateway enforces this too;
+              hiding it here just avoids showing a tab that would 403. */}
+          {TABS.filter((t) => t.key !== 'integrations' || isOperator).map(({ key, label }) => (
             <button
               key={key}
               onClick={() => setActiveTab(key)}
@@ -279,7 +291,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
             </div>
           )}
 
-          {activeTab === 'integrations' && (
+          {activeTab === 'integrations' && isOperator && (
             /* Which upstreams are configured, and what each missing key costs.
                Lives here rather than on a dashboard route because it is
                operator configuration, not intelligence. */

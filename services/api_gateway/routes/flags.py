@@ -34,7 +34,10 @@ class ResetFlagRequest(BaseModel):
     flag_name: str
 
 
-@router.get("", dependencies=[Depends(require_role(Role.VIEWER))])
+# ADMIN: kill-switch and rollout state is operational control surface. The
+# toggle already required ADMIN; reading which signals are live and at what
+# rollout percentage is the reconnaissance that precedes wanting to.
+@router.get("", dependencies=[Depends(require_role(Role.ADMIN))])
 async def get_feature_flags(redis=Depends(get_redis_optional)):
     """Returns the real-time operational status of all signal flags and master kill switch."""
     manager = FeatureFlagManager(redis)

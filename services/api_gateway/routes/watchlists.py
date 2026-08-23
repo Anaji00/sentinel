@@ -80,7 +80,9 @@ async def _publish_sync_signal(redis_client, mutated_by: str, count: int):
         logger.error(f"Failed to publish watchlist sync message: {e}")
 
 
-@router.get("/equities")
+# The PUT below requires ADMIN; this had no gate at all, so the tracked-symbol
+# configuration was readable by anyone with an account.
+@router.get("/equities", dependencies=[Depends(require_role(Role.ANALYST))])
 async def get_equities_watchlist(redis = Depends(get_redis_client)):
     """Retrieve the active equities watchlist with dynamic priority scores."""
     raw_redis = getattr(redis, "raw", redis)

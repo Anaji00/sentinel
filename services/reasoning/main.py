@@ -39,6 +39,7 @@ from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 from shared.utils.ollama import OllamaClient
+from shared.utils.inference_budget import InferenceBudget
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task
 
@@ -162,6 +163,38 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     
     sem = asyncio.Semaphore(3)
 
+    # Shared with the agent swarm: one Ollama, one budget.
+    _budget = InferenceBudget(redis_client, os.getenv("AGENT_MODEL", "qwen2.5:1.5b"))
+    _shed = 0
+
+    # Detached syntheses, bounded so a slow model cannot turn backlog into
+    # unbounded memory. Rarely approached: the semaphore admits three at a time.
+    MAX_INFLIGHT_SYNTHESES = 32
+    _inflight: set = set()
+
+    def _account_for_synthesis(task, original_payload):
+        """Records a detached synthesis as it finishes.
+
+        Runs as a completion callback so the consume loop never waits on it.
+        Retrieving the exception matters: an un-retrieved one is swallowed into
+        a warning at garbage-collection time, hiding every real failure.
+        """
+        nonlocal _processed, _scenarios, _errors
+        if task.cancelled():
+            return
+        err = task.exception()
+        if err is not None:
+            _errors += 1
+            logger.error(f"Synthesis task failed: {err}", exc_info=err)
+            safe_create_task(
+                producer.send(Topics.DLQ, {"error": str(err), "payload": original_payload})
+            )
+            return
+        _processed += 1
+        if task.result() is not None:
+            _scenarios += 1
+
+
     async def sem_process_cluster(cluster, *args):
         async with sem:
             return await process_cluster(cluster, *args)
@@ -196,6 +229,27 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                             cluster = CorrelationCluster(**raw_data)
                             logger.debug(f"Received correlation cluster {cluster.correlation_id} for reasoning analysis")
                             
+                            # Shed what cannot possibly be reached. Scenario
+                            # synthesis is two model passes at several minutes
+                            # each, three at a time -- about 36 clusters an hour
+                            # against a backlog of 161,000, which is six months
+                            # of work that will never be done. Queuing it all
+                            # only guarantees the service reasons about
+                            # increasingly stale correlations.
+                            #
+                            # The budget is shared with the agent swarm because
+                            # they all talk to the same single-threaded Ollama.
+                            # Peeking does not claim the slot; it just avoids
+                            # building work that would sit unread.
+                            if not await _budget.is_available():
+                                _shed += 1
+                                if _shed % 500 == 1:
+                                    logger.info(
+                                        f"Reasoning shed {_shed} clusters to stay within "
+                                        f"inference capacity (consumer stays current)"
+                                    )
+                                continue
+
                             task = safe_create_task(
                                 sem_process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
                             )
@@ -206,17 +260,37 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                             logger.error(f"Failed parsing reasoning message: {parse_e}", exc_info=True)
                             await producer.send(Topics.DLQ, {"error": str(parse_e), "raw": str(message.value)})
                 if batch_tasks:
-                    results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                    for task_result, original_payload in zip(results, dlq_payloads):
-                        if isinstance(task_result, Exception):
-                            _errors += 1
-                            logger.error(f"Synthesis task failed: {task_result}", exc_info=True)
-                            await producer.send(Topics.DLQ, {"error": str(task_result), "payload": original_payload})
-                        else:
-                            _processed += 1
-                            if task_result is not None:
-                                _scenarios += 1
+                    # Scenario synthesis is multi-pass: a generation, then a
+                    # devil's-advocate critique, each a separate model call of
+                    # several minutes. Awaiting the batch here meant the loop
+                    # stopped polling and committing until every cluster in it
+                    # was fully argued through -- measured stuck at exactly zero
+                    # messages an hour with 161,000 of backlog, while the process
+                    # sat at 0.5% CPU simply waiting.
+                    #
+                    # Work is registered and accounted for on completion instead.
+                    # Concurrency is still bounded by the semaphore inside
+                    # sem_process_cluster, so this does not increase load on the
+                    # model; it only stops the consumer waiting on it.
+                    for task, original_payload in zip(batch_tasks, dlq_payloads):
+                        _inflight.add(task)
+                        task.add_done_callback(_inflight.discard)
+                        task.add_done_callback(
+                            lambda t, p=original_payload: _account_for_synthesis(t, p)
+                        )
+
+                # Committed once the work is accepted rather than once it is
+                # argued. The correlation cluster is already persisted upstream;
+                # what a crash costs is one scenario, which is regenerable.
                 await consumer.commit()
+
+                # Throttle *after* committing, never before. A backlog this size
+                # delivers batches far larger than the in-flight ceiling, so
+                # waiting for capacity first meant blocking before the offset
+                # ever moved -- the stall simply relocated. Committing first lets
+                # the consumer advance; this only paces the next fetch.
+                while len(_inflight) >= MAX_INFLIGHT_SYNTHESES:
+                    await asyncio.wait(set(_inflight), return_when=asyncio.FIRST_COMPLETED)
         
             except Exception as batch_error:
                 logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}", exc_info=True)

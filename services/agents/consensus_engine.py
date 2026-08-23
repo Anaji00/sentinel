@@ -43,6 +43,7 @@ Contradictions are detected when:
 import asyncio
 import json
 import logging
+import time
 import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -287,7 +288,25 @@ class ConsensusEngine(SentinelAgent):
     def output_topic(self) -> str:
         return Topics.CONSENSUS_REPORTS
 
+    # Consensus is a property of the whole swarm's current opinions, not of any
+    # one message. analyze() re-reads every bulletin and every scorecard, so
+    # running it per message meant repeating an identical global computation
+    # thousands of times an hour and re-deriving the same answer -- which is
+    # what held this consumer at a few hundred messages an hour against 61,000
+    # of backlog.
+    #
+    # Messages still trigger it, so a burst of activity is reflected promptly;
+    # they just cannot trigger it more often than the picture can meaningfully
+    # change.
+    _REVIEW_INTERVAL_SEC = 120
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        now = time.monotonic()
+        last = getattr(self, "_last_review_at", 0.0)
+        if now - last < self._REVIEW_INTERVAL_SEC:
+            return None
+        self._last_review_at = now
+
         report = await self.analyze()
         if report.contradictions or report.consensus_signals:
             return report.model_dump()

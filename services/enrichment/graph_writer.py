@@ -23,18 +23,78 @@ from shared.models.ontology import is_valid_predicate, normalize_predicate, is_v
 logger = logging.getLogger("enrichment.graph")
 
 
+# A position fix repeats every few seconds and carries facts that do not change
+# between fixes: an aircraft's registration country, a vessel's flag state. Each
+# repeat was re-proposing the same node and the same edges, and the supervisor
+# MERGEs idempotently, so all of it was work that changed nothing.
+#
+# Measured cost: enrichment fell from 14 events/s to 3.6/s once aviation started
+# writing to the graph, and its backlog became almost entirely aviation -- 39,615
+# of ~40,000. Aviation alone produces ~700 fixes a minute, each previously
+# generating up to three Kafka sends.
+_PROPOSAL_MEMO_MAX = 200_000
+
+
 class GraphWriter:
 
     def __init__(self, producer: SentinelProducer):
         self.producer = producer
+        # Proposals already sent, as (entity, action, target). Bounded because
+        # the aircraft and vessel populations are large and unbounded over time.
+        self._seen: set = set()
+
+    def _already_proposed(self, *parts) -> bool:
+        """True when this exact proposal has been sent before.
+
+        Deliberately in-memory rather than Redis: this is called several times
+        per event on the hottest path in the pipeline, and a round trip per call
+        would cost more than the send it avoids. A restart re-proposes
+        everything once, which is harmless because the writes are idempotent.
+        """
+        key = "|".join(str(p) for p in parts)
+        if key in self._seen:
+            return True
+        if len(self._seen) >= _PROPOSAL_MEMO_MAX:
+            # Cheap bound: drop everything rather than track recency. The next
+            # pass re-proposes each fact once and settles again.
+            self._seen.clear()
+        self._seen.add(key)
+        return False
 
     # ── PHYSICAL ASSETS ────────────────────────────────────────────────────────
+
+    async def _link_region(self, entity_id: str, label: str, region: Optional[str]) -> None:
+        """Emits a location edge only when the asset has entered a new region.
+
+        Registration and flag state are fixed for the life of an asset; its
+        region is not. Keying on the pair means a vessel crossing from the Black
+        Sea into the Turkish Straits proposes once, and every fix in between
+        proposes nothing.
+        """
+        region = (region or "").strip()
+        if not region:
+            return
+        if self._already_proposed("region", entity_id, region):
+            return
+        await self.link_entities(
+            entity_id, "LOCATED_IN", region,
+            properties={"confidence": 1.0},
+            source_label=label, target_label="Region",
+        )
+
+
 
     async def upsert_vessel(self, mmsi: str, data: Optional[Dict[str, Any]] = None):
         """Routes vessel node and flag tags to GraphSupervisor via Kafka."""
         if not mmsi:
             return
         data = data or {}
+        # The node itself is identical on every position fix.
+        if self._already_proposed("vessel", mmsi, data.get("name") or ""):
+            # Region still changes as a vessel moves, so the location edge is
+            # evaluated below on its own key rather than skipped with the node.
+            await self._link_region(mmsi, "Vessel", data.get("region"))
+            return
         try:
             proposal = {
                 "entity_id": str(mmsi).upper(),
@@ -71,13 +131,7 @@ class GraphWriter:
                     source_label="Vessel", target_label="Flag",
                 )
 
-            region = (data.get("region") or "").strip()
-            if region:
-                await self.link_entities(
-                    mmsi, "LOCATED_IN", region,
-                    properties={"confidence": 1.0, "source": "ais"},
-                    source_label="Vessel", target_label="Region",
-                )
+            await self._link_region(mmsi, "Vessel", data.get("region"))
         except Exception as e:
             logger.error(f"Failed to route vessel {mmsi} to Supervisor: {e}")
 
@@ -86,6 +140,9 @@ class GraphWriter:
         if not icao24:
             return
         data = data or {}
+        if self._already_proposed("aircraft", icao24, data.get("callsign") or ""):
+            await self._link_region(icao24, "Aircraft", data.get("region"))
+            return
         try:
             proposal = {
                 "entity_id": str(icao24).upper(),
@@ -108,13 +165,7 @@ class GraphWriter:
                     source_label="Aircraft", target_label="Flag",
                 )
 
-            region = (data.get("region") or "").strip()
-            if region:
-                await self.link_entities(
-                    icao24, "LOCATED_IN", region,
-                    properties={"confidence": 1.0, "source": "adsb"},
-                    source_label="Aircraft", target_label="Region",
-                )
+            await self._link_region(icao24, "Aircraft", data.get("region"))
         except Exception as e:
             logger.error(f"Failed to route aircraft {icao24} to Supervisor: {e}")
 

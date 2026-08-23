@@ -93,6 +93,17 @@ async def run_task_queue_worker(redis_client, agents: dict):
             await asyncio.sleep(1)
 # ── AGENT FACTORY ─────────────────────────────────────────────────────────────
 
+# The heavy agents asked for qwen2.5:7b by name. That image is 4.7 GB and the
+# ollama container is capped at 4 GB with OLLAMA_MAX_LOADED_MODELS=2, so it could
+# never load: every call walked the retry-and-fallback ladder before landing on a
+# small model anyway, paying the full timeout each time.
+#
+# AGENT_MODEL already carries the right choice per tier -- the compose file sets
+# qwen2.5:3b for agents-heavy and qwen2.5:1.5b for agents-fast -- so the tier
+# decides, not a literal buried in this file.
+HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
+
+
 def build_agent(
     AgentClass, 
     agent_name:    str,
@@ -177,7 +188,7 @@ async def main():
         ],
         group_id="agent-macro-intelligence",
         shared_infra=shared_infra,
-        model="qwen2.5:7b",
+        model=HEAVY_MODEL,
         fallback_model="qwen2.5:1.5b",
     )
 
@@ -191,7 +202,7 @@ async def main():
         ],
         group_id="agent-quant-trading",
         shared_infra=shared_infra,
-        model="qwen2.5:7b",
+        model=HEAVY_MODEL,
         fallback_model="qwen2.5:1.5b",
     )
 
@@ -245,7 +256,7 @@ async def main():
         ],
         group_id="supervisor-group",
         shared_infra=shared_infra,
-        model="qwen2.5:7b",
+        model=HEAVY_MODEL,
         fallback_model="qwen2.5:1.5b",
     )
 
@@ -271,7 +282,7 @@ async def main():
         ],
         group_id="agent-adversarial-wargamer",
         shared_infra=shared_infra,
-        model="qwen2.5:7b",
+        model=HEAVY_MODEL,
         fallback_model="qwen2.5:1.5b",
     )
 

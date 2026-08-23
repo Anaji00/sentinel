@@ -12,6 +12,34 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import aiohttp
 from pydantic import BaseModel, Field
 
+from shared.utils.inference_budget import InferenceBudget, InferenceShed
+
+# Ceiling on detached dispatches. Most finish in milliseconds; only the few
+# the inference budget admits run long, so this is rarely approached. It
+# exists so a slow model cannot convert backlog into unbounded memory.
+MAX_INFLIGHT_DISPATCHES = 64
+
+
+def _message_domain(message: Dict[str, Any]) -> str:
+    """Best-effort domain for a message, for inference prioritisation.
+
+    Messages reach the swarm as correlations, briefs, scenarios and raw events,
+    and each names its domain differently. Guessing wrong only changes how long
+    a slot is held, never whether the work is correct, so this reads whatever is
+    present rather than demanding one shape.
+    """
+    for key in ("primary_domain", "domain", "source_domain"):
+        value = message.get(key)
+        if value:
+            return str(value)
+    # Event types encode the domain in their prefix: "headline", "equity_block",
+    # "vessel_position", "flight_anomaly".
+    event_type = message.get("type") or message.get("event_type")
+    if event_type:
+        return str(event_type)
+    source = message.get("source")
+    return str(source) if source else ""
+
 from shared.utils.ollama import (
     OllamaClient, SchemaViolationError, InferenceError,
     OLLAMA_MODEL, OLLAMA_FALLBACK_MODEL, OLLAMA_URL
@@ -162,6 +190,16 @@ class SentinelAgent(ABC):
             self.logger.info(f"{self.name} cancelled — shutting down")
         finally:
             heartbeat_task.cancel()
+            # Dispatches now outlive the loop that started them, so give them a
+            # bounded chance to finish before the HTTP session they are using is
+            # closed underneath them. Anything still running after this is
+            # cancelled rather than left to fail noisily on a dead session.
+            inflight = set(getattr(self, "_inflight", set()))
+            if inflight:
+                self.logger.info(f"Draining {len(inflight)} in-flight dispatches...")
+                done, pending = await asyncio.wait(inflight, timeout=30)
+                for task in pending:
+                    task.cancel()
             if self._session:
                 await self._session.close()
             await self._consumer.close()
@@ -171,6 +209,7 @@ class SentinelAgent(ABC):
 
     async def _consume_loop(self):
         loop = asyncio.get_running_loop()
+        self._inflight: set = getattr(self, "_inflight", set())
         while True:
             try:
                 batches = await self._consumer.get_batch(timeout_ms=1000)
@@ -191,16 +230,41 @@ class SentinelAgent(ABC):
                             self.logger.error(f"POISON PILL dropped: {e}")
                             await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
 
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r, msg in zip(results, msg_list):
-                        if isinstance(r, Exception):
-                            self.logger.error(f"Dispatch task failed with unhandled exception: {r}", exc_info=r)
-                            try:
-                                payload = json.loads(msg.value.decode('utf-8'))
-                            except Exception:
-                                payload = {"raw": str(msg.value)}
-                            topic_name = tp.topic if hasattr(tp, 'topic') else (self.input_topics[0] if self.input_topics else "unknown")
-                            await self._send_dlq(payload, f"UnhandledException: {type(r).__name__}: {str(r)}", topic_name)
+                    # Reading is decoupled from thinking. Awaiting the batch here
+                    # meant one slow inference froze the loop: a single measured
+                    # call took 482 seconds, during which this consumer neither
+                    # polled nor committed, so its lag grew while it sat idle
+                    # holding one message. Agents that never call a model were
+                    # stalled by agents that did.
+                    #
+                    # Tasks now run detached and are accounted for as they finish.
+                    # Nothing about an agent's own logic changes -- the same
+                    # handler runs with the same model on the same message -- only
+                    # who waits for it.
+                    topic_name = tp.topic if hasattr(tp, "topic") else (
+                        self.input_topics[0] if self.input_topics else "unknown"
+                    )
+                    for task, msg in zip(tasks, msg_list):
+                        self._inflight.add(task)
+                        task.add_done_callback(self._inflight.discard)
+                        task.add_done_callback(
+                            lambda t, m=msg, tn=topic_name: self._account_for(t, m, tn)
+                        )
+
+                    # Bounded, so a slow model cannot turn unread backlog into
+                    # unbounded memory. Waiting for the *first* completion rather
+                    # than all of them keeps the loop moving as soon as capacity
+                    # frees up.
+                    while len(self._inflight) >= MAX_INFLIGHT_DISPATCHES:
+                        await asyncio.wait(
+                            set(self._inflight), return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                # Committed once the work is accepted rather than once it is
+                # finished. The at-least-once guarantee is deliberately not
+                # extended to model output: the event itself is already persisted
+                # and correlated upstream, so a crash mid-inference loses one
+                # opinion, which is what the budget sheds by design anyway.
                 try:
                     await self._consumer.commit()
                 except Exception as commit_err:
@@ -211,6 +275,36 @@ class SentinelAgent(ABC):
             except Exception as e:
                 self.logger.error(f"Consume loop error: {e}", exc_info=True)
                 await asyncio.sleep(5)
+
+    def _account_for(self, task: "asyncio.Task", msg, topic_name: str) -> None:
+        """Records the outcome of a detached dispatch.
+
+        Runs on the event loop as each task finishes, so the consume loop never
+        waits on it. The DLQ send is itself scheduled rather than awaited,
+        because a done-callback cannot await.
+        """
+        if task.cancelled():
+            return
+        err = task.exception()
+        if err is None:
+            return
+        if isinstance(err, InferenceShed):
+            # Capacity, not failure: no DLQ, no error counter.
+            self._shed = getattr(self, "_shed", 0) + 1
+            if self._shed % 1000 == 1:
+                self.logger.info(
+                    "%s: shed %s messages to stay within the inference budget",
+                    self.name, self._shed,
+                )
+            return
+        self.logger.error(f"Dispatch task failed with unhandled exception: {err}", exc_info=err)
+        try:
+            payload = json.loads(msg.value.decode("utf-8"))
+        except Exception:
+            payload = {"raw": str(msg.value)}
+        asyncio.create_task(
+            self._send_dlq(payload, f"UnhandledException: {type(err).__name__}: {err}", topic_name)
+        )
 
     async def _dispatch(self, raw: Dict[str, Any]):
         async with self._dispatch_semaphore:
@@ -870,6 +964,21 @@ class SentinelAgent(ABC):
             self.logger.error(f"Failed to fetch global context: {e}")
             return ""
 
+    @property
+    def _inference_budget(self) -> InferenceBudget:
+        """Model-scoped budget, created on first use and shared through Redis."""
+        budget = getattr(self, "_budget_instance", None)
+        if budget is None:
+            # getattr rather than attribute access: agents are sometimes built
+            # partially (tests, out-of-band dispatch) and a budget that raises
+            # on a missing model would break callers that never reach a model.
+            budget = InferenceBudget(
+                getattr(self, "redis", None),
+                getattr(self, "model", None) or "default",
+            )
+            self._budget_instance = budget
+        return budget
+
     async def _execute_with_telemetry(
         self,
         message: dict,
@@ -882,6 +991,19 @@ class SentinelAgent(ABC):
         num_predict: Optional[int] = None,
     ) -> Any:
         
+        # Budget first: before telemetry, before the producer starts, before any
+        # work at all. One inference on this host measured 482 seconds, so the
+        # swarm can perform roughly 180 a day against an input of tens of
+        # thousands. Without a limit each agent queued behind an eight-minute
+        # call, committed nothing, and its consumer fell further behind than it
+        # advanced -- 395,000 messages of backlog on one topic alone.
+        #
+        # The budget is shared per model, not per agent: these processes talk to
+        # one single-threaded Ollama, so a per-agent limit would multiply by the
+        # number of agents and rebuild the queue it exists to prevent.
+        if not await self._inference_budget.try_acquire(domain=_message_domain(message)):
+            raise InferenceShed(self.name, model or self.model)
+
         start_time = time.monotonic()
         # Fallback to a UUID if no event_id is present (e.g., scheduled tasks)
         run_id = message.get("event_id", str(uuid.uuid4())[:8])

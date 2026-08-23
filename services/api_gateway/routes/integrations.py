@@ -149,7 +149,11 @@ KEYLESS_SOURCES = [
 ]
 
 
-@router.get("", dependencies=[Depends(require_role(Role.VIEWER))])
+# ADMIN, not VIEWER. This reports which upstreams are configured and which
+# environment variables are missing -- deployment reconnaissance, not a
+# product feature. It was readable by any signed-in user, which became
+# "readable by anyone" the moment open signup went live.
+@router.get("", dependencies=[Depends(require_role(Role.ADMIN))])
 async def list_integrations():
     """Configuration status for every upstream, with remediation guidance.
 

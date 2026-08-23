@@ -26,6 +26,7 @@ Theory:
     explode). We enforce this during fitting.
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -330,6 +331,9 @@ class CrossDomainHawkesCorrelator:
     """
 
     # Refit interval: 6 hours (in seconds)
+    # Sized from measurement, not preference: at 250 per domain the fit takes
+    # ~86s, which is 0.4% of a six-hour interval. Raising it is quadratic.
+    MAX_EVENTS_PER_DOMAIN_FOR_FIT = 250
     REFIT_INTERVAL = 6 * 3600
     # History window for fitting: 7 days
     FIT_WINDOW_HOURS = 168
@@ -474,8 +478,33 @@ class CrossDomainHawkesCorrelator:
                 logger.info(f"Hawkes refit skipped: only {total} events (need {self.MIN_EVENTS_FOR_FIT})")
                 return None
 
-            logger.info(f"Hawkes MLE refit starting with {total} events across {len(event_streams)} domains")
-            result = self._mle.fit(event_streams)
+            # Bound the input. The fit is O(n^2) in events and was handed the
+            # entire 7-day history, which only grows: measured at 800 events it
+            # takes 16s, at 3,200 it takes 218s, and at the 23,055 it was
+            # actually given, roughly three hours. With a six-hour refit
+            # interval that is half the service's life spent inside one call.
+            #
+            # Trimming to the most recent events per domain is sound rather than
+            # merely expedient: the excitation kernel decays as exp(-beta*dt) and
+            # the inner loop already ignores anything older than 5/beta, so older
+            # events inform only the baseline rate, which a recent sample
+            # estimates perfectly well. Measured across 1,200 / 2,000 / 2,400
+            # events the fitted spectral radius was identical.
+            trimmed = {
+                domain: timestamps[-self.MAX_EVENTS_PER_DOMAIN_FOR_FIT:]
+                for domain, timestamps in event_streams.items()
+            }
+            kept = sum(len(v) for v in trimmed.values())
+            logger.info(
+                f"Hawkes MLE refit starting with {kept} of {total} events across "
+                f"{len(event_streams)} domains (capped at {self.MAX_EVENTS_PER_DOMAIN_FOR_FIT}/domain)"
+            )
+
+            # Off the event loop. This is several seconds to minutes of pure
+            # Python arithmetic; run inline it stopped the correlation engine
+            # consuming altogether -- zero events a minute, no log output, and
+            # 250,000 messages of backlog while the CPU sat pinned at 93%.
+            result = await asyncio.to_thread(self._mle.fit, trimmed)
             self._fit_result = result
             self._branching_ratios = result.get("branching_ratios", {})
 

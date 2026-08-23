@@ -68,21 +68,17 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { email, password, apiKey } = body;
+    const { email, password } = body;
 
-    const gatewayKey = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
-
+    // The master gateway key is deliberately NOT accepted here. It exists for
+    // service-to-service calls, and letting it mint a browser session meant
+    // anyone who learned or guessed it held an ADMIN account -- with a form on
+    // the public sign-in page inviting them to try.
     let isAuthenticated = false;
     let sessionEmail = ADMIN_EMAIL;
     let account: Record<string, unknown> | null = null;
 
-    if (apiKey) {
-      // Only accept an API-key login when a gateway key is actually configured,
-      // so an unset key can never match an empty-string submission.
-      if (gatewayKey && apiKey === gatewayKey) {
-        isAuthenticated = true;
-      }
-    } else if (email && password) {
+    if (email && password) {
       // Credentials are verified by the gateway against scrypt hashes in the
       // users table. This route used to compare a plaintext ADMIN_PASSWORD held
       // in the environment of a public-facing web process, which allowed exactly

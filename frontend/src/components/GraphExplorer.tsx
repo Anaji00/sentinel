@@ -157,7 +157,11 @@ function classifyEpistemicCategory(rel: string): 'statistical' | 'structural' | 
 }
 
 export default function GraphExplorer({ entityId: initialEntity }: { entityId?: string }) {
-    const [mode, setMode] = useState<'1hop' | '2hop' | 'path'>('1hop');
+    // 'overview' is the default: the explorer used to open empty and demand a
+    // pick from a dropdown of alphabetically-first hex wallet addresses, which
+    // reads as broken even with 19,000 nodes behind it.
+    const [mode, setMode] = useState<'overview' | '1hop' | '2hop' | 'path'>('overview');
+    const [labelFilter, setLabelFilter] = useState<string>('');
     const [categoryFilter, setCategoryFilter] = useState<EpistemicCategory>('all');
     const [minDecayedWeight, setMinDecayedWeight] = useState<number>(0.10);
     
@@ -166,6 +170,20 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
         '/graph/entities',
         fetcher,
         { refreshInterval: 10000 }
+    );
+
+    // The whole graph, ranked by connectivity, with the edges between what it
+    // returns. Only fetched in overview mode so the hop views are unaffected.
+    const { data: networkData } = useSWR<{
+        nodes: Array<{ id: string; name: string; type: string; degree: number }>;
+        edges: Array<{ source: string; target: string; relationship: string; weight: number }>;
+        labels: string[];
+    }>(
+        mode === 'overview'
+            ? `/graph/network?limit=45${labelFilter ? `&label=${encodeURIComponent(labelFilter)}` : ''}`
+            : null,
+        fetcher,
+        { refreshInterval: 30000 }
     );
 
     // Dynamic SWR fetch for streaming events
@@ -209,9 +227,55 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
     const [isLoading, setIsLoading] = useState(false);
     const [pathResultMsg, setPathResultMsg] = useState<string>('');
 
+    // Overview: lay the returned subgraph out radially, hubs first. Kept separate
+    // from the hop/path effect below because it needs no entity selection at all.
+    useEffect(() => {
+        if (mode !== 'overview') return;
+        const ns = networkData?.nodes || [];
+        const es = networkData?.edges || [];
+        if (!ns.length) {
+            setNodes([]);
+            setEdges([]);
+            return;
+        }
+        const present = new Set(ns.map((n) => n.id));
+        const cx = 460, cy = 300;
+        const laidOut: Node[] = ns.map((n, i) => {
+            // Ring by rank: the most connected sit near the centre, where the eye
+            // starts, rather than being scattered by insertion order.
+            const ring = i === 0 ? 0 : i < 9 ? 1 : i < 25 ? 2 : 3;
+            const inRing = i === 0 ? 1 : ring === 1 ? 8 : ring === 2 ? 16 : Math.max(1, ns.length - 25);
+            const idx = i === 0 ? 0 : ring === 1 ? i - 1 : ring === 2 ? i - 9 : i - 25;
+            const angle = (2 * Math.PI * idx) / inRing;
+            const radius = ring * 150;
+            return {
+                id: n.id,
+                data: { label: `${n.name}${n.degree ? `  ·${n.degree}` : ''}` },
+                position: { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) },
+                style: getNodeStyle(n.id, n.type, i === 0),
+            };
+        });
+        setNodes(laidOut);
+        setEdges(
+            es
+                .filter((e) => present.has(e.source) && present.has(e.target))
+                .map((e, i) => ({
+                    id: `ov-${i}-${e.source}-${e.target}`,
+                    source: e.source,
+                    target: e.target,
+                    label: e.relationship,
+                    animated: false,
+                    style: { stroke: '#3b82f6', strokeWidth: Math.min(3, 0.5 + e.weight) },
+                    labelStyle: { fill: '#94a3b8', fontSize: 8 },
+                }))
+        );
+        setEdgeMetadataMap({});
+    }, [mode, networkData]);
+
     // Fetch and build graph network
     useEffect(() => {
         const fetchGraphData = async () => {
+            if (mode === 'overview') return;
             if (!targetEntity && mode !== 'path') return;
             if ((!sourceEntity || !destinationEntity) && mode === 'path') return;
 
@@ -501,6 +565,12 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                     {/* Mode Toggles */}
                     <div className="flex bg-slate-900 rounded-lg p-0.5 border border-slate-800 text-[10px]">
                         <button
+                            onClick={() => setMode('overview')}
+                            className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer ${mode === 'overview' ? 'bg-emerald-400 text-slate-950' : 'text-slate-400 hover:text-white'}`}
+                        >
+                            OVERVIEW
+                        </button>
+                        <button
                             onClick={() => setMode('1hop')}
                             className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer ${mode === '1hop' ? 'bg-[#00f2fe] text-[#06080d]' : 'text-slate-400 hover:text-white'}`}
                         >
@@ -520,8 +590,25 @@ export default function GraphExplorer({ entityId: initialEntity }: { entityId?: 
                         </button>
                     </div>
 
+                    {/* In overview the graph needs no entity, but it does need a way
+                        to reach domains the hubs do not touch: crypto wallets dominate
+                        by degree, so vessels and flags are invisible without this. */}
+                    {mode === 'overview' && (
+                        <select
+                            value={labelFilter}
+                            onChange={(e) => setLabelFilter(e.target.value)}
+                            className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-[10px] text-slate-200"
+                            aria-label="Filter by entity type"
+                        >
+                            <option value="">ALL TYPES</option>
+                            {(networkData?.labels || []).map((l) => (
+                                <option key={l} value={l}>{l.toUpperCase()}</option>
+                            ))}
+                        </select>
+                    )}
+
                     {/* Search Form */}
-                    {mode !== 'path' ? (
+                    {mode !== 'path' && mode !== 'overview' ? (
                         <form onSubmit={handleSearch} className="flex items-center gap-1.5">
                             <div className="relative">
                                 <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2" />

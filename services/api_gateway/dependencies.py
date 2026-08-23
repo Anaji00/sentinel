@@ -332,10 +332,19 @@ def require_pro(feature: str):
 
     async def _gate(request: _Request):
         from shared.utils.accounts import PRO_FEATURES, account_from_row
+        from shared.utils.stripe_client import billing_enabled
 
         if feature not in PRO_FEATURES:
             # A typo in a gate name must not silently grant access.
             raise HTTPException(status_code=500, detail=f"Unknown gated feature {feature!r}.")
+
+        # While payments are switched off the whole platform is free, including
+        # the reasoning tier. Charging is the only thing a paywall is for, so
+        # gating without it would deny people features nobody can pay for.
+        # Tied to the same switch as billing so the two can never disagree:
+        # turning payments on restores every gate in one move.
+        if not billing_enabled():
+            return True
 
         identity = getattr(getattr(request, "state", None), "identity", "") or ""
         # An API key is the operator's own credential, not a subscriber session;

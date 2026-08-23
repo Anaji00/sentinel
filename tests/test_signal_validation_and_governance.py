@@ -396,8 +396,18 @@ def test_api_gateway_feature_flags_routes():
     admin_cookies = {"sentinel_session": create_jwt_token({"sub": "admin-user"}, role="ADMIN")}
     viewer_cookies = {"sentinel_session": create_jwt_token({"sub": "viewer-user"}, role="VIEWER")}
 
-    # 1. GET /api/v1/flags allows VIEWER
+    # 1. GET /api/v1/flags is ADMIN-only.
+    #
+    # This asserted VIEWER access, which was right when every account was a
+    # trusted colleague. Open signup changed the premise: VIEWER now means
+    # anyone on the internet who filled in a form. The payload is operational
+    # control surface -- master kill-switch state with its operator-written
+    # `reason` string, per-signal rollout percentages, and ticker whitelists --
+    # so reading it is reconnaissance, not a product feature.
     res = client.get("/api/v1/flags", cookies=viewer_cookies)
+    assert res.status_code == 403, "flag state must not be readable by a signed-up stranger"
+
+    res = client.get("/api/v1/flags", cookies=admin_cookies)
     assert res.status_code == 200
     data = res.json()
     assert "signals" in data

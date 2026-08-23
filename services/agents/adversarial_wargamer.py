@@ -42,6 +42,67 @@ class WargameSimulationOutput(BaseModel):
     remediation_recommendation: str
 
 
+# Tiers that justify four model calls. WATCH and ALERT are the routine end of the
+# scale and make up the bulk of the stream; simulating them would mean the
+# genuinely serious clusters wait behind them.
+_SIMULATION_WORTHY_TIERS = frozenset({"ELEVATED", "INTELLIGENCE", "CRITICAL"})
+
+# Floor for anything arriving without a tier (news, briefs, scenarios).
+_MIN_CONFIDENCE_TO_SIMULATE = 0.70
+
+
+# Position fixes and their kin. These arrive in the tens of thousands per hour,
+# describe nothing to simulate, and are already capped at 0.15 anomaly by the
+# enricher that produced them.
+_ROUTINE_TELEMETRY_PREFIXES = ("vessel", "flight", "aircraft", "maritime", "aviation", "radar")
+
+
+def _is_routine_telemetry(message: Dict[str, Any]) -> bool:
+    """True for high-volume positional telemetry carrying no situation."""
+    for key in ("type", "event_type", "primary_domain", "domain", "source"):
+        value = message.get(key)
+        if not value:
+            continue
+        token = str(value).strip().lower()
+        if token.startswith(_ROUTINE_TELEMETRY_PREFIXES):
+            return True
+    return False
+
+
+def _is_worth_simulating(message: Dict[str, Any]) -> bool:
+    """Whether this message earns an adversarial simulation.
+
+    Deliberately permissive about *shape* and strict about *significance*: the
+    agent consumes correlations, briefs, scenarios and raw news, which carry
+    their severity under different names.
+    """
+    tier = str(message.get("alert_tier") or "").upper()
+    if tier:
+        return tier in _SIMULATION_WORTHY_TIERS
+
+    for key in ("confidence_score", "anomaly_score", "severity_score"):
+        value = message.get(key)
+        if value is not None:
+            try:
+                return float(value) >= _MIN_CONFIDENCE_TO_SIMULATE
+            except (TypeError, ValueError):
+                continue
+
+    # Severity as an integer scale (intel briefs use 1-5).
+    severity = message.get("severity")
+    if severity is not None:
+        try:
+            return float(severity) >= 4
+        except (TypeError, ValueError):
+            pass
+
+    # Nothing stated a severity. Rejecting outright was too blunt: a news
+    # headline about export controls on a named company carries no tier and is
+    # exactly what this agent exists for. What the expensive path must never be
+    # spent on is routine telemetry, so that is what gets excluded by name.
+    return not _is_routine_telemetry(message)
+
+
 class AdversarialWargamerAgent(SentinelAgent):
     """
     Agentic game-theory simulation engine.
@@ -87,6 +148,27 @@ class AdversarialWargamerAgent(SentinelAgent):
                 entity_ids = ["GLOBAL_SYS"]
             else:
                 return None
+
+        # A wargame costs four model calls -- three persona turns and an
+        # arbitration -- so at swarm capacity it needs four budget slots, or
+        # about forty minutes. Running one per inbound message was never
+        # possible: every message paid a Neo4j subgraph query, a Redis fetch and
+        # three shed persona attempts, then logged "WARGAME SKIPPED" and threw
+        # the work away. That is what held this consumer at 384 messages an hour.
+        #
+        # Two gates, cheapest first.
+
+        # (a) Is it worth simulating? A wargame is an expensive opinion about a
+        #     serious situation; running it on routine chatter spends the swarm's
+        #     scarcest resource on noise.
+        if not _is_worth_simulating(message):
+            return None
+
+        # (b) Is there capacity at all? Peeking does not claim the slot -- the
+        #     atomic claim still happens at the inference call -- it just avoids
+        #     building context for work that cannot run.
+        if not await self._inference_budget.is_available():
+            return None
 
         self.logger.info(f"⚔️ WARGAME SIMULATION | Targets: {entity_ids} | Description: {description[:70]}...")
 

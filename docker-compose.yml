@@ -222,7 +222,10 @@ services:
     build:
       context: .
       dockerfile: ml.Dockerfile
-    container_name: sentinel-enrichment
+    # No fixed container_name: enrichment is the pipeline's throughput ceiling and
+    # must be scalable with `docker compose up -d --scale enrichment=N`, which
+    # Docker refuses for a service with a fixed name. Nothing references it by
+    # name -- addressing is by service name on the compose network.
     command: python services/enrichment/main.py
     env_file: .env
     volumes:
@@ -232,7 +235,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
+          # Raised from 1.5. Enrichment was the narrowest point in the pipeline
+          # at ~12 events/s against 22/s of production, and it is CPU-bound:
+          # scoring, sanctions matching and payload construction per event.
+          cpus: '4.0'
           memory: 1.5G
     depends_on:
       migrator:
@@ -260,7 +266,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
+          # Raised from 1.5. Correlation is CPU-bound on sentence-transformer
+          # encoding (~945ms/event single, ~454ms batched) and was pinned at its
+          # ceiling while its lag grew.
+          cpus: '3.0'
           memory: 1.5G
     depends_on:
       kafka:

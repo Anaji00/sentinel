@@ -6,13 +6,11 @@ import { useRouter } from 'next/navigation';
 
 export default function LoginPage() {
   const router = useRouter();
-  const [authMode, setAuthMode] = useState<'credentials' | 'apikey'>('credentials');
   // Empty by default. Prefilling the configured admin address discloses a valid
   // account name to anyone who loads the login page, and hardcodes one
   // deployment's operator into the build.
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [apiKey, setApiKey] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -23,7 +21,7 @@ export default function LoginPage() {
     setErrorMsg(null);
 
     try {
-      const payload = authMode === 'credentials' ? { email, password } : { apiKey };
+      const payload = { email, password };
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -69,36 +67,8 @@ export default function LoginPage() {
           </p>
         </div>
 
-        {/* Mode Selector Tabs */}
-        <div className="flex bg-slate-950/80 p-1 rounded-xl border border-slate-800 text-xs">
-          <button
-            type="button"
-            onClick={() => setAuthMode('credentials')}
-            className={`flex-1 py-2 rounded-lg font-bold transition-all ${
-              authMode === 'credentials'
-                ? 'bg-cyan-950 text-cyan-400 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,242,254,0.2)]'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            CREDENTIALS
-          </button>
-          <button
-            type="button"
-            onClick={() => setAuthMode('apikey')}
-            className={`flex-1 py-2 rounded-lg font-bold transition-all ${
-              authMode === 'apikey'
-                ? 'bg-cyan-950 text-cyan-400 border border-cyan-500/40 shadow-[0_0_15px_rgba(0,242,254,0.2)]'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            API KEY
-          </button>
-        </div>
-
         {/* Authentication Form */}
         <form onSubmit={handleSubmit} className="space-y-4 text-xs">
-          {authMode === 'credentials' ? (
-            <>
               <div>
                 <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Corporate Email</label>
                 <input
@@ -123,21 +93,6 @@ export default function LoginPage() {
                   required
                 />
               </div>
-            </>
-          ) : (
-            <div>
-              <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Master API Gateway Key</label>
-              <input
-                type="text"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                className="w-full mt-1.5 bg-slate-950/90 border border-slate-800 focus:border-[#00f2fe] rounded-xl px-4 py-3 text-cyan-300 font-mono outline-none transition-colors"
-                placeholder="sentinel-key-..."
-                required
-              />
-              <p className="text-[10px] text-slate-500 mt-1">Validates X-API-KEY header across REST & WebSocket subscriptions.</p>
-            </div>
-          )}
 
           {errorMsg && (
             <div className="p-3 rounded-xl bg-red-950/80 border border-red-500/40 text-red-300 text-[11px] font-semibold">

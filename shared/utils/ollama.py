@@ -31,10 +31,27 @@ OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
 
 # How long ollama holds a model in RAM after a request. Mirrors the server-side
-# OLLAMA_KEEP_ALIVE so the client does not contradict it. "-1" pins the model
-# permanently, which is the right trade on a CPU-only host with memory to spare:
-# a cold load costs ~15s, and the agent tiers are called in bursts.
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
+# OLLAMA_KEEP_ALIVE so the client does not contradict it. Pinning permanently is
+# the right trade on a CPU-only host with memory to spare: a cold load costs
+# ~15s and the agent tiers are called in bursts.
+#
+# The env var and the REST field do NOT share a grammar. The server accepts the
+# string "-1" to mean forever; the API's `keep_alive` field parses a *duration*,
+# so "-1" fails with `time: missing unit in duration "-1"` and the request 400s.
+# As a JSON number it is valid, and negative still means forever. Sending the
+# env var through verbatim took the entire reasoning tier down: every inference
+# returned 400, each agent burned its retry and fallback ladder on it, and the
+# consumers wedged -- 0 messages/minute across every topic that calls a model.
+def _coerce_keep_alive(raw: str):
+    """Duration strings pass through; bare numbers become JSON numbers."""
+    value = str(raw).strip()
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+OLLAMA_KEEP_ALIVE = _coerce_keep_alive(os.getenv("OLLAMA_KEEP_ALIVE", "5m"))
 # Dynamic timeout: Enforce 1200 seconds (20 mins) to allow local CPU/GPU heavy LLM inference completion
 _raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "1200.0"))
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))

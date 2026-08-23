@@ -41,6 +41,13 @@ logger = logging.getLogger("correlation.soft")
 
 # Default similarity threshold — used as initial prior before conformal calibration.
 # Once calibrated, the ConformalSimilarityCalibrator's threshold replaces this.
+# Versioned deliberately. Vectors written before the embedding text was
+# corrected carry ~0.27 of similarity contributed purely by a shared sentence
+# frame; comparing them against corrected ones would be worse than either
+# alone. A new collection separates them without deleting anything -- the old
+# one can be dropped once nothing needs it.
+EVENT_COLLECTION = "sentinel_events_v2"
+
 SIMILARITY_THRESHOLD_DEFAULT = 0.65
 
 
@@ -183,7 +190,7 @@ class SoftCorrelator:
 
                 qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
                 self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
-                for collection in ["sentinel_events", "sentinel_concepts"]:
+                for collection in [EVENT_COLLECTION, "sentinel_concepts"]:
                     exists = await self._client.collection_exists(collection)
                     if not exists:
                         try:
@@ -218,6 +225,22 @@ class SoftCorrelator:
                 logger.debug(f"Retry connect failed: {e}")
             backoff = min(backoff * 2, 60)
         
+    def _describe(self, event: NormalizedEvent) -> str:
+        """The text an event is embedded as.
+
+        Shared by the single and batch paths on purpose: two spellings of this
+        would produce vectors that are not comparable with each other, which is
+        the same defect as the sentence frame this replaced.
+        """
+        parts = [
+            event.headline or "",
+            event.primary_entity.name if event.primary_entity else "",
+            event.region or "",
+        ]
+        if event.primary_entity and event.primary_entity.flags:
+            parts.append(" ".join(str(f) for f in event.primary_entity.flags))
+        return ". ".join(p for p in parts if p).strip() or str(event.type.value)
+
     async def embed_event(self, event: NormalizedEvent) -> Optional[List[float]]:
         """Convert event to embedding vector for similarity search."""
         """Convert event to embedding vector without freezing the event loop."""
@@ -227,7 +250,17 @@ class SoftCorrelator:
             # 1. Native Semantic Formatting
             # LLM translation is too slow for real-time telemetry streaming and causes Ollama timeouts.
             # We use native f-strings to build a dense semantic representation for the embedding model.
-            natural_language_desc = f"Event of type {event.type.value} involving {event.primary_entity.name} in {event.region}. Flags: {event.primary_entity.flags}. Description: {event.headline}"
+            # Content only. Every event previously carried the same sentence
+            # frame -- "Event of type X involving Y in Z. Flags: [...].
+            # Description: ..." -- and that shared scaffolding dominated the
+            # embedding. Measured on this model, four deliberately unrelated
+            # cross-domain events scored a mean cosine similarity of 0.453 with
+            # the frame and 0.186 without it: the wrapper alone contributed
+            # ~0.27 of apparent similarity between events that have nothing in
+            # common. Against a 0.65 threshold and a corpus this large, every
+            # event could find some neighbour above the bar, which is how 93.5%
+            # of events came to fire a "correlation".
+            natural_language_desc = self._describe(event)
             loop = asyncio.get_running_loop()
             try:
                 encode_func = partial(self._model.encode, show_progress_bar=False)
@@ -237,6 +270,41 @@ class SoftCorrelator:
                 logger.error(f"Error embedding event {event.event_id}: {e}")
                 return None
         
+    async def embed_events(self, events: List[NormalizedEvent]) -> Dict[str, List[float]]:
+        """Encodes many events in one pass, keyed by event_id.
+
+        The encoder is the dominant cost on the correlation hot path. Measured on
+        this host with all-mpnet-base-v2: ~945ms per event called one at a time,
+        ~454ms when batched -- a 2.08x difference for the same model and the same
+        vectors. Per-event calls left the engine consuming 475 events/min against
+        623/min of production.
+
+        Returns only what encoded successfully; callers fall back to the
+        single-event path for anything missing.
+        """
+        if not self._enabled or not events:
+            return {}
+
+        texts, ids = [], []
+        for event in events:
+            try:
+                texts.append(self._describe(event))
+                ids.append(str(event.event_id))
+            except Exception:
+                continue
+        if not texts:
+            return {}
+
+        async with self._embed_semaphore:
+            loop = asyncio.get_running_loop()
+            try:
+                encode = partial(self._model.encode, batch_size=32, show_progress_bar=False)
+                vectors = await loop.run_in_executor(None, encode, texts)
+                return {eid: vec.tolist() for eid, vec in zip(ids, vectors)}
+            except Exception as e:
+                logger.error(f"Batch embedding failed for {len(texts)} events: {e}")
+                return {}
+
     async def store(self, event: NormalizedEvent, embedding: List[float]):
         """Store event embedding in Qdrant with metadata for later retrieval."""
         # Safety check: Do nothing if the system isn't enabled or connected.
@@ -245,7 +313,7 @@ class SoftCorrelator:
         try:
             # 'Upsert' means "Insert if it doesn't exist, Update if it does".
             await self._client.upsert( 
-                collection_name="sentinel_events",
+                collection_name=EVENT_COLLECTION,
                 points = [{
                     # Qdrant requires IDs to be specific formats (like a 16-byte UUID or integer).
                     # We strip the hyphens from our event UUID and take the first 16 characters.
@@ -284,7 +352,7 @@ class SoftCorrelator:
             from qdrant_client.http import models
             # Ask the vector database for points that are closest in semantic meaning.
             results = await self._client.search(
-                collection_name="sentinel_events",
+                collection_name=EVENT_COLLECTION,
                 query_vector=embedding,
                 # We fetch extra results because the filter step (must_not) might remove some.
                 limit=limit + 20,   # fetch extra to filter by domain
