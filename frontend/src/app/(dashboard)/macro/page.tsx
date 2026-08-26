@@ -1,5 +1,5 @@
 import React from 'react';
-import { GraphExplorerIsland, FinancialAdvisorAdviceIsland, BondYieldsChartIsland, PredictionMarketPanelIsland, CyberIntelligencePanelIsland } from './islands';
+import { FinancialAdvisorAdviceIsland, BondYieldsChartIsland, PredictionMarketPanelIsland, CyberIntelligencePanelIsland } from './islands';
 
 export default function MacroPage() {
   return (
@@ -57,12 +57,9 @@ export default function MacroPage() {
         </div>
       </div>
 
-      {/* Graph & Advisor Grid */}
+      {/* Financial Advisor */}
       <div className="grid grid-cols-12 gap-4 min-h-[450px]">
-        <div className="col-span-8 flex flex-col bg-[#090d16] rounded-2xl border border-slate-800 overflow-hidden relative">
-          <GraphExplorerIsland />
-        </div>
-        <div className="col-span-4 flex flex-col bg-[#090d16] rounded-2xl border border-slate-800 overflow-hidden relative">
+        <div className="col-span-12 flex flex-col bg-[#090d16] rounded-2xl border border-slate-800 overflow-hidden relative">
           <FinancialAdvisorAdviceIsland />
         </div>
       </div>

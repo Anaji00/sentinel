@@ -57,8 +57,8 @@ export default function SystemHealthHUD() {
 
       {/* Infrastructure Telemetry Modal */}
       {isOpen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-xl max-w-lg w-full p-5 space-y-4 shadow-[0_0_35px_rgba(0,242,254,0.25)] font-mono text-xs text-slate-200">
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-xl max-w-lg w-full p-5 space-y-4 font-mono text-xs text-slate-200">
             {/* Header */}
             <div className="flex items-center justify-between border-b border-cyan-500/20 pb-3">
               <div className="flex items-center gap-2">

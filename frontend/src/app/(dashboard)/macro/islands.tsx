@@ -6,10 +6,6 @@ import { PanelSkeleton } from '@/components/ui/Skeleton';
 
 /** Client islands for the macro view. */
 
-const GraphExplorer = dynamic(() => import('@/components/GraphExplorer'), {
-  loading: () => <PanelSkeleton title="Loading Macro Knowledge Graph..." />,
-  ssr: false,
-});
 
 const FinancialAdvisorAdvice = dynamic(() => import('@/components/FinancialAdvisorAdvice'), {
   loading: () => <PanelSkeleton title="Loading Macro Risk Advisor..." />,
@@ -30,10 +26,6 @@ const CyberIntelligencePanel = dynamic(() => import('@/components/CyberIntellige
   loading: () => <PanelSkeleton title="Loading Cyber Threat Panel..." />,
   ssr: false,
 });
-
-export function GraphExplorerIsland() {
-  return <GraphExplorer />;
-}
 
 export function FinancialAdvisorAdviceIsland() {
   return <FinancialAdvisorAdvice />;

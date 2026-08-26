@@ -107,7 +107,7 @@ export default function SubscriptionPanel() {
         <p className="text-sm text-slate-300 leading-relaxed">
           {status.has_pro
             ? 'You have the full platform, including the reasoning tier.'
-            : 'The analyst platform is yours in full — every domain, the knowledge graph, and all dashboards. Pro adds the reasoning tier.'}
+            : 'The analyst platform is yours in full — every domain and all dashboards. Pro adds the reasoning tier.'}
         </p>
 
         {!status.has_pro && (

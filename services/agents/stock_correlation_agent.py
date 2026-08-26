@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from shared.utils.equities import split_macro_and_equities
 from shared.kafka import Topics
 from shared.models import NormalizedEvent
 
@@ -142,9 +143,15 @@ class StockCorrelationAgent(SentinelAgent):
                     except (ValueError, TypeError):
                         pass
 
-            # Identify macro/commodity assets vs equities dynamically
-            macro_assets = [t for t in price_map if any(m in t for m in ["WTI", "BRENT", "CL=F", "US10Y", "US02Y", "US2Y", "US30Y", "US30", "SHY", "TLT", "GLD", "VIX", "OIL"])]
-            equities = [t for t in price_map if t not in macro_assets]
+            # Identify macro/commodity assets vs equities.
+            #
+            # Was a substring match against names like "BRENT", "GLD" and "VIX"
+            # while the quote keys hold ticker symbols, so BZ=F (Brent), GC=F
+            # (gold), SI=F (silver), NG=F (gas), ZC=F, ZW=F, ES=F, NQ=F, VXX and
+            # TIP were all classified as equities. On the live quote set that
+            # was 2 macro assets recognised out of 14, with the other 12 sitting
+            # on the equity side of a cross-asset comparison.
+            macro_assets, equities = split_macro_and_equities(list(price_map))
 
             if not macro_assets or not equities:
                 return None

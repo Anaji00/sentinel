@@ -1,5 +1,15 @@
 import React from 'react';
 
+/**
+ * The container every panel renders through.
+ *
+ * Titles were set in uppercase monospace with `tracking-widest` in bright cyan
+ * (#66fcf1) -- the least legible way to set a phrase, in the colour reserved
+ * for things you can click. Sixteen of them competed with each other and with
+ * the data underneath. A panel title is a label, not a signal: it is quiet, and
+ * cyan is left to mean interactive.
+ */
+
 interface CardProps {
   title?: string;
   subtitle?: string;
@@ -20,25 +30,15 @@ export const Card: React.FC<CardProps> = ({
   noPadding = false,
 }) => {
   return (
-    <div
-      className={`glass-panel glass-panel-hover rounded-xl flex flex-col h-full w-full overflow-hidden ${className}`}
-    >
+    <div className={`panel flex flex-col h-full w-full overflow-hidden ${className}`}>
       {(title || badge || headerAction) && (
-        <div className="flex items-center justify-between px-4 py-3 border-b border-cyan-500/10 bg-slate-950/40">
-          <div className="flex items-center gap-2.5">
-            {title && (
-              <h3 className="text-xs font-mono font-bold tracking-widest text-[#66fcf1] uppercase">
-                {title}
-              </h3>
-            )}
-            {subtitle && (
-              <span className="text-[10px] text-slate-400 font-sans">
-                {subtitle}
-              </span>
-            )}
+        <div className="panel-header shrink-0">
+          <div className="flex items-baseline gap-2.5 min-w-0">
+            {title && <h3 className="panel-title truncate">{title}</h3>}
+            {subtitle && <span className="panel-subtitle truncate">{subtitle}</span>}
             {badge}
           </div>
-          {headerAction && <div>{headerAction}</div>}
+          {headerAction && <div className="shrink-0">{headerAction}</div>}
         </div>
       )}
       <div className={`flex-1 flex flex-col min-h-0 overflow-y-auto ${noPadding ? '' : 'p-4'}`}>

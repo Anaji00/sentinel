@@ -79,7 +79,7 @@ export default function DarkPoolFlowPanel() {
   });
 
   return (
-    <Card className="h-full flex flex-col bg-[#06080e]/90 border border-cyan-500/20 backdrop-blur-xl shadow-2xl overflow-hidden font-mono select-none">
+    <Card className="h-full flex flex-col bg-[#06080e]/90 border border-cyan-500/20 shadow-2xl overflow-hidden font-mono">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-cyan-500/20 bg-[#090d18]/80 shrink-0">
         <div className="flex items-center gap-3">
@@ -103,7 +103,7 @@ export default function DarkPoolFlowPanel() {
               onClick={() => setFilterType(t)}
               className={`px-2.5 py-1 rounded-lg font-bold border transition-all cursor-pointer ${
                 filterType === t
-                  ? 'bg-cyan-500/20 text-[#00f2fe] border-[#00f2fe]/60 shadow-[0_0_10px_rgba(0,242,254,0.3)]'
+                  ? 'bg-cyan-500/20 text-[#00f2fe] border-[#00f2fe]/60'
                   : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-white'
               }`}
             >

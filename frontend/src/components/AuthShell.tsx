@@ -22,10 +22,10 @@ export default function AuthShell({
       <div className="absolute -top-40 -left-40 w-96 h-96 bg-cyan-500/15 rounded-full blur-3xl pointer-events-none" />
       <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-purple-500/15 rounded-full blur-3xl pointer-events-none" />
 
-      <div className="relative w-full max-w-md bg-[#090d16]/90 border border-[#00f2fe]/40 rounded-3xl p-8 backdrop-blur-2xl shadow-[0_0_60px_rgba(0,242,254,0.15)] z-10 space-y-6">
+      <div className="relative w-full max-w-md bg-[#090d16]/90 border border-[#00f2fe]/40 rounded-3xl p-8 z-10 space-y-6">
         <div className="text-center space-y-2">
-          <div className="inline-flex h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-950 to-slate-950 border border-[#00f2fe]/60 items-center justify-center shadow-[0_0_30px_rgba(0,242,254,0.5)] mb-2">
-            <span className="text-[#00f2fe] font-black text-2xl tracking-tighter drop-shadow-[0_0_12px_rgba(0,242,254,0.9)]">S</span>
+          <div className="inline-flex h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-950 to-slate-950 border border-[#00f2fe]/60 items-center justify-center mb-2">
+            <span className="text-[#00f2fe] font-black text-2xl tracking-tighter drop-">S</span>
           </div>
           <h1 className="text-xl font-black text-white tracking-widest uppercase">{title}</h1>
           {subtitle && <p className="text-[11px] text-slate-400 font-mono tracking-wide">{subtitle}</p>}

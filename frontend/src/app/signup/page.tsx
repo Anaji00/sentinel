@@ -14,6 +14,8 @@ export default function SignupPage() {
   const [displayName, setDisplayName] = useState('');
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
+  const [emailSent, setEmailSent] = useState(false);
+  const [serverMessage, setServerMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
@@ -38,6 +40,14 @@ export default function SignupPage() {
       } else if (!res.ok) {
         setError(body?.detail || 'Could not create the account. Try again.');
       } else {
+        // The server reports whether a mail actually went out. It deliberately
+        // answers email_sent: false with an explanation when SMTP is not
+        // configured -- "the claim is only made when it is true", as the
+        // handler puts it -- and this page used to discard both fields and
+        // tell every user to check an inbox regardless. On a deployment
+        // without SMTP that is a link that never arrives.
+        setEmailSent(body?.email_sent === true);
+        setServerMessage(typeof body?.message === 'string' ? body.message : null);
         setDone(true);
       }
     } catch {
@@ -49,16 +59,26 @@ export default function SignupPage() {
 
   if (done) {
     return (
-      <AuthShell title="Check your email" subtitle="ONE STEP LEFT">
+      <AuthShell
+        title={emailSent ? 'Check your email' : 'Your account is ready'}
+        subtitle={emailSent ? 'ONE STEP LEFT' : 'NOTHING TO CONFIRM'}
+      >
         <div className="space-y-4 text-sm text-slate-300 leading-relaxed">
-          <p>
-            We sent a confirmation link to <span className="text-cyan-400">{email}</span>. It works
-            for 48 hours.
-          </p>
+          {emailSent ? (
+            <p>
+              We sent a confirmation link to <span className="text-cyan-400">{email}</span>. It
+              works for 48 hours.
+            </p>
+          ) : (
+            <p>
+              {serverMessage ||
+                'Email confirmation is not available on this deployment, so no link was sent. Sign in and use the platform now.'}
+            </p>
+          )}
           <p className="text-slate-400">
             Your account is already active on the free plan — the whole analyst platform, every
-            domain, the knowledge graph and all dashboards. Confirming just proves the address is
-            yours.
+            domain and all dashboards.
+            {emailSent ? ' Confirming just proves the address is yours.' : ''}
           </p>
           <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300 text-sm">
             Go to sign in

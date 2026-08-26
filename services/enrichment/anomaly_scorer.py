@@ -76,6 +76,39 @@ redis.call('SET', var_key, tostring(current_v))
 return results
 """
 
+# BGP hijack scoring. A confirmed hijack starts here and the structural signals
+# decide where in the remaining headroom it lands, so two hijacks stay rankable
+# against each other rather than both sitting on the ceiling.
+HIJACK_BASE_SCORE = 0.70
+
+# Shares of the headroom above the base. They sum to 1.0, so only the most
+# extreme event reaches 1.0.
+HIJACK_NOVELTY_WEIGHT = 0.5
+HIJACK_CENTRALITY_WEIGHT = 0.3
+HIJACK_VELOCITY_WEIGHT = 0.2
+
+
+def _as_float(value):
+    """Redis returns bytes, strings or None; a bad value is not a measurement."""
+    if value is None:
+        return None
+    try:
+        return float(value.decode() if isinstance(value, (bytes, bytearray)) else value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Burst detection. A boost is earned by exceeding an entity's own established
+# rate, not by repeating: the previous implementation added 0.05 per repeat and
+# capped at 0.20, so any entity emitting four or more events in the window
+# scored the maximum forever.
+BURST_RATIO_THRESHOLD = 2.0      # twice its normal rate before anything counts
+FREQUENCY_BOOST_PER_MULTIPLE = 0.05
+FREQUENCY_BOOST_CAP = 0.20
+BASELINE_EMA_ALPHA = 0.25        # slow enough that one odd window is not the new normal
+BASELINE_RETENTION_WINDOWS = 24  # remember an entity's rate for a day of windows
+
+
 class DynamicAnomalyScorer:
     def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
         if redis_client is None:
@@ -499,13 +532,28 @@ class DynamicAnomalyScorer:
         else:
             rrcf_score = 0.5
         
-        # 5. Hijack override: known hijacks always score high regardless of RRCF
-        if is_hijack:
-            rrcf_score = max(rrcf_score, 0.85)
-        
-        # 6. Path novelty boost: never-seen AS-prefix pair is strong hijack signal
-        if graph_features["path_novelty"] > 0.9:
-            rrcf_score = min(1.0, rrcf_score * 1.3)
+        # 5. Blend the structural signals instead of stacking a floor and a
+        #    multiplier into the ceiling.
+        #
+        #    This raised a hijack to a floor of 0.85 and then multiplied a novel
+        #    AS-path by 1.3 -- 1.105, clamped to 1.0. A previously unseen
+        #    AS/prefix pair is novel by definition the first time it appears, so
+        #    virtually every hijack landed on exactly 1.0: measured over 24
+        #    hours, all 1,852 bgp_anomaly events shared a single distinct score.
+        #    A detector whose output never varies ranks nothing.
+        #
+        #    Each signal now takes a bounded share of the headroom above the
+        #    base, so a hijack on a high-centrality AS with a novel path still
+        #    reaches 1.0 while an ordinary one sits well below it, and the two
+        #    stay comparable.
+        base = HIJACK_BASE_SCORE if is_hijack else rrcf_score
+        headroom = max(0.0, 1.0 - base)
+        contribution = (
+            HIJACK_NOVELTY_WEIGHT * min(1.0, float(graph_features.get("path_novelty") or 0.0))
+            + HIJACK_CENTRALITY_WEIGHT * min(1.0, float(graph_features.get("betweenness_centrality") or 0.0))
+            + HIJACK_VELOCITY_WEIGHT * min(1.0, float(velocity or 0.0))
+        )
+        rrcf_score = round(min(1.0, base + headroom * min(1.0, contribution)), 4)
         
         is_significant = await self._check_ema_gatekeeper("bgp_anomaly", rrcf_score)
         
@@ -689,22 +737,73 @@ class DynamicAnomalyScorer:
             return False
 
     async def track_frequency(self, entity_id: str, domain: str, window_seconds: int = 3600) -> float:
-        """
-        Increments a Redis-backed frequency counter for an entity in a given domain over a rolling window.
-        Returns a progressive boost: 0.05 per repeat mention, capped at 0.20.
+        """Boost for an entity behaving unusually *for itself*.
+
+        This used to return 0.05 per repeat within the window, capped at 0.20 --
+        so the fourth and every subsequent event from an entity scored the
+        maximum. That rewards repetition, which is the opposite of what an
+        anomaly detector is for: an address emitting eleven transfers in thirty
+        minutes is the least surprising thing in the stream, and it was earning
+        the largest boost. It also produced a constant: every suspect crypto
+        transfer scored 0.4 + 0.15 + 0.20 = exactly 0.75, across 29,150 events
+        in a day, indistinguishable from one another.
+
+        Burst is now measured against the entity's own rolling baseline. An
+        address that always emits 100 events an hour emitting 100 is not
+        anomalous; one that normally emits 1 and suddenly emits 20 is. A steady
+        stream therefore decays to no boost as the baseline catches up.
         """
         if not self.redis or not entity_id:
             return 0.0
         try:
-            key = f"sentinel:frequency:{domain}:{entity_id.lower()}"
+            ident = entity_id.lower()
+            key = f"sentinel:frequency:{domain}:{ident}"
+            last_key = f"sentinel:frequency:last:{domain}:{ident}"
+            baseline_key = f"sentinel:frequency:baseline:{domain}:{ident}"
+
             pipe = self.redis.raw.pipeline()
             pipe.incr(key)
             pipe.expire(key, window_seconds)
+            pipe.get(baseline_key)
+            pipe.get(last_key)
             results = await pipe.execute()
-            count = results[0]
+
+            count = float(results[0] or 0)
+            baseline = _as_float(results[2])
+            previous_window = _as_float(results[3])
+
+            # The baseline moves only at a window boundary. Updating it on every
+            # event lets it chase the count inside the window, so a burst is
+            # compared against a baseline the burst itself just raised -- which
+            # silently cancels the very signal being measured.
             if count <= 1:
+                folded = (
+                    previous_window if baseline is None
+                    else BASELINE_EMA_ALPHA * previous_window + (1 - BASELINE_EMA_ALPHA) * baseline
+                ) if previous_window is not None else baseline
+                if folded is not None:
+                    baseline = folded
+                    await self.redis.raw.set(
+                        baseline_key, str(round(folded, 4)),
+                        ex=window_seconds * BASELINE_RETENTION_WINDOWS,
+                    )
+
+            await self.redis.raw.set(last_key, str(count), ex=window_seconds * 2)
+
+            # First sighting: nothing to compare against. Calling an unknown
+            # entity anomalous on its first appearance would make every new
+            # entity a maximum-severity event.
+            if baseline is None or baseline <= 0:
                 return 0.0
-            return min(0.20, (count - 1) * 0.05)
+
+            ratio = count / baseline
+            if ratio <= BURST_RATIO_THRESHOLD:
+                return 0.0
+            return round(
+                min(FREQUENCY_BOOST_CAP,
+                    (ratio - BURST_RATIO_THRESHOLD) * FREQUENCY_BOOST_PER_MULTIPLE),
+                4,
+            )
         except Exception:
             return 0.0
 

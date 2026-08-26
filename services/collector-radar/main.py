@@ -215,7 +215,13 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
                         "ticker": ticker,
                         "volume": volume,
                         "close_price": close_price,
-                        "z_score": z_score
+                        "z_score": z_score,
+                        # evaluate_volume() already computed this and refused to
+                        # emit below $150k, then dropped the number. RadarAgent
+                        # re-checks notional against its own $50k floor and read
+                        # a missing key as 0.0, so every anomaly this collector
+                        # raised was discarded one hop later.
+                        "notional_usd": float(volume) * float(close_price),
                     },
                     occurred_at=datetime.now(timezone.utc)
                 )

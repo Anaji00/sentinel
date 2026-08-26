@@ -414,8 +414,8 @@ export default function FinancialAdvisorAdvice() {
 
       {/* Trade Signal Execution Inspector Modal */}
       {selectedPlay && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0b0e17] border border-cyan-400/50 rounded-2xl max-w-xl w-full p-6 space-y-4 shadow-[0_0_50px_rgba(0,242,254,0.3)] font-mono text-xs max-h-[90vh] overflow-y-auto">
+        <div className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
+          <div className="bg-[#0b0e17] border border-cyan-400/50 rounded-2xl max-w-xl w-full p-6 space-y-4 font-mono text-xs max-h-[90vh] overflow-y-auto">
             {/* Modal Header */}
             <div className="flex items-center justify-between border-b border-cyan-500/20 pb-3">
               <div className="flex items-center gap-2">

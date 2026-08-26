@@ -161,6 +161,20 @@ export default function CryptoAnalytics() {
                     {e.headline || e.summary}
                   </p>
 
+                  {/* Rows the browser fetched directly, because the backend
+                      returned nothing for this domain. They carry raw exchange
+                      fields but none of the platform's enrichment, anomaly
+                      scoring or correlation, so they are labelled rather than
+                      presented as Sentinel's own analysis. */}
+                  {e.data_provenance && (
+                    <span
+                      className="mt-1 inline-block rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-300"
+                      title="Fetched directly from the exchange by your browser. Not enriched, scored or correlated by Sentinel."
+                    >
+                      Unenriched · direct feed
+                    </span>
+                  )}
+
                   {/* Contextual Metric Cards for Funding, Basis, & Microstructure */}
                   <div className="mt-2 grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-[10px]">
                     {cd.funding_rate !== undefined && (
@@ -208,7 +222,7 @@ export default function CryptoAnalytics() {
 
       {/* Inspector Modal */}
       {selectedEvent && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 font-mono">
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 font-mono">
           <div className="bg-[#0b0e17] border border-amber-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-[0_0_40px_rgba(245,158,11,0.25)] text-xs text-slate-200">
             <div className="flex items-center justify-between border-b border-amber-500/30 pb-3">
               <div className="flex items-center gap-2">

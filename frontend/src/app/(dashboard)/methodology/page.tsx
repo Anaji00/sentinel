@@ -249,7 +249,7 @@ export default function MethodologyPage() {
         </div>
 
         {/* Detailed Methodology View */}
-        <div className="md:col-span-3 flex flex-col gap-5 bg-slate-900/80 border border-slate-800 rounded-xl p-6 shadow-xl backdrop-blur-sm">
+        <div className="md:col-span-3 flex flex-col gap-5 bg-slate-900/80 border border-slate-800 rounded-xl p-6 shadow-xl">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
             <div>
               <span className="px-2 py-0.5 text-[11px] font-semibold rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 uppercase tracking-wide">

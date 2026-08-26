@@ -9,6 +9,7 @@ Delegates statistical Z-score and RRCF anomaly scoring to AnomalyScorer.
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,6 +17,21 @@ from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, PredictionMarketData
 
 logger = logging.getLogger("enrichment.prediction")
+
+# Exact vocabulary for a two-sided market. "outcome 0"/"outcome 1" are kept only
+# because events collected before the collector read the right field carry those
+# placeholders; new events carry the real names.
+_YES_TOKENS = frozenset({"yes", "y", "true", "1", "outcome 0"})
+_NO_TOKENS = frozenset({"no", "n", "false", "0", "outcome 1"})
+
+
+def _is_binary_outcome_set(outcome_names: list) -> bool:
+    """True only when the market has exactly two sides that mean yes and no."""
+    if not outcome_names or len(outcome_names) != 2:
+        return False
+    lowered = {str(n).strip().lower() for n in outcome_names}
+    return bool(lowered & _YES_TOKENS) and bool(lowered & _NO_TOKENS)
+
 
 class PredictionEnricher:
     def __init__(self, scorer, redis_client, graph_writer):
@@ -58,6 +74,23 @@ class PredictionEnricher:
 
         yes_prob = p.get("yes_probability")
         no_prob = p.get("no_probability")
+        outcome_names = p.get("outcome_names") or []
+        outcome_prices = p.get("outcome_prices") or None
+        is_binary = p.get("is_binary")
+        if is_binary is None:
+            is_binary = _is_binary_outcome_set(outcome_names)
+
+        # A leg of a multi-choice field is still a yes/no bet, and its own
+        # yes/no stays correct. What changes is which distribution is worth
+        # publishing: "Newsom 15 / Kelly 9 / Cuban 4" is the question a reader
+        # is actually asking, and the leg's own {Yes, No} is not.
+        choice_name = p.get("choice_name") or ""
+        choice_prices = p.get("choice_prices") or None
+        choice_space = p.get("choice_space") or []
+        is_multi_choice = bool(p.get("is_multi_choice")) and len(choice_space) >= 2
+        event_slug = p.get("event_slug") or ""
+        if is_multi_choice and choice_prices:
+            outcome_prices = choice_prices
         
         # Track previous probabilities in Redis to compute dynamic delta_p
         delta_p = 0.0
@@ -67,20 +100,45 @@ class PredictionEnricher:
             if prev_price_raw:
                 delta_p = price - float(prev_price_raw)
             await self.redis.raw.set(prev_price_key, str(price), ex=86400)
+            distribution_key = event_slug if (is_multi_choice and event_slug) else slug
+            if outcome_prices:
+                # The whole field's current odds, so a categorical prediction can
+                # later be resolved against what the market settled on. Without
+                # this the resolver has only a single leg's price and no way to
+                # tell which outcome led.
+                await self.redis.raw.set(
+                    f"sentinel:prediction:outcomes:{distribution_key}",
+                    json.dumps(outcome_prices),
+                    ex=7 * 86400,
+                )
         except Exception:
             pass
 
-        # Identify YES vs NO side bid/trade value
+        # Identify YES vs NO side bid/trade value.
+        #
+        # Matched exactly, not by substring: `"no" in outcome` reads "None of the
+        # above", "Another candidate", "Nominee TBD" and "November winner" as NO
+        # bets, and those are ordinary outcome names in a multi-candidate field.
         clean_outcome = outcome.strip().lower()
-        if "yes" in clean_outcome or clean_outcome in ("true", "1", "outcome 0"):
+        if not is_binary and outcome_names:
+            # A buy of a named outcome is conviction in that outcome, the same
+            # relation a YES token has to its question. There is no second side
+            # to attribute the complement to, so none is invented.
             yes_val = notional
             no_val = 0.0
-        elif "no" in clean_outcome or clean_outcome in ("false", "0", "outcome 1"):
+        elif clean_outcome in _YES_TOKENS:
+            yes_val = notional
+            no_val = 0.0
+        elif clean_outcome in _NO_TOKENS:
             no_val = notional
             yes_val = 0.0
         else:
-            yes_val = notional * (float(yes_prob or price or 0.5))
-            no_val = notional * (float(no_prob or (1.0 - price) or 0.5))
+            # `is not None` rather than `or`: 0.0 is a probability the market
+            # actually quoted, and `or` would discard it as though it were absent.
+            y = float(yes_prob) if yes_prob is not None else (price if price else 0.5)
+            n = float(no_prob) if no_prob is not None else (1.0 - price if price else 0.5)
+            yes_val = notional * y
+            no_val = notional * n
 
         # Dynamic anomaly scoring via central AnomalyScorer (RRCF + Z-scores)
         anomaly_res = await self.scorer.score_prediction_anomaly(
@@ -102,20 +160,41 @@ class PredictionEnricher:
         tags = ["prediction_market", slug.lower()]
         display_contract = question if question != "UNKNOWN QUESTION" else slug.upper()
 
+        # For a leg of a field, name the field and the choice. "Will Newsom win
+        # the nomination? YES @ 15%" reads as a coin flip; "2028 Dem nomination
+        # — Newsom @ 15% (2nd of 12)" is the same fact as an analyst would say it.
+        rank_note = ""
+        if is_multi_choice:
+            event_title = p.get("event_title") or ""
+            if event_title:
+                display_contract = event_title
+            if choice_name:
+                ranked = sorted((choice_prices or {}).items(), key=lambda kv: kv[1], reverse=True)
+                position = next(
+                    (i + 1 for i, (n, _) in enumerate(ranked) if n == choice_name), None
+                )
+                if position:
+                    rank_note = f" [{choice_name}: {position} of {len(ranked)}]"
+                else:
+                    rank_note = f" [{choice_name}]"
+
         if z_vol >= 2.5 or (notional > 0 and anomaly_score >= 0.75):
             tags.extend(["large_bid", "whale_bet", "volume_spike"])
-            side_str = "YES" if yes_val > no_val else ("NO" if no_val > yes_val else outcome.upper())
-            headline = f"🐋 LARGE POLYMARKET BID ({side_str}): {display_contract} (${notional:,.2f} @ {(price*100):.1f}%)"
+            if not is_binary and outcome_names:
+                side_str = outcome.upper()
+            else:
+                side_str = "YES" if yes_val > no_val else ("NO" if no_val > yes_val else outcome.upper())
+            headline = f"🐋 LARGE POLYMARKET BID ({side_str}): {display_contract}{rank_note} (${notional:,.2f} @ {(price*100):.1f}%)"
         elif z_prob >= 2.5 or (abs(delta_p) > 0 and anomaly_score >= 0.65):
             shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
             tags.extend(["odd_shift", "probability_spike"])
-            headline = f"🎯 {shift_dir}: {display_contract} ({outcome} shift: {(delta_p*100):+.1f}%)"
+            headline = f"🎯 {shift_dir}: {display_contract}{rank_note} ({choice_name or outcome} shift: {(delta_p*100):+.1f}%)"
         elif anomaly_score >= 0.50:
             tags.append("volume_spike")
-            headline = f"🎯 POLYMARKET VOLUME MOVER: {display_contract} (${notional:,.2f} — {outcome})"
+            headline = f"🎯 POLYMARKET VOLUME MOVER: {display_contract}{rank_note} (${notional:,.2f} — {choice_name or outcome})"
         else:
             tags.append("odds_update")
-            headline = f"🎯 POLYMARKET ODDS: {display_contract} ({outcome} @ {(price*100):.1f}%)"
+            headline = f"🎯 POLYMARKET ODDS: {display_contract}{rank_note} ({choice_name or outcome} @ {(price*100):.1f}%)"
 
         try:
             await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
@@ -142,6 +221,7 @@ class PredictionEnricher:
                 total_volume=total_vol,
                 yes_probability=yes_prob,
                 no_probability=no_prob,
+                outcome_prices=outcome_prices,
                 category=p.get("category") or "Macro & Geopolitics",
                 resolution_date=p.get("resolution_date")
             ),

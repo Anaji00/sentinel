@@ -33,6 +33,38 @@ from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistra
 logger = logging.getLogger("correlation.statistical_discovery")
 
 
+def pearson_on_returns(prices_a, prices_b):
+    """Pearson correlation of two price series' returns, with its p-value.
+
+    Extracted so discovery and the out-of-sample re-test compute the *same*
+    statistic. They must: a verdict reached with a different measure than the
+    one that found the edge would fail edges that never changed, and the
+    difference would look like the edge decaying rather than like a bug.
+
+    Returns (r, p) or (None, None) when the series cannot support the estimate.
+    """
+    min_len = min(len(prices_a), len(prices_b))
+    if min_len < 20:
+        return None, None
+
+    x = np.array(prices_a[-min_len:], dtype=np.float64)
+    y = np.array(prices_b[-min_len:], dtype=np.float64)
+
+    ret_x = np.diff(x) / (x[:-1] + 1e-8)
+    ret_y = np.diff(y) / (y[:-1] + 1e-8)
+
+    # A flat series has no correlation to measure, only floating-point noise.
+    if len(ret_x) < 15 or np.std(ret_x) < 1e-6 or np.std(ret_y) < 1e-6:
+        return None, None
+
+    r = float(np.corrcoef(ret_x, ret_y)[0, 1])
+    n = len(ret_x)
+    df = n - 2
+    t_stat = r * math.sqrt(df / max(1e-6, 1.0 - r ** 2)) if abs(r) < 0.9999 else 999.0
+    p = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t_stat) / math.sqrt(2.0))))
+    return r, p
+
+
 def _granger_p(gc_result: Dict[str, Any]) -> float:
     """Extracts a Granger p-value, defaulting to 1.0 when absent.
 
@@ -488,6 +520,65 @@ class StatisticalDiscoveryEngine:
         return discoveries
 
     # ── 5. INTRA-TRADFI SECTOR HAWKES CONTAGION (§4.3) ─────────────────────────
+
+
+    async def retest_due_edges(self, limit: int = 50) -> Dict[str, Any]:
+        """Re-measures discovered edges once their out-of-sample window elapses.
+
+        Edges were registered for survival tracking at discovery and never
+        looked at again: register() was called, evaluate() and due_for_retest()
+        had no callers anywhere. The whole point of registering an edge is to
+        find out later whether it held, so without this the survival machinery
+        recorded candidates and produced no verdicts -- and a correlation
+        discovered once stayed in the graph as though it were still true.
+
+        Re-measurement uses the same price series and the same statistic as
+        discovery, on fresh bars. An edge whose data has gone missing is left
+        pending rather than failed: absence of evidence is not a dead edge.
+        """
+        try:
+            due = await self.survival.due_for_retest(limit=limit)
+        except Exception as e:
+            logger.warning(f"Could not list edges due for retest: {e}")
+            return {"retested": 0, "survived": 0, "failed": 0}
+
+        retested = survived = failed = skipped = 0
+        for reg in due:
+            try:
+                series_a = await self.fetch_price_series(reg.source)
+                series_b = await self.fetch_price_series(reg.target)
+                if len(series_a) < 30 or len(series_b) < 30:
+                    skipped += 1
+                    continue
+
+                coefficient, p_value = pearson_on_returns(series_a, series_b)
+                if coefficient is None:
+                    skipped += 1
+                    continue
+
+                verdict = await self.survival.evaluate(
+                    edge_id=reg.edge_id,
+                    coefficient=coefficient,
+                    p_value=p_value,
+                )
+                if verdict is None:
+                    skipped += 1
+                    continue
+                retested += 1
+                if getattr(verdict, "survived", False):
+                    survived += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.debug(f"Retest failed for {reg.edge_id}: {e}")
+                skipped += 1
+
+        if retested:
+            logger.info(
+                "🔬 Edge survival: retested %s, survived %s, failed %s (%s skipped for want of data)",
+                retested, survived, failed, skipped,
+            )
+        return {"retested": retested, "survived": survived, "failed": failed, "skipped": skipped}
 
     async def discover_sector_hawkes_contagion(self) -> Dict[str, Any]:
         """

@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import Optional, Any, Callable, Union
 
 logger = logging.getLogger("shared.heartbeat")
 
@@ -213,14 +213,29 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
         "components": results
     }
 
-async def start_heartbeat_task(redis_client: Any, component: str, interval: int = 15, ttl: int = 120):
+async def start_heartbeat_task(
+    redis_client: Any,
+    component: str,
+    interval: int = 15,
+    ttl: int = 120,
+    metadata: Optional[Union[dict, Callable[[], dict]]] = None,
+):
     """
     Background task loop that periodically touches heartbeat for a component.
+
+    `metadata` may be a dict or a callable returning one, so a caller can
+    publish state that changes between beats -- an agent roster, the models in
+    use, per-agent counters. touch_heartbeat has always accepted metadata; this
+    loop never passed any, so every consumer of it saw an empty dict. The
+    /agents/processes route reads metadata["agents"] to build its roster and
+    consequently reported active_agents_count: 0 with null names forever, while
+    ten agents were running.
     """
     logger.info(f"Starting heartbeat loop for component: {component} (interval={interval}s, ttl={ttl}s)")
     while True:
         try:
-            await touch_heartbeat(redis_client, component, ttl=ttl)
+            meta = metadata() if callable(metadata) else metadata
+            await touch_heartbeat(redis_client, component, ttl=ttl, metadata=meta)
         except asyncio.CancelledError:
             break
         except Exception as e:

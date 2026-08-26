@@ -237,8 +237,8 @@ export default function QuantRadarPanel() {
 
       {/* Radar Anomaly Inspector Modal */}
       {selectedAnomaly && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-[#0b0e17] border border-[#00f2fe]/50 rounded-xl max-w-md w-full p-5 space-y-3 shadow-[0_0_30px_rgba(0,242,254,0.3)] font-mono text-xs">
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-[#0b0e17] border border-[#00f2fe]/50 rounded-xl max-w-md w-full p-5 space-y-3 font-mono text-xs">
             <div className="flex items-center justify-between border-b border-cyan-500/20 pb-2.5">
               <span className="text-xs font-bold text-white uppercase">{selectedAnomaly.ticker} VOLUME SPIKE INSPECTOR</span>
               <button

@@ -286,6 +286,57 @@ MIGRATIONS = [
             );
         """,
         "transactional": True
+    },
+    {
+        "version": "0007_event_corroboration",
+        "sql": """
+            -- Independent corroboration of a claim across sources, for the
+            -- events where that is meaningful (news, OSINT). Deliberately
+            -- separate from source_reliability: that is a source's historical
+            -- record, this is whether anyone else is reporting the same thing
+            -- right now. A trusted outlet reporting alone and four outlets
+            -- agreeing are different situations, and conflating them is how a
+            -- single source comes to look like consensus.
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS corroboration JSONB;
+
+            -- Single-sourced claims are the ones worth surfacing to an analyst,
+            -- so they get an index rather than a scan.
+            CREATE INDEX IF NOT EXISTS events_single_sourced_idx
+                ON events ((corroboration->>'is_single_sourced'))
+                WHERE corroboration IS NOT NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0008_domain_payload_indexes",
+        "sql": """
+            -- One partial index per domain payload column.
+            --
+            -- /events/{domain} filters on "<column> IS NOT NULL" and then takes
+            -- the most recent rows. Nothing indexed that predicate, so finding
+            -- the newest matching rows meant scanning back through the whole
+            -- hypertable ordered by time. Measured on a 50-row request against
+            -- ~700k events: tradfi 15.6s, cyber 18.2s, prediction 9.6s -- the
+            -- sparse domains, where matches are rare and the scan runs longest.
+            -- The dense ones (crypto, maritime) came back in ~0.1s because a
+            -- match turns up almost immediately.
+            --
+            -- Partial and ordered by time, because that is exactly the access
+            -- pattern: "the newest N rows carrying this payload".
+            CREATE INDEX IF NOT EXISTS events_financial_time_idx
+                ON events (occurred_at DESC) WHERE financial_data IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_crypto_time_idx
+                ON events (occurred_at DESC) WHERE crypto_data IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_security_time_idx
+                ON events (occurred_at DESC) WHERE security_data IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_prediction_time_idx
+                ON events (occurred_at DESC) WHERE prediction_market_data IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_vessel_time_idx
+                ON events (occurred_at DESC) WHERE vessel_data IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_flight_time_idx
+                ON events (occurred_at DESC) WHERE flight_data IS NOT NULL;
+        """,
+        "transactional": True
     }
 ]
 

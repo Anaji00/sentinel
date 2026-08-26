@@ -18,7 +18,7 @@ export const MetricCard: React.FC<MetricCardProps> = ({
   className = '',
 }) => {
   return (
-    <div className={`p-3 rounded-lg bg-slate-900/60 border border-cyan-500/10 backdrop-blur-md flex flex-col justify-between ${className}`}>
+    <div className={`p-3 rounded-lg bg-slate-900/60 border border-cyan-500/10 flex flex-col justify-between ${className}`}>
       <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
         {label}
       </span>

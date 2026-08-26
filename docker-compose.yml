@@ -396,7 +396,21 @@ services:
       resources:
         limits:
           cpus: '6.0'
-          memory: 4G
+          # 5G, raised from 4G. MAX_LOADED_MODELS=2 above asks for two
+          # resident models and they did not fit: ollama reported
+          # total="4.0 GiB" free="1.0 GiB" and then, for every qwen2.5:3b
+          # request, "model requires more system memory than is currently
+          # available, evicting a model to make space"
+          # required=1999443968 free=1084825600 -- followed by a 47.86s
+          # reload. The two tiers evicted each other in turn, so most of the
+          # budget went on loading rather than answering.
+          #
+          # 5G and not more: the WSL2 VM is capped at 26 GiB and the whole
+          # stack has to fit inside it (full stack with observability at 5G:
+          # 25.5 GiB). It is enough -- qwen2.5:3b (1.9 GB) plus qwen2.5:1.5b
+          # (1.0 GB) is 2.9 GB of weights, and one resident model measured
+          # 2.22 GiB including KV cache and runtime.
+          memory: 5G
     healthcheck:
       test: [ "CMD", "ollama", "list" ]
       interval: 10s

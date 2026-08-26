@@ -168,7 +168,7 @@ export default function CyberIntelligencePanel() {
 
       {/* Cyber Event Inspector Modal */}
       {selectedEvent && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 font-mono">
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 font-mono">
           <div className="bg-[#0b0e17] border border-rose-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-[0_0_40px_rgba(244,63,94,0.25)] text-xs text-slate-200">
             <div className="flex items-center justify-between border-b border-rose-500/30 pb-3">
               <div className="flex items-center gap-2">

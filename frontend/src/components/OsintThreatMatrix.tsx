@@ -92,11 +92,11 @@ export default function OsintThreatMatrix() {
   });
 
   return (
-    <Card className="h-full flex flex-col bg-[#080b13]/90 border border-cyan-500/20 backdrop-blur-xl shadow-2xl overflow-hidden font-mono select-none">
+    <Card className="h-full flex flex-col bg-[#080b13]/90 border border-cyan-500/20 shadow-2xl overflow-hidden font-mono">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-cyan-500/20 bg-[#0c101d]/80 shrink-0">
         <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-cyan-950/80 border border-[#00f2fe]/60 flex items-center justify-center shadow-[0_0_12px_rgba(0,242,254,0.3)]">
+          <div className="h-9 w-9 rounded-lg bg-cyan-950/80 border border-[#00f2fe]/60 flex items-center justify-center">
             <span className="text-[#00f2fe] text-lg">🛡️</span>
           </div>
           <div>

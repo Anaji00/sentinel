@@ -97,7 +97,7 @@ function AssetSparklineCard({
   return (
     <div
       onClick={() => onExpand(config)}
-      className="group relative bg-[#090d16] border border-slate-800 hover:border-cyan-500/50 rounded-2xl p-4 transition-all duration-200 cursor-pointer shadow-[0_4px_25px_rgba(0,0,0,0.5)] hover:shadow-[0_0_30px_rgba(0,242,254,0.15)] overflow-hidden font-mono flex flex-col justify-between"
+      className="group relative bg-[#090d16] border border-slate-800 hover:border-cyan-500/50 rounded-2xl p-4 transition-all duration-200 cursor-pointer shadow-[0_4px_25px_rgba(0,0,0,0.5)] hover: overflow-hidden font-mono flex flex-col justify-between"
     >
       {/* Top Header & Expand Icon */}
       <div className="flex items-start justify-between">
@@ -429,13 +429,13 @@ export default function ChartsPage() {
 
       {/* CLICK-TO-EXPAND LARGEST COMPONENT MODAL VIEW */}
       {expandedAsset && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xl flex items-center justify-center p-4 sm:p-8 font-mono">
-          <div className="bg-[#070a12] border border-cyan-500/50 rounded-3xl max-w-6xl w-full h-[90vh] flex flex-col overflow-hidden shadow-[0_0_60px_rgba(0,242,254,0.3)] text-xs text-slate-200">
+        <div className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4 sm:p-8 font-mono">
+          <div className="bg-[#070a12] border border-cyan-500/50 rounded-3xl max-w-6xl w-full h-[90vh] flex flex-col overflow-hidden text-xs text-slate-200">
 
             {/* Modal Header Bar */}
             <div className="flex items-center justify-between px-6 py-4 bg-[#0b0f1d] border-b border-cyan-500/30">
               <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-xl bg-cyan-950 border border-cyan-500/50 flex items-center justify-center text-cyan-400 font-extrabold text-sm shadow-[0_0_15px_rgba(0,242,254,0.4)]">
+                <div className="h-10 w-10 rounded-xl bg-cyan-950 border border-cyan-500/50 flex items-center justify-center text-cyan-400 font-extrabold text-sm">
                   {expandedAsset.symbol.substring(0, 3)}
                 </div>
                 <div>

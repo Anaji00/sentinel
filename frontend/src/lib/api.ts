@@ -163,23 +163,30 @@ async function fetchDirectCryptoEvents(limit = 25) {
             entity_name: `${coinName} Perpetual`,
             anomaly_score: isExtreme ? 0.88 : 0.42,
             tags: ['crypto', 'perp_funding', 'binance', coinName.toLowerCase()],
+            // Only the fields this endpoint actually returns.
+            //
+            // Previously this block also reported open_interest as
+            // markPrice * 25000, order-flow imbalance as Math.sin(markPrice),
+            // and Kyle's lambda and Amihud illiquidity as the fixed constants
+            // 0.00045 and 0.000012. Those rendered in the Crypto Analytics
+            // panel beside genuine funding data, indistinguishable from it.
+            // Open interest and microstructure are real measurements and are
+            // now collected server-side from OKX; a number invented in the
+            // browser is worse than an empty field, because the empty field
+            // does not claim anything.
             crypto_data: {
               pair: item.symbol,
               trade_type: 'PERPETUAL_FUNDING',
               side: fundingRate >= 0 ? 'LONG_PAYS_SHORT' : 'SHORT_PAYS_LONG',
               price: markPrice,
-              size_tokens: 15.0,
               funding_rate: fundingRate,
               mark_price: markPrice,
               index_price: indexPrice,
               basis_bps: Number(basisBps.toFixed(2)),
-              open_interest: Number((markPrice * 25000).toFixed(0)),
-              market_microstructure: {
-                ofi: Number((Math.sin(markPrice) * 0.4).toFixed(3)),
-                kyles_lambda: 0.00045,
-                amihud_illiquidity: 0.000012,
-              },
             },
+            // Browser-side fallback, not the platform's own analysis. The panel
+            // uses this to say where the row came from.
+            data_provenance: 'client_direct_binance',
           };
         }).slice(0, limit);
       }
@@ -209,6 +216,7 @@ async function fetchDirectCyberEvents(limit = 20) {
         primary_entity_name: item.vendorProject || 'CISA KEV',
         entity_name: item.vendorProject || 'CISA KEV',
         anomaly_score: 0.94,
+        data_provenance: 'client_direct_cisa',
         tags: ['cyber', 'cisa_kev', 'vulnerability', item.vendorProject ? item.vendorProject.toLowerCase() : 'active_exploit'],
         security_data: {
           cvss_score: 9.8,
@@ -262,6 +270,7 @@ async function fetchDirectPredictionEvents(limit = 25) {
           summary: item.description || item.title,
           primary_entity_name: item.ticker || item.slug || 'PolyMarket Contract',
           anomaly_score: vol > 500000 ? 0.85 : 0.45,
+          data_provenance: 'client_direct_polymarket',
           tags: ['prediction_market', 'polymarket', (item.category || 'macro').toLowerCase()],
           prediction_market_data: {
             market_id: item.slug || item.id,

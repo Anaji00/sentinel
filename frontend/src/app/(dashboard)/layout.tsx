@@ -1,6 +1,7 @@
 import React from 'react';
 import { Header } from '../../components/ui/Header';
 import { Sidebar } from '../../components/ui/Sidebar';
+import { CommandPalette } from '../../components/ui/CommandPalette';
 
 export default function DashboardLayout({
   children,
@@ -8,7 +9,8 @@ export default function DashboardLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex h-screen w-full bg-[#08090c] text-slate-100 overflow-hidden select-none">
+    <div className="flex h-screen w-full bg-[#08090c] text-slate-100 overflow-hidden">
+      <CommandPalette />
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <Header />

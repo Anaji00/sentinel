@@ -14,6 +14,31 @@ class WatchlistPruneDecision(BaseModel):
     evict_tickers: List[str]
     rationale: str
 
+# An earnings surprise this large is worth a look regardless of the flow behind
+# it. Below it, a beat is noise: consensus is set to be beaten by a little.
+MIN_EARNINGS_SURPRISE_PCT = 10.0
+
+
+def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
+    """EPS surprise on an event, or 0.0 when it is not an earnings event."""
+    for container in (
+        message.get("financial_data"),
+        message.get("raw_payload"),
+        message.get("trigger"),
+        message,
+    ):
+        if not isinstance(container, dict):
+            continue
+        value = container.get("eps_surprise_pct")
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 class RadarAgent(SentinelAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -37,21 +62,50 @@ class RadarAgent(SentinelAgent):
             except (ValueError, TypeError):
                 return default
 
+        def _notional_from(d: dict) -> float:
+            """Dollar flow behind an event, however the producer expressed it.
+
+            Three vocabularies reach this agent for one quantity and none of
+            them is present on the events that matter most:
+
+              - collector-radar sent {ticker, volume, close_price, z_score}. It
+                computed volume * price, refused to emit below $150k, and then
+                dropped the number -- so `notional_usd` was absent and read as
+                0.0, and every anomaly it raised died at the $50k floor below.
+                Measured: a real CGCP anomaly carried $341,415 of flow and
+                arrived here as $0.
+              - enriched equity anomalies carry `premium_usd`, an options field,
+                fixed at 0.0 for equities, with close_price null.
+              - options flow genuinely uses premium_usd.
+
+            So notional is taken from whichever the producer supplied, and
+            derived from volume * price when only those exist.
+            """
+            for key in ("notional_usd", "notional", "premium_usd", "value_usd"):
+                value = _safe_float(d.get(key))
+                if value > 0:
+                    return value
+            volume = _safe_float(d.get("volume") or d.get("size") or d.get("shares"))
+            price = _safe_float(
+                d.get("close_price") or d.get("price") or d.get("last_price")
+            )
+            return volume * price
+
         if "raw_payload" in message and isinstance(message["raw_payload"], dict):
             p = message["raw_payload"]
             ticker = p.get("ticker")
             z_score = _safe_float(p.get("z_score"))
-            notional_usd = _safe_float(p.get("notional_usd"))
+            notional_usd = _notional_from(p)
         elif "financial_data" in message and isinstance(message["financial_data"], dict):
             fd = message["financial_data"]
             ticker = fd.get("ticker")
             z_score = _safe_float(message.get("anomaly_score")) * 5.0
-            notional_usd = _safe_float(fd.get("premium_usd"))
+            notional_usd = _notional_from(fd)
         elif "trigger" in message and isinstance(message["trigger"], dict):
             trig = message["trigger"]
             ticker = trig.get("ticker")
             z_score = _safe_float(trig.get("anomaly_score"))
-            notional_usd = _safe_float(trig.get("notional_usd"))
+            notional_usd = _notional_from(trig)
 
         if ticker:
             ticker = str(ticker).upper().strip()
@@ -126,7 +180,15 @@ class RadarAgent(SentinelAgent):
             return None
 
         # 2. HEIGHTENED ANOMALY FLOW GATEKEEPER ($50k notional minimum)
-        if notional_usd < 50_000:
+        #
+        # Flow is not the only way an equity becomes interesting. An earnings
+        # surprise has no notional at all -- there is no trade behind it -- so a
+        # dollar floor silently excluded the entire category: 501 earnings
+        # events over three days, every one with premium_usd null, every one
+        # dropped here. Those are judged on the size of the surprise instead,
+        # which is the quantity that actually carries the signal.
+        surprise_pct = abs(_earnings_surprise_pct(message))
+        if surprise_pct < MIN_EARNINGS_SURPRISE_PCT and notional_usd < 50_000:
             return None
         
         # Idempotency: Do not re-evaluate a ticker we already escalated today
@@ -155,7 +217,7 @@ class RadarAgent(SentinelAgent):
             pass
 
         if len(closes) >= 20:
-            returns = list(np.diff(closes) / closes[:-1])
+            returns = quant_calc.simple_returns(closes)
             hurst_val = quant_calc.hurst_exponent(closes)
             garch_vol = quant_calc.garch_volatility(returns, annualize=True)
             regime_str = f"Hurst Exponent: {hurst_val:.3f} ({'Trending' if hurst_val > 0.5 else 'Mean-Reverting'}) | GARCH(1,1) Volatility: {garch_vol:.2%}"

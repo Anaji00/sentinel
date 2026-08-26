@@ -14,6 +14,104 @@ from typing import Dict, Set, Tuple, Any, Optional
 # ── ALLOWED CRYPTO EXCEPTION ──────────────────────────────────────────────────
 ALLOWED_CRYPTO_TOKENS: Set[str] = {"BTC", "BTCUSDT", "BTCUSD"}
 
+# Crypto assets this deployment actually collects a market surface for: OKX
+# perpetual funding, mark and index price, basis and open interest, plus spot
+# from Coinbase.
+#
+# Kept separate from ALLOWED_CRYPTO_TOKENS on purpose. That set answers "may this
+# go in the *equity* watchlist", and the answer for ETH is still no. This one
+# answers "does the platform hold data on this", which is a different question
+# and the one an agent should be asking before it decides it has nothing to say.
+# Conflating them meant the perpetual surface was collected, enriched, stored and
+# then refused by every agent: QuantTradingEngine gates its whole handle path on
+# the equity check while carrying a _fetch_funding_context() written for exactly
+# these assets.
+MAJOR_CRYPTO_ASSETS: Set[str] = {
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC",
+    "LTC", "BCH", "ATOM", "UNI", "AAVE", "NEAR", "APT", "ARB", "OP", "SUI",
+    "TON", "TRX", "ICP", "FIL", "INJ", "SEI", "TIA", "PEPE", "SHIB", "ENA",
+    "HYPE", "ZEC", "PUMP", "TRUMP", "WIF", "BNB",
+}
+
+
+# Macro instruments: the other side of a cross-asset correlation. Commodities,
+# rates, volatility and index futures -- what "oil down 5%, tech up 5%" is about.
+#
+# StockCorrelationAgent classified these with a substring list containing
+# "BRENT", "WTI", "GLD", "VIX" and "US10Y". Live quote keys are ticker symbols,
+# so BZ=F (Brent), GC=F (gold), SI=F (silver), NG=F (natural gas), ZC=F (corn),
+# ZW=F (wheat), ES=F and NQ=F (index futures), VXX and TIP all failed to match
+# and were classified as *equities* -- the very instruments the agent exists to
+# correlate equities against ended up on the equity side of the comparison.
+MACRO_SYMBOLS: Set[str] = {
+    # Energy
+    "CL=F", "BZ=F", "NG=F", "RB=F", "HO=F", "USO", "UNG", "BNO", "XLE",
+    # Metals
+    "GC=F", "SI=F", "HG=F", "PL=F", "PA=F", "GLD", "SLV", "IAU", "GDX", "CPER",
+    # Agriculture
+    "ZC=F", "ZW=F", "ZS=F", "KC=F", "SB=F", "CC=F", "CT=F", "LE=F", "DBA",
+    # Rates and credit
+    "ZN=F", "ZB=F", "ZF=F", "ZT=F", "TLT", "IEF", "SHY", "TIP", "LQD", "HYG",
+    "AGG", "BND", "US10Y", "US02Y", "US2Y", "US30Y", "US05Y",
+    # Volatility
+    "VIX", "VXX", "UVXY", "VIXY", "SVXY", "VX=F",
+    # Index and FX futures
+    "ES=F", "NQ=F", "YM=F", "RTY=F", "DX=F", "6E=F", "6J=F", "6B=F", "DXY",
+}
+
+# Yahoo-style suffixes and prefixes that mark an instrument as macro regardless
+# of whether the symbol itself is listed above: "=F" is a futures contract,
+# "^" an index, "=X" an FX pair.
+_MACRO_SUFFIXES = ("=F", "=X")
+_MACRO_PREFIXES = ("^",)
+
+
+def is_macro_asset(ticker: str) -> bool:
+    """True for a commodity, rate, volatility, FX or index instrument."""
+    if not ticker or not isinstance(ticker, str):
+        return False
+    sym = ticker.strip().upper()
+    if not sym:
+        return False
+    if sym in MACRO_SYMBOLS:
+        return True
+    if sym.endswith(_MACRO_SUFFIXES) or sym.startswith(_MACRO_PREFIXES):
+        return True
+    # Treasury tenors arrive in several spellings across collectors.
+    return bool(re.match(r"^US\d{1,2}Y$", sym))
+
+
+def split_macro_and_equities(symbols) -> tuple:
+    """Partition a symbol list into (macro instruments, equities)."""
+    macro, equities = [], []
+    for sym in symbols:
+        (macro if is_macro_asset(sym) else equities).append(sym)
+    return macro, equities
+
+
+def is_major_crypto(ticker: str) -> bool:
+    """True for a crypto asset this deployment collects market data on."""
+    if not ticker or not isinstance(ticker, str):
+        return False
+    sym = ticker.strip().upper()
+    # Instrument ids arrive as BTC-USDT-SWAP or BTCUSDT depending on the venue.
+    for suffix in ("-USDT-SWAP", "-USD-SWAP", "-USDT", "-USD", "USDT", "USD"):
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            sym = sym[: -len(suffix)]
+            break
+    return sym in MAJOR_CRYPTO_ASSETS
+
+
+def is_supported_asset(ticker: str) -> bool:
+    """True when the platform holds data on this symbol at all.
+
+    The union of primary US common equity and the crypto majors above. Use this
+    to decide whether an agent has anything to reason about; use
+    is_valid_primary_equity() when the question is specifically about equities,
+    such as what may enter the equity watchlist.
+    """
+    return is_valid_primary_equity(ticker) or is_major_crypto(ticker)
+
 # ── COMPILED REGEX PATTERNS ──────────────────────────────────────────────────
 
 # OCC Options Contract Pattern (e.g. AAPL240816C00220000)
@@ -21,6 +119,36 @@ RE_OCC_OPTION = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d+$", re.IGNORECASE)
 
 # Ticker structural noise: slashes, dots, dashes, digits, or non-alphabetics (e.g. BRK.A, TSLA/WS, AAPL-W)
 RE_STRUCTURAL_DERIVATIVE = re.compile(r"[\.\/\-\=\+\~\d]", re.IGNORECASE)
+
+# Class-share tickers: BRK.B, BF.B, BRK.A, HEI.A. Ordinary common equity that
+# happens to carry a share class, and among the largest companies listed. The
+# structural-punctuation rule above rejects them for the dot, so they have to be
+# recognised before it runs -- and PRIMARY_EQUITY_EXCEPTIONS cannot rescue them,
+# because that check sits *after* the punctuation rule in the classifier.
+RE_CLASS_SHARE = re.compile(r"^[A-Z]{1,4}\.[A-Z]$")
+
+# Non-leveraged index, sector and commodity funds. Distinct from
+# ALL_DERIVATIVE_ETFS, which lists leveraged and inverse products only -- so the
+# most heavily traded funds on the market (SPY, QQQ, GLD) matched no rule and
+# fell through to "clean primary US common equity". That put them in the equity
+# watchlist for agents to reason about as though they were companies, and it
+# contradicted the async validator, which returns False for anything Finnhub
+# types as ETF/ETP. Same ticker, opposite answers, depending on which function
+# the caller happened to use.
+BROAD_MARKET_ETFS: Set[str] = {
+    # Broad market / index
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "IVV", "VEA", "VWO", "EFA",
+    "EEM", "VXUS", "ACWI", "RSP", "MDY", "SCHD", "VIG", "VYM", "IWF", "IWD",
+    # Sector
+    "XLF", "XLE", "XLK", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+    "XLC", "SMH", "XBI", "IBB", "XOP", "XME", "XRT", "KRE", "ITB", "JETS",
+    # Commodity / rates / credit
+    "GLD", "SLV", "USO", "UNG", "TLT", "IEF", "SHY", "LQD", "HYG", "AGG",
+    "BND", "TIP", "GDX", "GDXJ", "SLX", "DBC", "PDBC", "IAU",
+    # Popular active / thematic
+    "ARKK", "ARKG", "ARKW", "ARKQ", "ARKF", "ICLN", "TAN", "LIT", "BOTZ",
+    "ROBO", "HACK", "SKYY", "FDN", "IGV", "VNQ", "REET", "EWJ", "FXI", "INDA",
+}
 
 # Warrant, Right, Unit, Preferred Share, and Class suffixes (e.g. NVDAWS, AAPLRT, TSLAPR)
 RE_DERIVATIVE_SUFFIX = re.compile(r"(WS|WT|RT|R|PR|P|UN|U|CL|CV)$", re.IGNORECASE)
@@ -167,12 +295,28 @@ def fast_classify_equity(ticker: str, cached_asset_type: Optional[str] = None) -
             "reason": "OCC options symbol format"
         }
 
+    if RE_CLASS_SHARE.match(sym):
+        return {
+            "ticker": sym,
+            "is_primary_equity": True,
+            "asset_class": "PRIMARY_COMMON_EQUITY",
+            "reason": "Class share of a primary common equity",
+        }
+
     if RE_STRUCTURAL_DERIVATIVE.search(sym):
         return {
             "ticker": sym,
             "is_primary_equity": False,
             "asset_class": "PREFERRED_RIGHT_WARRANT",
             "reason": "Non-alphabetic structural punctuation"
+        }
+
+    if sym in BROAD_MARKET_ETFS:
+        return {
+            "ticker": sym,
+            "is_primary_equity": False,
+            "asset_class": "INDEX_SECTOR_ETF",
+            "reason": "Index, sector or commodity fund, not a company",
         }
 
     if sym in ALL_DERIVATIVE_ETFS:

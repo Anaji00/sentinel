@@ -14,6 +14,7 @@ Preserves 100% of existing Kafka topics, Redis keys, and output schemas.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -27,7 +28,7 @@ from shared.kafka import Topics
 from shared.utils import quant_calc
 from shared.utils.tasks import safe_create_task
 import numpy as np
-from shared.utils.equities import is_valid_primary_equity_async
+from shared.utils.equities import is_major_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.candles import candle_cache_key
@@ -299,8 +300,17 @@ class QuantTradingEngine(SentinelAgent):
             if mapped_ticker:
                 ticker = mapped_ticker
 
-        # ── PRIMARY EQUITY VALIDATOR GATE ──────────────────────────────────────
-        if not await is_valid_primary_equity_async(ticker, redis_client=self.redis):
+        # ── SUPPORTED ASSET GATE ───────────────────────────────────────────────
+        # Equities *or* the crypto majors this deployment collects a perpetual
+        # surface for. The gate was equity-only, so every ETH, SOL, DOGE and
+        # AAVE event was dropped here -- in an engine that carries
+        # _fetch_funding_context() written for those very assets, reading
+        # funding rate, basis, mark and index. The data was collected, enriched,
+        # stored, and then refused one step before anything could use it.
+        if not (
+            await is_valid_primary_equity_async(ticker, redis_client=self.redis)
+            or is_major_crypto(ticker)
+        ):
             return None
 
         anomaly_score = float(raw.get("anomaly_score") or trig.get("anomaly_score") or message.get("anomaly_score", 0.5))
@@ -387,8 +397,19 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 
             closes, _, _ = await self._fetch_prices(ticker)
             if len(closes) >= 10:
-                returns = list(np.diff(closes) / closes[:-1])
-                sr = quant_calc.sharpe_ratio(returns)
+                # Annualized on the frequency the series is actually sampled at.
+                # This called sharpe_ratio(returns) bare, taking the default
+                # trading_days=252 -- the daily equity convention -- on a series
+                # of PRICE_TIMEFRAME ("1h") bars. That understates the figure by
+                # sqrt(1638/252) = 2.55x for equities and sqrt(8760/252) = 5.9x
+                # for crypto, and the result is published as
+                # quality_metrics.sharpe_ratio. Twenty lines further down the
+                # same engine derives the factor correctly for the same series.
+                returns = quant_calc.simple_returns(closes)
+                bars_per_year = quant_calc.periods_per_year(
+                    self.PRICE_TIMEFRAME, quant_calc.classify_asset_class(ticker)
+                )
+                sr = quant_calc.sharpe_ratio(returns, annualize=True, trading_days=bars_per_year)
                 mdd, _, _ = quant_calc.max_drawdown(closes)
             else:
                 sr, mdd = 0.0, 0.0
@@ -483,7 +504,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         # The series is sampled at PRICE_TIMEFRAME, so annualization and the VaR
         # horizon are both derived from that frequency and the asset's calendar —
         # never assumed daily.
-        returns = list(np.diff(closes) / closes[:-1]) if len(closes) > 1 else [0.0]
+        returns = quant_calc.simple_returns(closes) if len(closes) > 1 else [0.0]
         has_history = len(returns) >= 10
 
         asset_class = quant_calc.classify_asset_class(ticker)

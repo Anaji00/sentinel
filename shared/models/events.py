@@ -519,6 +519,12 @@ class NormalizedEvent(BaseModel):
     regulatory_data: Optional[RegulatoryData] = None
     supply_chain_data: Optional[SupplyChainData] = None
 
+    # Independent corroboration of this claim across sources, when it is the
+    # kind of event that can be corroborated (news, OSINT). Distinct from
+    # source_reliability, which is the source's historical record: a reliable
+    # outlet reporting alone and four outlets agreeing are different situations
+    # and an analyst needs to tell them apart.
+    corroboration: Optional[Dict[str, Any]] = None
     tags: List[str] = Field(default_factory=list) 
     named_entities: List[str] = Field(default_factory=list) 
     sentiment: Optional[float] = None

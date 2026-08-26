@@ -294,13 +294,16 @@ def test_service_status_badges_are_driven_by_health_not_hardcoded():
     """Status pills must reflect backend state.
 
     The graph view rendered NEO4J LIVE with a pulsing green dot unconditionally,
-    which is reassuring exactly when it should not be.
+    which is reassuring exactly when it should not be. That view has since been
+    removed from the product, so the assertion moved to the component every
+    remaining surface uses -- the property is unchanged, only its last consumer.
     """
-    graph = _read("app/(dashboard)/graph/page.tsx")
-    assert "NEO4J LIVE" not in graph, "hardcoded status pill still present"
-    assert "ServiceStatusBadges" in graph, "graph view has no live status source"
-
     badges = _read("components/ui/ServiceStatusBadges.tsx")
+    # "LIVE" is legitimate here: it is the label for the `healthy` state in a
+    # status map, chosen by the health response rather than printed regardless
+    # of it. What must not exist is a pill with no state behind it.
+    assert "healthy: 'LIVE'" in badges, "the liveness label is no longer state-driven"
+
     assert "/health/data" in badges, "status badges do not consult the health endpoint"
     assert "unknown" in badges, "status badges have no explicit unknown state"
 

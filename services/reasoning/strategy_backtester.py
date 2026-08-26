@@ -549,7 +549,13 @@ class StrategyBacktester:
         profit_factor = round(total_profit / max(1.0, total_loss), 2)
 
         total_return_pct = round(((capital - initial_capital) / initial_capital) * 100.0, 2)
-        benchmark_return_pct = round(((closes[-1] - closes[0]) / closes[0]) * 100.0, 2)
+        # Guarded: closes[0] is 0.0 for any bar that arrived without a close
+        # price, and an unguarded divide made the benchmark -- and therefore
+        # alpha -- infinite for the whole backtest.
+        benchmark_return_pct = (
+            round(((closes[-1] - closes[0]) / closes[0]) * 100.0, 2)
+            if closes and closes[0] > 0 else 0.0
+        )
         alpha_pct = round(total_return_pct - benchmark_return_pct, 2)
 
         # Max Drawdown calculation across portfolio equity curve

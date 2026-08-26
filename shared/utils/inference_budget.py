@@ -76,9 +76,29 @@ class InferenceBudget:
         model: str,
         cooldown_sec: int = DEFAULT_COOLDOWN_SEC,
         priority_cooldown_sec: int = PRIORITY_COOLDOWN_SEC,
+        lane: Optional[str] = None,
     ):
+        """`lane` reserves an independent slot for a caller.
+
+        Without it every caller on the same model shares one key, which is
+        correct when the callers are peers competing for a scarce resource. It
+        is not correct when one of them is a different tier of the system: the
+        reasoning service and the five agents-fast agents both run
+        qwen2.5:1.5b, so they shared a slot -- and the agents, consuming a far
+        busier stream, re-claimed it before it could expire. Sampled once every
+        ten seconds the key was never free.
+
+        The consequence was total starvation rather than degradation: reasoning
+        sheds a cluster whenever the slot is busy, so it shed every one of them
+        and the scenarios table stood empty since the service was first
+        deployed. A lane guarantees it a turn.
+
+        Concurrency is still bounded -- two lanes mean at most two in-flight
+        requests, which Ollama serialises anyway with OLLAMA_NUM_PARALLEL=1.
+        """
         self.redis = redis_client
         self.model = model or "default"
+        self.lane = (lane or "").strip() or None
         self.cooldown_sec = max(0, int(cooldown_sec))
         # Never longer than the standard hold: a "priority" domain that waited
         # longer than routine telemetry would be the opposite of the intent.
@@ -88,6 +108,8 @@ class InferenceBudget:
 
     @property
     def _key(self) -> str:
+        if self.lane:
+            return f"sentinel:inference:budget:{self.lane}:{self.model}"
         return f"sentinel:inference:budget:{self.model}"
 
     async def try_acquire(self, score: Optional[float] = None, domain: Optional[str] = None) -> bool:

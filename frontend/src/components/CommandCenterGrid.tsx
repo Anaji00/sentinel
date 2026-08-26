@@ -9,10 +9,6 @@ const IntelligenceFeed = dynamic(() => import('./IntelligenceFeed'), {
   ssr: false,
 });
 
-const GraphExplorer = dynamic(() => import('./GraphExplorer'), {
-  loading: () => <PanelSkeleton title="Loading Graph..." />,
-  ssr: false,
-});
 
 const QuantRadarPanel = dynamic(() => import('./QuantRadarPanel'), {
   loading: () => <PanelSkeleton title="Loading Radar..." />,
@@ -29,13 +25,12 @@ const BondYieldsChart = dynamic(() => import('./charts/BondYieldsChart'), {
   ssr: false,
 });
 
-type ViewMode = 'all' | 'intelligence' | 'graph' | 'radar' | 'advisor' | 'charts';
+type ViewMode = 'all' | 'intelligence' | 'radar' | 'advisor' | 'charts';
 
 export function CommandCenterGrid() {
   const [activeView, setActiveView] = useState<ViewMode>('all');
   const [visibleFeeds, setVisibleFeeds] = useState<{ [key: string]: boolean }>({
     intelligence: true,
-    graph: true,
     radar: true,
     advisor: true,
   });
@@ -52,11 +47,10 @@ export function CommandCenterGrid() {
   const setViewMode = (mode: ViewMode) => {
     setActiveView(mode);
     if (mode === 'all') {
-      setVisibleFeeds({ intelligence: true, graph: true, radar: true, advisor: true });
+      setVisibleFeeds({ intelligence: true, radar: true, advisor: true });
     } else {
       setVisibleFeeds({
         intelligence: mode === 'intelligence',
-        graph: mode === 'graph',
         radar: mode === 'radar',
         advisor: mode === 'advisor',
         charts: mode === 'charts',
@@ -77,9 +71,9 @@ export function CommandCenterGrid() {
   }
 
   return (
-    <div className="h-full w-full flex flex-col bg-[#05070c] p-3 space-y-2.5 font-mono overflow-hidden select-none">
+    <div className="h-full w-full flex flex-col bg-[#05070c] p-3 space-y-2.5 font-mono overflow-hidden">
       {/* Top HUD Feed Selector & Dynamic View Toggles */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-[#0b0e17] rounded-xl border border-cyan-500/20 backdrop-blur-md shrink-0 shadow-lg text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-[#0b0e17] rounded-xl border border-cyan-500/20 shrink-0 shadow-lg text-xs">
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-pulse" />
           <span className="text-[#00f2fe] font-extrabold tracking-wider uppercase text-[11px]">
@@ -92,7 +86,6 @@ export function CommandCenterGrid() {
           {[
             { id: 'all', label: 'ALL FEEDS (4-GRID)', icon: '🎛️' },
             { id: 'intelligence', label: 'INTELLIGENCE STREAM', icon: '📡' },
-            { id: 'graph', label: 'KNOWLEDGE GRAPH', icon: '🕸️' },
             { id: 'radar', label: 'QUANT RADAR', icon: '⚡' },
             { id: 'advisor', label: 'PORTFOLIO ALLOCATOR', icon: '💼' },
             { id: 'charts', label: 'MARKET CHARTS', icon: '📈' },
@@ -102,7 +95,7 @@ export function CommandCenterGrid() {
               onClick={() => setViewMode(view.id as ViewMode)}
               className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
                 activeView === view.id
-                  ? 'bg-[#00f2fe] text-[#06080d] border border-white shadow-[0_0_15px_rgba(0,242,254,0.4)]'
+                  ? 'bg-[#00f2fe] text-[#06080d] border border-white'
                   : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
               }`}
             >
@@ -117,7 +110,6 @@ export function CommandCenterGrid() {
           <span className="uppercase font-bold mr-1">TOGGLE:</span>
           {[
             { key: 'intelligence', label: 'STREAM' },
-            { key: 'graph', label: 'GRAPH' },
             { key: 'radar', label: 'RADAR' },
             { key: 'advisor', label: 'ALLOCATOR' },
             { key: 'charts', label: 'CHARTS' },
@@ -150,15 +142,6 @@ export function CommandCenterGrid() {
             </div>
           )}
 
-          {visibleFeeds.graph && (
-            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
-              <div className="flex-1 min-h-0 relative">
-                <Suspense fallback={<PanelSkeleton title="Graph Loading..." />}>
-                  <GraphExplorer />
-                </Suspense>
-              </div>
-            </div>
-          )}
 
           {visibleFeeds.radar && (
             <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">

@@ -15,9 +15,65 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType, Crypto
 from shared.kafka import Topics
 from shared.utils import quant_calc
 import asyncio
+import math
 from shared.utils.metrics import MetricsCollector
 
 logger = logging.getLogger("enrichment.crypto")
+
+
+# What actually counts as a whale on-chain movement, in USD.
+WHALE_NOTIONAL_USD = 1_000_000.0
+
+# Where the log scale starts. Below this a transfer is ordinary retail traffic.
+_NOTIONAL_FLOOR_USD = 10_000.0
+
+# Where it saturates. A move this large is as anomalous as the scale reports.
+_NOTIONAL_CEILING_USD = 100_000_000.0
+
+
+def _notional_score(notional: float) -> float:
+    """Anomaly contribution of a transfer's size, on a log scale.
+
+    Transfer sizes span nine orders of magnitude, and the previous linear map
+    (`notional / 50_000_000 * 0.5`) gave a $5M movement a score of 0.05 -- below
+    the noise floor of every other domain -- while reserving anything
+    meaningful for $50M and up. Log scaling puts $10k at 0, $1M at about 0.5 and
+    $100M at 1.0, so the ranking between two whale transfers is informative
+    rather than uniformly maximal.
+    """
+    try:
+        value = float(notional)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= _NOTIONAL_FLOOR_USD:
+        return 0.0
+    if value >= _NOTIONAL_CEILING_USD:
+        return 1.0
+    span = math.log10(_NOTIONAL_CEILING_USD) - math.log10(_NOTIONAL_FLOOR_USD)
+    return round((math.log10(value) - math.log10(_NOTIONAL_FLOOR_USD)) / span, 4)
+
+
+def _money(usd: float) -> str:
+    """Formats an amount at a unit that shows it.
+
+    Every headline read "$0.0M" because `notional/1e6` was used for all sizes,
+    so a $50 transfer and a $500,000 one were displayed identically -- which is
+    also why a stream of genuinely distinct transfers looked like the same event
+    repeated.
+    """
+    try:
+        value = float(usd)
+    except (TypeError, ValueError):
+        return "$0"
+    if not math.isfinite(value):
+        return "$0"
+    if abs(value) >= 1e9:
+        return f"${value / 1e9:.2f}B"
+    if abs(value) >= 1e6:
+        return f"${value / 1e6:.2f}M"
+    if abs(value) >= 1e3:
+        return f"${value / 1e3:.1f}K"
+    return f"${value:,.0f}"
 
 # Rolling trade buffer size for microstructure calculations (configurable)
 MICRO_BUFFER_SIZE = int(os.getenv("CRYPTO_MICRO_BUFFER_SIZE", "100"))
@@ -51,9 +107,13 @@ class CryptoEnricher:
                 other_tasks.append(self._enrich_whale_transfer(raw, p))
             elif source == "binance_futures" and trade_type == "LIQUIDATION":
                 other_tasks.append(self._enrich_liquidation(raw, p))
-            elif source == "binance_futures" and trade_type == "CRYPTO_PERP_FUNDING":
+            # Matched on trade_type, not venue. Funding is funding whoever
+            # reports it, and pinning these to "binance_futures" meant the OKX
+            # poller -- added because Binance answers 451 from this host -- had
+            # its events silently dropped here after being collected correctly.
+            elif trade_type == "CRYPTO_PERP_FUNDING":
                 other_tasks.append(self._enrich_funding_rate(raw, p))
-            elif source == "binance_futures" and trade_type == "OPEN_INTEREST":
+            elif trade_type == "OPEN_INTEREST":
                 other_tasks.append(self._enrich_open_interest(raw, p))
             elif source == "coinbase_spot":
                 spot_trades.append((raw, p))
@@ -250,12 +310,23 @@ class CryptoEnricher:
                     signed_volumes_computed.append(0.0)
 
             k_lambda = quant_calc.kyle_lambda(price_changes, signed_volumes_computed) if len(price_changes) >= 10 else 0.0
-            returns = [abs(prices[i] / prices[i + 1] - 1) for i in range(len(prices) - 1)]
-            valid_notionals = notionals[:-1]
+            # Amihud pairs |return| with the notional traded over the same step,
+            # so the two lists are built together: dividing by prices[i + 1] was
+            # unguarded, and the collectors write 0.0 for a trade that arrived
+            # without a price, so a single bad tick made the estimate infinite.
+            # Filtering only `returns` would desynchronise it from the notionals
+            # and amihud_illiquidity would quietly answer 0.0 on the length
+            # mismatch, which loses the measurement instead of fixing it.
+            returns, valid_notionals = [], []
+            for i in range(len(prices) - 1):
+                base = prices[i + 1]
+                notional = notionals[i] if i < len(notionals) else 0.0
+                if base and notional > 0:
+                    returns.append(abs(prices[i] / base - 1))
+                    valid_notionals.append(notional)
             ami = quant_calc.amihud_illiquidity(
-                returns,
-                valid_notionals
-            ) if len(prices) >= 5 and all(n > 0 for n in valid_notionals) else 0.0
+                returns, valid_notionals
+            ) if len(returns) >= 4 else 0.0
             v = quant_calc.vwap(prices, volumes) if volumes else price
 
             return MarketMicrostructure(
@@ -301,12 +372,22 @@ class CryptoEnricher:
         if is_watched:
             anomaly = min(1.0, anomaly + 0.15)
 
-        # Fetch latest OI from Redis to attach as context (no separate API call)
+        # Prefer the value the collector already put on the event. The Redis
+        # lookup below reads a key written only by the Binance OI poller, which
+        # cannot run from this host (HTTP 451) -- so open_interest arrived null
+        # even when the event carried it, as OKX's events do.
         oi_value = None
+        payload_oi = p.get("open_interest")
+        if payload_oi is not None:
+            try:
+                oi_value = float(payload_oi)
+            except (TypeError, ValueError):
+                oi_value = None
         try:
-            raw_oi = await self.redis.raw.get(f"sentinel:crypto:oi:{asset}")
-            if raw_oi:
-                oi_value = float(raw_oi)
+            if oi_value is None:
+                raw_oi = await self.redis.raw.get(f"sentinel:crypto:oi:{asset}")
+                if raw_oi:
+                    oi_value = float(raw_oi)
         except Exception:
             pass
 
@@ -334,7 +415,14 @@ class CryptoEnricher:
             source=raw.source,
             primary_entity=entity,
             crypto_data=CryptoData(
-                pair=asset,
+                # The instrument, not the asset. Entity stays the asset (BTC),
+                # which is what an analyst reasons about and what everything
+                # groups by; pair says which contract produced the number, so
+                # BTC-USDT-SWAP and BTC-USDC-SWAP stay distinguishable without
+                # fragmenting BTC into several "entities" -- which is what the
+                # Binance rows did, leaving BTCUSDT, BTCUSDC and BTCUSD_PERP as
+                # three separate subjects in the graph.
+                pair=(p.get("pair") or asset),
                 trade_type="CRYPTO_PERP_FUNDING",
                 side=direction.upper(),
                 price=mark_price,
@@ -516,26 +604,49 @@ class CryptoEnricher:
         except (ValueError, TypeError):
             notional = 0.0
 
-        is_baseline = notional < 1_000_000 and not is_suspect
+        # Size and provenance are separate signals and are no longer conflated.
+        #
+        # `notional < 1_000_000 and not is_suspect` meant a transfer from a
+        # watched wallet skipped the size test entirely, so a 50 USDC movement
+        # was published as "SUSPECT Whale Transfer" at CRITICAL. Because
+        # notional/50_000_000 is ~0 at that size, every such event scored
+        # 0 + 0.4 + boosts = exactly 0.75 regardless of amount -- 51,771 crypto
+        # transfers in 24 hours, indistinguishable from one another and from a
+        # genuine nine-figure move.
+        is_whale = notional >= WHALE_NOTIONAL_USD
 
-        if is_baseline:
-            anomaly = 0.1
+        # Log-scaled, because transfer sizes span nine orders of magnitude.
+        # Linear scaling gave a $5M move a score of 0.05 -- less than the noise
+        # floor -- while only a $50M+ move registered at all.
+        size_score = _notional_score(notional)
+
+        if not is_whale and not is_suspect:
+            anomaly = round(min(0.35, size_score), 4)
             tags = ["crypto", "transfer", "baseline_data"]
-            headline = f"Standard Transfer: ${notional/1e6:.2f}M {asset}"
+            headline = f"Transfer: {_money(notional)} {asset}"
         else:
-            anomaly = min(1.0, notional / 50_000_000 * 0.5)
-            if is_suspect: anomaly = min(1.0, anomaly + 0.4)
-            
-            # Watchlist & Frequency boost
+            anomaly = size_score
+            if is_suspect:
+                # A watched counterparty is a reason to look, not a verdict. It
+                # lifts the floor rather than replacing the size signal.
+                anomaly = max(anomaly, 0.45)
+
             is_w_sender = await self.scorer.check_watchlist(sender, "wallets") if sender != "UNKNOWN" else False
             is_w_receiver = await self.scorer.check_watchlist(wallet, "wallets") if wallet != "UNKNOWN" else False
             w_boost = 0.15 if (is_w_sender or is_w_receiver) else 0.0
             f_boost = await self.scorer.track_frequency(wallet, "crypto_transfer")
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
-            
-            tags = ["crypto", "whale_transfer", asset.lower()]
-            if is_suspect: tags.append("suspect_wallet")
-            headline = f"{'🚨 SUSPECT ' if is_suspect else ''}Whale Transfer: ${notional/1e6:.1f}M {asset}"
+            anomaly = round(min(1.0, anomaly + w_boost + f_boost), 4)
+
+            tags = ["crypto", asset.lower()]
+            tags.append("whale_transfer" if is_whale else "watched_wallet_transfer")
+            if is_suspect:
+                tags.append("suspect_wallet")
+
+            # The label states which signal fired. Calling a $50 movement a
+            # whale transfer is simply untrue, and it trained the reader to
+            # ignore the word.
+            kind = "Whale Transfer" if is_whale else "Watched Wallet Transfer"
+            headline = f"{'🚨 ' if is_suspect else ''}{kind}: {_money(notional)} {asset}"
 
             if notional > 5_000_000:
                 try:

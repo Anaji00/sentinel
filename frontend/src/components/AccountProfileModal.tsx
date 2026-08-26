@@ -147,13 +147,13 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
       : 'text-slate-400';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in duration-200">
-      <div className="relative w-full max-w-2xl bg-[#0b0e17] border border-[#00f2fe]/40 rounded-2xl shadow-[0_0_50px_rgba(0,242,254,0.2)] overflow-hidden font-mono text-slate-200">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 animate-in fade-in duration-200">
+      <div className="relative w-full max-w-2xl bg-[#0b0e17] border border-[#00f2fe]/40 rounded-2xl overflow-hidden font-mono text-slate-200">
 
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 bg-slate-950/80 border-b border-cyan-500/20">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-lg shadow-[0_0_15px_rgba(0,242,254,0.5)]">
+            <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-lg">
               {initials}
             </div>
             <div>
@@ -289,6 +289,19 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 </p>
               </div>
             </div>
+          )}
+
+          {activeTab === 'access' && (
+            /* The plan page was built and linked from nowhere, so nobody could
+               reach their own subscription. It belongs beside access and limits
+               rather than in the main navigation, which is for intelligence
+               surfaces rather than account settings. */
+            <a
+              href="/account"
+              className="mt-4 inline-flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-cyan-400 hover:text-cyan-300"
+            >
+              Manage plan &amp; billing →
+            </a>
           )}
 
           {activeTab === 'integrations' && isOperator && (

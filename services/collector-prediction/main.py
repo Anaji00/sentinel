@@ -38,12 +38,150 @@ logger = logging.getLogger("collector.prediction")
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Outcome names that mean "this market is a straight yes/no bet". Anything else
+# is a named outcome in a field of several, where forcing a yes/no reading
+# invents a probability for a question nobody asked.
+_BINARY_YES = frozenset({"yes", "y", "true"})
+_BINARY_NO = frozenset({"no", "n", "false"})
+
+
+def _json_list(value) -> list:
+    """Gamma returns these as JSON-encoded strings, not arrays."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _price_map(names: list, prices: list) -> dict:
+    """Outcome name -> probability, for the legs the API priced.
+
+    Returned empty rather than partially guessed when the two arrays disagree in
+    length: a misaligned name/price pairing is worse than no distribution, since
+    it reads as authoritative.
+    """
+    if not names or len(names) != len(prices):
+        return {}
+    out = {}
+    for name, price in zip(names, prices):
+        try:
+            out[str(name)] = round(float(price), 4)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _pair_markets_with_events(data: list, queried_slug: str) -> list:
+    """Each market paired with the event it belongs to.
+
+    The /markets endpoint answers with a flat list even when every row is one
+    leg of the same question -- 20 rows came back for the 2028 nomination, one
+    per candidate, with no event wrapper. Grouping is therefore done on each
+    market's own nested `events[0]`, which carries the real title
+    ("Democratic Presidential Nominee 2028") rather than being inferred from the
+    shape of the response.
+    """
+    pairs = []
+    flat = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if "markets" in item and isinstance(item["markets"], list):
+            for market in item["markets"]:
+                if isinstance(market, dict):
+                    pairs.append((market, item))
+        else:
+            flat.append(item)
+
+    groups = {}
+    for market in flat:
+        events = market.get("events")
+        event = events[0] if isinstance(events, list) and events and isinstance(events[0], dict) else {}
+        key = event.get("slug") or queried_slug
+        if key not in groups:
+            groups[key] = {
+                "title": event.get("title") or "",
+                "slug": key,
+                "markets": [],
+            }
+        groups[key]["markets"].append(market)
+
+    for group in groups.values():
+        for market in group["markets"]:
+            pairs.append((market, group))
+    return pairs
+
+
+def _choice_context(market: dict, parent_event) -> dict:
+    """The multi-choice field this market is one leg of, if it is one.
+
+    Polymarket prices "who wins" as one yes/no market per candidate. Each leg is
+    a real binary bet and stays one; what was missing is that the legs belong to
+    a single question. Without the parent, three markets in one nomination race
+    look like three unrelated coin flips -- which is exactly how they were being
+    stored.
+    """
+    siblings = (parent_event or {}).get("markets") or []
+    choice_name = market.get("groupItemTitle") or None
+
+    # One market under an event is not a field of choices.
+    if len(siblings) < 2:
+        return {
+            "choice_name": choice_name,
+            "choice_space": [],
+            "choice_prices": {},
+            "event_title": (parent_event or {}).get("title") or "",
+            "event_slug": (parent_event or {}).get("slug") or "",
+            "is_multi_choice": False,
+        }
+
+    space, prices = [], {}
+    for sib in siblings:
+        title = sib.get("groupItemTitle")
+        if not title:
+            continue
+        space.append(str(title))
+        # The leg's own p(yes) is that choice's probability within the field.
+        leg = _json_list(sib.get("outcomePrices"))
+        names = _json_list(sib.get("outcomes"))
+        pair = _price_map(names, leg)
+        for key, value in pair.items():
+            if key.strip().lower() in _BINARY_YES:
+                prices[str(title)] = value
+                break
+
+    return {
+        "choice_name": choice_name,
+        "choice_space": space,
+        "choice_prices": prices,
+        "event_title": (parent_event or {}).get("title") or "",
+        "event_slug": (parent_event or {}).get("slug") or "",
+        "is_multi_choice": len(space) >= 2,
+    }
+
+
+def _is_binary_market(outcome_names: list) -> bool:
+    """True only for a genuine two-sided yes/no market."""
+    if len(outcome_names) != 2:
+        return False
+    lowered = {str(n).strip().lower() for n in outcome_names}
+    return bool(lowered & _BINARY_YES) and bool(lowered & _BINARY_NO)
+
 # ── POLYMARKET STREAM ─────────────────────────────────────────────────────────        
 
 async def stream_polymarket(producer: SentinelProducer, redis_client):
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     redis_key = "sentinel:polymarket:watched_slugs"
     id_to_label = {}
+    # Structured view of the same tokens. The label is a display string and
+    # cannot answer "how many outcomes does this market have", which is the
+    # question that decides whether yes/no is even meaningful.
+    id_to_meta = {}
 
     async def update_subscriptions(ws, session):
         base_url = "https://gamma-api.polymarket.com/markets"
@@ -87,18 +225,18 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                             if resp.status == 200:
                                 data = await resp.json()
                                 
-                                # FIX: Gamma API returns a list of Events, which contain Markets.
-                                markets = []
-                                if isinstance(data, list):
-                                    for item in data:
-                                        if isinstance(item, dict) and "markets" in item:
-                                            markets.extend(item["markets"])
-                                        elif isinstance(item, dict):
-                                            markets.append(item)
-                                else:
+                                # Gamma returns Events, which contain Markets. The
+                                # parent is kept rather than flattened away: a
+                                # multi-choice question ("who wins the nomination")
+                                # is modelled as one binary market per candidate,
+                                # so the *field* only exists at the event level.
+                                # Verified live: 23 of 25 events carry 3+ sibling
+                                # markets and every one has a groupItemTitle.
+                                if not isinstance(data, list):
                                     continue
+                                markets = _pair_markets_with_events(data, slug)
 
-                                for market in markets:
+                                for market, parent_event in markets:
                                     if not isinstance(market, dict) or market.get("closed"): 
                                         continue
 
@@ -110,17 +248,33 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                         except (json.JSONDecodeError, TypeError, Exception):
                                             continue
                                     
-                                    outcomes = market.get("outcomeNames", [])
-                                    if isinstance(outcomes, str):
-                                        try:
-                                            outcomes = json.loads(outcomes)
-                                        except (json.JSONDecodeError, TypeError, Exception):
-                                            outcomes = []
-                                    
+                                    # Gamma calls these "outcomes" and "outcomePrices".
+                                    # Verified against the live API: "outcomeNames" is
+                                    # absent from every market, so reading it produced an
+                                    # empty list, every token fell through to the
+                                    # "Outcome {i}" placeholder, and the real names were
+                                    # never seen downstream.
+                                    outcomes = _json_list(market.get("outcomes"))
+                                    if not outcomes:
+                                        outcomes = _json_list(market.get("outcomeNames"))
+                                    prices = _json_list(market.get("outcomePrices"))
+
                                     for i, token_id in enumerate(tokens):
                                         if token_id not in id_to_label:
-                                            outcome_name = outcomes[i] if (outcomes and i < len(outcomes)) else f"Outcome {i}"
+                                            outcome_name = str(outcomes[i]) if i < len(outcomes) else f"Outcome {i}"
                                             id_to_label[token_id] = f"{slug} | {question} | {outcome_name}"
+                                            id_to_meta[token_id] = {
+                                                "slug": slug,
+                                                "question": question,
+                                                **_choice_context(market, parent_event),
+                                                "outcome_name": outcome_name,
+                                                "outcome_index": i,
+                                                "outcome_names": [str(o) for o in outcomes],
+                                                # Snapshot of the whole field at subscribe
+                                                # time. Trades carry one leg's price; this
+                                                # keeps the other legs visible.
+                                                "outcome_prices": _price_map(outcomes, prices),
+                                            }
                                             new_assets.append(token_id)
                             else:
                                 logger.error(f"Gamma API error for {slug}: HTTP {resp.status}")
@@ -159,22 +313,44 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     notional_usd = price * size
 
                                     label = id_to_label.get(asset_id, "UNKNOWN")
-                                    
-                                    # Extract outcome name to calculate yes/no probabilities
-                                    outcome_name = label.split(" | ")[-1] if " | " in label else ""
-                                    clean_outcome = outcome_name.strip().lower()
-                                    if clean_outcome in ("yes", "y", "true", "1", "outcome 0"):
-                                        yes_prob = round(price, 4)
-                                        no_prob = round(max(0.0, 1.0 - price), 4)
-                                    elif clean_outcome in ("no", "n", "false", "0", "outcome 1"):
-                                        no_prob = round(price, 4)
-                                        yes_prob = round(max(0.0, 1.0 - price), 4)
-                                    else:
-                                        # Default probability derivation from contract price (CLOB token prices equal probability)
-                                        yes_prob = round(price, 4) if price <= 1.0 else round(price / 100.0, 4)
-                                        no_prob = round(max(0.0, 1.0 - yes_prob), 4)
+                                    meta = id_to_meta.get(asset_id, {})
 
-                                    logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label} | YesProb: {yes_prob} | NoProb: {no_prob}")
+                                    outcome_name = meta.get("outcome_name") or (
+                                        label.split(" | ")[-1] if " | " in label else ""
+                                    )
+                                    outcome_names = meta.get("outcome_names") or []
+                                    clean_outcome = outcome_name.strip().lower()
+
+                                    # A CLOB token price is already the probability of
+                                    # that one outcome, so the traded leg is known
+                                    # exactly whatever the market's shape.
+                                    leg_prob = round(price, 4) if price <= 1.0 else round(price / 100.0, 4)
+                                    outcome_prices = dict(meta.get("outcome_prices") or {})
+                                    if outcome_name:
+                                        outcome_prices[outcome_name] = leg_prob
+
+                                    if _is_binary_market(outcome_names) or not outcome_names:
+                                        # Two-sided market: the complement is the other
+                                        # side, and yes/no is a true description of it.
+                                        if clean_outcome in _BINARY_NO:
+                                            no_prob = leg_prob
+                                            yes_prob = round(max(0.0, 1.0 - leg_prob), 4)
+                                        else:
+                                            yes_prob = leg_prob
+                                            no_prob = round(max(0.0, 1.0 - leg_prob), 4)
+                                    else:
+                                        # Several named outcomes. 1 - price is the
+                                        # probability of "any other candidate", not of
+                                        # "no", so publishing it as no_probability
+                                        # asserts something the market never priced.
+                                        yes_prob = None
+                                        no_prob = None
+
+                                    if yes_prob is None:
+                                        logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label} | "
+                                                    f"P({outcome_name}): {leg_prob} of {len(outcome_names)} outcomes")
+                                    else:
+                                        logger.info(f"Polymarket Trade Found | {size} shares @ ${price} | {label} | YesProb: {yes_prob} | NoProb: {no_prob}")
 
                                     # STATELESS: Pipe directly to Kafka. Let Enrichment score anomalies.
                                     raw_event = RawEvent(
@@ -188,7 +364,21 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                             "notional_usd": notional_usd,
                                             "yes_probability": yes_prob,
                                             "no_probability": no_prob,
-                                            "outcome_name": outcome_name
+                                            "outcome_name": outcome_name,
+                                            "outcome_prices": outcome_prices or None,
+                                            "outcome_names": outcome_names or None,
+                                            "outcome_index": meta.get("outcome_index"),
+                                            "is_binary": _is_binary_market(outcome_names) if outcome_names else None,
+                                            "market_question": meta.get("question") or "",
+                                            "market_slug": meta.get("slug") or "",
+                                            # The field this leg belongs to, when it
+                                            # belongs to one.
+                                            "choice_name": meta.get("choice_name"),
+                                            "choice_space": meta.get("choice_space") or None,
+                                            "choice_prices": meta.get("choice_prices") or None,
+                                            "event_title": meta.get("event_title") or "",
+                                            "event_slug": meta.get("event_slug") or "",
+                                            "is_multi_choice": bool(meta.get("is_multi_choice"))
                                         }
                                     )
                                     await producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")

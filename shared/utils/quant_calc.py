@@ -18,7 +18,7 @@ Usage:
 import os
 import math
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Sequence, Tuple, Any, Set
 
 import numpy as np
 from scipy.stats import f as f_dist
@@ -65,8 +65,20 @@ def periods_per_year(timeframe: str, asset_class: str = "equity") -> float:
     if ac not in _ACTIVE_MINUTES_PER_YEAR:
         ac = "equity"
 
-    tf = str(timeframe or "1d").strip().lower()
+    raw = str(timeframe or "1d").strip()
     sessions = _SESSIONS_PER_YEAR[ac]
+
+    # "1M" is a month; "1m" is a minute. Case is the only thing separating them,
+    # and this function lower-cased before comparing -- so a monthly series was
+    # annualized as if sampled every minute: 98,280 periods per year instead of
+    # 12, an 8,190x error that inflates a Sharpe ratio by about 90x. "1M" is a
+    # live timeframe here: the radar route accepts it and reads it from
+    # tradfi_bars_1mth. Matched before the fold, exactly as
+    # shared/utils/candles.normalize_timeframe does.
+    if raw == "1M":
+        return 12.0
+
+    tf = raw.lower()
 
     if tf in ("1d", "d", "1day", "daily"):
         return float(sessions)
@@ -84,6 +96,30 @@ def periods_per_year(timeframe: str, asset_class: str = "equity") -> float:
         return float(sessions)
 
     return _ACTIVE_MINUTES_PER_YEAR[ac] / float(minutes)
+
+
+def simple_returns(closes: Sequence[float]) -> List[float]:
+    """Period returns from a close series, skipping bars that cannot produce one.
+
+    The idiom this replaces -- `np.diff(closes) / closes[:-1]` -- divides by the
+    previous close with no guard, and the collectors substitute 0.0 for a bar
+    that arrived without a close price. One malformed bar therefore produced inf
+    or nan, which then propagated silently through volatility, Sharpe, VaR and
+    Kelly: every downstream figure became nan without any error being raised.
+
+    A bar with no usable base price yields no return rather than an infinite one.
+    Non-finite inputs are dropped for the same reason.
+    """
+    out: List[float] = []
+    for previous, current in zip(closes, list(closes)[1:]):
+        try:
+            prev_f = float(previous)
+            curr_f = float(current)
+        except (TypeError, ValueError):
+            continue
+        if prev_f > 0 and math.isfinite(prev_f) and math.isfinite(curr_f):
+            out.append((curr_f - prev_f) / prev_f)
+    return out
 
 
 def classify_asset_class(symbol: str) -> str:

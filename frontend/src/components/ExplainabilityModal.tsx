@@ -84,8 +84,8 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
   const { data, error, isLoading } = useSWR<ExplainResponse>(targetPath, fetcher);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-      <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-2xl max-w-2xl w-full p-6 space-y-5 shadow-[0_0_40px_rgba(0,242,254,0.25)] font-mono text-xs text-slate-200 max-h-[90vh] overflow-y-auto custom-scrollbar">
+    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+      <div className="bg-[#0b0e17] border border-[#00f2fe]/40 rounded-2xl max-w-2xl w-full p-6 space-y-5 font-mono text-xs text-slate-200 max-h-[90vh] overflow-y-auto custom-scrollbar">
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b border-slate-800/80 pb-4">
           <div className="flex items-center gap-3">

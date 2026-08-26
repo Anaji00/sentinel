@@ -257,6 +257,12 @@ class ConsensusReport(BaseModel):
     stale_agents: List[str] = Field(default_factory=list)
     total_active_bulletins: int = 0
     agents_reporting: List[str] = Field(default_factory=list)
+    # Every agent reads this back through get_swarm_context() as
+    # "Swarm Consensus: ...". The field did not exist, so `cons.get("summary")`
+    # returned None on every read and the line was never added to any prompt:
+    # the engine computed fusion, contradictions and ACH matrices, persisted
+    # them, and no agent ever saw a word of it.
+    summary: str = ""
 
 
 # ── CONSENSUS ENGINE ─────────────────────────────────────────────────────────
@@ -383,7 +389,11 @@ class ConsensusEngine(SentinelAgent):
                     consensus_score=self._direction_to_score(direction) * b.conviction * weight,
                     contributing_agents=1,
                     weighted_conviction=b.conviction * weight,
-                    agreement_ratio=1.0,
+                    # Not 1.0. One agent agreeing with itself is not unanimity,
+                    # and this figure is read as "the swarm concurs". Agreement
+                    # is undefined with a single opinion; 0.0 says so without
+                    # inventing corroboration that nobody supplied.
+                    agreement_ratio=0.0,
                     fused_opinion=opinion,
                     bulletins=group,
                     evidence_trail=_build_evidence_trail(group),
@@ -519,6 +529,7 @@ class ConsensusEngine(SentinelAgent):
             stale_agents=stale_agents,
             total_active_bulletins=len(bulletins),
             agents_reporting=sorted(agents_reporting),
+            summary=self._build_summary(consensus_signals, contradictions, stale_agents),
         )
 
         # Persist the report
@@ -600,6 +611,42 @@ class ConsensusEngine(SentinelAgent):
         except Exception as e:
             logger.debug(f"Failed to read scorecards: {e}")
         return scorecards
+
+    @staticmethod
+    def _build_summary(
+        signals: List[ConsensusSignal],
+        contradictions: List["ContradictionReport"],
+        stale_agents: List[str],
+    ) -> str:
+        """One line of swarm state, written for another agent's prompt.
+
+        Deliberately states how many agents stand behind each call. The reader
+        is a model that will treat "Swarm Consensus" as corroboration, so a
+        signal carried by one agent has to say so -- otherwise an agent's own
+        opinion returns to it a cycle later wearing the swarm's authority, and
+        the swarm converges on nothing but its own echo.
+        """
+        parts: List[str] = []
+
+        corroborated = [s for s in signals if s.contributing_agents > 1]
+        solo = [s for s in signals if s.contributing_agents <= 1]
+
+        for sig in sorted(corroborated, key=lambda x: abs(x.consensus_score), reverse=True)[:3]:
+            parts.append(
+                f"{sig.ticker} {sig.direction} "
+                f"({sig.contributing_agents} agents, {sig.agreement_ratio:.0%} agreement)"
+            )
+        if solo:
+            names = ", ".join(sorted({s.ticker for s in solo})[:3])
+            parts.append(f"single-agent only: {names}")
+        if contradictions:
+            parts.append(f"{len(contradictions)} contradiction(s) open")
+        if stale_agents:
+            parts.append(f"stale: {', '.join(sorted(stale_agents)[:3])}")
+
+        if not parts:
+            return "No corroborated swarm signals."
+        return " | ".join(parts)
 
     async def _persist_report(self, report: ConsensusReport) -> None:
         """Stores the consensus report in Redis for dashboards and other consumers."""

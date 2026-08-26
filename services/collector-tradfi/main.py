@@ -45,6 +45,83 @@ logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.ge
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 REDIS_EQUITIES_KEY = "sentinel:watched:equities"
 
+# Finnhub allows 50 concurrent symbol subscriptions, and that budget was spent
+# entirely on recency: zrevrange takes the 50 most recently *added* watchlist
+# entries, and the watchlist is scored by time.time() as the radar and quant
+# agents encounter anomalies. The result on a live pre-market session was a
+# subscription set of AAL, ACGL, ACM, BIIB, BRKR, CAG, CLH, DTM, EIX, EME ...
+# -- mid-caps that print minutes apart before the open -- with no NVDA, AAPL,
+# MSFT, TSLA, AMZN or META anywhere in it. The trade counter sat unchanged at
+# 7,787 across 217 consecutive heartbeats while the collector reported
+# "Streaming 50/50 symbols", because that figure counts subscriptions, not data.
+#
+# A desk always watches the same handful of anchors and rotates the rest onto
+# whatever is moving today. These slots are reserved for the names that carry
+# the market; the remainder still go to the newest discoveries.
+CORE_EQUITY_SYMBOLS = [
+    t.strip().upper()
+    for t in os.getenv(
+        "CORE_EQUITY_SYMBOLS",
+        "NVDA,AAPL,MSFT,AMZN,META,GOOGL,TSLA,AVGO,JPM,XOM,SPY,QQQ",
+    ).split(",")
+    if t.strip()
+]
+
+# Never let the core crowd out discovery entirely: at most this share of the
+# budget is reserved, so the radar always keeps room to surface something new.
+MAX_CORE_SHARE = float(os.getenv("CORE_EQUITY_MAX_SHARE", "0.5"))
+
+FINNHUB_SUBSCRIPTION_LIMIT = int(os.getenv("FINNHUB_SUBSCRIPTION_LIMIT", "50"))
+
+# How long a single read may block before the loop checks for staleness. Short,
+# because its only job is to return control regularly.
+WS_READ_TIMEOUT_SEC = float(os.getenv("FINNHUB_WS_READ_TIMEOUT_SEC", "30"))
+
+# How long the feed may deliver nothing during an open session before the
+# connection is treated as dead. Generous enough for a quiet pre-market minute
+# on illiquid names, far short of an eight-hour outage.
+WS_MAX_STALL_SEC = float(os.getenv("FINNHUB_WS_MAX_STALL_SEC", "300"))
+
+# A send that cannot drain is a wedged socket, not a slow one.
+WS_SEND_TIMEOUT_SEC = float(os.getenv("FINNHUB_WS_SEND_TIMEOUT_SEC", "15"))
+
+
+def select_subscription_symbols(discovered, limit: int = None) -> list:
+    """The symbols worth spending a scarce subscription slot on.
+
+    Core anchors first, in declared order, then the most recent discoveries
+    until the budget is full. Deduplicated, and capped so the core can never
+    consume more than MAX_CORE_SHARE of the slots.
+
+    `discovered` arrives newest-first (zrevrange), and that order is preserved
+    for the non-core remainder -- recency is a reasonable tiebreak among
+    discoveries, it was simply the wrong rule for the whole budget.
+    """
+    # `is None`, not `or`: an explicit limit of 0 means subscribe to nothing,
+    # and `0 or 50` would quietly turn that into the full budget.
+    limit = FINNHUB_SUBSCRIPTION_LIMIT if limit is None else int(limit)
+    if limit <= 0:
+        return []
+
+    core_budget = max(0, min(len(CORE_EQUITY_SYMBOLS), int(limit * MAX_CORE_SHARE)))
+    selected, seen = [], set()
+
+    for symbol in CORE_EQUITY_SYMBOLS[:core_budget]:
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            selected.append(symbol)
+
+    for symbol in discovered:
+        if len(selected) >= limit:
+            break
+        symbol = str(symbol).strip().upper()
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            selected.append(symbol)
+
+    return selected[:limit]
+
+
 # ── MARKET SESSION HELPER ─────────────────────────────────────────────────────
 
 def get_market_session() -> tuple:
@@ -290,22 +367,36 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
 
         while True:
             try:
-                raw_tickers = await redis_client.raw.zrevrange(REDIS_EQUITIES_KEY, 0, 49)
-                decoded_tickers = {t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers}
-                desired_subs = {t.upper() for t in decoded_tickers if is_valid_primary_equity(t)}
+                # Read more than the budget: the core anchors are prepended, so
+                # the discovery list needs headroom to still fill the remainder.
+                raw_tickers = await redis_client.raw.zrevrange(
+                    REDIS_EQUITIES_KEY, 0, FINNHUB_SUBSCRIPTION_LIMIT * 2
+                )
+                decoded_tickers = [t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers]
+                discovered = [t.upper() for t in decoded_tickers if is_valid_primary_equity(t)]
 
-                # §0.2 — Finnhub 50-ticker clamp (hard validation)
-                if len(desired_subs) > 50:
-                    logger.warning("Watchlist exceeds Finnhub limit (50). Truncating %d symbols.", len(desired_subs) - 50)
-                    desired_subs = set(list(desired_subs)[:50])
+                # Core anchors first, discoveries after -- and the result is
+                # already clamped to the Finnhub limit by construction, so the
+                # separate truncation that used to follow is unnecessary.
+                desired_subs = set(select_subscription_symbols(discovered))
 
                 to_add = desired_subs - current_subs
                 to_remove = current_subs - desired_subs
 
+                # Bounded sends. On a half-open socket `ws.send` awaits a drain
+                # that never happens, and this task is the one that also logs the
+                # heartbeat -- so a wedged send silences the only signal that
+                # would have shown the feed was dead.
                 for ticker in to_add:
-                    await ws.send(json.dumps({"type": "subscribe", "symbol": ticker}))
+                    await asyncio.wait_for(
+                        ws.send(json.dumps({"type": "subscribe", "symbol": ticker})),
+                        timeout=WS_SEND_TIMEOUT_SEC,
+                    )
                 for ticker in to_remove:
-                    await ws.send(json.dumps({"type": "unsubscribe", "symbol": ticker}))
+                    await asyncio.wait_for(
+                        ws.send(json.dumps({"type": "unsubscribe", "symbol": ticker})),
+                        timeout=WS_SEND_TIMEOUT_SEC,
+                    )
 
                 if to_add or to_remove:
                     current_subs = desired_subs
@@ -347,16 +438,55 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                 logger.info("Connected to Finnhub WebSocket")
                 sync_task = asyncio.create_task(sync_subscriptions(ws))
                 flush_task = asyncio.create_task(flush_aggregator())
+                last_message_at = time.monotonic()
 
                 try:
                     while True:
-                        message = await ws.recv()
+                        # Bounded read, with a staleness watchdog.
+                        #
+                        # A bare `await ws.recv()` blocks forever on a socket
+                        # that is healthy at the protocol level but delivering
+                        # nothing. That is not hypothetical: this feed went
+                        # silent from 12:13 to 20:11 UTC -- the whole regular
+                        # session -- while pings were still being answered, so
+                        # the keepalive never fired. Heartbeats per hour ran
+                        # 4, 0, 0, 0, 1, 0, 0, 0, 49.
+                        #
+                        # Pings prove the peer is alive. They cannot prove the
+                        # subscription is still delivering, and only the second
+                        # question matters here.
+                        try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=WS_READ_TIMEOUT_SEC)
+                            last_message_at = time.monotonic()
+                        except asyncio.TimeoutError:
+                            stalled_for = time.monotonic() - last_message_at
+                            session_name, _ = get_market_session()
+                            # Silence is expected when the market is shut. It is
+                            # a fault only when trading is open.
+                            if session_name != "CLOSED" and stalled_for > WS_MAX_STALL_SEC:
+                                raise ConnectionError(
+                                    f"Finnhub delivered nothing for {stalled_for:.0f}s "
+                                    f"during {session_name}; reconnecting."
+                                )
+                            continue
+
                         data = json.loads(message)
 
                         if data.get("type") == "trade":
                             for item in data.get("data", []):
                                 ticker = item.get("s")
-                                if not ticker or not is_valid_primary_equity(ticker):
+                                # Anything deliberately subscribed to is ingested.
+                                #
+                                # is_valid_primary_equity() gates what may enter
+                                # the *equity watchlist*, and correctly rejects
+                                # SPY and QQQ -- they are funds, not companies.
+                                # Applying it to the *feed* meant spending two
+                                # of fifty scarce Finnhub slots on symbols whose
+                                # trades were then thrown away on arrival.
+                                if not ticker:
+                                    continue
+                                if not (is_valid_primary_equity(ticker)
+                                        or ticker.upper() in CORE_EQUITY_SYMBOLS):
                                     continue
                                 price = float(item.get("p", 0))
                                 volume = float(item.get("v", 0))

@@ -231,7 +231,7 @@ export const Institutional13FPanel: React.FC = () => {
   const activePositions = getActivePositions();
 
   return (
-    <div className="flex flex-col gap-4 bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-2xl text-slate-100 backdrop-blur-md">
+    <div className="flex flex-col gap-4 bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-2xl text-slate-100">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
         <div>

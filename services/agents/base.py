@@ -76,11 +76,20 @@ class AgentPrediction(BaseModel):
     prediction_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     agent_name: str
     ticker: str
-    direction: str  # "up", "down"
+    direction: str  # "up", "down", "flat" -- price predictions only
     conviction: float
     time_horizon_hours: int = 24
     entry_price: float = 0.0
     target_price: float = 0.0
+    # Categorical predictions. Not every question the platform reasons about is a
+    # two-sided price bet: a nomination race prices one leg per candidate, and
+    # "up or down on candidate X" is not the claim an analyst is making. When
+    # outcome_space is populated the prediction is about *which* outcome wins,
+    # and `direction` does not describe it.
+    outcome_space: List[str] = Field(default_factory=list)
+    predicted_outcome: Optional[str] = None
+    market_key: Optional[str] = None
+    resolved_outcome: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     verified: bool = False
     outcome_correct: Optional[bool] = None
@@ -183,6 +192,9 @@ class SentinelAgent(ABC):
         await self._producer.start()
         await self._dlq.start()
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Without this, predictions expire unscored and every scorecard
+        # stays at its default -- see _resolve_predictions_loop.
+        resolver_task = asyncio.create_task(self._resolve_predictions_loop())
 
         try:
             await self._consume_loop()
@@ -190,6 +202,7 @@ class SentinelAgent(ABC):
             self.logger.info(f"{self.name} cancelled — shutting down")
         finally:
             heartbeat_task.cancel()
+            resolver_task.cancel()
             # Dispatches now outlive the loop that started them, so give them a
             # bounded chance to finish before the HTTP session they are using is
             # closed underneath them. Anything still running after this is
@@ -686,11 +699,62 @@ class SentinelAgent(ABC):
             await self.redis.raw.sadd(idx_key, key)
             await self.redis.raw.expire(idx_key, ttl)
 
+            # A categorical call on a market that prices the same outcome is a
+            # paired forecast: Sentinel's probability for a named outcome beside
+            # the market's, on one proposition and on the same 0-1 scale. That
+            # is the only pairing in this system where both sides are answering
+            # an identical question, so it is the one recorded.
+            await self._record_paired_forecast(pred)
+
             self.logger.debug(f"Recorded prediction {pred.prediction_id}: {ticker} {direction} @ {conviction:.0%}")
             return pred.prediction_id
         except Exception as e:
             self.logger.warning(f"Failed to record prediction: {e}")
             return ""
+
+    async def _record_paired_forecast(self, pred: "AgentPrediction") -> bool:
+        """Files a Sentinel/market probability pair, when one genuinely exists.
+
+        Only categorical predictions qualify. A price-direction call ("up on
+        NVDA") has no market quoting the same proposition, and grading it
+        against one would produce a Brier score for a question nobody asked --
+        which is why MarketCalibrationTracker had no callers rather than a
+        convenient one.
+        """
+        if not pred.outcome_space or not pred.predicted_outcome:
+            return False
+        market_key = pred.market_key or pred.ticker
+        distribution = await self._latest_outcome_distribution(market_key)
+        if not distribution:
+            return False
+
+        # The market's price for the very outcome the agent named.
+        market_p = None
+        target = pred.predicted_outcome.strip().lower()
+        for name, price in distribution.items():
+            if str(name).strip().lower() == target:
+                market_p = float(price)
+                break
+        if market_p is None:
+            return False
+
+        try:
+            from services.reasoning.market_calibration import (
+                MarketCalibrationTracker,
+                PairedForecast,
+            )
+        except Exception as e:
+            self.logger.debug(f"Calibration tracker unavailable: {e}")
+            return False
+
+        tracker = MarketCalibrationTracker(self.redis)
+        return await tracker.record_forecast(PairedForecast(
+            market_id=f"{market_key}:{pred.predicted_outcome}",
+            question=f"{market_key}: does '{pred.predicted_outcome}' win?",
+            sentinel_probability=max(0.0, min(1.0, float(pred.conviction))),
+            market_probability=max(0.0, min(1.0, market_p)),
+            ticker=pred.ticker,
+        ))
 
     async def current_regime(self) -> str:
         """The prevailing market regime, or "unknown".
@@ -979,6 +1043,227 @@ class SentinelAgent(ABC):
             self._budget_instance = budget
         return budget
 
+
+    # ── Closing the prediction loop ──────────────────────────────────────────
+    #
+    # Predictions were recorded with a TTL and then expired unresolved:
+    # update_scorecard() existed and had no callers anywhere in the codebase.
+    # Every agent's scorecard therefore sat at its constructed default forever,
+    # which matters beyond bookkeeping -- the consensus engine fuses opinions
+    # *weighted by these scorecards*, so a weighting that never moves is no
+    # weighting at all, and an agent that is consistently wrong carried exactly
+    # as much influence as one that is consistently right.
+    #
+    # Each agent resolves its own predictions. That keeps the work where the
+    # scorecard and the agent name already are, and needs no cross-process
+    # coordination.
+    PREDICTION_SWEEP_INTERVAL_SEC = 900
+
+    # Moves smaller than this are noise, not a direction. Scoring them credits an
+    # agent for a call the market never made.
+    FLAT_BAND = 0.002
+
+    # A categorical market is only treated as settled when the leader is clear of
+    # the field by this much. Two candidates at 0.34 and 0.33 have not resolved
+    # anything.
+    OUTCOME_DECISION_MARGIN = 0.15
+
+    async def _resolve_predictions_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.PREDICTION_SWEEP_INTERVAL_SEC)
+            try:
+                await self.resolve_due_predictions()
+            except Exception as e:
+                self.logger.warning(f"Prediction resolution sweep failed: {e}")
+
+    async def _latest_price(self, ticker: str) -> Optional[float]:
+        """Most recent quote for a ticker, or None when nothing is known.
+
+        None is a real answer here: resolving a prediction against a price we do
+        not have would manufacture a track record out of nothing.
+        """
+        try:
+            raw = await self.redis.raw.get(f"sentinel:quotes:latest:{ticker.upper()}")
+            if not raw:
+                return None
+            text = raw if isinstance(raw, str) else raw.decode("utf-8")
+
+            # The collectors write a bare number here -- "93.23" -- not an
+            # object. json.loads() parses that to a float perfectly happily, and
+            # the old code then called .get("price") on it, raising
+            # AttributeError into a bare `except Exception: return None`. So
+            # this returned None for every ticker that existed, every time, and
+            # the prediction resolver read that as "unverifiable, so uncounted":
+            # no prediction was ever scored and no scorecard ever moved.
+            try:
+                quote = json.loads(text)
+            except (ValueError, TypeError):
+                quote = text
+
+            if isinstance(quote, (int, float)):
+                return float(quote)
+            if isinstance(quote, str):
+                return float(quote.strip())
+            if isinstance(quote, dict):
+                for field in ("price", "close", "last", "c"):
+                    if quote.get(field) is not None:
+                        return float(quote[field])
+        except Exception:
+            return None
+        return None
+
+    async def _score_directional(self, pred: "AgentPrediction") -> Optional[bool]:
+        """Was a price-direction call right? None when it cannot be judged.
+
+        A flat close is not a win for "down". The original scoring said
+        `moved_up = current > entry`, so an unchanged price scored every bearish
+        call correct -- a free record for predicting nothing happens. An
+        unchanged price answers no directional question and is left uncounted,
+        unless the agent actually predicted flat.
+        """
+        current = await self._latest_price(pred.ticker)
+        if current is None or not pred.entry_price:
+            return None
+
+        direction = (pred.direction or "").strip().lower()
+        # Relative, so the threshold means the same thing for a $3 stock and a
+        # $3,000 one.
+        move = (current - pred.entry_price) / abs(pred.entry_price)
+
+        if direction in ("flat", "neutral", "unchanged", "hold"):
+            return abs(move) <= self.FLAT_BAND
+        if abs(move) <= self.FLAT_BAND:
+            return None             # no move to judge a directional call against
+        if direction in ("up", "long", "bullish", "buy"):
+            return move > 0
+        if direction in ("down", "short", "bearish", "sell"):
+            return move < 0
+        # An unrecognised direction used to be silently scored as "down", which
+        # credited the agent for a word the resolver did not understand.
+        self.logger.debug("Unscoreable direction %r on %s", pred.direction, pred.ticker)
+        return None
+
+    async def _score_categorical(self, pred: "AgentPrediction") -> Optional[bool]:
+        """Did the predicted outcome lead its field at the horizon?
+
+        Resolved against the market's own closing distribution, which is the only
+        settlement signal this deployment actually receives. None whenever the
+        distribution is missing or too close to call, so an unresolved race is
+        uncounted rather than guessed.
+        """
+        if not pred.predicted_outcome:
+            return None
+        distribution = await self._latest_outcome_distribution(pred.market_key or pred.ticker)
+        if not distribution:
+            return None
+
+        ranked = sorted(distribution.items(), key=lambda kv: kv[1], reverse=True)
+        leader, leader_p = ranked[0]
+        runner_up_p = ranked[1][1] if len(ranked) > 1 else 0.0
+        if leader_p - runner_up_p < self.OUTCOME_DECISION_MARGIN:
+            return None             # still a contest, not a result
+
+        pred.resolved_outcome = leader
+        correct = leader.strip().lower() == pred.predicted_outcome.strip().lower()
+
+        # Close the calibration loop. Without a settled outcome the tracker can
+        # compute divergence but never a Brier score, which is why skill_report()
+        # answered with an explicit "no resolved markets" note instead of a
+        # number -- the one thing it exists to produce.
+        try:
+            from services.reasoning.market_calibration import MarketCalibrationTracker
+            tracker = MarketCalibrationTracker(self.redis)
+            await tracker.resolve(
+                f"{pred.market_key or pred.ticker}:{pred.predicted_outcome}",
+                1 if correct else 0,
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not resolve paired forecast: {e}")
+
+        return correct
+
+    async def _latest_outcome_distribution(self, market_key: str) -> Optional[Dict[str, float]]:
+        """Current odds across a market's outcomes, as written by enrichment."""
+        if not market_key:
+            return None
+        try:
+            raw = await self.redis.raw.get(f"sentinel:prediction:outcomes:{market_key}")
+            if not raw:
+                return None
+            parsed = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            if not isinstance(parsed, dict) or not parsed:
+                return None
+            out: Dict[str, float] = {}
+            for name, prob in parsed.items():
+                try:
+                    out[str(name)] = float(prob)
+                except (TypeError, ValueError):
+                    continue
+            return out or None
+        except Exception:
+            return None
+
+    async def resolve_due_predictions(self) -> int:
+        """Scores this agent's predictions whose horizon has elapsed.
+
+        Returns how many were resolved. A prediction with no price to check
+        against is left alone rather than guessed at; it expires on its own TTL
+        and simply never counts, which is the honest outcome for something that
+        cannot be verified.
+        """
+        resolved = 0
+        try:
+            pattern = f"sentinel:predictions:{self.name}:*"
+            keys = [k async for k in self.redis.raw.scan_iter(match=pattern, count=200)]
+        except Exception as e:
+            self.logger.debug(f"Could not scan predictions: {e}")
+            return 0
+
+        now = datetime.now(timezone.utc)
+        for key in keys:
+            try:
+                raw = await self.redis.raw.get(key)
+                if not raw:
+                    continue
+                pred = AgentPrediction(**json.loads(
+                    raw if isinstance(raw, str) else raw.decode("utf-8")
+                ))
+                if pred.verified:
+                    continue
+
+                created = datetime.fromisoformat(pred.created_at)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (now - created).total_seconds() < pred.time_horizon_hours * 3600:
+                    continue        # still open; the market has not answered yet
+
+                if pred.outcome_space:
+                    correct = await self._score_categorical(pred)
+                else:
+                    correct = await self._score_directional(pred)
+                if correct is None:
+                    continue        # unverifiable, so uncounted
+
+                await self.update_scorecard(
+                    prediction_correct=correct,
+                    conviction=pred.conviction,
+                )
+
+                pred.verified = True
+                pred.outcome_correct = correct
+                # Kept briefly after resolution so a scorecard dispute can be
+                # traced back to the predictions behind it.
+                await self.redis.raw.set(key, pred.model_dump_json(), ex=86400)
+                resolved += 1
+            except Exception as e:
+                self.logger.debug(f"Could not resolve prediction {key}: {e}")
+
+        if resolved:
+            self.logger.info(
+                "Resolved %s prediction(s) for %s against realised prices", resolved, self.name
+            )
+        return resolved
+
     async def _execute_with_telemetry(
         self,
         message: dict,
@@ -1112,14 +1397,19 @@ class SentinelAgent(ABC):
         Uses an LLM agentic verification step to double-check that a symbol is a valid 
         primary US common equity (or BTC) and NOT a derivative ETF, option, or crypto altcoin.
         """
-        from shared.utils.equities import is_valid_primary_equity
+        from shared.utils.equities import is_major_crypto, is_supported_asset
 
         if not ticker or not isinstance(ticker, str):
             return False
 
         clean_ticker = ticker.strip().upper()
-        if not is_valid_primary_equity(clean_ticker):
+        if not is_supported_asset(clean_ticker):
             return False
+
+        # A crypto major needs no model call: membership of the collected set is
+        # the whole question, and it is answered deterministically above.
+        if is_major_crypto(clean_ticker):
+            return True
 
         class TickerVerificationDecision(BaseModel):
             valid: bool
@@ -1132,7 +1422,7 @@ class SentinelAgent(ABC):
         
         Strict Rules:
         - If '{clean_ticker}' is a YieldMax, Roundhill, Defiance, T-REX, GraniteShares, or any derivative ETF of a primary equity, set valid=false.
-        - If '{clean_ticker}' is a crypto altcoin (ETH, SOL, XRP, DOGE, etc.), set valid=false.
+        - If '{clean_ticker}' is a crypto token this platform does not collect, set valid=false.
         - If '{clean_ticker}' is an option, warrant, preferred share, or invalid token, set valid=false.
         - If '{clean_ticker}' is a legitimate primary operating company stock or BTC, set valid=true.
         

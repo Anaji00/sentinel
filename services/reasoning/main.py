@@ -43,6 +43,27 @@ from shared.utils.inference_budget import InferenceBudget
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task
 
+def _jsonable(value):
+    """Plain data from Pydantic models, for a json.dumps that cannot see them.
+
+    `json.dumps(scenario.hypotheses)` was handed a list of ScenarioHypothesis
+    instances and raised "Object of type ScenarioHypothesis is not JSON
+    serializable" -- caught by the enclosing handler, logged, and swallowed. The
+    scenario was still broadcast to Kafka, so the pipeline looked healthy from
+    every angle except the one that mattered: the scenarios table stood at zero
+    rows for the entire life of the deployment.
+    """
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
+
+
 async def _save_scenario(db, scenario):
     """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
     try:
@@ -59,7 +80,12 @@ async def _save_scenario(db, scenario):
             scenario.status.value,
             scenario.headline,
             scenario.significance,
-            json.dumps(scenario.hypotheses),
+            # The list itself, not json.dumps(...) of it. The connection pool
+            # registers a jsonb codec whose encoder is already json.dumps, so a
+            # pre-serialised string is encoded a second time and lands as a
+            # jsonb *string* rather than an array -- jsonb_typeof() returns
+            # "string" and every reader that indexes into it gets nothing.
+            _jsonable(scenario.hypotheses),
             scenario.recommended_monitoring,
             scenario.confidence_overall,
             scenario.confidence_rationale
@@ -164,7 +190,23 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     sem = asyncio.Semaphore(3)
 
     # Shared with the agent swarm: one Ollama, one budget.
-    _budget = InferenceBudget(redis_client, os.getenv("AGENT_MODEL", "qwen2.5:1.5b"))
+    # A reserved lane, not the swarm's shared slot.
+    #
+    # Reasoning runs the same model as the agents-fast tier, so it shared one
+    # budget key with five agents consuming a far busier stream. They re-claimed
+    # the slot before it expired -- sampled every ten seconds it was never free
+    # -- and because this service sheds a cluster whenever the slot is busy, it
+    # shed every single one. Zero scenarios were persisted in the lifetime of
+    # the deployment while the correlation topic grew past 299,000 messages.
+    #
+    # The cooldown is short because a scenario is the platform's headline
+    # output; the lane bounds concurrency to one reasoning inference at a time.
+    _budget = InferenceBudget(
+        redis_client,
+        os.getenv("AGENT_MODEL", "qwen2.5:1.5b"),
+        cooldown_sec=int(os.getenv("REASONING_COOLDOWN_SEC", "120")),
+        lane="reasoning",
+    )
     _shed = 0
 
     # Detached syntheses, bounded so a slow model cannot turn backlog into

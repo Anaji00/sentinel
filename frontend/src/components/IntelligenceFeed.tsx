@@ -30,7 +30,38 @@ interface CorrelationCluster {
 }
 
 // Helper to derive clean domain tag + icon
-function getDomainMeta(type: string): { label: string; icon: string; badgeStyle: string } {
+/** The domain an event belongs to.
+ *
+ *  The gateway decides this now, from which payload column the row actually
+ *  carries, and sends it as `domain`. It has to: deriving it here meant
+ *  substring-matching the event type, and "market_anomaly" contains "market",
+ *  so every Coinbase candle anomaly was labelled TRADFI -- BCHUSDT, DOTUSDT and
+ *  ADAUSDT rendered as stock-market events.
+ *
+ *  The payload checks and the type heuristic remain as fallbacks for rows served
+ *  by an older gateway.
+ */
+export function domainMetaFor(e: NormalizedEvent): { label: string; icon: string; badgeStyle: string } {
+    const declared = (e as { domain?: string }).domain;
+    const exemplar: Record<string, string> = {
+        crypto: 'crypto_trade',
+        prediction: 'prediction_market_trade',
+        maritime: 'vessel_position',
+        aviation: 'flight_position',
+        cyber: 'bgp_anomaly',
+        tradfi: 'equity_block',
+        news: 'headline',
+    };
+    if (declared && exemplar[declared]) return getDomainMeta(exemplar[declared]);
+    if (e.crypto_data) return getDomainMeta('crypto_trade');
+    if (e.prediction_market_data) return getDomainMeta('prediction_market_trade');
+    if (e.vessel_data) return getDomainMeta('vessel_position');
+    if (e.flight_data) return getDomainMeta('flight_position');
+    if (e.financial_data) return getDomainMeta('equity_block');
+    return getDomainMeta(e.type);
+}
+
+export function getDomainMeta(type: string): { label: string; icon: string; badgeStyle: string } {
     const t = (type || '').toLowerCase();
     if (t.includes('pred') || t.includes('poly') || t.includes('kalshi')) {
         return { label: 'PREDICTION', icon: '🎯', badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10' };
@@ -60,19 +91,18 @@ function getDomainMeta(type: string): { label: string; icon: string; badgeStyle:
 }
 
 // Helper to derive clean source name
-function getCleanSource(e: NormalizedEvent): string {
+export function getCleanSource(e: NormalizedEvent): string {
     if (e.source && e.source !== 'unknown' && !e.source.startsWith('Event ')) {
         return e.source;
     }
-    const domain = getDomainMeta(e.type).label;
-    switch (domain) {
-        case 'MARITIME': return 'AISStream Telemetry';
-        case 'CYBER': return 'BGP Monitoring Network';
-        case 'TRADFI': return 'AlphaVantage Feed';
-        case 'CRYPTO': return 'CoinGecko On-Chain';
-        case 'PREDICTION': return 'PolyMarket API';
-        default: return 'Sentinel Intelligence Collector';
-    }
+    // Nothing, rather than a guess. This used to name a vendor per domain --
+    // "AlphaVantage Feed" for TRADFI, "CoinGecko On-Chain" for CRYPTO,
+    // "AISStream Telemetry" for MARITIME. This deployment uses none of them
+    // (equities come from Alpaca and Finnhub, crypto from Coinbase and OKX), so
+    // the interface credited data to companies with no part in producing it --
+    // and did so most confidently on rows whose domain it had already guessed
+    // wrong. An unattributed row now shows no attribution.
+    return '';
 }
 
 // Helper to format clean English titles for events
@@ -109,8 +139,51 @@ const getScoreBadge = (score: number) => {
   return <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">NORMAL {score.toFixed(2)}</span>;
 };
 
+/** How well a claim is independently supported.
+ *
+ *  Only meaningful for events that can be corroborated at all -- news and
+ *  OSINT. A market tick has no second source, and marking it "single-sourced"
+ *  would be noise, so an absent assessment renders nothing.
+ *
+ *  Single-sourced is the state worth an analyst's attention: still a lead, but
+ *  it must not read as confirmed. Syndication is called out separately, because
+ *  four outlets running one wire story looks like consensus and is not.
+ */
+function CorroborationBadge({ e }: { e: NormalizedEvent }) {
+    const c = e.corroboration;
+    if (!c) return null;
+
+    if (c.is_single_sourced) {
+        return (
+            <span
+                className="badge tone-caution"
+                title="Only one source reports this so far. It is a lead, not a confirmed fact."
+            >
+                single source
+            </span>
+        );
+    }
+
+    const timing =
+        c.minutes_to_corroboration !== null
+            ? ` — second source ${Math.round(c.minutes_to_corroboration)} min later`
+            : '';
+    const syndicated = c.is_syndicated
+        ? ' Some reports share wording, which suggests syndication rather than independent confirmation.'
+        : '';
+
+    return (
+        <span
+            className={`badge ${c.is_syndicated ? 'tone-info' : 'tone-positive'}`}
+            title={`${c.contributing_sources.slice(0, 6).join(', ')}${timing}.${syndicated}`}
+        >
+            {c.independent_sources} sources
+        </span>
+    );
+}
+
 const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: NormalizedEvent) => void }) => {
-  const domainMeta = getDomainMeta(e.type);
+  const domainMeta = domainMetaFor(e);
   const sourceName = getCleanSource(e);
   const title = formatEnglishHeadline(e);
   const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown Entity';
@@ -128,6 +201,7 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
           <span className={`px-1.5 py-0.5 rounded border font-bold uppercase ${domainMeta.badgeStyle}`}>
             {domainMeta.icon} {domainMeta.label}
           </span>
+          <CorroborationBadge e={e} />
           {fd.option_type && (
             <span className={`px-1.5 py-0.5 rounded border font-extrabold text-[9px] ${
               fd.option_type === 'CALL' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
@@ -147,9 +221,11 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
               {formatPercent(cd.funding_rate, { from: 'ratio', decimals: 4 })} RATE
             </span>
           )}
-          <span className="text-slate-400 font-medium">
-            via <span className="text-cyan-400 font-bold">{sourceName}</span>
-          </span>
+          {sourceName && (
+            <span className="text-slate-400 font-medium">
+              via <span className="text-cyan-400 font-bold">{sourceName}</span>
+            </span>
+          )}
         </div>
         {getScoreBadge(e.anomaly_score)}
       </div>
@@ -329,7 +405,16 @@ export default function IntelligenceFeed() {
     setFullEventDetail(null);
     setIsLoadingDetail(true);
     try {
-      const response = await apiClient.get(`/events/${encodeURIComponent(event.event_id)}`);
+      // /events/detail/{id}, not /events/{id}.
+      //
+      // The latter matches the /events/{domain} route, and an unrecognised
+      // "domain" falls through to the all-events branch -- so this returned a
+      // list of fifty unrelated events instead of the one requested. DataGrid
+      // flattens objects and returns nothing for an array, which is why the
+      // inspector reported "No structured detail available" for every event.
+      const response = await apiClient.get(
+        `/events/detail/${encodeURIComponent(event.event_id)}`,
+      );
       setFullEventDetail(response.data);
     } catch (err) {
       console.warn("Could not fetch deep event detail from hypertable, using live payload fallback:", err);
@@ -530,7 +615,7 @@ export default function IntelligenceFeed() {
 
               <div className="grid grid-cols-2 gap-2 bg-slate-950 p-3 rounded-lg border border-slate-800">
                 <div><span className="text-slate-400">EVENT ID:</span> <span className="text-cyan-400 font-bold block truncate">{selectedEvent.event_id}</span></div>
-                <div><span className="text-slate-400">SOURCE:</span> <span className="text-cyan-400 font-bold block">{getCleanSource(selectedEvent)}</span></div>
+                <div><span className="text-slate-400">SOURCE:</span> <span className="text-cyan-400 font-bold block">{getCleanSource(selectedEvent) || 'unattributed'}</span></div>
                 <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-amber-400 font-bold block">{selectedEvent.anomaly_score.toFixed(2)}</span></div>
                 <div><span className="text-slate-400">TIMESTAMP:</span> <span className="text-slate-200 block">{new Date(selectedEvent.occurred_at).toUTCString()}</span></div>
                 <div><span className="text-slate-400">PRIMARY ENTITY:</span> <span className="text-emerald-400 font-bold block">{selectedEvent.primary_entity_name || selectedEvent.entity_name || selectedEvent.primary_entity?.name || 'N/A'}</span></div>

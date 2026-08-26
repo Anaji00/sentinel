@@ -355,7 +355,7 @@ export default function GlobalMap() {
     return (
         <div className="w-full h-full bg-[#06080d] relative overflow-hidden font-mono text-white rounded-xl border border-cyan-500/20 shadow-[0_0_25px_rgba(0,0,0,0.6)]">
             {/* Top Bar Navigation & Multi-Domain Layer Toggles */}
-            <div className="absolute top-3 left-3 right-3 z-10 bg-slate-950/90 px-3.5 py-2 rounded-lg border border-[#00f2fe]/30 text-xs backdrop-blur-md flex flex-wrap items-center justify-between gap-2 shadow-2xl">
+            <div className="absolute top-3 left-3 right-3 z-10 bg-slate-950/90 px-3.5 py-2 rounded-lg border border-[#00f2fe]/30 text-xs flex flex-wrap items-center justify-between gap-2 shadow-2xl">
                 <div className="flex items-center gap-2">
                     <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-ping" />
                     <span className="text-[#00f2fe] font-bold tracking-wider uppercase">
@@ -426,7 +426,7 @@ export default function GlobalMap() {
 
             {/* Object Inspector Drawer Modal */}
             {selectedObject && (
-                <div className="absolute top-14 left-3 z-20 bg-slate-950/95 border border-[#00f2fe]/50 p-4 rounded-xl max-w-sm text-xs backdrop-blur-md shadow-2xl space-y-2.5 font-mono">
+                <div className="absolute top-14 left-3 z-20 bg-slate-950/95 border border-[#00f2fe]/50 p-4 rounded-xl max-w-sm text-xs shadow-2xl space-y-2.5 font-mono">
                     <div className="flex items-center justify-between border-b border-cyan-500/30 pb-2">
                         <span className="font-bold text-[#00f2fe] uppercase tracking-wide">
                             {selectedObject.type === 'vessel' && (selectedObject.data.isTanker ? '🛢️ TANKER INSPECTOR' : '🚢 VESSEL INSPECTOR')}
@@ -523,7 +523,7 @@ export default function GlobalMap() {
             )}
 
             {/* Bottom-Right Multi-Domain Spatial HUD */}
-            <div className="absolute bottom-3 right-3 z-10 bg-slate-950/85 px-3 py-2 rounded-lg border border-cyan-500/30 text-[10px] space-y-1 backdrop-blur-md shadow-lg font-mono">
+            <div className="absolute bottom-3 right-3 z-10 bg-slate-950/85 px-3 py-2 rounded-lg border border-cyan-500/30 text-[10px] space-y-1 shadow-lg font-mono">
                 <div className="flex items-center gap-2">
                     <span className="h-1.5 w-1.5 rounded-full bg-[#f59e0b] animate-pulse" />
                     <span className="text-amber-300 font-bold">🛢️ Tankers ({tankersCount})</span>

@@ -142,6 +142,135 @@ class ScenarioOutput(BaseModel):
 
 # ── GENERATOR ─────────────────────────────────────────────────────────────────
 
+# A draft is challenged when challenging it could change the answer. These are
+# the conditions under which a red-team pass historically earns its cost.
+# A complete ScenarioOutput measured past 1,500 tokens: three nested
+# hypotheses of seven fields each, plus five top-level fields. Asking for
+# 1024 returned 4,056 characters with the JSON still open, and an
+# unterminated object fails every branch of the extractor.
+# What kind of thing a cluster is about, stated plainly for the model.
+#
+# A 1.5B model will not infer that "ADAUSDT" is a perpetual futures pair or that
+# "0x28c6c062..." is a wallet, and the prompt previously offered no help: it led
+# with the detector's name and a section headed "RECENT GEOPOLITICAL HEADLINES".
+# The result was assessments like "Geopolitical Cascade Alert in 'Adausdt'" --
+# a crypto ticker read as a place.
+_DOMAIN_SUBJECTS = {
+    "crypto": "crypto assets and on-chain addresses",
+    "tradfi": "publicly traded equities",
+    "financial": "publicly traded equities",
+    "maritime": "commercial vessels",
+    "aviation": "aircraft",
+    "cyber": "network infrastructure and disclosed vulnerabilities",
+    "prediction": "prediction-market contracts",
+    "news": "reported events",
+}
+
+_PAYLOAD_DOMAIN = (
+    ("crypto_data", "crypto"),
+    ("financial_data", "tradfi"),
+    ("vessel_data", "maritime"),
+    ("flight_data", "aviation"),
+    ("cyber_data", "cyber"),
+)
+
+
+def _subject_line(cluster, raw_events) -> str:
+    """One line naming what this cluster is about, and of what kind."""
+    domains = []
+    for event in (raw_events or [])[:12]:
+        if not isinstance(event, dict):
+            continue
+        for column, domain in _PAYLOAD_DOMAIN:
+            if event.get(column) and domain not in domains:
+                domains.append(domain)
+
+    entities = []
+    for source in (getattr(cluster, "entity_names", None), getattr(cluster, "entity_ids", None)):
+        for value in (source or []):
+            text = str(value).strip()
+            if text and text not in entities:
+                entities.append(text)
+        if entities:
+            break
+
+    kinds = [_DOMAIN_SUBJECTS[d] for d in domains if d in _DOMAIN_SUBJECTS]
+    kind_text = " and ".join(kinds) if kinds else "signals of unstated type"
+    entity_text = ", ".join(entities[:6]) if entities else "unnamed entities"
+    # The caution about geography applies to instruments and addresses. A vessel
+    # or an aircraft genuinely has a position, and telling the model otherwise
+    # would suppress the most useful thing it can say about one.
+    caution = ""
+    if any(d in ("crypto", "tradfi", "financial", "prediction") for d in domains):
+        caution = (
+            " A ticker or address identifies an instrument or an account; it is "
+            "not a country, city, or region, and no geography follows from it."
+        )
+    return f"Entities: {entity_text}" + chr(10) + f"These are {kind_text}.{caution}"
+
+
+SCENARIO_TOKEN_BUDGET = 1800
+
+CRITIQUE_CONFIDENCE_CEILING = 75      # at or above this the draft has committed
+CLEAR_LEAD_MARGIN = 15                # points between the top two hypotheses
+MIN_ARGUED_RATIONALE_CHARS = 80       # shorter than this is a claim, not an argument
+
+
+def _draft_needs_critique(output) -> bool:
+    """Whether a second inference on this draft is worth its cost.
+
+    The policy is deliberately conservative: only a draft that is strong on
+    every structural axis skips the red team. Everything else is challenged,
+    because a critique that was not needed costs time while a critique that was
+    skipped costs correctness.
+
+    "Strong" means it committed to an answer (high confidence), ranked its
+    hypotheses clearly rather than splitting them evenly, offered more than one
+    to weigh, and argued the confidence rather than asserting it.
+    """
+    if output is None:
+        return False
+
+    hypotheses = getattr(output, "hypotheses", None) or []
+    if len(hypotheses) < 2:
+        # Nothing to weigh against anything. Either malformed or unconsidered.
+        return True
+
+    confidence = getattr(output, "confidence_overall", 0) or 0
+    rationale = str(getattr(output, "confidence_rationale", "") or "")
+    probabilities = sorted(
+        (getattr(h, "probability", 0) or 0 for h in hypotheses), reverse=True
+    )
+    leading_margin = probabilities[0] - probabilities[1]
+
+    is_strong = (
+        confidence >= CRITIQUE_CONFIDENCE_CEILING
+        and leading_margin >= CLEAR_LEAD_MARGIN
+        and len(rationale) >= MIN_ARGUED_RATIONALE_CHARS
+    )
+    return not is_strong
+
+
+def _is_at_least_as_complete(candidate, incumbent) -> bool:
+    """Whether a critique's output may replace the draft it reviewed.
+
+    Structural only -- this cannot judge whether the analysis got better, but it
+    can refuse the cases where it plainly got worse. A red team that deletes the
+    hypotheses has not improved anything.
+    """
+    if candidate is None:
+        return False
+    if not str(getattr(candidate, "headline", "") or "").strip():
+        return False
+    new_hypotheses = getattr(candidate, "hypotheses", None) or []
+    old_hypotheses = getattr(incumbent, "hypotheses", None) or []
+    if not new_hypotheses:
+        return False
+    # Losing a hypothesis is legitimate -- pruning a weak one is what a critique
+    # is for -- but losing most of them is a failure, not an edit.
+    return len(new_hypotheses) >= max(1, len(old_hypotheses) - 1)
+
+
 class ScenarioGenerator:
     """
     Synthesizes correlation clusters into intelligence scenarios using Llama3.
@@ -232,7 +361,7 @@ class ScenarioGenerator:
                     schema=ScenarioOutput,
                     temperature=0.25,
                     max_retries=3,
-                    num_predict=1024,
+                    num_predict=SCENARIO_TOKEN_BUDGET,
                 )
                 break
             except (SchemaViolationError, Exception) as e:
@@ -247,6 +376,21 @@ class ScenarioGenerator:
             return None
 
         # ── 3.5 PASS 2 (DEVIL'S ADVOCATE CRITIQUE & POLISH) ───────────────────
+        #
+        # The critique is a second full inference -- on this host roughly eight
+        # minutes -- so running it unconditionally halves how many scenarios can
+        # be produced at all. It earns that cost on a draft that is uncertain or
+        # internally inconsistent; on one that is already confident and coherent
+        # it mostly rephrases. Spending the swarm's scarcest resource on the
+        # drafts that need challenging is the point of having a red team.
+        if not _draft_needs_critique(output):
+            logger.info(
+                "Pass 2 skipped for %s: draft is confident and internally consistent",
+                cluster.correlation_id[:8],
+            )
+            output = self._normalize_probabilities(output)
+            return self._to_scenario(cluster, output)
+
         try:
             logger.info("😈 Running Pass 2 Critique (Devil's Advocate) for %s...", cluster.correlation_id[:8])
             critique_prompt = f"""
@@ -268,9 +412,19 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
                 schema=ScenarioOutput,
                 temperature=0.15,
                 max_retries=2,
-                num_predict=1024,
+                num_predict=SCENARIO_TOKEN_BUDGET,
             )
-            output = polished_output
+            # The critique replaces the draft only if it is at least as usable.
+            # It was accepted unconditionally, so a pass that dropped the
+            # hypotheses or returned an empty headline silently destroyed a
+            # perfectly good scenario -- and the failure looked like a success.
+            if _is_at_least_as_complete(polished_output, output):
+                output = polished_output
+            else:
+                logger.warning(
+                    "Pass 2 critique for %s returned a weaker draft; keeping Pass 1",
+                    cluster.correlation_id[:8],
+                )
         except Exception as e:
             logger.warning(f"Pass 2 critique skipped (fallback to Pass 1 draft): {e}")
 
@@ -278,10 +432,22 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
         output = self._normalize_probabilities(output)
 
         # ── 5. MAP TO DB SCENARIO MODEL ────────────────────────────────────────
-        # Take the raw Python dictionary/Pydantic object returned by the AI
-        # and convert it into the official `Scenario` database model.
+        return self._to_scenario(cluster, output)
+
+    def _to_scenario(self, cluster, output) -> Scenario:
+        """Maps a validated model output onto the database Scenario.
+
+        Shared by both exits from synthesis -- the critiqued path and the
+        skip-critique path -- so the two cannot drift apart.
+        """
         scenario = Scenario(
-            scenario_id=f"scn_{uuid.uuid4().hex[:8]}",
+            # A real UUID, matching both the model's own default and the
+            # scenarios.scenario_id column type. The short "scn_xxxxxxxx" form
+            # was rejected by asyncpg on every insert -- "invalid UUID
+            # 'scn_a2754df3': length must be between 32..36 characters" -- and
+            # the exception was caught, logged and swallowed, so the pipeline
+            # reported success while the table stayed empty.
+            scenario_id=str(uuid.uuid4()),
             correlation_id=cluster.correlation_id,
             status=ScenarioStatus.HYPOTHESIS,
             created_at=datetime.now(timezone.utc),
@@ -370,8 +536,16 @@ Pre-computed swarm consensus and agent bulletins:
 {json.dumps({'consensus': consensus, 'bulletins': bulletins[:5]}, separators=(',', ':'), default=str)}
 """
 
-        return f"""=== ANOMALY CLUSTER ===
-Rule Fired: {cluster.rule_name}
+        return f"""=== SUBJECT ===
+{_subject_line(cluster, raw_events)}
+
+=== ANOMALY CLUSTER ===
+Detector That Fired: {cluster.rule_name}
+  (This is the name of a pattern detector, not a conclusion. The detector
+   matches on signal shape, so its name may not describe this subject at all --
+   a rule called "Geopolitical Cascade" fires on correlated movement, including
+   between crypto pairs. Judge the subject from the SUBJECT and SIGNAL sections,
+   never from the detector's name.)
 Alert Tier: {cluster.alert_tier.name}
 Description: {cluster.description}
 Tags: {', '.join(cluster.tags)}
@@ -388,14 +562,28 @@ Known relationships for involved entities:
 Similar confirmed/denied scenarios from the past 90 days:
 {patterns_section}
 
-=== RECENT GEOPOLITICAL HEADLINES ===
+=== RECENT NEWS CONTEXT ===
+(Background only. Do not assume the subject above is connected to these unless
+ an entity is named in both.)
 {headlines_section}
 {agent_section}
 {consensus_section}
 === TASK ===
-Synthesize all signals above into a structured intelligence assessment.
-Produce exactly 3 hypotheses that together explain the observed anomaly cluster.
-The hypothesis probabilities must sum to 100.
+Synthesize the signals above into a structured intelligence assessment.
+
+Rules for a defensible assessment:
+- Write about the subject named in the SUBJECT section. An identifier such as
+  ADAUSDT, BTC-USDT-SWAP or 0x28c6c062 is an instrument or an address. It is
+  not a place, a country, or an organisation, and no geography may be inferred
+  from it.
+- Every mechanism must reference a signal that actually appears above. If the
+  evidence does not support three distinct explanations, make the weaker ones
+  explicitly low-probability rather than inventing detail.
+- The headline must name the subject and what is unusual about it. Do not open
+  with the detector's name.
+- Keep prose tight: significance in 2-3 sentences, each mechanism in one or two.
+
+Produce exactly 3 hypotheses whose probabilities sum to 100.
 Return the JSON assessment now:"""
 
     async def _fetch_events(self, event_ids: List[str]) -> List[Dict]:

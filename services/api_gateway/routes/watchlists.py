@@ -82,6 +82,9 @@ async def _publish_sync_signal(redis_client, mutated_by: str, count: int):
 
 # The PUT below requires ADMIN; this had no gate at all, so the tracked-symbol
 # configuration was readable by anyone with an account.
+# ANALYST, deliberately. The tracked-symbol set is deployment configuration:
+# it discloses what this deployment watches, and open signup means a VIEWER
+# is any stranger with an email address. test_open_signup_exposure pins this.
 @router.get("/equities", dependencies=[Depends(require_role(Role.ANALYST))])
 async def get_equities_watchlist(redis = Depends(get_redis_client)):
     """Retrieve the active equities watchlist with dynamic priority scores."""

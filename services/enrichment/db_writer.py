@@ -12,8 +12,12 @@ class DBWriter:
     def _extract_tuple(self, e: NormalizedEvent) -> tuple:
         def _dump(attr):
             val = getattr(e, attr, None)
-            # Return dict, asyncpg's JSONB codec handles the stringification
-            return val.model_dump() if val else None
+            if not val:
+                return None
+            # Most payloads are pydantic models; corroboration is a plain dict
+            # already in its final shape. Assuming model_dump() exists raised on
+            # the first plain-dict field added to this table.
+            return val.model_dump() if hasattr(val, "model_dump") else val
         
         pe = e.primary_entity
 
@@ -67,7 +71,12 @@ class DBWriter:
             getattr(e, 'named_entities', []),
             getattr(e, 'sentiment', None),
             getattr(e, 'anomaly_score', 0.0),
-            getattr(e, 'correlation_ids', [])
+            getattr(e, 'correlation_ids', []),
+            # Independent corroboration, where the event type supports it.
+            # Serialised rather than stored as a column per field: the shape is
+            # a judgement about a claim, not a fixed record, and it is read
+            # whole or not at all.
+            _dump('corroboration'),
         )
 
     async def write_events_batch(self, events: list[NormalizedEvent]):
@@ -85,7 +94,7 @@ class DBWriter:
                 vessel_data, flight_data, financial_data, security_data,
                 prediction_market_data, crypto_data, cyber_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids,
-                coordinates
+                coordinates, corroboration
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17,
@@ -96,6 +105,8 @@ class DBWriter:
                     THEN ST_SetSRID(ST_MakePoint($11::float, $12::float), 4326)
                     ELSE NULL 
                 END
+            ,
+                $30
             )
             ON CONFLICT (event_id, occurred_at) DO UPDATE SET
                 latitude = COALESCE(EXCLUDED.latitude, events.latitude),

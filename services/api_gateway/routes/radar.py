@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 from fastapi import APIRouter, Depends, Query
 from services.api_gateway.dependencies import get_db, get_db_optional, get_redis_client, get_redis_optional
 from shared.utils.serialization import score_dto, to_dto
@@ -140,11 +142,86 @@ SYMBOL_YAF_MAP = {
     "SHY": "SHY",
 }
 
+# How long an on-the-spot series stays good enough to reuse.
+#
+# These are intraday series behind a chart, and the alternative is a live call
+# to the US Treasury or Yahoo on every page load: /market-series was measured at
+# 15-60 seconds per request because it fetched up to six symbols from external
+# APIs, uncached, every single time. A minute-old series is indistinguishable
+# from a fresh one on a chart; a minute-long page load is not.
+ON_THE_SPOT_CACHE_TTL_SEC = int(os.getenv("MARKET_SERIES_CACHE_TTL_SEC", "60"))
+
+
+def _as_float(value, default=None):
+    """A number, or the default. Never a fabricated stand-in."""
+    try:
+        if value is None or value == "":
+            return default
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed == parsed else default   # NaN is not a measurement
+
+
+def _first_price(financial: dict, crypto: dict):
+    """The first genuinely quoted price across both payloads, or None.
+
+    `a or b or c or 100.0` had two faults: a legitimate 0.0 fell through to the
+    next candidate, and an event with no price at all plotted $100.
+    """
+    for source, key in (
+        (financial, "current_price"), (financial, "close"),
+        (crypto, "price"), (crypto, "mark_price"),
+    ):
+        value = _as_float((source or {}).get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
 async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = None):
+    """Cached wrapper around the live fetch.
+
+    /market-series calls this for every symbol it lacks data for, and the
+    underlying function reaches out to the US Treasury and Yahoo on the request
+    path. Uncached, the endpoint measured 15-60 seconds per request -- on the
+    route behind every chart in the product. A minute-old intraday series is
+    indistinguishable from a fresh one on a chart; a minute-long page load is
+    not.
+
+    Cache failures are never request failures: a miss, a Redis outage or a
+    malformed entry all fall through to the live fetch.
+    """
+    symbol_upper = symbol.upper().strip()
+    cache_key = f"sentinel:market_series:spot:{symbol_upper}:{limit}"
+
+    if redis is not None:
+        try:
+            cached = await redis.raw.get(cache_key)
+            if cached:
+                parsed = json.loads(cached if isinstance(cached, str) else cached.decode("utf-8"))
+                if isinstance(parsed, list):
+                    return parsed
+        except Exception:
+            pass
+
+    series = await _fetch_on_the_spot_uncached(symbol, limit, redis)
+
+    if redis is not None and series:
+        try:
+            await redis.raw.set(cache_key, json.dumps(series, default=str), ex=ON_THE_SPOT_CACHE_TTL_SEC)
+        except Exception:
+            pass
+    return series
+
+async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None):
     """
     Fetches real authentic historical price series on the spot from public APIs
     if no events currently persist in TimescaleDB for the requested symbol.
     Queries live Redis cache for latest collector quotes if external APIs are rate-limited.
+
+    Results are cached briefly: without it every chart render re-fetched every
+    symbol from a third-party API on the request path.
     """
     symbol_upper = symbol.upper().strip()
 
@@ -216,7 +293,9 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
                                     pts.append({
                                         "timestamp": ts_str,
                                         "price": round(raw_p, 3),
-                                        "volume": float(v or 1000),
+                                        # Absent volume is absent. `v or 1000` invented a round number
+                                        # that renders as a real bar on the chart.
+                                        "volume": _as_float(v),
                                         "anomaly_score": 0.0,
                                         "provider": "CBOE 2-Year Treasury Note Yield (2YY=F)",
                                         "source_type": "SECONDARY_MARKET_YIELD"
@@ -309,7 +388,9 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
                             pts.append({
                                 "timestamp": ts_str,
                                 "price": round(raw_p, 2),
-                                "volume": float(v or 1000),
+                                # Absent volume is absent. `v or 1000` invented a round number
+                                        # that renders as a real bar on the chart.
+                                        "volume": _as_float(v),
                                 "anomaly_score": 0.0
                             })
                     if pts:
@@ -354,8 +435,14 @@ async def get_market_series(
                 SELECT primary_entity_id, primary_entity_name, occurred_at, anomaly_score,
                        financial_data, crypto_data
                 FROM events
-                WHERE LOWER(primary_entity_id) IN (SELECT LOWER(unnest($1::text[])))
-                   OR LOWER(primary_entity_name) IN (SELECT LOWER(unnest($1::text[])))
+                -- Matched on the column directly, not LOWER(column): wrapping
+                -- the column in a function makes events_entity_time_idx
+                -- unusable and turns this into a full scan of the events
+                -- hypertable on the request path behind every chart. Symbols
+                -- are upper-cased by the caller and stored upper-cased.
+                WHERE (primary_entity_id = ANY($1::text[])
+                       OR primary_entity_name = ANY($1::text[]))
+                  AND occurred_at > NOW() - INTERVAL '7 days'
                 ORDER BY occurred_at DESC
                 LIMIT $2;
                 """,
@@ -369,12 +456,21 @@ async def get_market_series(
                 
                 fin = r.get("financial_data") or {}
                 cryp = r.get("crypto_data") or {}
-                price = fin.get("current_price") or fin.get("close") or cryp.get("price") or cryp.get("mark_price") or 100.0
+                # No invented price. This ended `or 100.0`, so any event without
+                # a usable price plotted a flat $100 line on the chart -- a
+                # fabricated quote presented as market data, and one that looks
+                # entirely plausible next to a real series. A point with no price
+                # is skipped instead: a gap is honest, a made-up level is not.
+                price = _first_price(fin, cryp)
+                if price is None:
+                    continue
                 
                 series_data[sym].append({
                     "timestamp": r["occurred_at"].isoformat() if hasattr(r["occurred_at"], "isoformat") else str(r["occurred_at"]),
                     "price": float(price),
-                    "volume": float(fin.get("volume") or cryp.get("volume") or 1000),
+                    # Volume genuinely absent is reported as absent, not as the
+                    # invented 1000 that used to stand in for it.
+                    "volume": _as_float(fin.get("volume"), _as_float(cryp.get("volume"))),
                     "anomaly_score": float(r["anomaly_score"] or 0.0)
                 })
         except Exception as e:
@@ -440,6 +536,7 @@ async def get_candles(
         
     ticker = ticker.upper()
     candles = []
+    source = "none"
     
     ticker_candidates = [ticker]
     alias_map = {
@@ -485,6 +582,7 @@ async def get_candles(
                         except Exception:
                             pass
                     if candles:
+                        source = "redis"
                         break
         except Exception as e:
             logger.warning(f"Error fetching candles for {ticker} from Redis: {e}")
@@ -517,6 +615,8 @@ async def get_candles(
                     """,
                     ticker, limit
                 )
+                if rows:
+                    source = f"timescale:{table_name}"
                 for r in rows:
                     candles.append({
                         "ts": r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else str(r["ts"]),
@@ -528,12 +628,30 @@ async def get_candles(
                         "ticker": ticker
                     })
         except Exception as db_err:
-            logger.debug(f"TimescaleDB CAGG fallback for {ticker} {timeframe}: {db_err}")
+            # Warning, not debug. This is the durable path behind every chart on
+            # the platform, and a failure here returns an empty series with a
+            # 200 -- indistinguishable from "this ticker has no data". It was
+            # logged below the default level, so the charts backbone could fail
+            # continuously without leaving a trace.
+            logger.warning(
+                "Market-series DB query failed for %s %s: %s",
+                ticker, timeframe, db_err, exc_info=True,
+            )
+
+    # Which path served this, recorded on the response. A chart that comes back
+    # empty is otherwise indistinguishable from a ticker with no data, and the
+    # two have completely different fixes.
+    if not candles:
+        logger.warning(
+            "Market-series empty for %s %s (redis=%s, db=%s)",
+            ticker, timeframe, redis is not None, db is not None,
+        )
 
     return {
         "ticker": ticker,
         "timeframe": timeframe,
         "count": len(candles),
+        "source": source,
         "candles": candles
     }
 

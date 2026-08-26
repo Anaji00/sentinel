@@ -58,7 +58,7 @@ export const Badge: React.FC<BadgeProps> = ({
 
   return (
     <span
-      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-widest border backdrop-blur-md transition-all duration-200 ${style.bg} ${style.text} ${style.border} ${className}`}
+      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-widest border transition-all duration-200 ${style.bg} ${style.text} ${style.border} ${className}`}
     >
       {pulse && (
         <span className="relative flex h-2 w-2">

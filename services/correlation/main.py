@@ -241,6 +241,31 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
         logger.error(f"Failed to evaluate dynamic rules: {e}")
     return clusters
 
+def _corroboration_weight(event) -> float:
+    """Multiplier for a correlation's confidence, from its claim's support.
+
+    Only events that can be corroborated carry an assessment -- news and OSINT.
+    Market ticks and position fixes have no notion of a second source, so they
+    are left unweighted rather than penalised for lacking a field that does not
+    apply to them.
+
+    A single-sourced claim is discounted rather than discarded: it is still a
+    lead worth surfacing, just not one to act on as though it were confirmed.
+    """
+    assessment = getattr(event, "corroboration", None)
+    if not isinstance(assessment, dict):
+        return 1.0
+    if assessment.get("is_single_sourced"):
+        return 0.75
+    score = assessment.get("corroboration_score")
+    try:
+        # Corroborated claims are trusted at face value and a little above, so a
+        # well-supported story can clear a tier a single report would not.
+        return 1.0 + 0.15 * float(score or 0.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Correlation Engine (Dynamic AI Rules)")
@@ -518,7 +543,16 @@ async def main():
                         rule_name="Cross-Domain Semantic Convergence",
                         alert_tier=tier,
                         primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "semantic",
-                        confidence_score=min(1.0, 0.70 + (0.1 * len(supporting_ids))),
+                        # Weighted by how well the underlying claim is supported.
+                        # A cross-domain convergence resting on a single-sourced
+                        # report is a lead; the same convergence corroborated by
+                        # several independent outlets is a finding, and reporting
+                        # both at one confidence tells an analyst nothing about
+                        # which is which.
+                        confidence_score=min(
+                            1.0,
+                            (0.70 + (0.1 * len(supporting_ids))) * _corroboration_weight(event),
+                        ),
                         summary_headline=f"🧠 Semantic Convergence: {e_name} across {len(similar_events)} cross-domain events",
                         supporting_headlines=supp_headlines,
                         metrics_summary={
@@ -567,6 +601,18 @@ async def main():
                 logger.error(f"Hawkes refit loop error: {e}")
             await asyncio.sleep(hawkes_correlator.REFIT_INTERVAL)
 
+    # Discovered edges were registered for survival tracking and never looked at
+    # again -- evaluate() and due_for_retest() had no callers. Registering an
+    # edge is only worth doing if something later asks whether it held.
+    async def _edge_retest_loop():
+        await asyncio.sleep(600)
+        while True:
+            try:
+                await discovery_engine.retest_due_edges()
+            except Exception as e:
+                logger.error(f"Edge retest loop error: {e}")
+            await asyncio.sleep(3600)
+
     # Background task: Periodic Statistical Correlation & Granger Discovery (§4.1, §4.2)
     async def _statistical_discovery_loop():
         await asyncio.sleep(30)
@@ -606,6 +652,7 @@ async def main():
 
     asyncio.create_task(_hawkes_refit_loop())
     asyncio.create_task(_statistical_discovery_loop())
+    asyncio.create_task(_edge_retest_loop())
     asyncio.create_task(_sector_hawkes_loop())
     asyncio.create_task(_threshold_calibration_loop())
 

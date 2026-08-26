@@ -10,6 +10,7 @@ Sources:
 4. Ethereum RPC (Mempool Whale Tracking & Sanctioned Wallet Monitoring)
 """
 
+import aiohttp
 import asyncio
 import json
 import logging
@@ -18,6 +19,7 @@ import sys
 import time
 import websockets
 from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -38,6 +40,16 @@ logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.ge
 ETH_WSS_URL = os.getenv("ETH_RPC_WSS_URL") or os.getenv("ETH_WSS_URL") or "wss://ethereum-rpc.publicnode.com"
 ARB_WSS_URL = os.getenv("ARB_RPC_WSS_URL") or os.getenv("ARB_WSS_URL") or "wss://arbitrum-one-rpc.publicnode.com"
 BASE_WSS_URL = os.getenv("BASE_RPC_WSS_URL") or os.getenv("BASE_WSS_URL") or "wss://base-rpc.publicnode.com"
+
+# Tried in order when the configured endpoint cannot be reached. Each was
+# verified from this host: ethereum.publicnode.com and eth.drpc.org both
+# answered and agreed on block 25821116, while ethereum-rpc.publicnode.com,
+# eth.llamarpc.com and mainnet.gateway.tenderly.co all failed the TLS handshake.
+RPC_FALLBACKS = {
+    "ethereum": ["wss://ethereum.publicnode.com", "wss://eth.drpc.org"],
+    "arbitrum": ["wss://arbitrum-one-rpc.publicnode.com", "wss://arbitrum.drpc.org"],
+    "base": ["wss://base-rpc.publicnode.com", "wss://base.drpc.org"],
+}
 
 WHALE_THRESHOLD_USD = 250_000
 
@@ -325,6 +337,182 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
         await asyncio.sleep(3600)
 
 
+# ── 3b. OKX PERPETUAL SURFACE (REST POLLER) ───────────────────────────────────
+#
+# Binance answers HTTP 451 -- "unavailable for legal reasons" -- to this host, on
+# both fstream (websocket) and fapi (REST). The funding stream above therefore
+# never connected, and because it is the only thing that fills
+# _observed_perp_symbols, the open-interest poller sat on an empty set logging
+# "No perp symbols observed yet" once a minute indefinitely.
+#
+# The measurable consequence: across 24 hours, every one of 34,000 stored crypto
+# events had funding_rate, open_interest, basis_bps, mark_price and leverage
+# null. The fields were declared on CryptoData, rendered by the frontend, and
+# never once populated.
+#
+# OKX serves the same surface from here (checked: funding-rate, mark-price,
+# open-interest and index-tickers all 200, 453 SWAP instruments).
+
+OKX_BASE = "https://www.okx.com/api/v5"
+OKX_POLL_INTERVAL_SEC = int(os.getenv("OKX_POLL_INTERVAL_SEC", "300"))
+OKX_TOP_N = int(os.getenv("OKX_PERP_SYMBOLS", "12"))
+
+# Emit only when funding moves enough to mean something. OKX pays funding every
+# eight hours, so polling every five minutes mostly re-reads the same number;
+# without a gate this would republish an unchanged rate ~96 times per interval.
+OKX_FUNDING_DELTA_TRIGGER = float(os.getenv("OKX_FUNDING_DELTA_TRIGGER", "0.00005"))
+
+
+async def _okx_get(session, path: str, params: str = "") -> list:
+    """One OKX v5 read. Returns [] rather than raising: a poller that dies on a
+    transient 5xx takes the whole perp surface down with it."""
+    url = f"{OKX_BASE}{path}{params}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                logger.warning("OKX %s -> HTTP %s", path, resp.status)
+                return []
+            body = await resp.json()
+            if str(body.get("code")) != "0":
+                logger.warning("OKX %s -> code %s %s", path, body.get("code"), body.get("msg"))
+                return []
+            return body.get("data") or []
+    except Exception as e:
+        logger.warning("OKX %s failed: %s", path, e)
+        return []
+
+
+def _f(value, default=0.0) -> float:
+    """OKX returns every number as a string, and empty string for 'not set'."""
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def poll_okx_perpetuals(producer: SentinelProducer, redis_client):
+    """Funding rate, mark/index price, basis and open interest for OKX swaps."""
+    last_funding: dict = {}
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                tickers = await _okx_get(session, "/market/tickers", "?instType=SWAP")
+                # Rank by quote volume so the poll spends its budget on the
+                # instruments anyone is actually trading.
+                usdt = [t for t in tickers if str(t.get("instId", "")).endswith("-USDT-SWAP")]
+                # Ranked by USD notional, not volCcy24h. volCcy24h counts base
+                # units, so a token priced at $0.00000001265 reports 100 trillion
+                # of them and sorts above everything: the first run of this poller
+                # tracked SATS, PEPE, SHIB, BONK and FLOKI while ignoring BTC and
+                # ETH. Multiplying by last price gives ETH $7.97B, BTC $5.26B,
+                # SOL $0.96B -- the instruments a desk actually watches.
+                usdt.sort(key=lambda t: _f(t.get("volCcy24h")) * _f(t.get("last")), reverse=True)
+                top = usdt[:OKX_TOP_N]
+                if not top:
+                    await asyncio.sleep(OKX_POLL_INTERVAL_SEC)
+                    continue
+
+                marks = {m.get("instId"): _f(m.get("markPx"))
+                         for m in await _okx_get(session, "/public/mark-price", "?instType=SWAP")}
+                ois = {o.get("instId"): o
+                       for o in await _okx_get(session, "/public/open-interest", "?instType=SWAP")}
+
+                emitted = 0
+                for ticker in top:
+                    inst = ticker.get("instId")
+                    if not inst:
+                        continue
+
+                    funding_rows = await _okx_get(session, "/public/funding-rate", f"?instId={inst}")
+                    if not funding_rows:
+                        continue
+                    funding = funding_rows[0]
+                    funding_rate = _f(funding.get("fundingRate"))
+
+                    mark_price = marks.get(inst) or _f(ticker.get("last"))
+                    index_rows = await _okx_get(
+                        session, "/market/index-tickers", f"?instId={inst.replace('-SWAP', '')}"
+                    )
+                    index_price = _f(index_rows[0].get("idxPx")) if index_rows else 0.0
+
+                    # Perp premium over spot. Undefined without an index price,
+                    # so it is left at zero rather than divided by nothing.
+                    basis_bps = (
+                        ((mark_price - index_price) / index_price) * 10000.0
+                        if index_price > 0 else 0.0
+                    )
+
+                    oi_row = ois.get(inst) or {}
+                    open_interest = _f(oi_row.get("oi"))
+                    open_interest_usd = _f(oi_row.get("oiUsd"))
+
+                    payload = {
+                        "funding_rate": funding_rate,
+                        "mark_price": mark_price,
+                        "index_price": index_price,
+                        "basis_bps": round(basis_bps, 4),
+                        "open_interest": open_interest,
+                        "open_interest_usd": open_interest_usd,
+                        "next_funding_time": int(_f(funding.get("fundingTime"))),
+                        "max_funding_rate": _f(funding.get("maxFundingRate")),
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                    asset = inst.replace("-USDT-SWAP", "").upper()
+                    try:
+                        await redis_client.raw.set(
+                            f"sentinel:crypto:funding:{inst}", json.dumps(payload), ex=3600
+                        )
+                        # Also under the bare asset. QuantTradingEngine's
+                        # _fetch_funding_context() looks up "BTC" then "BTCUSDT"
+                        # -- Binance's naming -- so a key written only as
+                        # "BTC-USDT-SWAP" is invisible to the one agent that
+                        # reads funding at all.
+                        await redis_client.raw.set(
+                            f"sentinel:crypto:funding:{asset}", json.dumps(payload), ex=3600
+                        )
+                        if open_interest:
+                            # The key the enricher and other consumers already
+                            # read; it was only ever written by the Binance
+                            # poller, which cannot reach its API from here.
+                            await redis_client.raw.set(
+                                f"sentinel:crypto:oi:{asset}", str(open_interest), ex=3600
+                            )
+                    except Exception as re:
+                        logger.debug("Redis funding cache write failed for %s: %s", inst, re)
+
+                    previous = last_funding.get(inst)
+                    moved = previous is None or abs(funding_rate - previous) >= OKX_FUNDING_DELTA_TRIGGER
+                    last_funding[inst] = funding_rate
+                    if not moved:
+                        continue
+
+                    event = RawEvent(
+                        source="okx_swap",
+                        occurred_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "asset": asset.lower(),
+                            "pair": inst,
+                            "trade_type": "CRYPTO_PERP_FUNDING",
+                            **payload,
+                        },
+                    )
+                    await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=inst)
+                    emitted += 1
+
+                if emitted:
+                    logger.info(
+                        "⚡ OKX PERP SURFACE | %s/%s instruments moved | top=%s",
+                        emitted, len(top), top[0].get("instId"),
+                    )
+            except Exception as e:
+                logger.error("OKX perpetual poller error: %s", e)
+
+            await asyncio.sleep(OKX_POLL_INTERVAL_SEC)
+
+
 # ── 4. BINANCE FUTURES OPEN INTEREST (REST POLLER) ────────────────────────────
 
 async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
@@ -348,7 +536,11 @@ async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
                 # Use dynamically observed symbols, not a hardcoded list
                 symbols = list(_observed_perp_symbols)
                 if not symbols:
-                    logger.info("OI Poller: No perp symbols observed yet, waiting...")
+                    logger.debug(
+                    "OI Poller: no perp symbols observed yet. This is expected when "
+                    "Binance is unavailable from this host (HTTP 451); OKX carries "
+                    "open interest instead."
+                )
                     await asyncio.sleep(60)
                     continue
 
@@ -421,8 +613,50 @@ async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
 
 # ── 5. MULTI-CHAIN ON-CHAIN WHALE TRACKING (§1.2) ───────────────────────────
 
+async def _pick_reachable_rpc(chain_name: str, candidates: list) -> Optional[str]:
+    """First RPC endpoint that completes a handshake and answers eth_blockNumber.
+
+    Public RPC hosts go bad without notice and without changing their DNS.
+    Measured here: wss://ethereum-rpc.publicnode.com began failing every
+    handshake with [SSL: WRONG_VERSION_NUMBER] while arbitrum-one-rpc and
+    base-rpc on the same provider stayed healthy -- so the Ethereum whale
+    stream reconnected every 60 seconds and produced nothing, for as long as
+    that host stayed broken, while the collector reported no errors of its own.
+
+    A reachability check costs one round trip at startup and turns a silent
+    permanent outage into a logged failover.
+    """
+    for url in [u for u in candidates if u]:
+        try:
+            async with websockets.connect(url, open_timeout=15, close_timeout=5) as ws:
+                await ws.send(json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
+                ))
+                reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                if reply.get("result"):
+                    logger.info(
+                        "%s RPC: using %s (block %s)",
+                        chain_name.upper(), url, int(reply["result"], 16),
+                    )
+                    return url
+        except Exception as e:
+            logger.warning(
+                "%s RPC endpoint unusable, trying next: %s (%s)",
+                chain_name.upper(), url, type(e).__name__,
+            )
+    logger.error(
+        "%s RPC: no reachable endpoint among %s candidates; this chain will be silent.",
+        chain_name.upper(), len(candidates),
+    )
+    return None
+
+
 async def _stream_chain_whales(chain_name: str, wss_url: str, contracts_map: dict, producer: SentinelProducer, redis_client):
     from shared.utils.websocket import ResilientWebSocketClient
+    if not wss_url:
+        return
+
+    wss_url = await _pick_reachable_rpc(chain_name, [wss_url] + RPC_FALLBACKS.get(chain_name, []))
     if not wss_url:
         return
 
@@ -640,6 +874,9 @@ async def main():
             stream_binance_liquidations(producer),
             stream_binance_funding_rates(producer, redis_client),
             poll_binance_open_interest(producer, redis_client),
+            # The two above answer 451 from this host; OKX carries the same
+            # surface and is what actually populates funding/OI/basis.
+            poll_okx_perpetuals(producer, redis_client),
             stream_onchain_whales(producer, redis_client),
             stream_cross_exchange_divergence(producer, redis_client),
         )

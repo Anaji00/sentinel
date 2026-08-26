@@ -17,6 +17,7 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions
 from shared.utils.equities import is_valid_primary_equity
+from shared.utils.corroboration import CorroborationTracker
 from shared.utils.source_scorecard import get_source_scorecard
 
 logger = logging.getLogger("enrichment.news")
@@ -218,6 +219,12 @@ class NewsEnricher:
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
+        # Answers "is anyone else reporting this", which nothing asked before.
+        # Held per-process rather than in Redis: it is a sliding window of token
+        # sets consulted on every news event, and a round trip per comparison
+        # would cost more than the comparison. A restart loses the window, which
+        # costs at most one window's corroboration history.
+        self._corroboration = CorroborationTracker()
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
         p     = raw.raw_payload
@@ -369,4 +376,13 @@ class NewsEnricher:
             named_entities=unique_entities,
             sentiment=sentiment,
             anomaly_score=anomaly,
+            # Distinct from source_reliability above: that is this outlet's
+            # historical record, this is whether the claim itself has independent
+            # support right now. Four outlets running the same wire copy score as
+            # one, so syndication cannot masquerade as consensus.
+            corroboration=self._corroboration.observe(
+                f"{title} {summary}".strip(),
+                source=str(raw.source or "unknown"),
+                reliability=reliability,
+            ).to_dict(),
         )

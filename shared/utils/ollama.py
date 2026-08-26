@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+from functools import lru_cache
 import re
 import time
 from typing import Any, Dict, Optional, Type
@@ -53,6 +54,57 @@ def _coerce_keep_alive(raw: str):
 
 OLLAMA_KEEP_ALIVE = _coerce_keep_alive(os.getenv("OLLAMA_KEEP_ALIVE", "5m"))
 # Dynamic timeout: Enforce 1200 seconds (20 mins) to allow local CPU/GPU heavy LLM inference completion
+@lru_cache(maxsize=1)
+def _inference_threads() -> Optional[int]:
+    """llama.cpp worker threads, or None to let Ollama decide.
+
+    Measured here: the ollama runner ran 16 threads against the 6-core cgroup
+    quota in `cpus: '6.0'`. nproc and os.cpu_count() report the host's 12 CPUs
+    and never see the quota, so llama.cpp sized its pool to CPUs the container
+    may not use and the threads then contended for six cores' worth of
+    scheduling -- visible as throughput below the cap (383% of 600%), not as an
+    error.
+
+    Read only from OLLAMA_NUM_THREAD, deliberately. The obvious implementation
+    -- detect the quota from cgroup -- reads the *caller's* cgroup, and the
+    caller is an agent container, not the model server: agents-heavy is capped
+    at 2.5 cores, so it would have told a 6-core Ollama to use 2 threads and
+    made inference slower than leaving it alone. Only the deployment knows the
+    server's allocation, so it is stated rather than inferred.
+
+    None means "send no num_thread", preserving Ollama's own default.
+    """
+    raw = os.getenv("OLLAMA_NUM_THREAD")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric OLLAMA_NUM_THREAD=%r", raw)
+        return None
+    if value < 1:
+        logger.warning("Ignoring OLLAMA_NUM_THREAD=%s: must be >= 1", value)
+        return None
+    return value
+
+
+# Token budgets for structured output.
+#
+# The ceilings exist because generation is linear in tokens on a CPU-only host.
+# The defaults stay low for callers that do not state a need; a caller that asks
+# for more has a schema that requires it, and truncating that request produces
+# text no parser can use.
+SMALL_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_SMALL_DEFAULT_TOKENS", "384"))
+# Measured: a scenario at 1024 tokens produced 4,056 characters and still had
+# not closed its JSON. The schema is three nested hypotheses of seven fields
+# each plus five top-level fields, so a complete answer runs past 1,500 tokens.
+# Generation is linear in tokens -- 1024 took ~2m40s here -- which is why the
+# default stays low and only a caller that declares a large schema pays for it.
+SMALL_MODEL_MAX_TOKENS = int(os.getenv("OLLAMA_SMALL_MAX_TOKENS", "2048"))
+LARGE_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_LARGE_DEFAULT_TOKENS", "512"))
+LARGE_MODEL_MAX_TOKENS = int(os.getenv("OLLAMA_LARGE_MAX_TOKENS", "2048"))
+
+
 _raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "1200.0"))
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))
 
@@ -120,6 +172,9 @@ class OllamaClient:
         self.service_name = service_name or os.getenv("SERVICE_NAME", "default")
         # Circuit breaker state (per-model)
         self._consecutive_timeouts: Dict[str, int] = {}
+        # Set by _call_ollama when Ollama reports it stopped at the token limit,
+        # so infer() can tell a truncated answer from a malformed one.
+        self.last_truncated: bool = False
         self._circuit_open_until: Dict[str, float] = {}
         self.failures = self._consecutive_timeouts
 
@@ -316,8 +371,18 @@ class OllamaClient:
 
                 parsed = self._extract_json(raw_text)
                 if parsed is None:
-                    last_error = f"No valid JSON found in: {raw_text[:300]}"
-                    logger.warning(f"Ollama attempt {attempt+1} ({active_model}): no JSON — {last_error[:100]}")
+                    if getattr(self, "last_truncated", False):
+                        # Not a formatting failure. Retrying the same request
+                        # reproduces it exactly, so the budget is raised first.
+                        last_error = (
+                            f"Response truncated at the token limit before the JSON closed "
+                            f"({len(raw_text)} chars). Schema needs a larger num_predict."
+                        )
+                        logger.warning("Ollama attempt %s (%s): %s", attempt + 1, active_model, last_error)
+                        num_predict = min(int((num_predict or SMALL_MODEL_DEFAULT_TOKENS) * 2), LARGE_MODEL_MAX_TOKENS)
+                    else:
+                        last_error = f"No valid JSON found in: {raw_text[:300]}"
+                        logger.warning(f"Ollama attempt {attempt+1} ({active_model}): no JSON — {last_error[:100]}")
                     continue
 
                 if isinstance(parsed, dict):
@@ -472,11 +537,30 @@ class OllamaClient:
             "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": temperature,
-                "num_predict": min(num_predict or 384, 512) if is_small_model else min(num_predict or 512, 1024),
+                # The caller's request is honoured up to a ceiling, rather than
+                # silently halved.
+                #
+                # This read min(num_predict or 384, 512) for small models. The
+                # scenario generator explicitly asks for 1024 because its schema
+                # is a dozen fields with three nested hypotheses; it received
+                # 512, the response was cut off mid-object, and _extract_json
+                # needs a closing brace, so every scenario failed to parse. The
+                # log then reported "No valid JSON found", which points at the
+                # model's formatting rather than at the token budget that caused
+                # it. Zero scenarios have ever been persisted.
+                #
+                # A slower complete answer beats a fast unusable one: nine
+                # minutes spent producing unparseable text is nine minutes lost.
+                "num_predict": min(num_predict or SMALL_MODEL_DEFAULT_TOKENS, SMALL_MODEL_MAX_TOKENS)
+                               if is_small_model
+                               else min(num_predict or LARGE_MODEL_DEFAULT_TOKENS, LARGE_MODEL_MAX_TOKENS),
                 "num_ctx": 3072 if is_small_model else 4096,  # Optimized context window size in tokens
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }
+        _threads = _inference_threads()
+        if _threads is not None:
+            payload["options"]["num_thread"] = _threads
         if format:
             payload["format"] = format
             
@@ -527,7 +611,25 @@ class OllamaClient:
                     data = {"response": str(resp)}
 
             self._consecutive_timeouts[active_model] = 0
-            return data.get("response", "") if isinstance(data, dict) else str(data)
+            if not isinstance(data, dict):
+                return str(data)
+
+            # Ollama says why it stopped. "length" means the answer was cut off
+            # at num_predict, which for a JSON schema means an object with no
+            # closing brace -- unparseable by construction. Recording it here
+            # lets the caller report a token-budget problem instead of blaming
+            # the model's formatting, which is what "No valid JSON found" did
+            # for every scenario this service ever attempted.
+            if data.get("done_reason") == "length":
+                logger.warning(
+                    "Ollama truncated '%s' at the token limit (%s tokens produced). "
+                    "The response is incomplete; raise num_predict for this schema.",
+                    active_model, data.get("eval_count"),
+                )
+                self.last_truncated = True
+            else:
+                self.last_truncated = False
+            return data.get("response", "")
             
         except asyncio.TimeoutError:
             self._consecutive_timeouts[active_model] = self._consecutive_timeouts.get(active_model, 0) + 1
@@ -555,7 +657,14 @@ class OllamaClient:
     def _extract_json(text: str) -> Optional[Dict]:
         text = text.strip()
         try:
-            return json.loads(text)
+            direct = json.loads(text)
+            # A model that wraps its object in an array still meant the object.
+            # Returning the list violated this function's own contract and blew
+            # up at schema(**parsed) one frame later.
+            if isinstance(direct, list) and len(direct) == 1 and isinstance(direct[0], dict):
+                return direct[0]
+            if isinstance(direct, dict):
+                return direct
         except json.JSONDecodeError:
             pass
 
@@ -572,16 +681,135 @@ class OllamaClient:
             except json.JSONDecodeError:
                 pass
 
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
+        # Only a *top-level* array, anchored at the start of the response.
+        #
+        # Unanchored, this matched the nested "hypotheses" array of a truncated
+        # scenario and returned its first element as the whole object -- so a
+        # cut-off scenario came back as a lone hypothesis with none of the
+        # required top-level fields.
+        stripped_text = text.strip()
+        if stripped_text.startswith("["):
+            match = re.search(r"\[.*\]", stripped_text, re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group(0))
+                    if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+                        return result[0]
+                except json.JSONDecodeError:
+                    pass
+
+        return OllamaClient._repair_truncated_json(text)
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> Optional[Dict]:
+        """Closes a JSON object the model ran out of tokens to finish.
+
+        Small models pad: a scenario schema that needs ~2,000 characters came
+        back at 7,596 and still had not closed, so raising the budget only buys
+        more padding. A truncated object is not a corrupt one -- the prefix is
+        valid, and everything up to the cut is exactly what the model meant.
+
+        The incomplete trailing element is discarded and the open structures are
+        closed. Nothing is invented: no value is supplied that the model did not
+        produce, so a scenario recovered this way has fewer hypotheses, never
+        fabricated ones. If required fields are missing the schema rejects it,
+        which is the correct outcome.
+        """
+        start = text.find("{")
+        if start < 0:
+            return None
+        body = text[start:]
+
+        # Walk the text tracking structure, ignoring braces inside strings.
+        stack, in_string, escaped, last_safe = [], False, False, None
+        for i, ch in enumerate(body):
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch in "}]":
+                if stack:
+                    stack.pop()
+            elif ch == "," and len(stack) <= 2:
+                # A comma at shallow depth ends a complete element, so this is a
+                # point the text can be truncated back to without losing a
+                # half-written one.
+                last_safe = i
+
+        if not stack:
+            return None                      # not truncated; earlier passes failed for another reason
+
+        for candidate in (len(body), last_safe):
+            if candidate is None:
+                continue
+            prefix = body[:candidate].rstrip().rstrip(",")
+            # Close whatever is still open, innermost first.
+            depth, in_str, esc = [], False, False
+            for ch in prefix:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch in "{[":
+                    depth.append(ch)
+                elif ch in "}]" and depth:
+                    depth.pop()
+            repaired = prefix + ('"' if in_str else "")
+            repaired += "".join("}" if ch == "{" else "]" for ch in reversed(depth))
             try:
-                result = json.loads(match.group(0))
-                if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
-                    return result[0]
+                parsed = json.loads(repaired)
+                if isinstance(parsed, dict):
+                    dropped = OllamaClient._drop_partial_tail(parsed)
+                    logger.info(
+                        "Recovered a truncated JSON object (%s of %s chars kept%s).",
+                        len(prefix), len(body),
+                        f", {dropped} incomplete element(s) dropped" if dropped else "",
+                    )
+                    return parsed
             except json.JSONDecodeError:
-                pass
- 
+                continue
+
         return None
+
+    @staticmethod
+    def _drop_partial_tail(obj: Dict) -> int:
+        """Removes a trailing list element that was cut off mid-write.
+
+        Closing the structure recovers a final element that has only the fields
+        the model managed to emit -- {"label": "h2"} where its siblings carry
+        seven keys. That is not invented data, but it is incomplete, and a
+        required-field schema rejects the whole object because of it, which
+        turns a partial success back into a total loss.
+
+        Elements of a schema-driven array share a shape, so a last element with
+        strictly fewer keys than its predecessor was truncated and is dropped.
+        """
+        dropped = 0
+        for value in obj.values():
+            if not isinstance(value, list) or len(value) < 2:
+                continue
+            last, previous = value[-1], value[-2]
+            if isinstance(last, dict) and isinstance(previous, dict):
+                if set(last) < set(previous):
+                    value.pop()
+                    dropped += 1
+        return dropped
 
     @staticmethod
     def _coerce_parsed_json(parsed: Any, schema: Type[BaseModel]) -> Any:

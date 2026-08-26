@@ -14,6 +14,7 @@ ARCHITECTURAL UPGRADES:
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
 from services.api_gateway.dependencies import get_db, get_redis_client, verify_websocket_api_key
@@ -22,6 +23,9 @@ logger = logging.getLogger("api-gateway.events")
 router = APIRouter(prefix="/api/v1/events", tags=["Domain Events"])
 
 # ARCHITECTURAL FIX: Explicitly map API Domain routes to strict DB Schema Columns
+# Anything shaped like an event id is not a domain name.
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
 # Updated to support Sentinel's full multi-domain expansion
 DOMAIN_TO_COLUMN = {
     "maritime": "vessel_data",
@@ -67,13 +71,58 @@ async def get_domain_events(
         limit_idx = f"${param_idx}"
         params.append(limit)
 
+        # An identifier is not a domain. /events/{domain} and /events/detail/{id}
+        # sit next to each other, and a caller reaching for the wrong one used to
+        # get the newest fifty events of every kind rather than an error -- a
+        # plausible-looking answer to a question nobody asked. The client did
+        # exactly that, and its event inspector rendered the resulting array as
+        # "no structured detail".
+        if _UUID_RE.match(domain):
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{domain}' is not a domain. For a single event use /events/detail/{domain}.",
+            )
+
         if domain == "all" or domain not in DOMAIN_TO_COLUMN or domain == "news":
+            # `source` and `domain` are returned because the client cannot derive
+            # either. Without them the feed guessed the domain from a substring of
+            # `type` -- and "market_anomaly" contains "market", so every Coinbase
+            # candle anomaly was labelled TRADFI -- then invented a provider name
+            # to match, crediting crypto ticks to an "AlphaVantage Feed" this
+            # deployment does not use. The domain is decided here by which payload
+            # column the row actually carries, which is the only authoritative
+            # answer.
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, 
-                       COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude, 
-                       COALESCE(longitude, ST_X(coordinates::geometry)) as longitude, 
-                       summary as domain_data
-                FROM events 
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score,
+                       source,
+                       CASE
+                           WHEN crypto_data IS NOT NULL THEN 'crypto'
+                           WHEN prediction_market_data IS NOT NULL THEN 'prediction'
+                           WHEN vessel_data IS NOT NULL THEN 'maritime'
+                           WHEN flight_data IS NOT NULL THEN 'aviation'
+                           WHEN security_data IS NOT NULL THEN 'cyber'
+                           WHEN financial_data IS NOT NULL THEN 'tradfi'
+                           ELSE 'news'
+                       END AS domain,
+                       COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude,
+                       COALESCE(longitude, ST_X(coordinates::geometry)) as longitude,
+                       headline,
+                       summary,
+                       -- The row's actual domain payload, not its prose.
+                       --
+                       -- This was `summary as domain_data`: a text column
+                       -- aliased into the field every consumer treats as the
+                       -- structured payload. DataGrid flattens an object and
+                       -- returns nothing for a string, so the event inspector
+                       -- rendered "No structured detail available" for any row
+                       -- from this branch -- while the data sat in the very
+                       -- columns being skipped. The branch also returned no
+                       -- headline at all, leaving the feed to reconstruct one.
+                       COALESCE(
+                           crypto_data, prediction_market_data, vessel_data,
+                           flight_data, security_data, financial_data
+                       ) AS domain_data
+                FROM events
                 WHERE {where_sql}
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
@@ -91,18 +140,78 @@ async def get_domain_events(
                 f"{where_sql} AND {target_column} IS NOT NULL "
                 f"AND {target_column}::text NOT IN ('{{}}', 'null')"
             )
+            # Interleaved by sub-type, not purely by recency.
+            #
+            # A domain is not one stream. Crypto carries transfers, spot trades,
+            # liquidations, perp funding and market anomalies, and their rates
+            # differ by three orders of magnitude: on-chain transfers arrive at
+            # ~10,000/hour while perp funding updates 12 every five minutes.
+            # Under a plain ORDER BY occurred_at DESC the loud sub-type takes
+            # every row -- measured: 200 crypto events returned, none of them
+            # carrying a funding rate, while the database held 24 such events
+            # from the preceding half hour. The data was collected, enriched and
+            # stored correctly and was still invisible to the caller.
+            #
+            # So each sub-type gets a guaranteed share of the page, and whatever
+            # is left over is filled by recency as before. Callers that want a
+            # single sub-type still filter on `type` themselves.
+            # `limit` is the request's own value; limit_idx is only its SQL
+            # placeholder and cannot be divided.
+            per_type = max(3, int(limit) // 8)
+            # The window functions run over a bounded pool, not the whole domain.
+            #
+            # Ranking every matching row to return fifty is work proportional to
+            # history: crypto alone holds 131,937 rows, and once headline and
+            # summary joined the projection the materialisation pushed this past
+            # a 90-second timeout. The pool is the most recent `candidate_pool`
+            # rows by time -- an index-supported read -- and the interleaving
+            # then happens inside it. A sub-type absent from the newest few
+            # thousand events is not something a live feed should surface.
+            candidate_pool = max(2000, limit * 40)
             query = f"""
-                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name, primary_entity_name as entity_name, region, anomaly_score, 
-                       COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude, 
-                       COALESCE(longitude, ST_X(coordinates::geometry)) as longitude, 
-                       {target_column} as domain_data
-                FROM events 
-                WHERE {domain_sql}
+                WITH recent AS (
+                    SELECT * FROM events
+                    WHERE {domain_sql}
+                    ORDER BY occurred_at DESC
+                    LIMIT {candidate_pool}
+                ), domain_events AS (
+                    SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
+                           primary_entity_name as entity_name, region, anomaly_score,
+                           source,
+                           CASE
+                               WHEN crypto_data IS NOT NULL THEN 'crypto'
+                               WHEN prediction_market_data IS NOT NULL THEN 'prediction'
+                               WHEN vessel_data IS NOT NULL THEN 'maritime'
+                               WHEN flight_data IS NOT NULL THEN 'aviation'
+                               WHEN security_data IS NOT NULL THEN 'cyber'
+                               WHEN financial_data IS NOT NULL THEN 'tradfi'
+                               ELSE 'news'
+                           END AS domain,
+                           COALESCE(latitude, ST_Y(coordinates::geometry)) as latitude,
+                           COALESCE(longitude, ST_X(coordinates::geometry)) as longitude,
+                           headline,
+                           summary,
+                           {target_column} as domain_data,
+                           ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as type_rank,
+                           ROW_NUMBER() OVER (ORDER BY occurred_at DESC) as overall_rank
+                    FROM recent
+                )
+                SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
+                       entity_name, region, anomaly_score, source, domain,
+                       latitude, longitude, headline, summary, domain_data
+                FROM domain_events
+                WHERE type_rank <= {per_type} OR overall_rank <= {limit_idx}
                 ORDER BY occurred_at DESC LIMIT {limit_idx}
             """
 
         return await db.query(query, *params)
     
+    except HTTPException:
+        # A deliberate 4xx is an answer, not a fault. Re-raised untouched: the
+        # blanket handler below turned the "that is an event id, not a domain"
+        # 404 into a 500 reading "Database query failed", which points an
+        # operator at the database over a routing mistake in the caller.
+        raise
     except Exception as e:
         logger.error(f"Failed to fetch {domain} events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database query failed")

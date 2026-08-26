@@ -102,7 +102,7 @@ export default function FeatureFlagManager() {
   const isMasterActive = data?.master_kill_switch?.active;
 
   return (
-    <div className="bg-[#0b0e17]/90 border border-slate-800/80 rounded-2xl p-5 space-y-5 font-mono text-xs text-slate-200 shadow-xl backdrop-blur-md">
+    <div className="bg-[#0b0e17]/90 border border-slate-800/80 rounded-2xl p-5 space-y-5 font-mono text-xs text-slate-200 shadow-xl">
       {/* Header & Master Control */}
       <div className="flex items-center justify-between border-b border-slate-800/80 pb-4">
         <div className="flex items-center gap-3">

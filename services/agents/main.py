@@ -379,24 +379,42 @@ async def main():
     # without it the agent tiers are invisible to the health system and the
     # gateway has to guess at their status.
     heartbeat_component = f"agents-{tier_filter}" if tier_filter != "all" else "agents"
-    tasks.append(
-        safe_create_task(
-            start_heartbeat_task(shared_infra["redis"], heartbeat_component),
-            name="agents_heartbeat",
-        )
-    )
 
-    # Publish the roster this process is actually running, so the gateway can
-    # report real agent composition instead of a hardcoded list.
-    await touch_heartbeat(
-        shared_infra["redis"],
-        heartbeat_component,
-        metadata={
+    # The roster this process is actually running, republished on every beat.
+    #
+    # It used to be written once at startup and then erased: start_heartbeat_task
+    # re-wrote the same key every 15 seconds with no metadata, so the roster
+    # survived about fifteen seconds of uptime. /agents/processes reads
+    # metadata["agents"] and so reported active_agents_count: 0 with null names
+    # and null models, while ten agents ran -- which is what left the frontend
+    # rendering a hardcoded list of invented agent statistics instead.
+    def _tier_metadata() -> dict:
+        return {
             "tier": tier_filter,
             "model": os.getenv("AGENT_MODEL", ""),
             "fallback_model": os.getenv("OLLAMA_FALLBACK_MODEL", ""),
             "agents": sorted(active_agents.keys()),
-        },
+            "agent_detail": [
+                {
+                    "name": ag.name,
+                    "model": ag.model,
+                    "fallback_model": ag.fallback_model,
+                    "topics": len(ag.input_topics),
+                    "processed": int(getattr(ag, "_processed", 0) or 0),
+                    "errors": int(getattr(ag, "_errors", 0) or 0),
+                }
+                for ag in agents_by_name.values()
+            ],
+        }
+
+    await touch_heartbeat(shared_infra["redis"], heartbeat_component, metadata=_tier_metadata())
+    tasks.append(
+        safe_create_task(
+            start_heartbeat_task(
+                shared_infra["redis"], heartbeat_component, metadata=_tier_metadata
+            ),
+            name="agents_heartbeat",
+        )
     )
 
     logger.info(f"Swarm launched with AGENT_TIER_FILTER='{tier_filter}' ({len(tasks)-1} active agents).")

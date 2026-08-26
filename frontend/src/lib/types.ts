@@ -14,6 +14,16 @@ export interface EvidenceItem {
     reasoning?: string;
 }
 
+export interface Corroboration {
+    independent_sources: number;
+    total_reports: number;
+    corroboration_score: number;
+    is_single_sourced: boolean;
+    is_syndicated: boolean;
+    minutes_to_corroboration: number | null;
+    contributing_sources: string[];
+}
+
 export interface Scenario {
     scenario_id?: string;
     correlation_id: string;
@@ -182,20 +192,40 @@ export interface PredictionMarketData {
 }
 
 export interface NormalizedEvent {
+    /** Set only on rows the browser fetched directly, because the backend
+     * returned nothing for that domain. Absent means the row came through
+     * the platform's own collection, enrichment and anomaly scoring. */
+    data_provenance?: string;
     event_id: string;
     trace_id?: string;
     type: string;
     occurred_at: string;
     source: string;
     primary_entity?: Entity;
+    /** The entity's identifier, as every /events endpoint returns it. It was
+     *  absent from this interface while components read it through casts, so
+     *  the contract did not describe what the server actually sends. */
+    primary_entity_id?: string;
     primary_entity_name?: string;
     entity_name?: string;
+    /** Which domain the row belongs to, decided server-side from the payload
+     *  column it carries. Present because deriving it on the client meant
+     *  substring-matching `type`, and "market_anomaly" contains "market" -- so
+     *  Coinbase candle anomalies were labelled TRADFI. */
+    domain?: 'crypto' | 'prediction' | 'maritime' | 'aviation' | 'cyber' | 'tradfi' | 'news';
+    /** Present on geocoded rows; the map plots from these. */
+    latitude?: number | null;
+    longitude?: number | null;
     headline: string;
     summary?: string;
     tags?: string[];
     country_code?: string;
     region?: string;
     anomaly_score: number;
+    /** Independent corroboration of the claim, for events that can have it
+     *  (news, OSINT). Distinct from the source's own track record: a trusted
+     *  outlet reporting alone and four outlets agreeing are different things. */
+    corroboration?: Corroboration;
     financial_data?: FinancialData;
     crypto_data?: CryptoData;
     vessel_data?: VesselData;
