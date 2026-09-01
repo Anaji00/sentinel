@@ -14,7 +14,12 @@ Three defects, measured against the running system:
 
   2. `WHERE LOWER(primary_entity_id) IN (...)` wraps the column in a function,
      which makes events_entity_time_idx unusable and turns the query into a full
-     scan of the events hypertable on the request path.
+     scan of the events hypertable on the request path. Dropping the wrapper
+     alone was not the answer either: the column holds six identifier
+     namespaces in inconsistent casings, so a bare `=` silently missed every
+     row a collector wrote in lower case. The predicate normalises and
+     migration 0009 indexes the same expression, which is the pairing this
+     file now pins.
 
   3. For any symbol without stored data the route called out to the US Treasury
      and Yahoo synchronously, uncached, on every request. Measured at 15-60
@@ -107,9 +112,32 @@ def test_as_float_tolerates_junk():
 # -- the query must be able to use its index ----------------------------------
 
 def test_the_entity_predicate_is_index_friendly():
+    """Normalisation in the predicate must have an index that serves it.
+
+    The rule is not "never wrap the column" -- primary_entity_id holds six
+    identifier namespaces written in whatever casing each collector chose, so
+    the predicate has to normalise or it misses rows. The rule is never to wrap
+    it *without* a matching expression index, because that is what turns the
+    query behind every chart into a scan of the hypertable.
+
+    The two strings have to agree character for character: the planner matches
+    an expression index by the expression, so `upper(x)` here and `UPPER(x)` in
+    the migration would silently fall back to a scan.
+    """
     code = _code()
     assert "LOWER(primary_entity_id) IN" not in code, "the column is wrapped again"
-    assert "primary_entity_id = ANY($1::text[])" in code
+    assert "upper(primary_entity_id) = ANY($1::text[])" in code
+    assert "upper(primary_entity_name) = ANY($1::text[])" in code
+
+    # The optimisation fence. Without it the planner reads the LIMIT as licence
+    # to walk the time index backwards and filter, which leaves both expression
+    # indexes unused -- measured at 11.8s against 107ms with the fence.
+    assert "WITH matched AS MATERIALIZED" in code, "the selection is not fenced"
+
+    migrations = (ROOT / "shared" / "db" / "migrate.py").read_text(encoding="utf-8")
+    assert "events_entity_id_upper_time_idx" in migrations, "the predicate has no index"
+    assert "ON events (upper(primary_entity_id), occurred_at DESC)" in migrations
+    assert "ON events (upper(primary_entity_name), occurred_at DESC)" in migrations
 
 
 def test_the_query_is_time_bounded():

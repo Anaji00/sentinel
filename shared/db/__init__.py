@@ -71,23 +71,81 @@ class RedisClient:
 class Neo4jClient:
     def __init__(self):
         self._driver = None
-        self._uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        if "bolt://neo4j:" in self._uri:
-            try:
-                import socket
-                socket.gethostbyname("neo4j")
-            except socket.gaierror:
-                self._uri = self._uri.replace("bolt://neo4j:", "bolt://localhost:")
+        # The configured address is kept, verbatim and permanently.
+        #
+        # This used to resolve "neo4j" with socket.gethostbyname() at
+        # construction and, on gaierror, rewrite bolt://neo4j: to
+        # bolt://localhost: -- for the life of the process. The fallback exists
+        # so the supervisor can be run outside compose, which is reasonable; the
+        # trigger was not. A DNS lookup fails while the container is still
+        # coming up, or for the seconds a compose network is being rebuilt, and
+        # one such moment permanently pinned a correctly configured client to
+        # localhost, where nothing listens. Observed: enrichment crash-looped
+        # indefinitely on `Couldn't connect to localhost:7687` with
+        # NEO4J_URI=bolt://neo4j:7687 correct in its own environment, because
+        # Neo4j had been down for the few seconds the client was constructed.
+        #
+        # A transient failure must not become a permanent one. The fallback now
+        # happens at connect time, per attempt, and only after the configured
+        # address has actually refused a connection -- so a later attempt tries
+        # the real address again.
+        self._configured_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self._uri = self._configured_uri
 
         neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         neo4j_pass = resolve_env_var("NEO4J_PASSWORD", "sentinel_graph")
         self._auth = (neo4j_user, neo4j_pass)
 
+    def _candidate_uris(self) -> List[str]:
+        """The configured address first, then a local fallback if one applies.
+
+        Only a container-style hostname gets a fallback: rewriting an explicit
+        remote address to localhost would silently point a production client at
+        the wrong database, which is worse than failing.
+        """
+        candidates = [self._configured_uri]
+        for host in ("neo4j", "sentinel-neo4j"):
+            local = self._configured_uri.replace(f"//{host}:", "//localhost:")
+            if local != self._configured_uri and local not in candidates:
+                candidates.append(local)
+        return candidates
+
     async def connect(self):
-        if not self._driver:
-            self._driver = _Neo4j.driver(self._uri, auth=self._auth)
-            await self._driver.verify_connectivity()
-            logger.info("Neo4j connected")
+        if self._driver:
+            return
+
+        last_error = None
+        for uri in self._candidate_uris():
+            driver = None
+            try:
+                driver = _Neo4j.driver(uri, auth=self._auth)
+                await driver.verify_connectivity()
+                self._driver = driver
+                self._uri = uri
+                if uri != self._configured_uri:
+                    logger.warning(
+                        "Neo4j connected on fallback %s after %s refused a connection. "
+                        "This is the out-of-compose path; if the service is meant to "
+                        "reach %s, that is the fault to fix.",
+                        uri, self._configured_uri, self._configured_uri,
+                    )
+                else:
+                    logger.info("Neo4j connected (%s)", uri)
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("Neo4j unreachable at %s: %s", uri, e)
+                if driver is not None:
+                    try:
+                        await driver.close()
+                    except Exception:
+                        pass
+
+        # Raised, not swallowed. The caller decides whether the graph is
+        # optional; this class must not pretend it connected.
+        raise ConnectionError(
+            f"No reachable Neo4j among {self._candidate_uris()}: {last_error}"
+        )
 
     async def execute(self, cypher: str, params: dict = None):
         async with self._driver.session() as s:
@@ -132,8 +190,23 @@ class TimescaleClient:
             try:
                 self._pool = await asyncpg.create_pool(
                     dsn,
-                    min_size=2,
-                    max_size=40,
+                    # Sized against the server's budget, not against ambition.
+                    #
+                    # This was min_size=2, max_size=40 -- in every service. The
+                    # server runs max_connections=60, so a single service could
+                    # claim two thirds of the whole budget and roughly a dozen
+                    # of them share it. Observed: "FATAL: sorry, too many
+                    # clients already", which locks out not just the next
+                    # service but psql, the migrator and anything trying to
+                    # diagnose the problem.
+                    #
+                    # 60 connections across ~12 database-using services leaves
+                    # 5 each with a little headroom for the migrator and an
+                    # operator's session. A service that genuinely needs more
+                    # can be given it explicitly; the default must not be able
+                    # to starve its neighbours.
+                    min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+                    max_size=int(os.getenv("DB_POOL_MAX_SIZE", "5")),
                     command_timeout=60,
                     init=init_connection # Register the JSONB codec
                 )

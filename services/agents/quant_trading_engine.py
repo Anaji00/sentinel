@@ -28,6 +28,7 @@ from shared.kafka import Topics
 from shared.utils import quant_calc
 from shared.utils.tasks import safe_create_task
 import numpy as np
+from shared.models.events import entity_cache_key
 from shared.utils.equities import is_major_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
@@ -112,6 +113,14 @@ class PortfolioMetrics(BaseModel):
     risk_horizon: Optional[str] = None
     annualization_basis: Optional[str] = None
 
+# Upper bound on plays turned into predictions and bulletins from one brief.
+#
+# Not a quality filter -- highest_conviction_plays is already the model's own
+# ranking. This only stops a malformed response producing an unbounded number
+# of tracked claims.
+MAX_RECORDED_PLAYS = int(os.getenv("QUANT_MAX_RECORDED_PLAYS", "8"))
+
+
 class TradingSignal(BaseModel):
     ticker: str
     action: str  # "BUY", "SELL", "HOLD"
@@ -121,7 +130,10 @@ class TradingSignal(BaseModel):
     stop_loss: float
     risk_reward_ratio: float
     kelly_allocation_pct: float
-    conviction_score: float
+    # Bounded so the constraint reaches the model: these bounds appear in the
+    # JSON schema Ollama now decodes against, which is the only thing that
+    # stops a percentage being written into a probability field.
+    conviction_score: float = Field(ge=0.0, le=1.0)
     sigma_shock: Optional[float] = None
     expected_move_pct: Optional[float] = None
     order_type: Optional[str] = "Limit"
@@ -812,8 +824,22 @@ Return raw JSON matching schema:"""
 
             await self.redis.raw.set("sentinel:financial:advice:latest", json.dumps(res_payload), ex=86400)
 
-            # Record predictions & publish bulletins for top plays
-            for play in brief.highest_conviction_plays[:2]:
+            # Record every play the brief actually produced, not the first two.
+            #
+            # The inference is the scarce resource here -- this host affords
+            # roughly twenty an hour -- and by this point it has already been
+            # spent. Each play above has been through full deterministic risk
+            # construction: entry level, stop distance, conviction-tiered
+            # risk-reward, Kelly sizing. Taking [:2] of a list already named
+            # `highest_conviction_plays` was a second arbitrary cut on top of
+            # the model's own ranking, and it discarded finished directional
+            # claims that cost nothing more to keep.
+            #
+            # This is the cheapest available optimisation of a capacity-bound
+            # tier: it does not create slots, it stops wasting the ones already
+            # paid for. The cap that remains exists to bound a runaway model,
+            # not to throttle value.
+            for play in brief.highest_conviction_plays[:MAX_RECORDED_PLAYS]:
                 direction = "up" if play.action == "BUY" else "down" if play.action == "SELL" else "neutral"
 
                 safe_create_task(
@@ -964,7 +990,7 @@ Return raw JSON matching schema:"""
     async def _fetch_earnings_context(self, ticker: str) -> str:
         """Fetch cached earnings context from Redis (populated by Finnhub earnings poller)."""
         try:
-            raw = await self.redis.raw.get(f"sentinel:earnings:{ticker}")
+            raw = await self.redis.raw.get(entity_cache_key("sentinel:earnings", ticker))
             if raw:
                 data = json.loads(raw)
                 report_date = data.get("report_date", "")

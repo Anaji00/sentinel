@@ -34,6 +34,46 @@ DARK_THRESHOLDS_AIRCRAFT = {
     "Default":              2.0,
 }
 
+# Where the empirical gap distribution for each region is kept.
+#
+# An absolute hour count cannot say whether silence is unusual. ADS-B is
+# received by ground stations, so coverage -- not the aircraft -- decides
+# whether a position is heard. Over open ocean there are no receivers, and a
+# multi-hour gap is the normal state of every flight on the route. The previous
+# score, min(1.0, 0.60 + gap_hours/10.0), reached the ceiling at four hours and
+# pinned 8,064 of 9,056 events at exactly 1.00 in six hours -- one maximally
+# anomalous aircraft every 2.7 seconds.
+#
+# The question is not "how long has it been silent" but "how long is silent, for
+# here". That is measurable: record what gaps this region actually produces and
+# score against them. A gap at the median of its own region is by definition
+# unremarkable, however many hours it is.
+_GAP_SAMPLES_KEY = "sentinel:aviation:gap_samples:{region}"
+
+# Samples retained per region, and the minimum before the distribution is
+# allowed to decide anything.
+_GAP_SAMPLE_CAP = 500
+_MIN_GAP_SAMPLES = 60
+
+# Where a gap has to sit in its region's own distribution before it is an event.
+# At or below the median it is what this airspace does all day.
+_NOTABLE_PERCENTILE = 0.90
+
+# Score band for gaps that clear the percentile bar. The ceiling is deliberately
+# not 1.0: an aircraft losing ADS-B is a prompt to look, not a certainty, and
+# the top of the scale should be reachable by something that is.
+_SCORE_FLOOR = 0.35
+_SCORE_CEILING = 0.92
+
+
+def _percentile_rank(samples: List[float], value: float) -> float:
+    """Fraction of observed gaps in this region shorter than `value`."""
+    if not samples:
+        return 0.0
+    below = sum(1 for s in samples if s < value)
+    return below / len(samples)
+
+
 class AviationGapDetector:
     def __init__(self, producer, scorer, db_writer, redis_client):
         self.producer = producer
@@ -104,10 +144,61 @@ class AviationGapDetector:
         elif not has_keys:
             logger.info("Aviation Gap Detector: No aircraft tracked in Redis, skipping check.")
 
+    async def _load_region_samples(self) -> Dict[str, List[float]]:
+        """The observed gap distribution for every region, newest first.
+
+        Read once per batch rather than per aircraft: a scan covers thousands of
+        keys and there are a dozen regions.
+        """
+        regions = set(DARK_THRESHOLDS_AIRCRAFT) | {"Default"}
+        pipe = self.redis.raw.pipeline()
+        ordered = sorted(regions)
+        for region in ordered:
+            pipe.lrange(_GAP_SAMPLES_KEY.format(region=region), 0, _GAP_SAMPLE_CAP - 1)
+        rows = await pipe.execute()
+
+        out: Dict[str, List[float]] = {}
+        for region, raw_samples in zip(ordered, rows):
+            values = []
+            for item in raw_samples or []:
+                try:
+                    values.append(float(item))
+                except (TypeError, ValueError):
+                    continue
+            out[region] = values
+        return out
+
+    async def _record_gaps(self, observations: List[tuple]) -> None:
+        """Adds this scan's gaps to each region's distribution.
+
+        Every gap is recorded, not only the ones that fired. A distribution
+        built from alerts alone is truncated at the threshold and would report
+        every observation as extreme -- the same circularity that let an
+        absolute cutoff call routine oceanic silence maximally anomalous.
+        """
+        if not observations:
+            return
+        pipe = self.redis.raw.pipeline()
+        for region, gap_hours in observations:
+            key = _GAP_SAMPLES_KEY.format(region=region)
+            pipe.lpush(key, gap_hours)
+            pipe.ltrim(key, 0, _GAP_SAMPLE_CAP - 1)
+            # Long enough to survive a restart, short enough that a route or
+            # receiver change is not argued against by last month's coverage.
+            pipe.expire(key, 30 * 86400)
+        try:
+            await pipe.execute()
+        except Exception as e:
+            logger.debug(f"Failed recording aviation gap samples: {e}")
+
     async def _process_batch(self, keys: List[str], now: datetime):
         fired = 0
+        unmeasured = 0
+        ordinary = 0
         events_to_write = []
-        
+        observations: List[tuple] = []
+        region_samples = await self._load_region_samples()
+
         pipe = self.redis.raw.pipeline()
         for k in keys:
             pipe.get(k)
@@ -137,6 +228,11 @@ class AviationGapDetector:
                 gap_hours = (now - last_seen).total_seconds() / 3600.0
                 threshold = DARK_THRESHOLDS_AIRCRAFT.get(region, DARK_THRESHOLDS_AIRCRAFT["Default"])
                 
+                # Recorded before any threshold is applied, so the
+                # distribution describes the airspace rather than the alerts.
+                if 0.0 <= gap_hours < 48.0:
+                    observations.append((region, round(gap_hours, 3)))
+
                 dedup_key = f"{icao24}:{region}"
                 if gap_hours < threshold:
                     self._seen_gaps.discard(dedup_key)
@@ -147,6 +243,26 @@ class AviationGapDetector:
                     
                 self._seen_gaps.add(dedup_key)
                 
+                # How unusual is this silence, for this airspace?
+                samples = region_samples.get(region, [])
+                if len(samples) < _MIN_GAP_SAMPLES:
+                    # Not enough history to say. Refusing is the honest output:
+                    # the alternative is asserting an anomaly from a threshold
+                    # nobody measured, which is what produced 8,064 ceilings.
+                    unmeasured += 1
+                    continue
+
+                rank = _percentile_rank(samples, gap_hours)
+                if rank < _NOTABLE_PERCENTILE:
+                    # More ordinary than 90% of what this region produces.
+                    ordinary += 1
+                    continue
+
+                # Rescale the surviving tail across the score band, so the
+                # ranking within it still carries information.
+                tail = (rank - _NOTABLE_PERCENTILE) / max(1e-9, 1.0 - _NOTABLE_PERCENTILE)
+                score = round(_SCORE_FLOOR + tail * (_SCORE_CEILING - _SCORE_FLOOR), 4)
+
                 event = NormalizedEvent(
                     type=EventType.FLIGHT_DARK,
                     occurred_at=now,
@@ -155,10 +271,13 @@ class AviationGapDetector:
                         id=icao24,
                         name=callsign or icao24.upper(),
                         type=EntityType.AIRCRAFT,
-                        flags=["dark_aircraft", f"gap_{gap_hours:.1f}h"]
+                        flags=["dark_aircraft", f"gap_{gap_hours:.1f}h", f"pctile_{rank:.2f}"]
                     ),
-                    headline=f"Aircraft '{callsign or icao24.upper()}' went dark in {region} (silent for {gap_hours:.1f}h)",
-                    anomaly_score=min(1.0, 0.60 + (gap_hours / 10.0)),
+                    headline=(
+                        f"Aircraft '{callsign or icao24.upper()}' silent {gap_hours:.1f}h in {region} "
+                        f"— longer than {rank * 100:.0f}% of gaps observed here"
+                    ),
+                    anomaly_score=score,
                     region=region
                 )
                 
@@ -170,4 +289,11 @@ class AviationGapDetector:
             except Exception as e:
                 logger.debug(f"Failed parsing aircraft key {key}: {e}")
 
+        await self._record_gaps(observations)
+        if unmeasured or ordinary:
+            logger.debug(
+                "Aviation gaps: %s fired, %s ordinary for their region, "
+                "%s with too little regional history to judge.",
+                fired, ordinary, unmeasured,
+            )
         return fired, events_to_write

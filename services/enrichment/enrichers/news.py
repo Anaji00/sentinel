@@ -16,7 +16,7 @@ import spacy
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions
-from shared.utils.equities import is_valid_primary_equity
+from shared.utils.equities import is_valid_primary_equity, looks_like_a_ticker, confirm_tickers
 from shared.utils.corroboration import CorroborationTracker
 from shared.utils.source_scorecard import get_source_scorecard
 
@@ -272,14 +272,45 @@ class NewsEnricher:
             for candidate in groups:
                 if candidate:
                     clean_t = candidate.strip("$,.():;[]{}'\"").upper()
-                    if is_valid_primary_equity(clean_t):
+                    if looks_like_a_ticker(clean_t):
                         extracted_tickers.append(clean_t)
 
         # 2. Standalone word equity check for major tickers
+        # Case is the discriminator, and .upper() destroys it before the check.
+        #
+        # Membership in the live universe removes THE and AND, and cannot remove
+        # HONG, KONG, AMID, WAR, TIME, YEAR or SAY -- every one of those is a
+        # genuinely listed symbol and also an ordinary English word. Measured
+        # over 1,200 headlines, those homographs were the top "tickers" the news
+        # produced: AI 60, WAR 51, HONG 46, TIME 45, SAY 44, from "Hong Kong",
+        # "amid", "next year".
+        #
+        # A real mention is written AAPL, not Aapl. Requiring the token to be
+        # upper-case *as it appeared* keeps NVDA and AI while dropping the prose,
+        # and the cashtag path above still catches $aapl and (NASDAQ: msft)
+        # regardless of case. Single letters are excluded: a lone capital in
+        # prose is an initial far more often than it is Agilent.
         for word in combined_text[:400].split():
-            clean_word = word.strip("$,.():;[]{}'\"").upper()
-            if 1 <= len(clean_word) <= 5 and clean_word.isalpha() and is_valid_primary_equity(clean_word):
+            token = word.strip("$,.():;[]{}'\"")
+            if not token.isupper() or len(token) < 2:
+                continue
+            clean_word = token.upper()
+            if len(clean_word) <= 5 and clean_word.isalpha() and looks_like_a_ticker(clean_word):
                 extracted_tickers.append(clean_word)
+
+        # Confirmed against the live universe before anything downstream sees
+        # them. The shape test above is a denylist and lets ZZZZZ through; the
+        # 11,821-symbol set is the allowlist. One round trip for the handful of
+        # survivors, not one per word.
+        #
+        # This column and `tags` are read by the scenario tracker's array
+        # matching and counted by the anomaly scorer -- `entity_boost` is
+        # len(named_entities) * per_entity -- so an unlisted token here does not
+        # merely look untidy, it raises the score of a headline for containing
+        # more ordinary English. Measured before this: the most frequently
+        # "named entities" in 48 hours of news were THE (1,098), TO (891),
+        # IN (813), OF (806), A (742) and AND (738).
+        extracted_tickers = await confirm_tickers(extracted_tickers, self.redis)
 
         # 3. spaCy Named Entity Recognition
         named_entities = list(dict.fromkeys(extracted_tickers))

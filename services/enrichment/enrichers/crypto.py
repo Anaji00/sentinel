@@ -17,6 +17,10 @@ from shared.utils import quant_calc
 import asyncio
 import math
 from shared.utils.metrics import MetricsCollector
+from shared.utils.counterparty import (
+    choose_primary, is_infrastructure, is_null_address, note_counterparty,
+)
+from services.enrichment.anomaly_scorer import lift_score
 
 logger = logging.getLogger("enrichment.crypto")
 
@@ -26,6 +30,36 @@ WHALE_NOTIONAL_USD = 1_000_000.0
 
 # Where the log scale starts. Below this a transfer is ordinary retail traffic.
 _NOTIONAL_FLOOR_USD = 10_000.0
+
+# Below this, a movement is not an alert whoever sent it.
+#
+# A watched counterparty made a transfer an alert at any size, so the stream
+# carried "🚨 Watched Wallet Transfer: $0 USDC" and "$5 USDC" beside "$291.3K
+# DAI" -- all three at the same score, under the same siren. Dust, gas top-ups
+# and zero-value contract calls are the bulk of what a watched address emits.
+#
+# The provenance is still recorded: these keep the suspect tag and stay
+# queryable. What they lose is the claim on a reader's attention, and the
+# inference slot that claim was buying.
+#
+# Deliberately the same threshold the log scale already uses rather than a
+# second number to tune: _NOTIONAL_FLOOR_USD is where this module declares that
+# size stops carrying information, and an event whose size says nothing should
+# not be an alert on provenance alone. Below it, scores were uniform anyway --
+# every transfer in the band arrived at 0.45 whether it was $0 or $9,999.
+_ALERT_FLOOR_USD = _NOTIONAL_FLOOR_USD
+
+# How hard a watched counterparty lifts the size signal.
+#
+# This was `max(anomaly, 0.45)`, which did not lift the signal but replaced it:
+# _notional_score only exceeds 0.45 above $1M, so every suspect transfer from
+# $0 to $1M -- effectively all of them -- collapsed onto exactly 0.45 and then
+# onto 0.53 after boosts. 39,262 transfers in six hours shared one score, and
+# the anomaly score's correlation with trade size was -0.002.
+#
+# A lift keeps the ordering: a larger transfer from a watched wallet still
+# outranks a smaller one from the same wallet.
+_SUSPECT_LIFT_WEIGHT = 0.45
 
 # Where it saturates. A move this large is as anomalous as the scale reports.
 _NOTIONAL_CEILING_USD = 100_000_000.0
@@ -189,13 +223,17 @@ class CryptoEnricher:
             is_watched_wallets, is_watched_equities, f_boost = check_results[i]
             is_watched = is_watched_wallets or is_watched_equities
             w_boost = 0.15 if is_watched else 0.0
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            # Headroom lift, not addition. `min(1.0, a + b)` has no notion of
+            # how much room is left, so any boosted event above ~0.85 lands on
+            # the ceiling and stops being distinguishable from one at 0.99.
+            anomaly = lift_score(anomaly, w_boost)
+            anomaly = lift_score(anomaly, f_boost, w_boost)
             
             # Hawkes cross-domain excitation: tradfi/prediction events boost crypto intensity
             hawkes_ratio = self.scorer.get_hawkes_intensity("crypto")
             if hawkes_ratio > 1.5:
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
-                anomaly = min(1.0, anomaly + hawkes_boost)
+                anomaly = lift_score(anomaly, hawkes_boost)
             
             # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
             if anomaly >= 0.5:
@@ -370,7 +408,7 @@ class CryptoEnricher:
         # Watchlist boost
         is_watched = await self.scorer.check_watchlist(asset, "equities")
         if is_watched:
-            anomaly = min(1.0, anomaly + 0.15)
+            anomaly = lift_score(anomaly, 0.15)
 
         # Prefer the value the collector already put on the event. The Redis
         # lookup below reads a key written only by the Binance OI poller, which
@@ -554,7 +592,11 @@ class CryptoEnricher:
             is_watched = await self.scorer.check_watchlist(asset, "wallets") or await self.scorer.check_watchlist(asset, "equities")
             w_boost = 0.15 if is_watched else 0.0
             f_boost = await self.scorer.track_frequency(asset, f"crypto_candle_{tf}m")
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            # Headroom lift, not addition. `min(1.0, a + b)` has no notion of
+            # how much room is left, so any boosted event above ~0.85 lands on
+            # the ceiling and stops being distinguishable from one at 0.99.
+            anomaly = lift_score(anomaly, w_boost)
+            anomaly = lift_score(anomaly, f_boost, w_boost)
             
             tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()]
 
@@ -615,27 +657,40 @@ class CryptoEnricher:
         # genuine nine-figure move.
         is_whale = notional >= WHALE_NOTIONAL_USD
 
+        # Provenance is interesting; provenance at dust size is not. A watched
+        # wallet paying gas is not an event, and treating it as one is what put
+        # a siren on a $0 transfer.
+        is_alertable = notional >= _ALERT_FLOOR_USD
+
         # Log-scaled, because transfer sizes span nine orders of magnitude.
         # Linear scaling gave a $5M move a score of 0.05 -- less than the noise
         # floor -- while only a $50M+ move registered at all.
         size_score = _notional_score(notional)
 
-        if not is_whale and not is_suspect:
+        if not is_whale and not (is_suspect and is_alertable):
             anomaly = round(min(0.35, size_score), 4)
             tags = ["crypto", "transfer", "baseline_data"]
+            # The provenance still travels with the event even when it is not
+            # promoted; a reader filtering for watched wallets still finds it.
+            if is_suspect:
+                tags.append("suspect_wallet")
             headline = f"Transfer: {_money(notional)} {asset}"
         else:
             anomaly = size_score
+            suspect_spent = 0.0
             if is_suspect:
-                # A watched counterparty is a reason to look, not a verdict. It
-                # lifts the floor rather than replacing the size signal.
-                anomaly = max(anomaly, 0.45)
+                # A watched counterparty is a reason to look, not a verdict, and
+                # it lifts the size signal rather than overwriting it. `max()`
+                # here flattened every transfer under $1M onto the same number.
+                anomaly = lift_score(anomaly, _SUSPECT_LIFT_WEIGHT)
+                suspect_spent = _SUSPECT_LIFT_WEIGHT
 
             is_w_sender = await self.scorer.check_watchlist(sender, "wallets") if sender != "UNKNOWN" else False
             is_w_receiver = await self.scorer.check_watchlist(wallet, "wallets") if wallet != "UNKNOWN" else False
             w_boost = 0.15 if (is_w_sender or is_w_receiver) else 0.0
             f_boost = await self.scorer.track_frequency(wallet, "crypto_transfer")
-            anomaly = round(min(1.0, anomaly + w_boost + f_boost), 4)
+            anomaly = lift_score(anomaly, w_boost, suspect_spent)
+            anomaly = round(lift_score(anomaly, f_boost, suspect_spent + w_boost), 4)
 
             tags = ["crypto", asset.lower()]
             tags.append("whale_transfer" if is_whale else "watched_wallet_transfer")
@@ -648,7 +703,14 @@ class CryptoEnricher:
             kind = "Whale Transfer" if is_whale else "Watched Wallet Transfer"
             headline = f"{'🚨 ' if is_suspect else ''}{kind}: {_money(notional)} {asset}"
 
-            if notional > 5_000_000:
+            # Watch the counterparty, never the venue.
+            #
+            # This previously added any address receiving over $5M, which an
+            # exchange hot wallet clears every few minutes. Once watched, every
+            # later transfer to it was an alert -- so the system promoted the
+            # addresses it should ignore and then alerted on the traffic it had
+            # promoted them for. 19,251 events in a day came from one such loop.
+            if notional > 5_000_000 and not await is_infrastructure(self.redis, wallet):
                 try:
                     await self.redis.raw.sadd("sentinel:watched:wallets", wallet)
                 except Exception as e:
@@ -661,7 +723,25 @@ class CryptoEnricher:
                     "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "RELATED_TO", "weight": anomaly}
                 }, key=sender)
 
-        entity = Entity(id=wallet, type=EntityType.WALLET, name=f"Wallet_{wallet[:6]}")
+        # Which side of this transfer is an actor?
+        #
+        # The receiver was used unconditionally, which made the busiest
+        # addresses on the chain the busiest entities in the system: the top ten
+        # addresses carried 40.4% of all transfers in a day, led by an exchange
+        # hot wallet with 19,251. "Somebody deposited to Binance" names no one.
+        await note_counterparty(self.redis, wallet, sender)
+        await note_counterparty(self.redis, sender, wallet)
+        primary_wallet, both_infra = await choose_primary(self.redis, sender, wallet)
+        if both_infra:
+            tags.append("infrastructure_flow")
+        if is_null_address(wallet) or is_null_address(sender):
+            # A transfer to the zero address is a burn and one from it is a
+            # mint. Both are supply mechanics rather than anybody's decision.
+            tags.append("token_supply_event")
+
+        entity = Entity(
+            id=primary_wallet, type=EntityType.WALLET, name=f"Wallet_{primary_wallet[:6]}"
+        )
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,

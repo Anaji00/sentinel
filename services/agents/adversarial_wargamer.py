@@ -12,14 +12,13 @@ Inherits from SentinelAgent for full telemetry, scorecard prediction tracking,
 and cross-agent bulletin integration.
 """
 
-import asyncio
 import json
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
-from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, InferenceShed
 from shared.kafka import Topics
 from shared.utils.tasks import safe_create_task
 
@@ -32,6 +31,15 @@ class SimulationMove(BaseModel):
     target_entity_id: str
     disruption_potential_percent: int = Field(default=10, ge=0, le=100)
     strategic_rationale: str
+
+
+class SimulationBoard(BaseModel):
+    """Every persona's move from a single turn of the simulation.
+
+    The personas were three separate inference calls until each one was an
+    independent claim on a budget that could rarely satisfy even one.
+    """
+    moves: List[SimulationMove] = Field(default_factory=list)
 
 
 class WargameSimulationOutput(BaseModel):
@@ -106,8 +114,9 @@ def _is_worth_simulating(message: Dict[str, Any]) -> bool:
 class AdversarialWargamerAgent(SentinelAgent):
     """
     Agentic game-theory simulation engine.
-    Consumes correlation clusters, runs 3 parallel adversarial personas,
-    synthesizes cascade failure probabilities, and emits predictive wargame reports.
+    Consumes correlation clusters, plays 3 adversarial personas against each
+    other, synthesizes cascade failure probabilities, and emits predictive
+    wargame reports.
     """
 
     @property
@@ -149,12 +158,11 @@ class AdversarialWargamerAgent(SentinelAgent):
             else:
                 return None
 
-        # A wargame costs four model calls -- three persona turns and an
-        # arbitration -- so at swarm capacity it needs four budget slots, or
-        # about forty minutes. Running one per inbound message was never
-        # possible: every message paid a Neo4j subgraph query, a Redis fetch and
-        # three shed persona attempts, then logged "WARGAME SKIPPED" and threw
-        # the work away. That is what held this consumer at 384 messages an hour.
+        # A wargame costs two model calls -- one persona board and an
+        # arbitration -- and the slot is shared with every other agent. Running one per inbound message was never possible:
+        # each paid a Neo4j subgraph query and a Redis fetch before being shed,
+        # then threw the work away. That is what held this consumer at 384
+        # messages an hour.
         #
         # Two gates, cheapest first.
 
@@ -179,22 +187,40 @@ class AdversarialWargamerAgent(SentinelAgent):
         cross_context = await self.get_cross_agent_context(limit=3)
         cross_block = f"\nCROSS-AGENT INTELLIGENCE:\n{cross_context}\n" if cross_context else ""
 
-        # 3. Parallel Persona Maneuver Simulation
+        # 3. Persona Maneuver Simulation -- one call, three personas.
+        #
+        # This was three concurrent calls, and the wargame completed zero times
+        # in ninety minutes of live traffic: every attempt logged "All persona
+        # turns returned empty". The cause is not the personas. InferenceShed is
+        # a BaseException, so the `except Exception` inside a persona turn never
+        # sees it and its fallback move is never produced; gather() collects
+        # three sheds, `moves` is empty, and the run is abandoned having spent a
+        # Neo4j subgraph query for nothing. errors stayed 0 throughout, which is
+        # why this looked like a quiet agent rather than a broken one.
+        #
+        # A wargame needed four slots from a budget shared with radar, the graph
+        # engine and quant. Asking for them as four independent races loses all
+        # four about as often as it wins any, and a partial win is worth nothing
+        # here -- arbitration still needs its own.
+        # Collapsing the personas into a single structured call makes it two
+        # slots instead of four and, more importantly, makes the expensive step
+        # atomic: one claim, which either succeeds or sheds before any context
+        # is built.
+        #
+        # The personas stay adversarial to each other inside the prompt; what is
+        # given up is three independent samplings of the model, which is a real
+        # cost and a smaller one than never running at all.
         personas = {
-            "State_Saboteur": "You are an aggressive geopolitical state saboteur. Propose high-disruption counter-maneuvers.",
-            "Financial_Short_Seller": "You are a predatory hedge-fund operator exploiting market chaos. Propose financial short/squeeze moves.",
-            "Asymmetric_Defender": "You are an advanced intelligence defense grid. Propose hardening & remediation counter-measures."
+            "State_Saboteur": "an aggressive geopolitical state saboteur proposing high-disruption counter-maneuvers",
+            "Financial_Short_Seller": "a predatory hedge-fund operator exploiting market chaos with short/squeeze moves",
+            "Asymmetric_Defender": "an advanced intelligence defense grid proposing hardening & remediation counter-measures",
         }
 
-        tasks = [
-            self._execute_persona_turn(name, prompt, description, subgraph, cross_block)
-            for name, prompt in personas.items()
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        moves = [r for r in results if isinstance(r, SimulationMove)]
+        board = await self._execute_persona_board(personas, description, subgraph, cross_block)
+        moves = board.moves if board else []
 
         if not moves:
-            self.logger.warning(f"⚔️ WARGAME SKIPPED | All persona turns returned empty for {entity_ids}")
+            self.logger.warning(f"⚔️ WARGAME SKIPPED | No persona moves returned for {entity_ids}")
             return None
 
         # 4. Game-Theoretic Arbitration & Synthesis
@@ -274,28 +300,49 @@ class AdversarialWargamerAgent(SentinelAgent):
                 self.logger.debug(f"Graph context extraction failed for {entity_id}: {e}")
         return list(set(extracted_edges))
 
-    async def _execute_persona_turn(
+    async def _execute_persona_board(
         self,
-        persona: str,
-        system_prompt: str,
+        personas: Dict[str, str],
         scenario: str,
         subgraph: List[str],
-        cross_block: str
-    ) -> Optional[SimulationMove]:
-        user_prompt = f"SCENARIO:\n{scenario}\n\nGRAPH CONSTRAINTS:\n{json.dumps(subgraph)}\n{cross_block}\nPropose counter-maneuver."
+        cross_block: str,
+    ) -> Optional[SimulationBoard]:
+        """Every persona's move, in one inference call.
+
+        Returns None when the budget declines the work, which is the honest
+        answer: no fallback board is fabricated. A wargame assembled from
+        placeholder moves would still reach arbitration, still be published, and
+        still record a prediction -- an invented opinion carrying the same
+        weight as a reasoned one. Skipping is visible; fabricating is not.
+        """
+        roster = "\n".join(f"- {name}: {brief}" for name, brief in personas.items())
+        user_prompt = (
+            f"SCENARIO:\n{scenario}\n\n"
+            f"GRAPH CONSTRAINTS:\n{json.dumps(subgraph)}\n{cross_block}\n"
+            f"ADVERSARIAL PERSONAS:\n{roster}\n\n"
+            "Play every persona above against this scenario. Each proposes one "
+            "counter-maneuver, in character and in opposition to the others -- "
+            "the saboteur and the defender must not converge on the same move.\n"
+            "Return raw JSON: {\"moves\": [{\"persona_name\": ..., "
+            "\"proposed_counter_action\": ..., \"target_entity_id\": ..., "
+            "\"disruption_potential_percent\": ..., \"strategic_rationale\": ...}]}\n"
+            f"Exactly {len(personas)} moves, one per persona. target_entity_id must "
+            "name an entity from the scenario or graph constraints, never a new one."
+        )
         try:
             return await self._execute_with_telemetry(
-                message={"system": f"persona_{persona}"},
-                system_prompt=system_prompt,
+                message={"system": "persona_board"},
+                system_prompt=(
+                    "You are a red-team simulation engine voicing several adversaries "
+                    "at once. Keep each persona's reasoning distinct."
+                ),
                 user_prompt=user_prompt,
-                schema=SimulationMove,
+                schema=SimulationBoard,
                 temperature=0.35,
             )
+        except InferenceShed:
+            # Not an error, and not this agent's to absorb: the budget declined.
+            raise
         except Exception as e:
-            self.logger.warning(f"Simulation turn failed for {persona}: {e}")
-            return SimulationMove(
-                persona_name=persona,
-                proposed_counter_action="PASS",
-                target_entity_id="NONE",
-                strategic_rationale="Fallback default move."
-            )
+            self.logger.warning(f"Persona board simulation failed: {e}")
+            return None

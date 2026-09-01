@@ -260,21 +260,40 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                     prices = _json_list(market.get("outcomePrices"))
 
                                     for i, token_id in enumerate(tokens):
-                                        if token_id not in id_to_label:
-                                            outcome_name = str(outcomes[i]) if i < len(outcomes) else f"Outcome {i}"
-                                            id_to_label[token_id] = f"{slug} | {question} | {outcome_name}"
-                                            id_to_meta[token_id] = {
-                                                "slug": slug,
-                                                "question": question,
-                                                **_choice_context(market, parent_event),
-                                                "outcome_name": outcome_name,
-                                                "outcome_index": i,
-                                                "outcome_names": [str(o) for o in outcomes],
-                                                # Snapshot of the whole field at subscribe
-                                                # time. Trades carry one leg's price; this
-                                                # keeps the other legs visible.
-                                                "outcome_prices": _price_map(outcomes, prices),
-                                            }
+                                        outcome_name = str(outcomes[i]) if i < len(outcomes) else f"Outcome {i}"
+                                        is_new = token_id not in id_to_label
+                                        id_to_label[token_id] = f"{slug} | {question} | {outcome_name}"
+                                        # Rewritten on every poll, not only on first
+                                        # sight.
+                                        #
+                                        # This whole block sat behind the
+                                        # "unseen token" guard, so the field's
+                                        # odds were captured once when the
+                                        # collector first subscribed and never
+                                        # again. Enrichment republishes them to
+                                        # sentinel:prediction:outcomes:* with a
+                                        # seven-day TTL and the agents' categorical
+                                        # resolver ranks outcomes from that key to
+                                        # decide which one won -- so a race whose
+                                        # leader changed after subscribe time was
+                                        # graded against the odds as they stood on
+                                        # the day the process started.
+                                        #
+                                        # Only the subscription itself is
+                                        # once-per-token; the prices are not.
+                                        id_to_meta[token_id] = {
+                                            "slug": slug,
+                                            "question": question,
+                                            **_choice_context(market, parent_event),
+                                            "outcome_name": outcome_name,
+                                            "outcome_index": i,
+                                            "outcome_names": [str(o) for o in outcomes],
+                                            # The whole field as of this poll. Trades
+                                            # carry one leg's price; this keeps the
+                                            # other legs visible and current.
+                                            "outcome_prices": _price_map(outcomes, prices),
+                                        }
+                                        if is_new:
                                             new_assets.append(token_id)
                             else:
                                 logger.error(f"Gamma API error for {slug}: HTTP {resp.status}")

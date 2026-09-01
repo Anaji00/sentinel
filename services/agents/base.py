@@ -10,14 +10,43 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import aiohttp
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from shared.utils.inference_budget import InferenceBudget, InferenceShed
+from shared.utils.freshness import is_stale
+from shared.utils.inference_budget import (
+    DEFAULT_COOLDOWN_SEC,
+    InferenceBudget,
+    InferenceShed,
+)
 
 # Ceiling on detached dispatches. Most finish in milliseconds; only the few
 # the inference budget admits run long, so this is rarely approached. It
 # exists so a slow model cannot convert backlog into unbounded memory.
 MAX_INFLIGHT_DISPATCHES = 64
+
+
+def _message_score(message: Dict[str, Any]) -> Optional[float]:
+    """How important this message claims to be, for inference admission.
+
+    Read from whatever the producer supplied. None when nothing usable is
+    present, which the budget treats as "cannot rank, do not refuse" -- a
+    caller that does not score its work must not be silently starved by a
+    selection rule it never participated in.
+    """
+    for key in ("anomaly_score", "confidence_score", "severity", "conviction"):
+        value = message.get(key)
+        if value is None:
+            continue
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        # severity is authored on a 1-5 scale; the rest are already 0-1.
+        return max(0.0, min(1.0, score / 5.0 if key == "severity" else score))
+    trigger = message.get("trigger")
+    if isinstance(trigger, dict):
+        return _message_score(trigger)
+    return None
 
 
 def _message_domain(message: Dict[str, Any]) -> str:
@@ -78,6 +107,38 @@ class AgentPrediction(BaseModel):
     ticker: str
     direction: str  # "up", "down", "flat" -- price predictions only
     conviction: float
+
+    @field_validator("conviction", mode="before")
+    @classmethod
+    def _as_probability(cls, value):
+        """Conviction is a probability. Some callers hand it a percentage.
+
+        The first prediction this system ever recorded read:
+
+            quant_trading_engine  DOTUSDT  up  conviction=55.0
+
+        Every consumer treats this as 0-1 -- the wargamer divides its cascade
+        probability by 100 before arriving here, and the quant engine's own risk
+        tiering tests `< 0.6` and `< 0.8`. A 55.0 is therefore not merely
+        weighted 55x too heavily: it is above every threshold, so a model saying
+        "55% confident" was read as maximum conviction and given the widest
+        risk-reward tier.
+
+        The value came from a model filling a bare `float` field, so the fix
+        belongs on the shared contract rather than on the one caller that
+        happened to expose it -- the next recorder would have the same problem.
+        Normalised rather than rejected: record_prediction swallows exceptions
+        and returns "", so raising here would turn a recoverable value into a
+        silently missing prediction, which is the failure this whole path was
+        just dug out of.
+        """
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return value
+        if 1.0 < number <= 100.0:
+            number /= 100.0
+        return min(1.0, max(0.0, number))
     time_horizon_hours: int = 24
     entry_price: float = 0.0
     target_price: float = 0.0
@@ -131,6 +192,171 @@ class ThrottledLogger:
             self._last_logged[key] = now
             self.logger.warning(msg, *args, **kwargs)
 
+# How long a prediction outlives its horizon, waiting to be resolved.
+#
+# Twelve hours, not two: the window has to survive an outage, not just a sweep
+# interval. An expired prediction is an inference already spent and a scorecard
+# entry never made.
+PREDICTION_RESOLUTION_BUFFER_SEC = int(
+    os.getenv("PREDICTION_RESOLUTION_BUFFER_SEC", str(12 * 3600))
+)
+
+
+class InferenceBatcher:
+    """Collects like questions so that one inference answers all of them.
+
+    The scarce resource on this deployment is not tokens, it is *calls*. A
+    single inference takes three to six minutes on a CPU-only host, and the
+    shared budget releases one slot every 600 seconds -- so the swarm gets
+    roughly twenty model decisions an hour against an input of about a hundred
+    and fifty thousand events. RadarAgent was spending one whole slot deciding
+    whether to track one ticker.
+
+    Ten tickers in one prompt is ten decisions for the price of one, and the
+    prompt grows by a line each while the expensive part -- loading the model,
+    evaluating the system prompt, waiting for a slot -- is paid once. The same
+    budget then buys an order of magnitude more coverage without asking the
+    hardware for anything it cannot do.
+
+    Callers do not see any of this. `submit()` awaits a single item's answer
+    exactly as a direct call would, so an agent's handler reads the same way it
+    did before.
+
+    Flushes on whichever comes first:
+      * `max_items`, so a busy stream does not build an unbounded prompt, and
+      * `max_wait_sec`, so a quiet one does not leave a lone candidate waiting
+        for company that never arrives.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        flush_fn,
+        max_items: int = 10,
+        max_wait_sec: float = 20.0,
+        logger: Optional[logging.Logger] = None,
+        max_waiters: Optional[int] = None,
+        max_stall_sec: Optional[float] = None,
+    ):
+        self.name = name
+        self._flush_fn = flush_fn
+        # Clamped by the caller's stated capacity for simultaneous waiters. A
+        # batch that needs more callers than can exist never fills by size and
+        # silently degrades to "always wait the full timer", which is the slow
+        # path plus a stall.
+        if max_waiters is not None and max_items > max_waiters:
+            max_items = max(1, int(max_waiters))
+        self.max_items = max(1, int(max_items))
+        self.max_wait_sec = max(0.5, float(max_wait_sec))
+        # Ceiling on how long any one caller waits: the batch window plus room
+        # for a real inference on this host, which measured 1-6 minutes.
+        self.max_stall_sec = float(
+            max_stall_sec if max_stall_sec is not None
+            else os.getenv("BATCH_MAX_STALL_SEC", "420")
+        )
+        self.logger = logger or logging.getLogger(f"agents.batcher.{name}")
+        self._pending: List[tuple] = []
+        self._lock = asyncio.Lock()
+        self._timer: Optional[asyncio.Task] = None
+
+    async def submit(self, key: str, item: Any) -> Any:
+        """Queues one question and waits for its answer.
+
+        Returns None when the batch could not be answered -- shed by the
+        budget, timed out, malformed. None means "no decision was reached",
+        which is what the caller would have got from a failed direct call, and
+        is deliberately distinct from a decision of False.
+        """
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        async with self._lock:
+            self._pending.append((key, item, future))
+            should_flush = len(self._pending) >= self.max_items
+            if should_flush and self._timer:
+                self._timer.cancel()
+                self._timer = None
+            elif not self._timer:
+                self._timer = asyncio.create_task(self._flush_after_wait())
+
+        if should_flush:
+            # Detached, not awaited inline. Awaiting here put the whole flush --
+            # a multi-minute inference -- ahead of the bounded wait below, so
+            # the caller that happened to complete the batch was unbounded while
+            # every other caller was protected. It also made one arbitrary
+            # caller bear the cost of the batch on behalf of the rest.
+            asyncio.create_task(self._flush())
+
+        # Bounded, always.
+        #
+        # A caller parked here is holding a dispatch slot, and the consume loop
+        # blocks once MAX_INFLIGHT_DISPATCHES of them accumulate -- so a batch
+        # that never resolves does not merely lose its own answers, it stops the
+        # agent reading its topic at all. Observed: radar_agent at processed=5
+        # in 29 minutes, consumer live and assigned, offsets frozen across all
+        # three partitions while lag climbed past 9,000.
+        #
+        # Timing out to None is the same outcome the caller already handles for
+        # a shed or malformed batch: no verdict was reached. An unanswered
+        # candidate costs one inference later; a wedged consumer costs
+        # everything behind it.
+        try:
+            return await asyncio.wait_for(future, timeout=self.max_stall_sec)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "%s: no verdict for %s after %.0fs; releasing the dispatch slot. "
+                "The batch is still in flight and its answer will be discarded.",
+                self.name, key, self.max_stall_sec,
+            )
+            return None
+
+    async def _flush_after_wait(self):
+        try:
+            await asyncio.sleep(self.max_wait_sec)
+            await self._flush()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.warning("Batch timer for %s failed: %s", self.name, e)
+
+    async def _flush(self):
+        async with self._lock:
+            batch, self._pending = self._pending, []
+            # Never cancel the task we are running on.
+            #
+            # _flush_after_wait calls this, so self._timer is frequently the
+            # current task; cancelling it delivered CancelledError at the next
+            # await -- which is the inference itself, minutes long. The flush
+            # died mid-call and the futures below were never resolved, so every
+            # caller waited forever and the agent silently stopped producing
+            # decisions. It survived unit testing because a flush that returns
+            # instantly finishes before the cancellation is delivered; only real
+            # latency exposes it.
+            current = asyncio.current_task()
+            if self._timer is not None and self._timer is not current:
+                self._timer.cancel()
+            self._timer = None
+        if not batch:
+            return
+
+        keys = [k for k, _, _ in batch]
+        try:
+            answers = await self._flush_fn([(k, item) for k, item, _ in batch])
+            answers = answers or {}
+            self.logger.info(
+                "%s: one inference answered %s candidate(s) -- %s",
+                self.name, len(batch), ", ".join(keys[:8]) + ("..." if len(keys) > 8 else ""),
+            )
+        except Exception as e:
+            # One failure resolves the whole batch to "no decision" rather than
+            # leaving callers awaiting a future that will never complete. A
+            # hung handler is a worse failure than an unanswered question.
+            self.logger.warning("%s: batch of %s failed: %s", self.name, len(batch), e)
+            answers = {}
+
+        for key, _, future in batch:
+            if not future.done():
+                future.set_result(answers.get(key))
+
+
 class SentinelAgent(ABC):
     _global_received_count = 0
     def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3", fallback_model: Optional[str] = None):
@@ -155,7 +381,20 @@ class SentinelAgent(ABC):
         self._llm: Optional[OllamaClient] = None
         
         # Concurrency bound: Limit inflight tasks to prevent memory explosion and LLM timeouts
-        self._dispatch_semaphore = asyncio.Semaphore(int(os.getenv("AGENT_CONCURRENCY", "5")))
+        # Concurrency has to exceed the largest batch an agent assembles.
+        #
+        # A batching agent parks each caller on a future until the batch flushes,
+        # and those callers hold a dispatch slot while they wait. With
+        # concurrency 5 and a batch size of 10 the size trigger is unreachable
+        # by construction: only five callers can ever be waiting, so every batch
+        # falls through to its timer while holding every slot the agent has.
+        # Observed live -- radar_agent's processed count froze at 5,292 with
+        # 4,902 messages of lag behind it.
+        #
+        # These are idle awaits, not work, so the bound is about bookkeeping
+        # rather than load; it needs to be comfortably above the batch size.
+        self.dispatch_concurrency = int(os.getenv("AGENT_CONCURRENCY", "24"))
+        self._dispatch_semaphore = asyncio.Semaphore(self.dispatch_concurrency)
 
         # Cross-agent state synchronization (§3.3):
         # Track recently processed event IDs and entities for context drift detection.
@@ -319,7 +558,58 @@ class SentinelAgent(ABC):
             self._send_dlq(payload, f"UnhandledException: {type(err).__name__}: {err}", topic_name)
         )
 
+    # A reserved slot in the inference budget, or None to share the common one.
+    #
+    # The default is to share: eight agents against a single-threaded model
+    # server, one slot every ten minutes, and a shared key is what stops them
+    # queueing behind each other. An agent gets its own lane only when sharing
+    # demonstrably starves it -- see RadarAgent, whose batched decisions never
+    # landed because knowledge_graph_engine, rule_synthesizer and
+    # stock_correlation_agent kept winning the common slot.
+    #
+    # Each lane is one more inference that can be in flight, so this is a real
+    # cost paid against a real host. Adding lanes without measuring the
+    # starvation first would rebuild the queue the budget exists to prevent.
+    INFERENCE_LANE: Optional[str] = None
+
+    # How late an event may be and still be worth an agent's attention.
+    #
+    # An hour, not the correlation engine's fifteen minutes. Copying that window
+    # here was wrong twice over. Correlation asks "what co-occurred inside a
+    # sliding window", so fifteen minutes is the question itself; an agent asks
+    # "is this worth watching", which an hour-old signal still answers.
+    #
+    # And agents consume the whole enriched.events firehose while caring about a
+    # small slice of it, so they run steadily behind -- radar_agent sat ~15,600
+    # messages back. Everything it read was therefore older than 900s and every
+    # single event was dropped: "radar_agent skipped 10,001 event(s) older than
+    # 900s", including a $479,668 GOOGL block that passed every other gate. A
+    # guard meant to stop the system reasoning about yesterday was instead
+    # stopping it reasoning at all.
+    MAX_EVENT_AGE_SEC = int(os.getenv("AGENT_MAX_EVENT_AGE_SEC", "3600"))
+
     async def _dispatch(self, raw: Dict[str, Any]):
+        # Refuse to act on history.
+        #
+        # An agent resuming after any interruption -- a deploy, a crash, a
+        # laptop suspending overnight -- works forward from its committed
+        # offset through everything that arrived while it was gone. Measured
+        # after one such gap: the radar orchestrator held ~44,000 events. Acting
+        # on those means escalating tickers whose flow finished hours ago and
+        # spending the swarm's scarcest resource, an inference slot, to do it.
+        #
+        # Skipped, not seeked: the message is still consumed, committed and
+        # counted, so the lag figure stays honest and the backlog drains at
+        # parse speed instead of at inference speed.
+        if is_stale(raw, self.MAX_EVENT_AGE_SEC):
+            self._stale_skipped = getattr(self, "_stale_skipped", 0) + 1
+            if self._stale_skipped % 2000 == 1:
+                self.logger.warning(
+                    "%s skipped %s event(s) older than %ss while catching up.",
+                    self.name, self._stale_skipped, self.MAX_EVENT_AGE_SEC,
+                )
+            return
+
         async with self._dispatch_semaphore:
             t0 = time.monotonic()
             try:
@@ -679,8 +969,37 @@ class SentinelAgent(ABC):
         """
         Records a prediction for later verification.
         Returns the prediction_id.
+
+        A repeat of a standing call is not a second forecast. The quant engine
+        re-derives the same plays on every run, and with nothing to stop it the
+        same claim was stored again each time: of six predictions recorded, two
+        pairs were byte-identical duplicates of one another. That inflates the
+        count, and it double-weights the scorecard that the consensus engine
+        reads -- an agent repeating itself would outrank one that was right.
         """
         try:
+            # One standing call per agent, ticker and direction. A genuine
+            # change of view -- a reversal, or a new entry after the last
+            # horizon lapsed -- still gets through, because the claim expires
+            # with the prediction it guards.
+            claim_key = (
+                f"sentinel:predictions:claim:{self.name}:"
+                f"{str(ticker).upper()}:{str(direction).lower()}"
+            )
+            claim_ttl = max(int(time_horizon_hours) * 3600, 3600)
+            try:
+                is_new = await self.redis.raw.set(claim_key, "1", nx=True, ex=claim_ttl)
+                if not is_new:
+                    logger.debug(
+                        "Prediction for %s %s already stands; not recording a duplicate.",
+                        ticker, direction,
+                    )
+                    return ""
+            except Exception as e:
+                # A failed claim must not lose the prediction. Recording a
+                # duplicate is a smaller harm than dropping a forecast.
+                logger.debug(f"Prediction dedupe claim failed for {ticker}: {e}")
+
             pred = AgentPrediction(
                 agent_name=self.name,
                 ticker=ticker.upper(),
@@ -691,7 +1010,23 @@ class SentinelAgent(ABC):
                 time_horizon_hours=time_horizon_hours,
             )
             key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
-            ttl = max(time_horizon_hours * 3600 + 7200, 86400)  # Horizon + 2h buffer, min 24h
+            # Horizon plus a generous window to be resolved in.
+            #
+            # This was a two-hour buffer. The resolver sweeps every fifteen
+            # minutes, so two hours is ample while the agent is running -- and
+            # the agent is frequently not: deploys, restarts, a laptop
+            # suspending overnight. Any of those spanning the wrong two hours
+            # expires the prediction unresolved, and an unresolved prediction is
+            # a wasted inference on a host that affords about twenty an hour.
+            # The scorecards it would have fed are what weight the consensus
+            # engine, so the loss compounds.
+            #
+            # Redis storage for a few extra hours is the cheapest thing in this
+            # system. The buffer is sized for the outage, not the sweep.
+            ttl = max(
+                time_horizon_hours * 3600 + PREDICTION_RESOLUTION_BUFFER_SEC,
+                86400,
+            )
             await self.redis.raw.set(key, pred.model_dump_json(), ex=ttl)
 
             # Index by ticker for fast lookup
@@ -1039,6 +1374,15 @@ class SentinelAgent(ABC):
             budget = InferenceBudget(
                 getattr(self, "redis", None),
                 getattr(self, "model", None) or "default",
+                cooldown_sec=(
+                    int(os.getenv("AGENT_LANE_COOLDOWN_SEC", "300"))
+                    if self.INFERENCE_LANE else DEFAULT_COOLDOWN_SEC
+                ),
+                lane=self.INFERENCE_LANE,
+                # So the budget can tell callers apart and take turns between
+                # them. Without a name every claim looks the same, and the
+                # agent with the busiest input stream wins every slot.
+                owner=getattr(self, "name", None),
             )
             self._budget_instance = budget
         return budget
@@ -1286,7 +1630,15 @@ class SentinelAgent(ABC):
         # The budget is shared per model, not per agent: these processes talk to
         # one single-threaded Ollama, so a per-agent limit would multiply by the
         # number of agents and rebuild the queue it exists to prevent.
-        if not await self._inference_budget.try_acquire(domain=_message_domain(message)):
+        # The message's own anomaly score decides whether this candidate is
+        # worth the slot. Passing it is what turns the budget from
+        # first-come-first-served into a selection: the parameter existed and no
+        # caller had ever filled it, so "which twenty events of a hundred and
+        # fifty thousand get analysed" was answered by arrival timing alone.
+        if not await self._inference_budget.try_acquire(
+            score=_message_score(message),
+            domain=_message_domain(message),
+        ):
             raise InferenceShed(self.name, model or self.model)
 
         start_time = time.monotonic()
@@ -1362,7 +1714,19 @@ class SentinelAgent(ABC):
                 }
             )
             raise
-        
+        finally:
+            # The slot was claimed for the worst case -- a worker that claims and
+            # never returns -- and that is the only thing the full cooldown is
+            # protecting against. This inference has now either produced
+            # something or failed, so continuing to hold the slot for the
+            # remaining minutes rations nothing and idles the model server.
+            #
+            # In `finally` rather than after the success path because a failed
+            # inference held the budget exactly as long as a successful one, and
+            # a tier that is erroring is the last one that should also be
+            # blocking every other agent from trying.
+            await self._inference_budget.finish()
+
         if hasattr(response, "model_dump"):
             output_payload = response.model_dump()
         elif hasattr(response, "dict"):

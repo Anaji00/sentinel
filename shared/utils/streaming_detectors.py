@@ -48,6 +48,12 @@ except ImportError:
 # SECTION 1: ROBUST RANDOM CUT FOREST
 # ════════════════════════════════════════════════════════════════════════════════
 
+# Scoring bounds for the z-score fallback used when rrcf is unavailable.
+FALLBACK_MIN_HISTORY = 64      # observations before an empirical percentile means anything
+FALLBACK_HISTORY_SIZE = 512    # how much recent history the percentile is taken against
+FALLBACK_MAX_SCORE = 0.995     # never exactly 1.0 -- see _insert_fallback
+
+
 class RRCFDetector:
     """
     Streaming anomaly detector using Robust Random Cut Forest.
@@ -79,6 +85,10 @@ class RRCFDetector:
 
         # Shingle buffer: stores the last `shingle_size` raw points
         self._shingle_buffer: deque = deque(maxlen=shingle_size)
+
+        # Recent magnitudes, on both paths: the positional score needs history
+        # whichever detector produced the number.
+        self._z_history: deque = deque(maxlen=FALLBACK_HISTORY_SIZE)
 
         if HAS_RRCF:
             self._forest = [rrcf.RCTree() for _ in range(num_trees)]
@@ -150,10 +160,50 @@ class RRCFDetector:
         else:
             return 0.0
 
-        # Sigmoid normalization: maps raw CoDisp to [0, 1]
-        # CoDisp of ~3-5 should map to ~0.5-0.7 (anomalous territory)
-        score = 1.0 / (1.0 + math.exp(-0.5 * (avg_codisp - 4.0)))
-        return round(min(1.0, max(0.0, score)), 4)
+        # Positioned against this detector's own recent CoDisp values.
+        #
+        # This was a fixed sigmoid, 1/(1+exp(-0.5*(avg_codisp-4.0))), and the
+        # constants were guesses made before the system ran. CoDisp on a
+        # shingled five-feature vector routinely reaches the twenties, where
+        # that curve is long since saturated -- so live equity blocks scored
+        # exactly 1.000 for 378 of ~400 samples with 45% of the population in
+        # the top decile, and everything downstream inherited it: radar
+        # multiplies the score by five for its z-score, correlation derives
+        # confidence from it, and every ranking in the product rests on it.
+        #
+        # The same treatment as the fallback path, through the same method, so
+        # the two cannot drift into disagreeing about what a score means.
+        return self._positional_score(
+            avg_codisp,
+            warmup_curve=lambda c: 1.0 / (1.0 + math.exp(-0.5 * (c - 4.0))),
+        )
+
+    def _positional_score(self, raw: float, warmup_curve) -> float:
+        """Where this observation sits among the detector's recent history.
+
+        Both scoring paths -- RRCF CoDisp and the z-score fallback -- produce an
+        unbounded magnitude that then has to become a [0,1] score. Each did it
+        with its own hand-picked sigmoid, and both curves were exhausted by the
+        magnitudes real traffic produces.
+
+        An empirical position is self-calibrating: 0.9 means "more extreme than
+        90% of what this detector has lately seen", which is how the number gets
+        read anyway, and it spreads across the range whatever the units of the
+        underlying signal. The supplied curve is used only while there is too
+        little history for a percentile to mean anything.
+        """
+        self._z_history.append(float(raw))
+
+        if len(self._z_history) < FALLBACK_MIN_HISTORY:
+            score = warmup_curve(raw)
+        else:
+            below = sum(1 for prior in self._z_history if prior < raw)
+            score = below / len(self._z_history)
+
+        # Never exactly 1.0. The most extreme thing seen so far is still only
+        # that, and a detector reporting certainty leaves nothing to say when
+        # something genuinely worse arrives.
+        return round(min(FALLBACK_MAX_SCORE, max(0.0, score)), 4)
 
     def _insert_fallback(self, point: np.ndarray) -> float:
         """Z-score fallback when rrcf is not installed."""
@@ -170,9 +220,21 @@ class RRCFDetector:
         z_scores = np.abs(diff) / (np.sqrt(self._ema_var) + 1e-8)
         max_z = float(np.max(z_scores))
 
-        # Map max z-score to [0, 1] via sigmoid
-        score = 1.0 / (1.0 + math.exp(-0.8 * (max_z - 2.5)))
-        return round(min(1.0, max(0.0, score)), 4)
+        # Scored against this detector's own recent history, not a fixed curve.
+        #
+        # This was a sigmoid: 1/(1+exp(-0.8*(max_z-2.5))). Both constants were
+        # written before the system ran, and against real traffic the curve is
+        # exhausted almost immediately -- z=8 already scores 0.988 and anything
+        # past z=15 rounds to exactly 1.0000. Measured on live equity blocks:
+        # 378 of ~400 came back at 1.000 before a single adjustment was applied,
+        # and the top decile held 45% of the population. A detector whose output
+        # is 1.0 for nearly half its input is not ranking that half.
+        #
+        # The empirical position is self-calibrating: a score of 0.9 means "more
+        # extreme than 90% of what this detector has recently seen", which is
+        # what an analyst reads it as anyway, and it spreads across the range by
+        # construction whatever the units of the underlying features.
+        return self._positional_score(max_z, warmup_curve=lambda z: 1.0 / (1.0 + math.exp(-0.8 * (z - 2.5))))
 
     def insert_batch(self, points: List[np.ndarray]) -> List[float]:
         """Insert multiple points sequentially, return list of scores."""
@@ -318,6 +380,24 @@ class KalmanResidualFilter:
 # SECTION 3: MULTIVARIATE HAWKES PROCESS
 # ════════════════════════════════════════════════════════════════════════════════
 
+# Bounds on the excitation ratio and how its baseline is learned.
+#
+# A ratio is "how much busier than usual", so it is only meaningful against what
+# this deployment actually receives. The seeded constants were a guess made
+# before the system ran and were wrong by more than two orders of magnitude for
+# the busiest domain.
+BASELINE_ALPHA = 0.20              # per window, and windows are 30s apart
+BASELINE_MIN_OBSERVATIONS = 3      # windows, not arrivals, before trusting it
+BASELINE_WINDOW_SEC = 30.0         # a rate is counted over this, never per arrival
+BASELINE_MAX_GAP_SEC = 3600.0      # a longer gap is an outage, not a quiet period
+
+# Reported ratios are capped. Beyond roughly two orders of magnitude the number
+# has stopped being a measurement and started being a division artefact, and
+# printing "230,093,397.3x baseline" in an operator's alert is worse than
+# printing the cap: the first invites belief, the second invites a question.
+MAX_EXCITATION_RATIO = 100.0
+
+
 class HawkesIntensityTracker:
     """
     Multivariate self- and cross-exciting point process tracker.
@@ -340,17 +420,92 @@ class HawkesIntensityTracker:
     # Default cross-excitation matrix (α values)
     # Row = source domain, Column = target domain
     # Higher α = stronger excitation
+    # Why the empty cells are still empty.
+    #
+    # An estimation attempt was made against 1,373 five-minute bins spanning
+    # 168 hours of this deployment's own events, using each domain's share of
+    # bin activity to control for the system being on or off. It produced 21
+    # domain pairs with |r| >= 0.15 and every one of them is an artifact:
+    #
+    #   Symmetry. crypto->maritime scored 0.604 and maritime->crypto 0.601 --
+    #   a gap of 0.002. Excitation is directional; a relationship symmetric to
+    #   three decimal places is co-occurrence, two domains busy at the same
+    #   time because the collectors are running.
+    #
+    #   Wrong-way decay. aviation->crypto rose from 0.509 at five minutes to
+    #   0.611 at thirty. An influence that strengthens as it ages is not an
+    #   influence.
+    #
+    #   Closure. Shares sum to exactly 1.000 and news averages 62% of every
+    #   bin, so every other domain anti-correlates with news by arithmetic
+    #   necessity -- which is where news->crypto = -0.817 came from.
+    #
+    # Filling these cells from that measurement would have produced twenty-one
+    # confident coefficients and no knowledge. Estimating them properly needs
+    # event-level lead-lag on matched entities, not bin-level activity
+    # correlation.
+    #
+    # That prescription was later checked against the data, and it does not
+    # work either -- for a reason worth recording, because it is the reason
+    # these cells stay empty rather than a matter of waiting for uptime.
+    # Distinct entities per domain over fourteen days, and how many of them
+    # tradfi also names:
+    #
+    #     crypto      87,902        9          aviation   12,258      0
+    #     maritime     4,545        0          cyber       1,902      1
+    #     news         1,602      196          prediction     52      0
+    #
+    # Every domain missing a coefficient shares essentially no entities with
+    # the domain it would excite. Entity matching cannot measure these paths
+    # because they are not entity-mediated: a Suez closure moves crude through
+    # a causal channel that names no vessel, and an equity block names no
+    # aircraft. The one pair with real overlap, news->tradfi at 12%, is also the
+    # one pair already carrying a coefficient.
+    #
+    # So this needs a mechanism the system does not currently have -- concept
+    # or instrument-class association rather than entity identity -- and not
+    # more data of the kind already collected. Until then has_excitation_path()
+    # keeps the system from forecasting what it cannot represent, which is the
+    # honest state and not a placeholder.
+    # Measured, 2026-08-31, by scripts/estimate_excitation.py over ten days of
+    # this deployment: 1.8M events, one-minute bins, joint Poisson fit of
+    #
+    #     E[N_d(t)] = mu_d + SUM_d' alpha_{d',d} * w_{d'}(t)
+    #
+    # with every source domain in the same regression, so each coefficient is a
+    # partial effect and "the whole system was busy" is a term rather than a
+    # confound. Five of forty-nine ordered pairs survived being positive,
+    # significant against a likelihood ratio, and stable across the two halves
+    # of the window. The rest are absent because they could not be measured, and
+    # has_excitation_path() below refuses to forecast through an absent one.
+    #
+    # What was here before was invented, and every cell that could be checked
+    # was wrong by one to two orders of magnitude:
+    #
+    #     crypto -> tradfi     0.3   invented    0.0019  measured
+    #     crypto -> crypto     0.5   invented    0.1044  measured
+    #     tradfi -> tradfi     0.4   invented    unstable across halves
+    #     tradfi -> crypto     0.2   invented    unstable across halves
+    #     news   -> tradfi     0.1   invented    no excitation
+    #     maritime -> tradfi   0.05  invented    unstable across halves
+    #     cyber  -> tradfi     0.05  invented    unstable across halves
+    #     prediction -> *      0.15  invented    source has 217 events
+    #
+    # The shape of the result is worth reading before trusting it. Four of the
+    # five survivors are self-excitation, which is the effect this data can
+    # actually see: a domain's own recent arrivals predict its next ones. Only
+    # crypto -> tradfi survives across domains, at 0.0019 -- small enough that
+    # the honest summary is "this deployment shows almost no cross-domain
+    # excitation", not "here are the cross-domain coefficients".
+    #
+    # Re-run the script rather than editing these by hand. A coefficient with no
+    # provenance is what this table used to be.
     DEFAULT_EXCITATION = {
-        ("crypto", "tradfi"):     0.3,    # Crypto liquidation cascades hit equities
-        ("tradfi", "crypto"):     0.2,    # Equity flash crash hits crypto
-        ("crypto", "crypto"):     0.5,    # Crypto self-excitation (liquidation cascades)
-        ("tradfi", "tradfi"):     0.4,    # Equity self-excitation (panic selling)
-        ("prediction", "tradfi"): 0.15,   # Prediction market shift → equity positioning
-        ("prediction", "crypto"): 0.15,   # Prediction market → crypto
-        ("news", "tradfi"):       0.1,    # Breaking news → market reaction
-        ("news", "crypto"):       0.1,    # Breaking news → crypto reaction
-        ("maritime", "tradfi"):   0.05,   # Maritime disruption → commodity/equity
-        ("cyber", "tradfi"):      0.05,   # Cyber attack → market fear
+        ("crypto", "crypto"):     0.1044,   # liquidation cascades
+        ("cyber", "cyber"):       0.0957,
+        ("maritime", "maritime"): 0.0950,
+        ("news", "news"):         0.0783,   # a story begets coverage
+        ("crypto", "tradfi"):     0.0019,   # the only cross-domain survivor
     }
 
     DEFAULT_DECAY = 0.1  # β: events decay over ~10 time units (minutes)
@@ -374,6 +529,25 @@ class HawkesIntensityTracker:
         self._excitation = excitation_matrix or self.DEFAULT_EXCITATION
         self._decay = decay
         self._max_history = max_history
+
+        # Baselines above are seeds, not measurements.
+        #
+        # They are a guess at events per second made before the system had ever
+        # run, and the excitation ratio divides by them. Crypto was seeded at
+        # 0.01/s and actually arrives at roughly 4.7/s on this deployment --
+        # about 470 times higher -- so every ratio computed against it was
+        # meaningless. Published in an alert at tier 4, that read as
+        # "crypto-domain intensity (230,093,397.3x baseline)": eight orders of
+        # magnitude, presented to an operator as a measurement.
+        #
+        # The observed rate replaces the seed once a domain has been seen often
+        # enough to estimate it. A ratio is only interesting relative to what
+        # this deployment actually receives, which no constant can know.
+        self._observed_rate: Dict[str, float] = {}
+        self._last_seen: Dict[str, float] = {}
+        self._observation_count: Dict[str, int] = {}
+        self._window_start: Dict[str, float] = {}
+        self._window_count: Dict[str, int] = {}
 
         # Event history per domain: deque of timestamps
         self._history: Dict[str, deque] = {
@@ -400,11 +574,12 @@ class HawkesIntensityTracker:
             self._history[domain] = deque(maxlen=self._max_history)
 
         self._history[domain].append(timestamp)
+        self._update_observed_rate(domain, timestamp)
 
         # Compute intensity for the source domain
         intensity = self._compute_intensity(domain, timestamp)
-        baseline = self._baselines.get(domain, 0.01)
-        ratio = intensity / max(1e-10, baseline)
+        baseline = self._effective_baseline(domain)
+        ratio = min(MAX_EXCITATION_RATIO, intensity / max(1e-10, baseline))
 
         # Compute cross-domain intensities
         cross = {}
@@ -419,6 +594,108 @@ class HawkesIntensityTracker:
             "cross_intensities": {k: round(float(v), 6) for k, v in cross.items()},
         }
 
+    def is_baseline_established(self, domain: str) -> bool:
+        """Whether this domain's normal rate has actually been measured yet.
+
+        Until it has, _effective_baseline returns the seed -- a constant written
+        before the system ran. Dividing by it produces a number with the shape
+        of a measurement and none of the content: prediction is seeded at
+        0.005/s (one event every 200 seconds) and arrives from Polymarket in
+        bursts, so any burst read as enormous and pinned to the reporting cap.
+        "100.0x baseline" is the cap saying it gave up, not a finding.
+
+        Callers that publish a ratio check this first. A domain too quiet to
+        have established a rate is a domain we cannot yet say anything
+        quantitative about, and saying so is better than saying something false.
+        """
+        return self._observation_count.get(domain, 0) >= BASELINE_MIN_OBSERVATIONS
+
+    def has_excitation_path(self, domain: str) -> bool:
+        """Whether anything in the model can excite this domain at all.
+
+        Two of seven now, not five: the coefficients were measured (see
+        DEFAULT_EXCITATION above) and crypto, cyber, maritime, news and tradfi
+        each gained an inbound term, four of them by exciting themselves.
+
+        Aviation and prediction still have none, and that is a result rather
+        than a gap -- aviation produced no stable coefficient from any source,
+        and prediction has 217 events in the whole fitted window. For those two
+        the excitation sum is empty by construction, so intensity equals
+        baseline and the ratio is exactly 1.0 no matter what arrives.
+
+        What must not happen is publishing a "forecast" for such a domain,
+        because the number is the baseline restated and carries no information.
+        Callers check this before reporting.
+        """
+        return any(
+            alpha > 0.0 for (_, target), alpha in self._excitation.items()
+            if target == domain
+        )
+
+    def _update_observed_rate(self, domain: str, timestamp: float) -> None:
+        """Estimates the domain's normal rate, over a window, not per arrival.
+
+        The baseline is a *rate over a window*, folded in at most once per
+        BASELINE_WINDOW_SEC. Two reasons, and the second is the important one.
+
+        Statistically, 1/gap is an estimate from a single inter-arrival and is
+        wildly noisy; count/elapsed over a window is not.
+
+        Structurally, folding every arrival lets a burst raise the baseline it
+        is about to be measured against. An earlier version of this method did
+        exactly that: twenty arrivals in a second each pulled the EMA toward
+        20/s, so by the time the ratio was read the burst had already become the
+        new normal and registered as *less* excited than the calm stream before
+        it. That is the same failure this codebase fixed once already in
+        track_frequency -- "a burst compared against a baseline the burst itself
+        just raised" -- reintroduced here.
+        """
+        started = self._window_start.get(domain)
+        if started is None:
+            self._window_start[domain] = timestamp
+            self._window_count[domain] = 1
+            self._last_seen[domain] = timestamp
+            return
+
+        gap_since_last = timestamp - self._last_seen.get(domain, timestamp)
+        self._last_seen[domain] = timestamp
+
+        if gap_since_last > BASELINE_MAX_GAP_SEC:
+            # An outage, not a quiet period. The partial window spans the gap
+            # and would read as a near-zero rate, which is how the first event
+            # after a restart comes to look infinitely excited. Start over.
+            self._window_start[domain] = timestamp
+            self._window_count[domain] = 1
+            return
+
+        self._window_count[domain] = self._window_count.get(domain, 0) + 1
+        elapsed = timestamp - started
+        if elapsed < BASELINE_WINDOW_SEC:
+            return
+
+        rate = self._window_count[domain] / elapsed
+        current = self._observed_rate.get(domain)
+        self._observed_rate[domain] = (
+            rate if current is None
+            else BASELINE_ALPHA * rate + (1.0 - BASELINE_ALPHA) * current
+        )
+        self._observation_count[domain] = self._observation_count.get(domain, 0) + 1
+        self._window_start[domain] = timestamp
+        self._window_count[domain] = 0
+
+    def _effective_baseline(self, domain: str) -> float:
+        """The measured arrival rate once known, else the seed.
+
+        The seed is used only until a domain has been seen enough times to
+        estimate its rate. Reporting a ratio against a guess is what produced
+        the eight-order-of-magnitude figures.
+        """
+        if self._observation_count.get(domain, 0) >= BASELINE_MIN_OBSERVATIONS:
+            observed = self._observed_rate.get(domain)
+            if observed and observed > 0:
+                return observed
+        return self._baselines.get(domain, 0.01)
+
     def get_intensity(self, domain: str, timestamp: float) -> float:
         """Get current intensity for a domain without recording an event."""
         return self._compute_intensity(domain, timestamp)
@@ -426,14 +703,14 @@ class HawkesIntensityTracker:
     def get_excitation_ratio(self, domain: str, timestamp: float) -> float:
         """Get intensity / baseline for a domain. >1.0 = excited state."""
         intensity = self._compute_intensity(domain, timestamp)
-        baseline = self._baselines.get(domain, 0.01)
-        return intensity / max(1e-10, baseline)
+        baseline = self._effective_baseline(domain)
+        return min(MAX_EXCITATION_RATIO, intensity / max(1e-10, baseline))
 
     def _compute_intensity(self, target_domain: str, t: float) -> float:
         """
         Compute λ_d(t) = μ_d + Σ_{d'} Σ_{t_i < t} α_{d',d} * exp(-β * (t - t_i))
         """
-        mu = self._baselines.get(target_domain, 0.01)
+        mu = self._effective_baseline(target_domain)
         excitation_sum = 0.0
 
         for source_domain, history in self._history.items():
@@ -653,7 +930,14 @@ class BGPGraphFeatureExtractor:
             features["prefix_specificity"] = defaults["prefix_specificity"]
             return features
         except Exception as e:
-            logger.debug(f"Neo4j BGP feature extraction failed for {origin_as}: {e}")
+            # The defaults claim maximum novelty and zero centrality, which is
+            # a score of 0.850 for every hijack. Falling back to them is a
+            # measurement failure and is reported as one.
+            logger.warning(
+                "BGP graph features unavailable for %s: %s. Falling back to "
+                "assumed-novel defaults, which do not discriminate.",
+                origin_as, e,
+            )
             return defaults
 
     async def upsert_as_path(
@@ -702,7 +986,26 @@ class BGPGraphFeatureExtractor:
             )
 
             # Upsert ANNOUNCES relationship
-            path_str = ",".join(as_path) if as_path else origin_as
+            #
+            # str() on every element, because RIS sends AS paths as integers and
+            # ",".join() raises TypeError on the first one. That exception was
+            # thrown here -- after the two node upserts and before the
+            # relationship -- and caught by the handler below at debug level, so
+            # the AS and Prefix nodes were created and the edge between them
+            # never was. Zero ANNOUNCES relationships existed against 2,028 AS
+            # nodes and 3,548 prefixes.
+            #
+            # The cost was not the missing edge. Novelty is measured by whether
+            # this AS has announced this prefix before, so with no edge ever
+            # written the answer was always "no": path_novelty pinned at 1.0,
+            # every event scored 0.70 + 0.30 x (0.5 x 1.0) = 0.850, and all 219
+            # bgp_anomaly events in a 45-minute window shared one score.
+            #
+            # A note above this in the collector records that `as_path` was
+            # already fixed once, when the enricher was reading a field the
+            # producer did not send. The name was corrected and the type was
+            # not, so the feature stayed dead through both fixes.
+            path_str = ",".join(str(hop) for hop in as_path) if as_path else str(origin_as)
             await self._neo4j.query(
                 """
                 MATCH (a:AutonomousSystem {id: $as_id})
@@ -714,7 +1017,13 @@ class BGPGraphFeatureExtractor:
                 {"as_id": origin_as, "cidr": prefix, "now": now_iso, "path": path_str},
             )
         except Exception as e:
-            logger.debug(f"Neo4j BGP AS-path upsert failed: {e}")
+            # Warning, not debug. This failing silently is what kept path
+            # novelty pinned at 1.0 for the life of the detector.
+            logger.warning(
+                "BGP AS-path upsert failed for %s %s: %s. Path novelty cannot "
+                "be measured without it, so scores will not discriminate.",
+                origin_as, prefix, e,
+            )
 
     async def _query_graph_features(
         self, origin_as: str, prefix: str

@@ -39,6 +39,14 @@ from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
 from shared.utils.ollama import OllamaClient
+from shared.utils.freshness import is_stale
+
+# Reasoning is slower by nature than correlation -- a scenario is minutes of
+# inference, not microseconds of window arithmetic -- so it gets a longer
+# window than the 900s the correlation engine uses. An hour is still well
+# inside "current" for a geopolitical or market judgement, and well outside the
+# eight-hour backlog a single overnight suspend produced.
+REASONING_MAX_CLUSTER_AGE_SEC = int(os.getenv("REASONING_MAX_CLUSTER_AGE_SEC", "3600"))
 from shared.utils.inference_budget import InferenceBudget
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task
@@ -208,6 +216,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         lane="reasoning",
     )
     _shed = 0
+    _stale = 0
 
     # Detached syntheses, bounded so a slow model cannot turn backlog into
     # unbounded memory. Rarely approached: the semaphore admits three at a time.
@@ -268,6 +277,35 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                     )
                                 continue
                                 
+                            # Agent analysis shares this topic and is not a cluster.
+                            #
+                            # stock_correlation_agent declares Topics.CORRELATIONS
+                            # as its output_topic, so its cross-asset analysis
+                            # lands here and was fed straight into
+                            # CorrelationCluster(**raw_data). Its payload shares
+                            # none of the five required fields -- rule_id,
+                            # rule_name, alert_tier, trigger_event_id,
+                            # description -- so every one raised five validation
+                            # errors, went to the DLQ, exhausted its retries and
+                            # was written to failed_events as permanently
+                            # failed. The agent ran, produced its analysis,
+                            # published it, and the consumer discarded all of it.
+                            #
+                            # Kept the way intel briefs are: cached for the
+                            # generator to read as context, rather than parsed
+                            # as something it never was.
+                            if "agent" in raw_data and "correlation_id" not in raw_data:
+                                agent_name = str(raw_data.get("agent") or "unknown")
+                                try:
+                                    await redis_client.raw.set(
+                                        f"sentinel:agents:correlation_analysis:{agent_name}",
+                                        json.dumps(raw_data),
+                                        ex=3600,
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Could not cache {agent_name} analysis: {e}")
+                                continue
+
                             cluster = CorrelationCluster(**raw_data)
                             logger.debug(f"Received correlation cluster {cluster.correlation_id} for reasoning analysis")
                             
@@ -283,6 +321,28 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                             # they all talk to the same single-threaded Ollama.
                             # Peeking does not claim the slot; it just avoids
                             # building work that would sit unread.
+                            # Age before capacity. A cluster older than the
+                            # window cannot be reasoned about usefully however
+                            # much capacity exists, and checking it first means
+                            # a backlog drains at parse speed instead of
+                            # occupying the budget peek.
+                            #
+                            # This service held 26,405 correlations after a
+                            # single overnight suspend. Without this it works
+                            # forward through all of them, spending minutes of
+                            # inference each on describing a world that has
+                            # already moved.
+                            if is_stale(cluster, REASONING_MAX_CLUSTER_AGE_SEC):
+                                _stale += 1
+                                if _stale % 500 == 1:
+                                    logger.warning(
+                                        "Reasoning skipped %s cluster(s) older than %ss. "
+                                        "Analysing a backlog describes a world that has "
+                                        "already changed.",
+                                        _stale, REASONING_MAX_CLUSTER_AGE_SEC,
+                                    )
+                                continue
+
                             if not await _budget.is_available():
                                 _shed += 1
                                 if _shed % 500 == 1:
@@ -362,6 +422,26 @@ async def main():
  
     db              = await get_timescale()
     redis_client    = await get_redis()
+    # Publish this process's metrics, so inference can be accounted for.
+    #
+    # MetricsCollector.increment("ollama_calls_total") has run in this service
+    # since it was written, and never left the process: bind_redis() had exactly
+    # one caller, a collector-specific helper, so only the collectors ever
+    # published. The module's own docstring describes cross-process aggregation
+    # as the problem it solves, and the services doing all the inference were
+    # not participating in it.
+    #
+    # The cost was not a missing dashboard. It made "how much model time does
+    # each agent consume" unanswerable from inside, which left parsing Ollama's
+    # access log by container IP as the only option -- and Docker reassigns
+    # those on restart, so the attribution was wrong in a way that took two
+    # corrections to notice.
+    try:
+        from shared.utils.metrics import bind_redis
+        await bind_redis(redis_client, service_name=os.getenv("SENTINEL_SERVICE", "reasoning"))
+    except Exception as e:
+        logger.debug("Metrics binding skipped: %s", e)
+
     context_builder = ContextBuilder(db)
     generator       = ScenarioGenerator(db, redis_client=redis_client) 
     tracker_producer = SentinelProducer()

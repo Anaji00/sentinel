@@ -21,7 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from services.agents.consensus_engine import (
     ConsensusEngine, ConsensusReport, SubjectiveOpinion, ACHReport, CompetingHypothesis, ACH_UNCERTAINTY_THRESHOLD
 )
-from services.agents.adversarial_wargamer import AdversarialWargamerAgent, WargameSimulationOutput, SimulationMove
+from services.agents.adversarial_wargamer import (
+    AdversarialWargamerAgent,
+    WargameSimulationOutput,
+    SimulationBoard,
+    SimulationMove,
+)
 from services.agents.edge_validator import validate_edges
 from services.agents.macro_intelligence_engine import MacroIntelligenceEngine, TICKER_METADATA_REGISTRY
 from services.agents.base import AgentBulletin, AgentScorecard
@@ -75,11 +80,21 @@ def test_adversarial_wargamer_entity_extraction_and_handle():
         agent.redis.raw = AsyncMock()
 
         async def mock_execute_telemetry(message, system_prompt, user_prompt, schema, temperature=0.0):
-            if schema == SimulationMove:
-                return SimulationMove(
-                    persona_name="State_Saboteur", proposed_counter_action="Target supply lines",
-                    target_entity_id="NVDA", disruption_potential_percent=80, strategic_rationale="Exploit bottleneck"
-                )
+            # The personas arrive as one board rather than three separate
+            # calls; see tests/test_wargame_slot_cost.py for why.
+            if schema == SimulationBoard:
+                return SimulationBoard(moves=[
+                    SimulationMove(
+                        persona_name="State_Saboteur", proposed_counter_action="Target supply lines",
+                        target_entity_id="NVDA", disruption_potential_percent=80,
+                        strategic_rationale="Exploit bottleneck",
+                    ),
+                    SimulationMove(
+                        persona_name="Asymmetric_Defender", proposed_counter_action="Dual-source fab capacity",
+                        target_entity_id="NVDA", disruption_potential_percent=30,
+                        strategic_rationale="Remove the single point of failure",
+                    ),
+                ])
             return WargameSimulationOutput(
                 primary_vulnerability_isolated="Supply chain choke point", cascade_failure_probability=75,
                 predicted_next_target_entity_id="NVDA", remediation_recommendation="Hedge positions"

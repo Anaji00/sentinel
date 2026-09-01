@@ -202,7 +202,7 @@ class PredictionEnricher:
             pass
 
         entity_name = display_contract if display_contract != "UNKNOWN QUESTION" else slug
-        entity = Entity(id=slug, type=EntityType.INSTRUMENT, name=entity_name)
+        entity = Entity(id=slug, type=EntityType.PREDICTION_MARKET, name=entity_name)
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
@@ -306,7 +306,7 @@ class PredictionEnricher:
             tags.append("odds_update")
             headline = f"🎯 KALSHI ODDS: {ticker} ({title})"
 
-        entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
+        entity = Entity(id=ticker, type=EntityType.PREDICTION_MARKET, name=ticker)
 
         try:
             await self.redis.raw.sadd("sentinel:kalshi:watched_tickers", ticker)

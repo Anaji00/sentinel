@@ -31,6 +31,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
+from typing import Dict
 import aiohttp
 from dotenv import load_dotenv
 
@@ -280,15 +281,56 @@ async def fetch_live_sofr_rate(session: aiohttp.ClientSession) -> dict:
     }
 
 
+# Last quote published per ticker, as (close, high, low, volume).
+#
+# The macro tier polls on a fixed cadence and used to publish on every cycle
+# whether or not the quote had moved. Outside regular hours the IEX feed's
+# latestTrade is the previous session's last print and does not change, so a
+# six-hour overnight window produced 211 rows per ticker carrying exactly ONE
+# distinct close -- twelve of twelve macro instruments, against QQQ's 45
+# distinct closes in 61 rows on a live feed.
+#
+# That is not a cosmetic duplication. Three things downstream read it as fact:
+#
+#   * The hourly continuous aggregate SUMs volume, so one real print of 1,000
+#     was reported as 111,000 -- the figure measured the poll count.
+#   * Bar-over-bar returns are exactly zero on every repeat, so two frozen
+#     series correlate at |r| = 1.000 on the handful of bars that did move.
+#     The first live peer-graph run published six such pairs.
+#   * Any volume-spike or trend detector reading these bars was measuring the
+#     polling cadence rather than the market.
+#
+# A quote that has not moved is not new information. Republishing it invents
+# observations, and every consumer that counts bars was counting this one.
+_last_published: Dict[str, tuple] = {}
+
+
+def _quote_fingerprint(quote: dict) -> tuple:
+    """What has to change before a quote counts as a new observation."""
+    return (
+        round(float(quote.get("close") or 0.0), 6),
+        round(float(quote.get("high") or 0.0), 6),
+        round(float(quote.get("low") or 0.0), 6),
+        round(float(quote.get("volume") or 0.0), 6),
+    )
+
+
 async def fetch_and_publish(producer: SentinelProducer):
     logger.info("Fetching real macro market quotes across 3-Tier API provider chain...")
     tickers = list(MACRO_TICKERS.keys())
     now = datetime.now(timezone.utc).isoformat()
     published = 0
+    unchanged = 0
 
     async with aiohttp.ClientSession() as session:
         # Fetch and publish live SOFR / Risk-Free Rate
         sofr_data = await fetch_live_sofr_rate(session)
+        # SOFR is set once a day. Publishing it on every 30-second poll made a
+        # daily fixing look like a stream of ~2,880 observations, which is the
+        # same defect as the frozen macro quotes and lands in the same
+        # consumers. The effective_date is what changes when the rate is new.
+        sofr_fingerprint = (sofr_data.get("effective_date"), sofr_data.get("rate_pct"))
+        sofr_is_new = _last_published.get("__SOFR__") != sofr_fingerprint
         sofr_event = {
             "source": "nyfed_sofr",
             "raw_payload": {
@@ -302,8 +344,10 @@ async def fetch_and_publish(producer: SentinelProducer):
             "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"sofr_{int(time.time())}")),
             "occurred_at": now,
         }
-        await producer.send(Topics.RAW_TRADFI, sofr_event, key="SOFR")
-        logger.info(f"🏛️ Live Risk-Free Rate (SOFR) Published: {sofr_data['rate_pct']}% ({sofr_data['rate_decimal']}) via {sofr_data['provider']}")
+        if sofr_is_new:
+            await producer.send(Topics.RAW_TRADFI, sofr_event, key="SOFR")
+            _last_published["__SOFR__"] = sofr_fingerprint
+            logger.info(f"🏛️ Live Risk-Free Rate (SOFR) Published: {sofr_data['rate_pct']}% ({sofr_data['rate_decimal']}) via {sofr_data['provider']}")
 
         # 1. Fetch Alpaca snapshots for all ETF proxies simultaneously
         alpaca_quotes = await fetch_alpaca_quotes(tickers)
@@ -328,6 +372,15 @@ async def fetch_and_publish(producer: SentinelProducer):
 
                 if not q or q.get("close", 0.0) <= 0.0:
                     logger.warning(f"No real market quote returned for {ticker}. Skipping ticker.")
+                    continue
+
+                # A quote that has not moved since the last cycle is the same
+                # observation, not a new one. Skipping it is what keeps the
+                # overnight window honest: gaps where the market was closed,
+                # rather than rows asserting a print that never happened.
+                fingerprint = _quote_fingerprint(q)
+                if _last_published.get(ticker) == fingerprint:
+                    unchanged += 1
                     continue
 
                 current_price  = q["close"]
@@ -357,11 +410,15 @@ async def fetch_and_publish(producer: SentinelProducer):
                         "name": MACRO_TICKERS[ticker],
                         "provider": provider
                     },
-                    "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"macro_{ticker}_{int(time.time())}")),
+                    # Derived from the quote itself, not the clock. A clock-derived id is
+                    # unique by construction, which means no consumer downstream can
+                    # ever recognise a repeat.
+                    "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"macro_{ticker}_{fingerprint}")),
                     "occurred_at": now,
                 }
 
                 await producer.send(Topics.RAW_TRADFI, payload, key=ticker)
+                _last_published[ticker] = fingerprint
                 published += 1
                 logger.info(f"📊 Real Macro Tick Published | {ticker} ({MACRO_TICKERS[ticker]}): ${current_price:.2f} via {provider}")
 
@@ -369,7 +426,14 @@ async def fetch_and_publish(producer: SentinelProducer):
                 logger.error(f"Error processing macro ticker {ticker}: {e}", exc_info=True)
 
     if published > 0:
-        logger.info(f"✅ Published {published}/{len(tickers)} real macro market ticks.")
+        logger.info(
+            f"✅ Published {published}/{len(tickers)} real macro market ticks "
+            f"({unchanged} unchanged since last cycle, not republished)."
+        )
+    elif unchanged:
+        # The normal state of a closed market, and worth saying plainly rather
+        # than warning about: nothing moved, so nothing was invented.
+        logger.info(f"⏸️ Macro quotes unchanged for all {unchanged} ticker(s); nothing published.")
     else:
         logger.warning("No real macro ticks published this cycle.")
 

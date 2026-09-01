@@ -407,6 +407,17 @@ class CrossDomainHawkesCorrelator:
         now = timestamp
 
         for source in SENTINEL_DOMAINS:
+            # A ratio against a seeded guess is not a measurement.
+            #
+            # Until a domain's rate has actually been observed, the divisor is
+            # the constant seeded before this system ever ran. Prediction is
+            # seeded at 0.005 events/second and arrives in bursts, so every
+            # burst read as astronomical and pinned to the reporting cap --
+            # published as "prediction-domain intensity (100.0x baseline)",
+            # which is the cap announcing it gave up, dressed as a finding.
+            if not self._tracker.is_baseline_established(source):
+                continue
+
             source_ratio = self._tracker.get_excitation_ratio(source, now)
             if source_ratio < threshold:
                 continue
@@ -424,6 +435,22 @@ class CrossDomainHawkesCorrelator:
 
                 # Only forecast if branching ratio is non-trivial
                 if branching < 0.05:
+                    continue
+
+                # And only for a target the model can actually move.
+                #
+                # DEFAULT_EXCITATION carries terms only into tradfi and crypto,
+                # so prediction, news, maritime, aviation and cyber have an
+                # empty excitation sum: their intensity equals their baseline
+                # and their ratio is exactly 1.0 whatever arrives. Forecasting
+                # one of them produced "prediction-domain anomaly intensity is
+                # forecast Nx above baseline" -- a sentence about a quantity
+                # that cannot vary, published at tier 4.
+                #
+                # Filling the matrix in would invent coefficients nobody has
+                # estimated. Declining to forecast what the model cannot
+                # represent is the honest half of that, and is what happens here.
+                if not self._tracker.has_excitation_path(target):
                     continue
 
                 # Compute expected excess intensity multiplier

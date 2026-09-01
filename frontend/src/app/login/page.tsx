@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 
@@ -14,6 +14,43 @@ export default function LoginPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Rendered only when a provider is actually configured. An SSO button that
+  // leads to a 404 is worse than no button: the person cannot tell whether
+  // they are meant to use it.
+  const [sso, setSso] = useState<{ enabled: boolean; label: string } | null>(null);
+  const [ssoBusy, setSsoBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/sso/start')
+      .then((r) => r.json())
+      .then((d) => { if (!cancelled) setSso({ enabled: !!d?.enabled, label: d?.label || 'Single sign-on' }); })
+      .catch(() => { if (!cancelled) setSso({ enabled: false, label: '' }); });
+
+    // The callback redirects here with ?sso_error=... when the provider or the
+    // gateway declined. Surfaced in the same place as a password failure,
+    // because to the person signing in it is the same event.
+    const reason = new URLSearchParams(window.location.search).get('sso_error');
+    if (reason) setErrorMsg(reason);
+    return () => { cancelled = true; };
+  }, []);
+
+  const startSso = async () => {
+    setSsoBusy(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch('/api/auth/sso/start', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data?.authorization_url) {
+        window.location.href = data.authorization_url;
+        return;
+      }
+      setErrorMsg(data?.error || 'Single sign-on is unavailable.');
+    } catch {
+      setErrorMsg('Could not reach the sign-on provider.');
+    }
+    setSsoBusy(false);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -118,6 +155,28 @@ export default function LoginPage() {
             )}
           </button>
         </form>
+
+        {/* Single sign-on, when the deployment has a provider. Below the
+            password form rather than above it: passwords still work, and
+            demoting the path most people use to a secondary position would be
+            a regression for every deployment that never configures an IdP. */}
+        {sso?.enabled && (
+          <div className="pt-3">
+            <div className="flex items-center gap-3 pb-3">
+              <span className="h-px flex-1 bg-slate-800" />
+              <span className="text-[10px] uppercase tracking-widest text-slate-500">or</span>
+              <span className="h-px flex-1 bg-slate-800" />
+            </div>
+            <button
+              type="button"
+              onClick={startSso}
+              disabled={ssoBusy || isLoading || isSuccess}
+              className="w-full py-3 rounded-xl border border-slate-700 hover:border-cyan-500/60 text-slate-200 font-bold tracking-wide uppercase text-xs transition-all disabled:opacity-50"
+            >
+              {ssoBusy ? 'REDIRECTING...' : sso.label}
+            </button>
+          </div>
+        )}
 
         {/* Open signup: the platform is free to join, so the way in belongs on
             the sign-in page rather than behind it. */}

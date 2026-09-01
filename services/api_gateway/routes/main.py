@@ -29,6 +29,7 @@ from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
     auth,
+    oidc,
     billing,
     system,
     search,
@@ -153,6 +154,10 @@ app.add_middleware(
 
 # MODULAR ROUTING:
 app.include_router(auth.router)
+# Registered unconditionally; every route inside answers 404 unless OIDC is
+# configured. Mounting conditionally would mean the sign-in page could not ask
+# whether SSO exists without the answer itself being a 404.
+app.include_router(oidc.router)
 app.include_router(billing.router)
 app.include_router(system.router)
 app.include_router(scenarios.router)

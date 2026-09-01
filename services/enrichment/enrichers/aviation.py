@@ -20,7 +20,17 @@ from shared.utils.regions import classify_region
 from shared.utils.sanctions import check_sanctions
 from shared.kafka import Topics
 
+from services.enrichment.anomaly_scorer import lift_score
+
 logger = logging.getLogger("enrichment.aviation")
+
+# How hard a sanctions match lifts an aircraft's measured behaviour.
+#
+# A lift, not a replacement: a sanctioned aircraft flying an ordinary cruise
+# should not rank with one manoeuvring off its filed route, and the flat 0.80
+# this replaced meant they always did.
+SANCTIONED_LIFT_WEIGHT = 0.55
+
 
 
 def _as_float(v) -> Optional[float]:
@@ -212,16 +222,35 @@ class AviationEnricher:
                             is_emerg: bool, is_sanctioned: bool, lat: float, lon: float,
                             speed: float, heading: float, ts: float, alt_norm: float):
         """Helper to score a single flight concurrently."""
+        # The kinematic score is always measured, including for aircraft that
+        # already qualify on their squawk or their operator.
+        #
+        # `elif is_sanctioned: raw_score = 0.80` replaced the measurement with a
+        # category, so all 85 flight_anomaly events in a 45-minute window shared
+        # one score: a sanctioned aircraft holding a normal cruise was ranked
+        # identically to one manoeuvring off its filed route. Being sanctioned
+        # is a reason to look, not a description of what the aircraft is doing.
+        #
+        # This is the same correction already made to crypto transfers, where a
+        # watched counterparty was overwriting the size signal instead of
+        # raising it, and 39,262 transfers shared one score for the same reason.
+        res = await self.scorer.score_kinematic_event(
+            icao24, lat=lat, lon=lon, speed=speed, heading=heading,
+            timestamp=ts, extra_features=[alt_norm]
+        )
+        kinematic = float(res.get("score", 0.10) or 0.10)
+
         if is_emerg:
-            raw_score = {"7500": 1.0, "7700": 0.85, "7600": 0.70}.get(squawk, 0.60)
+            # Squawk codes are standardised and their meanings genuinely differ,
+            # so these are floors rather than assertions: 7500 is a hijack, 7700
+            # a general emergency, 7600 a radio failure. Kinematics can still
+            # lift one above its floor.
+            floor = {"7500": 1.0, "7700": 0.85, "7600": 0.70}.get(squawk, 0.60)
+            raw_score = lift_score(floor, SANCTIONED_LIFT_WEIGHT * kinematic)
         elif is_sanctioned:
-            raw_score = 0.80
+            raw_score = lift_score(kinematic, SANCTIONED_LIFT_WEIGHT)
         else:
-            res = await self.scorer.score_kinematic_event(
-                icao24, lat=lat, lon=lon, speed=speed, heading=heading,
-                timestamp=ts, extra_features=[alt_norm]
-            )
-            raw_score = res.get("score", 0.10)
+            raw_score = kinematic
 
         # Check watchlist in parallel
         watch_tasks = [self.scorer.check_watchlist(icao24, "aircraft")]
@@ -233,6 +262,9 @@ class AviationEnricher:
 
         w_boost = 0.15 if is_watched else 0.0
         f_boost = await self.scorer.track_frequency(icao24, "aviation_position")
-        final_score = raw_score + w_boost + f_boost
+        # Headroom lift, not addition. `raw + w + f` puts every boosted event on
+        # the ceiling and makes a 0.85 indistinguishable from a 0.99.
+        final_score = lift_score(raw_score, w_boost)
+        final_score = lift_score(final_score, f_boost, w_boost)
 
         return final_score, is_watched

@@ -35,6 +35,7 @@ from shared.utils.candles import candle_cache_key
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
+from shared.models.events import entity_cache_key
 from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symbol
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.heartbeat import start_heartbeat_task
@@ -67,9 +68,42 @@ CORE_EQUITY_SYMBOLS = [
     if t.strip()
 ]
 
+# The cross-asset anchors, reserved the same way the equity core is.
+#
+# Without these the discovery engine cannot find an inverse relationship, and
+# the reason is arithmetic rather than statistical. It computes signed Pearson
+# and bidirectional Granger correctly -- and over the streamed universe it had
+# produced five surviving edges, coefficients 0.657 to 0.991, every one
+# positive. That universe was ten crypto pairs plus a rotating set of mid-caps:
+# BTCUSDT, EXK, GAP, WU, CI, OKE, F, RGEN, ETSY, ELF. Everything in it is beta
+# to the same factor, so "yields up, stocks down" is not a relationship the data
+# was capable of expressing.
+#
+# MACRO_SYMBOLS has carried sixty of these since it was written, and
+# macro_intelligence_engine names TNX, CL=F, GC=F and TLT explicitly. None were
+# ever streamed: the fifty subscription slots went to the equity core plus
+# whatever the radar touched most recently, and the radar touches crypto because
+# crypto is 51.7% of the event stream. The attention loop fed itself.
+#
+# A relationship needs both legs present at the same time. These are the legs.
+CORE_MACRO_SYMBOLS = [
+    t.strip().upper()
+    for t in os.getenv(
+        "CORE_MACRO_SYMBOLS",
+        "TLT,TNX,CL=F,GC=F,VIX,DXY,ZB=F,HYG",
+    ).split(",")
+    if t.strip()
+]
+
 # Never let the core crowd out discovery entirely: at most this share of the
 # budget is reserved, so the radar always keeps room to surface something new.
+# The share now covers both cores together -- adding macro must cost the
+# discoveries nothing it did not already cost them.
 MAX_CORE_SHARE = float(os.getenv("CORE_EQUITY_MAX_SHARE", "0.5"))
+
+# How the reserved half is split between the two cores. Equities carry more of
+# the event volume; macro carries the relationships that volume cannot express.
+MACRO_CORE_SHARE = float(os.getenv("CORE_MACRO_SHARE", "0.4"))
 
 FINNHUB_SUBSCRIPTION_LIMIT = int(os.getenv("FINNHUB_SUBSCRIPTION_LIMIT", "50"))
 
@@ -103,10 +137,21 @@ def select_subscription_symbols(discovered, limit: int = None) -> list:
     if limit <= 0:
         return []
 
-    core_budget = max(0, min(len(CORE_EQUITY_SYMBOLS), int(limit * MAX_CORE_SHARE)))
+    reserved = max(0, int(limit * MAX_CORE_SHARE))
+    macro_budget = max(0, min(len(CORE_MACRO_SYMBOLS), int(reserved * MACRO_CORE_SHARE)))
+    equity_budget = max(0, min(len(CORE_EQUITY_SYMBOLS), reserved - macro_budget))
+
     selected, seen = [], set()
 
-    for symbol in CORE_EQUITY_SYMBOLS[:core_budget]:
+    # Macro first. If the budget ever shrinks, the anchors that make a
+    # cross-asset relationship expressible are the ones worth keeping: a
+    # correlation engine with only one side of a pair discovers nothing.
+    for symbol in CORE_MACRO_SYMBOLS[:macro_budget]:
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            selected.append(symbol)
+
+    for symbol in CORE_EQUITY_SYMBOLS[:equity_budget]:
         if symbol and symbol not in seen:
             seen.add(symbol)
             selected.append(symbol)
@@ -565,7 +610,19 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
 
                 raw_symbols = await redis_client.raw.zrange(REDIS_EQUITIES_KEY, 0, 49)
                 raw_symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
-                symbols = [s.upper().strip() for s in raw_symbols if is_valid_primary_equity(s)]
+                # The same universe the websocket subscribes to, chosen by the
+                # same function.
+                #
+                # This filtered on is_valid_primary_equity alone, which now
+                # rejects broad-market funds -- so SPY and QQQ, two of the
+                # CORE_EQUITY_SYMBOLS anchors the websocket ingest path admits
+                # explicitly, were dropped here. The effect was regular-session
+                # bars and no extended-hours bars at all for the two most
+                # heavily traded names on the watchlist. Routing both paths
+                # through select_subscription_symbols stops them drifting apart
+                # again.
+                discovered = [s.upper().strip() for s in raw_symbols if is_valid_primary_equity(s)]
+                symbols = select_subscription_symbols(discovered, limit=50)
                 if not symbols:
                     logger.debug(f"Extended-Hours Poller [{session_name}]: No symbols found in {REDIS_EQUITIES_KEY}. Waiting for dynamic watchlist.")
                     await asyncio.sleep(60)
@@ -695,8 +752,32 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 if not latest_trade:
                                     continue
 
-                                price = float(latest_trade.get("price") or 0.0)
-                                size = float(latest_trade.get("size") or 0.0)
+                                # Alpaca's market-data API abbreviates: a trade is
+                                # {"c","p","s","t","x"}, not {"price","size"}. Reading
+                                # the long names returned None for every contract, so
+                                # `float(None or 0.0)` made every option trade worth
+                                # zero dollars and the filter below could never pass.
+                                #
+                                # Measured against the live endpoint: 99 of 100 NVDA
+                                # contracts carry a latestTrade, and the maximum
+                                # premium across all of them computed as $0.00. The
+                                # poller has reported "Checked 50 equity tickers |
+                                # Sweeps published: 0" on every cycle since it was
+                                # written, with no error, because a parse that yields
+                                # zero is indistinguishable from a quiet market.
+                                #
+                                # Downstream this is why options_flow has never been
+                                # produced, and why rule_options_darkpool_surge and
+                                # rule_insider_options_convergence have never fired --
+                                # both trigger on event types nothing emits, while
+                                # _enrich_options_flow sits fully implemented and has
+                                # never received a single event.
+                                price = float(
+                                    latest_trade.get("p", latest_trade.get("price")) or 0.0
+                                )
+                                size = float(
+                                    latest_trade.get("s", latest_trade.get("size")) or 0.0
+                                )
                                 premium = price * size * 100.0
 
                                 if premium >= 50000.0 or size >= 100.0:
@@ -888,7 +969,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                     }
                     try:
                         await redis_client.raw.set(
-                            f"sentinel:earnings:{symbol}",
+                            entity_cache_key("sentinel:earnings", symbol),
                             json.dumps(earnings_context),
                             ex=604800,
                         )

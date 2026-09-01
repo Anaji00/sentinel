@@ -230,6 +230,21 @@ async def verify_api_key(request: Request = None):
         "/api/v1/auth/resend-verification",
         "/api/v1/auth/forgot-password",
         "/api/v1/auth/reset-password",
+        # Single sign-on, all three steps. Every one of them happens before the
+        # caller has any credential of ours -- that is the entire point of the
+        # flow -- so gating them behind the API key made SSO unusable in a way
+        # that looked like it simply did not exist: /status answered 403, the
+        # BFF read any non-200 as "no provider configured", and the button never
+        # rendered even with an issuer set.
+        #
+        # None of the three leaks anything. /status reports only whether SSO is
+        # enabled and its button label; the issuer, client id and secret stay
+        # server-side. /start and /callback are throttled per source and are
+        # already bound by state, nonce and PKCE, which is a stronger check
+        # than a shared key that every browser session would have to carry.
+        "/api/v1/auth/oidc/status",
+        "/api/v1/auth/oidc/start",
+        "/api/v1/auth/oidc/callback",
         "/api/v1/billing/waitlist",
     )
     if path.rstrip("/") in _PUBLIC_AUTH_PATHS:

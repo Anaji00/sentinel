@@ -386,8 +386,22 @@ async def signup(
         "message": (
             "Check your email to confirm your address. Your free account is ready to use."
             if mail_works else
-            "Your free account is ready -- sign in now. Email confirmation is not "
-            "available on this deployment yet, so there is nothing to confirm."
+            # True for both cases, because this response deliberately cannot
+            # distinguish them without becoming a membership oracle.
+            #
+            # It read "Your free account is ready -- sign in now", which is
+            # false for an address that already has an account: signup is a
+            # no-op on that branch by design, so the password just chosen was
+            # never stored. The mail that would have explained that is the
+            # branch's whole compensating control, and it cannot be sent on a
+            # deployment with no SMTP -- so the user is told the account is
+            # ready, tries the password they just typed, gets a 401, and has no
+            # way to discover why. Both accounts on this deployment reached
+            # exactly that state.
+            "If this address is new, your free account is ready -- sign in now. "
+            "If it already had an account, its existing password still applies: "
+            "use the password reset link on the sign-in page. Email is not "
+            "configured on this deployment, so nothing has been sent to you."
         ),
     }
 

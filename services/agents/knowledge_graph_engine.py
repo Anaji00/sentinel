@@ -20,9 +20,10 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError
 from shared.kafka import Topics
 from shared.models.ontology import VALID_PREDICATES, is_valid_predicate
+from shared.models.events import graph_node_id
 
 
 class IntelEntity(BaseModel):
@@ -155,6 +156,17 @@ class EntityClassification(BaseModel):
     reasoning: str
 
 
+class EntityClassificationBatch(BaseModel):
+    """Several classifications from one inference.
+
+    Entity classification is the cheapest question this swarm asks -- a label, a
+    domain, a confidence -- and it was costing a whole 600-second budget slot
+    per entity, on the agent with the highest message rate in the tier. Twelve
+    entities in one prompt is twelve classifications for that same slot.
+    """
+    classifications: List[EntityClassification]
+
+
 # Actions the GraphSupervisor consumes off the shared ontology topic. Listed
 # here so this engine can tell a command apart from an observation; keep in step
 # with the branches in services/agents/supervisor.py.
@@ -172,6 +184,72 @@ class KnowledgeGraphEngine(SentinelAgent):
     Combines news intelligence synthesis, entity classification, relationship triple extraction,
     and single-transaction Neo4j MERGE updates in a single pass.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._classification_batcher = InferenceBatcher(
+            name="entity_classification",
+            flush_fn=self._classify_batch,
+            max_items=int(os.getenv("ONTOLOGY_BATCH_SIZE", "12")),
+            max_wait_sec=float(os.getenv("ONTOLOGY_BATCH_WAIT_SEC", "20")),
+            logger=logger,
+            max_waiters=self.dispatch_concurrency,
+        )
+
+    async def _classify_batch(self, items: List[tuple]) -> Dict[str, "EntityClassification"]:
+        """Classifies every queued entity in one inference.
+
+        Returns {entity_name: classification}. An entity the model does not
+        answer for is absent, and the batcher resolves it to None -- so it stays
+        unclassified rather than acquiring a label nothing chose for it. An
+        unclassified entity is simply retried later; a wrongly labelled one
+        propagates into the graph and is much harder to notice.
+        """
+        if not items:
+            return {}
+
+        listed = []
+        for _, ctx in items:
+            line = f"- {ctx['entity_name']}"
+            if ctx.get("context"):
+                line += f" (seen in: {str(ctx['context'])[:120]})"
+            listed.append(line)
+        names = [ctx["entity_name"] for _, ctx in items]
+
+        prompt = (
+            f"Classify each of these {len(items)} unknown entities for an intelligence "
+            f"ontology.\n\nENTITIES\n" + f"\n".join(listed) + f"\n\n"
+            "primary_domain must be one of: maritime, aviation, financial, cyber, geopolitical.\n"
+            "suggested_label must be one of: Company, Vessel, Aircraft, Organization, "
+            "Location, Person, Instrument, Infrastructure.\n"
+            "Classify each entity independently -- appearing in the same batch implies "
+            "no relationship between them.\n"
+            "If an entity cannot be classified from its name and context, omit it "
+            "entirely rather than guessing.\n\n"
+            "Return ONE classification per entity you can classify, and no others."
+        )
+
+        batch = await self._execute_with_telemetry(
+            message=items[0][1].get("message", {}),
+            system_prompt=(
+                "You are SENTINEL Ontology Master. Classify unknown entities into "
+                "ontology types and macro concepts. Return ONLY raw JSON."
+            ),
+            user_prompt=prompt,
+            schema=EntityClassificationBatch,
+            temperature=0.1,
+            num_predict=min(1024, 128 + 64 * len(items)),
+        )
+
+        wanted = {n.lower(): n for n in names}
+        out: Dict[str, EntityClassification] = {}
+        for c in (getattr(batch, "classifications", None) or []):
+            key = str(getattr(c, "entity_name", "")).strip().lower()
+            # Only entities actually asked about. A classification for a name
+            # the model invented must never reach the ontology.
+            if key in wanted and wanted[key] not in out:
+                out[wanted[key]] = c
+        return out
 
     @property
     def output_topic(self) -> str:
@@ -341,6 +419,17 @@ class KnowledgeGraphEngine(SentinelAgent):
             asyncio.create_task(self.publish_bulletin(
                 bulletin_type="alert" if brief.severity >= 4 else "thesis",
                 summary=f"Intel ({brief.geopolitical_theater}): {(brief.headline_summary or brief.headline or brief.summary)[:80]}",
+                # Attributed to the entity it is about.
+                #
+                # This published with primary_entity_id and ticker both null,
+                # so the bulletin named no subject -- and the consensus engine
+                # fuses bulletins *by entity*. An unattributed bulletin cannot
+                # be corroborated by, or contradicted by, anything: it reaches
+                # the swarm and then sits outside every comparison the swarm
+                # exists to make. Observed live on the first bulletin this
+                # system ever produced end to end.
+                primary_entity_id=message.get("primary_entity_id"),
+                primary_entity_name=message.get("primary_entity_name"),
                 conviction=min(1.0, brief.severity / 5.0),
                 expected_direction="neutral",
                 payload={"severity": brief.severity, "hotspots": brief.geographic_hotspots, "theater": brief.geopolitical_theater},
@@ -360,21 +449,32 @@ class KnowledgeGraphEngine(SentinelAgent):
         if cached:
             return json.loads(cached if isinstance(cached, str) else cached.decode("utf-8"))
 
-        user_prompt = f"Classify unknown entity '{entity_name}' for ontology graph. Context: {message.get('context', '')}"
-
         try:
-            classification: EntityClassification = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Ontology Master. Classify unknown entity into ontology types and macro concepts. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=EntityClassification,
-                temperature=0.1,
+            # Queued rather than dispatched: one budget slot classifies a dozen
+            # entities instead of one. Awaiting a single entity reads the same
+            # as the direct call it replaced.
+            classification = await self._classification_batcher.submit(
+                entity_name,
+                {"entity_name": entity_name, "context": message.get("context", ""), "message": message},
             )
+
+            # None means the batch reached no verdict for this entity -- shed,
+            # timed out, or omitted by a model told to omit rather than guess.
+            # It stays unclassified and is retried when next seen. An
+            # unclassified entity costs a later inference; a wrongly labelled
+            # one propagates into the graph and is far harder to notice.
+            if classification is None:
+                return None
 
             # Route through governed ONTOLOGY_PROPOSALS channel (§3.3)
             if self._producer:
+                # Not .upper(). Most of what this classifies carries the
+                # generic `Entity` label, which canonicalises to UNKNOWN --
+                # preserved exactly as given. So upper-casing here is not undone
+                # downstream: it put 139,047 `0X...` nodes in the graph beside
+                # 6,366 `0x...` ones, the same addresses split in two.
                 proposal = {
-                    "entity_id": entity_name.upper(),
+                    "entity_id": graph_node_id(entity_name, classification.suggested_label),
                     "action": "MERGE_ONTOLOGY_NODE",
                     "data": {
                         "label": classification.suggested_label,
@@ -383,7 +483,7 @@ class KnowledgeGraphEngine(SentinelAgent):
                         "confidence": classification.confidence,
                     }
                 }
-                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=entity_name.upper())
+                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=proposal["entity_id"])
 
             data = classification.model_dump()
             await self.redis.raw.set(cache_key, json.dumps(data), ex=604800)
@@ -409,11 +509,13 @@ class KnowledgeGraphEngine(SentinelAgent):
                 if len(t.subject) > 80 or len(t.object) > 80:
                     continue
 
+                subject_label = getattr(t, 'subject_type', 'Entity')
+                object_label = getattr(t, 'object_type', 'Entity')
                 proposal = {
-                    "entity_id": t.subject.upper(),
+                    "entity_id": graph_node_id(t.subject, subject_label),
                     "action": "LINK_ENTITY",
                     "data": {
-                        "target_id": t.object.upper(),
+                        "target_id": graph_node_id(t.object, object_label),
                         "source_label": getattr(t, 'subject_type', 'Entity'),
                         "target_label": getattr(t, 'object_type', 'Entity'),
                         "relation_type": t.predicate,
@@ -421,14 +523,20 @@ class KnowledgeGraphEngine(SentinelAgent):
                         "confidence": t.confidence,
                     }
                 }
-                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=t.subject.upper())
+                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=proposal["entity_id"])
         except Exception as e:
             logger.error(f"Failed to emit graph triples to ONTOLOGY_PROPOSALS: {e}")
 
-    async def get_entity_centrality(self, entity_id: str) -> float:
+    async def get_entity_centrality(self, entity_id: str, label: str = "Entity") -> float:
         """
         Fetches degree centrality for an entity in Neo4j graph.
         Weights anomaly correlation-cluster severity by node centrality.
+
+        Note for whoever wires this up: it currently has no callers. The
+        severity weighting it describes does not happen anywhere. The lookup is
+        spelled correctly as of now, which it was not -- it read `.upper()`
+        while the writers were being corrected to canonical spelling, so it
+        would have missed every wallet it was asked about.
         """
         try:
             from shared.db import get_neo4j
@@ -439,7 +547,7 @@ class KnowledgeGraphEngine(SentinelAgent):
             OPTIONAL MATCH (e)-[r]-(neighbor)
             RETURN count(r) as degree
             """
-            res = await neo4j_client.query(query, {"id": entity_id.upper()})
+            res = await neo4j_client.query(query, {"id": graph_node_id(entity_id, label)})
             if res and res[0].get("degree"):
                 degree = float(res[0]["degree"])
                 return 1.0 + math.log(1.0 + degree)

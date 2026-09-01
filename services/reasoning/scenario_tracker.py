@@ -35,6 +35,42 @@ from .calibration_harness import DynamicBayesianCalibrator
 CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
 
+def _signal_parts(signal) -> tuple:
+    """(entity, text) from either shape a signal can arrive in.
+
+    Structured signals are what the generator emits now: an entity, an
+    observable, and optionally a comparator and threshold. Everything already
+    stored is a bare sentence, and those keep working -- with no entity, which
+    is exactly why they resolve so rarely.
+    """
+    # The observable is returned empty rather than falling back to the entity.
+    # Substituting it made the entity its own keyword, so the query demanded
+    # `headline ILIKE '%ethusdt%' AND primary_entity_id = 'ETHUSDT'` -- the same
+    # fact twice, rejecting events correctly attributed to the entity whose
+    # headline happens not to spell it.
+    if isinstance(signal, dict):
+        return (str(signal.get("entity") or "").strip(),
+                str(signal.get("observable") or "").strip())
+    entity = getattr(signal, "entity", None)
+    if entity is not None:
+        return (str(entity).strip(),
+                str(getattr(signal, "observable", "") or "").strip())
+    return "", str(signal or "")
+
+
+def _checkable(signals) -> list:
+    """The subset of signals that name something to look for.
+
+    Returns everything when nothing is structured, so a scenario written before
+    ResolutionSignal existed still gets its keyword pass rather than silently
+    becoming unresolvable. It is only when a hypothesis has *some* named signals
+    that the unnamed ones are dropped -- there, the named ones are strictly
+    better evidence and the sentences only add noise.
+    """
+    named = [s for s in signals if _signal_parts(s)[0]]
+    return named or list(signals)
+
+
 class ScenarioTracker:
     def __init__(self, db, producer=None, redis=None):
         self._db = db
@@ -68,11 +104,27 @@ class ScenarioTracker:
             w_sigs = h.get("watch_signals") or []
             d_sigs = h.get("deny_signals") or []
 
-            w_hits = await self._match_signals(w_sigs) if w_sigs else []
+            # Only signals that can actually be looked up count as evidence.
+            #
+            # A signal with no entity is a sentence, and a sentence that fails
+            # to match is not evidence of absence -- it is evidence that nobody
+            # said what to look for. Feeding those into the recalibrator as
+            # misses is the same conflation that caused the original defect
+            # here: a query that could not run and a signal that genuinely did
+            # not fire produced identical silence.
+            #
+            # Several hundred scenarios were generated before ResolutionSignal
+            # existed and their signals have no entity. They stay unresolved,
+            # which is honest, rather than accumulating false negatives against
+            # hypotheses nobody can check.
+            w_checkable = _checkable(w_sigs)
+            d_checkable = _checkable(d_sigs)
+
+            w_hits = await self._match_signals(w_checkable) if w_checkable else []
             if w_hits:
                 watch_hits_by_index[idx] = w_hits
 
-            d_hits = await self._match_signals(d_sigs) if d_sigs else []
+            d_hits = await self._match_signals(d_checkable) if d_checkable else []
             if d_hits:
                 deny_hits_by_index[idx] = d_hits
 
@@ -160,22 +212,75 @@ class ScenarioTracker:
         # Querying text inside a database loop is an "N+1 query" anti-pattern and can 
         # exhaust database resources. We slice `signals[:10]` to strictly limit the 
         # maximum number of database queries executed per scenario.
+        # ALL, not ANY -- and the difference is the whole meaning of the result.
+        #
+        # Once the cast above was fixed and matching actually ran, the tracker
+        # confirmed 185 scenarios and denied none. Measured over 303 distinct
+        # watch signals against 48 hours of events:
+        #
+        #     any keyword matches   271 / 303   (89%)
+        #     all keywords match      7 / 303   (2.3%)
+        #
+        # A rule that fires on 89% of signals is not evidence, it is a rubber
+        # stamp: the same wording appears in a scenario's watch signals and its
+        # deny signals, both hit, and the Bayesian recalibrator nets out
+        # positive on noise. Dropping corpus-common words first barely moves it
+        # (87%), because the frequency is in the corpus rather than the
+        # vocabulary -- "wallet" and "watched" each appear in 59,063 headlines
+        # of position telemetry.
+        #
+        # Worth stating plainly, because this fix is necessary and not
+        # sufficient: at 2.3% the signals are still not really checkable. They
+        # are model-generated prose -- "Significant price movements on
+        # cryptocurrency exchanges" -- which matches everything under ANY and
+        # nothing under ALL. The generator needs to emit signals with a named
+        # entity and a threshold before resolution means much. Until it does,
+        # under-resolving is the honest failure and over-confirming is not:
+        # these outcomes feed the confidence calibration and the pattern
+        # library, so a false confirmation is worse than no confirmation.
         for signal in signals[:10]:  # Check up to 10 signals to limit DB load
-            keywords = [w.lower() for w in signal.split() if len(w) > 4][:3]  # keywords extracted by splitting signal text
-            if not keywords:
-                continue    
+            entity, text = _signal_parts(signal)
+            keywords = [w.lower() for w in text.split() if len(w) > 4][:3]
+
+            # A named entity is checkable on its own. The keyword guard below
+            # predates the entity path, and skipping here threw away signals
+            # like {"entity": "NVDA", "observable": "price up"} -- every word
+            # four characters or shorter, so no keywords, so never looked up at
+            # all despite naming an indexed entity.
+            if not keywords and not entity:
+                continue
+
+            # A named entity turns a keyword search into a lookup. Signals
+            # generated from now on carry one because ResolutionSignal requires
+            # it; the ones already in the table are plain strings and do not,
+            # so both shapes have to work -- there are hundreds of stored
+            # scenarios and rewriting their hypotheses would be inventing
+            # entities they never named.
+            if entity:
+                rows = await self._match_on_entity(entity, keywords, cutoff)
+                if rows:
+                    matched.append(text)
+                continue
 
             try:
-                # ARCHITECTURAL FIX: Native Postgres Array overlap operator (&&)
-                # Replaced expensive unnest() scans with optimized index-friendly arrays.
-                # Passed the keywords as a native tuple to leverage psycopg2 array adaptation.
+                # `events.tags` and `events.named_entities` are text[], and this
+                # cast said varchar[]. Postgres has no `text[] && varchar[]`
+                # operator, so the statement raised every time it ran -- caught
+                # below and logged at debug, which is why nothing showed at INFO.
+                #
+                # _match_signals therefore returned [] for every signal of every
+                # scenario since the tracker was written. Nothing could ever
+                # confirm or deny, and all 231 scenarios sat at `hypothesis`
+                # while the loop reported "Checking 100 active scenarios" every
+                # thirty minutes. The confidence numbers this system produces
+                # have never once been scored against an outcome.
                 rows = await self._db.query("""
                     SELECT 1 FROM events
                     WHERE occurred_at > $1
                       AND (
-                        headline ILIKE ANY($2)
-                        OR tags && $3::varchar[]
-                        OR named_entities && $4::varchar[]
+                        headline ILIKE ALL($2)
+                        OR tags @> $3::text[]
+                        OR named_entities @> $4::text[]
                       )
                     LIMIT 1
                 """, 
@@ -188,10 +293,40 @@ class ScenarioTracker:
                 if rows: 
                     matched.append(signal) 
             except Exception as e:
-                logger.debug(f"Signal match error: {e}")
+                # Not debug. A query that cannot execute is not a signal that
+                # did not match, and the two were indistinguishable here for the
+                # lifetime of the service.
+                logger.warning("Signal match query failed for %r: %s", signal[:60], e)
  
         return matched
     
+    async def _match_on_entity(self, entity: str, keywords: list, cutoff) -> list:
+        """Events about a named entity, narrowed by the observable's words.
+
+        Keyed on primary_entity_id rather than scanning headlines, so this is an
+        index lookup instead of a text match across the whole window. The
+        keywords still have to all appear, for the reason given above -- naming
+        the entity removes the ambiguity about *what* the signal is about, not
+        about whether the thing described actually happened.
+        """
+        try:
+            return await self._db.query("""
+                SELECT 1 FROM events
+                WHERE occurred_at > $1
+                  AND (upper(primary_entity_id) = upper($2)
+                       OR upper(primary_entity_name) = upper($2))
+                  AND (
+                    $5::boolean
+                    OR headline ILIKE ALL($3)
+                    OR tags @> $4::text[]
+                    OR named_entities @> $4::text[]
+                  )
+                LIMIT 1
+            """, cutoff, entity, [f"%{k}%" for k in keywords] or [""], keywords, not keywords)
+        except Exception as e:
+            logger.warning("Entity signal match failed for %r: %s", entity[:40], e)
+            return []
+
     async def _fetch_active_scenarios(self) -> List[Dict]:
         try:
             return await self._db.query("""

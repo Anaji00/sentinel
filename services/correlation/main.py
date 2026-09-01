@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 import inspect
 import time
@@ -36,8 +37,27 @@ from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
 from services.correlation.hawkes_correlator import CrossDomainHawkesCorrelator
 from services.correlation.statistical_discovery import StatisticalDiscoveryEngine
+from services.correlation import peer_graph
+from services.enrichment.ref_data import get_reference_data
 from shared.utils.streaming_detectors import FirstStoryDetector
+from services.correlation.soft_correlator import POSITION_TELEMETRY_TYPES
+from shared.utils.freshness import is_stale as _shared_is_stale
 from shared.utils.tasks import safe_create_task
+
+# How many tickers the peer pass considers, and how deep a window it asks for.
+# Pairwise correlation is O(n^2), and only twenty tickers currently carry
+# twenty bars, so the cap is headroom rather than a constraint today.
+# What a textual resemblance has to reach before it is filed as intelligence.
+#
+# effective_score is distinct_subjects x centrality, so this asks for either
+# many more subjects than the three that used to suffice, or a genuinely
+# central entity. CRITICAL is deliberately unreachable from this rule: a
+# sentence encoder reporting that two headlines are worded alike cannot
+# establish the relationship that tier is supposed to mean.
+SEMANTIC_INTELLIGENCE_SCORE = float(os.getenv("SEMANTIC_INTELLIGENCE_SCORE", "6.0"))
+
+PEER_MAX_TICKERS = int(os.getenv("PEER_MAX_TICKERS", "60"))
+PEER_SERIES_BARS = int(os.getenv("PEER_SERIES_BARS", "120"))
 from shared.utils.heartbeat import start_heartbeat_task
 
 _dynamic_rules_cache = {}
@@ -183,6 +203,25 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         region=corr.get("region")
                     )
                     if hits:
+                        # Routine position telemetry is not corroboration.
+                        #
+                        # A vessel or aircraft reporting where it is makes no
+                        # claim, so nothing about it can support or contradict a
+                        # BGP hijack. Accepting it meant a rule fired at CRITICAL
+                        # named "Cyber Aviation Chokepoint Disruption" whose only
+                        # evidence was fifty vessel position fixes over 48 hours
+                        # -- no aviation event, no cyber correlation, and a name
+                        # asserting both. Vessels are always somewhere; that is
+                        # not a finding.
+                        #
+                        # Dark, spoofed and anomalous position events are still
+                        # accepted: those are findings about a vessel or
+                        # aircraft, and a finding is what a rule should correlate.
+                        hits = [
+                            h for h in hits
+                            if str(h.get("type", "")) not in POSITION_TELEMETRY_TYPES
+                        ]
+                    if hits:
                         supporting_events.extend(hits)
                         domains_triggered.update([h.get("type", "").split("_")[0] for h in hits])
                         
@@ -210,7 +249,16 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         alert_tier=alert_tier,
                         primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "general",
                         confidence_score=min(1.0, event.anomaly_score + 0.1),
-                        summary_headline=f"🚨 {rule.get('rule_name', rule.get('rule_id'))}: {entity_name}",
+                        # Names the domains actually matched. The rule name is a
+                        # detector's name and may assert a combination the match
+                        # never required -- "Cyber Aviation Chokepoint
+                        # Disruption" fires on any one of four correlation
+                        # types, so the title claimed aviation on evidence that
+                        # contained none.
+                        summary_headline=(
+                            f"🚨 {rule.get('rule_name', rule.get('rule_id'))}: {entity_name} "
+                            f"[matched: {', '.join(sorted(domains_triggered)) or 'none'}]"
+                        ),
                         supporting_headlines=supporting_headlines,
                         metrics_summary={
                             "supporting_event_count": len(supporting_events),
@@ -222,7 +270,13 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         supporting_event_ids=[e["event_id"] for e in supporting_events[:10]],
                         primary_entity_id=entity_id,
                         primary_entity_name=entity_name,
-                        entity_ids=[entity_id] + [e.get("entity_id", "") for e in supporting_events[:5] if e.get("entity_id")],
+                        # Deduplicated, as entity_names already was. The trigger
+                        # entity appeared again in its own supporting events, so
+                        # a cluster listed the same wallet twice and looked like
+                        # two subjects.
+                        entity_ids=list(dict.fromkeys(
+                            [entity_id] + [e.get("entity_id", "") for e in supporting_events[:5] if e.get("entity_id")]
+                        )),
                         entity_names=list(dict.fromkeys([entity_name] + supporting_entity_names)),
                         description=(
                             f"Rule '{rule.get('rule_name', rule.get('rule_id'))}' triggered by '{entity_name}'. "
@@ -240,6 +294,25 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
     except Exception as e:
         logger.error(f"Failed to evaluate dynamic rules: {e}")
     return clusters
+
+# How late an observation may be and still be worth correlating.
+#
+# Correlation answers "what else is happening right now". Past this age the
+# answer is a historical note, not an alert, and emitting it as an alert is
+# what made this engine report yesterday's market as though it were live.
+MAX_EVENT_AGE_SEC = int(os.getenv("CORRELATION_MAX_EVENT_AGE_SEC", "900"))
+
+
+def _is_stale(event, now=None) -> bool:
+    """Thin wrapper over the shared rule, kept for this module's call sites.
+
+    The rule lives in shared.utils.freshness because correlation is not the only
+    stage that must refuse history: the reasoning service and every agent resume
+    from a committed offset after any interruption and would otherwise work
+    forward through a backlog. One definition, so the three cannot drift.
+    """
+    return _shared_is_stale(event, MAX_EVENT_AGE_SEC, now)
+
 
 def _corroboration_weight(event) -> float:
     """Multiplier for a correlation's confidence, from its claim's support.
@@ -292,11 +365,27 @@ async def main():
         topics=[Topics.ENRICHED_EVENTS],
         group_id="correlation-engine",
         auto_offset_reset="latest",
+        # SentinelConsumer defaults to 15 records a poll. This loop spends about
+        # a second per cycle -- the getmany timeout plus processing -- so 15 a
+        # poll is a hard ceiling of roughly 15 events/second, and measured it
+        # was consuming 12.75/s against 12/s of production. Net drain of 0.75/s
+        # against a 357,000-message backlog is five and a half days, which is
+        # not a backlog, it is a permanent state.
+        #
+        # The cap was never a safety measure here: the pause/heartbeat dance
+        # below already keeps the group membership alive across a long batch,
+        # which is the thing a small poll size normally protects. Larger batches
+        # also make the encoder cheaper, since embed_events() is roughly twice
+        # as fast per event batched as called one at a time.
+        max_poll_records=int(os.getenv("CORRELATION_MAX_POLL_RECORDS", "200")),
     )
 
     processed = 0
     corr_fired = 0
     errors = 0
+    stale_skipped = 0
+    stale_dropped = 0
+    last_logged_stale = 0
     total_received = 0
     last_logged_received = 0
 
@@ -363,8 +452,27 @@ async def main():
             logger.debug(f"Failed to stream correlation live: {pub_err}")
 
     async def _process_correlation_event(event: NormalizedEvent, precomputed_embedding=None):
-        nonlocal corr_fired, processed
+        nonlocal corr_fired, processed, stale_skipped
         try:
+            # 0. Refuse to correlate history.
+            #
+            # Everything below asks "what is happening at the same time as
+            # this", and the answer is only worth anything while it is still
+            # true. Running it over a backlog produces alerts about a market
+            # that has since closed and a vessel that has since arrived --
+            # measured here, the engine was 357,000 messages and 32 hours behind
+            # and every cascade it fired described state from the previous day.
+            #
+            # Skipped, not seeked: the event is still consumed, still committed
+            # and still counted, so nothing is silently dropped from the offset
+            # record. It simply does not produce a correlation, which is the
+            # honest outcome for an observation that arrived too late to
+            # correlate. This is also what lets a backlog drain at parse speed
+            # instead of encoder speed.
+            if _is_stale(event):
+                stale_skipped += 1
+                return
+
             # 1. Evaluate Geopolitical Cascade Engine
             cascade_cluster = cascade_engine.ingest_event(event)
             if cascade_cluster:
@@ -515,8 +623,24 @@ async def main():
                 if similar_events:
                     logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
                     
-                    supporting_ids = [e.get("event_id") for e in similar_events[:3] if e.get("event_id")]
-                    supp_headlines = [e.get("headline") or e.get("summary") or f"{e.get('type')}: {e.get('entity_name', 'Unknown')}" for e in similar_events[:3]]
+                    # The evidence actually kept. Everything downstream counts
+                    # this list rather than `similar_events`, which is up to ten
+                    # long: the description read "matched 10 highly similar
+                    # cross-domain events" while three were stored and three
+                    # were scored, so the alert overstated its own evidence
+                    # threefold to anyone who went looking for the other seven.
+                    kept = similar_events[:3]
+                    supporting_ids = [e.get("event_id") for e in kept if e.get("event_id")]
+                    supp_headlines = [e.get("headline") or e.get("summary") or f"{e.get('type')}: {e.get('entity_name', 'Unknown')}" for e in kept]
+
+                    # Distinct subjects, not raw matches. Three headlines about
+                    # one vessel are one observation seen three times, and
+                    # counting them as three is how a single flight alert came
+                    # to corroborate dozens of separate correlations.
+                    distinct_subjects = len({
+                        str(e.get("entity_name") or e.get("entity_id") or idx)
+                        for idx, e in enumerate(kept)
+                    })
                     
                     e_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
                     e_name = (event.primary_entity.name or e_id) if event.primary_entity else "UNKNOWN"
@@ -534,8 +658,27 @@ async def main():
                         except Exception as cx:
                             logger.debug(f"Centrality lookup fallback for {e_id}: {cx}")
 
-                    effective_score = len(supporting_ids) * centrality_mult
-                    tier = AlertTier.CRITICAL if effective_score >= 4.0 else (AlertTier.INTELLIGENCE if effective_score >= 2.0 else AlertTier.ALERT)
+                    effective_score = distinct_subjects * centrality_mult
+
+                    # A resemblance is a lead, never a verdict, and the tier has
+                    # to agree with the description a few lines below -- which
+                    # already says in as many words that shared wording is not
+                    # itself a relationship.
+                    #
+                    # Three distinct subjects and a centrality of 1.33 cleared
+                    # 4.0 and became CRITICAL, so "QQQ appeared in three events"
+                    # was filed at the top severity the system has. Measured
+                    # live over three hours: 2,711 clusters at the two highest
+                    # tiers, every one citing a single entity, against 2,464
+                    # from the equity/options rule that cites ten supporting
+                    # events and six entities. Each one is a candidate for an
+                    # inference slot on a host that affords a few dozen an hour,
+                    # so an over-graded rule does not merely mislabel -- it
+                    # crowds out the correlations that earned their tier.
+                    tier = (
+                        AlertTier.INTELLIGENCE if effective_score >= SEMANTIC_INTELLIGENCE_SCORE
+                        else AlertTier.ALERT
+                    )
 
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
@@ -549,14 +692,29 @@ async def main():
                         # several independent outlets is a finding, and reporting
                         # both at one confidence tells an analyst nothing about
                         # which is which.
+                        # 0.35 + 0.15 per distinct subject, capped below 1.0.
+                        #
+                        # This read 0.70 + 0.1 * len(supporting_ids), and
+                        # supporting_ids is capped at three -- so every semantic
+                        # correlation that fired at all scored exactly 1.00 and
+                        # the field ranked nothing. The floor of 0.70 was doing
+                        # the same work as the ceiling: a match on one templated
+                        # headline was already "highly confident" before any
+                        # evidence was counted.
+                        #
+                        # The cap stays under 1.0 deliberately. This is an
+                        # embedding's opinion that two sentences resemble each
+                        # other; it should never present as certainty.
                         confidence_score=min(
-                            1.0,
-                            (0.70 + (0.1 * len(supporting_ids))) * _corroboration_weight(event),
+                            0.95,
+                            (0.35 + (0.15 * distinct_subjects)) * _corroboration_weight(event),
                         ),
-                        summary_headline=f"🧠 Semantic Convergence: {e_name} across {len(similar_events)} cross-domain events",
+                        summary_headline=f"🧠 Semantic Convergence: {e_name} across {distinct_subjects} cross-domain subject(s)",
                         supporting_headlines=supp_headlines,
                         metrics_summary={
-                            "similar_event_count": len(similar_events),
+                            "supporting_event_count": len(supporting_ids),
+                            "distinct_subjects": distinct_subjects,
+                            "candidates_considered": len(similar_events),
                             "centrality_multiplier": round(centrality_mult, 2),
                             "effective_score": round(effective_score, 2),
                         },
@@ -566,7 +724,29 @@ async def main():
                         primary_entity_name=e_name,
                         entity_ids=[e_id],
                         entity_names=[e_name],
-                        description=f"Neural embedding matched {len(similar_events)} highly similar cross-domain events for entity '{e_name}' (Centrality Multiplier: {centrality_mult:.2f}x). Anomalous semantic convergence detected.",
+                        # The description is the field a person actually reads
+                        # back out of the correlations table, so it states what
+                        # was kept and what was merely considered. It claimed
+                        # "matched 10 highly similar cross-domain events" while
+                        # three were stored and three were scored -- an alert
+                        # overstating its own evidence to the one reader in a
+                        # position to check it.
+                        #
+                        # "Resembles" and not "converges": this is a sentence
+                        # encoder reporting that two headlines are worded alike.
+                        # A vessel and an aircraft that both name the Strait of
+                        # Malacca score highly here and have nothing to do with
+                        # each other, so the wording says what was measured
+                        # rather than what it might mean.
+                        description=(
+                            f"Embedding resemblance: '{e_name}' matches "
+                            f"{len(supporting_ids)} retained event(s) across "
+                            f"{distinct_subjects} distinct subject(s), from "
+                            f"{len(similar_events)} candidate(s) considered "
+                            f"(centrality {centrality_mult:.2f}x). Textual similarity "
+                            f"only -- shared wording or a shared place name is not "
+                            f"itself a relationship."
+                        ),
                         tags=["semantic_match", "cross_domain", "ai_cluster", f"entity:{e_name}", f"trigger_anomaly_{event.anomaly_score:.2f}", f"centrality_{centrality_mult:.2f}"]
                     )
                     
@@ -625,6 +805,71 @@ async def main():
                 logger.error(f"Statistical discovery loop error: {e}")
             await asyncio.sleep(300)
 
+    # Background task: Peer derivation, so contagion has an edge to travel along
+    async def _peer_graph_loop():
+        """Derives PEER_OF from realised co-movement and publishes the proposals.
+
+        Runs on the same series the discovery engine already fetches, and
+        deliberately after it: the discovery engine answers "is there any
+        relationship here", this answers the narrower "would a shock to one
+        plausibly reach the other", which is the question an earnings surprise
+        actually poses.
+
+        Hourly. Peers are a property of how two issuers behave over weeks, not
+        minutes, and re-deriving them every five would mostly re-publish the
+        same edges while spending the collector's rate limit.
+        """
+        await asyncio.sleep(120)
+        while True:
+            try:
+                tickers = await discovery_engine.build_candidate_pairs()
+                names = sorted({t for pair in (tickers or []) for t in pair})
+
+                series = {}
+                for name in names[:PEER_MAX_TICKERS]:
+                    bars = await discovery_engine.fetch_price_series(name, limit=PEER_SERIES_BARS)
+                    if bars and len(bars) > peer_graph.MIN_OVERLAP_BARS:
+                        series[name] = bars
+
+                # Structure corroborates a measured correlation; it never
+                # creates one. Two names that co-move *and* share an index are a
+                # better contagion path than two that merely co-move, and until
+                # the daily refresh was wired every peer edge carried only the
+                # realised half of its evidence.
+                reference = {}
+                for name in series:
+                    try:
+                        ref = await get_reference_data(redis_client, name)
+                        if ref:
+                            reference[name] = ref
+                    except Exception:
+                        # Absent reference data is the designed-for case, not an
+                        # error: derive_peers works without it.
+                        pass
+
+                if len(series) < 2:
+                    logger.info(
+                        "Peer derivation skipped: %s ticker(s) carry a usable window. "
+                        "A peer needs both legs measured over the same bars.",
+                        len(series),
+                    )
+                else:
+                    edges = peer_graph.derive_peers(series, reference)
+                    for edge in edges:
+                        await producer.send(
+                            Topics.ONTOLOGY_PROPOSALS,
+                            edge.as_proposal(),
+                            key=edge.source,
+                        )
+                    if edges:
+                        logger.info(
+                            "🔗 Peer graph: %s edge(s) published (%s inverse) from %s tickers.",
+                            len(edges), sum(1 for e in edges if e.is_inverse), len(series),
+                        )
+            except Exception as e:
+                logger.error(f"Peer graph loop error: {e}")
+            await asyncio.sleep(3600)
+
     # Background task: Periodic Intra-TradFi Sector Hawkes Contagion (§4.3)
     async def _sector_hawkes_loop():
         await asyncio.sleep(60)
@@ -654,6 +899,7 @@ async def main():
     asyncio.create_task(_statistical_discovery_loop())
     asyncio.create_task(_edge_retest_loop())
     asyncio.create_task(_sector_hawkes_loop())
+    asyncio.create_task(_peer_graph_loop())
     asyncio.create_task(_threshold_calibration_loop())
 
     try:
@@ -694,6 +940,38 @@ async def main():
                             except Exception as dlq_err:
                                 logger.debug(f"DLQ send failed for parse error (event lost): {dlq_err}")
                     
+                    # Stale events are dropped here, before any work is spent
+                    # on them.
+                    #
+                    # The guard inside _process_correlation_event was too late:
+                    # store.add_event and the batch encoder both run before
+                    # dispatch, so a backlog still paid for the event store and
+                    # the sentence encoder -- the two most expensive things in
+                    # this loop -- and only then discovered the event was a day
+                    # old. Filtering at the top took the drain rate from ~12/s
+                    # to parse speed.
+                    #
+                    # It also keeps the windowed rules honest: feeding
+                    # yesterday's events into a one-hour sliding window is what
+                    # makes a backlog look like a burst.
+                    fresh_events = [e for e in all_events if not _is_stale(e)]
+                    dropped = len(all_events) - len(fresh_events)
+                    if dropped:
+                        stale_dropped += dropped
+                        if stale_dropped - last_logged_stale >= 5000:
+                            logger.warning(
+                                "Skipped %s events older than %ss while catching up; "
+                                "correlating a backlog would describe state that has "
+                                "already changed.",
+                                stale_dropped, MAX_EVENT_AGE_SEC,
+                            )
+                            last_logged_stale = stale_dropped
+
+                    all_events = fresh_events
+                    representative_events = {
+                        k: v for k, v in representative_events.items() if not _is_stale(v)
+                    }
+
                     if all_events:
                         await asyncio.gather(*[store.add_event(e) for e in all_events], return_exceptions=True)
                         

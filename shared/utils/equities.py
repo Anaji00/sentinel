@@ -120,11 +120,17 @@ RE_OCC_OPTION = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d+$", re.IGNORECASE)
 # Ticker structural noise: slashes, dots, dashes, digits, or non-alphabetics (e.g. BRK.A, TSLA/WS, AAPL-W)
 RE_STRUCTURAL_DERIVATIVE = re.compile(r"[\.\/\-\=\+\~\d]", re.IGNORECASE)
 
-# Class-share tickers: BRK.B, BF.B, BRK.A, HEI.A. Ordinary common equity that
+# Class-share tickers: BRK.B, BF.B, CWEN.A, HEI.A. Ordinary common equity that
 # happens to carry a share class, and among the largest companies listed. The
 # structural-punctuation rule above rejects them for the dot, so they have to be
 # recognised before it runs -- and PRIMARY_EQUITY_EXCEPTIONS cannot rescue them,
 # because that check sits *after* the punctuation rule in the classifier.
+#
+# It has to clear the length gate as well. A four-letter root plus ".A" is six
+# characters, so CWEN.A and LGF.A were rejected as INVALID_LENGTH two branches
+# before this pattern was ever consulted -- which made the {1,4} in it dead for
+# every root longer than three. The check therefore runs ahead of the length
+# rule, not merely ahead of the punctuation one.
 RE_CLASS_SHARE = re.compile(r"^[A-Z]{1,4}\.[A-Z]$")
 
 # Non-leveraged index, sector and commodity funds. Distinct from
@@ -271,6 +277,14 @@ def fast_classify_equity(ticker: str, cached_asset_type: Optional[str] = None) -
             "reason": "Explicit allowed crypto token exception (BTC)"
         }
 
+    if RE_CLASS_SHARE.match(sym):
+        return {
+            "ticker": sym,
+            "is_primary_equity": True,
+            "asset_class": "PRIMARY_COMMON_EQUITY",
+            "reason": "Class share of a primary common equity",
+        }
+
     if not (1 <= len(sym) <= 5):
         return {
             "ticker": sym,
@@ -293,14 +307,6 @@ def fast_classify_equity(ticker: str, cached_asset_type: Optional[str] = None) -
             "is_primary_equity": False,
             "asset_class": "DERIVATIVE_OPTION",
             "reason": "OCC options symbol format"
-        }
-
-    if RE_CLASS_SHARE.match(sym):
-        return {
-            "ticker": sym,
-            "is_primary_equity": True,
-            "asset_class": "PRIMARY_COMMON_EQUITY",
-            "reason": "Class share of a primary common equity",
         }
 
     if RE_STRUCTURAL_DERIVATIVE.search(sym):
@@ -357,6 +363,104 @@ def fast_classify_equity(ticker: str, cached_asset_type: Optional[str] = None) -
         "asset_class": "PRIMARY_COMMON_EQUITY",
         "reason": "Clean primary US common equity"
     }
+
+
+# Words that are shaped exactly like tickers and are not tickers.
+#
+# fast_classify_equity() answers a structural question -- "could this be a
+# primary US common equity?" -- and 1-5 uppercase letters always could. It
+# returns True for THE, TO, IN, OF, AND, and for ZZZZZ. The news enricher used
+# it to decide what counts as a named entity, so 48 hours of headlines produced
+# THE (1,098), TO (891), IN (813), OF (806), A (742), AND (738) as the most
+# frequently "named entities" in the platform.
+#
+# The damage was not confined to a noisy column. Those tokens land in both
+# `named_entities` and `tags`, which the scenario tracker matches against with
+# array containment -- and the anomaly scorer computes
+# `entity_boost = len(named_entities) * per_entity`, so a headline scored higher
+# for containing more ordinary English.
+#
+# The real fix is membership in the live universe, which
+# is_valid_primary_equity_async() already reads from Redis. It is empty,
+# because refresh_watchlist_reference_data() has never been called. Until that
+# populates, this list is the floor: a token has to survive both.
+#
+# Deliberately only the closed-class words -- articles, prepositions,
+# conjunctions, auxiliaries, pronouns. Nothing here is a plausible issuer, and
+# real one-to-three letter tickers (F, GM, T, KO, V, MU) are untouched.
+EQUITY_UNIVERSE_KEY = "sentinel:equities:valid_set"
+
+TICKER_SHAPED_STOPWORDS = frozenset({
+    "A", "AN", "THE", "AND", "OR", "BUT", "NOR", "SO", "YET",
+    "OF", "TO", "IN", "ON", "AT", "BY", "FOR", "FROM", "WITH", "INTO",
+    "OVER", "UNDER", "UP", "OUT", "OFF", "AS", "THAN", "THEN",
+    "IS", "ARE", "WAS", "WERE", "BE", "BEEN", "AM", "HAS", "HAVE", "HAD",
+    "DO", "DOES", "DID", "WILL", "WOULD", "CAN", "COULD", "MAY", "MUST",
+    "IT", "ITS", "HE", "SHE", "HIS", "HER", "THEY", "THEM", "WE", "US",
+    "YOU", "I", "ME", "MY", "OUR", "WHO", "WHOM", "WHAT", "WHEN", "WHERE",
+    "WHY", "HOW", "ALL", "ANY", "BOTH", "EACH", "MORE", "MOST", "SOME",
+    "SUCH", "NO", "NOT", "ONLY", "OWN", "SAME", "TOO", "VERY", "JUST",
+    "NEW", "NOW", "ONE", "TWO", "SAID", "SAYS", "ALSO", "AFTER", "BEFORE",
+    "THIS", "THAT", "THESE", "THOSE", "THERE", "HERE", "IF", "ELSE",
+})
+
+
+def looks_like_a_ticker(token: str) -> bool:
+    """Whether a bare word from prose may be treated as a ticker symbol.
+
+    Structure alone is not enough -- see TICKER_SHAPED_STOPWORDS above.
+    """
+    clean = (token or "").strip().upper()
+    if not clean or clean in TICKER_SHAPED_STOPWORDS:
+        return False
+    return is_valid_primary_equity(clean)
+
+
+async def confirm_tickers(candidates, redis_client) -> list:
+    """The candidates that are actually listed, in one round trip.
+
+    Two stages, because they answer different questions at different costs.
+
+    `looks_like_a_ticker` is a denylist and runs in-process: it rejects the
+    closed-class English words that are shaped like symbols, which is most of
+    the noise and costs nothing. It cannot reject ZZZZZ or QQQZ, because
+    nothing about their shape is wrong.
+
+    Membership in sentinel:equities:valid_set is the allowlist -- 11,821 live US
+    symbols maintained by the radar collector -- and it rejects anything that is
+    not actually listed. That is the correct test, and it is the reason this is
+    async at all.
+
+    Prefilter first, then one SMISMEMBER for the survivors. A bare-word scan
+    considers 60-80 tokens per headline; awaiting each one would be 60-80 round
+    trips on a path handling ~400 events a minute, to answer a question the
+    denylist already settles for all but two or three of them.
+
+    Degrades to the prefilter if the set is missing, rather than returning
+    nothing: an empty universe means reference data has not loaded yet, not that
+    the world contains no equities.
+    """
+    seen, prefiltered = set(), []
+    for token in candidates or []:
+        clean = str(token or "").strip().upper()
+        if clean and clean not in seen and looks_like_a_ticker(clean):
+            seen.add(clean)
+            prefiltered.append(clean)
+
+    if not prefiltered or redis_client is None:
+        return prefiltered
+
+    raw = getattr(redis_client, "raw", redis_client)
+    try:
+        if not await raw.exists(EQUITY_UNIVERSE_KEY):
+            return prefiltered
+        flags = await raw.smismember(EQUITY_UNIVERSE_KEY, prefiltered)
+    except Exception:
+        return prefiltered
+
+    if not isinstance(flags, (list, tuple)) or len(flags) != len(prefiltered):
+        return prefiltered
+    return [sym for sym, listed in zip(prefiltered, flags) if listed]
 
 
 def is_valid_primary_equity(ticker: str) -> bool:

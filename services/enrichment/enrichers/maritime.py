@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from typing import Optional, List
  
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
-from shared.utils.regions import classify_region, decode_nav_status, decode_vessel_type
+from shared.utils.regions import (
+    classify_region, decode_nav_status, decode_vessel_type, is_restricted_nav_status,
+)
 from shared.utils.sanctions import check_sanctions
  
 logger = logging.getLogger("enrichment.maritime")
@@ -78,10 +80,11 @@ class MaritimeEnricher:
             
             speed = float(pos.get("Sog") or 0)
             heading = int(pos.get("TrueHeading") or 0)
-            nav_status = decode_nav_status(pos.get("NavigationalStatus") or 0)
+            nav_code = pos.get("NavigationalStatus") or 0
+            nav_status = decode_nav_status(nav_code)
             region = classify_region(lat, lon)
             
-            parsed.append((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region))
+            parsed.append((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region))
             mmsi_list.append(mmsi)
             meta_list.append(meta)
             
@@ -100,10 +103,15 @@ class MaritimeEnricher:
         headings_list = []
         timestamps_list = []
         extra_features_list = []
-        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel in zip(parsed, vessels):
+        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel in zip(parsed, vessels):
             from shared.utils.regions import get_region_sensitivity_multiplier
             reg_mult = get_region_sensitivity_multiplier(region) if region else 1.0
-            nav_anomaly = 1.0 if nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")) else 0.0
+            # Matched on the AIS code, not on prose in the display label.
+            # The old test asked whether "not under command" appeared in
+            # "notundercommand" and it never did, so status 2 -- a vessel that
+            # cannot manoeuvre -- raised nothing. Three of the four terms were
+            # single words and matched by luck.
+            nav_anomaly = 1.0 if is_restricted_nav_status(nav_code) else 0.0
             is_sanctioned = 1.0 if vessel.get("flags") else 0.0
             
             entities.append(mmsi)
@@ -121,7 +129,7 @@ class MaritimeEnricher:
         
         # Batch watchlist & frequency checks concurrently to avoid sequential awaits blocking
         check_tasks = []
-        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, region), vessel, score_dict in zip(parsed, vessels, scores):
+        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel, score_dict in zip(parsed, vessels, scores):
             check_tasks.append(asyncio.gather(
                 self.scorer.check_watchlist(mmsi, "vessels"),
                 self.scorer.track_frequency(mmsi, "vessel_position")
@@ -143,7 +151,9 @@ class MaritimeEnricher:
                     vtype = "Tanker"
 
             is_sanctioned = bool(flags)
-            is_emergency_nav = bool(nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")))
+            # By code, not by prose in the label -- see the note at the
+            # nav_anomaly assignment above.
+            is_emergency_nav = is_restricted_nav_status(nav_code)
 
             # ROUTINE TELEMETRY GUARD:
             # Routine AIS pings in normal status (not sanctioned, not emergency, not watched)
@@ -185,7 +195,9 @@ class MaritimeEnricher:
         final_events = []
         for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, region, vessel, flags, vtype, anomaly) in results:
             is_sanctioned = bool(flags)
-            is_emergency_nav = bool(nav_status and any(w in nav_status.lower() for w in ("not under command", "restricted", "constrained", "aground")))
+            # By code, not by prose in the label -- see the note at the
+            # nav_anomaly assignment above.
+            is_emergency_nav = is_restricted_nav_status(nav_code)
             is_watched = bool(anomaly > 0.15)
             
             headline_str = (

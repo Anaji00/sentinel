@@ -1,8 +1,9 @@
 from __future__ import annotations
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 import json
 
@@ -65,6 +66,11 @@ class EntityType(str, Enum):
     MEDIA_SOURCE = "media_source"
     VULNERABILITY = "vulnerability"
     WALLET = "wallet"
+    # A prediction-market contract. These were typed INSTRUMENT because the
+    # enum had no member for them, which is how a Polymarket slug came to sit
+    # in the same identifier space as a stock ticker and inherit its casing
+    # rule. They are not tickers and they do not behave like them.
+    PREDICTION_MARKET = "prediction_market"
     UNKNOWN = "unknown"
 
 class AlertTier(str, Enum):
@@ -80,14 +86,233 @@ class ScenarioStatus(str, Enum):
     DENIED = "denied"
     DEVELOPING = "developing"
 
+class ResolutionSignal(BaseModel):
+    """One observable, in a form the tracker can go and look for.
+
+    These were free text, and that is why nothing resolved honestly. Matching
+    any keyword over four characters fired on 89% of signals -- 271 of 303
+    measured against 48 hours of events -- because a sentence like "Significant
+    price movements on cryptocurrency exchanges" contains words that appear in
+    tens of thousands of position-telemetry headlines. Requiring every keyword
+    drops that to 2.3%, which stops the calibration being fed noise without
+    making the signal checkable: it never named anything specific enough.
+
+    `entity` is what turns a text search into an indexed lookup. A signal that
+    cannot name one is not an observable.
+
+    Lives here rather than beside the generator because the persisted
+    ScenarioHypothesis needs the same type. Defining it in the service and not
+    in the model is precisely what broke scenario generation for half an hour:
+    the model emitted the right structure and the Scenario it was mapped into
+    still declared List[str].
+    """
+    entity: str = ""
+    observable: str = ""
+    # Constrained here too, not only in the generator's subclass. Leaving the
+    # persisted type an open str let a hand-edited row or a future producer put
+    # "greater_than" in the field: as_text() renders it verbatim and every
+    # consumer switching on the four known values falls through its default.
+    comparator: Literal["above", "below", "occurs", "absent"] = "occurs"
+    threshold: Optional[float] = None
+    unit: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_text(cls, data: Any) -> Any:
+        """Signals already in the table are bare sentences.
+
+        Hundreds of scenarios were stored before this type existed. They load
+        with no entity -- which is honest, since they never named one, and is
+        why they resolve so rarely.
+        """
+        if isinstance(data, str):
+            return {"entity": "", "observable": data}
+        return data
+
+    def as_text(self) -> str:
+        bound = ""
+        if self.threshold is not None:
+            bound = f" {self.comparator} {self.threshold}{self.unit or ''}"
+        return f"{self.entity}: {self.observable}{bound}".strip(": ").strip()
+
+
 class ScenarioHypothesis(BaseModel):
     label: str
     probability: int
     mechanism: str
     beneficiaries: List[str]
-    watch_signals: List[str]
-    deny_signals: List[str]
+    watch_signals: List[ResolutionSignal]
+    deny_signals: List[ResolutionSignal]
     time_horizon: str
+
+# ── Canonical entity identifiers ──────────────────────────────────────────────
+#
+# primary_entity_id is one TEXT column holding six identifier namespaces, and
+# until now no rule said how any of them was spelled. tradfi wrote upper-cased
+# tickers; crypto upper-cased assets on most paths and not on one; wallet
+# addresses arrived EIP-55 mixed-case straight from the RPC; Polymarket slugs
+# were lowercase kebab; maritime wrote a numeric MMSI. Two writers describing
+# the same thing produced two different identities, so a reader comparing with
+# `=` matched or missed depending on which collector happened to write the row.
+#
+# The rule lives here, on the model every producer already constructs, rather
+# than in each of the nineteen call sites -- and because it is applied at
+# construction it reaches Redis keys and Neo4j node ids too, not only Postgres.
+#
+# Case is not cosmetic in every namespace, which is why this is keyed off the
+# entity type rather than applied uniformly:
+
+# Identifier spaces with a conventional upper-case form: tickers, CVE ids, ISO
+# country codes, AS numbers.
+_UPPERCASE_ID_TYPES = frozenset({
+    EntityType.INSTRUMENT,
+    EntityType.COMPANY,
+    EntityType.VULNERABILITY,
+    EntityType.COUNTRY,
+    EntityType.INFRASTRUCTURE,
+})
+
+# Lower-case: an Ethereum address's checksum casing is a validation artifact
+# carried by the same 40 hex characters, not part of the identity -- the same
+# wallet written two ways is one wallet. ICAO24 transponder addresses are hex
+# too and conventionally lower.
+_LOWERCASE_ID_TYPES = frozenset({
+    EntityType.WALLET,
+    EntityType.AIRCRAFT,
+})
+
+# Left exactly as written: these identifiers are human names, where case
+# carries meaning and there is no canonical upper form. Folding "Reuters" to
+# "REUTERS" would destroy information to solve a problem these types do not
+# have, since nothing generates them twice with different casing.
+_PRESERVE_CASE_ID_TYPES = frozenset({
+    EntityType.PERSON,
+    EntityType.MEDIA_SOURCE,
+    # A venue mints these and we quote them back verbatim. Polymarket issues a
+    # lowercase kebab slug, Kalshi an upper-case ticker, and both are used as
+    # written for Redis keys -- sentinel:prediction:outcomes:{slug},
+    # sentinel:kalshi:watched_tickers. Imposing a casing here would rewrite the
+    # database's copy of an identifier while every other store kept the venue's,
+    # which is the split this whole rule exists to close. There is nothing to
+    # canonicalise: the venue already did it.
+    EntityType.PREDICTION_MARKET,
+    EntityType.UNKNOWN,
+})
+
+_NON_DIGIT_RE = re.compile(r"\D")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+# A trailing parenthetical holding nothing but a number, a price or a percentage.
+#
+# Identifiers were being built from prose, so a quoted value rode along inside
+# one: the graph holds "SI=F ($59.06)", "SI=F ($50.78)" and "SI=F" as three
+# separate nodes for one silver future. An identifier containing a mutable value
+# is not an identifier -- it mints a new identity every time the value moves,
+# which fragments an instrument's history across as many nodes as it had prices.
+#
+# Deliberately narrow. It matches "($59.06)", "(12.5%)" and "(-3)", and leaves
+# "(finorion)" and "(Class A)" alone, because those distinguish one entity from
+# another rather than describing its state at a moment.
+_DECORATIVE_VALUE_RE = re.compile(r"\s*\(\s*[-+]?[$€£¥]?\s*[\d][\d.,]*\s*%?\s*\)\s*$")
+
+
+def canonical_entity_id(raw: Any, entity_type: "EntityType" = None) -> str:
+    """The one spelling of an identifier, given what it identifies.
+
+    Exported so the Redis and Neo4j writers can key on the same value the
+    database will hold. Anything it cannot improve it returns unchanged: an
+    unrecognised type, an empty string, or a vessel id carrying no digits are
+    all left alone rather than mangled into something new.
+    """
+    if raw is None:
+        return raw
+    text = _WHITESPACE_RE.sub(" ", str(raw).strip())
+    # Stripped before any casing rule, and for every type: a price is not part
+    # of a name, a ticker, or a wallet address.
+    text = _DECORATIVE_VALUE_RE.sub("", text).strip()
+    if not text:
+        return text
+
+    if entity_type in _PRESERVE_CASE_ID_TYPES:
+        return text
+    if entity_type in _LOWERCASE_ID_TYPES:
+        return text.lower()
+    if entity_type == EntityType.VESSEL:
+        # MMSI and IMO are numeric. Some feeds decorate them ("MMSI:311000123",
+        # "IMO 9321483"), and the digits are the identity. A value carrying no
+        # digits at all is not one of those and is left as written rather than
+        # reduced to an empty string.
+        digits = _NON_DIGIT_RE.sub("", text)
+        return digits or text.upper()
+    if entity_type in _UPPERCASE_ID_TYPES:
+        return text.upper()
+    return text
+
+
+def entity_cache_key(namespace: str, raw: Any, entity_type: "EntityType" = None) -> str:
+    """A Redis key scoped to an entity, spelled the one canonical way.
+
+    Postgres was brought under canonical_entity_id by putting the rule on the
+    Entity model, but a key built from a raw payload string never constructs
+    that model and so never picks the rule up. `sentinel:earnings:{symbol}` is
+    written by the tradfi collector and read by two other services, none of
+    which normalise -- so a writer and a reader disagreeing about casing simply
+    miss each other, silently, with the data sitting right there.
+
+    Passing every entity-scoped key through here closes the third store. The
+    default type is INSTRUMENT because that is what almost every such key is
+    scoped to; pass the real type where it is something else.
+    """
+    canonical = canonical_entity_id(raw, entity_type or EntityType.INSTRUMENT)
+    return f"{namespace}:{canonical}"
+
+
+# Graph labels are the only type information a Neo4j writer has: it holds a
+# label like "Wallet" where the rest of the system holds an EntityType.
+#
+# Unmapped labels fall through to UNKNOWN, which preserves the string -- the
+# safe answer when we cannot say what kind of identifier we are holding.
+_LABEL_TO_ENTITY_TYPE = {
+    "company": EntityType.COMPANY,
+    "cryptoasset": EntityType.INSTRUMENT,
+    "instrument": EntityType.INSTRUMENT,
+    "vessel": EntityType.VESSEL,
+    "aircraft": EntityType.AIRCRAFT,
+    "wallet": EntityType.WALLET,
+    "vulnerability": EntityType.VULNERABILITY,
+    "autonomoussystem": EntityType.INFRASTRUCTURE,
+    "infrastructure": EntityType.INFRASTRUCTURE,
+    "prefix": EntityType.INFRASTRUCTURE,
+    "country": EntityType.COUNTRY,
+    "person": EntityType.PERSON,
+    "predictionmarket": EntityType.PREDICTION_MARKET,
+}
+
+
+def graph_node_id(raw: Any, label: str = "Entity") -> str:
+    """The node id for an entity, spelled the way the database spells it.
+
+    Lives here rather than beside one writer because it has two callers that
+    must agree, and when it had one the other went on doing something else.
+    The graph supervisor was corrected to use this rule; the knowledge-graph
+    engine, which *produces* the proposals the supervisor consumes, went on
+    calling `.upper()` first. Measured on the live graph:
+
+        0X... (uppercased)   139,047 nodes
+        0x... (as written)     6,366 nodes
+
+    and the same address present under both spellings.
+
+    WALLET lower-cases, so had these been labelled `Wallet` the rule would have
+    undone the damage. They are labelled `Entity`, which maps to UNKNOWN, and
+    UNKNOWN returns the string exactly as given -- the right answer when we
+    cannot say what kind of identifier we hold, and the reason the mangling
+    became permanent. A generic label and a producer that pre-mangles; neither
+    half does this alone, which is why fixing the writer did not fix it.
+    """
+    entity_type = _LABEL_TO_ENTITY_TYPE.get(str(label or "").strip().lower(), EntityType.UNKNOWN)
+    return canonical_entity_id(raw, entity_type)
+
 
 class Entity(BaseModel):
     id: str
@@ -96,7 +321,28 @@ class Entity(BaseModel):
     flags: List[str] = Field(default_factory=list) 
     country_code: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
- 
+
+    @model_validator(mode="after")
+    def _canonicalize_identity(self) -> "Entity":
+        """Normalises `id` at construction, without changing what is displayed.
+
+        `mode="after"` and not a field_validator on `id`, because the rule needs
+        `type` and `id` is declared first -- a field validator would run before
+        `type` had been set and would silently fall through to the default.
+
+        `name` is filled from the identifier as it was written whenever the
+        producer supplied none. Several call sites pass only an id and rely on
+        db_writer falling back to it for the display name; canonicalising in
+        place without this would turn "Apple Inc" into "APPLE INC" on screen,
+        which is a regression in the one place a person actually reads.
+        """
+        canonical = canonical_entity_id(self.id, self.type)
+        if canonical != self.id:
+            if not self.name:
+                self.name = self.id
+            self.id = canonical
+        return self
+
     def is_flagged(self) -> bool:
         return len(self.flags) > 0
     def has_flag(self, flag: str) -> bool:
@@ -193,6 +439,15 @@ class FinancialData(BaseModel):
     strike: Optional[float] = None
     expiry: Optional[str] = None
     premium_usd: Optional[float] = None
+    # The dollar value of an equity trade or bar.
+    #
+    # The model had only premium_usd, which is what an *option* costs, so the
+    # tradfi enricher wrote an equity block's dollar value there and
+    # notional_usd stayed null on every equity_block event -- 480 of 480 in a
+    # 40-minute sample. Consumers reading the obvious field saw nothing and had
+    # to know to look in the options field instead; RadarAgent still carries a
+    # comment explaining that workaround.
+    notional_usd: Optional[float] = None
     volume: Optional[int] = None
     open_interest: Optional[int] = None
     implied_volatility: Optional[float] = None

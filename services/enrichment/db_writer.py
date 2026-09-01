@@ -5,6 +5,22 @@ from shared.models import NormalizedEvent
 
 logger = logging.getLogger("enrichment.db")
 
+def _as_uuid(value) -> str:
+    """A UUID string, deterministically derived when the value is not one.
+
+    Several producers mint readable identifiers and several columns are typed
+    uuid. Rather than each caller knowing which is which, anything that is
+    already a UUID passes through and anything else is mapped through uuid5 --
+    stable, so the same input always yields the same UUID and any join on it
+    still holds.
+    """
+    try:
+        uuid.UUID(str(value))
+        return str(value)
+    except (ValueError, TypeError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))
+
+
 class DBWriter:
     def __init__(self, timescale_client):
         self.db = timescale_client
@@ -21,11 +37,7 @@ class DBWriter:
         
         pe = e.primary_entity
 
-        event_id = e.event_id
-        try:
-            uuid.UUID(str(event_id))
-        except (ValueError, TypeError, AttributeError):
-            event_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(event_id)))
+        event_id = _as_uuid(e.event_id)
 
         pe_id = pe.id if pe else "UNKNOWN"
         pe_name = (pe.name if (pe and pe.name) else pe_id) or "UNKNOWN"
@@ -71,7 +83,23 @@ class DBWriter:
             getattr(e, 'named_entities', []),
             getattr(e, 'sentiment', None),
             getattr(e, 'anomaly_score', 0.0),
-            getattr(e, 'correlation_ids', []),
+            # Coerced, not trusted.
+            #
+            # correlation_ids is a uuid[] column, and the statistical discovery
+            # engine mints semantic identifiers -- "granger:AAPL:MSFT:lag2",
+            # "corr:stat:NVDA:TSM" -- which the tradfi enricher attaches to
+            # every event for a ticker that has one. asyncpg rejects the whole
+            # executemany batch on the first such value, so a single discovered
+            # correlation made every event batched beside it unwritable:
+            # measured at 2,130 errors against 4,838 processed, a 44% loss rate,
+            # with equity blocks disappearing while the collector was plainly
+            # emitting them.
+            #
+            # uuid5 is deterministic, so the same semantic id always maps to the
+            # same UUID and the linkage survives; the readable form is still in
+            # Redis where it was minted. Dropping the value instead would lose
+            # the link, and letting it through loses the entire batch.
+            [_as_uuid(c) for c in (getattr(e, 'correlation_ids', None) or [])],
             # Independent corroboration, where the event type supports it.
             # Serialised rather than stored as a column per field: the shape is
             # a judgement about a claim, not a fixed record, and it is read

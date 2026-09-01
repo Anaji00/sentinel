@@ -50,6 +50,98 @@ def _extract_event_context(event: NormalizedEvent) -> dict:
     }
 
 
+# Domains where a cluster is a claim about the world: someone did something,
+# somewhere. A co-occurrence that includes one of these is what "geopolitical"
+# was ever meant to describe.
+_WORLD_DOMAINS = frozenset({
+    "news", "osint", "headline", "vessel_position", "flight_position",
+    "bgp_anomaly", "cyber_incident", "vulnerability", "sanctions",
+})
+
+
+# What a single-domain cluster is called, keyed on the domain that actually
+# fired. Matched on prefix, because the event vocabulary is
+# "<subject>_<observation>" -- vessel_dark, flight_anomaly, bgp_anomaly.
+_SINGLE_DOMAIN_LABELS = (
+    ("vessel", "maritime_activity_cluster", "Maritime Activity Cluster"),
+    ("flight", "aviation_activity_cluster", "Aviation Activity Cluster"),
+    ("bgp", "network_activity_cluster", "Network Activity Cluster"),
+    ("cyber", "cyber_activity_cluster", "Cyber Activity Cluster"),
+    # Ordered before the bare "crypto" prefix: an on-chain transfer is a
+    # movement of coins between addresses, not a price event. Labelling a
+    # cluster of wallet transfers a "Market Anomaly" says something about
+    # markets that the evidence never touched.
+    ("crypto_transfer", "onchain_activity_cluster", "On-Chain Activity Cluster"),
+    ("crypto_whale", "onchain_activity_cluster", "On-Chain Activity Cluster"),
+    ("crypto", "market_anomaly_cluster", "Market Anomaly Cluster"),
+    ("market", "market_anomaly_cluster", "Market Anomaly Cluster"),
+    ("equity", "market_anomaly_cluster", "Market Anomaly Cluster"),
+    ("tradfi", "market_anomaly_cluster", "Market Anomaly Cluster"),
+    ("prediction", "market_anomaly_cluster", "Market Anomaly Cluster"),
+    ("news", "reporting_cluster", "Reporting Cluster"),
+    ("headline", "reporting_cluster", "Reporting Cluster"),
+)
+
+
+def _single_domain_label(domain: str) -> tuple:
+    """Names a one-domain cluster after the domain that produced it.
+
+    The first version of this function called every single-domain cluster a
+    "Market Anomaly Cluster", because market anomalies were the case being
+    fixed. That is the same error it replaced, one step along: four vessel_dark
+    events in the Suez Canal were published as a market anomaly, which is no
+    more true than calling them a geopolitical cascade. A cluster is named after
+    what fired, or it is not named at all.
+    """
+    lowered = (domain or "").strip().lower()
+    for prefix, slug, label in _SINGLE_DOMAIN_LABELS:
+        if lowered.startswith(prefix):
+            return slug, label
+    subject = lowered.split("_")[0] or "signal"
+    return f"{subject}_activity_cluster", f"{subject.title()} Activity Cluster"
+
+
+def _looks_like_identifier(key: str) -> bool:
+    """True for a key that is a machine identifier rather than a place name.
+
+    Regions ("black sea", "strait of malacca") read better title-cased; wallet
+    addresses, tickers and instrument ids must be shown exactly as written or
+    they stop being the thing they identify.
+    """
+    text = (key or "").strip()
+    if not text:
+        return False
+    if text.lower().startswith("0x"):
+        return True
+    # No spaces and carrying digits or punctuation: a symbol, not a place.
+    return " " not in text and any(c.isdigit() or c in "=-_:." for c in text)
+
+
+def _classify_cluster(domains_present: Set[str], is_multi_domain: bool) -> tuple:
+    """What kind of cluster this is, from what actually fired.
+
+    This was the string "Geopolitical Cascade", unconditionally, for every
+    branch and every domain. It reached the operator ("GEOPOLITICAL CASCADE
+    DETECTED in 'ethusdt'"), the cluster's rule_name, its description and its
+    tags -- and then the scenario generator, where a 1.5B model reading
+    "Geopolitical Cascade" above a crypto ticker produced assessments like
+    "Geopolitical Cascade Alert in 'Adausdt'". The prompt now carries a
+    paragraph telling the model not to believe the detector's name, which is a
+    workaround for this function not existing.
+
+    Four correlated ETHUSDT candle anomalies are a market microstructure
+    cluster. They are not a geopolitical event, and calling them one costs the
+    word its meaning for the cases that are.
+    """
+    if not is_multi_domain:
+        # Named after the one domain present, not after the case that happened
+        # to motivate this function.
+        return _single_domain_label(next(iter(domains_present), ""))
+    if domains_present & _WORLD_DOMAINS:
+        return "geopolitical_cascade", "Geopolitical Cascade"
+    return "cross_asset_cascade", "Cross-Asset Cascade"
+
+
 class GeopoliticalCascadeEngine:
     """
     Sliding-window multi-domain compound event cascade detector.
@@ -130,15 +222,31 @@ class GeopoliticalCascadeEngine:
             # Mark cooldown timestamp for this key
             self._last_trigger[key] = now
 
+            kind_slug, kind_label = _classify_cluster(
+                domains_present, is_multi_domain_cascade
+            )
+
+            # Displayed as written. key.title() was turning a wallet address
+            # into 0Xd9695C855Ea4477C3290Dec8Adc8E3F6C5B1C30E -- a string that
+            # matches nothing, cannot be pasted into a block explorer, and reads
+            # as a different address to anyone comparing by eye. Title case is
+            # for prose; an identifier is quoted, never restyled.
+            display_key = key if _looks_like_identifier(key) else key.title()
+
             # Collect rich context for log + description
             top_entries = current_entries[-5:]  # most recent 5
             unique_entities = list(dict.fromkeys(e[1]["entity_name"] for e in current_entries))[:5]
-            headlines = [e[1]["headline"] for e in top_entries[:3]]
+            # Deduplicated. unique_entities already collapses repeats, but the
+            # headline list did not, so one vessel reporting twice inside the
+            # window appeared as two pieces of evidence -- observed live, with
+            # SAGA VOYAGER filling two of three slots in a Taiwan Strait
+            # cluster. The same observation seen twice is one observation.
+            headlines = list(dict.fromkeys(e[1]["headline"] for e in top_entries))[:3]
             supporting_ids = [e[1]["event_id"] for e in current_entries]
             domain_list = sorted(domains_present)
 
             logger.warning(
-                f"🚨 GEOPOLITICAL CASCADE DETECTED in '{key}' | "
+                f"🚨 {kind_label.upper()} DETECTED in '{key}' | "
                 f"Flashpoint Index: {flashpoint_index}/100 | "
                 f"Domains ({len(domains_present)}): {domain_list} | "
                 f"Entities: {unique_entities} | "
@@ -153,9 +261,22 @@ class GeopoliticalCascadeEngine:
             import uuid
             cluster = CorrelationCluster(
                 correlation_id=str(uuid.uuid4()),
-                rule_id=f"rule_geopolitical_cascade_{key.lower().replace(' ', '_')}",
-                rule_name=f"Geopolitical Cascade ({key.title()})",
-                alert_tier=AlertTier.CRITICAL if flashpoint_index >= 75.0 else AlertTier.ELEVATED,
+                rule_id=f"rule_{kind_slug}_{key.lower().replace(' ', '_')}",
+                rule_name=f"{kind_label} ({display_key})",
+                # CRITICAL is reserved for a genuine cross-domain cascade.
+                #
+                # A single-domain cluster is not a cascade by this engine's own
+                # definition -- nothing cascaded, one detector fired repeatedly
+                # on one entity -- so it cannot reach the tier that pages
+                # someone. It was reaching it routinely: four ETHUSDT candle
+                # anomalies, the largest a 1.10% move, scored 75.0/100 and went
+                # out as CRITICAL, because avg_score sat at ~1.0 where the
+                # domain scorers saturate.
+                alert_tier=(
+                    AlertTier.CRITICAL
+                    if (flashpoint_index >= 75.0 and is_multi_domain_cascade)
+                    else AlertTier.ELEVATED
+                ),
                 trigger_event_id=supporting_ids[0],
                 supporting_event_ids=supporting_ids[1:],
                 primary_entity_id=ctx["entity_id"],
@@ -163,12 +284,12 @@ class GeopoliticalCascadeEngine:
                 entity_ids=[e[1]["entity_id"] for e in current_entries[:10]],
                 entity_names=unique_entities,
                 description=(
-                    f"Geopolitical Cascade Alert (Flashpoint: {flashpoint_index}/100) in '{key.title()}'. "
+                    f"{kind_label} (Flashpoint: {flashpoint_index}/100) in '{display_key}'. "
                     f"Entities: {entity_summary}. "
                     f"Domains: {domain_summary}. "
                     f"Activity: {headline_summary}"
                 ),
-                tags=["geopolitical_cascade", key.lower().replace(" ", "_")]
+                tags=[kind_slug, key.lower().replace(" ", "_")]
                     + [f"entity:{n}" for n in unique_entities[:3]]
                     + [f"domain:{d}" for d in domain_list]
             )

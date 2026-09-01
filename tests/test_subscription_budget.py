@@ -85,10 +85,15 @@ def test_no_symbol_is_subscribed_twice(collector):
 
 
 def test_discovery_order_is_preserved(collector):
-    """zrevrange arrives newest-first; recency is a fine tiebreak among finds."""
+    """zrevrange arrives newest-first; recency is a fine tiebreak among finds.
+
+    Two reserved cores now sit ahead of the discoveries -- equities and macro --
+    so "not a core symbol" has to mean neither of them.
+    """
+    reserved = set(collector.CORE_EQUITY_SYMBOLS) | set(collector.CORE_MACRO_SYMBOLS)
     selected = collector.select_subscription_symbols(OBSERVED)
-    discoveries = [s for s in selected if s not in collector.CORE_EQUITY_SYMBOLS]
-    expected = [s for s in OBSERVED if s not in collector.CORE_EQUITY_SYMBOLS]
+    discoveries = [s for s in selected if s not in reserved]
+    expected = [s for s in OBSERVED if s not in reserved]
     assert discoveries == expected[:len(discoveries)]
 
 
@@ -216,3 +221,37 @@ def test_the_session_names_the_watchdog_checks_are_real(collector):
     """A typo here would disable the watchdog silently."""
     name, _ = collector.get_market_session()
     assert name in ("CLOSED", "PRE_MARKET", "REGULAR", "AFTER_HOURS")
+
+
+# -- the macro reservation -----------------------------------------------------
+
+def test_macro_anchors_are_reserved(collector):
+    """Without both legs streamed at once, no inverse relationship exists to be
+    found. The discovery engine had produced five surviving edges, every one
+    positive, over a universe of ten co-moving crypto pairs and rotating
+    mid-caps -- BTCUSDT, EXK, GAP, WU, CI, OKE, F, RGEN, ETSY, ELF."""
+    selected = collector.select_subscription_symbols(OBSERVED)
+    macro = [s for s in selected if s in collector.CORE_MACRO_SYMBOLS]
+    assert macro, "no macro anchor reserved; 'yields up, stocks down' is inexpressible"
+
+
+def test_macro_does_not_crowd_out_the_equity_core(collector):
+    selected = collector.select_subscription_symbols(OBSERVED)
+    assert [s for s in selected if s in collector.CORE_EQUITY_SYMBOLS]
+
+
+def test_the_reserved_share_is_unchanged_by_adding_macro(collector):
+    """Adding a second core must cost discovery nothing it did not already
+    cost it -- the two split the existing reservation rather than extending it."""
+    selected = collector.select_subscription_symbols(OBSERVED)
+    reserved = set(collector.CORE_EQUITY_SYMBOLS) | set(collector.CORE_MACRO_SYMBOLS)
+    core_count = len([s for s in selected if s in reserved])
+    budget = collector.FINNHUB_SUBSCRIPTION_LIMIT
+    assert core_count <= int(budget * collector.MAX_CORE_SHARE)
+
+
+def test_macro_survives_a_shrunken_budget(collector):
+    """If slots get scarce, the anchors that make a relationship expressible are
+    the ones worth keeping: half a pair discovers nothing."""
+    selected = collector.select_subscription_symbols(OBSERVED, limit=6)
+    assert [s for s in selected if s in collector.CORE_MACRO_SYMBOLS]

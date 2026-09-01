@@ -195,13 +195,37 @@ async def get_domain_events(
                            ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as type_rank,
                            ROW_NUMBER() OVER (ORDER BY occurred_at DESC) as overall_rank
                     FROM recent
+                ), picked AS (
+                    -- Selected by interleave, presented by recency.
+                    --
+                    -- Ordering this union by occurred_at and cutting it back to
+                    -- `limit` undid the interleaving entirely: `overall_rank <=
+                    -- limit` already names the newest `limit` rows of the pool,
+                    -- and every row admitted by `type_rank` is older than those
+                    -- by construction, so the truncation dropped exactly the
+                    -- rows the partition existed to reserve. The result was
+                    -- identical to a plain ORDER BY occurred_at DESC, at the
+                    -- cost of two window functions.
+                    --
+                    -- Ranking the reserved rows ahead of the recency fill is
+                    -- what actually reserves the share: every sub-type's newest
+                    -- `per_type` rows are taken first, and only the remainder of
+                    -- the page is handed to recency, as intended. The outer
+                    -- query restores the chronological order callers expect.
+                    SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
+                           entity_name, region, anomaly_score, source, domain,
+                           latitude, longitude, headline, summary, domain_data
+                    FROM domain_events
+                    WHERE type_rank <= {per_type} OR overall_rank <= {limit_idx}
+                    ORDER BY (CASE WHEN type_rank <= {per_type} THEN 0 ELSE 1 END) ASC,
+                             occurred_at DESC
+                    LIMIT {limit_idx}
                 )
                 SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
                        entity_name, region, anomaly_score, source, domain,
                        latitude, longitude, headline, summary, domain_data
-                FROM domain_events
-                WHERE type_rank <= {per_type} OR overall_rank <= {limit_idx}
-                ORDER BY occurred_at DESC LIMIT {limit_idx}
+                FROM picked
+                ORDER BY occurred_at DESC
             """
 
         return await db.query(query, *params)

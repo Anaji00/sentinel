@@ -13,6 +13,7 @@ import re
 from typing import List, Dict, Any, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
+from shared.models.events import graph_node_id
 from shared.models.ontology import (
     VALID_PREDICATES,
     ALLOWED_NODE_LABELS,
@@ -22,6 +23,45 @@ from shared.models.ontology import (
 )
 
 logger = logging.getLogger("agent.supervisor")
+
+
+def _as_unit_interval(value, default: float = 1.0) -> float:
+    """A confidence or weight on 0-1, whatever scale the producer used.
+
+    SYMPATHY_MOVER edges in the live graph range from -0.1 to 95.0 on both
+    properties, because the stock-correlation agent passes a model-generated
+    `conviction` straight through and nothing bounded it. Consumers read these
+    as probabilities: a 95.0 outranks every genuine edge, and a -0.1 is a
+    negative confidence, which is not a quantity.
+
+    Same defect and same remedy as AgentPrediction.conviction -- normalise on
+    the shared boundary rather than in the one producer that exposed it, since
+    every writer reaching this supervisor has the same freedom to be wrong.
+    Percentages are rescaled; anything else is clamped.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:                      # NaN
+        return default
+    if 1.0 < number <= 100.0:
+        number /= 100.0
+    return min(1.0, max(0.0, number))
+
+
+# What an edge says about direction when nobody measured one.
+#
+# The default was "lead", so every relationship that did not state a direction
+# was written to the graph asserting one. PEER_OF is derived from a
+# contemporaneous Pearson correlation, which is symmetric and has no lead or
+# lag at all -- yet all three live peer edges carried direction="lead", a causal
+# claim about instruments whose relationship was only ever measured
+# simultaneously. STATISTICALLY_CORRELATED_WITH has the same shape.
+#
+# A default is not a measurement. Lead and lag are what the Granger path
+# establishes, and edges from that path still state it explicitly.
+UNDIRECTED = "undirected"
 
 
 class GraphSupervisor(SentinelAgent):
@@ -95,7 +135,7 @@ class GraphSupervisor(SentinelAgent):
                     if label not in nodes_by_label:
                         nodes_by_label[label] = []
                     nodes_by_label[label].append({
-                        "name": str(entity_id).upper(),
+                        "name": graph_node_id(entity_id, label),
                         "domain": data.get("primary_domain", "financial"),
                         "concepts": data.get("macro_concepts", []),
                         "sanctions": data.get("sanctions_risk"),
@@ -122,12 +162,12 @@ class GraphSupervisor(SentinelAgent):
                         
                         props = data.get("properties", {})
                         links_by_relation[rel_key].append({
-                            "id": str(entity_id).upper(),
-                            "target_id": str(target_id).upper(),
-                            "weight": float(data.get("weight", props.get("weight", 1.0))),
-                            "confidence": float(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                            "id": graph_node_id(entity_id, source_label),
+                            "target_id": graph_node_id(target_id, target_label),
+                            "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
+                            "confidence": _as_unit_interval(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
                             "relationship": data.get("relationship", props.get("relationship", "")),
-                            "direction": data.get("direction", props.get("direction", "lead")),
+                            "direction": data.get("direction", props.get("direction", UNDIRECTED)),
                             "method": props.get("method", ""),
                             "window": props.get("window", ""),
                             "coefficient": float(props.get("coefficient", 0.0)),
@@ -222,7 +262,7 @@ class GraphSupervisor(SentinelAgent):
                     e.last_updated = timestamp()
                 """
                 await self.neo4j.execute(cypher, {
-                    "name": str(entity_id).upper(),
+                    "name": graph_node_id(entity_id, label),
                     "domain": data.get("primary_domain", "financial"),
                     "concepts": data.get("macro_concepts", []),
                     "sanctions": data.get("sanctions_risk"),
@@ -272,12 +312,12 @@ class GraphSupervisor(SentinelAgent):
                     r.last_updated = timestamp()
                 """
                 await self.neo4j.execute(cypher, {
-                    "id": str(entity_id).upper(),
-                    "target_id": str(target_id).upper(),
-                    "weight": float(data.get("weight", props.get("weight", 1.0))),
-                    "confidence": float(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                    "id": graph_node_id(entity_id, source_label),
+                    "target_id": graph_node_id(target_id, target_label),
+                    "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
+                    "confidence": _as_unit_interval(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
                     "relationship": str(data.get("relationship", props.get("relationship", ""))),
-                    "direction": str(data.get("direction", props.get("direction", "lead"))),
+                    "direction": str(data.get("direction", props.get("direction", UNDIRECTED))),
                     "method": str(props.get("method", "")),
                     "window": str(props.get("window", "")),
                     "coefficient": float(props.get("coefficient", 0.0)),
@@ -306,7 +346,13 @@ class GraphSupervisor(SentinelAgent):
                     e.updated_at = timestamp(),
                     e.last_updated = timestamp()
                 """
-                await self.neo4j.execute(cypher, {"id": str(entity_id).upper(), "new_tags": tags})
+                # `label`, not `source_label`. This branch has no source/target
+                # pair -- it tags a single node -- and the name it does bind is
+                # the one the MERGE above already uses. `source_label` is bound
+                # only in the two link-handling branches, so this raised
+                # UnboundLocalError every time a tag proposal arrived, inside a
+                # handler that reported it as a Neo4j commit failure.
+                await self.neo4j.execute(cypher, {"id": graph_node_id(entity_id, label), "new_tags": tags})
                 logger.debug(f"✅ Added {len(tags)} tags to {entity_id}")
 
             else:

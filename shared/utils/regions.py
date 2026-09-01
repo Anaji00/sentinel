@@ -1,3 +1,4 @@
+import re
 """
 shared/utils/regions.py
  
@@ -241,5 +242,39 @@ def decode_vessel_type(type_code: int) -> str:
         return f"Unknown({type_code})"
     
 
+# AIS navigational statuses that mean the vessel cannot freely manoeuvre.
+#
+# Matched on the code, not the label. The label is a display string and the
+# consumer was substring-matching prose against it: `"not under command" in
+# nav_status.lower()` against "NotUnderCommand" lowercased to
+# "notundercommand", which never matches. Three of the four terms happened to
+# be single words and worked by luck; the multi-word one silently did not, so
+# status 2 -- a vessel that cannot manoeuvre, among the most serious states AIS
+# can report -- never raised an anomaly.
+RESTRICTED_NAV_STATUS_CODES = frozenset({
+    2,   # NotUnderCommand
+    3,   # RestrictedManoeuverability
+    4,   # ConstrainedByDraught
+    6,   # Aground
+})
+
+
+def is_restricted_nav_status(status_code) -> bool:
+    """Whether this AIS status means the vessel cannot manoeuvre freely."""
+    try:
+        return int(status_code) in RESTRICTED_NAV_STATUS_CODES
+    except (TypeError, ValueError):
+        return False
+
+
 def decode_nav_status(status_code: int) -> str:
-    return NAVIGATIONAL_STATUS.get(status_code, f"Unknown({status_code})")
+    """The AIS status as words.
+
+    Spaced rather than CamelCase because this string is read: it reaches vessel
+    headlines and the reasoning prompt, where "restrictedmanoeuverability" is a
+    word nobody writes and the model has never seen.
+    """
+    label = NAVIGATIONAL_STATUS.get(status_code)
+    if not label:
+        return f"Unknown({status_code})"
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label)

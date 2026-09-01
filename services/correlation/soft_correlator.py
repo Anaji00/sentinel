@@ -48,6 +48,28 @@ logger = logging.getLogger("correlation.soft")
 # one can be dropped once nothing needs it.
 EVENT_COLLECTION = "sentinel_events_v2"
 
+# Event types that say only "this thing is here now".
+#
+# A position fix makes no claim, so there is nothing for it to converge with,
+# and its headline is a filled-in template: "Flight TGW405 position in Strait of
+# Malacca" against "Vessel MSC MARA position in Strait of Malacca" share almost
+# every token. A sentence encoder scores that pair very highly and it means
+# nothing -- a ship and an aircraft near the same strait is geography, not a
+# relationship. Observed: the container ship MSC MARA was published as
+# "semantically converged" with an aviation emergency alert on exactly that
+# resemblance, and the two share no connection beyond a place name.
+#
+# Excluded from the index entirely rather than filtered at query time: something
+# that cannot be evidence should not be stored as evidence. Dark, spoofed and
+# anomalous position events are deliberately NOT listed -- those are findings
+# about a vessel or aircraft, and a finding is the kind of thing worth
+# correlating.
+POSITION_TELEMETRY_TYPES = frozenset({
+    "vessel_position",
+    "vessel_static",
+    "flight_position",
+})
+
 SIMILARITY_THRESHOLD_DEFAULT = 0.65
 
 
@@ -306,9 +328,17 @@ class SoftCorrelator:
                 return {}
 
     async def store(self, event: NormalizedEvent, embedding: List[float]):
-        """Store event embedding in Qdrant with metadata for later retrieval."""
+        """Store event embedding in Qdrant with metadata for later retrieval.
+
+        Routine position telemetry is never stored, so it can neither trigger a
+        semantic match nor be offered as evidence for one -- see
+        POSITION_TELEMETRY_TYPES.
+        """
         # Safety check: Do nothing if the system isn't enabled or connected.
         if not self._enabled or not self._client:
+            return
+        event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+        if event_type in POSITION_TELEMETRY_TYPES:
             return
         try:
             # 'Upsert' means "Insert if it doesn't exist, Update if it does".
@@ -356,12 +386,20 @@ class SoftCorrelator:
                 query_vector=embedding,
                 # We fetch extra results because the filter step (must_not) might remove some.
                 limit=limit + 20,   # fetch extra to filter by domain
+                # Telemetry is excluded here as well as at write time. The
+                # write gate stops new position fixes entering the index; this
+                # stops the ones already in it from being returned as evidence
+                # for as long as they take to age out.
                 query_filter=models.Filter(
                     must_not=[
                         models.FieldCondition(
-                            key="domain", 
+                            key="domain",
                             match=models.MatchValue(value=exclude_domain)
-                        )
+                        ),
+                        models.FieldCondition(
+                            key="type",
+                            match=models.MatchAny(any=sorted(POSITION_TELEMETRY_TYPES)),
+                        ),
                     ]
                 ),
                 score_threshold=self._similarity_calibrator.threshold,

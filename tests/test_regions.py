@@ -65,21 +65,26 @@ def test_region_sensitivity(region_name, expected_sensitive, min_multiplier):
 
 # ── 3. ITU AIS NAVIGATIONAL STATUS DECODING (CODES 0-15) ──────────────────────
 
+# Spaced, not CamelCase. These strings are read: they reach vessel headlines
+# and the reasoning prompt, and a live headline said "Tanker 'BANDA'
+# restrictedmanoeuverability in Turkish Straits" -- a word nobody writes and no
+# model has seen. The detector no longer reads them at all; it matches the AIS
+# code, because prose-matching a display label is what hid status 2.
 @pytest.mark.parametrize("status_code, expected_label", [
-    (0, "UnderWayUsingEngine"),
+    (0, "Under Way Using Engine"),
     (1, "Anchored"),
-    (2, "NotUnderCommand"),
-    (3, "RestrictedManoeuverability"),
-    (4, "ConstrainedByDraught"),
+    (2, "Not Under Command"),
+    (3, "Restricted Manoeuverability"),
+    (4, "Constrained By Draught"),
     (5, "Moored"),
     (6, "Aground"),
-    (7, "EngagedInFishing"),
-    (8, "UnderWaySailing"),
-    (9, "ReservedHSC"),
-    (10, "ReservedWIG"),
-    (11, "TowingAstern"),
-    (12, "PushingAheadTowingAlongside"),
-    (13, "ReservedFuture"),
+    (7, "Engaged In Fishing"),
+    (8, "Under Way Sailing"),
+    (9, "Reserved HSC"),
+    (10, "Reserved WIG"),
+    (11, "Towing Astern"),
+    (12, "Pushing Ahead Towing Alongside"),
+    (13, "Reserved Future"),
     (14, "AIS-SART Active"),
     (15, "Undefined"),
     (99, "Unknown(99)"),

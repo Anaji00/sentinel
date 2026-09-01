@@ -27,6 +27,25 @@ logger = logging.getLogger("reasoning.patterns")
 # We pull this out as a constant so it's easy to tune the strictness of historical matches.
 SIMILARITY_TAGS_THRESHOLD = 2   # minimum tag overlap to consider a pattern similar
 
+def _as_iso(value) -> str:
+    """A timestamp as ISO text, whatever shape the driver returned it in.
+
+    `created_at.isoformat()` assumed a datetime. When the column arrives as a
+    string -- which it does, depending on the cursor -- that raises
+    AttributeError, which the formatter's `except (TypeError, ValueError)` does
+    not catch. It escaped to the caller's handler, which returns [] for any
+    failure, so a type mismatch on one field silently disabled precedent
+    retrieval for every scenario the system generated. The log said "Error
+    fetching similar patterns" and the pipeline carried on without them.
+    """
+    if not value:
+        return ""
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(value)
+
+
 class PatternLibrary:
     def __init__(self, db_client):
         self._db = db_client
@@ -144,16 +163,16 @@ class PatternLibrary:
                 "rule":         row_dict.get("rule_id", ""),
                 "tags":         row_dict.get("correlation_tags", []),
                 "description":  row_dict.get("description", ""),
-                "date":         row_dict["created_at"].isoformat() if row_dict.get("created_at") else "",
+                "date":         _as_iso(row_dict.get("created_at")),
             }
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError):
             # Fallback for strict tuple cursors
             return {
                 "scenario_id":  str(row[0]) if row[0] else "",
                 "headline":     row[1] or "",
                 "outcome":      row[2] or "",
                 "confidence":   row[3],
-                "date":         row[4].isoformat() if row[4] else "",
+                "date":         _as_iso(row[4]),
                 "rule":         row[5] or "",
                 "tags":         row[6] or [],
                 "description":  row[7] or ""

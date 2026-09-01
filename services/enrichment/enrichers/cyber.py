@@ -176,7 +176,21 @@ class CyberEnricher:
         if not hijack and not is_critical: return None
         
         entity_id = f"AS{origin}"
-        vel = await self._calculate_velocity("bgp", entity_id, threshold=50) if not hijack else 0.0
+        # Velocity is measured for hijacks too.
+        #
+        # `if not hijack else 0.0` zeroed it for exactly the population that
+        # needs telling apart, and the arithmetic made the outcome certain: of
+        # the three features the blend uses, betweenness_centrality is
+        # permanently 0 because this deployment has no GDS plugin (0 gds.*
+        # procedures), and path_novelty is 1.0 for a hijack almost by
+        # definition -- announcing a prefix you have never announced is what a
+        # hijack is. With velocity forced to 0 as well, every event scored
+        # 0.70 + 0.30 x (0.5 x 1.0) = 0.850. All 219 in a 45-minute window did.
+        #
+        # An AS announcing hijacked prefixes in a burst is a different event
+        # from one doing it once, and that difference is the only one this
+        # deployment can still measure.
+        vel = await self._calculate_velocity("bgp", entity_id, threshold=50)
         
         # Graph-topology-aware BGP scoring:
         # Queries Neo4j for betweenness centrality, degree, path novelty, and

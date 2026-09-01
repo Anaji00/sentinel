@@ -187,8 +187,26 @@ services:
     image: redis:7.2-alpine
     container_name: sentinel-redis
     restart: unless-stopped
+    # Eviction policy: volatile-lru, not allkeys-lru.
+    #
+    # allkeys-lru evicts anything, including state the system means to keep
+    # forever. Verified live during market hours: used_memory peaked at 744MB
+    # against this 512MB cap and 83,289 keys were evicted, taking with them
+    # every recorded prediction, sentinel:equities:valid_set (the universe
+    # backing ticker confirmation) and the earnings cache. A prediction is
+    # written once and read at resolution 24 hours later, which makes it
+    # exactly what an LRU gives up first -- so "one prediction, ever" was
+    # partly a measurement of eviction rather than of the agents.
+    #
+    # volatile-lru confines eviction to keys carrying a TTL, which are the
+    # ones whose authors said they were disposable. Keys with no TTL are then
+    # never silently dropped; if memory is exhausted with nothing volatile
+    # left, writes fail loudly instead, which is a failure that can be seen.
+    #
+    # The 512mb cap is left alone deliberately: the observed peak is 45% over
+    # it, so raising it is a host-memory decision rather than a config tidy.
     command: >
-      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy volatile-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     volumes:
       - redis_data:/data
     deploy:
@@ -289,6 +307,8 @@ services:
     container_name: sentinel-reasoning
     command: python services/reasoning/main.py
     env_file: .env
+    environment:
+      - SENTINEL_SERVICE=reasoning
     volumes:
       - ./services:/app/services
       - ./shared:/app/shared
@@ -387,14 +407,52 @@ services:
       # tiers are called in bursts, so residency is worth 2.9 GB of the
       # ~16 GB headroom. Set to a duration (e.g. 5m) to reclaim it instead.
       - OLLAMA_KEEP_ALIVE=-1
-      # Both tiers must stay resident: agents-heavy and agents-fast request
-      # different models, and a value of 1 evicts/reloads on every alternating
-      # request -- far more costly than the memory it saves.
-      - OLLAMA_MAX_LOADED_MODELS=2
-      - OLLAMA_KV_CACHE_TYPE=q8_0
+      # One resident model, because the tiers now request the same one.
+      #
+      # Two resident models meant two runner processes, and each was started
+      # with NumThreads:6 against this service's 6-core quota -- twelve
+      # llama.cpp compute threads on six cores. Measured: 263% + 243% CPU, 506%
+      # of the 600% available, with 87 and 57 minutes of CPU time accumulated in
+      # 35 minutes of wall clock. llama.cpp threads busy-wait at a barrier, so
+      # oversubscription does not degrade linearly, it collapses: an eight-token
+      # request did not return in nine minutes, and every agent and reasoning
+      # inference hit the 600s client timeout having produced nothing.
+      #
+      # The earlier reasoning for =2 was sound for the configuration it
+      # described (alternating requests for different models evicting each
+      # other). Consolidating the tiers onto one model removes the alternation
+      # instead, which is strictly better than paying for both.
+      - OLLAMA_MAX_LOADED_MODELS=1
+      # f16, not q8_0. A quantised KV cache trades CPU for memory: every
+      # attention step dequantises. That is the right trade on a GPU short of
+      # VRAM and the wrong one here, where cycles are the scarce resource and
+      # the host has ~15 GB available.
+      - OLLAMA_KV_CACHE_TYPE=f16
     deploy:
       resources:
         limits:
+          # Six, matching OLLAMA_NUM_THREAD in .env and the VM's six physical
+          # cores. tests/test_inference_thread_sizing.py pins the two together.
+          #
+          # Both halves of that pairing were raised and measured, and both were
+          # reverted. Raising the quota alone to 12 did nothing: the thread pool
+          # is what determines usage and it was already matched. Raising the
+          # pool to 12 against 6 physical cores wedged the server in under six
+          # minutes -- no completions, no healthchecks, 624% CPU, in-flight
+          # requests at 4m59s against a 157s baseline -- because llama.cpp
+          # busy-waits at a thread barrier, so oversubscription collapses rather
+          # than degrades. That is the incident already described above,
+          # reproduced by someone who had just read it.
+          #
+          # Widening the VM to all 8 physical cores and running 8 threads did
+          # work, and made the system slower anyway:
+          #
+          #     6 physical / 6 threads    43.3 inferences/hr   mean 157.4s
+          #     8 physical / 8 threads    34.0 inferences/hr   mean 168.0s
+          #
+          # The two cores were never idle -- they were running the other
+          # twenty-five containers. Giving them to the model server starved the
+          # pipeline that feeds it. See .wslconfig for the full note.
           cpus: '6.0'
           # 5G, raised from 4G. MAX_LOADED_MODELS=2 above asks for two
           # resident models and they did not fit: ollama reported
@@ -609,6 +667,11 @@ services:
     command: python services/agents/main.py
     env_file: .env
     environment:
+      # Distinct per replica: metrics are published to sentinel:metrics:{name},
+      # so two tiers sharing a name would overwrite each other's counters and
+      # the inference accounting would be wrong in a quieter way than having
+      # none at all.
+      - SENTINEL_SERVICE=agents-fast
       - AGENT_TIER_FILTER=fast
       - AGENT_MODEL=qwen2.5:1.5b
       - OLLAMA_FALLBACK_MODEL=gemma3:1b
@@ -646,10 +709,20 @@ services:
     command: python services/agents/main.py
     env_file: .env
     environment:
+      - SENTINEL_SERVICE=agents-heavy
       - AGENT_TIER_FILTER=heavy
       # 3b, not 7b: on a 15W Zen 2 part 7b yields ~3-5 tok/s, and keeping it
       # resident alongside the fast tier exceeds the VM memory budget.
-      - AGENT_MODEL=qwen2.5:3b
+      # Same model as agents-fast, deliberately.
+      #
+      # A separate 3b for this tier bought better answers in principle and none
+      # in practice: it forced a second resident runner, the two oversubscribed
+      # the CPU quota, and both tiers then timed out at 600s having produced
+      # nothing. A 1.5b that answers is worth more than a 3b that does not.
+      #
+      # Revisit if this deployment gets a GPU or a larger CPU allocation, where
+      # the two runners would no longer contend.
+      - AGENT_MODEL=qwen2.5:1.5b
       - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1

@@ -163,6 +163,26 @@ async def main():
     }
     logger.info("Shared infrastructure connected")
 
+    # Publish this process's metrics, so inference can be accounted for.
+    #
+    # MetricsCollector.increment("ollama_calls_total") has run in this service
+    # since it was written, and never left the process: bind_redis() had exactly
+    # one caller, a collector-specific helper, so only the collectors ever
+    # published. The module's own docstring describes cross-process aggregation
+    # as the problem it solves, and the services doing all the inference were
+    # not participating in it.
+    #
+    # The cost was not a missing dashboard. It made "how much model time does
+    # each agent consume" unanswerable from inside, which left parsing Ollama's
+    # access log by container IP as the only option -- and Docker reassigns
+    # those on restart, so the attribution was wrong in a way that took two
+    # corrections to notice.
+    try:
+        from shared.utils.metrics import bind_redis
+        await bind_redis(shared_infra["redis"], service_name=os.getenv("SENTINEL_SERVICE", "agents"))
+    except Exception as e:
+        logger.debug("Metrics binding skipped: %s", e)
+
     from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
 
     connector = aiohttp.TCPConnector(limit=20)

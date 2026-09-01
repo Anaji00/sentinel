@@ -164,17 +164,63 @@ class MacroIntelligenceEngine(SentinelAgent):
         ]
         vals = await self.redis.raw.mget(keys)
 
-        y2 = float(vals[0] or 4.25)
-        y10 = float(vals[1] or 4.15)
-        raw_tips = vals[2] or vals[3]
-        tips_val = float(raw_tips) if raw_tips else 1.85
-        tips_yield = tips_val if tips_val < 15.0 else 1.85
-        hyg = float(vals[4] or 77.5)
-        lqd = float(vals[5] or 108.2)
+        # No defaults. These were 4.25 / 4.15 / 1.85 / 77.5 / 108.2, and the
+        # quote keys have never been populated -- US2Y, US10Y, HYG and LQD are
+        # all empty -- so every evaluation this engine has ever published was
+        # computed from those constants:
+        #
+        #   📊 Macro Rates Evaluation | 2Y: 4.25% | 10Y: 4.15% | Spread: -10.0 bps
+        #
+        # identically, every hour. A 2s10s spread of -10bp is an inverted curve,
+        # which is a recession signal, and it was arithmetic on two numbers
+        # somebody typed. It then went into the model's prompt as "2Y Yield:
+        # 4.250% | 10Y Yield: 4.150%", stated as measurement.
+        #
+        # A missing input must produce no reading, not a plausible one. The
+        # same rule has_excitation_path() applies to the Hawkes model: refuse
+        # rather than restate a constant as an observation.
+        def _quote(raw, label):
+            if raw in (None, "", b""):
+                return None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return value
+
+        y2 = _quote(vals[0], "US2Y")
+        y10 = _quote(vals[1], "US10Y")
+
+        # TIPS is a *yield* here. vals[3] is the TIP ETF's price -- 106.82 --
+        # and the old `tips_val < 15.0` guard silently caught that and swapped
+        # in 1.85, which is how a fabricated 230bp breakeven reached the prompt.
+        # A price is not a substitute for the yield; it is a different quantity.
+        tips_yield = _quote(vals[2], "TIPS_YIELD")
+        if tips_yield is not None and not (-5.0 < tips_yield < 15.0):
+            logger.warning(
+                "Discarding TIPS_YIELD=%.3f: outside the range a real yield occupies. "
+                "A price posted to a yield key is the usual cause.", tips_yield,
+            )
+            tips_yield = None
+
+        hyg = _quote(vals[4], "HYG")
+        lqd = _quote(vals[5], "LQD")
+
+        if y2 is None or y10 is None:
+            logger.warning(
+                "Skipping macro rates evaluation: US2Y=%s US10Y=%s. Without both "
+                "legs there is no curve to report, and a default would publish a "
+                "recession signal nobody measured.",
+                "present" if y2 is not None else "MISSING",
+                "present" if y10 is not None else "MISSING",
+            )
+            return None
 
         spread_2y10y_bps = (y10 - y2) * 100.0
-        breakeven_inflation_bps = (y10 - tips_yield) * 100.0
-        credit_ratio = hyg / max(1.0, lqd)
+        breakeven_inflation_bps = (
+            (y10 - tips_yield) * 100.0 if tips_yield is not None else None
+        )
+        credit_ratio = (hyg / lqd) if (hyg and lqd and lqd > 0) else None
 
         # Atomic Redis pipeline write for rolling history
         async with self.redis.raw.pipeline(transaction=True) as pipe:
@@ -189,6 +235,13 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         logger.info(f"📊 Macro Rates Evaluation | 2Y: {y2:.2f}% | 10Y: {y10:.2f}% | Spread: {spread_2y10y_bps:+.1f} bps")
 
+        # "not measured" is a fact the analyst needs; a number implies it was.
+        tips_str = f"{tips_yield:.3f}%" if tips_yield is not None else "not measured"
+        breakeven_str = (
+            f"{breakeven_inflation_bps:.1f} bps" if breakeven_inflation_bps is not None
+            else "not measured"
+        )
+
         cross_context = await self.get_cross_agent_context(ticker="US10Y", limit=2)
         cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
 
@@ -196,8 +249,8 @@ class MacroIntelligenceEngine(SentinelAgent):
         Analyze Treasury yield curve and inflation metrics:
         - 2Y Yield: {y2:.3f}% | 10Y Yield: {y10:.3f}%
         - 2Y-10Y Spread: {spread_2y10y_bps:+.1f} bps
-        - 10Y TIPS Real Yield: {tips_yield:.3f}%
-        - Breakeven Inflation: {breakeven_inflation_bps:.1f} bps
+        - 10Y TIPS Real Yield: {tips_str}
+        - Breakeven Inflation: {breakeven_str}
         - HYG/LQD Credit Ratio: {credit_ratio:.4f}
         {cross_block}
         """

@@ -109,6 +109,38 @@ BASELINE_EMA_ALPHA = 0.25        # slow enough that one odd window is not the ne
 BASELINE_RETENTION_WINDOWS = 24  # remember an entity's rate for a day of windows
 
 
+# The most of a score's headroom that all boosts together may consume.
+MAX_TOTAL_LIFT_SHARE = float(os.getenv("ANOMALY_MAX_TOTAL_LIFT", "0.55"))
+
+
+def lift_score(anomaly: float, weight: float, spent: float = 0.0) -> float:
+    """Raises a score by a share of the headroom above it, within a budget.
+
+    The alternative -- `min(1.0, anomaly + boost)` -- is why boosted events
+    cluster on the ceiling: addition has no notion of how much room is left, so
+    a 0.85 score with two 0.15 boosts is simply 1.0, indistinguishable from a
+    0.99 score with the same boosts. The tradfi enricher was converted to a
+    headroom lift for exactly this reason; the crypto paths were not, and their
+    candle events still piled a third of the population into the top decile
+    after the detector itself had been recalibrated.
+
+    `spent` is the fraction of headroom already consumed on this event, so a
+    sequence of boosts shares one allowance instead of each taking a share of
+    what the last one left.
+    """
+    try:
+        base = float(anomaly)
+        w = float(weight)
+    except (TypeError, ValueError):
+        return anomaly
+    if not (0.0 <= base <= 1.0) or w <= 0:
+        return anomaly
+    remaining = max(0.0, MAX_TOTAL_LIFT_SHARE - max(0.0, float(spent)))
+    if remaining <= 0.0:
+        return anomaly
+    return round(base + (1.0 - base) * min(remaining, w), 6)
+
+
 class DynamicAnomalyScorer:
     def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
         if redis_client is None:
@@ -613,9 +645,28 @@ class DynamicAnomalyScorer:
         return [r["score"] for r in res]
 
     async def score_crypto_candle(self, asset: str, features: list) -> float:
-        if len(features) >= 3:
-            features[2] = await self._dynamic_normalize(f"crypto:{asset}", "candle_notional", features[2])
-        res = await self.score_event("crypto_candle", asset, (features + [0.0] * 5)[:5])
+        """Scores a candle. The caller's feature list is left as it was found.
+
+        This normalised in place -- `features[2] = ...` on the list the caller
+        passed -- so index 2 stopped being a notional in dollars the moment the
+        score was taken, and became a z-score. Every reader downstream still
+        believed it was money: the crypto and tradfi structural-anomaly
+        headlines both render it as `${notional/1e6:.1f}M vol`, which is how a
+        genuine $3.2M ETHUSDT bar came to be published as "on $-0.0M vol" -- a
+        z-score of about -0.03, divided by a million.
+
+        Nothing was wrong with the volume. It survives correctly all the way
+        into the stored event's size_tokens; only the headline's copy was
+        overwritten, by the scoring call sitting between the two reads.
+
+        Scoring is unchanged: the normalised value is still what reaches
+        score_event. It is now computed into a copy, so producing a score stops
+        being a side effect on the caller's data.
+        """
+        scored = list(features)
+        if len(scored) >= 3:
+            scored[2] = await self._dynamic_normalize(f"crypto:{asset}", "candle_notional", scored[2])
+        res = await self.score_event("crypto_candle", asset, (scored + [0.0] * 5)[:5])
         return res["score"]
 
     async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
@@ -640,9 +691,11 @@ class DynamicAnomalyScorer:
         return [r["score"] for r in res]
 
     async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
-        if len(features) >= 3:
-            features[2] = await self._dynamic_normalize(f"{domain}:{ticker}", "candle_notional", features[2])
-        res = await self.score_event("tradfi_candle", ticker, (features + [0.0] * 5)[:5])
+        """As score_crypto_candle: scores a copy, never the caller's list."""
+        scored = list(features)
+        if len(scored) >= 3:
+            scored[2] = await self._dynamic_normalize(f"{domain}:{ticker}", "candle_notional", scored[2])
+        res = await self.score_event("tradfi_candle", ticker, (scored + [0.0] * 5)[:5])
         return res["score"]
 
     async def score_prediction_trade(self, asset_id: str, notional: float) -> float:
@@ -763,7 +816,18 @@ class DynamicAnomalyScorer:
 
             pipe = self.redis.raw.pipeline()
             pipe.incr(key)
-            pipe.expire(key, window_seconds)
+            # TTL, not a fresh EXPIRE.
+            #
+            # Re-arming the expiry on every event meant the counter for an
+            # active entity never rolled over: `count` grew monotonically for as
+            # long as the entity kept emitting, so the `count <= 1` branch below
+            # never ran again and the baseline it advances stayed frozen at its
+            # first value. `ratio` then climbed without bound and this returned
+            # FREQUENCY_BOOST_CAP forever -- the constant score this rewrite
+            # exists to remove, reintroduced for precisely the high-rate
+            # entities it was measured on. The window is armed once, when the
+            # key is created, and is then allowed to expire.
+            pipe.ttl(key)
             pipe.get(baseline_key)
             pipe.get(last_key)
             results = await pipe.execute()
@@ -771,6 +835,15 @@ class DynamicAnomalyScorer:
             count = float(results[0] or 0)
             baseline = _as_float(results[2])
             previous_window = _as_float(results[3])
+
+            # -1 is "exists with no expiry", -2 is "gone". Either way the window
+            # needs arming, and only then.
+            try:
+                current_ttl = int(results[1]) if results[1] is not None else -2
+            except (TypeError, ValueError):
+                current_ttl = -2
+            if current_ttl < 0:
+                await self.redis.raw.expire(key, window_seconds)
 
             # The baseline moves only at a window boundary. Updating it on every
             # event lets it chase the count inside the window, so a burst is

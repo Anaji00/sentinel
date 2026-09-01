@@ -55,6 +55,15 @@ VALID_PREDICATES: Set[str] = {
 
     # 4. Statistical & Quantitative Causal Family (§3.5)
     "STATISTICALLY_CORRELATED_WITH", # Empirical correlation (properties: method, window, coefficient, p_value)
+    # A measured comparable: two issuers whose *returns* co-move over a common
+    # window, which is what an earnings surprise actually travels along. Distinct
+    # from STATISTICALLY_CORRELATED_WITH, which records any discovered
+    # relationship including cross-asset and cross-domain ones, and from
+    # SYMPATHY_MOVER, which is a model's narrative explanation of a transmission
+    # path rather than a measurement of one. Carries a signed coefficient, so an
+    # inverse peer -- a hedge, or a share-shift pair where one name's loss is
+    # another's gain -- is still a peer and still transmits, the other way.
+    "PEER_OF",
     "GRANGER_CAUSES",                # Directional predictive causality (properties: lag, f_stat, p_value)
     "HAWKES_EXCITES",                # Cross-domain self/mutually exciting point process (branching_ratio, half_life)
 }
@@ -106,6 +115,7 @@ def validate_data_boundary_compliance(category: str) -> bool:
 
 STATISTICAL_PREDICATES: Set[str] = {
     "STATISTICALLY_CORRELATED_WITH",
+    "PEER_OF",
     "GRANGER_CAUSES",
     "HAWKES_EXCITES",
     "SYMPATHY_MOVER",

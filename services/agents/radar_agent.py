@@ -1,14 +1,52 @@
 import json
+import os
 import time
 from typing import Any, Dict, Optional, List
 from pydantic import BaseModel
-from services.agents.base import SentinelAgent
+from services.agents.base import InferenceBatcher, SentinelAgent
 from shared.kafka import Topics
-from shared.utils.equities import is_valid_primary_equity
+from shared.utils.equities import BROAD_MARKET_ETFS, is_valid_primary_equity
 
 class RadarDecision(BaseModel):
     investigate: bool
     rationale: str
+
+
+class RadarCandidateDecision(BaseModel):
+    """One ticker's verdict inside a batched answer."""
+    ticker: str
+    investigate: bool
+    rationale: str
+
+
+class RadarBatchDecision(BaseModel):
+    """Many verdicts from one inference.
+
+    The scarce resource is the call, not the token: a budget slot opens every
+    600s and an inference runs three to six minutes, so deciding one ticker per
+    call capped this agent near twenty decisions an hour against a stream of
+    roughly a hundred and fifty thousand events. Asking about ten candidates at
+    once costs one extra prompt line each and returns ten verdicts.
+    """
+    decisions: List[RadarCandidateDecision]
+
+class RadarCandidateDecision(BaseModel):
+    """One ticker's verdict inside a batched answer."""
+    ticker: str
+    investigate: bool
+    rationale: str
+
+
+class RadarBatchDecision(BaseModel):
+    """Many verdicts from one inference.
+
+    The unit of scarcity here is the call, not the token: a slot opens every
+    600s and an inference runs three to six minutes, so deciding one ticker per
+    call capped the agent at roughly twenty decisions an hour. Asking about ten
+    at once costs one extra line of prompt each and returns ten verdicts.
+    """
+    decisions: List[RadarCandidateDecision]
+
 
 class WatchlistPruneDecision(BaseModel):
     evict_tickers: List[str]
@@ -39,10 +77,85 @@ def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
     return 0.0
 
 
+# How many tickers one inference decides, and how long a lone candidate waits
+# for company. Twenty seconds is negligible against a 600s budget slot and a
+# multi-minute inference, so batching costs a candidate almost no latency and
+# buys the agent an order of magnitude of coverage.
+RADAR_BATCH_SIZE = int(os.getenv("RADAR_BATCH_SIZE", "10"))
+RADAR_BATCH_WAIT_SEC = float(os.getenv("RADAR_BATCH_WAIT_SEC", "20"))
+
+
 class RadarAgent(SentinelAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.cooldown_seconds = 86400
+        self._decision_batcher = InferenceBatcher(
+            name="radar_decisions",
+            flush_fn=self._decide_batch,
+            max_items=RADAR_BATCH_SIZE,
+            max_wait_sec=RADAR_BATCH_WAIT_SEC,
+            logger=self.logger,
+            max_waiters=self.dispatch_concurrency,
+        )
+
+    async def _decide_batch(self, items: List[tuple]) -> Dict[str, "RadarCandidateDecision"]:
+        """Judges every queued candidate in a single inference.
+
+        Returns {ticker: decision}. A ticker the model does not answer for is
+        simply absent, and the batcher resolves it to None -- no verdict rather
+        than an invented one. That distinction matters: an unanswered ticker
+        must never be recorded as "decided not to investigate", because nothing
+        decided it.
+        """
+        if not items:
+            return {}
+
+        lines = []
+        for _, c in items:
+            line = (f"- {c['ticker']}: z-score {c['z_score']:.2f}, "
+                    f"1-minute flow ${c['notional_usd'] / 1e6:.2f}M, regime: {c['regime']}")
+            if c.get("cross_context"):
+                line += f" | prior agent context: {c['cross_context']}"
+            lines.append(line)
+        candidates = "\n".join(lines)
+        tickers = [c["ticker"] for _, c in items]
+
+        prompt = (
+            f"A background radar has flagged institutional volume anomalies on "
+            f"{len(items)} primary US-listed instruments.\n\n"
+            f"CANDIDATES\n{candidates}\n\n"
+            "For EACH candidate decide whether the flow warrants active high-frequency "
+            "tracking. Look for 'smart money' sweeps: size that is large relative to that "
+            "instrument's own regime, not merely large in dollars. Judge each on its own "
+            "metrics -- these are unrelated instruments and a verdict on one says nothing "
+            "about another.\n\n"
+            "Return one decision per candidate, for every ticker listed and no others.\n"
+            "Return ONLY valid JSON:\n"
+            '{"decisions": [{"ticker": "<exactly one of: ' + ", ".join(tickers) + '>", '
+            "\"investigate\": true, \"rationale\": \"<one sentence citing that candidate's own numbers>\"}]}"
+        )
+
+        # One budget slot, one telemetry record, one model call, for the whole
+        # batch. The first candidate's message carries the trace.
+        batch = await self._execute_with_telemetry(
+            message=items[0][1].get("message", {}),
+            system_prompt="You are a quantitative trading systems engineer judging institutional order flow.",
+            user_prompt=prompt,
+            schema=RadarBatchDecision,
+            temperature=0.1,
+            # ~48 tokens of verdict per candidate plus JSON scaffolding.
+            num_predict=min(1024, 96 + 48 * len(items)),
+        )
+
+        wanted = {t.upper() for t in tickers}
+        out: Dict[str, RadarCandidateDecision] = {}
+        for d in (getattr(batch, "decisions", None) or []):
+            name = str(getattr(d, "ticker", "")).strip().upper()
+            # Only tickers actually asked about: a model that invents a symbol
+            # must not have that verdict acted on.
+            if name in wanted and name not in out:
+                out[name] = d
+        return out
     
     @property
     def output_topic(self) -> str:
@@ -172,11 +285,112 @@ class RadarAgent(SentinelAgent):
         except Exception as e:
             self.logger.warning(f"Error during watchlist pruning: {e}")
 
+    # A reserved inference slot.
+    #
+    # Radar batches its decisions, so one slot is worth up to RADAR_BATCH_SIZE
+    # verdicts rather than one -- which is exactly the argument for giving it a
+    # slot it can rely on. Measured while sharing the common budget: 26
+    # candidates queued over ten minutes and not one batch reached the model,
+    # because knowledge_graph_engine, rule_synthesizer and
+    # stock_correlation_agent kept winning the shared key first. Batching
+    # multiplied the value of a slot radar was not getting.
+    INFERENCE_LANE = "radar"
+
+    # Bars needed before a regime estimate says anything. Below this, Hurst and
+    # GARCH are fitting noise.
+    MIN_REGIME_BARS = 20
+
+    async def _fetch_close_history(self, ticker: str, limit: int = 120) -> tuple:
+        """Hourly closes for a ticker, oldest first. Redis first, then the bars.
+
+        The Redis list is a hot cache appended once per hour-bucket rollover, so
+        it holds one entry per hour of continuous uptime for that ticker.
+        Measured across live equities it held one or two -- against the twenty
+        required before Hurst or GARCH would be computed. So the regime line
+        read "Hurst/GARCH Regime: Baseline Initialization" for every ticker on
+        every evaluation, and the model was told nothing about the instrument's
+        behaviour while tradfi_bars_1h held 68 bars for those same names. The
+        history was collected, aggregated and stored correctly, and simply never
+        consulted.
+
+        Returned oldest-first, which is also a correction: lrange returns
+        newest-first and simple_returns() reads consecutive pairs as
+        (previous, current), so every return computed from the old path had its
+        sign inverted.
+        """
+        closes: List[float] = []
+        try:
+            raw_candles = await self.redis.raw.lrange(f"sentinel:candles:1h:{ticker}", 0, limit - 1)
+            for c in raw_candles or []:
+                # Per entry, not per list. A single unparseable bar used to
+                # abort the loop and discard every valid one after it, so one
+                # bad write cost the whole series -- and the series going quiet
+                # is indistinguishable from a ticker with no history.
+                try:
+                    item = json.loads(c if isinstance(c, str) else c.decode("utf-8"))
+                    if isinstance(item, dict) and item.get("close") is not None:
+                        closes.append(float(item["close"]))
+                except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+                    continue
+            closes.reverse()          # lrange is newest-first; returns need chronological
+        except Exception as e:
+            self.logger.debug("Redis candle history unavailable for %s: %s", ticker, e)
+
+        if len(closes) >= self.MIN_REGIME_BARS or self.db is None:
+            return closes, "1h"
+
+        # The durable series, coarsest first.
+        #
+        # An hourly regime is the one worth having, but the hourly aggregate
+        # only holds what the collector has been up to accumulate: measured,
+        # 8 bars for MSFT and META against the 20 a regime estimate needs, while
+        # the 15-minute aggregate held 21 and the 5-minute 40. Falling back to a
+        # finer bucket is the difference between a regime and "Baseline
+        # Initialization" forever.
+        #
+        # The timeframe is returned with the series because it changes what the
+        # number means: volatility over 5-minute bars is not volatility over
+        # hourly ones, and telling a model "GARCH volatility 3%" without saying
+        # over what is how a figure gets read as something it is not.
+        for table, label in (("tradfi_bars_1h", "1h"),
+                             ("tradfi_bars_15m", "15m"),
+                             ("tradfi_bars_5m", "5m")):
+            try:
+                rows = await self.db.query(
+                    f"""
+                    SELECT close FROM (
+                        SELECT close, bucket_time FROM {table}
+                        WHERE ticker = $1 AND close IS NOT NULL
+                        ORDER BY bucket_time DESC LIMIT $2
+                    ) recent ORDER BY bucket_time ASC
+                    """,
+                    ticker, limit,
+                )
+                durable = [float(r["close"]) for r in (rows or []) if r.get("close") is not None]
+                if len(durable) >= self.MIN_REGIME_BARS:
+                    return durable, label
+                if len(durable) > len(closes):
+                    closes = durable
+            except Exception as e:
+                self.logger.debug("Candle history unavailable for %s from %s: %s", ticker, table, e)
+
+        return closes, "1h"
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ticker, z_score, notional_usd = self._extract_radar_params(message)
 
         # 1. PRIMARY EQUITY & DERIVATIVE FILTER (No NVDY, options, derivatives, or crypto)
-        if not ticker or not is_valid_primary_equity(ticker):
+        #
+        # Index and sector funds pass too. is_valid_primary_equity answers "is
+        # this a company", and it now correctly says no to SPY, QQQ and the rest
+        # of BROAD_MARKET_ETFS -- but that is not the question here. The
+        # collector subscribes SPY and QQQ as core anchors and enrichment scores
+        # their blocks, so gating on the company test alone meant a $200M SPY
+        # block was collected, enriched, and then dropped on this line. Leveraged
+        # and inverse products are still excluded: they are not in this set.
+        if not ticker or not (
+            is_valid_primary_equity(ticker) or ticker.upper() in BROAD_MARKET_ETFS
+        ):
             return None
 
         # 2. HEIGHTENED ANOMALY FLOW GATEKEEPER ($50k notional minimum)
@@ -201,60 +415,57 @@ class RadarAgent(SentinelAgent):
         from shared.utils import quant_calc
         import numpy as np
 
-        closes = []
-        try:
-            raw_candles = await self.redis.raw.lrange(f"sentinel:candles:1h:{ticker}", 0, -1)
-            for c in raw_candles:
-                item = json.loads(c if isinstance(c, str) else c.decode("utf-8"))
-                if isinstance(item, dict):
-                    c_val = item.get("close")
-                    if c_val is not None:
-                        try:
-                            closes.append(float(c_val))
-                        except (ValueError, TypeError):
-                            pass
-        except Exception:
-            pass
+        closes, tf_label = await self._fetch_close_history(ticker)
 
-        if len(closes) >= 20:
+        if len(closes) >= self.MIN_REGIME_BARS:
             returns = quant_calc.simple_returns(closes)
             hurst_val = quant_calc.hurst_exponent(closes)
             garch_vol = quant_calc.garch_volatility(returns, annualize=True)
-            regime_str = f"Hurst Exponent: {hurst_val:.3f} ({'Trending' if hurst_val > 0.5 else 'Mean-Reverting'}) | GARCH(1,1) Volatility: {garch_vol:.2%}"
+            # The timeframe is stated. A GARCH figure means something different
+            # over 5-minute bars than over hourly ones, and an unqualified
+            # percentage invites the reader to assume the wrong one.
+            regime_str = (
+                f"Hurst Exponent: {hurst_val:.3f} "
+                f"({'Trending' if hurst_val > 0.5 else 'Mean-Reverting'}) | "
+                f"GARCH(1,1) Volatility: {garch_vol:.2%} "
+                f"[over {len(closes)} {tf_label} bars]"
+            )
         else:
-            regime_str = "Hurst/GARCH Regime: Baseline Initialization"
+            regime_str = (
+                f"Hurst/GARCH Regime: insufficient history "
+                f"({len(closes)} bars, {self.MIN_REGIME_BARS} needed)"
+            )
 
         self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M | {regime_str}")
         entity_context = await self.fetch_entity_context(ticker)
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=2)
         cross_block = f"\nCross-Agent Intelligence:\n{cross_context}\n" if cross_context else ""
         
-        prompt = f"""
-        You are a quantitative trading systems engineer.
-        A background radar has detected an institutional volume anomaly for primary US equity: {ticker}.
-        
-        Metrics:
-        - Z-Score: {z_score:.2f} (standard deviations above the EMA)
-        - Notional 1-Minute Flow: ${notional_usd / 1_000_000:.2f} Million
-        - Instrument Regime: {regime_str}
-        {cross_block}
-        {entity_context}
-        
-        Determine if this ${notional_usd / 1_000_000:.2f}M anomaly warrants active high-frequency tracking. 
-        Focus on identifying 'smart money' sweeps.
-        Return ONLY valid JSON.
-        Schema: {{"investigate": boolean, "rationale": "string"}}
-        """
-
         try:
-            decision = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are a quantitative trading systems engineer.",
-                user_prompt=prompt,
-                schema=RadarDecision,
-                temperature=0.1,
-                num_predict=256,
+            # Queued rather than dispatched. The batcher answers this ticker
+            # together with whatever else arrives in the same short window, so
+            # one budget slot covers up to RADAR_BATCH_SIZE candidates instead
+            # of one. Awaiting a single ticker's verdict reads exactly as the
+            # direct call did.
+            decision = await self._decision_batcher.submit(
+                ticker,
+                {
+                    "ticker": ticker,
+                    "z_score": z_score,
+                    "notional_usd": notional_usd,
+                    "regime": regime_str,
+                    "entity_context": entity_context,
+                    "cross_context": cross_context,
+                    "message": message,
+                },
             )
+
+            # None means no verdict was reached -- shed, timed out or
+            # unparseable. Distinct from a verdict of False, and treated as
+            # "do not escalate" without recording a decision that was never made.
+            if decision is None:
+                self.logger.debug("No radar verdict reached for %s", ticker)
+                return None
 
             if decision.investigate:
                 self.logger.info(f"🧠 AGENT ESCALATION: {ticker} -> Primary Surveillance. Rationale: {decision.rationale}")
@@ -267,6 +478,37 @@ class RadarAgent(SentinelAgent):
                     pipe.zremrangebyrank("sentinel:watched:equities", 0, -46)
                     await pipe.execute()
                 
+                # Publish the thesis, so the escalation reaches the swarm.
+                #
+                # RadarAgent appeared in neither the publish_bulletin nor the
+                # record_prediction call graph -- and it is the one agent that
+                # reliably wins an inference slot, since it holds a reserved
+                # lane. The agents that do publish are the ones that rarely get
+                # a slot at all, so "no bulletin has ever completed end to end"
+                # had two causes and only one of them was capacity. This is the
+                # other: the working agent was never wired to the output.
+                #
+                # Deliberately NOT a prediction. RadarDecision is
+                # {investigate, rationale} -- it says this instrument deserves
+                # attention, not which way it will move. Recording a direction
+                # here would invent a claim the agent never made and then score
+                # a track record against it, which is the failure this codebase
+                # has spent its time removing.
+                await self.publish_bulletin(
+                    bulletin_type="thesis",
+                    summary=f"{ticker} escalated to primary surveillance: {decision.rationale}",
+                    ticker=ticker,
+                    conviction=min(1.0, max(0.0, z_score / 10.0)),
+                    expected_direction="neutral",
+                    payload={
+                        "z_score": round(z_score, 2),
+                        "notional_usd": round(notional_usd, 2),
+                        "regime": regime_str,
+                        "rationale": decision.rationale,
+                    },
+                    ttl_seconds=6 * 3600,
+                )
+
                 await self.mark_processed(ticker, self.cooldown_seconds)
 
                 return {

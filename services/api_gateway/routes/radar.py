@@ -432,17 +432,39 @@ async def get_market_series(
         try:
             rows = await db.query(
                 """
+                -- Matched on upper(column), served by
+                -- events_entity_id_upper_time_idx and
+                -- events_entity_name_upper_time_idx (migration 0009).
+                --
+                -- Neither column holds a consistent casing -- each collector
+                -- spells primary_entity_id its own way, which is why the row
+                -- handler below has to .upper() what it reads back. A plain `=`
+                -- against the caller's upper-cased symbols missed every row a
+                -- collector wrote in lower case and returned a blank chart.
+                --
+                -- MATERIALIZED is load-bearing, not decoration. Measured on
+                -- this deployment: with the entity filter and
+                -- `ORDER BY occurred_at DESC LIMIT` in one query, the planner
+                -- takes the LIMIT as licence to walk events_occurred_at_idx
+                -- backwards and filter as it goes -- expecting to hit 60
+                -- matching rows quickly. The entity predicate is far too
+                -- selective for that: only 196 rows in the whole 7-day window
+                -- match, so it walked most of the hypertable and the query took
+                -- 11.8 seconds with both new indexes sitting unused. Fencing
+                -- the selection into a materialised CTE makes it choose the
+                -- BitmapOr over the two expression indexes and sort 196 rows
+                -- afterwards: 107ms, and the fence is what holds the plan.
+                WITH matched AS MATERIALIZED (
+                    SELECT primary_entity_id, primary_entity_name, occurred_at,
+                           anomaly_score, financial_data, crypto_data
+                    FROM events
+                    WHERE (upper(primary_entity_id) = ANY($1::text[])
+                           OR upper(primary_entity_name) = ANY($1::text[]))
+                      AND occurred_at > NOW() - INTERVAL '7 days'
+                )
                 SELECT primary_entity_id, primary_entity_name, occurred_at, anomaly_score,
                        financial_data, crypto_data
-                FROM events
-                -- Matched on the column directly, not LOWER(column): wrapping
-                -- the column in a function makes events_entity_time_idx
-                -- unusable and turns this into a full scan of the events
-                -- hypertable on the request path behind every chart. Symbols
-                -- are upper-cased by the caller and stored upper-cased.
-                WHERE (primary_entity_id = ANY($1::text[])
-                       OR primary_entity_name = ANY($1::text[]))
-                  AND occurred_at > NOW() - INTERVAL '7 days'
+                FROM matched
                 ORDER BY occurred_at DESC
                 LIMIT $2;
                 """,

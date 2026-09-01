@@ -229,6 +229,99 @@ async def _heartbeat_loop(state: dict):
             f"uptime={int(elapsed)}s"
         )
 
+async def _reference_data_loop(redis_client, graph_writer):
+    """Refreshes sector, industry and index membership daily.
+
+    The function this calls has existed, complete and tested, with zero callers.
+    The cost of that was quiet: `sector`, `industry` and `index_membership` are
+    carried on every equity event and were null on all of them, so anything
+    reading them saw an empty field rather than a missing feed.
+
+    It matters more now that peers are derived. Shared sector or index is what
+    corroborates a measured correlation -- two names that co-move *and* sit in
+    the same index are a better contagion path than two that merely co-move --
+    and with reference data absent, every peer edge was carrying the realised
+    half of its evidence alone.
+
+    Daily, offset past startup so it does not compete with the initial backfill
+    for the same Finnhub rate limit.
+    """
+    from services.enrichment.ref_data import refresh_watchlist_reference_data
+
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await refresh_watchlist_reference_data(redis_client, graph_writer=graph_writer)
+        except Exception as e:
+            logger.error(f"Reference data refresh failed: {e}")
+        await asyncio.sleep(86400)
+
+
+# A detector whose output never varies ranks nothing.
+#
+# Seven were found this way, each with a different cause: a category overwriting
+# a measurement, an absolute threshold measuring the ocean, a TypeError killing
+# the graph edge novelty depends on, a divisor saturating at five sigma, a
+# baseline for events that have not happened, an EMA seeded with the very
+# observation it was meant to judge. The only thing they shared was the symptom,
+# and every one of them was invisible until somebody counted.
+#
+# So the system counts. This does not diagnose -- the causes have nothing in
+# common and reading the arithmetic is still the work -- it only says which
+# detector has stopped discriminating, which is the part nobody notices for
+# months.
+SCORE_DIVERSITY_INTERVAL_SEC = 3600
+SCORE_DIVERSITY_WINDOW = "1 hour"
+
+# Below this many events there is no expectation of variety; a detector that
+# fired twice may honestly have two identical answers.
+SCORE_DIVERSITY_MIN_EVENTS = 30
+
+# Event types whose score is legitimately constant. vessel_static is a
+# registration record -- a name and a callsign are not an anomaly, and 0.000 is
+# the correct answer every time.
+SCORE_DIVERSITY_EXEMPT = {"vessel_static"}
+
+
+async def _score_diversity_loop(timescale) -> None:
+    """Reports detectors whose anomaly score has stopped varying."""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            rows = await timescale.query(
+                f"""
+                SELECT type,
+                       COUNT(*)                                  AS n,
+                       COUNT(DISTINCT ROUND(anomaly_score::numeric, 3)) AS distinct_scores
+                FROM events
+                WHERE occurred_at > NOW() - INTERVAL '{SCORE_DIVERSITY_WINDOW}'
+                GROUP BY type
+                HAVING COUNT(*) >= {SCORE_DIVERSITY_MIN_EVENTS}
+                """
+            )
+            flat = [
+                r for r in (rows or [])
+                if int(r.get("distinct_scores") or 0) <= 1
+                and str(r.get("type")) not in SCORE_DIVERSITY_EXEMPT
+            ]
+            for row in flat:
+                logger.warning(
+                    "Detector %s emitted %s events in the last %s and %s distinct "
+                    "score(s). A detector whose output never varies ranks nothing; "
+                    "the cause is never the same twice, so read its arithmetic.",
+                    row.get("type"), row.get("n"), SCORE_DIVERSITY_WINDOW,
+                    row.get("distinct_scores"),
+                )
+            if not flat:
+                logger.info(
+                    "Score diversity: %s detector(s) checked, none flat.",
+                    len(rows or []),
+                )
+        except Exception as e:
+            logger.error(f"Score diversity check failed: {e}")
+        await asyncio.sleep(SCORE_DIVERSITY_INTERVAL_SEC)
+
+
 async def _ofac_sync_loop():
     """Syncs OFAC sanctions list on startup then every 24 hours.
     
@@ -271,6 +364,9 @@ async def main():
     timescale = await get_timescale()
     redis     = await get_redis()
     safe_create_task(_ofac_sync_loop(), name="ofac-sync")
+    safe_create_task(
+        _score_diversity_loop(timescale), name="score-diversity"
+    )
     
     # Wait for databases to come online
     producer = SentinelProducer()
@@ -280,6 +376,9 @@ async def main():
     scorer = DynamicAnomalyScorer(redis, neo4j_client=neo4j)
     db = DBWriter(timescale)
     graph = GraphWriter(producer)
+    safe_create_task(
+        _reference_data_loop(redis, graph), name="reference-data-refresh"
+    )
     resolver = EntityResolver(redis, neo4j, producer=producer)
 
 # STRICT DEPENDENCY INJECTION ALIGNMENT: (scorer, redis, graph, [resolver])

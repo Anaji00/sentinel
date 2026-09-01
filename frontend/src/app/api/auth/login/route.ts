@@ -13,7 +13,11 @@ const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000'
 // ANALYST for every session, which is why the BFF used to attach the operator's
 // master API key to proxied calls instead -- making every signed-in visitor an
 // admin and rendering any subscription gate decorative.
-function signSessionToken(email: string, role: string, expiresAt: number): string {
+// Exported so the SSO callback mints byte-identical cookies. A second
+// implementation there would be a second place for the session format to
+// drift, and a cookie signed slightly differently fails verification in a
+// way that looks like an expired login.
+export function signSessionToken(email: string, role: string, expiresAt: number): string {
   const payload = `${email}:${role}:${expiresAt}`;
   const hmac = crypto.createHmac('sha256', SESSION_SECRET as string).update(payload).digest('hex');
   return `${Buffer.from(payload).toString('base64url')}.${hmac}`;

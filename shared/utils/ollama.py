@@ -19,7 +19,7 @@ import os
 from functools import lru_cache
 import re
 import time
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Optional, Type, Union
  
 import aiohttp
 from pydantic import BaseModel, ValidationError
@@ -108,7 +108,70 @@ LARGE_MODEL_MAX_TOKENS = int(os.getenv("OLLAMA_LARGE_MAX_TOKENS", "2048"))
 _raw_timeout = float(os.getenv("OLLAMA_TIMEOUT", "1200.0"))
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))
 
+# Measured generation rate for this deployment, in tokens per second.
+#
+# 2.5 tok/s, taken from the server's own completion times on a CPU-only 6-core
+# allocation: 6m37s and 2m12s for agent-sized answers, and a 16-token request
+# that could not complete because it queued behind one of them.
+OLLAMA_TOKENS_PER_SEC = float(os.getenv("OLLAMA_TOKENS_PER_SEC", "2.5"))
+
+# Characters per token, for budgeting the prompt against the context window.
+# English averages ~4. Kept conservative because overshooting num_ctx truncates
+# on the *server* side, where there is no warning at all.
+CHARS_PER_TOKEN = int(os.getenv("OLLAMA_CHARS_PER_TOKEN", "4"))
+
+# Headroom for the chat scaffolding and the correction suffix a retry appends.
+PROMPT_BUDGET_MARGIN_TOKENS = int(os.getenv("OLLAMA_PROMPT_MARGIN_TOKENS", "256"))
+
+# Fraction of the timeout generation may consume. The remainder covers queueing
+# behind another request, model load and prompt evaluation -- all of which are
+# inside the client's timeout and none of which produce a token.
+_GENERATION_BUDGET_SHARE = float(os.getenv("OLLAMA_GENERATION_BUDGET_SHARE", "0.6"))
+
+
+def max_deliverable_tokens() -> int:
+    """The most tokens this host can actually produce before the client gives up.
+
+    A request for more than this cannot succeed. It is not slow, it is
+    arithmetically impossible: generation is linear in tokens, so asking for
+    1,800 at 2.5 tok/s is a 720-second answer against a 600-second timeout, and
+    the only possible outcome is a timeout that produces nothing while holding
+    the single inference slot for the full duration.
+
+    That was not hypothetical. SCENARIO_TOKEN_BUDGET was raised to 1800 to stop
+    scenarios being truncated mid-object, which fixed the truncation by
+    guaranteeing the timeout instead -- every agent and reasoning call on this
+    host failed at 600s having produced nothing at all.
+
+    Capping here rather than at each caller because every caller would otherwise
+    have to know the host's token rate, and none of them do.
+    """
+    total = OLLAMA_TIMEOUT.total or 600.0
+    return max(128, int(total * _GENERATION_BUDGET_SHARE * OLLAMA_TOKENS_PER_SEC))
+
 # Circuit breaker config
+# How long the server may accept requests without completing one before this
+# is called a stall rather than a queue.
+#
+# Ollama wedged for four hours and every check said it was fine. The
+# container healthcheck runs `ollama list`, which answers from the model
+# registry and never touches generation; it reported healthy throughout. The
+# circuit breaker did not fire either -- it counts client timeouts, and the
+# agents were starved by the inference budget at the time, so almost nothing
+# was being sent to time out. Twelve hours of logs, zero OLLAMA TIMEOUT lines,
+# through four hours of a dead model server.
+#
+# The obvious fix -- generate something in the healthcheck -- is worse than
+# the bug on this host. OLLAMA_NUM_PARALLEL=1, so a probe queues behind real
+# work: `ollama run` with a two-word prompt took over 400s under ordinary
+# load. A healthcheck built on that would fail while the server was merely
+# busy and restart it mid-inference, in a loop.
+#
+# So the detector lives where the evidence already is. This client sees every
+# request and every response; a stall is requests going out and nothing
+# coming back, which needs no extra load to observe.
+STALL_AFTER_SEC = float(os.getenv("OLLAMA_STALL_AFTER_SEC", "900"))
+
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("OLLAMA_CB_THRESHOLD", "3"))
 CIRCUIT_BREAKER_COOLDOWN  = float(os.getenv("OLLAMA_CB_COOLDOWN", "15.0"))  # 15 seconds adaptive cooldown
 
@@ -154,6 +217,87 @@ class SchemaViolationError(Exception):
     """LLM output could not be coerced to the required Pydantic schema."""
 
 
+def deliverable_prompt_chars(model: Optional[str] = None, num_predict: Optional[int] = None) -> int:
+    """The most prompt this host will actually send, in characters.
+
+    The same argument as max_deliverable_tokens(), on the input side. Callers
+    assemble context without knowing the window, so they overshoot and let
+    truncation decide what survives -- a live scenario prompt reached 49,115
+    characters against a budget of 7,664, and the 84% that did not fit was
+    chosen by position rather than by worth.
+
+    Exported so a builder can size its sections to what can be sent. Nothing
+    about the budget changes here; this is the same arithmetic the send path
+    applies, reachable before the prompt is built rather than after.
+    """
+    resolved = str(model or OLLAMA_MODEL or "").lower()
+    is_small_model = any(tag in resolved for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
+    context_tokens = 3072 if is_small_model else 4096
+    effective_predict = _bounded_num_predict(num_predict, is_small_model)
+    reserved = effective_predict + PROMPT_BUDGET_MARGIN_TOKENS
+    return max(1024, (context_tokens - reserved) * CHARS_PER_TOKEN)
+
+
+def _truncate_middle(prompt: str, budget: int) -> str:
+    """Keeps the head and the tail, drops what is between them.
+
+    Cutting the tail was removing the instructions. Every prompt in this system
+    is assembled with the task last -- the rules, the output schema, "produce
+    exactly 3 hypotheses" -- and a live scenario prompt of 49,115 characters
+    reached the model as 7,664: an 84% cut taken entirely from the end. The
+    model was being handed evidence and no question.
+
+    That is the likeliest explanation for instructions that appeared to be
+    ignored. Scenario headlines carried a concrete identifier 10 times in 83
+    while the prompt had asked for a named subject throughout -- it was asking
+    into a region of the prompt that never arrived.
+
+    The head is kept because it carries the subject; the tail because it carries
+    the task. Bulk context in between is what the budget cannot afford, and it
+    is also the part any single line of which is least likely to matter.
+    """
+    if budget <= 0 or len(prompt) <= budget:
+        return prompt
+
+    marker = chr(10) + '...[middle of prompt dropped to fit the context window]...' + chr(10)
+    room = budget - len(marker)
+    if room <= 0:
+        # No budget for both ends. The task is what makes a reply possible at
+        # all, so it is the half that survives.
+        return prompt[-budget:]
+
+    # The instructions are the smaller and the less compressible half, so they
+    # take the larger share.
+    tail_chars = min(len(prompt), int(room * 0.6))
+    head_chars = room - tail_chars
+    return prompt[:head_chars] + marker + prompt[-tail_chars:]
+
+
+def _bounded_num_predict(requested: Optional[int], is_small_model: bool) -> int:
+    """The caller's request, honoured up to both the schema ceiling and the host.
+
+    Two separate limits, and the tighter one wins. The schema ceiling says how
+    many tokens the answer could reasonably need; max_deliverable_tokens() says
+    how many this machine can produce before the client stops waiting. Asking
+    past the second is not ambition, it is a guaranteed timeout that also
+    occupies the one inference slot while it fails.
+    """
+    ceiling = SMALL_MODEL_MAX_TOKENS if is_small_model else LARGE_MODEL_MAX_TOKENS
+    default = SMALL_MODEL_DEFAULT_TOKENS if is_small_model else LARGE_MODEL_DEFAULT_TOKENS
+    wanted = min(requested or default, ceiling)
+
+    deliverable = max_deliverable_tokens()
+    if wanted > deliverable:
+        logger.warning(
+            "Capping num_predict %s -> %s: at %.1f tok/s this host cannot produce "
+            "more before the %.0fs timeout, and the request would fail having "
+            "generated nothing.",
+            wanted, deliverable, OLLAMA_TOKENS_PER_SEC, OLLAMA_TIMEOUT.total or 600.0,
+        )
+        return deliverable
+    return wanted
+
+
 class OllamaClient:
     """
     Async Ollama client with schema enforcement, context sizing optimizations,
@@ -169,7 +313,12 @@ class OllamaClient:
         self._session = session
         self.model = model
         self.redis_client = redis_client
-        self.service_name = service_name or os.getenv("SERVICE_NAME", "default")
+        # SENTINEL_SERVICE is what the deployment actually sets and what the
+        # metrics key is namespaced by; SERVICE_NAME was never set anywhere, so
+        # every service labelled its calls "default" and the gateway summed
+        # three services into one series -- discarding the per-service
+        # attribution the moment it was finally being published.
+        self.service_name = service_name or os.getenv("SENTINEL_SERVICE") or os.getenv("SERVICE_NAME", "default")
         # Circuit breaker state (per-model)
         self._consecutive_timeouts: Dict[str, int] = {}
         # Set by _call_ollama when Ollama reports it stopped at the token limit,
@@ -177,6 +326,44 @@ class OllamaClient:
         self.last_truncated: bool = False
         self._circuit_open_until: Dict[str, float] = {}
         self.failures = self._consecutive_timeouts
+        # Stall detection. Started at None rather than "now" so a client that
+        # has never completed anything is not credited with a fresh success.
+        self._last_completion: Optional[float] = None
+        self._requests_since_completion: int = 0
+        self._stall_reported: bool = False
+
+    def _note_request(self) -> None:
+        """Called as a request goes out. Reports a stall the first time it sees one."""
+        import time as _time
+
+        self._requests_since_completion += 1
+        if self._last_completion is None:
+            self._last_completion = _time.monotonic()
+            return
+        silent_for = _time.monotonic() - self._last_completion
+        # Two requests, not one: a single slow inference is a queue, not a stall.
+        if (
+            not self._stall_reported
+            and self._requests_since_completion > 1
+            and silent_for > STALL_AFTER_SEC
+        ):
+            self._stall_reported = True
+            logger.error(
+                "🛑 OLLAMA STALLED: %d request(s) issued and none completed in %.0fs. "
+                "The server may answer /api/tags and `ollama list` while generation "
+                "is wedged -- neither is evidence that it can produce a token.",
+                self._requests_since_completion, silent_for,
+            )
+
+    def _note_completion(self) -> None:
+        """Called when a response actually arrives."""
+        import time as _time
+
+        if self._stall_reported:
+            logger.warning("Ollama answered again after a reported stall.")
+        self._last_completion = _time.monotonic()
+        self._requests_since_completion = 0
+        self._stall_reported = False
 
     def is_circuit_open(self, model_name: str) -> bool:
         import time as _time
@@ -338,6 +525,24 @@ class OllamaClient:
             f"\n\nJSON SCHEMA:\n{schema_json}\n"
             "Return ONLY a raw JSON object conforming to this schema."
         )
+        # The schema is stated twice on the first attempt, and the two are not
+        # equivalent. Above it is prose in the prompt, which this host's 1.5B
+        # model reads and ignores: asked for a FinancialAdviceBrief it answered
+        # {"symbol": "XRPUSDT", "rsi": 61, ...} -- a flat echo of the inputs,
+        # failing on the only two fields that carry no default:
+        #
+        #     loc=('market_regime',)            type=missing  Field required
+        #     loc=('general_hedging_strategy',) type=missing  Field required
+        #
+        # Passed to Ollama as `format` the same dict stops being a request and
+        # becomes a decoding constraint. `format="json"` compels only *valid*
+        # JSON, which the model was already producing; it says nothing about
+        # shape, so three attempts cost three inferences and returned nothing.
+        #
+        # First attempt only. If Ollama cannot build a grammar for a schema it
+        # answers with an error, and attempts two and three then behave exactly
+        # as every attempt does today -- so this can improve on the current
+        # behaviour and cannot fall below it.
 
         last_error: Optional[str] = None
         for attempt in range(max_retries):
@@ -351,7 +556,21 @@ class OllamaClient:
                     "Your entire response must start with { and end with }" 
                 )
 
-            full_prompt = f"{system_prompt}\n\n{user_prompt}{schema_instruction}{correction}"
+            # The prose schema is redundant on the attempt that carries the
+            # grammar, and it is expensive: 2,715 characters of a 7,664-char
+            # window, 35% of everything this host can be told.
+            #
+            # The note above already establishes that this model reads the
+            # prose and ignores it, and that the same dict passed as `format`
+            # stops being a request and becomes a decoding constraint.
+            # Sending both on attempt 0 spends a third of the window
+            # restating what the decoder is already enforcing structurally.
+            #
+            # Retries keep it. They fall back to format="json", which compels
+            # valid JSON but says nothing about shape, so there the prose is
+            # the only statement of the schema the model gets.
+            attempt_schema = "" if (attempt == 0 and schema_dict) else schema_instruction
+            full_prompt = f"{system_prompt}\n\n{user_prompt}{attempt_schema}{correction}"
 
             try:
                 sem_start = time.monotonic()
@@ -363,7 +582,24 @@ class OllamaClient:
                     MetricsCollector.increment(f"ollama_calls_{self.service_name}")
                     call_start = time.monotonic()
                     try:
-                        raw_text = await self._call_ollama(full_prompt, temperature, active_model, format="json", num_predict=num_predict, exclude_models=visited)
+                        raw_text = await self._call_ollama(
+                            full_prompt, temperature, active_model,
+                            format=(schema_dict if attempt == 0 else "json"),
+                            num_predict=num_predict, exclude_models=visited,
+                        )
+                        # Read here, with no await between the call returning and
+                        # this line, so nothing else can run in between.
+                        #
+                        # last_truncated is state on the client, and the
+                        # semaphore guarding it is per-model: agents and
+                        # reasoning share one OllamaClient across several models,
+                        # so two inferences genuinely run at once. Reading the
+                        # attribute after the semaphore released let one call's
+                        # truncation be attributed to another's response -- which
+                        # doubles num_predict for a request that was merely
+                        # malformed, and never sends it the correction prompt it
+                        # actually needed.
+                        truncated = self.last_truncated
                         MetricsCollector.observe_latency(f"ollama_latency_{self.service_name}", time.monotonic() - call_start)
                     except (InferenceError, asyncio.TimeoutError) as call_err:
                         MetricsCollector.increment(f"ollama_timeouts_{self.service_name}")
@@ -371,7 +607,7 @@ class OllamaClient:
 
                 parsed = self._extract_json(raw_text)
                 if parsed is None:
-                    if getattr(self, "last_truncated", False):
+                    if truncated:
                         # Not a formatting failure. Retrying the same request
                         # reproduces it exactly, so the budget is raised first.
                         last_error = (
@@ -508,7 +744,7 @@ class OllamaClient:
                 
         raise InferenceError(f"Raw inference failed after {max_retries} attempts.")
         
-    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[str] = None, num_predict: Optional[int] = None, exclude_models: Optional[set] = None) -> str:
+    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[Union[str, dict]] = None, num_predict: Optional[int] = None, exclude_models: Optional[set] = None) -> str:
         import time as _time
 
         try:
@@ -516,14 +752,50 @@ class OllamaClient:
         except TypeError:
             resolved_model = await self._resolve_model(active_model)
 
-        # Truncate prompt based on model capacity to prevent prompt-processing timeout on lightweight models
-        clean_prompt = prompt
+        # Prompt budget, derived from the context window rather than guessed.
+        #
+        # This was a flat 3,500 characters for small models -- about 875 tokens
+        # against the 3,072-token window the same request asks for below. It
+        # discarded 72% of the space the model had been given, and the cut was
+        # silent: the marker goes into the prompt, not the log, so nothing
+        # anywhere reported that it had happened.
+        #
+        # Traced on a live scenario call the effect was total. The full prompt
+        # was 12,115 characters -- 4,049 of system prompt, 5,349 of signal data,
+        # 2,715 of JSON schema -- and the model received the first 3,500, which
+        # is 86% of the system prompt and *nothing else*. Every scenario was
+        # generated from the instructions alone, without the events it was
+        # reasoning about, the prompt ending mid-word inside a template slot.
+        #
+        # num_ctx covers prompt AND completion, so the budget is the window less
+        # what generation may produce, less a margin for chat scaffolding and
+        # the correction suffix a retry appends.
         model_lower = resolved_model.lower()
         is_small_model = any(tag in model_lower for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
-        max_prompt_chars = 3500 if is_small_model else 6000
+        context_tokens = 3072 if is_small_model else 4096
+        # The *effective* output budget, not the requested one. num_predict is
+        # capped below by _bounded_num_predict -- a scenario asks for 1800 and
+        # this host can only deliver 900 -- so reserving the request rather than
+        # the cap set aside twice the tokens generation could ever use and
+        # halved the prompt. Measured: 4,064 chars of budget where 7,664 was
+        # available, on a 12,546-char prompt.
+        effective_predict = _bounded_num_predict(num_predict, is_small_model)
+        reserved = effective_predict + PROMPT_BUDGET_MARGIN_TOKENS
+        max_prompt_chars = max(1024, (context_tokens - reserved) * CHARS_PER_TOKEN)
 
+        clean_prompt = prompt
         if len(clean_prompt) > max_prompt_chars:
-            clean_prompt = clean_prompt[:max_prompt_chars] + "\n...[truncated for speed]"
+            discarded = len(clean_prompt) - max_prompt_chars
+            # Said out loud. A silent cut is indistinguishable from a model that
+            # ignored its instructions, and this one was removing the entire
+            # input while every log line reported success.
+            logger.warning(
+                "Prompt truncated for %s: %s chars -> %s (%s discarded, %.0f%%). "
+                "Head and tail are preserved; the middle is dropped.",
+                resolved_model, len(clean_prompt), max_prompt_chars, discarded,
+                100.0 * discarded / len(clean_prompt),
+            )
+            clean_prompt = _truncate_middle(clean_prompt, max_prompt_chars)
 
         payload = {
             "model": resolved_model,
@@ -551,9 +823,9 @@ class OllamaClient:
                 #
                 # A slower complete answer beats a fast unusable one: nine
                 # minutes spent producing unparseable text is nine minutes lost.
-                "num_predict": min(num_predict or SMALL_MODEL_DEFAULT_TOKENS, SMALL_MODEL_MAX_TOKENS)
-                               if is_small_model
-                               else min(num_predict or LARGE_MODEL_DEFAULT_TOKENS, LARGE_MODEL_MAX_TOKENS),
+                # Also capped by what the timeout can actually deliver, so a
+                # caller cannot ask for an answer this host has no way to finish.
+                "num_predict": effective_predict,
                 "num_ctx": 3072 if is_small_model else 4096,  # Optimized context window size in tokens
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
@@ -564,6 +836,7 @@ class OllamaClient:
         if format:
             payload["format"] = format
             
+        self._note_request()
         try:
             req_cm = self._session.post(
                 f"{OLLAMA_URL}/api/generate",
@@ -611,7 +884,12 @@ class OllamaClient:
                     data = {"response": str(resp)}
 
             self._consecutive_timeouts[active_model] = 0
+            self._note_completion()
             if not isinstance(data, dict):
+                # Cleared before returning. This path left the flag at whatever
+                # the previous call set it to, so a stale True made the caller
+                # treat an ordinary formatting failure as a token-budget one.
+                self.last_truncated = False
                 return str(data)
 
             # Ollama says why it stopped. "length" means the answer was cut off

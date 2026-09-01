@@ -1,9 +1,11 @@
 import asyncio
 import json
+import math
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Optional
+from shared.models.events import entity_cache_key
 from shared.kafka import Topics
 from shared.models import (
     NormalizedEvent, EventType, Entity, EntityType, FinancialData,
@@ -14,9 +16,75 @@ import re
 
 logger = logging.getLogger("enrichment.tradfi")
 
+# Pre-announcement earnings scoring.
+#
+# A report that has not happened yet carries no surprise to measure, but the
+# flat 0.3 this replaced gave all 183 upcoming-earnings events in a 45-minute
+# window one identical score. The floor keeps a scheduled report visible; the
+# two weights are what let one outrank another.
+# Sigma at which a volume spike is already clearly significant. The curve is
+# 1 - exp(-z/scale), so this is the point reaching ~63% of the range.
+Z_SCORE_SCALE = 5.0
 
-def _lift(anomaly: float, weight: float) -> float:
+# Where an earnings surprise, judged on size alone, reaches the top of its band.
+# Fifty percent away from consensus is already extraordinary; the curve
+# approaches 1.0 without arriving, because larger misses exist.
+SURPRISE_MAGNITUDE_SCALE = 50.0
+
+
+class _NoEarningsHistory(Exception):
+    """Raised when an issuer has no prior surprises to compare against."""
+
+
+def _surprise_magnitude_score(abs_surprise: float) -> float:
+    """How large a surprise is, when there is nothing to compare it to.
+
+    Used on first sight of an issuer, where a z-score would be computed against
+    the observation itself and return zero.
+    """
+    try:
+        magnitude = abs(float(abs_surprise))
+    except (TypeError, ValueError):
+        return 0.30
+    return round(1.0 - math.exp(-magnitude / SURPRISE_MAGNITUDE_SCALE), 4)
+
+PRE_ANNOUNCEMENT_FLOOR = 0.20
+PROXIMITY_WEIGHT = 0.25
+SURPRISE_VOLATILITY_WEIGHT = 0.20
+
+# Ceiling for anything that has not reported. An upcoming report should never
+# outrank an actual surprise, which is scored on a measured z-score.
+PRE_ANNOUNCEMENT_CEILING = 0.65
+
+# Matches the collector's EARNINGS_LOOKAHEAD_DAYS window.
+EARNINGS_LOOKAHEAD_DAYS = int(os.getenv("EARNINGS_LOOKAHEAD_DAYS", "7"))
+
+
+
+# The most of a score's headroom that all adjustments together may consume.
+#
+# _lift already stopped adjustments multiplying past 1.0, but each one still
+# takes a share of whatever headroom remains, so a sequence of them approaches
+# the ceiling asymptotically. Measured after that fix: equity_block scores
+# formed a reasonable curve from 0.4 to 0.9 -- 102, 233, 328, 357, 319 per
+# decile -- and then piled 1,177 events into the top decile alone, 47% of the
+# sample. Not degenerate, but a ranking that puts nearly half its population in
+# one bucket is not ranking that half.
+#
+# A shared budget keeps every adjustment's contribution ordered and visible
+# while bounding what they can do together, so the top of the range stays
+# reserved for events that earned it on the base score rather than on the
+# number of boxes they ticked.
+MAX_TOTAL_LIFT_SHARE = float(os.getenv("TRADFI_MAX_TOTAL_LIFT", "0.55"))
+
+
+def _lift(anomaly: float, weight: float, spent: float = 0.0) -> float:
     """Raises a score by a share of the headroom left above it.
+
+    `spent` is the fraction of the original headroom already consumed by earlier
+    adjustments on this event. Once MAX_TOTAL_LIFT_SHARE of it is gone the
+    remaining adjustments still register, but against a shrinking allowance
+    rather than against fresh headroom each time.
 
     Every one of these was `min(1.0, anomaly * k)`. Multipliers compound: the
     block-trade path alone could apply 1.15, 1.2, 1.3, 1.1 and 1.4 to the same
@@ -37,7 +105,10 @@ def _lift(anomaly: float, weight: float) -> float:
         return anomaly
     if not (0.0 <= base <= 1.0) or w <= 0:
         return anomaly
-    return round(base + (1.0 - base) * min(1.0, w), 6)
+    remaining_share = max(0.0, MAX_TOTAL_LIFT_SHARE - max(0.0, float(spent)))
+    if remaining_share <= 0.0:
+        return anomaly
+    return round(base + (1.0 - base) * min(remaining_share, w), 6)
 
 
 # SEC Form 4 Classifications
@@ -215,7 +286,7 @@ class TradFiEnricher:
         if not tickers or not self.redis_client:
             return {}
         try:
-            keys = [f"sentinel:earnings:{t}" for t in tickers]
+            keys = [entity_cache_key("sentinel:earnings", t) for t in tickers]
             blobs = await self.redis_client.raw.mget(keys)
         except Exception as e:
             logger.debug("Earnings calendar lookup failed: %s", e)
@@ -277,7 +348,22 @@ class TradFiEnricher:
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
             base_score = anomaly
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
+
+            # Shared adjustment allowance, reset per event. Declared before the
+            # first lift rather than after it: the watchlist and frequency
+            # boosts below are lifts like any other and belong to the same
+            # allowance, and reading it before this line is an UnboundLocalError
+            # on the first iteration.
+            lift_spent = 0.0
+
+            # Headroom lift, not addition: adding boosts puts every boosted
+            # event on the ceiling, so a 0.85 and a 0.99 become the same
+            # number. This file's own comments say it was converted for that
+            # reason; four call sites were missed.
+            anomaly = _lift(anomaly, w_boost, lift_spent)
+            lift_spent += w_boost
+            anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
+            lift_spent += f_boost
 
             # Score adjustment provenance
             adjustments = []
@@ -292,7 +378,8 @@ class TradFiEnricher:
             earnings_lift = _earnings_proximity_lift(days_out, notional)
             if earnings_lift > 0:
                 pre_earnings = anomaly
-                anomaly = _lift(anomaly, earnings_lift)
+                anomaly = _lift(anomaly, earnings_lift, lift_spent)
+                lift_spent += earnings_lift
                 adjustments.append(ScoreAdjustment(
                     reason=f"earnings_in_{days_out}d",
                     delta=round(anomaly - pre_earnings, 6),
@@ -359,10 +446,12 @@ class TradFiEnricher:
                 pre_voi = anomaly
                 if voi > 0:
                     tags.append("institutional_accumulation")
-                    anomaly = _lift(anomaly, 0.15)
+                    anomaly = _lift(anomaly, 0.15, lift_spent)
+                    lift_spent += 0.15
                 else:
                     tags.append("institutional_distribution")
-                    anomaly = _lift(anomaly, 0.15)
+                    anomaly = _lift(anomaly, 0.15, lift_spent)
+                    lift_spent += 0.15
                 adjustments.append(ScoreAdjustment(reason="institutional_flow_x1.15", delta=round(anomaly - pre_voi, 6)))
                     
             conditions = str(p.get("conditions", "")).lower()
@@ -377,12 +466,14 @@ class TradFiEnricher:
                 if not is_dark_pool:
                     tags.append("lit_aggressor_sell")
                     pre_lit = anomaly
-                    anomaly = _lift(anomaly, 0.2)
+                    anomaly = _lift(anomaly, 0.2, lift_spent)
+                    lift_spent += 0.2
                     adjustments.append(ScoreAdjustment(reason="lit_aggressor_sell_x1.2", delta=round(anomaly - pre_lit, 6)))
                 if notional > 5_000_000:
                     tags.append("institutional_distribution")
                     pre_dist = anomaly
-                    anomaly = _lift(anomaly, 0.3)
+                    anomaly = _lift(anomaly, 0.3, lift_spent)
+                    lift_spent += 0.3
                     adjustments.append(ScoreAdjustment(reason="large_distribution_x1.3", delta=round(anomaly - pre_dist, 6)))
                     direction_str = "🔴 INSTITUTIONAL DUMP"
             elif aggressor_side == "BUY":
@@ -390,7 +481,8 @@ class TradFiEnricher:
                 if notional > 5_000_000:
                     tags.append("institutional_accumulation")
                     pre_acc = anomaly
-                    anomaly = _lift(anomaly, 0.1)
+                    anomaly = _lift(anomaly, 0.1, lift_spent)
+                    lift_spent += 0.1
                     adjustments.append(ScoreAdjustment(reason="accumulation_sweep_x1.1", delta=round(anomaly - pre_acc, 6)))
                     direction_str = "🟢 ACCUMULATION SWEEP"
 
@@ -410,12 +502,15 @@ class TradFiEnricher:
     async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None):
         if score_adjustments is None:
             score_adjustments = []
+            # Shared adjustment allowance, reset per event.
+            lift_spent = 0.0
         try:
             baseline = await self.redis_client.raw.get(f"baseline:volume:{ticker}")
             if baseline and float(baseline) > 0 and volume > float(baseline) * 20:
                 tags.append("volume_capitulation")
                 pre_cap = anomaly
-                anomaly = _lift(anomaly, 0.4)
+                anomaly = _lift(anomaly, 0.4, lift_spent)
+                lift_spent += 0.4
                 score_adjustments.append(ScoreAdjustment(reason="volume_capitulation_x1.4", delta=round(anomaly - pre_cap, 6)))
         except Exception as e:
             logger.debug(f"Baseline fetch failed: {e}")
@@ -559,8 +654,24 @@ class TradFiEnricher:
                 ticker=ticker, 
                 instrument_type="equity",
                 trade_type="RAW_TRADE", 
+                # notional_usd, not premium_usd.
+                #
+                # Premium is what an option costs; an equity block has a
+                # notional. Writing the dollar value into the options field left
+                # notional_usd null on every equity_block event -- 480 of 480 in
+                # a 40-minute sample -- so every consumer reading the obvious
+                # field saw nothing and had to know to look in the wrong one.
+                # RadarAgent already carries a comment explaining that
+                # workaround; this removes the need for it.
+                #
+                # premium_usd is still populated alongside, because readers
+                # built against the old shape are still in the tree and a
+                # silently emptied field is a worse failure than a redundant one.
+                # It should be dropped once those readers are gone.
+                notional_usd=notional,
                 premium_usd=notional,
                 underlying_price=price,
+                close_price=price,
                 volume=volume,
                 volume_oi_ratio=p.get("vol_oi_ratio"),
                 sector=ref_data.get("sector") if ref_data else None,
@@ -652,12 +763,21 @@ class TradFiEnricher:
             
             # Score adjustment provenance
             bar_adjustments = []
+            # Shared adjustment allowance, reset per event.
+            lift_spent = 0.0
 
             # Watchlist & Frequency boost
             is_watched = await self.scorer.check_watchlist(ticker, "equities")
             w_boost = 0.15 if is_watched else 0.0
             f_boost = await self.scorer.track_frequency(ticker, f"tradfi_candle_{tf}m")
-            anomaly = min(1.0, anomaly + w_boost + f_boost)
+            # Headroom lift, not addition: adding boosts puts every boosted
+            # event on the ceiling, so a 0.85 and a 0.99 become the same
+            # number. This file's own comments say it was converted for that
+            # reason; four call sites were missed.
+            anomaly = _lift(anomaly, w_boost, lift_spent)
+            lift_spent += w_boost
+            anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
+            lift_spent += f_boost
             if w_boost > 0:
                 bar_adjustments.append(ScoreAdjustment(reason="watchlist_boost", delta=w_boost))
             if f_boost > 0:
@@ -768,6 +888,8 @@ class TradFiEnricher:
                     ticker=ticker, 
                     instrument_type="equity",
                     trade_type=f"OHLCV_{tf}M_BAR", 
+                    # As above: a bar's dollar volume is a notional, not a premium.
+                    notional_usd=notional,
                     premium_usd=notional,
                     underlying_price=block["close"],
                     volume=block["volume"],
@@ -816,6 +938,11 @@ class TradFiEnricher:
             logger.error(f"Failed to update volume baseline for {ticker}: {e}")
 
     async def _enrich_insider(self, raw, p) -> Optional[NormalizedEvent]:
+        # Shared adjustment allowance, reset per event -- as in the other
+        # enrichment paths. Omitting it here raised NameError on every insider
+        # event and, because the caller swallows per-event failures, the whole
+        # path went silent with errors=0 on the heartbeat.
+        lift_spent = 0.0
         ticker = (p.get("ticker") or "").upper()
         if not ticker:
             title = p.get("title", "")
@@ -866,25 +993,31 @@ class TradFiEnricher:
         # Role-based weighting multiplier
         anomaly = min(1.0, value / 10_000_000 * 0.3)
         if "CEO" in title:
-            anomaly = _lift(anomaly, 0.5)
+            anomaly = _lift(anomaly, 0.5, lift_spent)
+            lift_spent += 0.5
         elif "CFO" in title:
-            anomaly = _lift(anomaly, 0.4)
+            anomaly = _lift(anomaly, 0.4, lift_spent)
+            lift_spent += 0.4
         elif "COO" in title or "PRESIDENT" in title:
-            anomaly = _lift(anomaly, 0.2)
+            anomaly = _lift(anomaly, 0.2, lift_spent)
+            lift_spent += 0.2
         elif "DIRECTOR" in title:
-            anomaly = _lift(anomaly, 0.1)
+            anomaly = _lift(anomaly, 0.1, lift_spent)
+            lift_spent += 0.1
         elif any(w in title for w in ("TEN PERCENT OWNER", "10% OWNER", "10 PERCENT")):
-            anomaly = _lift(anomaly, 0.3)
-
+            anomaly = _lift(anomaly, 0.3, lift_spent)
+            lift_spent += 0.3
         # Open market buys are high conviction
         if code == "P":
-            anomaly = _lift(anomaly, 0.2)
-
+            anomaly = _lift(anomaly, 0.2, lift_spent)
+            lift_spent += 0.2
         # Watchlist & Frequency boost
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         w_boost = 0.15 if is_watched else 0.0
         f_boost = await self.scorer.track_frequency(ticker, "insider_trade")
-        anomaly = min(1.0, anomaly + w_boost + f_boost)
+        anomaly = _lift(anomaly, w_boost, lift_spent)
+        lift_spent += w_boost
+        anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
 
         await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
             "entity_id": ticker,
@@ -937,7 +1070,10 @@ class TradFiEnricher:
         
         # Calculate baseline anomaly score based on premium size (e.g. $1M premium -> 0.50 score)
         base_score = min(1.0, premium / 1_000_000.0 * 0.5)
-        anomaly = min(1.0, base_score + w_boost + f_boost)
+        lift_spent = 0.0
+        anomaly = _lift(base_score, w_boost, lift_spent)
+        lift_spent += w_boost
+        anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
         
         tags = ["tradfi", "options_flow", ticker.lower(), option_type.lower()]
         if premium >= 100000.0:
@@ -992,8 +1128,27 @@ class TradFiEnricher:
         w_boost = 0.15 if is_watched else 0.0
         f_boost = await self.scorer.track_frequency(ticker, "quant_radar")
 
-        base_score = min(1.0, z_score / 5.0)
-        anomaly = min(1.0, base_score + w_boost + f_boost)
+        # A z-score is unbounded; the mapping onto 0-1 must not have a cliff.
+        #
+        # `min(1.0, z / 5.0)` saturated at five sigma, so a 5.02 and a 12.76 --
+        # observed together in one fifteen-minute window -- were both exactly
+        # 1.00, and 45 of the last 30 minutes' market_anomaly events sat on the
+        # ceiling. That discards precisely the information separating a notable
+        # spike from an extraordinary one, which is the whole content of a
+        # z-score.
+        #
+        # Exponential saturation keeps the existing calibration where it
+        # matters and stops the cliff: five sigma still clears the 0.6 the
+        # downstream thresholds use, and ten and twenty sigma remain
+        # distinguishable from it and from each other. The curve approaches 1.0
+        # and never arrives, which is the honest shape for an unbounded
+        # statistic -- there is always a larger spike.
+        base_score = 1.0 - math.exp(-max(0.0, z_score) / Z_SCORE_SCALE)
+        lift_spent = 0.0
+        anomaly = _lift(base_score, w_boost, lift_spent)
+        lift_spent += w_boost
+        anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
+        lift_spent += f_boost
 
         tags = ["tradfi", "radar_anomaly", ticker.lower()]
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
@@ -1017,6 +1172,50 @@ class TradFiEnricher:
             tags=tags,
             anomaly_score=anomaly,
         )
+
+    async def _pre_announcement_score(self, ticker: str, report_date: str) -> float:
+        """How much an upcoming earnings report is worth watching.
+
+        No surprise exists yet, so the two available signals are timing and the
+        issuer's own track record:
+
+          Proximity   A report tomorrow is actionable in a way one in seven
+                      days is not. Linear over the lookahead window.
+
+          Volatility  The per-ticker surprise variance this enricher already
+                      maintains. An issuer that habitually lands far from
+                      consensus has a genuinely more uncertain report coming.
+
+        Both are read from what the system measured rather than asserted, and
+        an issuer with no history simply scores on proximity alone.
+        """
+        proximity = 0.0
+        try:
+            report_dt = datetime.strptime(str(report_date), "%Y-%m-%d").date()
+            days_out = (report_dt - datetime.now(timezone.utc).date()).days
+            if 0 <= days_out <= EARNINGS_LOOKAHEAD_DAYS:
+                proximity = 1.0 - (days_out / max(1.0, float(EARNINGS_LOOKAHEAD_DAYS)))
+        except (ValueError, TypeError):
+            proximity = 0.0
+
+        volatility = 0.0
+        try:
+            raw_var = await self.redis_client.raw.get(
+                f"sentinel:earnings:surprise_var:{ticker}"
+            )
+            if raw_var:
+                # Standard deviation of past surprises, in percent. Ten points
+                # of typical deviation is already an unpredictable issuer.
+                volatility = min(1.0, (float(raw_var) ** 0.5) / 10.0)
+        except (ValueError, TypeError, AttributeError):
+            volatility = 0.0
+
+        score = (
+            PRE_ANNOUNCEMENT_FLOOR
+            + PROXIMITY_WEIGHT * proximity
+            + SURPRISE_VOLATILITY_WEIGHT * volatility
+        )
+        return round(min(PRE_ANNOUNCEMENT_CEILING, score), 4)
 
     async def _enrich_earnings_calendar(self, raw, p) -> Optional[NormalizedEvent]:
         """Enriches Finnhub earnings calendar events into NormalizedEvents.
@@ -1043,7 +1242,19 @@ class TradFiEnricher:
             event_type = EventType.EARNINGS_REPORT
 
         # Anomaly scoring — dynamic EMA z-score on abs(surprise_pct)
-        anomaly = 0.3  # Baseline for pre-announcement
+        # Pre-announcement scoring.
+        #
+        # This was a flat 0.3, which made all 183 upcoming-earnings events in a
+        # 45-minute window carry one score. A pre-announcement has no surprise
+        # to measure yet, but that does not make every one of them equally
+        # interesting, and a detector whose output never varies ranks nothing.
+        #
+        # Two things are already measured here and both bear on how much a
+        # report is worth watching: how soon it lands, and how unpredictable
+        # this issuer has been. The surprise EMA and variance are maintained a
+        # few lines below for exactly this ticker, so an issuer that habitually
+        # surprises raises its own upcoming report without anyone asserting it.
+        anomaly = await self._pre_announcement_score(ticker, report_date)
         if eps_surprise_pct is not None:
             abs_surprise = abs(eps_surprise_pct)
             # Dynamic z-score against historical surprises for this ticker
@@ -1053,7 +1264,25 @@ class TradFiEnricher:
                 var_key = f"sentinel:earnings:surprise_var:{ticker}"
                 raw_mean = await self.redis_client.raw.get(ema_key)
                 raw_var = await self.redis_client.raw.get(var_key)
-                ema_mean = float(raw_mean) if raw_mean else abs_surprise
+                # No history means no z-score, not a z-score of zero.
+                #
+                # ema_mean defaulted to abs_surprise, so the first observation
+                # of a ticker was compared against itself: z = 0, which the
+                # max(0.3, ...) floor then reported as 0.300. Issuers report
+                # quarterly and this EMA expires in four weeks, so there is
+                # never a second observation -- every surprise scored 0.300
+                # forever. Measured live: a +505.7% beat, a +2.4% beat, a -100%
+                # miss and a -26.6% miss, all at exactly 0.300.
+                #
+                # With no baseline, the magnitude of the surprise is the only
+                # thing actually known, so that is what gets scored. Once a
+                # ticker has a history the z-score takes over and says the more
+                # useful thing: how unusual this surprise is *for this issuer*.
+                has_history = raw_mean is not None
+                if not has_history:
+                    raise _NoEarningsHistory
+
+                ema_mean = float(raw_mean)
                 ema_var = float(raw_var) if raw_var else 1.0
                 std = max(ema_var ** 0.5, 0.01)
                 z = (abs_surprise - ema_mean) / std
@@ -1066,15 +1295,29 @@ class TradFiEnricher:
                 await pipe.execute()
                 # Map z-score to anomaly: z>=2 is significant
                 anomaly = min(1.0, max(0.3, abs(z) / 4.0))
+            except _NoEarningsHistory:
+                # First sight of this issuer. Score what is known -- the size of
+                # the surprise -- and let the EMA below record it for next time.
+                anomaly = _surprise_magnitude_score(abs_surprise)
             except Exception:
                 # Fallback: simple scaled surprise
-                anomaly = min(1.0, abs_surprise / 50.0)
+                anomaly = _surprise_magnitude_score(abs_surprise)
 
         # Watchlist & Frequency boost
+        # One allowance per event, shared by every lift below, so a run of
+        # boosts cannot each take a share of what the last one left.
+        lift_spent = 0.0
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         w_boost = 0.15 if is_watched else 0.0
         f_boost = await self.scorer.track_frequency(ticker, "earnings")
-        anomaly = min(1.0, anomaly + w_boost + f_boost)
+        # Headroom lift rather than addition: `anomaly + w_boost + f_boost`
+        # clamped at the ceiling, so a 0.85 score and a 0.99 score with the same
+        # boosts became indistinguishable. The rest of this file was converted
+        # for that reason; this path was missed.
+        anomaly = _lift(anomaly, w_boost, lift_spent)
+        lift_spent += w_boost
+        anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
+        lift_spent += f_boost
 
         # Direction tags
         direction = "beat" if (eps_surprise_pct or 0) > 0 else "miss" if (eps_surprise_pct or 0) < 0 else "inline"
