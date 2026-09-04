@@ -64,11 +64,10 @@ EVENT_COLLECTION = "sentinel_events_v2"
 # anomalous position events are deliberately NOT listed -- those are findings
 # about a vessel or aircraft, and a finding is the kind of thing worth
 # correlating.
-POSITION_TELEMETRY_TYPES = frozenset({
-    "vessel_position",
-    "vessel_static",
-    "flight_position",
-})
+# Defined in shared/models/events.py so the agent layer can apply the same
+# rule without importing this service. Re-exported here because callers across
+# the correlation package import it from this module by name.
+from shared.models.events import POSITION_TELEMETRY_TYPES
 
 SIMILARITY_THRESHOLD_DEFAULT = 0.65
 
@@ -173,6 +172,8 @@ class SoftCorrelator:
     """
     def __init__(self, ollama_client: OllamaClient):
         self._model = None  # Lazy load the embedding model
+        # Recently-embedded claim digests, for suppressing identical repeats.
+        self._claim_window = {}
         self._client = None  # Lazy load the Qdrant client
         self._enabled = False  # Set to True when ready to activate
         self._llm = ollama_client
@@ -335,6 +336,57 @@ class SoftCorrelator:
                 logger.error(f"Batch embedding failed for {len(texts)} events: {e}")
                 return {}
 
+    # How long one claim suppresses re-embedding of an identical one.
+    #
+    # Matched to the semantic window: two identical sentences an hour apart are
+    # the same claim for retrieval purposes, and beyond that the second is worth
+    # re-stating because the situation around it has moved.
+    _CLAIM_DEDUP_TTL_SEC = 3600
+    # Digests are small; the cap bounds memory at a few megabytes.
+    _CLAIM_WINDOW_MAX = 50_000
+
+    async def _is_duplicate_claim(self, event) -> bool:
+        """True when an identical claim was embedded recently.
+
+        In-process rather than in Redis: this correlator holds no Redis client,
+        and there is one correlation service, so a bounded local window is both
+        sufficient and one less dependency on the embedding path.
+
+        Keyed on the event type, the entity and the normalised headline, so two
+        different assets producing coincidentally identical text remain distinct
+        claims. Fails open -- a duplicate vector is a smaller harm than a
+        missing one.
+        """
+        try:
+            import hashlib, time as _t
+            etype = event.type.value if hasattr(event.type, "value") else str(event.type)
+            entity = str(event.primary_entity.id or "") if getattr(event, "primary_entity", None) else ""
+            text = " ".join(str(x or "").strip().lower()
+                            for x in (etype, entity, getattr(event, "headline", "")))
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+            now = _t.monotonic()
+            seen = self._claim_window.get(digest)
+            if seen is not None and (now - seen) < self._CLAIM_DEDUP_TTL_SEC:
+                return True
+            self._claim_window[digest] = now
+
+            # Bounded: evict the oldest whenever the window outgrows its cap, so
+            # a long-running process cannot accumulate a digest per event.
+            if len(self._claim_window) > self._CLAIM_WINDOW_MAX:
+                cutoff = now - self._CLAIM_DEDUP_TTL_SEC
+                self._claim_window = {
+                    k: v for k, v in self._claim_window.items() if v > cutoff
+                }
+                if len(self._claim_window) > self._CLAIM_WINDOW_MAX:
+                    for k in sorted(self._claim_window, key=self._claim_window.get)[
+                        : len(self._claim_window) - self._CLAIM_WINDOW_MAX
+                    ]:
+                        self._claim_window.pop(k, None)
+            return False
+        except Exception:
+            return False
+
     async def store(self, event: NormalizedEvent, embedding: List[float]):
         """Store event embedding in Qdrant with metadata for later retrieval.
 
@@ -347,6 +399,22 @@ class SoftCorrelator:
             return
         event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
         if event_type in POSITION_TELEMETRY_TYPES:
+            return
+
+        # One vector per distinct claim, not one per occurrence.
+        #
+        # Measured live on 4 September: 83 byte-identical "Transfer: $15 USDT"
+        # headlines in thirty minutes, 65 of "$30 USDT", 62 of "$100 USDC" --
+        # each stored as its own point among 413,702. So the nearest neighbours
+        # of any crypto event were hundreds of near-copies of itself, which is
+        # the mechanical reason "Cross-Domain Semantic Convergence" averaged
+        # 1.01 distinct evidence types across 657 firings: the space had nothing
+        # else nearby to find.
+        #
+        # The duplicate is not lost -- it is in Timescale, in Kafka and on the
+        # wire. What it stops being is a separate point in a space whose whole
+        # purpose is measuring distance between different things.
+        if await self._is_duplicate_claim(event):
             return
         try:
             # 'Upsert' means "Insert if it doesn't exist, Update if it does".

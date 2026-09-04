@@ -32,6 +32,14 @@ API_KEY = resolve_env_var("API_GATEWAY_KEY", "dev-only-key-replace-in-prod", war
 SESSION_SECRET = get_secret("SESSION_SECRET", required=True)
 
 
+# Health paths that describe the platform rather than merely whether it is up.
+# These require credentials like any other data endpoint.
+_AUTHENTICATED_HEALTH_PATHS = frozenset({
+    "/api/v1/health/sources",
+    "/api/v1/health/data",
+})
+
+
 def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_seconds: int = 86400, role: str = "ANALYST") -> str:
     """
     Creates an RFC 7519 compliant HS256 JWT string.
@@ -213,7 +221,21 @@ async def verify_api_key(request: Request = None):
     if hasattr(request, "method") and request.method == "OPTIONS":
         return None
     path = getattr(getattr(request, "url", None), "path", "")
-    if path in ("/metrics", "/metrics/json", "/health") or path.startswith("/api/v1/health"):
+    # The health prefix is exempt, but not everything under it.
+    #
+    # `/api/v1/health/sources`, added this session, inherited this blanket
+    # exemption and served the platform's entire feed inventory unauthenticated:
+    # 46 sources, their learned polling cadences, and which are currently down.
+    # For an intelligence platform the list of what it watches and how often is
+    # among the more sensitive things it holds, and a liveness probe is a poor
+    # reason to publish it.
+    #
+    # Liveness and readiness stay open because an orchestrator has to reach them
+    # before it has credentials. Anything that describes the platform's sources
+    # or data does not.
+    if path in ("/metrics", "/metrics/json", "/health"):
+        return None
+    if path.startswith("/api/v1/health") and path not in _AUTHENTICATED_HEALTH_PATHS:
         return None
     # Login must be reachable without credentials -- it is where credentials are
     # presented. It carries its own per-source throttling rather than relying on

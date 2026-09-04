@@ -50,6 +50,7 @@ from shared.utils.freshness import is_stale
 REASONING_MAX_CLUSTER_AGE_SEC = int(os.getenv("REASONING_MAX_CLUSTER_AGE_SEC", "3600"))
 from shared.utils.inference_budget import InferenceBudget
 from shared.utils.tasks import safe_create_task
+from shared.utils.backpressure import declare_pressure, clear_pressure
 from shared.utils.heartbeat import start_heartbeat_task
 
 def _jsonable(value):
@@ -81,8 +82,19 @@ def _narrative_summary(scenario) -> str:
     thirty-five inferences an hour, so spending one to restate an analysis it
     has already produced would be the wrong trade. The leading hypothesis is the
     one the confidence refers to, so it is the one worth naming here.
+
+    It says what the headline does not: which hypothesis the confidence refers
+    to, how confident the system is, and why the scenario matters.
     """
-    parts = [str(getattr(scenario, "headline", "") or "").strip()]
+    # The headline is deliberately not repeated here.
+    #
+    # This opened with it, and every surface that renders a narrative_summary
+    # renders the headline directly above it -- so the list view showed
+    # "XRPUSDT Signals Reveal Geopolitical Shifts and Cryptocurrency Trends"
+    # twice, once as the title and again as the first clause of its own summary.
+    # A summary that begins by restating the thing it sits under wastes the only
+    # line a reader gets to learn something new.
+    parts = []
 
     hypotheses = list(getattr(scenario, "hypotheses", None) or [])
     if hypotheses:
@@ -173,6 +185,15 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
 
     context = await context_builder.build(cluster)
     patterns = await library.find_similar(cluster.tags, cluster.rule_id)
+
+    # How often this rule has actually been borne out, alongside the examples.
+    # Cheap -- one aggregate over an indexed join -- and it is the single most
+    # calibrating fact the prompt can carry.
+    try:
+        context["rule_base_rate"] = await library.outcome_base_rate(cluster.rule_id)
+    except Exception as e:
+        logger.debug("Base rate unavailable for %s: %s", cluster.rule_id, e)
+
     scenario = await generator.generate(cluster, context, patterns)
     
     if scenario:
@@ -419,12 +440,42 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                 ):
                     if not await _budget.is_available():
                         _shed += 1
+
+                        # Say so upstream.
+                        #
+                        # This is the moment the service knows it cannot keep
+                        # up, and until now it was the only thing that knew.
+                        # The correlation layer went on building, embedding,
+                        # persisting and publishing clusters at full rate into
+                        # a tier managing roughly thirty-six an hour -- every
+                        # one of those costs paid for work discarded here.
+                        #
+                        # Declared on a short TTL, so recovery or a crash stops
+                        # throttling producers within ninety seconds.
+                        safe_create_task(
+                            declare_pressure(
+                                redis_client, "reasoning",
+                                reason="inference budget exhausted",
+                            ),
+                            name="reasoning-backpressure",
+                        )
+
                         if _shed % 500 == 1:
                             logger.info(
                                 f"Reasoning shed {_shed} clusters to stay within "
                                 f"inference capacity (consumer stays current)"
                             )
                         continue
+
+                    # Admitting work means the budget is available again.
+                    #
+                    # The TTL would clear the declaration eventually, but a
+                    # consumer that has recovered should say so rather than
+                    # leave its producers throttled for the rest of the window.
+                    safe_create_task(
+                        clear_pressure(redis_client, "reasoning"),
+                        name="reasoning-backpressure-clear",
+                    )
 
                     task = safe_create_task(
                         sem_process_cluster(cluster, db, redis_client, producer, context_builder, generator, library)
@@ -478,13 +529,28 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         await producer.close()
         logger.info(f"Final — clusters: {_processed}  scenarios: {_scenarios}  errors: {_errors}")
 
+# How long after start the first sweep runs, and the interval thereafter.
+#
+# The loop slept a full interval before its first execution, so a service
+# redeployed more often than every thirty minutes never ran this at all -- and
+# during this audit the reasoning service was restarted many times an hour. The
+# expiry decay was repaired, deployed, and still showed zero denied scenarios,
+# because the sweep that applies it had not once been reached.
+#
+# The short initial delay is to let the database pool and consumer settle; it is
+# not a throttle.
+TRACKER_FIRST_RUN_SEC = 120
+TRACKER_INTERVAL_SEC = 1800
+
+
 async def _tracker_loop(tracker: ScenarioTracker):
+    await asyncio.sleep(TRACKER_FIRST_RUN_SEC)
     while True:
-        await asyncio.sleep(1800)
         try:
             await tracker.check_all()
         except Exception as e:
             logger.error(f"Scenario Tracker error: {e}")
+        await asyncio.sleep(TRACKER_INTERVAL_SEC)
  
 # Tier weights for reasoning admission. A tier is the correlation layer's own
 # judgement of how much a cluster matters, and it was reaching the scheduler as

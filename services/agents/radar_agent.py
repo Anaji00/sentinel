@@ -56,6 +56,12 @@ class WatchlistPruneDecision(BaseModel):
 # it. Below it, a beat is noise: consensus is set to be beaten by a little.
 MIN_EARNINGS_SURPRISE_PCT = 10.0
 
+# How long one ticker stays claimed while its evaluation is in flight.
+# Live dispatches run 440s against a 420s no-verdict timeout, so the claim has
+# to outlast the slowest dispatch or the stampede reopens as soon as it expires.
+INFLIGHT_CLAIM_SECONDS = 900
+
+
 
 def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
     """EPS surprise on an event, or 0.0 when it is not an earnings event."""
@@ -155,6 +161,44 @@ class RadarAgent(SentinelAgent):
             # must not have that verdict acted on.
             if name in wanted and name not in out:
                 out[name] = d
+
+        # A rationale given verbatim for two candidates explains neither.
+        #
+        # Live, 4 September, from one batch of four: OC was NOT escalated and
+        # NFLX WAS, on the same sentence, word for word -- "the z-score is high
+        # but the regime suggests it may not be trending, and there is
+        # insufficient history for a reliable GARCH model. The prior context
+        # does not provide strong evidence of institutional activity." That text
+        # argues against escalation, and NFLX was escalated on it.
+        #
+        # The batcher's fan-out is keyed by ticker and mapped correctly; nothing
+        # is misaligned. The model simply recycled one sentence across candidates
+        # and varied the boolean independently of it. The prompt asks for "one
+        # sentence citing that candidate's own numbers", and a sentence that is
+        # byte-identical across two tickers cannot be citing either one's.
+        #
+        # These resolve to absent, which the batcher already turns into "no
+        # verdict" -- the outcome this function's docstring reserves for a
+        # ticker the model did not answer for. That is the correct category: a
+        # verdict whose stated reason belongs to a different instrument was not
+        # reached by judging this one. An unanswered candidate costs one
+        # inference later. An escalation recorded against a rationale that
+        # argues the opposite corrupts the decision history it is written into.
+        seen: Dict[str, list] = {}
+        for name, d in out.items():
+            r = " ".join(str(getattr(d, "rationale", "") or "").split()).lower()
+            if r:
+                seen.setdefault(r, []).append(name)
+        for r, names in seen.items():
+            if len(names) < 2:
+                continue
+            self.logger.warning(
+                "radar_decisions: identical rationale returned for %s -- "
+                "no verdict recorded for any of them. Rationale: %.120s",
+                ", ".join(sorted(names)), r,
+            )
+            for n in names:
+                out.pop(n, None)
         return out
     
     @property
@@ -417,9 +461,14 @@ class RadarAgent(SentinelAgent):
         if surprise_pct < MIN_EARNINGS_SURPRISE_PCT and notional_usd < 50_000:
             return None
         
-        # Idempotency: Do not re-evaluate a ticker we already escalated today
-        if await self.is_recently_processed(ticker, self.cooldown_seconds):
-            self.logger.info(f"Idempotency: Skipped evaluating ticker '{ticker}' (already evaluated recently).")
+        # Idempotency: Do not re-evaluate a ticker we already escalated today,
+        # and do not let two messages about one ticker both get that far.
+        #
+        # The claim is taken here, before the dispatch, not after the verdict.
+        # Held for the in-flight window; promoted to the full cooldown by
+        # mark_processed() below if this evaluation actually escalates.
+        if not await self.claim_processing(ticker, INFLIGHT_CLAIM_SECONDS):
+            self.logger.info(f"Idempotency: Skipped evaluating ticker '{ticker}' (already claimed or evaluated recently).")
             return None
         
         # ─── AGENTIC REASONING ───

@@ -71,6 +71,10 @@ def _message_domain(message: Dict[str, Any]) -> str:
     return str(source) if source else ""
 
 from shared.utils.tasks import safe_create_task
+from shared.utils.focus import offer_focus, prioritise
+# The same set the correlation layer refuses to treat as corroboration. One
+# definition of "this is a position report, not a claim", used by both.
+from shared.models.events import POSITION_TELEMETRY_TYPES as ROUTINE_TELEMETRY_TYPES
 from shared.utils.heartbeat import touch_heartbeat
 from shared.utils.text import clip
 from shared.utils.ollama import (
@@ -376,6 +380,26 @@ class InferenceBatcher:
         self._pending: List[tuple] = []
         self._lock = asyncio.Lock()
         self._timer: Optional[asyncio.Task] = None
+        # Whether a flush is currently inside the model call.
+        #
+        # The batch window is 20 seconds and an inference on this host takes
+        # 400+, so the timer fired about twenty more times while the first call
+        # was still running, and each firing started its own inference on
+        # whatever had accumulated in the meantime. They did not run in
+        # parallel -- the budget serialises them -- they queued, and every
+        # caller in every queued batch was counting down the same 420-second
+        # stall timeout while waiting for its turn.
+        #
+        # Measured over ninety minutes: 13 inferences answering 1, 1, 1, 3,
+        # four-six-times, 9 and 10 candidates, against 149 callers that timed
+        # out having never been answered at all. Three whole inferences spent
+        # on one candidate each, while 149 candidates got nothing.
+        #
+        # Holding new candidates back while a call is in flight costs them
+        # nothing -- a batch started now would queue behind that same call
+        # anyway -- and it means the next inference answers ten candidates
+        # instead of one.
+        self._inflight = False
 
     async def submit(self, key: str, item: Any) -> Any:
         """Queues one question and waits for its answer.
@@ -388,7 +412,7 @@ class InferenceBatcher:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         async with self._lock:
             self._pending.append((key, item, future))
-            should_flush = len(self._pending) >= self.max_items
+            should_flush = len(self._pending) >= self.max_items and not self._inflight
             if should_flush and self._timer:
                 self._timer.cancel()
                 self._timer = None
@@ -437,7 +461,6 @@ class InferenceBatcher:
 
     async def _flush(self):
         async with self._lock:
-            batch, self._pending = self._pending, []
             # Never cancel the task we are running on.
             #
             # _flush_after_wait calls this, so self._timer is frequently the
@@ -452,8 +475,24 @@ class InferenceBatcher:
             if self._timer is not None and self._timer is not current:
                 self._timer.cancel()
             self._timer = None
-        if not batch:
-            return
+
+            # Someone is already inside the model call. Leave the pending queue
+            # alone: it keeps filling, and the running flush re-arms below when
+            # it finishes, so these candidates go out together in the next
+            # inference instead of starting a rival one that would queue behind
+            # it. The timer reference is cleared above, so the next submit()
+            # arms a fresh one.
+            #
+            # This check has to come BEFORE the queue is drained. Draining
+            # first and then returning would take the batch out of _pending and
+            # abandon it -- its futures never resolved, every caller in it
+            # waiting out the full stall timeout for an answer no longer being
+            # computed. That is the exact failure the timer-cancel comment
+            # above describes, reintroduced one line lower down.
+            if self._inflight or not self._pending:
+                return
+            batch, self._pending = self._pending, []
+            self._inflight = True
 
         keys = [k for k, _, _ in batch]
         try:
@@ -473,6 +512,34 @@ class InferenceBatcher:
         for key, _, future in batch:
             if not future.done():
                 future.set_result(answers.get(key))
+
+        # Released here, not before the resolution above: a flush that started
+        # while these futures were still being settled would be answering a
+        # queue this one had already taken.
+        async with self._lock:
+            self._inflight = False
+            # Anything that arrived during the call goes out now. It has waited
+            # the length of a full inference already; making it wait another
+            # batch window on top of that is latency with nothing bought by it.
+            if self._pending and self._timer is None:
+                self._timer = safe_create_task(self._flush())
+
+
+def _is_resolvable(pred) -> bool:
+    """Whether a prediction could ever be scored, however long it is held.
+
+    A directional price prediction needs a positive entry to compare against.
+    Categorical and entity-appearance predictions do not, so they are never
+    retired on this basis.
+    """
+    kind = str(getattr(pred, "prediction_kind", "") or "price")
+    if kind != "price" or (getattr(pred, "outcome_space", None) or []):
+        return True
+    try:
+        entry = float(getattr(pred, "entry_price", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return entry > 0
 
 
 class SentinelAgent(ABC):
@@ -553,6 +620,36 @@ class SentinelAgent(ABC):
         # stays at its default -- see _resolve_predictions_loop.
         resolver_task = safe_create_task(self._resolve_predictions_loop())
 
+        # Run the scheduled review, if this agent defines one.
+        #
+        # `run_scheduled_review` is defined on the quant trading engine and on
+        # the consensus engine and was called by nothing -- no scheduler, no
+        # dynamic dispatch, no caller anywhere in the tree. So the quant
+        # engine's sweep across watched equities had never run, the consensus
+        # engine's scheduled analysis had never run, and the backtest refresh
+        # added earlier in this audit sat inside a method that could not
+        # execute, which is why sentinel:backtest:* was still empty after
+        # thirty-five minutes of live running.
+        # A one-time startup task, for agents that define one.
+        #
+        # Added because the graph type backfill was written into
+        # start_supervisor(), which is only reachable from that module's
+        # __main__ and which no compose service runs -- GraphSupervisor is
+        # constructed through build_agent like every other agent. That is the
+        # second time in this audit a repair was placed in a function with no
+        # caller; a declared hook is what stops it being the third.
+        if hasattr(self, "on_start"):
+            self._on_start_task = safe_create_task(
+                self.on_start(), name=f"{self.name}-on-start"
+            )
+
+        if hasattr(self, "run_scheduled_review"):
+            # Held on the instance so the task is not garbage-collected mid-flight
+            # and so shutdown can cancel it, matching how the resolver is kept.
+            self._review_task = safe_create_task(
+                self._scheduled_review_loop(), name=f"{self.name}-scheduled-review"
+            )
+
         try:
             await self._consume_loop()
         except asyncio.CancelledError:
@@ -585,6 +682,11 @@ class SentinelAgent(ABC):
     # an agent whose interests have not been written down keeps receiving
     # everything it did before.
     INTERESTED_EVENT_TYPES = None
+
+    # Types an agent will still receive despite the routine-telemetry denylist.
+    # Empty for every agent today; the hook exists so that adding one is a
+    # declaration on the agent rather than an edit to the shared filter.
+    ACCEPTS_TELEMETRY: frozenset = frozenset()
 
     async def _consume_loop(self):
         loop = asyncio.get_running_loop()
@@ -751,6 +853,35 @@ class SentinelAgent(ABC):
         # can act on now drops the rest at parse speed. Agents that declare
         # nothing are unaffected, so this cannot silently narrow an agent whose
         # interests were never written down.
+        # Routine telemetry, dropped for every agent.
+        #
+        # The allowlist below is opt-in and only radar_agent had ever filled it
+        # in, so nine of ten agents took the whole firehose onto the dispatch
+        # semaphore. An allowlist cannot safely be written for the others --
+        # they route on source, ticker and payload shape as much as on type, so
+        # declaring their interests as a type set would silently drop work they
+        # currently do.
+        #
+        # A denylist can. These three types are position reports: a vessel or an
+        # aircraft saying where it is. No agent's handle() references any of
+        # them -- verified across all ten -- and they are the bulk of
+        # ENRICHED_EVENTS. Dropping them here is the difference between an
+        # agent's concurrency limit being sized for real work and being sized
+        # for the firehose.
+        #
+        # An agent that later needs them declares them in ACCEPTS_TELEMETRY and
+        # this stops applying to it.
+        etype_raw = raw.get("type") or raw.get("event_type")
+        if etype_raw and str(etype_raw) in ROUTINE_TELEMETRY_TYPES:
+            if str(etype_raw) not in getattr(self, "ACCEPTS_TELEMETRY", frozenset()):
+                self._telemetry_dropped = getattr(self, "_telemetry_dropped", 0) + 1
+                if self._telemetry_dropped % 50000 == 1:
+                    self.logger.debug(
+                        "%s: %s routine position report(s) dropped before dispatch.",
+                        self.name, self._telemetry_dropped,
+                    )
+                return
+
         interests = getattr(self, "INTERESTED_EVENT_TYPES", None)
         if interests:
             etype = raw.get("type") or raw.get("event_type")
@@ -1073,6 +1204,18 @@ class SentinelAgent(ABC):
         Publishes a structured AgentBulletin to Redis.
         Other agents can query this via read_bulletins() or subscribe_bulletins().
         """
+
+        # Offer this subject to the rest of the swarm.
+        #
+        # Consensus fuses by entity and has never had two opinions on one --
+        # six live bulletins, five agents, six distinct tickers. Nothing asked a
+        # second agent to look at what the first found. This does, without
+        # compelling anything: the other agents consult the focus set when
+        # choosing and are free to ignore it.
+        safe_create_task(
+            offer_focus(self.redis, ticker, conviction, offered_by=self.name),
+            name=f"{self.name}-offer-focus",
+        )
         try:
             ent_id = primary_entity_id or ticker
             ent_name = primary_entity_name or ent_id
@@ -1514,6 +1657,34 @@ class SentinelAgent(ABC):
     async def mark_processed(self, entity_id: str, window_seconds: int = 3600):
         await self.redis.raw.set(self.state_key("seen", entity_id), "1", ex=window_seconds)
 
+    async def claim_processing(self, entity_id: str, ttl_seconds: int) -> bool:
+        """Take an exclusive claim on an entity, or report that someone holds it.
+
+        is_recently_processed() + mark_processed() is a check followed by an act,
+        and the gap between them is however long the work takes. In the radar
+        agent that gap is an LLM dispatch: 440 seconds, live. Every message for
+        the same ticker arriving inside those seven minutes read an absent key,
+        passed the guard, and bought its own inference slot -- META was
+        evaluated three times in two seconds, at Z=4.20, Z=0.77 and Z=2.55,
+        three separate dispatches of the scarcest resource the platform has to
+        answer one question.
+
+        SET NX collapses the two operations into one. The first caller gets the
+        key and proceeds; the rest are told it exists and stop.
+
+        The TTL is deliberately the in-flight window rather than the full
+        cooldown. A claim is not a verdict: if the work escalates, the caller
+        promotes it with mark_processed() and the entity is quiet for the whole
+        cooldown; if the work declines or raises, the claim expires on its own
+        and the entity can be reconsidered. Nothing has to release it, which
+        matters because the paths that decline are the ones most likely to
+        return early or raise.
+        """
+        res = await self.redis.raw.set(
+            self.state_key("seen", entity_id), "1", ex=ttl_seconds, nx=True
+        )
+        return bool(res)
+
     async def enqueue_task(self, task_type: str, payload: Dict, priority: str = "normal"):
         queue = {"high": TASK_QUEUE_HIGH, "normal": TASK_QUEUE_NORMAL, "low": TASK_QUEUE_LOW}.get(priority, TASK_QUEUE_NORMAL)
         task = {
@@ -1716,6 +1887,39 @@ class SentinelAgent(ABC):
     # anything.
     OUTCOME_DECISION_MARGIN = 0.15
 
+    # How often an agent that defines run_scheduled_review is asked to run it.
+    #
+    # Long, because a review is a sweep rather than a reaction and each one may
+    # spend inference. The first run waits a full interval so an agent starting
+    # up is not competing with its own backlog for the model.
+    SCHEDULED_REVIEW_INTERVAL_SEC = int(os.getenv("AGENT_SCHEDULED_REVIEW_SEC", "1800"))
+
+    # How long after start the first review runs.
+    #
+    # Sleeping a whole interval first meant an agent redeployed more often than
+    # every thirty minutes never ran its review at all. Short enough that a
+    # restart does not lose the cycle, long enough that the agent is not
+    # sweeping while its consumer and pools are still coming up.
+    SCHEDULED_REVIEW_FIRST_RUN_SEC = int(os.getenv("AGENT_SCHEDULED_REVIEW_FIRST_SEC", "180"))
+
+    async def _scheduled_review_loop(self) -> None:
+        """Calls run_scheduled_review on an interval, for agents that define it."""
+        await asyncio.sleep(self.SCHEDULED_REVIEW_FIRST_RUN_SEC)
+        while True:
+            try:
+                result = await self.run_scheduled_review()
+                if result:
+                    self.logger.info(
+                        "%s scheduled review produced a result.", self.name
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # A failed review must not end the loop; the next interval
+                # tries again.
+                self.logger.warning("%s scheduled review failed: %s", self.name, e)
+            await asyncio.sleep(self.SCHEDULED_REVIEW_INTERVAL_SEC)
+
     async def _resolve_predictions_loop(self) -> None:
         while True:
             await asyncio.sleep(self.PREDICTION_SWEEP_INTERVAL_SEC)
@@ -1811,6 +2015,28 @@ class SentinelAgent(ABC):
             self.logger.debug(f"Durable price lookup failed for {symbol}: {e}")
 
         return None
+
+    async def _retire_prediction(self, key: str, pred, reason: str) -> None:
+        """Moves a permanently unresolvable prediction out of the resolver's path."""
+        try:
+            payload = pred.model_dump_json()
+        except Exception:
+            payload = "{}"
+        try:
+            pipe = self.redis.raw.pipeline()
+            pipe.set(
+                f"sentinel:predictions:retired:{self.name}:{pred.prediction_id}",
+                payload, ex=7 * 86400,
+            )
+            pipe.delete(key)
+            await pipe.execute()
+            self.logger.info(
+                "Retired prediction %s on %s: %s. It could not resolve at any "
+                "point in the future, so it is no longer swept.",
+                str(pred.prediction_id)[:8], pred.ticker, reason,
+            )
+        except Exception as e:
+            self.logger.debug("Could not retire prediction %s: %s", key, e)
 
     async def _score_directional(self, pred: "AgentPrediction") -> Optional[bool]:
         """Was a price-direction call right? None when it cannot be judged.
@@ -2055,7 +2281,22 @@ class SentinelAgent(ABC):
                 else:
                     correct = await self._score_directional(pred)
                 if correct is None:
-                    continue        # unverifiable, so uncounted
+                    # Unverifiable *this time* is not the same as unverifiable
+                    # forever. A prediction whose entry price is non-positive
+                    # can never resolve however long it is kept, and six of the
+                    # eight records in the live corpus were exactly that --
+                    # re-read, re-judged and re-logged on every fifteen-minute
+                    # sweep, keeping three quarters of the corpus the scorecards
+                    # depend on permanently unusable.
+                    #
+                    # Retired rather than deleted: the record is kept briefly
+                    # under a distinct key so a person can see what was
+                    # discarded and why, and it stops being offered to the
+                    # resolver.
+                    if not _is_resolvable(pred):
+                        await self._retire_prediction(key, pred, "non-positive entry price")
+                        continue
+                    continue        # unverifiable for now, so uncounted
 
                 await self.update_scorecard(
                     prediction_correct=correct,

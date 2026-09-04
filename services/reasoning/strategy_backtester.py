@@ -23,6 +23,11 @@ from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("reasoning.backtester")
 
+# Closed trades required before a backtest may approve a strategy for live use.
+# The same number the quant engine uses before it will quote a payoff ratio.
+MIN_TRADES_FOR_VALIDATION = 20
+
+
 
 def _at(seq: List[Any], i: int) -> Any:
     """Safe positional access — external feeds return ragged parallel arrays."""
@@ -625,7 +630,22 @@ class StrategyBacktester:
 
         # ── 4. VALIDATION GATE DECISION (§B.1) ──────────────────────────────────
         # A strategy passes validation if Sharpe >= 1.0, Hit Rate >= 50%, Max DD <= 20%
+        # Enough trades for the statistics to mean anything, before anything else.
+        #
+        # The gate had no sample-size term, and live on 4 September it marked
+        # mean_reversion_abev APPROVED_FOR_LIVE on five trades with a 100% hit
+        # rate and a Sharpe of 24.91. That is not a strategy, it is what a
+        # five-sample Sharpe looks like: the ratio divides by a standard
+        # deviation estimated from four degrees of freedom, and on a lucky run
+        # it goes to the moon.
+        #
+        # Twenty is the threshold the platform already uses -- the quant engine
+        # refuses to trust a backtest payoff ratio below MIN_TRADES_FOR_PAYOFF
+        # for exactly this reason. The gate that decides whether a strategy may
+        # go live should not be more permissive than the one that decides
+        # whether its payoff ratio is quotable.
         passed_validation = bool(
+            total_trades >= MIN_TRADES_FOR_VALIDATION and
             hit_rate_pct >= 50.0 and
             sharpe_ratio is not None and
             sharpe_ratio >= 1.0 and
@@ -665,8 +685,10 @@ class StrategyBacktester:
             "brier_score": float(brier_score),
             "validation_gate": {
                 "passed": bool(passed_validation),
+                "min_trades_met": bool(total_trades >= MIN_TRADES_FOR_VALIDATION),
                 "status": "APPROVED_FOR_LIVE" if passed_validation else "REJECTED_GATED",
                 "criteria": {
+                    "min_trades_20": bool(total_trades >= MIN_TRADES_FOR_VALIDATION),
                     "min_hit_rate_50pct": bool(hit_rate_pct >= 50.0),
                     "min_sharpe_1_0": bool(sharpe_ratio is not None and sharpe_ratio >= 1.0),
                     "max_drawdown_20pct": bool(max_drawdown_pct <= 20.0),
@@ -677,19 +699,18 @@ class StrategyBacktester:
             "recent_trades": trades[-10:],
         }
 
-        # Cache report in Redis if available
-        if self.redis:
-            try:
-                import asyncio
-                safe_create_task(
-                    self.redis.raw.set(
-                        f"sentinel:backtest:results:{report['strategy_id']}",
-                        json.dumps(report, default=str),
-                        ex=86400 * 7
-                    )
-                )
-            except Exception as e:
-                logger.debug(f"Failed to cache backtest report in Redis: {e}")
+        # The caller persists this, not this function.
+        #
+        # The write was `safe_create_task(self.redis.raw.set(...))` inside a
+        # *synchronous* method, and the scheduled refresh offloads that method to
+        # a worker thread so it does not block the event loop. There is no
+        # running loop on a worker thread, so asyncio.create_task raised, the
+        # surrounding except logged it at debug, and sentinel:backtest:results:*
+        # stayed empty while the backtests themselves ran correctly and reported
+        # their results to the log.
+        #
+        # Returning the report and letting the async caller store it puts the
+        # write back on the loop that owns the Redis connection.
 
         logger.info(
             f"📈 Backtest complete for {report['strategy_id']}: Trades={total_trades} | "

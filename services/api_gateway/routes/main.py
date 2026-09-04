@@ -51,6 +51,8 @@ from services.api_gateway.routes import (
     filings,
     methodology,
     sovereignty,
+    attribution,
+    feedback,
 )
 
 @asynccontextmanager
@@ -168,6 +170,12 @@ app.include_router(agents.router)
 app.include_router(flags.router)
 app.include_router(backtest.router)
 app.include_router(explain.router)
+# Signal attribution and entity merge review: which weights earn their number,
+# and which spellings name one subject.
+app.include_router(attribution.router)
+# The one feedback loop the platform lacked -- everything it learned, it learned
+# from the market, which cannot see an alert that is valid and useless.
+app.include_router(feedback.router)
 app.include_router(health.router)
 app.include_router(watchlists.router)
 app.include_router(audit.router)

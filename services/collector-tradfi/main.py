@@ -19,6 +19,7 @@ import aiohttp
 import json
 import logging
 import os
+import re
 import sys
 import feedparser
 import time
@@ -34,6 +35,10 @@ load_dotenv(ROOT / ".env")
 from shared.utils.candles import candle_cache_key
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.kafka import SentinelProducer, Topics
+from shared.utils.source_freshness import mark_source_filtered
+from shared.utils.market_session import (
+    Session, current_session, eastern_now, poll_interval,
+)
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.models.events import entity_cache_key
@@ -212,43 +217,49 @@ def select_subscription_symbols(discovered, limit: int = None) -> list:
 # ── MARKET SESSION HELPER ─────────────────────────────────────────────────────
 
 def get_market_session() -> tuple:
+    """Current US Eastern market session, as (name, human-readable detail).
+
+    Delegates to shared.utils.market_session, which is the same logic this
+    function used to hold privately. It was the only place in the platform that
+    knew what time it was: the enrichers, the agents and every other collector
+    had no notion of a session, and this one used it to pick a source and label
+    a bar but never to decide how often to poll.
+
+    The tuple shape is preserved because six call sites in this file unpack it.
     """
-    Determines current US Eastern market session.
-    Sessions:
-      - PRE_MARKET:  04:00 - 09:30 ET (Mon-Fri)
-      - REGULAR:     09:30 - 16:00 ET (Mon-Fri)
-      - AFTER_HOURS: 16:00 - 20:00 ET (Mon-Fri)
-      - CLOSED:      All other times & weekends
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        et_tz = ZoneInfo("America/New_York")
-    except Exception:
-        et_tz = timezone(timedelta(hours=-5))
+    session = current_session(asset_class="equities")
+    now_et = eastern_now()
+    stamp = now_et.strftime("%H:%M")
 
-    now_et = datetime.now(et_tz)
-    weekday = now_et.weekday()
-    time_min = now_et.hour * 60 + now_et.minute
+    detail = {
+        Session.CLOSED: (
+            f"{now_et.strftime('%a %H:%M')} ET (Weekend)" if now_et.weekday() >= 5
+            else f"{stamp} ET (Overnight Closed)"
+        ),
+        Session.PRE_MARKET: f"{stamp} ET (Pre-Market 04:00-09:30)",
+        Session.REGULAR: f"{stamp} ET (Regular Hours 09:30-16:00)",
+        Session.AFTER_HOURS: f"{stamp} ET (After-Hours 16:00-20:00)",
+    }.get(session, f"{stamp} ET")
 
-    if weekday >= 5:
-        return "CLOSED", f"{now_et.strftime('%a %H:%M')} ET (Weekend)"
-
-    pre_market_start = 4 * 60       # 04:00 ET
-    regular_start = 9 * 60 + 30     # 09:30 ET
-    regular_end = 16 * 60           # 16:00 ET
-    after_hours_end = 20 * 60       # 20:00 ET
-
-    if pre_market_start <= time_min < regular_start:
-        return "PRE_MARKET", f"{now_et.strftime('%H:%M')} ET (Pre-Market 04:00-09:30)"
-    elif regular_start <= time_min < regular_end:
-        return "REGULAR", f"{now_et.strftime('%H:%M')} ET (Regular Hours 09:30-16:00)"
-    elif regular_end <= time_min < after_hours_end:
-        return "AFTER_HOURS", f"{now_et.strftime('%H:%M')} ET (After-Hours 16:00-20:00)"
-    else:
-        return "CLOSED", f"{now_et.strftime('%H:%M')} ET (Overnight Closed)"
+    return session.name, detail
 
 
 # ── SEC FORM 4 (REST POLLING) ─────────────────────────────────────────────────
+
+# Which EDGAR form types this poller will accept.
+#
+# Form 4 is the statement of changes in beneficial ownership -- an actual
+# insider transaction. 4/A is its amendment. Everything else beginning with "4"
+# is a different document entirely.
+_FORM4_TITLE = re.compile(r"^\s*(4|4/A)\s*(?:-|\s)", re.I)
+
+
+def _is_form4(title: str) -> bool:
+    """True when an EDGAR Atom entry is a Form 4 rather than a 424B."""
+    if not title:
+        return False
+    return bool(_FORM4_TITLE.match(str(title).strip()))
+
 
 async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer, redis_client):
     """
@@ -270,6 +281,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
         # are zero insider_trade events in the database and why the insider
         # clustering, the insider correlation rule and the Form 4 enricher have
         # all sat idle: not a routing defect, a 403 nobody could see.
+        skipped_non_form4 = 0
         async with session.get(url, timeout=15, headers={"User-Agent": SEC_USER_AGENT}) as resp:
             if resp.status != 200:
                 logger.warning(
@@ -283,6 +295,30 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
 
         feed = await loop.run_in_executor(None, feedparser.parse, content)
         for entry in feed.entries:
+            # EDGAR's `type=` is a prefix match, so `type=4` returns 424B2,
+            # 424B3 and 424B5 alongside Form 4.
+            #
+            # A 424B2 is a prospectus supplement -- routine structured-note
+            # paperwork -- and its "insider" is the bank filing its own
+            # offering. Live on 4 September: seven of seven events on this path
+            # were 424B2 filings from JPMorgan and Bank of America, published as
+            # source="sec_form4" and enriched into INSIDER_TRADE, the single
+            # most sensitive event type this platform has. The informed-trading
+            # sequence rule keys on insider_trade and would have taken a debt
+            # issuance as the leading leg of a case.
+            #
+            # The form type is in the entry title, which this loop already reads
+            # and renders into the headline.
+            if not _is_form4(entry.get("title", "")):
+                skipped_non_form4 += 1
+                # Heard from, and deliberately dropped. Without this the
+                # freshness tracker reads a run of 424B filings as a dead feed.
+                safe_create_task(
+                    mark_source_filtered(redis_client, "sec_form4"),
+                    name="form4-filtered",
+                )
+                continue
+
             link = entry.get("link", "")
             redis_key = f"sentinel:seen:form4:{link}"
 
@@ -373,6 +409,19 @@ class OHLCVAggregator:
             self.buffer[ticker] = {
                 "O": price, "H": price, "L": price, "C": price, "V": volume,
                 "pv_sum": price * volume,
+                # How many prints this bar is built from.
+                #
+                # A bar with one trade has zero range by construction, and 110
+                # of 852 live equity bars were exactly that -- open == high ==
+                # low == close, with real volume, on thin instruments like SGOV
+                # and CBRS where one print per five minutes is normal. The OHLC
+                # is honest; what was missing is any way for a reader to tell a
+                # genuinely flat five minutes from a five minutes containing a
+                # single trade. Every range-based measure -- realised
+                # volatility, the range-vol term in the structural detectors,
+                # ATR-derived stops -- reads zero on both and cannot
+                # distinguish them.
+                "N": 1,
             }
         else:
             d = self.buffer[ticker]
@@ -381,6 +430,7 @@ class OHLCVAggregator:
             d["C"] = price
             d["V"] = d["V"] + volume
             d["pv_sum"] = d["pv_sum"] + price * volume
+            d["N"] = d.get("N", 1) + 1
 
     async def flush(self):
         now = datetime.now(timezone.utc)
@@ -399,6 +449,10 @@ class OHLCVAggregator:
                         "high": data["H"],
                         "low": data["L"],
                         "close": data["C"],
+                        # So a zero-range bar can be read as "one print" rather
+                        # than "no movement".
+                        "trade_count": data.get("N", 1),
+                        "single_print": data.get("N", 1) <= 1,
                         "volume": data["V"],
                         "vwap": vwap,
                         "vwap_deviation": vwap_dev,
@@ -774,7 +828,13 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
             except Exception as e:
                 logger.error(f"Extended-hours equities polling error: {e}", exc_info=True)
 
-            await asyncio.sleep(60)
+            # Paced by the session this loop already knows it is in.
+            #
+            # It computed the session, logged it, and then slept the same sixty
+            # seconds whether the market was open or it was 03:00 on a Sunday --
+            # spending quota to observe that nothing had happened. The base rate
+            # is unchanged, so nothing slows down while the market is open.
+            await asyncio.sleep(poll_interval(60, asset_class="equities"))
 
 
 # The last option trade published per contract, so an unchanged snapshot is not

@@ -115,6 +115,90 @@ OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=max(600.0, _raw_timeout))
 # that could not complete because it queued behind one of them.
 OLLAMA_TOKENS_PER_SEC = float(os.getenv("OLLAMA_TOKENS_PER_SEC", "2.5"))
 
+# The rate the server reports for itself, which is not the same number.
+#
+# 2.5 was taken from *completion times* -- the comment above says so, and notes
+# a 16-token request that could not complete because it queued. That is wall
+# clock on a server running OLLAMA_NUM_PARALLEL=1 with eleven consumers, so it
+# is mostly waiting. Measured agent-side: 313s, 487s, 1,237s, 1,654s, 2,085s for
+# single calls, alongside 67 budget refusals in the same 45 minutes.
+#
+# Using a queue measurement as a generation rate makes the platform shorten its
+# own answers: _generation_token_cap multiplies it by the timeout, which is how
+# a 1,800-token request became 900. The model itself -- qwen2.5:1.5b at Q4 on
+# six cores -- generates far faster than 2.5 tok/s; it simply rarely gets to.
+#
+# Ollama returns eval_count and eval_duration on every response: the tokens it
+# produced and the nanoseconds it spent producing them, excluding queue and
+# excluding prompt evaluation. That is the real generation rate, and it is
+# already in every reply this client parses. Learned from it, the budget adapts
+# to the host instead of encoding one afternoon's observation of a queue.
+_OBSERVED_TOK_PER_SEC: Optional[float] = None
+
+# Weight on the newest observation. Slow, because a single unusually short
+# generation should not move a budget that governs timeouts.
+_TOK_RATE_ALPHA = 0.2
+
+# Bounds. The floor is the old constant, so a host that genuinely is this slow
+# behaves exactly as before; the ceiling stops one anomalous reading from
+# authorising a request that cannot finish.
+_TOK_RATE_FLOOR = 2.5
+_TOK_RATE_CEILING = 60.0
+
+# Generations required before the learned rate is trusted over the floor.
+_TOK_RATE_MIN_SAMPLES = 3
+_tok_rate_samples = 0
+
+
+def observe_generation_rate(data: dict) -> None:
+    """Learns the server's own generation rate from a completed response.
+
+    `eval_count / eval_duration` is what the model produced and how long it
+    spent producing it. It excludes queueing and prompt evaluation, which is
+    exactly what makes it the right number for sizing an answer.
+    """
+    global _OBSERVED_TOK_PER_SEC, _tok_rate_samples
+    if not isinstance(data, dict):
+        return
+    try:
+        count = float(data.get("eval_count") or 0)
+        nanos = float(data.get("eval_duration") or 0)
+    except (TypeError, ValueError):
+        return
+    if count < 16 or nanos <= 0:
+        # Too few tokens to measure a rate from.
+        return
+
+    rate = count / (nanos / 1e9)
+    if not (0 < rate < 1000):
+        return
+    rate = max(_TOK_RATE_FLOOR, min(_TOK_RATE_CEILING, rate))
+
+    if _OBSERVED_TOK_PER_SEC is None:
+        _OBSERVED_TOK_PER_SEC = rate
+    else:
+        _OBSERVED_TOK_PER_SEC = _TOK_RATE_ALPHA * rate + (1 - _TOK_RATE_ALPHA) * _OBSERVED_TOK_PER_SEC
+    _tok_rate_samples += 1
+
+    if _tok_rate_samples in (1, 3, 10, 50) or _tok_rate_samples % 250 == 0:
+        logger.info(
+            "Generation rate measured from the server's own telemetry: %.1f tok/s "
+            "over %d sample(s). The configured floor is %.1f, which was a "
+            "wall-clock figure including queue time.",
+            _OBSERVED_TOK_PER_SEC, _tok_rate_samples, _TOK_RATE_FLOOR,
+        )
+
+
+def generation_rate() -> float:
+    """Tokens per second to size a request against.
+
+    The learned rate once there is enough of it, the configured floor before
+    then -- so a cold start behaves exactly as this deployment always has.
+    """
+    if _OBSERVED_TOK_PER_SEC is not None and _tok_rate_samples >= _TOK_RATE_MIN_SAMPLES:
+        return _OBSERVED_TOK_PER_SEC
+    return OLLAMA_TOKENS_PER_SEC
+
 # Characters per token, for budgeting the prompt against the context window.
 # English averages ~4. Kept conservative because overshooting num_ctx truncates
 # on the *server* side, where there is no warning at all.
@@ -147,7 +231,7 @@ def max_deliverable_tokens() -> int:
     have to know the host's token rate, and none of them do.
     """
     total = OLLAMA_TIMEOUT.total or 600.0
-    return max(128, int(total * _GENERATION_BUDGET_SHARE * OLLAMA_TOKENS_PER_SEC))
+    return max(128, int(total * _GENERATION_BUDGET_SHARE * generation_rate()))
 
 # Circuit breaker config
 # How long the server may accept requests without completing one before this
@@ -410,7 +494,7 @@ def _bounded_num_predict(
             "Capping num_predict %s -> %s: at %.1f tok/s this host cannot produce "
             "more before the %.0fs timeout, and the request would fail having "
             "generated nothing.",
-            wanted, deliverable, OLLAMA_TOKENS_PER_SEC, OLLAMA_TIMEOUT.total or 600.0,
+            wanted, deliverable, generation_rate(), OLLAMA_TIMEOUT.total or 600.0,
         )
         return deliverable
     return wanted
@@ -1047,6 +1131,15 @@ class OllamaClient:
                 self.last_truncated = True
             else:
                 self.last_truncated = False
+
+            # Learn the server's real generation rate from what it just did.
+            #
+            # eval_count and eval_duration are on every response and describe
+            # only the generation: not the queue, not the prompt evaluation.
+            # That is the number a token budget should be sized against, and the
+            # platform had been sizing against a wall-clock figure instead.
+            observe_generation_rate(data)
+
             return data.get("response", "")
             
         except asyncio.TimeoutError:

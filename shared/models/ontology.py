@@ -65,7 +65,17 @@ VALID_PREDICATES: Set[str] = {
     # another's gain -- is still a peer and still transmits, the other way.
     "PEER_OF",
     "GRANGER_CAUSES",                # Directional predictive causality (properties: lag, f_stat, p_value)
-    "HAWKES_EXCITES",                # Cross-domain self/mutually exciting point process (branching_ratio, half_life)
+    "HAWKES_EXCITES",
+
+    # 5. On-chain
+    # A transfer between two addresses. RELATED_TO accounted for 270,513 of
+    # roughly 370,000 edges -- 73% of the graph -- and almost all of it was the
+    # crypto enricher recording transfers under the vocabulary's catch-all,
+    # beside SYMPATHY_MOVER at 172 and HAS_EXPOSURE_IN at 135. An edge type
+    # that covers three quarters of a graph distinguishes nothing, and the one
+    # relationship it was mostly standing in for is both specific and the
+    # highest-volume fact this platform observes.
+    "TRANSACTED_WITH",                # Cross-domain self/mutually exciting point process (branching_ratio, half_life)
 }
 
 

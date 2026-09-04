@@ -59,6 +59,11 @@ class ConsensusHoldersResponse(BaseModel):
     institutional_buyers: List[str] = Field(default_factory=list)
     total_prominent_holders: int = 0
     consensus_sentiment: str = "NEUTRAL"
+    # Whether the names above came from filings this platform actually
+    # ingested. False means no 13F basis exists for this ticker -- which is a
+    # different statement from "no institution holds it", and the two used to
+    # be indistinguishable in this response.
+    derived_from_filings: bool = False
 
 
 @router.get("/latest", response_model=List[FilingItemSummary])
@@ -217,15 +222,27 @@ async def get_13f_consensus_for_ticker(
         except Exception:
             pass
 
-    if not buyers:
-        # Default consensus mapping for major equities
-        if t_clean in ("NVDA", "AAPL", "MSFT", "AMZN"):
-            buyers = {"Warren Buffett", "Ken Griffin", "Jim Simons", "Cathie Wood"}
-        elif t_clean in ("BABA", "JD", "BIDU"):
-            buyers = {"Michael Burry", "David Tepper"}
-        elif t_clean in ("HLT", "QSR", "NKE", "CMG"):
-            buyers = {"Bill Ackman"}
-
+    # No filings, no consensus. The names are not ours to supply.
+    #
+    # This endpoint used to invent one when Redis held nothing: NVDA, AAPL,
+    # MSFT and AMZN returned "Warren Buffett, Ken Griffin, Jim Simons, Cathie
+    # Wood"; BABA, JD and BIDU returned "Michael Burry, David Tepper"; HLT,
+    # QSR, NKE and CMG returned "Bill Ackman". Those sets were hardcoded, were
+    # not derived from any filing, carried no flag saying so, and were then run
+    # through the sentiment rule below -- so a caller asking about BABA got two
+    # institutional buyers and the verdict ACCUMULATING, all of it invented.
+    #
+    # It was also wrong on its own terms, which is how it was found: Scion
+    # Asset Management has been dissolved, so Michael Burry files no 13F to be
+    # a buyer in, and Jim Simons died in 2024. A hardcoded roster of people
+    # does not merely lack evidence, it decays -- and the decay is invisible,
+    # because nothing about a constant looks stale.
+    #
+    # An empty answer is the correct one. The distinction that matters to a
+    # caller is between "no prominent filer holds this" and "we have no filing
+    # data for this ticker", and those were indistinguishable before because
+    # both returned NEUTRAL. derived_from_filings separates them.
+    derived = bool(buyers)
     sentiment = "ACCUMULATING" if len(buyers) >= 2 else ("MODERATE_HOLD" if len(buyers) == 1 else "NEUTRAL")
 
     return ConsensusHoldersResponse(
@@ -233,4 +250,5 @@ async def get_13f_consensus_for_ticker(
         institutional_buyers=sorted(list(buyers)),
         total_prominent_holders=len(buyers),
         consensus_sentiment=sentiment,
+        derived_from_filings=derived,
     )

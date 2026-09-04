@@ -113,5 +113,9 @@ def test_a_missing_critique_result_is_refused():
 def test_both_exits_from_synthesis_map_through_one_function():
     """The skip path and the critique path must produce the same shape."""
     src = (ROOT / "services/reasoning/scenario_generator.py").read_text(encoding="utf-8")
-    assert src.count("return self._to_scenario(cluster, output)") == 2
+    # Counted on the call, not on `return` preceding it. The skip path now
+    # assigns first so it can apply the grounding gate before returning, which
+    # is still one function producing both shapes -- the property this test
+    # exists to hold.
+    assert src.count("self._to_scenario(cluster, output)") == 2
     assert src.count("scenario = Scenario(") == 1, "two places build a Scenario and can drift"

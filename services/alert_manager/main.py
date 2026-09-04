@@ -12,6 +12,7 @@ Rate limiting: per-rule rate limit of 10 Telegram messages per hour.
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 import sys
 import time
 import json
@@ -45,6 +46,12 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL        = os.getenv("ALERT_WEBHOOK_URL")
 
+# Where alerts live inside the platform, independent of outbound delivery.
+ALERT_LOG_KEY = "sentinel:alerts:recent"
+ALERT_UNDELIVERED_KEY = "sentinel:alerts:undelivered"
+ALERT_LOG_MAX = 500
+ALERT_LOG_TTL_SEC = 7 * 86400
+
 DEDUP_TTL         = 21600   # 6 hours
 RATE_LIMIT_WINDOW = 3600    # 1 hour
 RATE_LIMIT_MAX    = 10      # max alerts per rule per hour
@@ -69,7 +76,7 @@ class AlertManager:
         
         return count < RATE_LIMIT_MAX
 
-    async def _record_alert_sent(self, rule_name: str):
+    async def _record_alert_sent(self, rule_name: str, confidence: float = 0.0):
         """Records an alert in the Redis sorted set for rate limiting."""
         now = time.time()
         key = f"sentinel:alert:rate_limit:{rule_name}"
@@ -77,7 +84,85 @@ class AlertManager:
         pipe = self._redis.raw.pipeline()
         pipe.zadd(key, {str(now): now})
         pipe.expire(key, RATE_LIMIT_WINDOW)
+        # Scored by confidence rather than time, so the weakest delivery of the
+        # hour is a zrange away and can be displaced by better evidence.
+        delivered = self._DELIVERED_KEY.format(rule=rule_name)
+        pipe.zadd(delivered, {f"{now}": float(confidence or 0.0)})
+        pipe.expire(delivered, RATE_LIMIT_WINDOW)
         await pipe.execute()
+
+    # Confidence of each alert delivered per rule this hour, so a later and
+    # better cluster can take a slot from an earlier and weaker one.
+    _DELIVERED_KEY = "sentinel:alert:delivered:{rule}"
+
+    async def _displaces_weakest(self, rule_name: str, cluster) -> bool:
+        """Whether this cluster beats the weakest already sent under this rule.
+
+        Returns True only when a slot is genuinely freed, and frees it as it
+        answers, so two callers cannot claim the same one.
+        """
+        try:
+            conf = float(getattr(cluster, "confidence_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        try:
+            key = self._DELIVERED_KEY.format(rule=rule_name)
+            raw = self._redis.raw
+            # Oldest entries first: the window is an hour, and anything older
+            # has already left the rate limiter's own window.
+            await raw.zremrangebyscore(key, "-inf", time.time() - RATE_LIMIT_WINDOW)
+            weakest = await raw.zrange(key, 0, 0, withscores=True)
+            if not weakest:
+                return False
+            member, score = weakest[0]
+            if conf <= float(score):
+                return False
+            await raw.zrem(key, member)
+            logger.info(
+                "Cluster at confidence %.3f displaces one at %.3f under '%s': the "
+                "hour's budget goes to the better evidence.",
+                conf, float(score), rule_name,
+            )
+            return True
+        except Exception as e:
+            logger.debug("Displacement check failed for %s: %s", rule_name, e)
+            return False
+
+    async def _record_alert(self, rule_name: str, title: str, body: str, delivered: bool) -> None:
+        """Keeps the alert inside the platform, whether or not it left it.
+
+        Outbound delivery and having produced an alert are two different facts,
+        and this service only recorded the first. With Telegram unconfigured
+        _send_telegram returns False, and every alert was then dropped on the
+        floor: no store, no record, nothing for the dashboard or the API to
+        read. A service whose entire job is not missing things was the one
+        component that could lose them silently.
+
+        Recorded first and delivered second, so an outbound failure -- an
+        unconfigured token, a network fault, Telegram rate-limiting us -- costs
+        the notification and never the alert itself.
+        """
+        try:
+            entry = json.dumps({
+                "rule_name": rule_name,
+                "title": title,
+                "body": body[:4000],
+                "delivered": bool(delivered),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            pipe = self._redis.raw.pipeline()
+            pipe.lpush(ALERT_LOG_KEY, entry)
+            pipe.ltrim(ALERT_LOG_KEY, 0, ALERT_LOG_MAX - 1)
+            pipe.expire(ALERT_LOG_KEY, ALERT_LOG_TTL_SEC)
+            if not delivered:
+                # A separate queue, so "produced but not delivered" is one
+                # lookup rather than a scan of everything.
+                pipe.lpush(ALERT_UNDELIVERED_KEY, entry)
+                pipe.ltrim(ALERT_UNDELIVERED_KEY, 0, ALERT_LOG_MAX - 1)
+                pipe.expire(ALERT_UNDELIVERED_KEY, ALERT_LOG_TTL_SEC)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug(f"Could not record alert {rule_name}: {e}")
 
     async def handle_correlation(self, cluster: CorrelationCluster):
         if cluster.alert_tier == AlertTier.WATCH:
@@ -92,17 +177,38 @@ class AlertManager:
         
         rule_name = cluster.rule_name
         if not await self._check_rate_limit(rule_name):
-            logger.warning(f"Rate limit reached for rule '{rule_name}' ({RATE_LIMIT_MAX}/hr max). Skipping alert delivery non-blockingly.")
-            return
+            # The budget is spent on the best of the hour, not the first of it.
+            #
+            # Live: 50 refusals for Cross-Domain Semantic Convergence and 21 for
+            # Cyber Aviation Chokepoint in twenty-five minutes, both against a
+            # 10/hr ceiling. The ceiling is right -- those are the two rules that
+            # fire most and mean least -- but selection was arrival order, so
+            # which ten of eighty got through was arbitrary. The platform ranks
+            # every correlation by confidence and then discarded the surplus
+            # without consulting it.
+            #
+            # A cluster more confident than the weakest one already delivered
+            # this hour displaces it. Nothing is sent twice and the ceiling is
+            # unchanged; what changes is which ten a reader sees.
+            if not await self._displaces_weakest(rule_name, cluster):
+                logger.info(
+                    "Rate limit reached for rule '%s' (%s/hr) and this cluster "
+                    "(confidence %.3f) does not beat what has already been sent.",
+                    rule_name, RATE_LIMIT_MAX, float(cluster.confidence_score or 0.0),
+                )
+                return
 
         tg_text = format_correlation(cluster)
         success = await self._send_telegram(tg_text)
         if success:
-            await self._record_alert_sent(rule_name)
+            await self._record_alert_sent(rule_name, cluster.confidence_score or 0.0)
             await self._redis.raw.set(dedup_key, "1", ex=DEDUP_TTL)
             if WEBHOOK_URL:
                 await self._send_webhook(format_generic(cluster))
             logger.info(f"!! [{cluster.alert_tier.name}] {cluster.rule_name} id:{cluster.correlation_id[:8]}")
+        await self._record_alert(
+            rule_name, cluster.summary_headline or rule_name, tg_text, success
+        )
 
     async def handle_scenario(self, scenario: Scenario):
         """Sends a follow-up intelligence briefing when the reasoning service finishes."""
@@ -155,10 +261,19 @@ class AlertManager:
             logger.info(f"!! [INTEL_BRIEF] Sent for agent run {run_id}")
         if WEBHOOK_URL:
             await self._send_webhook(brief)
+        await self._record_alert(rule_name, str(run_id), tg_text, success)
 
     async def _send_telegram(self, text: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.warning("Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is unset in environment (.env)")
+            # Once per process, not once per alert. This is a deployment state,
+            # not an event, and at alert volume it buried the log.
+            if not getattr(self, "_telegram_unconfigured_said", False):
+                self._telegram_unconfigured_said = True
+                logger.warning(
+                    "Telegram is not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID unset). "
+                    "Alerts are still evaluated and recorded to %s; they are not sent outward.",
+                    ALERT_LOG_KEY,
+                )
             return False
 
         for attempt in range(3):
@@ -253,9 +368,17 @@ async def main():
                                 await manager.handle_scenario(scenario)
                             elif tp.topic == Topics.INTEL_BRIEFS:
                                 await manager.handle_intel_brief(payload)
-                            else:
+                            elif tp.topic == Topics.CORRELATIONS:
+                                # Matched, not assumed. This was an `else`, so
+                                # every payload that was not a scenario or a
+                                # brief was constructed as a CorrelationCluster
+                                # regardless of what it actually was.
                                 cluster = CorrelationCluster(**payload)
                                 await manager.handle_correlation(cluster)
+                            else:
+                                logger.debug(
+                                    "No handler for topic %s; message ignored.", tp.topic
+                                )
                         except Exception as e:
                             logger.error(f"Alert processing error: {e}", exc_info=True)
                 

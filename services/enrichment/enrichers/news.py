@@ -19,6 +19,8 @@ from shared.utils.sanctions import check_sanctions
 from shared.utils.equities import is_valid_primary_equity, looks_like_a_ticker, confirm_tickers
 from shared.utils.corroboration import CorroborationTracker
 from shared.utils.source_scorecard import get_source_scorecard
+from services.enrichment.anomaly_scorer import lift_score
+from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
 logger = logging.getLogger("enrichment.news")
 
@@ -337,10 +339,22 @@ class NewsEnricher:
             hawkes_ratio = self.scorer.get_hawkes_intensity("news")
             if hawkes_ratio and isinstance(hawkes_ratio, (int, float)) and hawkes_ratio > 1.2:
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
-                anomaly = min(1.0, anomaly + hawkes_boost)
+                # Headroom lift, as everywhere else. The 0.15 cap and the 1.2
+                # trigger are this domain's own; how the boost lands is not.
+                anomaly = lift_score(anomaly, hawkes_boost)
 
         if ofac_hits:
-            anomaly = min(1.0, max(0.85, anomaly + 0.40))
+            # Deliberately a floor and not a lift. A sanctions match is a
+            # categorical fact about the subject, not evidence to be weighed
+            # against the detector's opinion, so it sets a minimum rather than
+            # taking a share of the headroom. This is the domain-specific half
+            # of the split: the composition rule above is shared, this is not.
+            # Bounded below certainty. A sanctions match is a categorical fact
+            # about the subject and rightly sets a floor -- but any anomaly at
+            # or above 0.60 then landed on exactly 1.0, and twelve headlines did
+            # on 4 September. Nothing in this platform should publish certainty;
+            # the floor stays, the ceiling joins every other detector's.
+            anomaly = min(FALLBACK_MAX_SCORE, max(0.85, anomaly + 0.40))
 
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
         if is_threat:

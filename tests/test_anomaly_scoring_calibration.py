@@ -24,6 +24,7 @@ CRITICAL. Three causes:
      shared one distinct score.
 """
 
+from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 import importlib.util
 import re
 import sys
@@ -80,7 +81,12 @@ def test_size_scoring_discriminates_across_orders_of_magnitude(crypto_enricher):
     assert score(50) == 0.0
     assert 0.4 < score(1_000_000) < 0.6
     assert score(5_000_000) > 0.6
-    assert score(500_000_000) == 1.0
+    # Capped below certainty, not at it. Every detector in this platform was
+    # bounded by FALLBACK_MAX_SCORE during this audit on one argument: the
+    # largest thing observed so far is still only that. A nine-figure transfer
+    # saturates the scale; it does not exhaust what the chain can carry.
+    assert score(500_000_000) == FALLBACK_MAX_SCORE
+    assert score(500_000_000) < 1.0
     sizes = [10_000, 100_000, 1_000_000, 10_000_000, 100_000_000]
     scores = [score(v) for v in sizes]
     assert scores == sorted(scores), "a larger transfer must never rank lower"

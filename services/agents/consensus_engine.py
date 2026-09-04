@@ -48,6 +48,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+from shared.utils.entity_resolution import resolve_entity
 
 from pydantic import BaseModel, Field
 
@@ -61,6 +62,110 @@ ACH_UNCERTAINTY_THRESHOLD = 0.40
 
 
 # ── SUBJECTIVE LOGIC ─────────────────────────────────────────────────────────
+
+# The prior used when there is not enough history to measure one.
+#
+# 0.5 is the honest answer to "how often is a claim of this kind true" when you
+# have never checked: it is the non-informative prior, and Subjective Logic's
+# projected probability degrades to belief-plus-half-the-uncertainty, which is
+# exactly what this system did everywhere until the outcomes existed.
+DEFAULT_BASE_RATE = 0.5
+
+# Resolved predictions required before a measured rate replaces the default.
+# Below this the rate is an artefact of a handful of outcomes; a base rate
+# computed from four resolutions is noisier than admitting ignorance.
+MIN_OUTCOMES_FOR_BASE_RATE = 25
+
+# How long a computed rate is reused before it is recomputed. The corpus grows
+# slowly and this query touches two tables.
+BASE_RATE_CACHE_TTL_SEC = 900
+BASE_RATE_CACHE_KEY = "sentinel:consensus:base_rate"
+
+# Bounds. A measured rate of 0.0 or 1.0 says a class of claim is never or always
+# right, which no finite sample establishes, and either extreme collapses the
+# projected probability onto belief or onto certainty.
+BASE_RATE_FLOOR = 0.05
+BASE_RATE_CEILING = 0.95
+
+
+async def measured_base_rate(db_client, redis_client, direction: str = "any") -> float:
+    """How often claims of this kind have actually turned out right.
+
+    Computed from the platform's own resolved history rather than assumed:
+    directional predictions from agent_predictions, which carry the direction
+    that was claimed and whether it was borne out.
+
+    Returns DEFAULT_BASE_RATE when there is too little history, which is the
+    correct answer rather than a failure -- an unmeasured prior should be
+    non-informative, not confidently wrong.
+    """
+    cache_field = str(direction or "any").lower()
+
+    if redis_client:
+        try:
+            raw_redis = getattr(redis_client, "raw", redis_client)
+            cached = await raw_redis.hget(BASE_RATE_CACHE_KEY, cache_field)
+            if cached:
+                return float(cached.decode() if isinstance(cached, bytes) else cached)
+        except Exception:
+            pass
+
+    if not db_client:
+        return DEFAULT_BASE_RATE
+
+    try:
+        if cache_field in ("up", "down"):
+            rows = await db_client.query(
+                """
+                SELECT count(*) AS n,
+                       count(*) FILTER (WHERE outcome_correct) AS correct
+                FROM agent_predictions
+                WHERE resolved_at IS NOT NULL
+                  AND outcome_correct IS NOT NULL
+                  AND lower(direction) = $1
+                  AND occurred_at > NOW() - INTERVAL '90 days'
+                """,
+                cache_field,
+            )
+        else:
+            rows = await db_client.query(
+                """
+                SELECT count(*) AS n,
+                       count(*) FILTER (WHERE outcome_correct) AS correct
+                FROM agent_predictions
+                WHERE resolved_at IS NOT NULL
+                  AND outcome_correct IS NOT NULL
+                  AND occurred_at > NOW() - INTERVAL '90 days'
+                """
+            )
+        if not rows:
+            return DEFAULT_BASE_RATE
+        n = int(rows[0].get("n") or 0)
+        correct = int(rows[0].get("correct") or 0)
+        if n < MIN_OUTCOMES_FOR_BASE_RATE:
+            return DEFAULT_BASE_RATE
+
+        rate = correct / float(n)
+        rate = max(BASE_RATE_FLOOR, min(BASE_RATE_CEILING, rate))
+
+        if redis_client:
+            try:
+                raw_redis = getattr(redis_client, "raw", redis_client)
+                await raw_redis.hset(BASE_RATE_CACHE_KEY, cache_field, rate)
+                await raw_redis.expire(BASE_RATE_CACHE_KEY, BASE_RATE_CACHE_TTL_SEC)
+            except Exception:
+                pass
+
+        logger.info(
+            "Base rate for %s claims measured at %.3f over %d resolved predictions.",
+            cache_field, rate, n,
+        )
+        return rate
+    except Exception as e:
+        logger.debug("Base rate query failed (%s); using the non-informative prior: %s",
+                     cache_field, e)
+        return DEFAULT_BASE_RATE
+
 
 class SubjectiveOpinion(BaseModel):
     """
@@ -89,7 +194,12 @@ class SubjectiveOpinion(BaseModel):
         return min(self.belief, self.disbelief) * 2.0
 
     @classmethod
-    def from_bulletin(cls, bulletin: AgentBulletin, weight: float = 1.0) -> "SubjectiveOpinion":
+    def from_bulletin(
+        cls,
+        bulletin: AgentBulletin,
+        weight: float = 1.0,
+        base_rate: float = DEFAULT_BASE_RATE,
+    ) -> "SubjectiveOpinion":
         """
         Map an AgentBulletin to a Subjective Logic opinion.
 
@@ -119,8 +229,21 @@ class SubjectiveOpinion(BaseModel):
         d = s / (r + s + W)
         u = W / (r + s + W)
 
+        # The prior, measured where there is history to measure it.
+        #
+        # This returned base_rate=0.5 unconditionally, and projected probability
+        # is `belief + base_rate * uncertainty` -- so a hardcoded coin flip was
+        # contributing a share of every answer proportional to how uncertain
+        # that answer was. With most signals carrying a single contributor,
+        # uncertainty is high and the constant dominated.
+        #
+        # The base rate is the one parameter Subjective Logic exists to let you
+        # inform, and the platform has been recording the outcomes needed to
+        # compute it: agent_predictions.outcome_correct and scenarios.status.
+        # Passing 0.5 while holding that history is choosing not to use it.
         return cls(belief=round(b, 6), disbelief=round(d, 6),
-                   uncertainty=round(u, 6), base_rate=0.5)
+                   uncertainty=round(u, 6),
+                   base_rate=round(max(0.0, min(1.0, float(base_rate))), 6))
 
     @classmethod
     def cumulative_fuse(cls, opinions: List["SubjectiveOpinion"]) -> "SubjectiveOpinion":
@@ -342,11 +465,35 @@ class ConsensusEngine(SentinelAgent):
         # 3. Detect stale agents via state digests (§3.3 context drift)
         stale_agents = await self._detect_stale_agents()
 
-        # 4. Group bulletins by ticker
+        # 4. Group bulletins by the *subject*, not by the spelling
+        #
+        # `b.ticker.upper()` groups two agents looking at the same company only
+        # when they happened to spell it the same way. They frequently do not:
+        # one publishes "AAPL", another "Apple Inc.", a third "CPB ($21.53)"
+        # before that was fixed -- three groups, each with one contributor,
+        # each unable to corroborate or contradict the others.
+        #
+        # Fusion is the entire purpose of this engine and it cannot fuse what it
+        # cannot group. Sixteen of seventeen live signals carried
+        # contributing_agents: 1, and the single-contributor case skips fusion
+        # altogether a few lines below.
+        # One measurement per pass, not one per opinion: the rate moves on the
+        # timescale of resolved predictions, not of bulletins.
+        prior = await measured_base_rate(
+            getattr(self, "db", None) or getattr(self, "_db", None), self.redis
+        )
+
         ticker_groups: Dict[str, List[AgentBulletin]] = defaultdict(list)
+        canonical_display: Dict[str, str] = {}
         for b in bulletins:
             if b.ticker:
-                ticker_groups[b.ticker.upper()].append(b)
+                subject = await resolve_entity(self.redis, b.ticker)
+                if not subject:
+                    continue
+                ticker_groups[subject].append(b)
+                # The readable spelling, for the report a person reads. The
+                # canonical key is for grouping; it is not a display name.
+                canonical_display.setdefault(subject, str(b.ticker))
 
         # 5. Analyze each ticker group
         contradictions = []
@@ -366,7 +513,7 @@ class ConsensusEngine(SentinelAgent):
                 trail = []
                 for b in bulletin_group:
                     w = _get_weight(b.agent_name)
-                    op = SubjectiveOpinion.from_bulletin(b, w)
+                    op = SubjectiveOpinion.from_bulletin(b, w, base_rate=prior)
                     trail.append(EvidenceContributor(
                         agent_name=b.agent_name,
                         direction=b.expected_direction or "neutral",
@@ -382,7 +529,7 @@ class ConsensusEngine(SentinelAgent):
                 agents_reporting.add(b.agent_name)
                 weight = _get_weight(b.agent_name)
                 direction = b.expected_direction or "neutral"
-                opinion = SubjectiveOpinion.from_bulletin(b, weight)
+                opinion = SubjectiveOpinion.from_bulletin(b, weight, base_rate=prior)
                 consensus_signals.append(ConsensusSignal(
                     ticker=ticker,
                     direction=self._map_direction(direction),
@@ -414,7 +561,7 @@ class ConsensusEngine(SentinelAgent):
                 direction = b.expected_direction or "neutral"
 
                 # Build Subjective Logic opinion from this bulletin
-                opinion = SubjectiveOpinion.from_bulletin(b, weight)
+                opinion = SubjectiveOpinion.from_bulletin(b, weight, base_rate=prior)
                 opinions.append((b.agent_name, opinion, direction))
 
                 if direction in ("up", "bullish", "long"):

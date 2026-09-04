@@ -17,11 +17,17 @@ grows with every resolved scenario and makes future analysis sharper.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
  
 from shared.db import get_timescale
  
 logger = logging.getLogger("reasoning.patterns")
+
+
+# Resolved outcomes required before a per-rule confirmation rate is stated.
+# Below this the rate is an anecdote with a decimal point, and a model shown one
+# will treat it as a frequency.
+MIN_PRECEDENTS_FOR_BASE_RATE = 8
 
 # CODING CONVICTION: Magic Numbers.
 # We pull this out as a constant so it's easy to tune the strictness of historical matches.
@@ -112,7 +118,16 @@ class PatternLibrary:
                     WHERE s.status IN ('confirmed', 'denied')
                       AND (SELECT count(*) FROM unnest(c.tags) t WHERE t = ANY($1::text[])) >= $4
                       AND c.rule_id != $2
-                    ORDER BY s.created_at DESC
+                    -- Overlap first, recency second.
+                    --
+                    -- This ordered by recency alone, so a precedent sharing one
+                    -- tag out of eight outranked one sharing seven as long as it
+                    -- arrived later. The whole point of the fuzzy stage is that
+                    -- these are the cases the exact rule_id match could not
+                    -- reach; ranking them by arrival throws away the only
+                    -- information distinguishing them.
+                    ORDER BY (SELECT count(*) FROM unnest(c.tags) t WHERE t = ANY($1::text[])) DESC,
+                             s.created_at DESC
                     LIMIT $3
                 """, list(tags), rule_id, int(remaining_limit), int(min_overlap))
                 rows += extra
@@ -136,6 +151,59 @@ class PatternLibrary:
             logger.error(f"Error fetching similar patterns: {e}")
             return []
         
+
+    async def outcome_base_rate(self, rule_id: str) -> Optional[Dict[str, Any]]:
+        """How often rules of this shape have actually been borne out.
+
+        The single most calibrating fact available, and the prompt was not
+        getting it. A model shown five past cases infers a base rate from those
+        five, which on a balanced sample is 50% and on this corpus was 100% --
+        neither of which is the real number.
+
+        Returned as counts and not only a rate, because "8 of 11" and "0.73"
+        support very different amounts of confidence and the model should see
+        which it is being given.
+        """
+        try:
+            rows = await self._db.query("""
+                SELECT
+                    count(*)                                          AS n,
+                    count(*) FILTER (WHERE s.status = 'confirmed')    AS confirmed,
+                    count(*) FILTER (WHERE s.status = 'denied')       AS denied
+                FROM scenarios s
+                JOIN correlations c ON s.correlation_id = c.correlation_id
+                WHERE s.status IN ('confirmed', 'denied')
+                  AND c.rule_id = $1
+            """, rule_id)
+        except Exception as e:
+            logger.debug("Base rate lookup failed for %s: %s", rule_id, e)
+            return None
+
+        if not rows:
+            return None
+        n = int(rows[0].get("n") or 0)
+        if n < MIN_PRECEDENTS_FOR_BASE_RATE:
+            # Said rather than estimated. A rate from three outcomes is an
+            # anecdote with a decimal point.
+            return {
+                "rule_id": rule_id,
+                "resolved": n,
+                "sufficient": False,
+                "note": (
+                    f"only {n} resolved outcome(s) for this rule; "
+                    f"too few to state a rate"
+                ),
+            }
+        confirmed = int(rows[0].get("confirmed") or 0)
+        return {
+            "rule_id": rule_id,
+            "resolved": n,
+            "confirmed": confirmed,
+            "denied": int(rows[0].get("denied") or 0),
+            "sufficient": True,
+            "confirmation_rate": round(confirmed / float(n), 4),
+        }
+
     async def record_outcome(
         self,
         scenario_id: str,

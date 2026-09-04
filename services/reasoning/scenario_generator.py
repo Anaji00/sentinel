@@ -803,6 +803,126 @@ def _is_at_least_as_complete(candidate, incumbent) -> bool:
     return len(new_hypotheses) >= max(1, len(old_hypotheses) - 1)
 
 
+def _hypotheses_are_discriminable(hypotheses) -> bool:
+    """Whether any observation could tell these hypotheses apart.
+
+    Hypotheses that carry identical watch and deny signals are not competing
+    explanations -- they are one explanation written several ways, and no
+    evidence can ever move probability between them. The tracker already
+    refuses to store such a scenario; this catches it before the second model
+    pass, which on this host costs roughly five minutes.
+    """
+    if not hypotheses or len(hypotheses) < 2:
+        return True
+
+    signatures = set()
+    for h in hypotheses:
+        watch = getattr(h, "watch_signals", None) or []
+        deny = getattr(h, "deny_signals", None) or []
+        signatures.add((
+            tuple(sorted(str(x) for x in watch)),
+            tuple(sorted(str(x) for x in deny)),
+        ))
+    return len(signatures) > 1
+
+
+def _subject_is_in_evidence(scenario, cluster) -> bool:
+    """Whether the scenario's subject appears anywhere in the evidence.
+
+    Live on 4 September a crypto liquidation cluster was published as
+    "Crypto Liquidation & Equity Spillover Linked to US President Trump" with a
+    leading hypothesis of "Trump's Economic Policy Influence (61%)" at overall
+    confidence 85. Nothing in the cluster named him. The arithmetic was sound
+    and the subject was invented.
+
+    Deliberately permissive: it asks only that *some* entity the cluster
+    actually carries is named in the headline. A scenario is allowed to reason
+    beyond its evidence; it is not allowed to be about something the evidence
+    never mentioned.
+    """
+    headline = str(getattr(scenario, "headline", "") or "").lower()
+    if not headline:
+        return True
+
+    known = []
+    for attr in ("entity_names", "entity_ids"):
+        known.extend(str(x) for x in (getattr(cluster, attr, None) or []))
+    for attr in ("primary_entity_name", "primary_entity_id"):
+        v = getattr(cluster, attr, None)
+        if v:
+            known.append(str(v))
+    known = [k.strip().lower() for k in known if k and str(k).strip().lower() not in ("", "unknown")]
+    if not known:
+        # Nothing to check against; not evidence of invention.
+        return True
+
+    if any(k in headline for k in known):
+        return True
+
+    # A headline that names nothing is not a headline that names the wrong thing.
+    #
+    # This originally required a cluster entity to appear in the headline, and
+    # discarded one scenario in three on the live stream -- including
+    # "Market Impact Convergence Alert", which invents no subject at all. The
+    # failure this guard exists for was different in kind: a crypto liquidation
+    # published as "Linked to US President Trump", naming a specific person the
+    # evidence never mentioned.
+    #
+    # So the test is narrowed to that case. A headline is refused only when it
+    # names something entity-shaped -- a capitalised proper noun of two or more
+    # words, or a ticker-like token -- and none of what it names is in the
+    # cluster. A generic summary passes, because generic is not false.
+    named = _named_subjects(str(getattr(scenario, "headline", "") or ""))
+    if not named:
+        return True
+    return any(any(k in n or n in k for k in known) for n in named)
+
+
+# Tokens that look like a subject rather than a description.
+_PROPER_NOUN = re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
+_TICKERISH_TOKEN = re.compile(r"\b[A-Z]{2,5}(?:[.\-][A-Z]{1,2})?\b")
+
+# Words that are capitalised in a headline without naming anyone.
+_NOT_SUBJECTS = frozenset({
+    # The vocabulary alerts are written in. A headline assembled entirely from
+    # these names no one, which is a different thing from naming the wrong one.
+    "MARKET", "IMPACT", "ALERT", "CONVERGENCE", "CRITICAL", "SIGNAL", "RISK",
+    "CROSS", "DOMAIN", "SEMANTIC", "CASCADE", "IMMINENT", "WATCH", "FLOW",
+    "SURGE", "SPIKE", "ANOMALY", "IMPLICATIONS", "IMPLICATION", "OUTLOOK",
+    "ANALYSIS", "REPORT", "UPDATE", "WARNING", "ELEVATED", "INTELLIGENCE",
+    "GEOPOLITICAL", "STRUCTURAL", "LIQUIDATION", "SPILLOVER", "SWEEP",
+    "EARNINGS", "PRECEDES", "OPTIONS", "EQUITY", "CRYPTO", "VOLUME",
+    "DISRUPTION", "EXCITATION", "RESEMBLANCE", "SENTIMENT", "PRESSURE",
+    "CONFIRMED", "DETECTED", "OBSERVED", "POTENTIAL", "POSSIBLE",
+    "BEARISH", "BULLISH", "NEUTRAL", "DARK", "POOL", "BLOCK", "TRADE",
+    "TRANSFER", "WHALE", "FUNDING", "RATE", "OPEN", "INTEREST", "CANDLE",
+})
+
+
+def _named_subjects(headline: str) -> list:
+    """Entity-shaped tokens in a headline: proper nouns and ticker-like symbols.
+
+    Deliberately conservative about what counts as naming a subject, because
+    every false positive here discards a scenario that cost minutes of model
+    time to produce.
+    """
+    if not headline:
+        return []
+    out = []
+    for m in _PROPER_NOUN.findall(headline):
+        # A phrase every word of which is a headline word names nobody.
+        # "Market Impact Convergence Alert" is title case and not a subject;
+        # "US President Trump" is title case and is one. The distinction is
+        # whether any word survives the vocabulary of alert-writing.
+        words = [w for w in m.split() if w.upper() not in _NOT_SUBJECTS]
+        if words:
+            out.append(m.strip().lower())
+    for m in _TICKERISH_TOKEN.findall(headline):
+        if m.upper() not in _NOT_SUBJECTS and len(m) >= 2:
+            out.append(m.strip().lower())
+    return out
+
+
 class ScenarioGenerator:
     """
     Synthesizes correlation clusters into intelligence scenarios using Llama3.
@@ -953,13 +1073,29 @@ class ScenarioGenerator:
         # internally inconsistent; on one that is already confident and coherent
         # it mostly rephrases. Spending the swarm's scarcest resource on the
         # drafts that need challenging is the point of having a red team.
+        # Refuse a draft whose hypotheses no observation could separate, before
+        # spending the second pass on it.
+        #
+        # The tracker already discards these, and on 4 September it did so after
+        # roughly ten minutes of model time had been spent producing one. The
+        # check is the same; doing it here means the cost is one pass instead of
+        # two on a host that manages a few dozen inferences an hour.
+        if not _hypotheses_are_discriminable(getattr(output, "hypotheses", None)):
+            logger.warning(
+                "Discarding draft for %s before Pass 2: every hypothesis carries the "
+                "same watch and deny signals, so no observation could tell them apart.",
+                cluster.correlation_id[:8],
+            )
+            return None
+
         if not _draft_needs_critique(output):
             logger.info(
                 "Pass 2 skipped for %s: draft is confident and internally consistent",
                 cluster.correlation_id[:8],
             )
             output = self._normalize_probabilities(output)
-            return self._to_scenario(cluster, output)
+            scenario = self._to_scenario(cluster, output)
+            return scenario if self._grounded(scenario, cluster) else None
 
         try:
             logger.info("😈 Running Pass 2 Critique (Devil's Advocate) for %s...", cluster.correlation_id[:8])
@@ -1123,6 +1259,34 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
 
         patterns_section = json.dumps(patterns[:3], separators=(',', ':'), default=str)
 
+        # The rate, stated, not left to be inferred from three examples.
+        #
+        # A model shown three precedents infers a base rate from those three.
+        # The library balances outcomes deliberately, so the sample it sees is
+        # closer to 50/50 than the corpus is -- and before denial was reachable
+        # the corpus was 216 confirmed against 0 denied, so any inference from
+        # the examples was wrong in one direction or the other.
+        #
+        # Stated as counts as well as a rate: "8 of 11" and "0.73" warrant
+        # different confidence and the model should see which it has.
+        base_rate = context.get("rule_base_rate") or {}
+        base_rate_section = ""
+        if base_rate.get("sufficient"):
+            base_rate_section = (
+                "\n    Base rate for this rule: "
+                f"{base_rate.get('confirmed')} of {base_rate.get('resolved')} "
+                f"resolved scenarios were confirmed "
+                f"({base_rate.get('confirmation_rate'):.0%}). "
+                "The precedents above are a balanced sample and do not reflect "
+                "this rate; weight your confidence against the rate, not the sample."
+            )
+        elif base_rate.get("resolved") is not None:
+            base_rate_section = (
+                "\n    Base rate for this rule: unknown -- "
+                f"{base_rate.get('resolved')} resolved scenario(s), too few to state one. "
+                "Do not infer a success rate from the precedents above."
+            )
+
         headlines = context.get("recent_headlines", [])[:5]
         headlines_section = "\n".join(f"• {h}" for h in headlines) if headlines else "None available"
 
@@ -1216,16 +1380,17 @@ Pre-computed swarm consensus and agent bulletins:
     Known relationships for involved entities:
     {graph_section}
     
-    === HISTORICAL PRECEDENTS ===
-    Similar confirmed/denied scenarios from the past 90 days:
-    {patterns_section}
-    
     === RECENT NEWS CONTEXT ===
     (Background only. Do not assume the subject above is connected to these unless
      an entity is named in both.)
     {headlines_section}
     {agent_section}
     {consensus_section}
+    
+    === HISTORICAL PRECEDENTS ===
+    Similar confirmed/denied scenarios from the past 90 days:
+    {patterns_section}
+    {base_rate_section}
     === TASK ===
     Synthesize the signals above into a structured intelligence assessment.
     
@@ -1311,6 +1476,25 @@ Pre-computed swarm consensus and agent bulletins:
         except Exception as e:
             logger.error("Failed to hydrate events: %s", e)
             return []
+
+    def _grounded(self, scenario, cluster) -> bool:
+        """Whether the scenario is about something the evidence actually names.
+
+        Permissive by design -- it asks only that some entity the cluster
+        carries appears in the headline. A scenario may reason beyond its
+        evidence; it may not be *about* a subject the evidence never mentioned.
+        """
+        if scenario is None:
+            return False
+        if _subject_is_in_evidence(scenario, cluster):
+            return True
+        logger.warning(
+            "Discarding scenario for %s: headline names a subject the cluster does "
+            "not contain (%r).",
+            getattr(cluster, "correlation_id", "?")[:8],
+            str(getattr(scenario, "headline", ""))[:90],
+        )
+        return False
 
     @staticmethod
     def _normalize_probabilities(output: ScenarioOutput) -> ScenarioOutput:

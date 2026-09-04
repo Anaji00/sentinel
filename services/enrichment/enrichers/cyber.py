@@ -183,6 +183,8 @@ class CyberEnricher:
         prefix = p.get("prefix", "")
         origin = p.get("origin_as", "")
         hijack = p.get("is_hijack", False)
+        origin_change = p.get("is_origin_change", False)
+        previous_origin = p.get("previous_origin_as", "")
         country = (p.get("country_code") or "")[:2].upper()
         as_name = p.get("as_name", f"AS{origin}")
         as_path = p.get("as_path", [])
@@ -190,7 +192,11 @@ class CyberEnricher:
         if not prefix: return None
         
         is_critical = any(kw in as_name.lower() for kw in HIGH_VALUE_ORGS)
-        if not hijack and not is_critical: return None
+        # An origin change is admitted on its own merit now that it is no
+        # longer mislabelled as a hijack. Without this clause the honest flag
+        # would have silenced the entire BGP feed, since nothing else sets
+        # is_hijack and only a handful of ASes match HIGH_VALUE_ORGS.
+        if not (hijack or origin_change or is_critical): return None
         
         entity_id = f"AS{origin}"
         # Velocity is measured for hijacks too.
@@ -225,17 +231,43 @@ class CyberEnricher:
         tags = ["bgp_anomaly", "routing"]
         if hijack:
             tags.append("bgp_hijack")
+        if origin_change:
+            tags.append("bgp_origin_change")
         if bgp_result.get("path_novelty", 0) > 0.9:
             tags.append("novel_as_path")
         
+        # The autonomous system is the subject; its registrant is an attribute.
+        #
+        # `as_name` is the RIR holder -- whoever registered the netblock -- and
+        # using it as the display name made law firms, a German university and
+        # an Italian optician the named subjects of live correlations:
+        # "Cyber Aviation Chokepoint Disruption: katten muchin rosenm". The
+        # holder of an AS block is not who is doing anything, any more than a
+        # building's landlord is a suspect.
+        #
+        # The registrant is still carried -- it is real, it is sometimes the
+        # point, and HIGH_VALUE_ORGS is matched against it above -- but as a
+        # flag rather than as the entity's name.
+        as_label = f"AS{origin}" if origin else (prefix or as_name)
         entity = Entity(
             id=entity_id, type=EntityType.INFRASTRUCTURE,
-            name=as_name, country_code=country or None,
-            flags=check_sanctions(as_name, "")
+            name=as_label, country_code=country or None,
+            flags=check_sanctions(as_name, "") + ([f"registrant:{as_name}"] if as_name and as_name != as_label else [])
         )
         await self._propose_ontology({"entity_id": entity_id, "label": "Infrastructure", "confidence": anomaly})
         
-        headline_parts = [f"BGP {'hijack' if hijack else 'anomaly'}: {prefix} via AS{origin}"]
+        # What changed, and from what. "BGP hijack: <prefix> via AS<n>" stated a
+        # conclusion the data does not support and omitted the one fact that
+        # makes the event legible -- which AS used to announce this prefix.
+        if hijack:
+            headline_parts = [f"BGP hijack: {prefix} via AS{origin}"]
+        elif origin_change:
+            headline_parts = [
+                f"BGP origin change: {prefix} now via AS{origin}"
+                + (f" (was AS{previous_origin})" if previous_origin else "")
+            ]
+        else:
+            headline_parts = [f"BGP anomaly: {prefix} via AS{origin}"]
         if bgp_result.get("path_novelty", 0) > 0.9:
             headline_parts.append("(NOVEL AS-PATH)")
         
@@ -244,7 +276,7 @@ class CyberEnricher:
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=" ".join(headline_parts),
-            security_data=SecurityData(breach_type="bgp_hijack" if hijack else "bgp_anomaly", affected_org=as_name, ip_address=prefix),
+            security_data=SecurityData(breach_type=("bgp_hijack" if hijack else ("bgp_origin_change" if origin_change else "bgp_anomaly")), affected_org=as_name, ip_address=prefix),
             tags=tags, country_code=country or None, anomaly_score=anomaly
         )
 

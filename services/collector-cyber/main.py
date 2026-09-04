@@ -549,7 +549,26 @@ async def stream_bgp(producer: SentinelProducer):
                             # The enricher reads `as_path`, not `path`; sending only
                             # `path` meant AS-path novelty scoring never saw a path.
                             "as_path":      path,
-                            "is_hijack":    True,
+                            # An origin change, which is what was measured.
+                            #
+                            # This was `"is_hijack": True`, hardcoded, on every
+                            # one of these. A prefix appearing under an origin
+                            # AS never seen for it before is a real and useful
+                            # signal, and it is not a hijack: adding a second
+                            # transit provider, transferring a prefix, expanding
+                            # anycast and renumbering an AS all produce exactly
+                            # this observation. Hijacking is one explanation
+                            # among several and the rarest of them.
+                            #
+                            # The cost of asserting it was not only the label.
+                            # is_hijack floors the score at HIJACK_BASE_SCORE in
+                            # the enricher, so all 811 events in six hours were
+                            # pinned above 0.70 and averaged 0.825 -- the
+                            # highest of any event type on the platform, above
+                            # ransomware disclosures. Reported honestly, the
+                            # streaming detector and the structural features
+                            # rank these instead of a constant.
+                            "is_origin_change": True,
                             "previous_origin_as": previous_origin,
                             # `as_name` is deliberately omitted rather than sent
                             # empty: the enricher falls back to f"AS{origin}" via

@@ -449,7 +449,24 @@ services:
       - OLLAMA_FLASH_ATTENTION=1
       # One slot: this CPU serves ~3-5 tok/s, so four concurrent contexts
       # quarter throughput and quadruple the KV cache.
-      - OLLAMA_NUM_PARALLEL=1
+      # Two slots, not one.
+      #
+      # Eleven consumers -- ten agents and the reasoning engine -- share one
+      # model server, and at NUM_PARALLEL=1 every request after the first waits
+      # for the one before it to finish. Measured over 45 minutes: 67
+      # InferenceShed refusals, and agent-side completion times of 313s, 487s,
+      # 1,237s, 1,654s and 2,085s. Those are wall-clock figures that are mostly
+      # queue, not generation: a 1.5B Q4 model on six cores generates far faster
+      # than the 2.5 tok/s the platform believes.
+      #
+      # Ollama shares model weights across parallel slots; only the KV cache
+      # duplicates, which at 3,072 context on a 1.5B model is on the order of
+      # a hundred megabytes. Measured headroom is 1.7 GiB (2.787 of 4.5 GiB
+      # used), so a second slot fits several times over. Two rather than four
+      # because the CPU allocation is six cores and two concurrent generations
+      # already saturate them -- more slots past that trade latency for
+      # throughput without adding either.
+      - OLLAMA_NUM_PARALLEL=2
       # Pinned deliberately. A cold load costs ~15s on CPU and the agent
       # tiers are called in bursts, so residency is worth 2.9 GB of the
       # ~16 GB headroom. Set to a duration (e.g. 5m) to reclaim it instead.
@@ -758,7 +775,14 @@ services:
         limits:
           cpus: '1.5'
           # Measured 185MiB serving live traffic.
-          memory: 768M
+          #
+          # 512M, not 768M. The stack sits at roughly 25.9 GiB against the
+          # 26.0 GiB the WSL allocation grants, so a new service has to be
+          # funded from measured headroom rather than added on top. At 185MiB
+          # observed this keeps 2.8x, which is the same margin the other
+          # right-sized services carry; the 256 MiB it releases is what the
+          # alert manager below runs in.
+          memory: 512M
     healthcheck:
       test: [ "CMD", "python", "-c", "import os, urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': os.environ.get('API_GATEWAY_KEY','')}); urllib.request.urlopen(r)" ]
       interval: 10s
@@ -867,6 +891,41 @@ services:
       ollama:
         condition: service_healthy
 
+  # The consumer agents.alerts never had.
+#
+# services/alert_manager/main.py existed with zero references in this file --
+# the same shape as the filings collector and the social collector, found the
+# same way. It consumes CORRELATIONS, SCENARIOS_GENERATED and INTEL_BRIEFS and
+# is the component that turns a correlation into something a person sees.
+#
+# Outbound delivery stays gated on credentials this file does not contain:
+# without TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID or ALERT_WEBHOOK_URL in .env
+# it evaluates and records alerts to sentinel:alerts:recent and sends nothing.
+# That is deliberate -- running it should not be the same decision as pointing
+# it at somebody's phone.
+  alert-manager:
+    profiles: ["agents"]
+    build: .
+    container_name: sentinel-alert-manager
+    command: python services/alert_manager/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 192M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
   frontend:
     build:
       context: ./frontend
@@ -905,7 +964,7 @@ services:
           # grow with traffic; 512M retains ~17x headroom.
           # 47.6 MiB observed against 512M, a production Next.js build
           # serving static output.
-          memory: 384M
+          memory: 192M
     depends_on:
       api-gateway:
         condition: service_healthy
@@ -923,7 +982,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 320M
     depends_on:
       kafka:
         condition: service_healthy
@@ -945,7 +1004,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 320M
     depends_on:
       kafka:
         condition: service_healthy

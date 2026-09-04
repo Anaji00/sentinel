@@ -9,7 +9,7 @@ transfers or exchange liquidations) and transforming it into a standardized
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData, MarketMicrostructure
 from shared.kafka import Topics
@@ -24,6 +24,7 @@ from shared.utils.counterparty import (
     choose_primary, is_infrastructure, is_null_address, note_counterparty,
 )
 from services.enrichment.anomaly_scorer import lift_score
+from shared.utils.materiality import apply_materiality, move_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
 logger = logging.getLogger("enrichment.crypto")
@@ -117,9 +118,33 @@ def _notional_score(notional: float) -> float:
     if not math.isfinite(value) or value <= _NOTIONAL_FLOOR_USD:
         return 0.0
     if value >= _NOTIONAL_CEILING_USD:
-        return 1.0
+        # Bounded below certainty, like every other detector here.
+        #
+        # A $106.61M USDC transfer scored exactly 1.000 live on 4 September.
+        # Every other path in this platform was capped at FALLBACK_MAX_SCORE
+        # during this audit -- the streaming detectors, the open-interest ramp,
+        # the dark-vessel score, the sanctions floor -- on the argument that the
+        # largest thing seen so far is still only that. Nine figures is not the
+        # largest transfer that will ever cross this chain.
+        return FALLBACK_MAX_SCORE
     span = math.log10(_NOTIONAL_CEILING_USD) - math.log10(_NOTIONAL_FLOOR_USD)
     return round((math.log10(value) - math.log10(_NOTIONAL_FLOOR_USD)) / span, 4)
+
+
+def _candle_close_ts(block: dict, timeframe_minutes) -> datetime:
+    """When a bar closed, which is when its content became knowable.
+
+    Falls back to the start timestamp if the timeframe cannot be read -- an
+    approximately-right timestamp beats an exception on the enrichment path.
+    """
+    start = datetime.fromisoformat(block["start_ts"])
+    try:
+        minutes = float(timeframe_minutes)
+    except (TypeError, ValueError):
+        return start
+    if minutes <= 0:
+        return start
+    return start + timedelta(minutes=minutes)
 
 
 def _money(usd: float) -> str:
@@ -261,6 +286,14 @@ class CryptoEnricher:
             # Headroom lift, not addition. `min(1.0, a + b)` has no notion of
             # how much room is left, so any boosted event above ~0.85 lands on
             # the ceiling and stops being distinguishable from one at 0.99.
+            #
+            # Weighted by whether the trade was big enough to have earned its
+            # rank. The percentile ranks within this detector's own history and
+            # cannot say whether the size is worth anyone's attention; the
+            # reference for a crypto trade is the whale threshold this module
+            # already uses. Applied before the boosts, so a watched asset lifts
+            # from a truthful base rather than from a ceiling.
+            anomaly = apply_materiality(anomaly, notional, "crypto_trade")
             anomaly = lift_score(anomaly, w_boost)
             anomaly = lift_score(anomaly, f_boost, w_boost)
             
@@ -661,6 +694,21 @@ class CryptoEnricher:
             is_watched = await self.scorer.check_watchlist(asset, "wallets") or await self.scorer.check_watchlist(asset, "equities")
             w_boost = 0.15 if is_watched else 0.0
             f_boost = await self.scorer.track_frequency(asset, f"crypto_candle_{tf}m")
+            # Weighted by whether the bar was big enough to have earned its rank.
+            #
+            # The percentile is right that a 0.27% move was the most extreme
+            # thing this detector lately saw, and wrong that this means 0.991.
+            # Live on 4 September: 237 of 241 market_anomaly events were crypto
+            # candles at the detector's ceiling for sub-1% moves on $100-200k of
+            # volume.
+            anomaly = apply_materiality(anomaly, notional, "crypto_candle")
+            # And by how far the price actually travelled.
+            #
+            # Size alone left BTCUSDT 60-min bars moving 0.47% at 0.832: bitcoin's
+            # hourly volume is always material, so the size term never bit, and
+            # nothing looked at the 0.47%. A percentile cannot, because every
+            # neighbour it ranks against is equally small.
+            anomaly = round(anomaly * move_materiality(price_change_pct * 100.0, tf), 4)
             # Headroom lift, not addition. `min(1.0, a + b)` has no notion of
             # how much room is left, so any boosted event above ~0.85 lands on
             # the ceiling and stops being distinguishable from one at 0.99.
@@ -682,7 +730,20 @@ class CryptoEnricher:
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
-                occurred_at=datetime.fromisoformat(block["start_ts"]),
+                # The bar's close, not its open.
+                #
+                # This carried start_ts, so a 240-minute bar was four hours old
+                # the instant it closed and a 30-minute bar half an hour. Live
+                # on 4 September that produced a median apparent "ingest lag" of
+                # 1,146s and a p95 of 3,100s for market_anomaly, with 63% of
+                # candle events already more than fifteen minutes old at
+                # collection -- while publication was in fact steady at 9-18 a
+                # minute. Every freshness and staleness decision in the platform
+                # reads this field, so the number it carries has to be when the
+                # observation became available, not when the window it describes
+                # began. The window itself is still recoverable: the timeframe
+                # is on the event and in its tags.
+                occurred_at=_candle_close_ts(block, tf),
                 source=raw.source,
                 source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
@@ -775,6 +836,19 @@ class CryptoEnricher:
             anomaly = lift_score(anomaly, w_boost, suspect_spent)
             anomaly = round(lift_score(anomaly, f_boost, suspect_spent + w_boost), 4)
 
+            # The lifts must not carry it past the ceiling the size score
+            # already respects.
+            #
+            # _notional_score is bounded by FALLBACK_MAX_SCORE, deliberately, so
+            # that a nine-figure transfer is not called certain. Three lifts
+            # then stack on top of it -- suspect counterparty, watchlist,
+            # frequency -- and a $354.65M WBTC movement from a watched wallet
+            # came back at exactly 1.000. Measured over 24 hours: 33 transfers
+            # at 1.000 and 124 above the cap, every one of them a large transfer
+            # tagged suspect_wallet, which is to say the ceiling held for the
+            # evidence and was lost to the corroboration.
+            anomaly = round(min(anomaly, FALLBACK_MAX_SCORE), 4)
+
             tags = ["crypto", asset.lower()]
             tags.append("whale_transfer" if is_whale else "watched_wallet_transfer")
             if is_suspect:
@@ -803,7 +877,11 @@ class CryptoEnricher:
                 await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
                     "entity_id": sender,
                     "action": "LINK_ENTITY",
-                    "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "RELATED_TO", "weight": anomaly}
+                    # The relationship this actually is. Recorded as RELATED_TO,
+                    # this was three quarters of every edge in the graph and
+                    # said only that two addresses had something to do with
+                    # each other.
+                    "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "TRANSACTED_WITH", "weight": anomaly}
                 }, key=sender)
 
         # Which side of this transfer is an actor?

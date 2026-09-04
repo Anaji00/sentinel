@@ -129,7 +129,13 @@ def test_the_headline_counts_what_was_kept_not_what_was_considered():
     """
     source = _source()
     assert "across {len(similar_events)} cross-domain events" not in source
-    assert "distinct_subjects} cross-domain subject(s)" in source
+    # The headline must count what was kept. It now also states the domain
+    # count as its own number rather than folding "cross-domain" into the
+    # phrase, which is a stronger version of this test's point: the earlier
+    # wording asserted cross-domain-ness of the subjects, where the code now
+    # reports how many domains there actually were.
+    assert "{distinct_subjects} subject(s) in " in source
+    assert "{semantic_domain_count} domain(s)" in source
 
 
 def test_the_stored_description_states_kept_and_considered_separately():

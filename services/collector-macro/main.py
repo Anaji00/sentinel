@@ -85,9 +85,21 @@ MACRO_TICKERS = {
 }
 
 # Proxy ETF map for Alpaca & Finnhub APIs
+# Each future maps to a distinct ETF, or to none.
+#
+# CL=F and BZ=F both mapped to USO, so WTI and Brent were the same series:
+# live 5-minute bars carried BZ=F=141.54 and CL=F=141.54, identical to the cent
+# across every bar, for two benchmarks that normally trade three to five dollars
+# apart. The platform believed it tracked both and tracked one, and any
+# correlation discovered between them was 1.0 by construction -- which is a
+# likely source of the perfect coefficients the peer-discovery pass reported.
+#
+# BNO is the Brent-specific fund and is the correct proxy. A future with no
+# distinct proxy is better left unmapped than aliased onto another instrument's
+# price, so it is absent here rather than pointed at the nearest thing.
 FALLBACK_MAP = {
     "CL=F": "USO",
-    "BZ=F": "USO",
+    "BZ=F": "BNO",
     "NG=F": "UNG",
     "GC=F": "GLD",
     "SI=F": "SLV",
@@ -171,6 +183,10 @@ async def fetch_alpaca_quotes(tickers: list) -> dict:
                                 "high": high_p,
                                 "low": low_p,
                                 "volume": vol,
+                                # The instrument actually quoted, carried on the
+                                # event rather than only in this module's docstring.
+                                "proxy_symbol": etf,
+                                "is_proxy": etf != ticker,
                                 "provider": f"Alpaca ({etf})"
                             }
                 return results
@@ -201,7 +217,21 @@ async def fetch_finnhub_quote(session: aiohttp.ClientSession, ticker: str) -> di
                         "open": open_p,
                         "high": high_p,
                         "low": low_p,
-                        "volume": 1000.0,
+                        # Volume the feed did not supply is absent, not invented.
+                        #
+                        # This was a hardcoded 1000.0, and the 5-minute
+                        # continuous aggregate SUMs it -- which is why every
+                        # macro bar read exactly 4000 or 5000, four or five
+                        # polls of a constant, never 4237. The identical defect
+                        # is described in a comment further down this file,
+                        # noting that the figure measures poll count rather than
+                        # market; the description was written and the constant
+                        # left in place. A null volume makes a detector refuse
+                        # to measure, which is the honest outcome when there is
+                        # nothing to measure.
+                        "volume": None,
+                        "proxy_symbol": etf,
+                        "is_proxy": etf != ticker,
                         "provider": f"Finnhub ({etf})"
                     }
     except Exception as e:
@@ -231,7 +261,9 @@ async def fetch_yfinance_single(ticker: str) -> dict:
                     "open": p,
                     "high": p,
                     "low": p,
-                    "volume": 500.0,
+                    # Absent rather than invented, as above.
+                    "volume": None,
+                    "is_proxy": False,
                     "provider": f"yfinance ({ticker})"
                 }
         except Exception:
@@ -584,8 +616,19 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
                         "close": current_price,
                         "high": high_val,
                         "low": low_val,
+                        # Volume and notional are absent when the feed did not
+                        # supply them, rather than zero or invented. A detector
+                        # that cannot tell "no volume reported" from "no volume
+                        # traded" will read the poll rate as market activity,
+                        # which is precisely what the hardcoded constant caused.
                         "volume": volume,
-                        "notional_usd": current_price * volume,
+                        "notional_usd": (current_price * volume) if volume is not None else None,
+                        # What was actually quoted. MACRO_TICKERS are futures
+                        # symbols and several are served by an ETF proxy, so a
+                        # consumer reading close=141.54 under CL=F needs to know
+                        # it is holding USO rather than crude.
+                        "proxy_symbol": q.get("proxy_symbol"),
+                        "is_proxy": bool(q.get("is_proxy")),
                         "tick_direction": tick_direction,
                         "name": MACRO_TICKERS[ticker],
                         "provider": provider

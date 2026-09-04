@@ -134,7 +134,6 @@ class AviationGapDetector:
                 # no consumer, so a dark event that goes only there is invisible
                 # to every rule written about it.
                 await self.producer.send(Topics.ENRICHED_EVENTS, payload)
-                await self.producer.send(Topics.ALERTS, payload)
             return
 
         fired = 0
@@ -336,9 +335,27 @@ class AviationGapDetector:
                     # events were 100% flight_anomaly despite its clause naming
                     # flight_dark explicitly. The detector this audit spent its
                     # longest stretch recalibrating was emitting into a dead end.
+                    # All three ALERTS sends are gone -- this one, the
+                    # heartbeat-degraded send above, and the matching pair in
+                    # gap_detector.py. ENRICHED_EVENTS is what carries these,
+                    # and was already carrying them: the dual-send was the
+                    # transitional half of an earlier repair, kept while it was
+                    # unclear whether anything downstream still wanted the
+                    # alert topic. Nothing does.
+                    #
+                    # alerts.outbound has accumulated 143,580 messages
+                    # and has zero consumer groups -- verified against the
+                    # broker, not inferred from the tree. Writing to it costs
+                    # broker storage and replication for a topic nothing reads.
+                    #
+                    # Kept as a constant rather than deleted: if an alerting
+                    # consumer is ever built, this is the topic it subscribes
+                    # to, and the alert manager is the service that would do it.
+                    # Subscribing it today would be wrong -- it would alert on
+                    # every dark vessel and aircraft, thousands a day, which is
+                    # the noise its rate limiter exists to suppress.
                     payload = event.model_dump(mode="json")
                     await self.producer.send(Topics.ENRICHED_EVENTS, payload)
-                    await self.producer.send(Topics.ALERTS, payload)
                 fired += 1
                 
             except Exception as e:

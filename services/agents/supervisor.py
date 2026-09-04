@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 from shared.models.events import graph_node_id
+from shared.utils.tasks import safe_create_task
 from shared.models.ontology import (
     VALID_PREDICATES,
     ALLOWED_NODE_LABELS,
@@ -113,6 +114,15 @@ def _describe_proposals(proposals: List[dict]) -> str:
 
 
 class GraphSupervisor(SentinelAgent):
+
+    async def on_start(self) -> None:
+        """One-time repairs this service is responsible for.
+
+        Runs from the base agent's start hook, which is the path GraphSupervisor
+        actually takes -- build_agent constructs it like every other agent, and
+        start_supervisor() below is only reachable from __main__.
+        """
+        await backfill_node_types(self.neo4j, self.redis)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -287,13 +297,27 @@ class GraphSupervisor(SentinelAgent):
                             "half_life": float(props.get("half_life", 0.0)),
                         })
 
+            # Every node carries its own type.
+            #
+            # 236,989 of 237,018 Entity nodes had type = null -- 99.99%. Twenty
+            # nine were typed, all EQUITY. The label was being set correctly as
+            # a Neo4j label, and the `type` property, which is what every
+            # consumer reads and what the ontology model declares, was never
+            # written at all.
+            #
+            # The relationship write below is the larger source: it MERGEs its
+            # own endpoints, so every edge created a bare node carrying nothing
+            # but an id and a timestamp. A graph of a quarter of a million
+            # untyped nodes cannot answer "show me the companies" or "show me
+            # the wallets", which is most of what a knowledge graph is for.
             # Commit Node batches
             for label, batch in nodes_by_label.items():
                 cypher = f"""
                 UNWIND $batch AS row
                 MERGE (e:{label} {{name: row.name}})
                 ON CREATE SET e.id = row.name, e.created_at = timestamp()
-                SET e.primary_domain = row.domain,
+                SET e.type = '{label}',
+                    e.primary_domain = row.domain,
                     e.macro_concepts = row.concepts,
                     e.sanctions_risk = row.sanctions,
                     e.sector = row.sector,
@@ -309,9 +333,9 @@ class GraphSupervisor(SentinelAgent):
                 cypher = f"""
                 UNWIND $batch AS row
                 MERGE (a:{source_label} {{name: row.id}})
-                ON CREATE SET a.id = row.id, a.created_at = timestamp()
+                ON CREATE SET a.id = row.id, a.created_at = timestamp(), a.type = '{source_label}'
                 MERGE (b:{target_label} {{name: row.target_id}})
-                ON CREATE SET b.id = row.target_id, b.created_at = timestamp()
+                ON CREATE SET b.id = row.target_id, b.created_at = timestamp(), b.type = '{target_label}'
                 MERGE (a)-[r:{relation}]->(b)
                 ON CREATE SET r.created_at = timestamp()
                 SET r.weight = row.weight,
@@ -362,6 +386,7 @@ class GraphSupervisor(SentinelAgent):
                 cypher = f"""
                 MERGE (e:{label} {{name: $name}})
                 ON CREATE SET e.id = $name, e.created_at = timestamp()
+                SET e.type = '{label}'
                 SET e.primary_domain = $domain,
                     e.macro_concepts = $concepts,
                     e.sanctions_risk = $sanctions,
@@ -401,9 +426,9 @@ class GraphSupervisor(SentinelAgent):
                 props = data.get("properties", {})
                 cypher = f"""
                 MERGE (a:{source_label} {{name: $id}})
-                ON CREATE SET a.id = $id, a.created_at = timestamp()
+                ON CREATE SET a.id = $id, a.created_at = timestamp(), a.type = '{source_label}'
                 MERGE (b:{target_label} {{name: $target_id}})
-                ON CREATE SET b.id = $target_id, b.created_at = timestamp()
+                ON CREATE SET b.id = $target_id, b.created_at = timestamp(), b.type = '{target_label}'
                 MERGE (a)-[r:{relation}]->(b)
                 ON CREATE SET r.created_at = timestamp()
                 SET r.weight = $weight,
@@ -449,6 +474,7 @@ class GraphSupervisor(SentinelAgent):
                 cypher = f"""
                 MERGE (e:{label} {{name: $id}})
                 ON CREATE SET e.id = $id, e.created_at = timestamp()
+                SET e.type = coalesce(e.type, '{label}')
                 WITH e, coalesce(e.tags, []) + $new_tags AS all_tags
                 UNWIND all_tags AS tag
                 WITH e, collect(distinct tag) AS unique_tags
@@ -475,6 +501,106 @@ class GraphSupervisor(SentinelAgent):
             await self.release_lock(entity_id, lock_token)
 
 
+# One-time backfill of node types, run once per deployment.
+#
+# Typing was added to every write path in this audit, and it is forward-only:
+# 533 of 238,388 nodes carried a `type` after the deploy, because the fix types
+# what it writes and nothing had ever revisited what was already there. A graph
+# that cannot answer "show me the companies" is not fixed by promising that
+# future companies will be answerable.
+#
+# Two populations, handled differently:
+#
+#   ~36,000 nodes carry a meaningful label already -- Aircraft, Vessel,
+#   AutonomousSystem, Company, Prefix -- and their type is simply that label.
+#   This is free and exact.
+#
+#   ~237,855 carry only the generic `Entity` label, so the label says nothing.
+#   Their kind is inferred from the shape of the identifier, which is the same
+#   rule graph_node_id already applies when writing: a 0x-prefixed 40-hex string
+#   is a wallet, and nothing else is guessed. An identifier that fits no known
+#   shape is left untyped rather than labelled with a guess -- an untyped node
+#   is a known gap and a wrongly-typed one is a silent error.
+BACKFILL_MARKER_KEY = "sentinel:graph:type_backfill_version"
+BACKFILL_VERSION = "1"
+
+# Batched so a quarter-million-node update cannot hold a single transaction open
+# long enough to stall the writes this service exists to perform.
+BACKFILL_BATCH = 5000
+
+
+async def backfill_node_types(neo4j_client, redis_client) -> None:
+    """Types the nodes that predate the typing fix. Idempotent; runs once."""
+    if not neo4j_client:
+        return
+    try:
+        if redis_client:
+            seen = await redis_client.raw.get(BACKFILL_MARKER_KEY)
+            if seen and str(seen.decode() if isinstance(seen, bytes) else seen) == BACKFILL_VERSION:
+                return
+    except Exception:
+        pass
+
+    labelled_total = 0
+    try:
+        # 1. Nodes whose label already says what they are.
+        for label in ("Aircraft", "Vessel", "Company", "AutonomousSystem", "Prefix", "Wallet"):
+            while True:
+                res = await neo4j_client.query(
+                    f"""
+                    MATCH (n:{label}) WHERE n.type IS NULL
+                    WITH n LIMIT {BACKFILL_BATCH}
+                    SET n.type = '{label}'
+                    RETURN count(n) AS n
+                    """
+                )
+                done = int((res or [{}])[0].get("n") or 0)
+                labelled_total += done
+                if done < BACKFILL_BATCH:
+                    break
+
+        # 2. Generic Entity nodes whose identifier shape is recognisable.
+        #    Only the wallet shape is asserted; everything else stays untyped.
+        wallet_total = 0
+        while True:
+            res = await neo4j_client.query(
+                f"""
+                MATCH (n:Entity)
+                WHERE n.type IS NULL AND n.id =~ '(?i)^0x[0-9a-f]{{40}}$'
+                WITH n LIMIT {BACKFILL_BATCH}
+                SET n.type = 'Wallet'
+                RETURN count(n) AS n
+                """
+            )
+            done = int((res or [{}])[0].get("n") or 0)
+            wallet_total += done
+            if done < BACKFILL_BATCH:
+                break
+
+        logger.info(
+            "Graph type backfill complete: %d node(s) typed from their label, "
+            "%d wallet(s) typed from their identifier shape. Nodes whose kind "
+            "cannot be established are left untyped rather than guessed.",
+            labelled_total, wallet_total,
+        )
+        if redis_client:
+            await redis_client.raw.set(BACKFILL_MARKER_KEY, BACKFILL_VERSION)
+    except Exception as e:
+        # A backfill that fails must not stop the supervisor: it is a repair of
+        # history, and history keeps.
+        logger.warning("Graph type backfill did not complete: %s", e)
+
+
+# NOT THE LIVE PATH. No compose service runs this file.
+#
+# GraphSupervisor is constructed through build_agent in services/agents/main.py
+# like every other agent; this standalone runner exists for local use. A graph
+# type backfill was placed in here during the September audit and never ran --
+# it had a caller, and the caller had no runtime. Anything that must execute in
+# the deployment belongs on the class, reachable from the agent lifecycle:
+# on_start() for one-shot work, or a loop started in run().
+#
+# scripts/check_reachability.py flags this file for exactly this reason.
 async def start_supervisor():
     logger.info("🛡️ Graph Supervisor Online. Protecting Neo4j state.")
     from shared.db import get_redis, get_neo4j, get_timescale

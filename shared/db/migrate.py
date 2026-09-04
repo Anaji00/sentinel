@@ -586,6 +586,65 @@ MIGRATIONS = [
                 WHERE resolved_at IS NULL;
         """,
         "transactional": True
+    },
+    {
+        "version": "0016_events_supply_chain_data",
+        "sql": """
+            -- Every other event sub-model has a column: vessel_data,
+            -- flight_data, financial_data, security_data,
+            -- prediction_market_data, crypto_data, cyber_data. supply_chain_data
+            -- did not, so the freight feed had nowhere durable to land even once
+            -- the enricher built it -- it would have travelled on Kafka and been
+            -- absent from every query written against the events table.
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS supply_chain_data JSONB;
+
+            -- The queries this column exists to serve ask "which freight
+            -- indices moved, and when", so the index is on time within the
+            -- rows that have one. Partial, because supply-chain events are a
+            -- small fraction of the table and a full index would mostly store
+            -- nulls.
+            CREATE INDEX IF NOT EXISTS events_supply_chain_idx
+                ON events(occurred_at DESC)
+                WHERE supply_chain_data IS NOT NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0017_failed_events_created_at",
+        "sql": """
+            -- The table that records permanently-failed messages had no
+            -- queryable timestamp, so "what has been failing since the deploy"
+            -- could not be asked of it -- which is the only question anyone
+            -- asks of a dead-letter table.
+            ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+            CREATE INDEX IF NOT EXISTS failed_events_created_idx ON failed_events(created_at DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0018_events_filing_data",
+        "sql": """
+            -- Every SEC filing's structured detail was being discarded on write.
+            --
+            -- The enricher builds a full FilingData for each one -- form_type,
+            -- cik, accession_number, items, primary_doc_url, report_date,
+            -- is_material_8k -- and events had no column to put it in, so the
+            -- object was constructed on every filing and dropped by the writer.
+            -- 466 filings over 48 hours were stored with the form type
+            -- recoverable only by parsing it back out of the headline text.
+            --
+            -- This is why the filing stream could not be filtered by form: the
+            -- field existed in the model, in the collector's payload and in the
+            -- enricher's output, and nowhere in the table.
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_data JSONB;
+
+            -- The question this column exists to answer is "which filings of
+            -- this form, recently", so the index is on form type and time.
+            CREATE INDEX IF NOT EXISTS events_filing_form_idx
+                ON events((filing_data->>'form_type'), occurred_at DESC)
+                WHERE filing_data IS NOT NULL;
+        """,
+        "transactional": True
     }
 ]
 

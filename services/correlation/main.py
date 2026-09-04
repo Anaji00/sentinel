@@ -45,7 +45,10 @@ from shared.utils.streaming_detectors import FirstStoryDetector
 from services.correlation.soft_correlator import POSITION_TELEMETRY_TYPES
 from shared.utils.freshness import is_stale as _shared_is_stale
 from shared.utils.tasks import safe_create_task
+from shared.utils.backpressure import is_under_pressure
+from shared.utils.metrics import MetricsCollector
 from shared.utils.counterparty import is_null_address
+from shared.models.events import event_domain
 
 # How many tickers the peer pass considers, and how deep a window it asks for.
 # Pairwise correlation is O(n^2), and only twenty tickers currently carry
@@ -149,7 +152,56 @@ SHIPPED_RULES = [
         "rule_name": "Cyber Aviation Chokepoint Disruption",
         "trigger_event_type": ["breach_detected", "infra_exposed", "ransomware", "bgp_anomaly"],
         "conditions": {"min_anomaly": 0.25},
-        "correlations": [{"event_types": ["flight_position", "flight_dark", "flight_anomaly", "vessel_position"], "hours": 48, "min_anomaly": 0.25}],
+        # Joined by geography, which is what the rule's name has always claimed.
+        #
+        # Declaring no join meant this correlated a ransomware disclosure about
+        # one company with the positions of unrelated aircraft anywhere on
+        # earth, on nothing but both falling inside 48 hours -- 27 of 39 live
+        # correlations, 69% of the layer's entire output. The join requirement
+        # added alongside this would otherwise have silenced the rule rather
+        # than corrected it, which is a worse outcome: a rule that fires wrongly
+        # is visible and a rule that stopped firing is not.
+        #
+        # A cyber event and an aircraft in the same chokepoint is a claim worth
+        # making. The same two on opposite sides of the world is not.
+        "correlations": [{"event_types": ["flight_position", "flight_dark", "flight_anomaly", "vessel_position"], "hours": 48, "min_anomaly": 0.25, "region": True}],
+        "alert_tier": "CRITICAL",
+        "expires_at": int(time.time()) + 315360000,
+        "definition_version": RULE_DEFINITION_VERSION
+    },
+    {
+        # The first rule that asks about order rather than co-occurrence.
+        #
+        # A price move preceded by insider selling and then by unusual options
+        # activity is the classic informed-trading sequence, and it is a
+        # different claim from "these three happened this week". The clauses
+        # below say so: both must PRECEDE the price move, within a window short
+        # enough that the ordering is meaningful rather than incidental.
+        #
+        # Deliberately narrow. This will fire rarely, which is the point -- the
+        # existing convergence rules fire hundreds of times an hour and mean
+        # very little individually.
+        "rule_id": "rule_informed_trading_sequence",
+        "rule_name": "Informed Trading Sequence",
+        "trigger_event_type": ["price_anomaly", "equity_block"],
+        "conditions": {"min_anomaly": 0.5},
+        "correlations": [
+            {
+                "event_types": ["insider_trade"],
+                "hours": 168,
+                "min_anomaly": 0.2,
+                "same_entity": True,
+                "precedes_trigger": True,
+            },
+            {
+                "event_types": ["options_flow"],
+                "hours": 72,
+                "min_anomaly": 0.3,
+                "same_entity": True,
+                "precedes_trigger": True,
+                "within_minutes": 4320,
+            },
+        ],
         "alert_tier": "CRITICAL",
         "expires_at": int(time.time()) + 315360000,
         "definition_version": RULE_DEFINITION_VERSION
@@ -189,7 +241,9 @@ SHIPPED_RULES = [
         "rule_name": "Headline Market Impact Convergence",
         "trigger_event_type": ["headline", "narrative_cluster"],
         "conditions": {"min_anomaly": 0.20},
-        "correlations": [{"event_types": ["equity_block", "price_anomaly", "options_flow", "crypto_trade", "crypto_liquidation", "dark_pool"], "hours": 24, "min_anomaly": 0.20}],
+        # Joined by the instrument the headline is about. Without it this
+        # correlated any news event with any market move inside 24 hours.
+        "correlations": [{"event_types": ["equity_block", "price_anomaly", "options_flow", "crypto_trade", "crypto_liquidation", "dark_pool"], "hours": 24, "min_anomaly": 0.20, "shared_tags": True}],
         "alert_tier": "ALERT",
         "expires_at": int(time.time()) + 315360000,
         "definition_version": RULE_DEFINITION_VERSION
@@ -372,8 +426,37 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                 # loop that now reads it.
                 entity_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
 
+                # The trigger's own time, against which "before" and "after"
+                # are judged.
+                try:
+                    trigger_epoch = event.occurred_at.timestamp() if event.occurred_at else None
+                except (AttributeError, ValueError, OSError):
+                    trigger_epoch = None
+
                 supporting_events = []
+                # Seeded with the trigger's own domain.
+                #
+                # This counted only the domains of the *evidence*, so a cluster
+                # triggered by a BGP anomaly and evidenced by flight events
+                # reported domain_count=1 and domains=["flight"] -- undercounting
+                # every rule-path cluster by exactly one, and understating the
+                # cross-domain rate that is the platform's headline claim. The
+                # trigger is as much a part of the cluster as anything it pulled
+                # in; it is the reason the cluster exists.
                 domains_triggered = set()
+                if event.type and getattr(event.type, "value", None):
+                    domains_triggered.add(event_domain(event.type))
+                # Which of the rule's own clauses actually produced evidence.
+                #
+                # A rule declaring three correlations is asserting that the three
+                # co-occur. Firing on one of them is not a weaker version of that
+                # claim, it is a different claim -- and it is published under the
+                # name of the first.
+                matched_clauses = 0
+                declared_clauses = len(rule.get("correlations", []) or [])
+                # Per-clause type breadth, for the single-clause-many-types case.
+                breadth_by_clause = []
+                breadth_declared = []
                 for corr in rule.get("correlations", []):
                     # same_entity is opt-in, so every rule that does not ask
                     # for it behaves exactly as before. Geographic and
@@ -385,7 +468,14 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         hours=corr.get("hours", 48),
                         min_anomaly=corr.get("min_anomaly", 0.0),
                         tags=corr.get("tags"),
-                        region=corr.get("region"),
+                        # `region: True` means "wherever the trigger is", which is
+                        # how a geographic join is expressed without naming a
+                        # place in the rule. A literal string still names one.
+                        region=(
+                            getattr(event, "region", None)
+                            if corr.get("region") is True
+                            else corr.get("region")
+                        ),
                         entity_id=(entity_id if corr.get("same_entity") else None),
                     )
                     if hits:
@@ -407,11 +497,141 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                             h for h in hits
                             if str(h.get("type", "")) not in POSITION_TELEMETRY_TYPES
                         ]
+                    # Sequence, where the rule asks for it.
+                    #
+                    # Every rule in this platform expressed co-occurrence: "these
+                    # types appeared within N hours", with no notion of order.
+                    # For the market-abuse patterns it exists to find, order is
+                    # the signal -- an insider trade followed by options flow
+                    # followed by a price move is a case; the same three shuffled
+                    # is a coincidence. Granger causality was already in the tree
+                    # and applied only to price series, never to event sequences.
+                    #
+                    # Opt-in, so every existing rule behaves exactly as before.
+                    hits = _apply_temporal_constraint(hits, corr, trigger_epoch)
+                    hits = _apply_join_requirement(hits, corr, rule, event)
+
                     if hits:
+                        matched_clauses += 1
+                        # How many of the clause's own declared types actually
+                        # appeared, not merely that the clause matched at all.
+                        #
+                        # A conjunction can be written two ways. Several clauses
+                        # is one; a single clause listing several event types is
+                        # the other, and that one is an OR. The convergence
+                        # requirement added earlier counted clauses, so
+                        # rule_cyber_aviation_chokepoint -- one clause listing
+                        # flight_position, flight_dark, flight_anomaly and
+                        # vessel_position -- passed on a single flight position
+                        # and fired nine times in six minutes at domain_count=1,
+                        # under a name asserting cyber, aviation and a chokepoint
+                        # together.
+                        declared_types = set(corr.get("event_types") or [])
+                        if len(declared_types) > 1:
+                            matched_types = {
+                                str(h.get("type")) for h in hits
+                            } & declared_types
+                            breadth_by_clause.append(len(matched_types))
+                            breadth_declared.append(len(declared_types))
                         supporting_events.extend(hits)
-                        domains_triggered.update([h.get("type", "").split("_")[0] for h in hits])
+                        domains_triggered.update(event_domain(h.get("type", "")) for h in hits)
                         
+                # A convergence rule has to converge.
+                #
+                # This fired on `len(supporting_events) > 0` -- any single clause
+                # matching was enough, however many the rule declared. Measured
+                # live: "Cyber Aviation Chokepoint Disruption" averaged exactly
+                # 1.00 distinct evidence types across 114 clusters, "Equity Block
+                # & Options Convergence" 1.07 across 457 with supporting evidence
+                # of 5,957 market_anomaly against 88 options_flow, and
+                # "Cross-Domain Semantic Convergence" 1.01 across 657. Every one
+                # of those names promises a conjunction and every one of them was
+                # being published on a single term of it.
+                #
+                # A rule declaring one correlation is unaffected -- one clause is
+                # all it asks for. A rule declaring several now needs at least two
+                # of them, which is the smallest requirement that makes the word
+                # in its name true.
+                required_clauses = 1 if declared_clauses <= 1 else 2
+
+                # A rule that expresses its conjunction inside one clause has to
+                # satisfy more than one term of it, exactly as a multi-clause
+                # rule does. A clause declaring a single type is unaffected.
+                single_clause_or = (
+                    declared_clauses == 1
+                    and breadth_declared
+                    and breadth_declared[0] > 1
+                    and breadth_by_clause
+                    and breadth_by_clause[0] < 2
+                )
+                if supporting_events and single_clause_or:
+                    MetricsCollector.increment("correlation_rule_held_single_type_total")
+                    logger.debug(
+                        "Rule %s declared %d event types in one clause and matched %d; "
+                        "an OR is not a convergence, so not published.",
+                        rule.get("rule_id", "unknown"),
+                        breadth_declared[0], breadth_by_clause[0],
+                    )
+                    continue
+
+                if supporting_events and matched_clauses < required_clauses:
+                    # Counted as well as logged. A rule that stops firing and a
+                    # rule that never matched look identical in a fired-only
+                    # counter, which is the ambiguity this instrumentation
+                    # exists to remove.
+                    MetricsCollector.increment("correlation_rule_held_not_converged_total")
+                    logger.debug(
+                        "Rule %s declared %d correlations and matched %d; not a "
+                        "convergence, so not published.",
+                        rule.get("rule_id", "unknown"), declared_clauses, matched_clauses,
+                    )
+                    continue
+
                 if len(supporting_events) > 0:
+                    # Counted, so the next change here can be attributed.
+                    #
+                    # The same-entity clause was added and the market closed
+                    # minutes later, so the drop in options-driven firing could
+                    # not be told apart from the close itself, from the options
+                    # feed ceasing to duplicate, or from equities ceasing to
+                    # trade -- three explanations for one observation and no way
+                    # to separate them after the fact.
+                    #
+                    # A per-rule counter, split by whether the rule asked for
+                    # same_entity, makes the next such change measurable while it
+                    # happens rather than reconstructable afterwards. These reach
+                    # the gateway's /metrics through the bind below.
+                    _rule_id = str(rule.get("rule_id") or rule.get("id") or "unknown")
+
+                    # Is this the first time, or the fortieth?
+                    _recurrence = await _recurrence_count(store, _rule_id, entity_id)
+                    # And how often the rule itself has fired, on anything.
+                    #
+                    # Keying only on (rule, entity) missed the shape actually
+                    # observed: one rule firing nine times in six minutes on
+                    # nine different entities, every one reporting
+                    # recurrence_count=0 because each entity was new. The
+                    # pathology being described is a rule flooding, so the rule
+                    # needs its own counter.
+                    _rule_recurrence = await _recurrence_count(store, _rule_id, "__rule__")
+                    _recur_factor = min(
+                        _recurrence_factor(_recurrence),
+                        _recurrence_factor(_rule_recurrence // RULE_FLOOD_DIVISOR),
+                    )
+                    _same_entity = any(
+                        c.get("same_entity") for c in (rule.get("correlations") or [])
+                    )
+                    MetricsCollector.increment("correlation_rule_fired_total")
+                    MetricsCollector.increment(f"correlation_rule_fired:{_rule_id}")
+                    MetricsCollector.increment(
+                        "correlation_rule_fired_same_entity_total" if _same_entity
+                        else "correlation_rule_fired_cross_entity_total"
+                    )
+                    MetricsCollector.set_gauge(
+                        f"correlation_rule_evidence_types:{_rule_id}",
+                        float(len(domains_triggered)),
+                    )
+
                     rule_tier_str = str(rule.get("alert_tier", "ALERT")).strip().upper()
                     alert_tier = AlertTier[rule_tier_str] if rule_tier_str in AlertTier.__members__ else AlertTier.ALERT
                     alert_tier = await _tier_after_frequency(
@@ -432,15 +652,34 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         for e in supporting_events[:3]
                     ]
 
+                    # What the stream demonstrates, alongside what a rule asserts.
+                    # Detached: learned structure must never delay the finding
+                    # that produced it.
+                    safe_create_task(
+                        _record_cooccurrence(
+                            store, [entity_name] + supporting_entity_names
+                        ),
+                        name="cooccurrence",
+                    )
+
+                    # The tier the evidence supports, capped by the rule's own.
+                    _confidence = round(
+                        _rule_confidence(event, supporting_events, domains_triggered)
+                        * _recur_factor,
+                        4,
+                    )
+                    alert_tier = _tier_supported_by(_confidence, alert_tier)
+
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
                         rule_name=rule.get("rule_name", "Dynamic AI Rule"),
                         alert_tier=alert_tier,
                         primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "general",
-                        confidence_score=_rule_confidence(
-                            event, supporting_events, domains_triggered
-                        ),
+                        # Discounted by how often this has already been said.
+                        # The repeat is still published; it just stops competing
+                        # with novel findings for the same inference slot.
+                        confidence_score=_confidence,
                         # Names the domains actually matched. The rule name is a
                         # detector's name and may assert a combination the match
                         # never required -- "Cyber Aviation Chokepoint
@@ -454,6 +693,12 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         supporting_headlines=supporting_headlines,
                         metrics_summary={
                             "supporting_event_count": len(supporting_events),
+                            # Stated, so a reader can tell a discounted repeat
+                            # from a genuinely weak first sighting -- the two
+                            # arrive at similar confidences by different routes.
+                            "recurrence_count": _recurrence,
+                            "rule_recurrence_count": _rule_recurrence,
+                            "recurrence_factor": _recur_factor,
                             "domain_count": len(domains_triggered),
                             "domains": sorted(list(domains_triggered)),
                             "trigger_anomaly_score": event.anomaly_score,
@@ -512,6 +757,342 @@ RULE_CONF_BREADTH_WEIGHT = 0.30   # how much supporting evidence was gathered
 RULE_CONF_DOMAIN_WEIGHT = 0.25    # whether it genuinely spans domains
 # A rule match is a lead, never a verdict.
 RULE_CONF_CEILING = 0.95
+
+# Temporal operators a correlation clause may declare.
+#
+#   "precedes_trigger": true   the evidence must have happened BEFORE the
+#                              trigger -- a cause, or at least a lead
+#   "follows_trigger": true    the evidence must have happened AFTER it
+#   "within_minutes": N        and within N minutes either way
+#
+# Absent all three, the clause behaves exactly as it always has: any event of
+# the declared types inside the window, in any order.
+# How often a rule has already fired on an entity, and what that is worth.
+#
+# The platform had first-story detection for news and nothing equivalent for its
+# own output. A rule firing on an entity for the fortieth time this week was
+# published at the same tier, with the same confidence, as the first -- and the
+# fortieth is a different object. It is the *first* that carries information;
+# the rest are the same observation restated, and each one costs an inference
+# slot on a host that affords a few dozen an hour.
+#
+# This is not deduplication. The repeat is still published, still stored, still
+# queryable -- a recurring pattern is a real finding and suppressing it would
+# hide an escalating situation. What changes is its claim on attention.
+RECURRENCE_KEY = "sentinel:correlation:recurrence:{rule}:{entity}"
+RECURRENCE_WINDOW_SEC = 7 * 86400
+
+# Firings after which a cluster is no longer novel. The second is still nearly
+# as informative as the first; the tenth is not.
+RECURRENCE_NOVEL_LIMIT = 2
+
+# The floor a recurrence discount may take confidence to. A repeat is worth
+# less, never nothing: the twentieth firing of a rule that matters still matters.
+RECURRENCE_MIN_FACTOR = 0.55
+
+# A rule is allowed to fire this many times per entity-equivalent before its
+# rule-level count starts discounting. Firing on many distinct entities is
+# legitimate for a broad rule, so the divisor keeps the rule-level signal
+# weaker than the per-entity one rather than treating them alike.
+RULE_FLOOD_DIVISOR = 5
+
+
+async def _recurrence_count(store, rule_id: str, entity_id: str) -> int:
+    """How many times this rule has fired on this entity inside the window.
+
+    Counted before the current firing, so the first ever returns 0 and reads as
+    novel. Best-effort: an unavailable counter means every cluster is treated as
+    novel, which is the behaviour this replaces.
+    """
+    redis = getattr(store, "_redis", None)
+    if not redis or not rule_id or not entity_id:
+        return 0
+    try:
+        raw = getattr(redis, "raw", redis)
+        key = RECURRENCE_KEY.format(rule=rule_id, entity=str(entity_id).upper())
+        current = await raw.get(key)
+        count = int(current) if current else 0
+        pipe = raw.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, RECURRENCE_WINDOW_SEC)
+        await pipe.execute()
+        return count
+    except Exception:
+        return 0
+
+
+def _recurrence_factor(count: int) -> float:
+    """What a cluster's confidence is worth given how often it has recurred.
+
+    Decays with the log of the repeat count rather than linearly: the difference
+    between the first and third firing is real, between the fortieth and the
+    forty-second is not.
+    """
+    if count <= RECURRENCE_NOVEL_LIMIT:
+        return 1.0
+    excess = count - RECURRENCE_NOVEL_LIMIT
+    factor = 1.0 / (1.0 + math.log1p(excess) * 0.35)
+    return max(RECURRENCE_MIN_FACTOR, round(factor, 4))
+
+
+# Which entities keep turning up together.
+#
+# The correlation layer evaluates each rule against a window and forgets. It has
+# never accumulated the simplest learnable structure available to it: that two
+# entities co-occur far more often than chance. That is a fact about the world
+# the platform is watching, it costs one sorted-set increment per cluster, and
+# it is exactly what the knowledge graph is for -- which currently learns only
+# what a model asserts, never what the stream demonstrates.
+#
+# Deliberately a count and not an edge. A pair seen together twice is a
+# coincidence; the graph should not carry it. Promotion to a real relationship
+# is left to statistical_discovery, which already tests pairs properly -- this
+# gives it a ranked list of candidates instead of the whole cross product.
+COOCCURRENCE_KEY = "sentinel:cooccurrence:pairs"
+COOCCURRENCE_TTL_SEC = 30 * 86400
+
+# Entities per cluster considered. A cluster citing twenty names yields 190
+# pairs, almost all of them incidental; the leading few are the ones the cluster
+# is actually about.
+COOCCURRENCE_MAX_ENTITIES = 6
+
+
+async def _record_cooccurrence(store, entity_names) -> None:
+    """Counts each pair of entities that appeared in one cluster.
+
+    Best-effort and never raises: this is learned structure, not the finding,
+    and a Redis failure must not cost the correlation that produced it.
+    """
+    redis = getattr(store, "_redis", None)
+    if not redis:
+        return
+    names = []
+    for n in (entity_names or []):
+        cleaned = str(n or "").strip().upper()
+        if cleaned and cleaned not in ("UNKNOWN", "") and cleaned not in names:
+            names.append(cleaned)
+        if len(names) >= COOCCURRENCE_MAX_ENTITIES:
+            break
+    if len(names) < 2:
+        return
+
+    try:
+        raw = getattr(redis, "raw", redis)
+        pipe = raw.pipeline()
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                # Sorted, so (A,B) and (B,A) are one pair rather than two.
+                pair = "|".join(sorted((a, b)))
+                pipe.zincrby(COOCCURRENCE_KEY, 1, pair)
+        pipe.expire(COOCCURRENCE_KEY, COOCCURRENCE_TTL_SEC)
+        await pipe.execute()
+    except Exception as e:
+        logger.debug("Co-occurrence not recorded: %s", e)
+
+
+# What confidence a tier has to be supported by.
+#
+# `alert_tier` is declared statically in each rule definition and
+# `confidence_score` is computed from the evidence that firing actually
+# gathered, and nothing reconciled them. Measured live across 211 clusters:
+# corr(tier, confidence) = -0.204 -- the two ranking signals the platform
+# publishes are not merely unrelated, they are mildly inverted. Tier 3 averaged
+# 0.796 while tiers 4 and 5 averaged 0.602 and 0.630, and clusters went out
+# reading "INTELLIGENCE, confidence 0.366, domain_count 1": the tier saying act
+# and the number saying do not.
+#
+# A rule's declared tier is a ceiling, not a promise. It still cannot be
+# exceeded -- a rule author's judgement about severity is not overridden upward
+# by arithmetic -- but a firing that gathered little evidence is published at
+# the tier that evidence supports.
+TIER_CONFIDENCE_FLOOR = {
+    AlertTier.CRITICAL: 0.75,
+    AlertTier.INTELLIGENCE: 0.60,
+    AlertTier.ELEVATED: 0.45,
+    AlertTier.ALERT: 0.25,
+    AlertTier.WATCH: 0.0,
+}
+
+# Descending, so the search below finds the highest tier the evidence supports.
+_TIER_ORDER = [
+    AlertTier.CRITICAL, AlertTier.INTELLIGENCE,
+    AlertTier.ELEVATED, AlertTier.ALERT, AlertTier.WATCH,
+]
+
+
+def _tier_supported_by(confidence: float, declared: "AlertTier") -> "AlertTier":
+    """The tier this confidence earns, never above the one the rule declared."""
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        return declared
+
+    try:
+        ceiling = _TIER_ORDER.index(declared)
+    except ValueError:
+        ceiling = _TIER_ORDER.index(AlertTier.ALERT)
+
+    for idx, tier in enumerate(_TIER_ORDER):
+        if idx < ceiling:
+            continue
+        if conf >= TIER_CONFIDENCE_FLOOR.get(tier, 0.0):
+            return tier
+    return AlertTier.WATCH
+
+
+# What has to connect evidence to the trigger before a correlation is a claim.
+#
+# rule_cyber_aviation_chokepoint produced 27 of 39 live correlations -- 69% of
+# everything the layer emitted -- carrying domains ["flight", "ransomware"].
+# That label is accurate and the finding under it is not: the rule declares no
+# same_entity and no region, so it correlated a ransomware disclosure about one
+# company with the positions of unrelated aircraft, on nothing but both having
+# happened inside 48 hours.
+#
+# Every guard it passed, it passed honestly. Two flight types satisfied the
+# convergence requirement. A cyber trigger satisfied cross-domain. The tier
+# reconciliation capped it at ALERT. None of them ask the question that matters,
+# which is what makes these two events part of one story.
+#
+# A correlation needs a join. Three are available and the rules already express
+# two of them:
+#
+#   same_entity   the trigger and its evidence concern one subject
+#   region        they concern one place
+#   proximity_km  they are near each other, for events carrying coordinates
+#
+# A rule declaring none of these is asserting that co-occurrence in a 48-hour
+# window is itself the relationship. For a single-domain rule that is sometimes
+# defensible -- several options prints on one name are related by the name. For
+# a cross-domain rule it is not: the two sides share nothing but a clock.
+#
+# So the requirement is scoped to where the failure is. A clause is required to
+# carry a join only when the rule spans domains, which is exactly the case that
+# was producing evidence about unrelated subjects.
+_JOIN_KEYS = ("same_entity", "region", "proximity_km", "shared_tags")
+
+
+def _clause_declares_join(corr: dict) -> bool:
+    """Whether this clause says what connects its evidence to the trigger."""
+    return any(corr.get(k) for k in _JOIN_KEYS)
+
+
+def _join_is_usable(corr: dict, event) -> bool:
+    """Whether the declared join can actually be applied to this trigger.
+
+    `region: True` joins on the trigger's own region, and a trigger with no
+    region cannot satisfy it -- the clause has declared a join it has no way to
+    evaluate, which is the same position as declaring none. Saying so here
+    keeps a rule from appearing to have a basis it does not.
+    """
+    if corr.get("region") is True and not getattr(event, "region", None):
+        return False
+    return True
+
+
+def _rule_is_cross_domain(rule: dict, event) -> bool:
+    """Whether the rule's evidence is drawn from a different domain than its trigger."""
+    try:
+        trigger_domain = event_domain(event.type) if event.type else ""
+    except AttributeError:
+        return False
+    if not trigger_domain:
+        return False
+    for corr in (rule.get("correlations") or []):
+        for et in (corr.get("event_types") or []):
+            if event_domain(et) != trigger_domain:
+                return True
+    return False
+
+
+def _apply_join_requirement(hits, corr: dict, rule: dict, event):
+    """Drops evidence that shares nothing with the trigger but a time window.
+
+    Only applies to cross-domain clauses that declare no join. A single-domain
+    rule, and any rule that says what connects its sides, is untouched.
+
+    The fallback join is the entity itself: where the rule declares nothing, a
+    hit is kept if it names a subject the trigger also names. That is the
+    weakest defensible relationship and it is still a relationship, which is
+    more than a shared 48 hours.
+    """
+    if not hits:
+        return hits
+    if _clause_declares_join(corr) and _join_is_usable(corr, event):
+        return hits
+    if not _rule_is_cross_domain(rule, event):
+        return hits
+
+    trigger_names = set()
+    if getattr(event, "primary_entity", None):
+        for v in (event.primary_entity.id, event.primary_entity.name):
+            if v:
+                trigger_names.add(str(v).strip().upper())
+    for n in (getattr(event, "named_entities", None) or []):
+        if n:
+            trigger_names.add(str(n).strip().upper())
+    trigger_names.discard("UNKNOWN")
+    if not trigger_names:
+        # Nothing to join on. A cross-domain rule with no declared join and a
+        # trigger naming no one cannot establish a relationship at all.
+        MetricsCollector.increment("correlation_join_absent_total")
+        return []
+
+    kept = []
+    for h in hits:
+        names = {str(h.get("entity_id") or "").strip().upper(),
+                 str(h.get("entity_name") or "").strip().upper()}
+        names |= {str(x).strip().upper() for x in (h.get("named_entities") or [])}
+        names.discard("")
+        names.discard("UNKNOWN")
+        if names & trigger_names:
+            kept.append(h)
+
+    if not kept:
+        MetricsCollector.increment("correlation_join_unsatisfied_total")
+    return kept
+
+
+def _apply_temporal_constraint(hits, corr, trigger_epoch):
+    """Filters evidence to the ordering the clause asked for.
+
+    Returns hits unchanged when the clause declares no temporal constraint, and
+    when the trigger has no usable timestamp -- an ordering cannot be enforced
+    against an unknown reference point, and silently dropping every hit would
+    turn a missing timestamp into a rule that never fires.
+    """
+    precedes = bool(corr.get("precedes_trigger"))
+    follows = bool(corr.get("follows_trigger"))
+    within = corr.get("within_minutes")
+
+    if not (precedes or follows or within):
+        return hits
+    if trigger_epoch is None:
+        return hits
+
+    try:
+        window = float(within) * 60.0 if within is not None else None
+    except (TypeError, ValueError):
+        window = None
+
+    kept = []
+    for h in hits:
+        ts = h.get("occurred_at_epoch")
+        if ts is None:
+            # Written before the store carried scores through. Not evidence
+            # against the ordering, so it is dropped from a clause that asks
+            # about ordering rather than counted as satisfying it.
+            continue
+        delta = float(ts) - trigger_epoch
+        if precedes and delta > 0:
+            continue
+        if follows and delta < 0:
+            continue
+        if window is not None and abs(delta) > window:
+            continue
+        kept.append(h)
+    return kept
+
 
 def _rule_confidence(event, supporting_events, domains_triggered) -> float:
     """How much a rule match is worth, from the evidence it actually gathered.
@@ -602,6 +1183,18 @@ async def main():
     db_client = await get_timescale()
     neo4j_client = await get_neo4j()
     
+    # Counters published to the gateway's /metrics.
+    #
+    # This service had no counters at all, and now has the ones that make rule
+    # behaviour measurable. bind_redis is what moves a process-local counter
+    # into the cross-process aggregate the gateway sums; without it they would
+    # increment into a dict nothing reads and a restart discards.
+    try:
+        from shared.utils.metrics import bind_redis
+        await bind_redis(redis_client, service_name=os.getenv("SENTINEL_SERVICE", "correlation"))
+    except Exception as e:
+        logger.debug("Metrics binding skipped: %s", e)
+
     rule_listener_task = safe_create_task(_listen_for_rule_updates(redis_client), name="correlation-rule-listener")
 
     # §1.1 Universal heartbeat
@@ -743,6 +1336,23 @@ async def main():
                 await _stream_live_correlation(cascade_cluster)
                 corr_fired += 1
                 logger.info(f"🚨 Geopolitical Cascade Alert Fired: {cascade_cluster.correlation_id}")
+
+            # Pause the semantic path while reasoning is saturated.
+            #
+            # declare_pressure was wired on the consumer side and nothing ever
+            # read it: reasoning announced that it could not keep up and the
+            # correlation layer went on producing at full rate into it. The
+            # producer half of the mechanism existed as throttled_interval and
+            # had no call site -- the same built-and-unwired shape this audit
+            # has found repeatedly, this time in its own work.
+            #
+            # Only the semantic path yields. Rule matches are cheap, deliberate
+            # and bounded; semantic convergence is the highest-volume producer
+            # and the least discriminating, so it is what should give way when
+            # the consumer is drowning.
+            _paused = await is_under_pressure(getattr(store, "_redis", None), "reasoning")
+            if _paused:
+                skip_soft_correlation = True
 
             dynamic_clusters = await evaluate_dynamic_rules(event, store)
             for c in dynamic_clusters:
@@ -948,11 +1558,17 @@ async def main():
                     # protocol constants. The enricher already recognises them and
                     # tags the event token_supply_event; the correlation layer was
                     # clustering on them anyway.
-                    if is_null_address(e_id) or e_id in ("UNKNOWN", ""):
+                    #
+                    # A guard, not a `continue`: this block is inside `if
+                    # similar_events:`, not inside a loop, so `continue` was a
+                    # compile-time SyntaxError that crash-looped the service.
+                    # ast.parse builds an AST without checking loop context and
+                    # reported the file clean; compile() is what catches it.
+                    skip_semantic = is_null_address(e_id) or e_id in ("UNKNOWN", "")
+                    if skip_semantic:
                         logger.debug(
                             "Skipped semantic cluster on %s: not an actor.", e_id
                         )
-                        continue
 
                     # Degree in the knowledge graph, looked up by the canonical
                     # identifier rather than by `.upper()`.
@@ -968,7 +1584,7 @@ async def main():
                     # knowledge-graph engine both write through, so the three
                     # now agree about how an identifier is spelled.
                     centrality_mult = 1.0
-                    if e_id and e_id != "UNKNOWN":
+                    if not skip_semantic and e_id and e_id != "UNKNOWN":
                         try:
                             from shared.db import get_neo4j
                             import math
@@ -1022,7 +1638,7 @@ async def main():
                         else AlertTier.ALERT
                     )
 
-                    cluster = CorrelationCluster(
+                    cluster = None if skip_semantic else CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id="SEMANTIC_001",
                         rule_name="Cross-Domain Semantic Convergence",
@@ -1111,14 +1727,17 @@ async def main():
                         )
                     )
                     
-                    await store.save_correlation(cluster)
-                    await producer.send(
-                        Topics.CORRELATIONS,
-                        cluster.model_dump(),
-                        key=cluster.correlation_id,
-                    )
-                    await _stream_live_correlation(cluster)
-                    corr_fired += 1
+                    # The whole publish, or none of it. Guarding only the save
+                    # would leave the send dereferencing a None cluster.
+                    if cluster is not None:
+                        await store.save_correlation(cluster)
+                        await producer.send(
+                            Topics.CORRELATIONS,
+                            cluster.model_dump(),
+                            key=cluster.correlation_id,
+                        )
+                        await _stream_live_correlation(cluster)
+                        corr_fired += 1
 
         except Exception as e:
             import traceback

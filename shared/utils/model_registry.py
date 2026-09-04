@@ -216,3 +216,51 @@ class ModelRegistry:
 
     def list_models(self) -> List[ModelMetadata]:
         return list(self._registry.values())
+
+
+class ConformalScoreCalibrator(ConformalZScoreCalibrator):
+    """Conformal calibration on the [0,1] score scale rather than the z scale.
+
+    The parent calibrates z-scores and clamps its threshold to [1.0, 3.5],
+    which is right for a z and wrong for anything else. The anomaly scorer was
+    feeding it detector output -- empirical percentiles in [0, 0.995] -- so its
+    quantile was always below 1.0, the clamp raised it to exactly 1.0, and a
+    threshold of 1.0 against a score that never reaches 1.0 marks nothing
+    significant at all.
+
+    That never surfaced because the computed threshold was assigned to a local
+    and never read. Connecting it as it stood would have disabled significance
+    for every domain at once.
+
+    Same conformal argument, bounds that fit the quantity: the threshold is the
+    (1 - target_far) quantile of observed scores, held inside a range where a
+    score threshold is meaningful. The value of this over a fixed cut is that
+    the false-alarm rate is what stays constant across domains, rather than the
+    number -- a 0.60 cut means something different in a domain whose scores
+    cluster high than in one whose scores cluster low.
+    """
+
+    # A significance cut below this is not a cut, and above it nothing survives:
+    # the detectors bound their own output at 0.995.
+    MIN_SCORE_THRESHOLD = 0.50
+    MAX_SCORE_THRESHOLD = 0.99
+
+    def _recalibrate(self):
+        """Recompute the threshold at the (1 - target_far) quantile of scores."""
+        sorted_scores = sorted(self._null_z_scores)
+        idx = int(len(sorted_scores) * (1.0 - self.target_far))
+        idx = min(max(0, idx), len(sorted_scores) - 1)
+        new_thresh = sorted_scores[idx]
+
+        new_thresh = max(self.MIN_SCORE_THRESHOLD, min(self.MAX_SCORE_THRESHOLD, new_thresh))
+
+        if self._calibrated_z_thresh is None or abs(new_thresh - self._calibrated_z_thresh) > 0.01:
+            logger.info(
+                "Conformal score threshold recalibrated for domain '%s': %.3f -> %.3f "
+                "(samples: %d, target FAR: %.1f%%)",
+                self.domain,
+                self._calibrated_z_thresh if self._calibrated_z_thresh is not None
+                else self.default_z_threshold,
+                new_thresh, len(self._null_z_scores), self.target_far * 100,
+            )
+        self._calibrated_z_thresh = new_thresh

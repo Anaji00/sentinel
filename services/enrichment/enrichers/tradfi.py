@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 from shared.models.events import entity_cache_key
-from shared.models.events import FilingData, ThirteenFData
+from shared.models.events import FilingData, ThirteenFData, SupplyChainData
 from shared.kafka import Topics
 from shared.utils.source_scorecard import baseline_reliability
 from services.enrichment.anomaly_scorer import lift_score
@@ -17,8 +17,11 @@ from shared.models import (
 from shared.utils import quant_calc
 from shared.utils.equities import is_valid_primary_equity
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
+from shared.utils.market_session import session_liquidity_factor
 import re 
 
+from shared.utils.materiality import apply_materiality
+from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -30,7 +33,69 @@ logger = logging.getLogger("enrichment.tradfi")
 # institutional block does not.
 INSTITUTIONAL_NOTIONAL_USD = 1_000_000.0
 
+# A freight index update is context rather than an alert; the move is what
+# carries information, and a collector-flagged spike lifts it further.
+FREIGHT_BASE_SCORE = 0.30
+FREIGHT_MAX_LIFT = 0.45
+FREIGHT_MOVE_SCALE = 2.0
+FREIGHT_SPIKE_LIFT = 0.20
+
+# How long one 13F filing is remembered, so re-reads of the same quarter do not
+# become new events. A quarter plus slack: the filing stays current for about
+# ninety days and the poller revisits it throughout.
+THIRTEEN_F_DEDUP_TTL_SEC = 100 * 86400
+
 THIRTEEN_F_BASE_SCORE = 0.60
+
+# What a filing's form says about how much it is worth reading.
+#
+# The score was `0.85 if is_8k else 0.45`: two values, and the second one
+# covered everything else. Measured over 48 hours, 466 filings carried exactly
+# two distinct scores, 447 of them at 0.45 -- and the great majority of those
+# were 424B2 prospectus supplements, the routine paperwork of a bank issuing
+# structured notes. JPMorgan alone filed 145. Each is a real, distinct filing
+# with its own accession number, so this is not duplication; it is that a
+# 424B2 and a 10-K annual report were being ranked as equally notable, which
+# put several hundred pieces of near-zero-signal paperwork into the same band
+# as company annual reports, and into the correlation windows that read from it.
+#
+# The ordering is by how much a form tells you that you did not already know.
+# An 8-K is unscheduled by construction -- it exists because something happened.
+# An S-1 is a company proposing to sell itself to the public. A 10-K and 10-Q
+# are scheduled, so their timing carries nothing even though their contents can;
+# they are the reference point rather than the floor. A 424B is a supplement to
+# an offering already registered.
+_FILING_FORM_SCORES = (
+    ("8-K",   0.85),   # material event, unscheduled
+    ("S-1",   0.70),   # registration of a new offering
+    ("S-3",   0.55),   # shelf registration
+    ("10-K",  0.50),   # annual report, scheduled
+    ("10-Q",  0.45),   # quarterly report, scheduled
+    ("424B",  0.20),   # prospectus supplement to an existing shelf
+    ("13F",   0.45),   # institutional holdings snapshot
+)
+
+# What an unrecognised form gets: the old catch-all. A form this table does not
+# name is not thereby routine -- it is unclassified, and the honest score for
+# that is the middle of the range rather than either end.
+_FILING_FORM_DEFAULT = 0.45
+
+
+def _filing_form_score(form_type: str, is_8k: bool) -> float:
+    """Base anomaly for a filing, from its form.
+
+    is_8k is honoured first: the collector sets it from a material-event check
+    that can be true for forms whose prefix this table would score lower.
+    """
+    if is_8k:
+        return 0.85
+    form = str(form_type or "").upper().strip()
+    for prefix, score in _FILING_FORM_SCORES:
+        if form.startswith(prefix):
+            return score
+    return _FILING_FORM_DEFAULT
+
+
 
 # How far the headroom above the base may be lifted by movement, and the scale
 # of the curve that gets there. Applied through tanh, so the lift approaches the
@@ -105,6 +170,81 @@ MAX_TOTAL_LIFT_SHARE = float(os.getenv("TRADFI_MAX_TOTAL_LIFT", "0.55"))
 # Shares per option contract. One contract is a hundred shares on every US
 # listed equity option; the figure is a market convention, not a guess.
 OPTION_CONTRACT_MULTIPLIER = 100
+
+
+# Premium at which an options sweep is unambiguously worth reading, and the
+# floor below which the premium carries no information about intent.
+OPTIONS_PREMIUM_REFERENCE_USD = 5_000_000.0
+OPTIONS_PREMIUM_FLOOR_USD = 50_000.0
+
+
+def _options_premium_score(premium: float) -> float:
+    """Score an options sweep by premium, on a log scale.
+
+    Premiums span four orders of magnitude. A linear map reserves the whole
+    upper range for sizes this feed almost never carries, which is how thirty
+    consecutive live sweeps came to average 0.054.
+    """
+    try:
+        value = float(premium)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= OPTIONS_PREMIUM_FLOOR_USD:
+        return 0.0
+    if value >= OPTIONS_PREMIUM_REFERENCE_USD:
+        return 1.0
+    span = math.log10(OPTIONS_PREMIUM_REFERENCE_USD) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)
+    return round((math.log10(value) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)) / span, 4)
+
+
+def _otm_percentage(strike, underlying_price, option_type) -> "Optional[float]":
+    """How far out of the money a contract is, as a percent of spot.
+
+    Positive is out of the money, negative is in the money, in both directions:
+    a call is OTM above spot and a put is OTM below it, so the sign means the
+    same thing for either.
+
+    This was never computed -- 0.0% populated across 731 live options events --
+    while strike, underlying_price and option_type were present on 99-100% of
+    them. It is arithmetic on three fields that were already there, and it is
+    what separates a far-OTM lottery sweep from an at-the-money block: the two
+    have completely different information content about conviction, and without
+    it every consumer saw the same premium with no idea which it was.
+    """
+    try:
+        k = float(strike)
+        spot = float(underlying_price)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(k) and math.isfinite(spot)) or spot <= 0 or k <= 0:
+        return None
+
+    moneyness = (k - spot) / spot
+    if str(option_type or "").upper().startswith("P"):
+        moneyness = -moneyness
+    return round(moneyness * 100.0, 4)
+
+
+def _volume_oi_ratio(volume, open_interest) -> "Optional[float]":
+    """Contracts traded against contracts outstanding.
+
+    The canonical read on whether a sweep is opening new exposure or closing
+    existing exposure: a ratio above 1 means more contracts changed hands today
+    than were open at the start of it, which cannot be closing alone.
+
+    Returns None rather than 0.0 when open interest is absent, which is the
+    normal case on this feed. A ratio of 0.0 asserts that a great deal of
+    open interest exists and none of it traded -- the opposite of what an
+    absent OI actually means.
+    """
+    try:
+        vol = float(volume)
+        oi = float(open_interest)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(vol) and math.isfinite(oi)) or oi <= 0:
+        return None
+    return round(vol / oi, 4)
 
 
 def _option_notional(strike, contracts) -> Optional[float]:
@@ -338,6 +478,8 @@ class TradFiEnricher:
             return await self._enrich_sec_filing(raw, p)
         elif source == "sec_edgar_13f":
             return await self._enrich_13f_filing(raw, p)
+        elif source == "macro_freight":
+            return await self._enrich_freight_rate(raw, p)
             
         return None
 
@@ -463,7 +605,9 @@ class TradFiEnricher:
             if hawkes_ratio > 1.5:
                 # Cross-domain excitation is active — boost anomaly proportionally
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
-                anomaly = min(1.0, anomaly + hawkes_boost)
+                # Headroom lift, matching the other boosts in this file --
+                # this path was the last additive one left in it.
+                anomaly = lift_score(anomaly, hawkes_boost)
                 adjustments.append(ScoreAdjustment(reason="hawkes_cross_domain", delta=hawkes_boost))
             
             # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
@@ -846,7 +990,10 @@ class TradFiEnricher:
                 underlying_price=price,
                 close_price=price,
                 volume=volume,
-                volume_oi_ratio=p.get("vol_oi_ratio"),
+                # Computed where the inputs exist rather than read from a key
+                # the feed does not send. `p.get("vol_oi_ratio")` returned None
+                # on every event.
+                volume_oi_ratio=_volume_oi_ratio(volume, p.get("open_interest")),
                 sector=ref_data.get("sector") if ref_data else None,
                 industry=ref_data.get("industry") if ref_data else None,
                 exchange=ref_data.get("exchange") if ref_data else None,
@@ -872,11 +1019,30 @@ class TradFiEnricher:
         ticker = (p.get("ticker") or "").upper()
         if not ticker: return None
 
-        open_p = float(p.get("open", 0))
-        high_p = float(p.get("high", 0))
-        low_p = float(p.get("low", 0))
-        close_p = float(p.get("close", 0))
-        volume = float(p.get("volume", 0))
+        # .get(k, 0) returns the default only when the key is ABSENT. The macro
+        # collector now sends "volume": None for proxy symbols whose volume it
+        # cannot honestly report -- key present, value None -- and float(None)
+        # raises. That was 243 enrichment failures in thirty minutes, every one
+        # of them a bar that was dropped rather than enriched.
+        #
+        # The previous collector behaviour was to emit a hardcoded 1000.0, which
+        # is why this never surfaced before: the field was always a number
+        # because it was always invented. None is the correct value and this is
+        # the call site that has to accept it.
+        def _num(key: str) -> float:
+            v = p.get(key)
+            if v is None:
+                return 0.0
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        open_p = _num("open")
+        high_p = _num("high")
+        low_p = _num("low")
+        close_p = _num("close")
+        volume = _num("volume")
         
         # Cache the absolute latest price so the Cointegration Engine can reference it
         if close_p > 0:
@@ -958,7 +1124,9 @@ class TradFiEnricher:
             bar_hawkes_ratio = self.scorer.get_hawkes_intensity("tradfi")
             if bar_hawkes_ratio > 1.5:
                 hawkes_boost = min(0.15, (bar_hawkes_ratio - 1.0) * 0.05)
-                anomaly = min(1.0, anomaly + hawkes_boost)
+                # Headroom lift, matching the other boosts in this file --
+                # this path was the last additive one left in it.
+                anomaly = lift_score(anomaly, hawkes_boost)
                 bar_adjustments.append(ScoreAdjustment(reason="hawkes_cross_domain", delta=hawkes_boost))
             
             tags = ["tradfi", "market_structure", f"volatile_{tf}m_candle", ticker.lower()]
@@ -1295,6 +1463,27 @@ class TradFiEnricher:
             logger.debug(f"CIK resolution unavailable for {cik}: {e}")
         return None
 
+    async def _underlying_spot(self, ticker: str) -> Optional[float]:
+        """The underlying's last traded price, or None.
+
+        Reads the quote cache the equities path already maintains. Returns None
+        rather than a fallback: every consumer of underlying_price is better
+        served by an absent value than by the option's own price wearing the
+        underlying's name, which is the defect this replaces.
+        """
+        if not ticker or not self.redis_client:
+            return None
+        try:
+            raw = await self.redis_client.raw.get(quote_key(ticker))
+            if not raw:
+                return None
+            data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            value = data.get("price") or data.get("close") or data.get("last")
+            spot = float(value) if value is not None else None
+            return spot if spot and spot > 0 else None
+        except Exception:
+            return None
+
     async def _enrich_options_flow(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
         if not ticker: return None
@@ -1316,6 +1505,9 @@ class TradFiEnricher:
                 expiry = expiry or parsed.get("expiry")
         
         option_type = str(option_type or "CALL").upper()
+
+        # The underlying's last price, if the platform has one.
+        underlying_spot = await self._underlying_spot(ticker)
         implied_volatility = float(p["implied_volatility"]) if p.get("implied_volatility") is not None else None
         open_interest = int(p["open_interest"]) if p.get("open_interest") is not None else None
         
@@ -1324,8 +1516,34 @@ class TradFiEnricher:
         w_boost = 0.15 if is_watched else 0.0
         f_boost = await self.scorer.track_frequency(ticker, "options_flow")
         
-        # Calculate baseline anomaly score based on premium size (e.g. $1M premium -> 0.50 score)
-        base_score = min(1.0, premium / 1_000_000.0 * 0.5)
+        # Log-scaled against what an options sweep actually costs.
+        #
+        # This was `premium / 1_000_000 * 0.5`, linear, which gave a $118,700
+        # AAPL sweep a score of 0.059 and needed a $2M premium to reach 1.0.
+        # Measured live: thirty consecutive options events, highest 0.231, mean
+        # 0.054 -- so options flow never cleared any correlation threshold, and
+        # the informed-trading rule that requires options_flow at min_anomaly
+        # 0.3 could not fire at all.
+        #
+        # Premiums span four orders of magnitude and the interesting range
+        # starts around $50k, so the scale is logarithmic between the floor and
+        # the reference: $50k reads 0.0, $500k reads about 0.5, $5M reads 1.0.
+        base_score = _options_premium_score(premium)
+
+        # Sized against the session it happened in.
+        #
+        # A $250k sweep at 10:00 and one at 03:00 are different claims: overnight
+        # and pre-market books are a fraction as deep, so the same premium buys a
+        # far larger share of available liquidity and says more about urgency
+        # than about conviction. session_liquidity_factor was written for exactly
+        # this and had no call site anywhere in the tree.
+        #
+        # Dividing rather than multiplying: the same absolute size is *more*
+        # notable in a thin session, not less. Bounded at 1.0 so a thin-session
+        # sweep cannot exceed the scale.
+        _session_depth = session_liquidity_factor(asset_class="equities")
+        if 0 < _session_depth < 1.0:
+            base_score = min(1.0, base_score / _session_depth)
         lift_spent = 0.0
         anomaly = _lift(base_score, w_boost, lift_spent)
         lift_spent += w_boost
@@ -1378,10 +1596,34 @@ class TradFiEnricher:
                 # out-of-the-money sweep. A size filter written against either
                 # one means something quite different.
                 notional_usd=_option_notional(strike, volume),
-                underlying_price=price,
+                underlying_price=underlying_spot,
+                # The contract's own traded price, under a name that says so.
                 close_price=price,
                 volume=int(volume),
                 open_interest=open_interest,
+                # The two fields that make options flow readable, and that were
+                # 0.0% populated across every event this enricher has produced.
+                #
+                # otm_percentage is pure arithmetic on strike, underlying and
+                # type, all of which were already on the event. volume_oi_ratio
+                # needs open interest, which this feed does not supply -- so it
+                # stays null rather than becoming a 0.0 that would read as
+                # "plenty of open interest, none of it traded".
+                # The underlying's price, not the contract's.
+                #
+                # `price` here is the option's own traded price -- what one
+                # share of the contract changed hands at. It was being written
+                # to underlying_price and close_price, and the moneyness
+                # calculation added earlier in this audit inherited the mistake
+                # and made it visible: AAPL 310 calls reported 2511% out of the
+                # money, which implies a spot of $11.87.
+                #
+                # The spot comes from the quote cache where it exists; where it
+                # does not, moneyness is None rather than computed from the
+                # wrong number. An absent field is recoverable and a wrong one
+                # is not.
+                otm_percentage=_otm_percentage(strike, underlying_spot, option_type),
+                volume_oi_ratio=_volume_oi_ratio(volume, open_interest),
                 implied_volatility=implied_volatility,
                 option_type=option_type,
                 # Reference data was fetched for the equity path and not this
@@ -1439,6 +1681,32 @@ class TradFiEnricher:
         lift_spent += w_boost
         anomaly = round(_lift(anomaly, f_boost, lift_spent), 4)
         lift_spent += f_boost
+
+        # Unusual for this instrument, then weighted by whether the flow was
+        # big enough to matter.
+        #
+        # Live on 4 September the only two market_anomaly events at exactly
+        # 1.000 were TBIL and SGOV -- ultra-short Treasury ETFs, both at
+        # "Z-Score: 50.00", on flows of $1.41M and $1.35M. Both numbers are
+        # explained by the same thing: a cash-equivalent fund has almost no
+        # volume variance, so the denominator collapses, the z-score pins to
+        # the collector's reporting cap, and a million dollars of a money-market
+        # proxy is ranked as the most extreme event on the platform.
+        #
+        # The z-score is right that this is unusual for TBIL. It cannot know
+        # that $1.4M of TBIL is not worth waking anyone for. Against the $25M
+        # market_anomaly reference this attenuates to about 0.59 -- still
+        # anomalous, no longer top of the book.
+        anomaly = apply_materiality(anomaly, notional, "market_anomaly")
+
+        # And never exactly certain.
+        #
+        # The curve above is documented as approaching 1.0 and never arriving,
+        # which is true of the arithmetic and not of the value stored: at the
+        # capped z of 50, 1 - exp(-10) is 0.99995, and round(x, 4) arrives.
+        # Every other detector in this platform is bounded by
+        # FALLBACK_MAX_SCORE; this path was bounded only by a rounding mode.
+        anomaly = round(min(anomaly, FALLBACK_MAX_SCORE), 4)
 
         tags = ["tradfi", "radar_anomaly", ticker.lower()]
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
@@ -1685,7 +1953,7 @@ class TradFiEnricher:
         if is_8k:
             tags.extend(["material_event", "ground_truth"])
 
-        anomaly = 0.85 if is_8k else 0.45
+        anomaly = _filing_form_score(form_type, is_8k)
         headline = p.get("title") or f"📄 SEC FILING: {company_name} ({ticker}) filed Form {form_type}"
         summary = p.get("summary") or f"SEC filing {form_type} for {company_name} ({ticker}) on {f_date}."
 
@@ -1719,6 +1987,104 @@ class TradFiEnricher:
             anomaly_score=round(anomaly, 3),
         )
 
+    async def _enrich_freight_rate(self, raw, p) -> Optional[NormalizedEvent]:
+        """Enriches a freight-rate index update into a supply-chain event.
+
+        The collector has been running and publishing FREIGHT_RATE_UPDATE to
+        RAW_TRADFI, and this enricher had no branch for it -- so the events fell
+        through the routing chain and returned None. A live feed of Baltic Dry,
+        container and tanker rates was being collected, paid for in polling and
+        bandwidth, and discarded on arrival.
+
+        SupplyChainData exists in the model for exactly this shape and had never
+        been constructed once: every field below maps onto a key the collector
+        already sends. It was one of three sub-models declared on NormalizedEvent
+        that nothing populated.
+
+        Freight rates are a real macro transmission channel -- a spike in the
+        Shanghai-to-Rotterdam container rate reaches goods inflation and the
+        margins of every importer on the watchlist -- which is why the collector
+        was written. This is what makes it readable downstream.
+        """
+        index_name = p.get("index_name") or p.get("index_symbol") or "FREIGHT_INDEX"
+        symbol = str(p.get("index_symbol") or index_name).upper()
+
+        def _num(key):
+            try:
+                v = p.get(key)
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        current = _num("current_rate") or 0.0
+        previous = _num("previous_rate")
+        change_pct = _num("change_pct")
+        is_spike = bool(p.get("is_rate_spike"))
+
+        # Scored on the size of the move against the index's own recent history,
+        # like every other magnitude in this system, rather than on the
+        # collector's own boolean alone. The boolean still lifts it: the
+        # collector applies a threshold this enricher cannot see.
+        anomaly = FREIGHT_BASE_SCORE
+        try:
+            normalised = await self.scorer._dynamic_normalize(
+                f"freight:{symbol}", "change_pct", abs(change_pct or 0.0)
+            )
+            anomaly = lift_score(
+                FREIGHT_BASE_SCORE,
+                FREIGHT_MAX_LIFT * math.tanh(abs(float(normalised)) / FREIGHT_MOVE_SCALE),
+            )
+        except Exception as e:
+            logger.debug("Freight move scoring fell back to base for %s: %s", symbol, e)
+        if is_spike:
+            anomaly = lift_score(anomaly, FREIGHT_SPIKE_LIFT)
+
+        direction = "surging" if (change_pct or 0) > 0 else "falling"
+        corridor = p.get("corridor")
+        headline = (
+            f"🚢 FREIGHT {direction.upper()}: {index_name} "
+            f"{current:,.0f}" + (f" ({change_pct:+.1f}%)" if change_pct is not None else "")
+        )
+
+        tags = list(p.get("tags") or [])
+        for t in ("macro", "supply_chain", "freight"):
+            if t not in tags:
+                tags.append(t)
+
+        entity = Entity(id=symbol, type=EntityType.INSTRUMENT, name=index_name)
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.MACRO_RELEASE,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
+            primary_entity=entity,
+            supply_chain_data=SupplyChainData(
+                index_name=index_name,
+                category=str(p.get("category") or "FREIGHT"),
+                current_value=current,
+                previous_value=previous,
+                change_14d_pct=change_pct,
+                route_corridor=corridor,
+                # The collector's benchmark table names a vessel class in the
+                # description for tanker and dry-bulk routes; absent for
+                # container indices, and left as None rather than guessed.
+                vessel_class=p.get("vessel_class"),
+                anomaly_flag=is_spike,
+            ),
+            headline=headline,
+            summary=(
+                f"{index_name} ({p.get('category', 'FREIGHT')}) at {current:,.2f}"
+                + (f", previously {previous:,.2f}" if previous is not None else "")
+                + (f", {change_pct:+.2f}%" if change_pct is not None else "")
+                + (f". Corridor: {corridor}." if corridor else ".")
+            ),
+            tags=tags,
+            anomaly_score=round(anomaly, 3),
+        )
+
     async def _enrich_13f_filing(self, raw, p) -> Optional[NormalizedEvent]:
         """Enriches quarterly 13F institutional portfolio filings."""
         filer_name = p.get("filer_name", "Institutional Manager")
@@ -1731,10 +2097,58 @@ class TradFiEnricher:
         tags = list(p.get("tags", []))
         tags.extend(["institutional_holdings", "13f_report", f"filer:{filer_id}"])
 
-        headline = f"🏛️ 13F REPORT: {manager_name} ({filer_name}) filed portfolio for {period}"
-        summary = f"Institutional 13F-HR filing for {filer_name} ({manager_name}). Total Portfolio Value: ${total_val/1e9:.2f}B across {pos_count} holdings."
+        # The filer is the firm. The manager is metadata, and it decays.
+        #
+        # This read "Jim Simons / Peter Brown (Renaissance Technologies LLC)
+        # filed portfolio for 2026-06-30" -- Simons died in 2024. The roster of
+        # principals is hand-maintained in thirteen_f.py and nothing revalidates
+        # it, so every stale name in that table is asserted, in a headline, as
+        # the person who filed a portfolio this quarter.
+        #
+        # An entity that files a 13F is the registered adviser, which is also
+        # the only party the filing itself names. Leading with it is both more
+        # accurate and stable; the principals stay available as the descriptive
+        # field they actually are.
+        headline = f"🏛️ 13F REPORT: {filer_name} filed portfolio for {period}"
+        summary = (
+            f"Institutional 13F-HR filing by {filer_name}. "
+            f"Total Portfolio Value: ${total_val/1e9:.2f}B across {pos_count} holdings. "
+            f"Principals on record: {manager_name}."
+        )
 
         entity = Entity(id=filer_id, type=EntityType.COMPANY, name=filer_name)
+
+        # One filing, one event. The poller re-reads the same quarter.
+        #
+        # Live over 48 hours: ten filers, sixty events, six per filer -- and per
+        # filer exactly ONE distinct headline and ZERO distinct portfolio
+        # values. The same quarterly filing was being re-polled and re-emitted
+        # six times, because a 13F stays "current" for three months and nothing
+        # remembered having seen it.
+        #
+        # That is also the whole reason the movement score below was stuck: it
+        # measures a filing against the filer's own EMA, and feeding that EMA
+        # six copies of one value drives the deviation to zero AND collapses
+        # the variance the next real filing would be measured against. Every
+        # thirteen_f event on the platform carried exactly 0.600, the base
+        # score, and the scoring written to prevent that constant was running
+        # correctly on an input that could not vary.
+        #
+        # Keyed on the values as well as the period, so an amended filing --
+        # genuinely new information about the same quarter -- is not suppressed
+        # along with the re-reads.
+        try:
+            fingerprint = f"{filer_id}:{period}:{total_val:.0f}:{pos_count}"
+            claimed = await self.redis_client.raw.set(
+                f"sentinel:enrich:13f:seen:{fingerprint}", "1",
+                ex=THIRTEEN_F_DEDUP_TTL_SEC, nx=True,
+            )
+            if not claimed:
+                return None
+        except Exception as e:
+            # A dedup failure must not drop the filing. Emitting a duplicate is
+            # recoverable; losing a quarterly disclosure is not.
+            logger.debug("13F dedup check failed for %s: %s", filer_id, e)
 
         # Scored against the filer's own history rather than published flat.
         #

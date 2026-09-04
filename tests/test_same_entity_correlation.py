@@ -37,6 +37,18 @@ class _Raw:
         rows = [m for m in rows if m[1] >= float(end)]
         if offset is not None:
             rows = rows[offset: offset + (num or len(rows))]
+        # withscores is honoured, because the code under test relies on it.
+        #
+        # redis-py returns [(member, score), ...] when withscores=True, and the
+        # store now reads the score to recover occurred_at rather than trusting
+        # a payload field. This double ignored the flag and returned bare
+        # members, so `for raw, score in raw_results` unpacked a JSON string
+        # character-wise and raised "too many values to unpack" inside the
+        # store's own try/except -- which logged and returned [], making every
+        # assertion here read as "the filter removed everything" rather than
+        # "the fake is the wrong shape".
+        if kw.get("withscores"):
+            return [(r[0], float(r[1])) for r in rows]
         return [r[0] for r in rows]
 
 

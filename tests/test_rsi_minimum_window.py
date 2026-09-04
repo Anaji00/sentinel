@@ -85,6 +85,14 @@ def test_an_all_gains_series_reads_overbought():
 
 def test_the_guard_is_on_the_computation_not_the_caller():
     """Every caller of this evaluator inherits the fix."""
+    import re
     source = (ROOT / "shared" / "utils" / "candles.py").read_text(encoding="utf-8")
-    assert "if len(closes) > MIN_RSI_OBSERVATIONS:" in source
+    # Matched on the comparison rather than one spelling of the line. The guard
+    # was later hoisted to `has_history = len(closes) > MIN_RSI_OBSERVATIONS`,
+    # which is the same guard in the same place; asserting the literal `if`
+    # made this test fail on a refactor that changed nothing it exists to
+    # protect.
+    assert re.search(r"len\(closes\)\s*>\s*MIN_RSI_OBSERVATIONS", source), (
+        "the window guard is no longer expressed against MIN_RSI_OBSERVATIONS"
+    )
     assert "if len(closes) > 1:" not in source

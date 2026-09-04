@@ -79,6 +79,8 @@ class DBWriter:
             _dump('prediction_market_data'),
             _dump('crypto_data'),
             _dump('cyber_data'),
+            _dump('supply_chain_data'),
+            _dump('filing_data'),
             getattr(e, 'tags', []),
             getattr(e, 'named_entities', []),
             getattr(e, 'sentiment', None),
@@ -120,21 +122,24 @@ class DBWriter:
                 primary_entity_id, primary_entity_type, primary_entity_name, primary_entity_flags,
                 longitude, latitude, region, country_code, headline, summary, url,
                 vessel_data, flight_data, financial_data, security_data,
-                prediction_market_data, crypto_data, cyber_data,
+                prediction_market_data, crypto_data, cyber_data, supply_chain_data,
+                filing_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids,
                 coordinates, corroboration
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24,
-                $25, $26, $27, $28, $29,
+                $25,
+                $26,
+                $27, $28, $29, $30, $31,
                 CASE 
                     WHEN $11::float IS NOT NULL AND $12::float IS NOT NULL 
                     THEN ST_SetSRID(ST_MakePoint($11::float, $12::float), 4326)
                     ELSE NULL 
                 END
             ,
-                $30
+                $32
             )
             ON CONFLICT (event_id, occurred_at) DO UPDATE SET
                 latitude = COALESCE(EXCLUDED.latitude, events.latitude),
@@ -142,6 +147,7 @@ class DBWriter:
                 coordinates = COALESCE(EXCLUDED.coordinates, events.coordinates),
                 vessel_data = COALESCE(EXCLUDED.vessel_data, events.vessel_data),
                 flight_data = COALESCE(EXCLUDED.flight_data, events.flight_data),
+                filing_data = COALESCE(EXCLUDED.filing_data, events.filing_data),
                 anomaly_score = GREATEST(EXCLUDED.anomaly_score, events.anomaly_score)
         """
 

@@ -265,11 +265,25 @@ def test_filings_api_gateway_routes():
     assert "total_portfolio_value_usd" in berkshire_data
 
     # 4. Consensus for ticker
+    #
+    # This asserted len(institutional_buyers) > 0, which held only because the
+    # endpoint invented names when it had no filings: NVDA returned a hardcoded
+    # "Warren Buffett, Ken Griffin, Jim Simons, Cathie Wood". The test was
+    # therefore pinning the fabrication in place -- it would have failed the
+    # moment the endpoint started telling the truth, which is what it did.
+    #
+    # With no 13F consensus data ingested in this test, the honest response is
+    # an empty list, and derived_from_filings says which of the two empty cases
+    # this is: no prominent filer holds it, or no filings were available to ask.
     res_consensus = client.get("/api/v1/filings/13f/consensus/NVDA", cookies=cookies)
     assert res_consensus.status_code == 200
     consensus_data = res_consensus.json()
     assert consensus_data["ticker"] == "NVDA"
-    assert len(consensus_data["institutional_buyers"]) > 0
+    assert consensus_data["institutional_buyers"] == []
+    assert consensus_data["derived_from_filings"] is False
+    assert consensus_data["consensus_sentiment"] == "NEUTRAL"
+    # Every name returned must be backed by an ingested filing.
+    assert len(consensus_data["institutional_buyers"]) == consensus_data["total_prominent_holders"]
 
 
 # ── 4. SUPPLY CHAIN & FREIGHT INDEX POLLER TESTS (§2.3) ───────────────────────

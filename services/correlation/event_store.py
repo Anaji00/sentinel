@@ -189,6 +189,15 @@ class EventStore:
             results = []
             offset = 0
             while True:
+                # With scores, because the score *is* the event time.
+                #
+                # The stored payload carries no timestamp -- occurred_at is the
+                # sorted-set score and nothing else -- so every hit reached the
+                # rule evaluator with no notion of when it happened, and the
+                # rules could only ever express co-occurrence inside a window.
+                # Reading the score costs nothing extra and it is already
+                # authoritative for members written before this change, which a
+                # payload field would not be.
                 raw_results = await self._redis.raw.zrange(
                     self.cache_key,
                     "+inf",
@@ -197,12 +206,14 @@ class EventStore:
                     byscore=True,
                     offset=offset,
                     num=RECENT_WINDOW_SCAN_BATCH,
+                    withscores=True,
                 )
                 if not raw_results:
                     break
                 offset += len(raw_results)
-                for raw in raw_results:
+                for raw, score in raw_results:
                     e = json.loads(raw)
+                    e["occurred_at_epoch"] = float(score)
                 
                     # FILTER FIX: Translated SQL conditions into native Python checks
                     if exclude_event_id and e["event_id"] == exclude_event_id:

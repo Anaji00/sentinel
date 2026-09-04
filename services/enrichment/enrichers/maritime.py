@@ -20,6 +20,7 @@ from shared.utils.regions import (
 )
 from shared.utils.sanctions import check_sanctions, mmsi_to_country
 from shared.utils.regions import routine_band_score
+from services.enrichment.anomaly_scorer import lift_score
  
 logger = logging.getLogger("enrichment.maritime")
  
@@ -225,7 +226,17 @@ class MaritimeEnricher:
             if not is_sanctioned and not is_emergency_nav and not is_watched:
                 anomaly = routine_band_score(raw_anomaly, region)
             else:
-                anomaly = min(1.0, raw_anomaly + w_boost + f_boost)
+                # Headroom lift, not addition -- the same composition every
+                # other enricher uses. `min(1.0, a + b)` has no notion of how
+                # much room is left, so any boosted event above ~0.85 lands on
+                # the ceiling and stops being distinguishable from one at 0.99.
+                #
+                # Only the *composition* is shared. The base score, the
+                # features behind it and the weights below stay this domain's
+                # own: what counts as anomalous differs by domain, how boosts
+                # combine does not.
+                anomaly = lift_score(raw_anomaly, w_boost)
+                anomaly = lift_score(anomaly, f_boost, w_boost)
 
             pipe.set(
                 f"vessel:last_seen:{mmsi}",

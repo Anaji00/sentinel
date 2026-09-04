@@ -323,7 +323,15 @@ async def evaluate_multi_timeframe(
                 "score published -- RSI and divergence would be placeholders.",
                 domain_tag, asset, tf, len(closes), MIN_RSI_OBSERVATIONS,
             )
-            return None
+            # This window, not the whole evaluation.
+            #
+            # `return None` here abandoned every remaining timeframe the moment
+            # one of them lacked history, and handed the caller None where the
+            # signature promises List[Tuple[...]]. The longer horizons are
+            # exactly the ones that take longest to accumulate closes, so the
+            # frame most likely to trigger this was also the one whose
+            # departure took the rest of the list with it.
+            continue
 
         logger.info(f"🧠 ML INFERENCE [{domain_tag}] | {asset} {tf}-min Structural Candle | Score: {anomaly:.3f} | Change: {price_change_pct*100:.2f}% | Vol: ${notional_volume/1e6:.2f}M | RSI: {rsi_normalized*100:.1f} | Div: {ema_divergence*100:.2f}%")
         

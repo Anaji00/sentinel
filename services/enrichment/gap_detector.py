@@ -94,7 +94,6 @@ class VesselGapDetector:
                 # topic can never enter the window the rules about it query.
                 payload = degraded_event.model_dump(mode="json")
                 await self.producer.send(Topics.ENRICHED_EVENTS, payload)
-                await self.producer.send(Topics.ALERTS, payload)
             return
 
         fired = 0

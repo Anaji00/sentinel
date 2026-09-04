@@ -399,6 +399,23 @@ class FlightData(BaseModel):
     operator: Optional[str] = None
     registration: Optional[str] = None
 
+# DECLARED, NOT SOURCED.
+#
+# BettingData and RegulatoryData are complete models attached to NormalizedEvent
+# that nothing in the platform populates and nothing reads: no collector
+# produces a sportsbook line or a Federal Register action, so `betting_data` and
+# `regulatory_data` are None on every event ever written.
+#
+# Kept rather than deleted -- they are a coherent design for feeds this platform
+# could plausibly add, and removing them would lose that. Labelled, because an
+# unlabelled optional field on the central event model reads as a capability:
+# the next person to write a query against betting_data would find an empty
+# column and have no way to tell "no sports events happened" from "this was
+# never wired up". SupplyChainData was in exactly this state until the freight
+# collector's output was routed to an enricher that builds it.
+#
+# Wiring either one means adding a collector and an enricher branch, not
+# changing anything here.
 class BettingData(BaseModel):
     matchup: Optional[str] = None
     market_type: Optional[str] = None
@@ -551,6 +568,23 @@ class ThirteenFData(BaseModel):
     exited_positions_count: int = 0
     filing_url: Optional[str] = None
 
+# DECLARED, NOT SOURCED.
+#
+# BettingData and RegulatoryData are complete models attached to NormalizedEvent
+# that nothing in the platform populates and nothing reads: no collector
+# produces a sportsbook line or a Federal Register action, so `betting_data` and
+# `regulatory_data` are None on every event ever written.
+#
+# Kept rather than deleted -- they are a coherent design for feeds this platform
+# could plausibly add, and removing them would lose that. Labelled, because an
+# unlabelled optional field on the central event model reads as a capability:
+# the next person to write a query against betting_data would find an empty
+# column and have no way to tell "no sports events happened" from "this was
+# never wired up". SupplyChainData was in exactly this state until the freight
+# collector's output was routed to an enricher that builds it.
+#
+# Wiring either one means adding a collector and an enricher branch, not
+# changing anything here.
 class RegulatoryData(BaseModel):
     agency: str
     action_type: str = "RULE"  # "RULE", "PROPOSED_RULE", "NOTICE", "EXECUTIVE_ORDER", "TARIFF"
@@ -999,3 +1033,81 @@ class Scenario(BaseModel):
             elif not data.get("primary_entity_name") and data.get("primary_entity_id"):
                 data["primary_entity_name"] = str(data["primary_entity_id"])
         return data
+
+
+# Event types that are a position report rather than a claim.
+#
+# A vessel or an aircraft saying where it is asserts nothing, so nothing about
+# it can corroborate or contradict anything else. Two consumers need this
+# distinction and had no shared name for it: the correlation layer refuses to
+# treat these as supporting evidence, and the agent layer drops them before they
+# can take a dispatch slot. Defined here so neither service imports the other.
+POSITION_TELEMETRY_TYPES = frozenset({
+    "vessel_position",
+    "vessel_static",
+    "flight_position",
+})
+
+
+# Which domain an event type belongs to.
+#
+# The correlation layer derived this as `event_type.split("_")[0]`, which is the
+# first token of the name rather than the domain: `breach_detected` and
+# `ransomware_detected` came out as two domains when both are cyber, and
+# `vessel_dark` and `vessel_position` as one domain called "vessel" rather than
+# maritime. Every cross-domain count in the platform was computed from that, so
+# the headline claim -- that this system finds relationships across domains --
+# rested on a string split.
+#
+# The anomaly scorer has had the real mapping since it was written, to choose a
+# detector per domain. It lives here now so both use one definition.
+# Leading token first, because a keyword scan gets this wrong: "dark" is a
+# maritime term and flight_dark is aviation, so a maritime-first keyword pass
+# assigns every dark-aircraft event to the wrong domain. The prefix is
+# unambiguous where it exists.
+_DOMAIN_PREFIX = {
+    "vessel": "maritime", "ais": "maritime", "mmsi": "maritime", "port": "maritime",
+    "flight": "aviation", "aircraft": "aviation", "adsb": "aviation", "icao": "aviation",
+    "crypto": "crypto", "token": "crypto", "wallet": "crypto",
+    "bgp": "cyber", "cyber": "cyber", "breach": "cyber", "ransomware": "cyber",
+    "malware": "cyber", "infra": "cyber", "cve": "cyber", "dns": "cyber",
+    "macro": "macro", "prediction": "prediction", "betting": "prediction",
+    "news": "news", "headline": "news", "social": "news", "narrative": "news",
+    "options": "tradfi", "equity": "tradfi", "dark": "tradfi", "insider": "tradfi",
+    "earnings": "tradfi", "price": "tradfi", "market": "tradfi", "thirteen": "tradfi",
+    "filing": "tradfi", "futures": "tradfi",
+}
+
+_DOMAIN_KEYWORDS = (
+    ("maritime",   ("vessel", "mmsi", "ais", "sts", "port", "strait")),
+    ("aviation",   ("flight", "icao", "adsb", "aircraft", "squawk")),
+    ("cyber",      ("bgp", "cyber", "dns", "ddos", "hijack", "breach", "ransomware",
+                    "malware", "infra", "cve", "exploit")),
+    ("crypto",     ("crypto", "token", "liquidation", "wallet", "chain", "perp")),
+    ("macro",      ("macro", "cpi", "gdp", "fed", "treasury", "yield", "rates")),
+    ("prediction", ("prediction", "polymarket", "kalshi", "betting")),
+    ("news",       ("news", "headline", "narrative", "social", "sentiment")),
+    ("tradfi",     ("equity", "stock", "option", "tradfi", "financial", "market",
+                    "price", "dark_pool", "insider", "earnings", "filing", "thirteen")),
+)
+
+
+def event_domain(event_type) -> str:
+    """The domain an event type belongs to, by the platform's own vocabulary.
+
+    Falls back to tradfi, which is where the scorer's equivalent lands too: the
+    financial path is the busiest and the least harmful default.
+    """
+    evt = str(getattr(event_type, "value", event_type) or "").lower()
+    if not evt:
+        return "unknown"
+
+    # The leading token settles it wherever it is known.
+    head = evt.split("_")[0]
+    if head in _DOMAIN_PREFIX:
+        return _DOMAIN_PREFIX[head]
+
+    for domain, keywords in _DOMAIN_KEYWORDS:
+        if any(k in evt for k in keywords):
+            return domain
+    return "tradfi"

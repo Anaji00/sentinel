@@ -12,12 +12,13 @@ and sector news headlines to discover macroeconomic transmission mechanisms.
 
 import asyncio
 import json
+import re
 import logging
 import time
 import numpy as np
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.utils.equities import split_macro_and_equities
@@ -27,17 +28,63 @@ from shared.models import NormalizedEvent
 logger = logging.getLogger("agent.stock_correlation")
 
 
+# The price was arriving inside the identifier.
+#
+# The prompt renders the pair as "equity CPB ($21.53)" so the model has the
+# quote in front of it, and the model echoed the whole string back into
+# equity_ticker. Live: ticker='CPB ($21.53)' and primary_entity_id='CPB
+# ($21.53)', with the summary reading "Dynamic Correlation Discovery (TLT
+# ($82.29) / CPB ($21.53))".
+#
+# That identifier is the join key for three separate systems. The consensus
+# engine fuses bulletins by entity, so a bulletin keyed this way can never be
+# corroborated or contradicted by another agent looking at the same company --
+# it is a different entity to every consumer, and a new one every time the price
+# moves. It is also written to Neo4j as a node id and used as a Kafka partition
+# key.
+#
+# Stripped here rather than only in the prompt, because a prompt is a request
+# and a validator is a guarantee: the same model will find another way to
+# decorate a symbol, and every consumer downstream assumes this field is one.
+_TICKER_DECORATION = re.compile(r"\s*[\(\[].*$")
+
+
+def _clean_symbol(value: str) -> str:
+    """The symbol out of whatever decoration arrived with it.
+
+    "CPB ($21.53)" -> "CPB"; "TLT [82.29]" -> "TLT"; "AAPL" -> "AAPL".
+    Deliberately conservative: it removes a trailing parenthetical and
+    normalises case and whitespace, and does not attempt to rescue a string
+    that has no symbol in it at all.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = _TICKER_DECORATION.sub("", value).strip().upper()
+    # A symbol is one token. If stripping the parenthetical still leaves
+    # several, the leading one is the symbol and the rest is prose.
+    if " " in cleaned:
+        cleaned = cleaned.split()[0]
+    return cleaned or value
+
+
 class SympathyMover(BaseModel):
     ticker: str
+
     relationship: str  # "COMPETITOR_SYMPATHY", "SUPPLIER_SYMPATHY", "SECTOR_PEER", "CROSS_ASSET_HEDGE"
     direction: str  # "BULLISH", "BEARISH", "CORRELATED"
     conviction: float
     reasoning: str
 
+    @field_validator("ticker", mode="before")
+    @classmethod
+    def _strip_ticker(cls, v):
+        return _clean_symbol(v)
+
 
 class DynamicCorrelationAssessment(BaseModel):
     macro_asset: str
     equity_ticker: str
+
     correlation_type: str  # "INVERSE_MARGIN_PRESSURE", "DECOUPLING", "COMMODITY_SPIKE_EQUITY_DUMP", "FLIGHT_TO_SAFETY"
     detected_covariance: float
     conviction: float
@@ -46,6 +93,11 @@ class DynamicCorrelationAssessment(BaseModel):
     impact_severity: str  # "LOW", "MODERATE", "SEVERE"
     sympathy_movers: List[SympathyMover] = Field(default_factory=list)
     recommended_hedging: List[str] = Field(default_factory=list)
+
+    @field_validator("macro_asset", "equity_ticker", mode="before")
+    @classmethod
+    def _strip_symbols(cls, v):
+        return _clean_symbol(v)
 
 
 class StockCorrelationAgent(SentinelAgent):
@@ -90,7 +142,12 @@ class StockCorrelationAgent(SentinelAgent):
 
     @property
     def output_topic(self) -> str:
-        return Topics.CORRELATIONS
+        # handle() returns None on every path, so the base class never publishes
+        # here; the agent's one send is explicit and goes to MACRO_DECOUPLING.
+        # Declared consistently with it so that if handle() ever does return a
+        # payload, it lands on the topic shaped for it rather than on the
+        # cluster contract.
+        return Topics.MACRO_DECOUPLING
 
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return await self.handle_message(message)
@@ -256,7 +313,9 @@ class StockCorrelationAgent(SentinelAgent):
                 )
 
             user_prompt = f"""
-            Analyze the real-time market relationship between macro asset {target_macro} (${price_map.get(target_macro, 0):.2f}) and equity {target_equity} (${price_map.get(target_equity, 0):.2f}).
+            Analyze the real-time market relationship between macro asset {target_macro} and equity {target_equity}.
+            Last prices, for context only: {target_macro} ${price_map.get(target_macro, 0):.2f}, {target_equity} ${price_map.get(target_equity, 0):.2f}.
+            Report macro_asset as exactly "{target_macro}" and equity_ticker as exactly "{target_equity}" -- the bare symbol, with no price, no currency and no parentheses.
             Recent Market Event: {headline}
             Active Market Universe Tickers: {', '.join(clean_tickers[:15])}
             {empirical_block}
@@ -359,8 +418,26 @@ class StockCorrelationAgent(SentinelAgent):
             }
 
             if self.producer:
+                # Not CORRELATIONS. That topic's contract is CorrelationCluster
+                # -- the correlation engine and the quant engine both send
+                # `cluster.model_dump()` -- and this payload is an agent
+                # assessment: {agent, created_at, assessment}. It has none of
+                # rule_id, rule_name or alert_tier, so every consumer that
+                # constructs a cluster from it raises. The alert manager was
+                # doing exactly that, five validation errors at a time, four
+                # messages an hour discarded with a full traceback each.
+                #
+                # Eight consumer groups read sentinel.correlations and all of
+                # them are entitled to assume the contract.
+                #
+                # MACRO_DECOUPLING is where this belongs on both counts: it is
+                # an agents.* topic, matching the convention for agent output,
+                # and it carries macro-versus-equity relationship findings,
+                # which is what this assessment is. It also has two live
+                # consumers, so this is a redirection to readers rather than
+                # the quieter fix of deleting a publish nothing could parse.
                 await self.producer.send(
-                    Topics.CORRELATIONS,
+                    Topics.MACRO_DECOUPLING,
                     payload,
                     key=f"{brief.macro_asset}_{brief.equity_ticker}",
                 )

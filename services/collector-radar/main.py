@@ -37,7 +37,13 @@ from shared.utils.tasks import safe_create_task
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
+from shared.utils.market_session import poll_interval
 logger = logging.getLogger("collector.radar")
+
+# What the radar wants when the market is busy. Everything slower than this is
+# derived from the session rather than configured separately.
+RADAR_BASE_POLL_SEC = 60.0
+
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
@@ -151,6 +157,24 @@ class QuantRadar:
         # than against a baseline it has already moved -- the mistake that made
         # a first-ever earnings surprise look unremarkable.
         await self._update_baseline(ticker, current_vol, mean, var, alpha)
+
+        # A baseline with moments but no count predates the counter.
+        #
+        # 2,179 tickers hold 1m_mean and 1m_var; 1,178 hold 1m_n. The counter was
+        # introduced after the moments, so roughly a thousand instruments have a
+        # baseline they cannot use and emit nothing until they have been observed
+        # MIN_BASELINE_OBSERVATIONS more times. Waiting is the correct behaviour
+        # -- a count of zero is the honest statement about a baseline whose
+        # history was never recorded -- but it was silent, and the only way to
+        # discover it was to compare Redis key counts by hand.
+        if n == 0 and mean > 0:
+            self._uncounted_baselines = getattr(self, "_uncounted_baselines", 0) + 1
+            if self._uncounted_baselines % 500 == 1:
+                logger.info(
+                    "%s tickers have a baseline with no observation count and are "
+                    "warming up before they can report a spike. This resolves as "
+                    "each is next observed.", self._uncounted_baselines,
+                )
 
         if n < MIN_BASELINE_OBSERVATIONS or mean <= 0:
             # Not enough history to say what unusual means here.
@@ -386,9 +410,29 @@ async def main():
                 logger.info(f"Starting radar evaluation cycle | dynamic thresholds: alpha={alpha:.4f}, z_threshold={z_threshold:.2f}")
                 await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state)
                 elapsed = asyncio.get_event_loop().time() - t0
-                if elapsed > 60.0:
-                    logger.warning(f"⚠️ Radar poll cycle exceeded 60.0 seconds! Elapsed: {elapsed:.2f}s")
-                await asyncio.sleep(max(0, 60.0 - elapsed))
+
+                # Paced by the session, not by a constant.
+                #
+                # The interval was a flat 60 seconds, so with the market shut
+                # this process re-evaluated all 11,644 symbols every minute
+                # against bars that cannot change until it reopens. Observed
+                # after the close on 4 September: eight consecutive scans
+                # reporting the identical top mover, "FSTA (Z=0.01, $0.16M)",
+                # to the same two decimal places -- ninety thousand symbol
+                # evaluations to re-derive one unchanged answer.
+                #
+                # poll_interval only ever slows the loop down, so the open is
+                # untouched at 60s while a closed market stretches to the
+                # 900-second ceiling. The ceiling matters: a feed nobody polls
+                # cannot notice it has broken, and the freshness tracker would
+                # correctly start calling this source stale.
+                interval = poll_interval(RADAR_BASE_POLL_SEC, "equities")
+                if elapsed > interval:
+                    logger.warning(
+                        "⚠️ Radar poll cycle exceeded its %.0fs budget! Elapsed: %.2fs",
+                        interval, elapsed,
+                    )
+                await asyncio.sleep(max(0, interval - elapsed))
         finally:
             heartbeat_task.cancel()
             hb_shared_task.cancel()

@@ -29,6 +29,7 @@ from shared.kafka import Topics
 from shared.utils import quant_calc
 from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.tasks import safe_create_task
+from shared.utils.focus import prioritise
 import numpy as np
 from shared.models.events import entity_cache_key, UNRATED_EDGE_CONFIDENCE
 from shared.models.events import AlertTier, CorrelationCluster
@@ -1095,6 +1096,14 @@ Return raw JSON matching schema:"""
             # calibration curve were all built and none of them ran.
             await self._refresh_backtests(tickers[:5])
 
+            # Subjects another agent is already examining come first.
+            #
+            # The sweep took the top five of its own watchlist, which is why the
+            # swarm's opinions never overlapped. Additive: every ticker the
+            # engine chose is still here, in its original order behind any that
+            # are already under examination elsewhere.
+            tickers = await prioritise(self.redis, tickers)
+
             results = []
             for ticker in tickers[:5]:  # Sweep top 5 watched tickers
                 res = await self._process_trading_advisory({"ticker": ticker, "anomaly_score": 0.75}, ticker, 0.75)
@@ -1151,7 +1160,7 @@ Return raw JSON matching schema:"""
                         continue
 
                     # backtest_strategy is synchronous and CPU-bound.
-                    await loop.run_in_executor(
+                    report = await loop.run_in_executor(
                         None,
                         partial(
                             backtester.backtest_strategy,
@@ -1160,6 +1169,16 @@ Return raw JSON matching schema:"""
                             strategy_type=strategy,
                         ),
                     )
+
+                    # Stored here, on the event loop that owns the connection.
+                    # The backtester used to do this itself and could not: it
+                    # runs on a worker thread, where creating a task raises.
+                    if report and self.redis:
+                        await self.redis.raw.set(
+                            f"sentinel:backtest:results:{report['strategy_id']}",
+                            json.dumps(report, default=str),
+                            ex=86400 * 7,
+                        )
                 except Exception as e:
                     logger.debug(f"Backtest refresh failed for {strategy}_{ticker}: {e}")
 

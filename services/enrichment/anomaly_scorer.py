@@ -8,6 +8,7 @@ import logging
 from shared.utils.metrics import MetricsCollector
 from shared.utils import quant_calc
 from shared.utils.streaming_detectors import (
+    FALLBACK_MAX_SCORE,
     RRCFDetector,
     KalmanResidualFilter,
     HawkesIntensityTracker,
@@ -15,7 +16,9 @@ from shared.utils.streaming_detectors import (
     BGPGraphFeatureExtractor,
     sts_zone_risk_multiplier,
 )
-from shared.utils.model_registry import ModelRegistry, ConformalZScoreCalibrator
+from shared.utils.model_registry import (
+    ModelRegistry, ConformalZScoreCalibrator, ConformalScoreCalibrator,
+)
 
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -209,6 +212,12 @@ def lift_score(anomaly: float, weight: float, spent: float = 0.0) -> float:
     return round(base + (1.0 - base) * min(remaining, w), 6)
 
 
+# The significance cut used before a domain has calibrated one, and where Redis
+# is unavailable. The value the no-Redis path has always used, kept so that an
+# uncalibrated domain behaves exactly as it did.
+SIGNIFICANCE_FALLBACK_CUT = 0.60
+
+
 class DynamicAnomalyScorer:
     def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
         if redis_client is None:
@@ -238,8 +247,18 @@ class DynamicAnomalyScorer:
 
         # ── CONFORMAL Z-SCORE CALIBRATORS (§1.3) ─────────────────────────────
         # Per-domain conformal calibrators for dynamic false-alarm rate bounds
-        self._conformal_z_calibrators: Dict[str, ConformalZScoreCalibrator] = {
-            domain: ConformalZScoreCalibrator(domain=domain, target_far=0.05, default_z_threshold=1.5)
+        # Calibrated on the scale the detectors actually emit.
+        #
+        # These were ConformalZScoreCalibrator, which clamps to [1.0, 3.5]
+        # because a z lives there. They are fed detector scores, which live in
+        # [0, 0.995] -- so every one of them pinned to exactly 1.0, a threshold
+        # no score can reach. The default of 0.60 below is the same cut the
+        # no-Redis path has always used, so an uncalibrated domain behaves
+        # exactly as before and calibration only ever refines it.
+        self._conformal_z_calibrators: Dict[str, ConformalScoreCalibrator] = {
+            domain: ConformalScoreCalibrator(
+                domain=domain, target_far=0.05, default_z_threshold=SIGNIFICANCE_FALLBACK_CUT
+            )
             for domain in self._rrcf_detectors.keys()
         }
 
@@ -450,18 +469,28 @@ class DynamicAnomalyScorer:
         if not raw_scores:
             return []
 
-        # Get conformal z-threshold for this domain (§1.3)
+        # The per-domain conformal cut for this event type.
         domain = self._get_domain(event_type)
         calibrator = self._conformal_z_calibrators.get(domain)
-        z_thresh = calibrator.z_threshold if calibrator else self.z_score_threshold
+        score_thresh = calibrator.z_threshold if calibrator else SIGNIFICANCE_FALLBACK_CUT
 
-        # Observe scores to dynamically calibrate conformal threshold
+        # Observe scores to dynamically calibrate the conformal threshold.
         if calibrator:
             for score in raw_scores:
                 calibrator.observe(score)
 
         if not self.redis or not getattr(self.redis, "raw", None):
-            return [score > 0.60 for score in raw_scores]
+            # Read, not discarded.
+            #
+            # This branch used a hardcoded 0.60 while the calibrated threshold
+            # sat unused in a local three lines above -- the platform's only
+            # self-tuning control, computed on every batch and thrown away.
+            # What the calibration buys is that the *false-alarm rate* is what
+            # holds constant across domains rather than the number: 0.60 means
+            # something different in a domain whose scores cluster high than in
+            # one whose scores cluster low, and the domains here differ exactly
+            # that way.
+            return [score > score_thresh for score in raw_scores]
 
         samples_key = f"sentinel:ml:score_samples:{event_type}"
 
@@ -877,13 +906,24 @@ class DynamicAnomalyScorer:
                 logger.debug("vessel_dark threshold config unavailable: %s", e)
 
         if "sanctioned" in " ".join(flags).lower():
-            base = min(1.0, base * config.get("sanctioned_multiplier", 1.5))
+            # Headroom lift, not multiplication.
+            #
+            # `min(1.0, base * 1.5)` is the same ceiling-clustering defect the
+            # additive form had, in a shape the earlier sweep did not look for:
+            # any base above 0.67 lands on exactly 1.0. Live on 4 September, 67
+            # vessel_dark events sat at 1.000 -- a detector reporting certainty
+            # about a vessel that stopped transmitting, which is the one thing
+            # AIS silence can never establish.
+            base = lift_score(base, config.get("sanctioned_multiplier", 1.5) - 1.0)
 
         # Contextual gap significance: STS transfer zone proximity multiplier
         zone_mult = sts_zone_risk_multiplier(region)
-        base = min(1.0, base * zone_mult)
+        # Same lift, for the same reason. zone_mult reaches 3.0 in the watched
+        # chokepoints, which multiplied any base above 0.33 straight to the top.
+        base = lift_score(base, max(0.0, zone_mult - 1.0))
 
-        return round(min(1.0, base), 3)
+        # Bounded below certainty, like every other detector in this system.
+        return round(min(FALLBACK_MAX_SCORE, base), 3)
 
     async def _record_vessel_gap(self, region: Optional[str], gap_hours: float) -> None:
         """Adds this observation to its region's empirical gap distribution."""

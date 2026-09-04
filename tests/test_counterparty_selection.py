@@ -43,6 +43,7 @@ ACTOR = "0x8f10b468b06c6fd214b65f87778827f7d113f996"
 class _FakeRaw:
     def __init__(self):
         self.hll = {}
+        self.kv = {}
 
     async def pfadd(self, key, value):
         self.hll.setdefault(key, set()).add(value)
@@ -53,6 +54,26 @@ class _FakeRaw:
     async def expire(self, key, ttl):
         return True
 
+    # note_counterparty only starts a HyperLogLog on an address's SECOND
+    # sighting -- one was previously created for every address the chain ever
+    # mentioned, 62,281 keys and 60.7% of the Redis instance. The promotion is
+    # driven by exists/set-NX/delete on a one-byte marker, and this double
+    # implemented none of them, so every call raised AttributeError into
+    # note_counterparty's own debug-level except and pfadd never ran. The
+    # degree stayed 0 and the failures read as "this wallet is not
+    # infrastructure" rather than "the fake is missing three commands".
+    async def exists(self, key):
+        return 1 if key in self.kv or key in self.hll else 0
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return None          # redis-py returns None when NX does not take
+        self.kv[key] = value
+        return True
+
+    async def delete(self, key):
+        return 1 if self.kv.pop(key, None) is not None else 0
+
 
 class _FakeRedis:
     def __init__(self):
@@ -60,7 +81,15 @@ class _FakeRedis:
 
 
 async def _make_venue(redis, address, degree=INFRASTRUCTURE_DEGREE):
-    for i in range(degree):
+    """Give an address `degree` recorded counterparties.
+
+    One more sighting than that is needed to produce them. The first is spent
+    on the promotion marker and recorded nowhere -- an address seen exactly
+    once cannot be a venue, which is the whole point of deferring the
+    HyperLogLog -- so seeding N sightings registers N-1 counterparties and
+    seeding the threshold exactly would leave a venue one short of it.
+    """
+    for i in range(degree + 1):
         await note_counterparty(redis, address, f"0x{i:040x}")
 
 
@@ -115,7 +144,9 @@ def test_a_participant_stays_a_participant():
     value moves through it."""
     async def run():
         redis = _FakeRedis()
-        for i in range(12):
+        # 13 sightings, 12 recorded: the first is spent on the promotion
+        # marker. See _make_venue.
+        for i in range(13):
             await note_counterparty(redis, ACTOR, f"0x{i:040x}")
         assert not await is_infrastructure(redis, ACTOR)
         assert await counterparty_degree(redis, ACTOR) == 12

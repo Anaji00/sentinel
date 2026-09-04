@@ -25,6 +25,7 @@ from shared.models import RawEvent, NormalizedEvent, CrossDomainSignal
 from shared.db import get_redis, get_timescale, get_neo4j
 from shared.db.bootstrap import bootstrap_database
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.source_freshness import mark_sources_seen
 
 from services.enrichment.anomaly_scorer import DynamicAnomalyScorer
 from services.enrichment.db_writer import DBWriter
@@ -442,6 +443,28 @@ async def _ofac_sync_loop():
             rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
         await asyncio.sleep(86_400)  # 24 hours
 
+# Tags that exempt an event from the fan-out floor, whatever it scored.
+#
+# A sanctions match on a $15 transfer is still a sanctions match; the platform's
+# own OFAC path is a floor rather than a lift for exactly this reason.
+FANOUT_EXEMPT_TAGS = frozenset({
+    "sanctioned", "suspect_wallet", "watched_wallet_transfer",
+    "emergency", "squawk", "dark_vessel", "token_supply_event",
+})
+
+
+def _is_below_fanout_floor(event) -> bool:
+    """Whether an event is one the scorer already judged to carry nothing."""
+    try:
+        score = float(getattr(event, "anomaly_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if score > 0.0:
+        return False
+    tags = set(getattr(event, "tags", None) or [])
+    return not (tags & FANOUT_EXEMPT_TAGS)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  Enrichment Service (Multi-Domain Edition)")
@@ -505,6 +528,7 @@ async def main():
     _start_time = _time.monotonic()
     processed = 0
     errors = 0
+    _fanout_skipped = 0
     heartbeat_state = {
         "processed": 0,
         "errors": 0,
@@ -666,6 +690,34 @@ async def main():
                             )
 
                 for enriched in batch_to_write:
+                    # An event the scorer has already judged worthless does not
+                    # take the fan-out.
+                    #
+                    # Measured live on 4 September: 6,969 of 17,506 events in
+                    # thirty minutes scored exactly 0.000, and 6,534 of those
+                    # were sub-$10k crypto transfers. The dust-scoring repair
+                    # earlier in this audit was right that a $15 stablecoin
+                    # movement scores zero -- but it changed only the number.
+                    # Each one was still published to ENRICHED_EVENTS and
+                    # delivered into ten agent inboxes, which is two fifths of
+                    # the platform's whole message volume spent distributing a
+                    # verdict of "nothing".
+                    #
+                    # It is still written to Timescale above and still fully
+                    # queryable; what it stops doing is costing what a finding
+                    # costs. Anything with a categorical reason to be seen --
+                    # sanctions, a watchlist, an emergency -- carries a tag and
+                    # is exempt, because those are facts about the subject
+                    # rather than judgements about magnitude.
+                    if _is_below_fanout_floor(enriched):
+                        _fanout_skipped += 1
+                        if _fanout_skipped % 20000 == 1:
+                            logger.info(
+                                "Held %s zero-scored event(s) out of the agent fan-out. "
+                                "They remain queryable in Timescale.", _fanout_skipped,
+                            )
+                        continue
+
                     entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"
                     produce_tasks.append(
                         producer.send(
@@ -730,6 +782,23 @@ async def main():
                             # FIX: write_events_batch is async — call it directly,
                             # not via run_in_executor (which is for sync functions).
                             await db.write_events_batch(batch_to_write)
+
+                            # When a feed goes quiet, make the silence legible.
+                            #
+                            # The platform knew whether a *collector* was alive
+                            # and nothing about whether its feed still produced.
+                            # Ten sources went an hour without an event during
+                            # this audit and the only way to tell a dead feed
+                            # from a slow one was to read the poller's source.
+                            # One hash write per batch, against each source's
+                            # own learned cadence.
+                            safe_create_task(
+                                mark_sources_seen(
+                                    redis, {e.source for e in batch_to_write if e.source}
+                                ),
+                                name="source-freshness",
+                            )
+
                             # Broadcast enriched events to Redis PubSub for real-time WebSocket live feed
                             try:
                                 pub_pipe = redis.raw.pipeline()

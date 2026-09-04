@@ -99,8 +99,49 @@ def test_a_cache_failure_does_not_drop_the_message_loudly():
     assert "except Exception" in block
 
 
-def test_the_agent_still_publishes_to_this_topic():
-    """If the agent's output_topic changes, this guard is dead code and the
-    test should say so rather than passing silently."""
-    agent_source = (ROOT / "services" / "agents" / "stock_correlation_agent.py").read_text(encoding="utf-8")
-    assert "return Topics.CORRELATIONS" in agent_source
+AGENT_SOURCE = (ROOT / "services" / "agents" / "stock_correlation_agent.py").read_text(encoding="utf-8")
+
+
+def test_the_agent_no_longer_publishes_onto_the_cluster_contract():
+    """The producer moved, which is what the previous version of this test
+    existed to force a decision about.
+
+    That test asserted the agent still published to CORRELATIONS, on the
+    grounds that if it ever stopped, the consumer's discriminator would be
+    dead code and something should say so rather than pass silently. It has
+    now said so, and this is the decision.
+
+    The guard fixed the reasoning consumer and only the reasoning consumer.
+    Eight consumer groups read sentinel.correlations, and the alert manager --
+    which had no such guard -- was still constructing CorrelationCluster from
+    this payload and raising five validation errors at a time, live, months
+    later. Requiring every reader of a topic to carry a discriminator for a
+    shape that is not the topic's contract makes correctness the obligation of
+    everyone who subscribes, and the alert manager is the proof that it does
+    not hold.
+
+    The other half is where the analysis went. The guard cached it to
+    sentinel:agents:correlation_analysis:{agent}, and nothing in the tree ever
+    read that key -- no readers, and no such keys live in Redis. The work was
+    still being discarded; it was simply being discarded quietly, in a Redis
+    key instead of the DLQ, which is why the noise stopped and the loss did
+    not.
+
+    MACRO_DECOUPLING carries macro-versus-equity relationship findings, follows
+    the agents.* convention for agent output, and has two live consumers that
+    already read heterogeneous topics. The analysis now reaches readers.
+    """
+    assert "Topics.MACRO_DECOUPLING" in AGENT_SOURCE
+    assert "return Topics.CORRELATIONS" not in AGENT_SOURCE
+
+
+def test_the_consumer_guard_is_retained_as_a_contract_defence():
+    """Kept deliberately, not left behind.
+
+    With the producer moved there is no live sender of this shape, so the
+    guard defends the contract rather than handling traffic: it costs one dict
+    lookup and it is the difference between a future misrouted publish being
+    absorbed and it filling the DLQ again. The cost of removing it is paid by
+    whoever reintroduces the defect.
+    """
+    assert 'if "agent" in raw_data and "correlation_id" not in raw_data:' in SOURCE

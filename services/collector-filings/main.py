@@ -74,6 +74,34 @@ SEC_HEADERS = {
 
 POLL_INTERVAL_SEC = 90
 
+# Beyond this, a 13F cannot be the current one.
+#
+# Form 13F is due 45 days after the quarter it covers, so at any moment the
+# newest filing in existence is at most a quarter plus that filing window old.
+# Two quarters of slack absorbs late filers and amended reports; past it, the
+# filing is not late, the filer has stopped.
+MAX_13F_AGE_DAYS = 225
+
+
+def _report_age_days(report_period: str):
+    """Days since the quarter a filing covers, or None if the period is unparseable.
+
+    Unparseable returns None rather than a large number: an unreadable period
+    is a reason to look, not a reason to silently drop a live filing.
+    """
+    if not report_period:
+        return None
+    text = str(report_period).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m"):
+        try:
+            when = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - when).days
+        except ValueError:
+            continue
+    return None
+
+
+
 # Standard fallback mapping for top watchable equities
 BASE_CIK_MAP = {
     "AAPL": "0000320193",
@@ -305,6 +333,42 @@ async def seed_prominent_13f_reports(session: aiohttp.ClientSession, producer: S
             if not report:
                 # Disclose that live EDGAR is currently unreachable, do NOT publish fabricated live data
                 logger.info(f"Live SEC EDGAR 13F data currently unavailable for {meta['name']} (CIK {cik}).")
+                continue
+
+            # A filing this old is not news, and may mean the filer is gone.
+            #
+            # Live on 4 September 2026, Appaloosa was publishing a portfolio
+            # dated 2015-12-31 -- ten years stale, emitted as a current 13F
+            # event, indistinguishable in the stream from Berkshire's
+            # 2026-06-30. A 13F is due 45 days after quarter end, so the newest
+            # available period is never more than about five months old; a
+            # decade-old one means EDGAR returned that filer's LAST filing and
+            # there have been none since.
+            #
+            # That is what a dissolved or deregistered manager looks like from
+            # here: not an error, not an empty response, but the final filing
+            # served forever as though it were current. Scion Asset Management
+            # is the case that prompted this check -- a fund that stopped
+            # filing does not announce it, and a collector that only ever asks
+            # for "the latest" cannot tell the difference between a manager who
+            # has not filed yet this quarter and one who will never file again.
+            staleness_days = _report_age_days(report.report_period)
+            if staleness_days is not None and staleness_days > MAX_13F_AGE_DAYS:
+                logger.warning(
+                    "%s (CIK %s) last filed for %s, %d days ago -- beyond the "
+                    "%d-day window in which a 13F can still be the current one. "
+                    "Not published: this filer appears to have stopped filing. "
+                    "Its last known portfolio remains in Redis for reference.",
+                    meta["name"], cik, report.report_period,
+                    staleness_days, MAX_13F_AGE_DAYS,
+                )
+                await raw_redis.set(
+                    f"sentinel:13f:{cik}:dormant",
+                    json.dumps({"last_period": report.report_period,
+                                "age_days": staleness_days,
+                                "observed_at": datetime.now(timezone.utc).isoformat()}),
+                    ex=86400 * 30,
+                )
                 continue
 
             report_json = report.model_dump_json()

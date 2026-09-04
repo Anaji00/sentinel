@@ -408,7 +408,9 @@ def test_context_builder_graph_staleness_and_decay_sorting():
 
 
 def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
-    from services.agents.rule_agent import RuleSynthesizerAgent, DynamicRule, RuleList
+    from services.agents.rule_agent import (
+        RuleSynthesizerAgent, DynamicRule, RuleList, CorrelationDef,
+    )
     from shared.kafka import Topics
 
     async def _test():
@@ -425,7 +427,20 @@ def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
                 rule_id="syn_energy_defense_01",
                 rule_name="Energy Spike to Defense Equity Convergence",
                 trigger_event_type="market_anomaly",
-                correlations=[],
+                # A rule with no clauses is now rejected before storage --
+                # "no correlation clauses: the rule constrains nothing" -- so
+                # an empty list no longer describes a proposal the synthesiser
+                # would accept. The governance is the point of this test's
+                # subject, and the fixture has to satisfy it to reach the
+                # storage assertions below.
+                correlations=[
+                    CorrelationDef(
+                        event_types=["market_anomaly"],
+                        hours=48,
+                        min_anomaly=0.6,
+                        tags=["LMT"],
+                    )
+                ],
                 alert_tier="ALERT",
                 tags=["XOM", "LMT"],
                 expires_at=int(time.time()) + 7 * 86400

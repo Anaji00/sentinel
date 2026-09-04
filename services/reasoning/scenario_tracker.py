@@ -112,6 +112,46 @@ def _checkable(signals) -> list:
     return named or list(signals)
 
 
+def _as_datetime(value) -> Optional[datetime]:
+    """A timezone-aware datetime from whatever the row actually carried.
+
+    This was `if not isinstance(created, datetime): return 0, ""`, written as a
+    defensive guard and behaving as an off switch: the database client returns
+    `created_at` as a **string**, so every call returned zero and the expiry
+    decay -- the mechanism that makes denial reachable at all -- did nothing
+    from the moment it was deployed. Verified in the running container:
+    `created_at type: str`. The tracker sweep examined a hundred scenarios aged
+    between 113 and 272 hours, every one of them overdue, and updated none.
+    Scenario status stayed at 219 confirmed and 0 denied.
+
+    The logic had been driven against a synthetic datetime and never against the
+    type production supplies. Accepting both is the fix; returning None only
+    when the value genuinely cannot be read is what keeps the guard defensive
+    without letting it be silent.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        # Postgres renders UTC as "+00" and ISO-8601 as "Z"; fromisoformat on
+        # this runtime accepts neither without help.
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        elif len(text) > 3 and text[-3] in "+-" and ":" not in text[-3:]:
+            text = text + ":00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            logger.debug("Could not read a timestamp from %r; no decay applied.", value)
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
 def _horizon_hours(hypotheses) -> int:
     """The longest horizon any of this scenario's hypotheses claimed.
 
@@ -133,11 +173,9 @@ def _expiry_decay(scenario: Dict, hypotheses, now: datetime) -> Tuple[int, str]:
     Returns (points, note). Zero and an empty note while the scenario is still
     within the time it gave itself.
     """
-    created = scenario.get("created_at")
-    if not isinstance(created, datetime):
+    created = _as_datetime(scenario.get("created_at"))
+    if created is None:
         return 0, ""
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
 
     horizon = _horizon_hours(hypotheses)
     elapsed_hours = (now - created).total_seconds() / 3600.0

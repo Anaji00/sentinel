@@ -30,6 +30,17 @@ SEC_HEADERS = {
 }
 
 # Premier Institutional Filers tracked on official SEC EDGAR
+# Hand-maintained, and therefore decaying.
+#
+# Every value below is a constant asserted about a real firm and a real person,
+# and nothing revalidates any of it. Two decayed silently and were found only by
+# reading the output: Renaissance's entry named a manager who died in 2024, and
+# Appaloosa's newest available filing is dated 2015 -- which the collector now
+# treats as a dormant filer rather than as news (see MAX_13F_AGE_DAYS).
+#
+# A fund that dissolves, deregisters or changes hands does not announce it here.
+# The staleness gate in the collector is what catches that, because it asks a
+# question this table cannot: when did this filer last actually file?
 PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
     "0001067983": {
         "id": "berkshire_hathaway",
@@ -62,7 +73,9 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
     "0001037389": {
         "id": "renaissance",
         "name": "Renaissance Technologies LLC",
-        "manager": "Jim Simons / Peter Brown",
+        # Jim Simons died in May 2024. Removed rather than left to be
+        # asserted in a headline about a 2026 filing.
+        "manager": "Peter Brown",
         "cik": "0001037389",
         "style": "Quantitative Systematic",
     },
