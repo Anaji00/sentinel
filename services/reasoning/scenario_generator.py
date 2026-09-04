@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field
 from shared.models.events import ResolutionSignal
 
 from shared.models import CorrelationCluster, Scenario, ScenarioStatus
-from shared.utils.ollama import deliverable_prompt_chars, OllamaClient, SchemaViolationError
+from shared.utils.ollama import deliverable_prompt_chars, DEFAULT_MODEL, OllamaClient, SchemaViolationError
 
 logger = logging.getLogger("reasoning.generator")
 
@@ -81,10 +81,12 @@ OUTPUT RULES:
    Example: {"entity": "ETHUSDT", "observable": "spot volume",
              "comparator": "above", "threshold": 20.0, "unit": "%"}
 
-OUTPUT SCHEMA:
+OUTPUT SHAPE:
 ANGLE BRACKETS ARE SLOTS TO FILL, NEVER TEXT TO COPY. A response that repeats
 any <...> phrasing, or describes what a field should contain instead of
 containing it, is rejected and re-requested.
+
+One hypothesis, shown in full. Produce exactly 3 in the "hypotheses" array.
 
 {
   "headline": "<the judgment itself, max 150 chars>",
@@ -98,34 +100,21 @@ containing it, is rejected and re-requested.
       "watch_signals": [{"entity": "<the ticker/wallet/vessel this is about>", "observable": "<what would be seen>", "comparator": "above|below|occurs|absent", "threshold": 5.0, "unit": "%"}],
       "deny_signals": [{"entity": "<name it>", "observable": "<what would refute this>", "comparator": "occurs", "threshold": null, "unit": null}],
       "time_horizon": "immediate | 24h | 72h | 1week | 1month"
-    },
-    {
-      "label": "<a genuinely different explanation, not a restatement>",
-      "probability": 35,
-      "mechanism": "<why the same signals could mean this instead>",
-      "beneficiaries": ["<who gains under this reading>"],
-      "watch_signals": [{"entity": "<name it>", "observable": "<must differ from the first hypothesis>", "comparator": "occurs", "threshold": null, "unit": null}],
-      "deny_signals": [{"entity": "<name it>", "observable": "<must differ from the first hypothesis>", "comparator": "occurs", "threshold": null, "unit": null}],
-      "time_horizon": "24h"
-    },
-    {
-      "label": "<the low-probability, high-impact case>",
-      "probability": 20,
-      "mechanism": "<what would have to be true for this>",
-      "beneficiaries": ["<who gains under this reading>"],
-      "watch_signals": [{"entity": "<name it>", "observable": "<must differ from the others>", "comparator": "occurs", "threshold": null, "unit": null}],
-      "deny_signals": [{"entity": "<name it>", "observable": "<must differ from the others>", "comparator": "occurs", "threshold": null, "unit": null}],
-      "time_horizon": "72h"
     }
   ],
-  "recommended_monitoring": [
-    "Specific track, ticker, wallet, or sensor feed to monitor"
-  ],
+  "recommended_monitoring": ["<specific track, ticker, wallet, or sensor feed>"],
   "confidence_overall": 62,
-  "confidence_rationale": "Key evidence vs intelligence gaps driving confidence level"
+  "confidence_rationale": "<key evidence against the intelligence gaps>"
 }
 
-CRITICAL: The 3 hypothesis probabilities MUST sum to 100."""
+THE OTHER TWO HYPOTHESES take the same shape and must differ in substance:
+- The second is a genuinely different explanation of the same signals, not a
+  restatement of the first in other words.
+- The third is the low-probability, high-impact case: what would have to be true.
+- Their watch and deny observables must differ from the first and from each
+  other. An observable that appears under every hypothesis discriminates
+  between none of them and is discarded.
+- Probabilities descend and the three MUST sum to 100."""
 
 
 # ── OUTPUT SCHEMA ─────────────────────────────────────────────────────────────
@@ -383,6 +372,49 @@ _SECTION_SHARES = {
 # the window and is not negotiable, so the dynamic sections share the rest.
 _DYNAMIC_BUDGET_SHARE = 0.55
 
+# The critique's scaffolding: headers, the instruction, and indentation.
+#
+# Kept as a template so its fixed cost is measured rather than estimated. A
+# hardcoded number goes stale the first time someone rewords the instruction,
+# and it goes stale silently -- the prompt simply starts overflowing again,
+# which is the failure this budget exists to prevent.
+_CRITIQUE_TEMPLATE = """
+            ORIGINAL SCENARIO DRAFT:
+            {draft}
+
+            ORIGINAL CORRELATION CONTEXT:
+            {context}
+
+            Review this draft ruthlessly. Correct any logical leaps, adjust hypothesis probabilities to sum to 100, and ensure all watch/deny signals are concrete and observable.
+            """
+_CRITIQUE_FIXED_CHARS = len(_CRITIQUE_TEMPLATE.format(draft="", context=""))
+
+
+def _critique_context_room(draft_json: str, system_prompt: str, model: str) -> int:
+    """Characters left for the original context once the draft is seated.
+
+    Pure sizing, kept out of the inference path so it can be tested without a
+    model. Raises _CritiqueNotAffordable when the draft alone will not fit,
+    because a critique of a truncated draft is worse than no critique: the
+    reviewer corrects the half it was shown and drops the rest without saying
+    so, and the caller cannot tell that from a real review.
+    """
+    try:
+        budget = int(deliverable_prompt_chars(model, SCENARIO_TOKEN_BUDGET))
+    except Exception:
+        # The same floor _build_user_prompt falls back to.
+        budget = 4064
+    room = max(0, budget - len(system_prompt) - _CRITIQUE_FIXED_CHARS)
+    if len(draft_json) > room:
+        raise _CritiqueNotAffordable(
+            f"draft is {len(draft_json)} chars against {room} of room"
+        )
+    return room - len(draft_json)
+
+
+class _CritiqueNotAffordable(Exception):
+    """The draft alone exceeds the window, so a faithful review is impossible."""
+
 
 def _clip(text: str, budget: int, label: str) -> str:
     """One section, cut to its share, saying so where it was cut.
@@ -560,6 +592,72 @@ def _signal_signature(signal) -> str:
     return f"{str(entity).strip().lower()}|{str(observable).strip().lower()}"
 
 
+def _known_entity_tokens(cluster, raw_events) -> set:
+    """Every identifier this cluster actually contains, lowercased.
+
+    Drawn from the cluster's own entity lists and from the events behind it, so
+    a signal naming something the cluster never mentioned can be recognised.
+    """
+    tokens = set()
+    for source in (
+        getattr(cluster, "entity_ids", None),
+        getattr(cluster, "entity_names", None),
+    ):
+        for value in (source or []):
+            token = str(value or "").strip().lower()
+            if len(token) >= _MIN_MATCHABLE_ENTITY:
+                tokens.add(token)
+    for event in (raw_events or []):
+        if not isinstance(event, dict):
+            continue
+        for key in ("entity_id", "entity_name", "primary_entity_id", "primary_entity_name"):
+            token = str(event.get(key) or "").strip().lower()
+            if len(token) >= _MIN_MATCHABLE_ENTITY:
+                tokens.add(token)
+    return tokens
+
+
+def _prune_unresolvable_signals(output, known: set) -> int:
+    """Drops watch and deny signals naming entities the cluster never contained.
+
+    Measured across 48 hours of scenarios: 353 distinct signal entities, and
+    201 of them -- 57% -- named something this platform has never observed.
+    They fall into a few shapes, all of them the model writing rather than
+    reading: invented placeholders ("XYZ Corp", "Exchange A", "Vessel X", "JKL
+    Wallet"), categories the prompt explicitly forbids ("INSIDER", "CYBER
+    THREAT", "Stablecoin Usage"), mangled tickers ("PIP R" for PIPR, "ADBES"),
+    and observables written into the entity field ("AIS call volume").
+
+    The tracker resolves signals by indexed entity lookup, so each of these is
+    a sweep that can never match. The scenario carrying them cannot be
+    confirmed or denied through them, which is the same unfalsifiability the
+    confidence ceilings exist to price -- and those ceilings still apply, since
+    a hypothesis left with no watch signal is caught by UNFALSIFIABLE_CEILING.
+
+    The prompt already states this rule and is ignored 57% of the time. A rule
+    worth stating to the model is worth enforcing on its output.
+    """
+    if not known:
+        return 0
+
+    removed = 0
+    for hypothesis in (getattr(output, "hypotheses", None) or []):
+        for field in ("watch_signals", "deny_signals"):
+            signals = getattr(hypothesis, field, None)
+            if not signals:
+                continue
+            kept = []
+            for signal in signals:
+                entity = str(getattr(signal, "entity", "") or "").strip().lower()
+                if entity and any(_names(candidate, entity) or entity == candidate
+                                  for candidate in known):
+                    kept.append(signal)
+                else:
+                    removed += 1
+            setattr(hypothesis, field, kept)
+    return removed
+
+
 def _discriminates_between_hypotheses(output) -> bool:
     """Whether the hypotheses can actually be told apart by observation.
 
@@ -599,6 +697,27 @@ SINGLE_HYPOTHESIS_CEILING = 50  # nothing was weighed against anything
 # that cannot be wrong.
 UNFALSIFIABLE_CEILING = 35
 
+# No deny signal on any hypothesis: the scenario can be confirmed and never
+# refuted. Measured across the full corpus once it became readable -- 148 of 676
+# scenarios, 21.9%, carry no deny signal anywhere. That is the other half of why
+# 672 scenarios produced 213 confirmations and not one denial: the confidence
+# arithmetic made the deny branch unreachable, and for a fifth of the corpus
+# there was nothing to feed it either. Set below the tracker's CONFIRM_THRESHOLD
+# of 65, because a claim that only has evidence pointing one way should not be
+# able to assert itself as strongly as one that could have gone the other.
+UNREFUTABLE_CEILING = 55
+
+# Every hypothesis watching for the same thing. The tracker applies watch hits
+# per hypothesis, so when all three watch the same observable a hit raises all
+# three together and separates none of them -- the update is uninformative
+# whatever fires. Measured: 117 of 676 scenarios, 17.3%.
+#
+# Capped rather than discarded. The fully degenerate case, where the deny
+# signals match as well, is still rejected outright by
+# _discriminates_between_hypotheses; this is the weaker form where the
+# hypotheses differ but nothing observable tells them apart.
+INDISCRIMINATE_WATCH_CEILING = 50
+
 
 def _supported_confidence(output) -> int:
     """The model's confidence, capped by what its own draft supports.
@@ -631,7 +750,37 @@ def _supported_confidence(output) -> int:
     if not any(getattr(h, "watch_signals", None) for h in hypotheses):
         ceiling = min(ceiling, UNFALSIFIABLE_CEILING)
 
+    # The refuting direction, which the check above does not cover: a draft can
+    # carry watch signals on every hypothesis and no deny signal anywhere, and
+    # such a scenario is confirmable but not refutable.
+    if hypotheses and not any(getattr(h, "deny_signals", None) for h in hypotheses):
+        ceiling = min(ceiling, UNREFUTABLE_CEILING)
+
+    if _shares_one_watch_set(hypotheses):
+        ceiling = min(ceiling, INDISCRIMINATE_WATCH_CEILING)
+
     return min(claimed, ceiling)
+
+
+def _shares_one_watch_set(hypotheses) -> bool:
+    """Whether every hypothesis watches for exactly the same things.
+
+    Separate from _discriminates_between_hypotheses, which compares the deny and
+    watch sets as a single signature and so only rejects when both match. A
+    scenario whose hypotheses share their watch signals but differ in their deny
+    signals passes that guard, and 117 of 676 did.
+    """
+    if len(hypotheses) < 2:
+        return False
+    signatures = {
+        tuple(sorted(_signal_signature(s) for s in (getattr(h, "watch_signals", None) or [])))
+        for h in hypotheses
+    }
+    # An empty watch set on every hypothesis is the unfalsifiable case above,
+    # which carries a lower ceiling already; do not claim it here as well.
+    if signatures == {()}:
+        return False
+    return len(signatures) == 1
 
 
 def _is_at_least_as_complete(candidate, incumbent) -> bool:
@@ -664,7 +813,7 @@ class ScenarioGenerator:
         # Store the database connection and redis client
         self.db    = db_client
         self.redis = redis_client
-        self.model = os.getenv("AGENT_MODEL", "llama3")
+        self.model = os.getenv("AGENT_MODEL", DEFAULT_MODEL)
         
         # Concurrency limit: one synthesis at a time per process.
         # The OllamaClient also acquires the global semaphore, but we keep this
@@ -724,11 +873,16 @@ class ScenarioGenerator:
         # ── 2. BUILD USER PROMPT ───────────────────────────────────────────────
         user_prompt = self._build_user_prompt(cluster, context, patterns, raw_events)
 
-        # ── 3. CALL LLAMA3 PASS 1 (GENERATION) ─────────────────────────────────
+        # ── 3. PASS 1 (GENERATION) ─────────────────────────────────────────────
+        #
+        # The line named Llama3 while qwen2.5:1.5b did the work, which is how
+        # the model mismatch stayed invisible: the log agreed with the stale
+        # default rather than with the model that ran. It reports self.model now.
         logger.info(
-            "🧠 Synthesizing [%s] %s via Llama3 (Pass 1: Generation)...",
+            "🧠 Synthesizing [%s] %s via %s (Pass 1: Generation)...",
             cluster.alert_tier.name,
             cluster.rule_name,
+            self.model,
         )
 
         client = OllamaClient(self._get_session(), self.model, redis_client=self.redis)
@@ -771,6 +925,18 @@ class ScenarioGenerator:
             )
             return None
 
+        # Signals naming entities this cluster never contained are dropped
+        # before anything downstream is asked to resolve them.
+        pruned = _prune_unresolvable_signals(
+            output, _known_entity_tokens(cluster, raw_events)
+        )
+        if pruned:
+            logger.info(
+                "Dropped %s unresolvable signal(s) from %s: named entities the "
+                "cluster does not contain.",
+                pruned, cluster.correlation_id[:8],
+            )
+
         if not _discriminates_between_hypotheses(output):
             logger.warning(
                 "Discarding scenario for %s: every hypothesis carries the same "
@@ -797,18 +963,32 @@ class ScenarioGenerator:
 
         try:
             logger.info("😈 Running Pass 2 Critique (Devil's Advocate) for %s...", cluster.correlation_id[:8])
-            critique_prompt = f"""
-            ORIGINAL SCENARIO DRAFT:
-            {output.model_dump_json() if hasattr(output, 'model_dump_json') else json.dumps(output.dict())}
-
-            ORIGINAL CORRELATION CONTEXT:
-            {user_prompt[:1500]}
-
-            Review this draft ruthlessly. Correct any logical leaps, adjust hypothesis probabilities to sum to 100, and ensure all watch/deny signals are concrete and observable.
-            """
-
             critique_system = """You are SENTINEL Red Team / Devil's Advocate.
 Review the intelligence scenario draft, challenge weak assumptions, refine confidence ratings, and return a polished final ScenarioOutput JSON. Respond with raw JSON matching the schema exactly."""
+
+            # The critique gets the same window as the draft did, and was the
+            # only prompt on this path never sized against it.
+            #
+            # It inlined the entire draft -- three hypotheses with mechanisms,
+            # signals, monitoring and rationale -- plus 1,500 characters of
+            # context, unbounded. Those are the 8,608 and 11,173 character
+            # prompts in the truncation log, against a 7,664 ceiling.
+            #
+            # Truncation now cuts the middle to preserve the task, which on this
+            # prompt means cutting the draft the critique exists to review. A
+            # reviewer handed half a draft will correct the half it can see and
+            # silently drop the rest, and that costs a full inference on a host
+            # that completes about fifty-eight an hour.
+            draft_json = (
+                output.model_dump_json() if hasattr(output, "model_dump_json")
+                else json.dumps(output.dict())
+            )
+            # Whatever the draft leaves over goes to the original context, which
+            # is corroboration here rather than the subject under review.
+            context_room = _critique_context_room(draft_json, critique_system, self.model)
+            critique_prompt = _CRITIQUE_TEMPLATE.format(
+                draft=draft_json, context=user_prompt[:context_room],
+            )
 
             polished_output: ScenarioOutput = await client.infer(
                 system_prompt=critique_system,
@@ -831,6 +1011,13 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
                     "Pass 2 critique for %s returned a weaker draft; keeping Pass 1",
                     cluster.correlation_id[:8],
                 )
+        except _CritiqueNotAffordable as e:
+            # The draft stands unreviewed, which is the honest outcome rather
+            # than a review of a fragment. Logged at info: this is a designed
+            # path, not a fault.
+            logger.info(
+                "Pass 2 critique skipped for %s: %s.", cluster.correlation_id[:8], e,
+            )
         except Exception as e:
             logger.warning(f"Pass 2 critique skipped (fallback to Pass 1 draft): {e}")
 
@@ -868,6 +1055,18 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
             recommended_monitoring=output.recommended_monitoring,
             confidence_overall=_supported_confidence(output),
             confidence_rationale=output.confidence_rationale,
+            # The events this scenario was actually built from.
+            #
+            # The column exists on the model and on the table and was left
+            # empty on all 628 scenarios, so a scenario could only be traced to
+            # its evidence indirectly, by following its correlation_id to the
+            # cluster and reading that cluster's list. Carrying it directly
+            # costs nothing and survives the cluster being pruned.
+            supporting_event_ids=[
+                str(e) for e in ([cluster.trigger_event_id] if cluster.trigger_event_id else [])
+                + list(cluster.supporting_event_ids or [])
+                if e
+            ],
         )
 
         logger.info(
@@ -1050,6 +1249,14 @@ Pre-computed swarm consensus and agent bulletins:
       hypothesis from the others. If a signal would confirm or refute every
       hypothesis equally, it belongs in none of them: an indicator that cannot
       discriminate is not an indicator.
+    - EVERY hypothesis must carry at least one deny_signal. A hypothesis with
+      nothing that would refute it is not a hypothesis, it is an assertion, and
+      it will be capped below the threshold at which anything is ever confirmed.
+      State what you would have to see to abandon this explanation.
+    - No two hypotheses may share the same set of watch_signals. If you find
+      yourself writing the same observable under two hypotheses, at least one of
+      them is not distinct enough to be worth listing separately -- change the
+      observable, or change the hypothesis.
     - The headline must name the subject and what is unusual about it. Do not open
       with the detector's name.
     - Keep prose tight: significance in 2-3 sentences, each mechanism in one or two.

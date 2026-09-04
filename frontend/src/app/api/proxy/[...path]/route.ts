@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifySessionToken } from '../../auth/login/route';
 
-const BACKEND_URL = process.env.API_GATEWAY_URL || 'http://localhost:8000';
+// Its three sibling handlers (auth/login, auth/sso/start, auth/sso/callback)
+// all default to the gateway; this one defaulted to localhost, which inside the
+// frontend container is the frontend. With API_GATEWAY_URL unset, sign-in would
+// keep working through the three that name the gateway correctly and every data
+// request would fail against this container -- an authentication success
+// followed by an empty product, which is the hardest shape to diagnose.
+const BACKEND_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 const API_GATEWAY_KEY = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
 
 // Endpoints a person reaches before they have a session: creating an account,

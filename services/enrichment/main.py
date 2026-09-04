@@ -33,6 +33,7 @@ from services.enrichment.entity_resolver import EntityResolver
 from services.enrichment.gap_detector import VesselGapDetector
 
 from shared.utils.tasks import safe_create_task
+from shared.utils.live_feed import worth_broadcasting
 
 # --- THE NEW ENRICHERS ---
 from services.enrichment.enrichers.maritime import MaritimeEnricher
@@ -229,6 +230,61 @@ async def _heartbeat_loop(state: dict):
             f"uptime={int(elapsed)}s"
         )
 
+# Which index the volatility regime is measured from, in preference order.
+#
+# QQQ first because it carries the deepest bar history on this deployment --
+# 530 bars with 342 distinct closes in a day, against SPY's 278 and 204.
+VOLATILITY_INDEXES = ["QQQ", "SPY"]
+VOLATILITY_INTERVAL_SEC = 900
+VOLATILITY_LOOKBACK_BARS = 240
+
+
+async def _volatility_loop(timescale, redis_client) -> None:
+    """Publishes realised index volatility for the radar's thresholds.
+
+    The radar scales its Z-score threshold by market volatility and read a key
+    nothing wrote, so it resolved to a hardcoded 20.0 on every call and never
+    scaled at all. VIX is not collected anywhere on this platform and the free
+    tiers do not carry it, so this measures what the platform does record.
+
+    Refusal is deliberate when the sample is thin: the radar falls back to the
+    same constant it used before, which is no worse than the previous behaviour
+    and is at least labelled as an assumption.
+    """
+    from shared.utils.volatility import REALISED_VOL_KEY, realised_volatility
+
+    await asyncio.sleep(120)
+    while True:
+        try:
+            measured = None
+            for ticker in VOLATILITY_INDEXES:
+                rows = await timescale.query(
+                    "SELECT close FROM tradfi_bars WHERE ticker = $1 "
+                    "ORDER BY time DESC LIMIT $2",
+                    ticker, VOLATILITY_LOOKBACK_BARS,
+                )
+                closes = [r["close"] for r in (rows or []) if r.get("close") is not None]
+                # Oldest first, so returns run forward in time.
+                measured = realised_volatility(list(reversed(closes)), bar="1m")
+                if measured is not None:
+                    await redis_client.raw.set(REALISED_VOL_KEY, str(measured), ex=3600)
+                    logger.info(
+                        "Realised volatility from %s: %.2f%% annualised over %s bars.",
+                        ticker, measured, len(closes),
+                    )
+                    break
+
+            if measured is None:
+                logger.info(
+                    "Realised volatility not measurable from %s; the radar will "
+                    "use its stated assumption rather than a measurement.",
+                    ", ".join(VOLATILITY_INDEXES),
+                )
+        except Exception as e:
+            logger.error(f"Volatility measurement failed: {e}")
+        await asyncio.sleep(VOLATILITY_INTERVAL_SEC)
+
+
 async def _reference_data_loop(redis_client, graph_writer):
     """Refreshes sector, industry and index membership daily.
 
@@ -277,6 +333,18 @@ SCORE_DIVERSITY_WINDOW = "1 hour"
 # fired twice may honestly have two identical answers.
 SCORE_DIVERSITY_MIN_EVENTS = 30
 
+# A detector reporting no more than this many distinct scores has stopped
+# ranking, whatever its volume. Three, because two values is a two-class
+# classifier and three is a ladder -- both of which downstream percentiles and
+# z-scores treat as a continuous measurement and cannot.
+SCORE_DIVERSITY_MIN_DISTINCT = 3
+
+# Above this volume, diversity is judged as a share rather than a count: a
+# detector emitting 2,000 events an hour across eight values is as flat in
+# practice as one emitting eighty across two.
+SCORE_DIVERSITY_RATIO_MIN_EVENTS = 200
+SCORE_DIVERSITY_MIN_RATIO = 0.02
+
 # Event types whose score is legitimately constant. vessel_static is a
 # registration record -- a name and a callsign are not an anomaly, and 0.000 is
 # the correct answer every time.
@@ -299,15 +367,35 @@ async def _score_diversity_loop(timescale) -> None:
                 HAVING COUNT(*) >= {SCORE_DIVERSITY_MIN_EVENTS}
                 """
             )
-            flat = [
-                r for r in (rows or [])
-                if int(r.get("distinct_scores") or 0) <= 1
-                and str(r.get("type")) not in SCORE_DIVERSITY_EXEMPT
-            ]
+            # `<= 1` was the test, and it caught nothing that was actually flat.
+            #
+            # A detector that has stopped varying reports one value; a detector
+            # that never varied by more than a step reports two or three, and
+            # every flat detector in this deployment is the second kind --
+            # bgp_anomaly runs 2,723 events a day at 114/hour with two distinct
+            # scores and passed this check on every sweep. This file's own
+            # account of that detector says it: two values over seven thousand
+            # events is a classifier with two classes, and every threshold and
+            # percentile computed against it is arithmetic on a constant.
+            #
+            # The bound is now proportional. A handful of distinct values across
+            # hundreds of events is flat whatever the absolute count, and a
+            # detector with genuinely few events is left alone by the volume
+            # floor above rather than by a second guess here.
+            flat = []
+            for r in (rows or []):
+                if str(r.get("type")) in SCORE_DIVERSITY_EXEMPT:
+                    continue
+                n = int(r.get("n") or 0)
+                distinct = int(r.get("distinct_scores") or 0)
+                if distinct <= SCORE_DIVERSITY_MIN_DISTINCT:
+                    flat.append(r)
+                elif n >= SCORE_DIVERSITY_RATIO_MIN_EVENTS and (distinct / n) < SCORE_DIVERSITY_MIN_RATIO:
+                    flat.append(r)
             for row in flat:
                 logger.warning(
                     "Detector %s emitted %s events in the last %s and %s distinct "
-                    "score(s). A detector whose output never varies ranks nothing; "
+                    "score(s). A detector whose output barely varies ranks nothing; "
                     "the cause is never the same twice, so read its arithmetic.",
                     row.get("type"), row.get("n"), SCORE_DIVERSITY_WINDOW,
                     row.get("distinct_scores"),
@@ -365,6 +453,9 @@ async def main():
     redis     = await get_redis()
     safe_create_task(_ofac_sync_loop(), name="ofac-sync")
     safe_create_task(
+        _volatility_loop(timescale, redis), name="realised-volatility"
+    )
+    safe_create_task(
         _score_diversity_loop(timescale), name="score-diversity"
     )
     
@@ -421,8 +512,24 @@ async def main():
     }
     heartbeat_task = safe_create_task(_heartbeat_loop(heartbeat_state), name="enrichment-heartbeat")
 
+    # Published to Redis so the gateway's /metrics can see them.
+    #
+    # bind_redis() is what moves a process-local counter into the cross-process
+    # aggregate the /metrics endpoint sums. Only the collectors, the agents and
+    # the reasoning engine were calling it, so every counter this service keeps
+    # -- scoring failures, uninitialised detectors, quote-cache and
+    # open-interest baseline errors -- incremented into a dict that was never
+    # read by anything and was discarded on restart. Each of those is a signal
+    # that a detector has stopped working correctly, which is precisely the
+    # class of failure that is silent without a counter.
+    try:
+        from shared.utils.metrics import bind_redis
+        await bind_redis(redis, service_name=os.getenv("SENTINEL_SERVICE", "enrichment"))
+    except Exception as e:
+        logger.debug("Metrics binding skipped: %s", e)
+
     # §1.1 Universal heartbeat — shared telemetry for data-health dashboard
-    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis, "enrichment"))
+    hb_shared_task = safe_create_task(start_heartbeat_task(redis, "enrichment"))
 
     logger.info("Enrichment Pipeline LIVE. Listening for raw telemetry...")
     
@@ -570,7 +677,12 @@ async def main():
                     try:
                         live_dict = enriched.model_dump(mode="json")
                         live_dict["event_id"] = str(enriched.event_id)
-                        safe_create_task(redis.raw.publish("sentinel:events:live", json.dumps(live_dict)), name="live-feed-pub")
+                        # The enricher already said whether this is worth
+                        # anyone's attention; this reads that verdict rather
+                        # than broadcasting everything and letting a person
+                        # filter a $6 transfer out by eye.
+                        if worth_broadcasting(live_dict):
+                            safe_create_task(redis.raw.publish("sentinel:events:live", json.dumps(live_dict)), name="live-feed-pub")
                     except Exception as pub_err:
                         logger.debug(f"Redis live feed publish bypass: {pub_err}")
 
@@ -622,7 +734,13 @@ async def main():
                             try:
                                 pub_pipe = redis.raw.pipeline()
                                 for evt in batch_to_write:
-                                    payload = json.dumps(evt.model_dump(), default=str)
+                                    as_dict = evt.model_dump()
+                                    # Same rule as the publisher above. Two
+                                    # sites broadcasting on different rules is
+                                    # how one of them ends up forgotten.
+                                    if not worth_broadcasting(as_dict):
+                                        continue
+                                    payload = json.dumps(as_dict, default=str)
                                     pub_pipe.publish("sentinel:events:live", payload)
                                 await pub_pipe.execute()
                             except Exception as pub_err:

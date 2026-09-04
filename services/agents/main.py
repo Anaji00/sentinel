@@ -20,7 +20,7 @@ logger = setup_sentinel_logging("agents.main", level=getattr(logging, os.getenv(
 
 from shared.db import get_timescale, get_neo4j, get_redis
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
-from shared.utils.ollama import OllamaClient
+from shared.utils.ollama import DEFAULT_MODEL, OllamaClient
 from services.agents.macro_intelligence_engine import MacroIntelligenceEngine
 from services.agents.quant_trading_engine import QuantTradingEngine
 from services.agents.knowledge_graph_engine import KnowledgeGraphEngine
@@ -132,7 +132,7 @@ def build_agent(
 
     # Per-agent environment variable resolution with tiered defaults
     env_name = agent_name.upper().replace("-", "_")
-    selected_model = model or os.getenv(f"{env_name}_MODEL", os.getenv("AGENT_MODEL", "llama3"))
+    selected_model = model or os.getenv(f"{env_name}_MODEL", os.getenv("AGENT_MODEL", DEFAULT_MODEL))
     selected_fallback = fallback_model or os.getenv(f"{env_name}_FALLBACK_MODEL", os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b"))
 
     return AgentClass(
@@ -203,7 +203,7 @@ async def main():
         agent_name="macro_intelligence_engine",
         input_topics=[
             Topics.RAW_NEWS, Topics.RAW_TRADFI, Topics.RAW_CRYPTO, Topics.ENRICHED_EVENTS,
-            Topics.SYSTEM_HEARTBEAT, Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES,
+            Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES,
             Topics.INSIDER_CLUSTERS
         ],
         group_id="agent-macro-intelligence",
@@ -285,7 +285,7 @@ async def main():
         agent_name="consensus_engine",
         input_topics=[
             Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE,
-            Topics.RULES_FEEDBACK, Topics.RULES_SYNTHESIZED, Topics.SYSTEM_HEARTBEAT,
+            Topics.RULES_FEEDBACK, Topics.RULES_SYNTHESIZED,
             Topics.MACRO_ASSESSMENT, Topics.CORRELATIONS, Topics.INSIDER_CLUSTERS
         ],
         group_id="agent-consensus-engine",
@@ -359,7 +359,7 @@ async def main():
     }
 
     logger.info(f"Consolidated Swarm built: 8 core engines live.")
-    logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', 'llama3')}")
+    logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', DEFAULT_MODEL)}")
     logger.info("=" * 60)
 
     # ── LAUNCH CONSOLIDATED ENGINES ───────────────────────────────────────────

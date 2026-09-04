@@ -19,6 +19,7 @@ import numpy as np
 
 from shared.utils import quant_calc
 from shared.utils.candles import candle_cache_key
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("reasoning.backtester")
 
@@ -680,7 +681,7 @@ class StrategyBacktester:
         if self.redis:
             try:
                 import asyncio
-                asyncio.create_task(
+                safe_create_task(
                     self.redis.raw.set(
                         f"sentinel:backtest:results:{report['strategy_id']}",
                         json.dumps(report, default=str),

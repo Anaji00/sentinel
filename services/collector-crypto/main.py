@@ -34,6 +34,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
 
 logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -149,7 +150,7 @@ async def stream_coinbase_market_data(producer: SentinelProducer):
         on_message=on_message
     )
     await client.start()
-    asyncio.create_task(candle_emitter())
+    safe_create_task(candle_emitter())
 
     while True:
         await asyncio.sleep(3600)
@@ -865,7 +866,7 @@ async def main():
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-crypto")
     await metrics.start(redis_client)
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-crypto"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-crypto"))
 
     try:
         # Run all WebSocket streams, multi-chain whale trackers, and divergence engines concurrently

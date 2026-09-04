@@ -25,6 +25,7 @@ import asyncio
 import logging
 import websockets
 from typing import Any, Callable, Optional
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("sentinel.ws")
 
@@ -77,7 +78,7 @@ class ResilientWebSocketClient:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._loop())
+        self._task = safe_create_task(self._loop())
 
     async def stop(self):
         """Stops the WebSocket client and cancels the connection loop."""
@@ -138,7 +139,7 @@ class ResilientWebSocketClient:
                     backoff = 1.0
 
                     queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=self.queue_size)
-                    worker = asyncio.create_task(self._worker(queue))
+                    worker = safe_create_task(self._worker(queue))
 
                     # Fire on_connect callback
                     if self.on_connect:

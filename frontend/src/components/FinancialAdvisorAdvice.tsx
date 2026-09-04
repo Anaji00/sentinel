@@ -39,7 +39,6 @@ interface SmartMoneyConvergence {
   insider_buyer_role?: string;
   insider_notional_usd?: number;
   option_sweep_premium_usd?: number;
-  conviction_boost?: number;
 }
 
 interface TradingSignal {
@@ -133,6 +132,19 @@ export default function FinancialAdvisorAdvice() {
 
   const handleExecuteOrder = async (signal: TradingSignal) => {
     const positionUsd = Number((portfolioCapital * (signal.kelly_allocation_pct / 100)).toFixed(2));
+
+    // An entry price of zero is not a degraded signal, it is an instruction that
+    // cannot be followed -- and the endpoint divides the position size by
+    // max(0.01, entry_price), so a zero would submit an order for a hundred
+    // times the intended dollar value. Refuse before it reaches the wire.
+    if (!Number.isFinite(signal.entry_level) || signal.entry_level <= 0) {
+      setToastMessage(
+        `⛔ REFUSED: ${signal.ticker} carries no entry price ($${signal.entry_level}). Nothing was sent.`
+      );
+      setSelectedPlay(null);
+      return;
+    }
+
     try {
       const res = await fetch('/api/v1/trading/orders/execute', {
         method: 'POST',
@@ -150,14 +162,40 @@ export default function FinancialAdvisorAdvice() {
           trade_type: signal.trade_type || 'Quantitative Breakout',
         }),
       });
-      const data = await res.json();
-      const orderId = data.order_id || `ORD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+
+      // fetch() rejects only on a network failure, so a 400, 403 or 500 arrives
+      // here as a resolved response. Without this check the rejection fell into
+      // the success branch, data.order_id was undefined, and the `||` below
+      // minted a random string that was shown to the operator as confirmation
+      // of an order the broker had refused.
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail =
+          (typeof data?.detail === 'string' && data.detail) ||
+          `HTTP ${res.status}`;
+        setToastMessage(`⛔ REJECTED: ${signal.action} ${signal.ticker} — ${detail}`);
+        setSelectedPlay(null);
+        return;
+      }
+
+      // Only a response that actually carries an order id is a placed order.
+      if (!data.order_id) {
+        setToastMessage(
+          `⚠ UNCONFIRMED: ${signal.action} ${signal.ticker} — the broker returned no order id. Check the account before retrying.`
+        );
+        setSelectedPlay(null);
+        return;
+      }
+
       setToastMessage(
-        `⚡ EXECUTED [${orderId}]: ${signal.action} ${signal.ticker} @ $${signal.entry_level} | Sized $${positionUsd.toLocaleString()} (${signal.kelly_allocation_pct}% Kelly) via ${data.broker || 'Alpaca Paper API v2'}`
+        `⚡ EXECUTED [${data.order_id}]: ${signal.action} ${signal.ticker} @ $${signal.entry_level} | Sized $${positionUsd.toLocaleString()} (${signal.kelly_allocation_pct}% Kelly) via ${data.broker || 'broker'}`
       );
     } catch (err) {
+      // A genuine network failure. The request did not arrive, so nothing was
+      // placed -- the old copy here read "SIMULATED DISPATCH ... via Alpaca
+      // Paper Bridge", which a reader takes for a successful paper trade.
       setToastMessage(
-        `⚡ SIMULATED DISPATCH: ${signal.action} ${signal.ticker} @ $${signal.entry_level} | Sized $${positionUsd.toLocaleString()} (${signal.kelly_allocation_pct}% Kelly) via Alpaca Paper Bridge`
+        `⛔ NOT SENT: ${signal.action} ${signal.ticker} — could not reach the trading API. No order was placed.`
       );
     }
     setSelectedPlay(null);

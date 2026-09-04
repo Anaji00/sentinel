@@ -20,10 +20,12 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_SLOW_SEC
 from shared.kafka import Topics
-from shared.models.ontology import VALID_PREDICATES, is_valid_predicate
-from shared.models.events import graph_node_id
+from shared.models.ontology import VALID_PREDICATES, is_valid_predicate, normalize_predicate
+from shared.models.events import graph_node_id, UNRATED_EDGE_CONFIDENCE
+from shared.utils.tasks import safe_create_task
+from shared.utils.text import clip
 
 
 class IntelEntity(BaseModel):
@@ -46,7 +48,7 @@ class GraphTriple(BaseModel):
     subject: str
     predicate: str
     object: str
-    confidence: float = 0.8
+    confidence: float = UNRATED_EDGE_CONFIDENCE
 
     @model_validator(mode="before")
     @classmethod
@@ -65,11 +67,11 @@ class GraphTriple(BaseModel):
             subj = data.get("subject") or data.get("head") or data.get("source") or data.get("from") or "Unknown"
             pred = data.get("predicate") or data.get("relation") or data.get("type") or data.get("action") or "RELATED_TO"
             obj = data.get("object") or data.get("tail") or data.get("target") or data.get("to") or "Unknown"
-            conf = data.get("confidence", 0.8)
+            conf = data.get("confidence", UNRATED_EDGE_CONFIDENCE)
             try:
                 conf = float(conf)
             except (ValueError, TypeError):
-                conf = 0.8
+                conf = UNRATED_EDGE_CONFIDENCE
             return {"subject": str(subj), "predicate": str(pred), "object": str(obj), "confidence": conf}
         return data
 
@@ -78,7 +80,18 @@ class IntelBrief(BaseModel):
     headline: str
     summary: str
     headline_summary: str = ""
-    primary_entity: Optional[str] = None
+    # Required, not optional.
+    #
+    # The prompt lists this under "Required fields" and the schema said
+    # Optional[str] = None. Ollama builds its decoding grammar from the schema,
+    # so the model was free to omit it and did on every brief published -- a
+    # bulletin whose own summary read "ANTAY moored in Black Sea" carried
+    # ticker=None and primary_entity_id=None, naming the vessel in prose and
+    # nowhere a consumer could read it. The consensus engine fuses by entity, so
+    # a brief with no entity cannot be corroborated or contradicted by anything.
+    #
+    # min_length=1 is what reaches the grammar: "" is not an entity.
+    primary_entity: str = Field(..., min_length=1)
     geopolitical_theater: str = "Global"
     geographic_hotspots: List[str] = Field(default_factory=list)
     entities: List[IntelEntity] = Field(default_factory=list)
@@ -91,6 +104,18 @@ class IntelBrief(BaseModel):
     def _coerce_brief(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+
+        # The cluster knows its own subject. Where the model left the field out,
+        # take it from the entities it did name rather than rejecting a brief
+        # that is otherwise complete -- this is the repair of an omission, not a
+        # guess at what the brief was about.
+        if not str(data.get("primary_entity") or "").strip():
+            ents = data.get("entities") or []
+            for e in ents:
+                name = e.get("name") if isinstance(e, dict) else getattr(e, "name", None)
+                if name and str(name).strip():
+                    data["primary_entity"] = str(name).strip()
+                    break
 
         raw_headline = data.get("headline") or data.get("title") or data.get("summary")
         raw_summary = data.get("summary") or data.get("description") or raw_headline
@@ -212,7 +237,7 @@ class KnowledgeGraphEngine(SentinelAgent):
         for _, ctx in items:
             line = f"- {ctx['entity_name']}"
             if ctx.get("context"):
-                line += f" (seen in: {str(ctx['context'])[:120]})"
+                line += f" (seen in: {clip(str(ctx['context']), 120)})"
             listed.append(line)
         names = [ctx["entity_name"] for _, ctx in items]
 
@@ -323,10 +348,10 @@ class KnowledgeGraphEngine(SentinelAgent):
             return None
 
         dedup_key = f"news_intel:{hash(headline)}:{int(time.time() // 3600)}"
-        if await self.is_recently_processed(dedup_key, window_seconds=3600):
+        if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_SLOW_SEC):
             return None
 
-        await self.mark_processed(dedup_key, window_seconds=3600)
+        await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_SLOW_SEC)
 
         logger.info(f"🌐 KNOWLEDGE GRAPH | Processing Graph Triples & Intel | Headline: '{headline[:60]}...'")
 
@@ -365,18 +390,49 @@ class KnowledgeGraphEngine(SentinelAgent):
                 temperature=0.1,
             )
 
-            # Filter graph triples using whitelist, self-loop guard, and length limit
-            valid_triples = [
-                t for t in brief.graph_triples
-                if t.predicate in VALID_PREDICATES
-                and t.subject.strip().lower() != t.object.strip().lower()
-                and len(t.subject) <= 80
-                and len(t.object) <= 80
-            ]
+            # Filter graph triples using whitelist, self-loop guard, and length limit.
+            #
+            # Matched through is_valid_predicate, which strips and uppercases,
+            # rather than by raw membership in VALID_PREDICATES.
+            #
+            # The strict test required the model to reproduce the constant's
+            # exact spelling, so "supplier_to", "Supplier_To" and " SUPPLIER_TO"
+            # were each dropped without a word -- and the extraction published
+            # graph_triples: [] on every brief in the deployment. is_valid_
+            # predicate was imported at the top of this file for this and never
+            # called; the case-sensitive comparison was written beside it.
+            #
+            # The predicate is normalised onto the kept triple too, because the
+            # Neo4j MERGE below interpolates it as a relationship type, and
+            # "supplier_to" and "SUPPLIER_TO" are two different edges in a graph
+            # that is queried by exact type.
+            valid_triples = []
+            rejected = 0
+            for t in brief.graph_triples:
+                if not is_valid_predicate(t.predicate):
+                    rejected += 1
+                    continue
+                if t.subject.strip().lower() == t.object.strip().lower():
+                    rejected += 1
+                    continue
+                if len(t.subject) > 80 or len(t.object) > 80:
+                    rejected += 1
+                    continue
+                t.predicate = normalize_predicate(t.predicate)
+                valid_triples.append(t)
+
+            # Said out loud. A filter that silently discards everything looks
+            # exactly like a model that extracted nothing.
+            if rejected:
+                logger.info(
+                    "Knowledge graph extraction: kept %d of %d triples, %d rejected "
+                    "(predicate not in the allowlist, self-loop, or over length).",
+                    len(valid_triples), len(brief.graph_triples), rejected,
+                )
 
             # Direct single-transaction Neo4j MERGE for extracted triples
             if valid_triples:
-                task = asyncio.create_task(self._merge_graph_triples(valid_triples))
+                task = safe_create_task(self._merge_graph_triples(valid_triples))
                 if not hasattr(self, "_background_tasks"):
                     self._background_tasks = set()
                 self._background_tasks.add(task)
@@ -415,10 +471,34 @@ class KnowledgeGraphEngine(SentinelAgent):
                     "source_headline": headline,
                 }, key=str(time.time()))
 
+            # The subject this bulletin is about, from whichever source knows it.
+            #
+            # The message is asked first because it carries the resolved entity
+            # id the rest of the platform keys on; the brief is the fallback,
+            # and it is the one that was missing. A bulletin published from a
+            # brief about an aircraft carried primary_entity_id=None and
+            # ticker=None, so the only thing that named the aircraft was prose
+            # inside the summary -- "an aviation alert with a specific aircraft
+            # ID", with the ID itself nowhere in the record.
+            subject_id = message.get("primary_entity_id") or brief.primary_entity
+            subject_name = message.get("primary_entity_name") or brief.primary_entity
+            if not subject_name and brief.entities:
+                first = brief.entities[0]
+                subject_name = getattr(first, "name", None) or str(first)
+                subject_id = subject_id or subject_name
+
+            # Named in the text as well as the metadata. A reader should not
+            # have to join against another field to learn what the bulletin is
+            # about, and a summary that describes the shape of its evidence
+            # rather than its content is the generic-output failure the scenario
+            # prompts were rewritten to fix.
+            headline_text = clip(brief.headline_summary or brief.headline or brief.summary, 80)
+            subject_prefix = f"{subject_name} — " if subject_name else ""
+
             # Publish structured AgentBulletin
-            asyncio.create_task(self.publish_bulletin(
+            safe_create_task(self.publish_bulletin(
                 bulletin_type="alert" if brief.severity >= 4 else "thesis",
-                summary=f"Intel ({brief.geopolitical_theater}): {(brief.headline_summary or brief.headline or brief.summary)[:80]}",
+                summary=f"Intel ({brief.geopolitical_theater}): {subject_prefix}{headline_text}",
                 # Attributed to the entity it is about.
                 #
                 # This published with primary_entity_id and ticker both null,
@@ -428,8 +508,8 @@ class KnowledgeGraphEngine(SentinelAgent):
                 # the swarm and then sits outside every comparison the swarm
                 # exists to make. Observed live on the first bulletin this
                 # system ever produced end to end.
-                primary_entity_id=message.get("primary_entity_id"),
-                primary_entity_name=message.get("primary_entity_name"),
+                primary_entity_id=subject_id,
+                primary_entity_name=subject_name,
                 conviction=min(1.0, brief.severity / 5.0),
                 expected_direction="neutral",
                 payload={"severity": brief.severity, "hotspots": brief.geographic_hotspots, "theater": brief.geopolitical_theater},
@@ -532,11 +612,12 @@ class KnowledgeGraphEngine(SentinelAgent):
         Fetches degree centrality for an entity in Neo4j graph.
         Weights anomaly correlation-cluster severity by node centrality.
 
-        Note for whoever wires this up: it currently has no callers. The
-        severity weighting it describes does not happen anywhere. The lookup is
-        spelled correctly as of now, which it was not -- it read `.upper()`
-        while the writers were being corrected to canonical spelling, so it
-        would have missed every wallet it was asked about.
+        The severity weighting this describes is applied by the correlation
+        tiering, which had its own inline copy of the query spelled `.upper()`
+        -- so it missed every wallet it was asked about and returned a degree of
+        zero, a centrality of exactly 1.0, on the boundary between ALERT and
+        INTELLIGENCE. Both now resolve through `graph_node_id`, so the readers
+        and the writers agree about how an identifier is spelled.
         """
         try:
             from shared.db import get_neo4j

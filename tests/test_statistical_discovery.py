@@ -64,7 +64,13 @@ def test_threshold_calibration_harness_and_redis_persistence():
         assert "min_granger_f_stat" in calibrated
         assert "min_hawkes_branching_ratio" in calibrated
         assert calibrated["min_correlation_coef"] >= 0.55
-        assert mock_redis.raw.set.call_count >= 2
+        # One write, not two. The harness wrote the same payload to both
+        # sentinel:calibration:latest and :correlation_thresholds, and only
+        # the latter has a reader (statistical_discovery reads it back);
+        # the duplicate was state nothing consumed.
+        assert mock_redis.raw.set.call_count >= 1
+        written_keys = [c.args[0] for c in mock_redis.raw.set.call_args_list if c.args]
+        assert "sentinel:calibration:correlation_thresholds" in written_keys, written_keys
 
         # Test threshold retrieval reads from Redis
         mock_redis.raw.get = AsyncMock(return_value=json.dumps(calibrated))

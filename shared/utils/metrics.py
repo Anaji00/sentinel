@@ -20,6 +20,7 @@ import os
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("sentinel.metrics")
 
@@ -137,7 +138,7 @@ async def bind_redis(redis_client: Any, service_name: Optional[str] = None) -> N
 
     await publish_now()
     if _publish_task is None or _publish_task.done():
-        _publish_task = asyncio.create_task(_publish_loop())
+        _publish_task = safe_create_task(_publish_loop())
     logger.info("Metrics publishing enabled for service=%s", _SERVICE_NAME)
 
 

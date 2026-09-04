@@ -495,6 +495,97 @@ MIGRATIONS = [
               AND primary_entity_type = 'instrument';
         """,
         "transactional": True
+    },
+    {
+        "version": "0013_correlation_published_fields",
+        "sql": """
+            -- A correlation is published with twenty fields and persisted with
+            -- thirteen. The eight below were dropped in silence on every one of
+            -- 373,887 rows, because the writer names the columns it knows about
+            -- and nothing raises for the ones it does not.
+            --
+            -- confidence_score is the costly one: the distribution measured on
+            -- the wire -- 79% of clusters on one of two values, 193 published
+            -- at exactly 1.0 -- exists only in Kafka, so nothing reading a
+            -- correlation from the database can see how confident it was. The
+            -- calibration harness had to reach through the trigger event for an
+            -- anomaly score for exactly this reason.
+            --
+            -- summary_headline is the line the alert is identified by; a reader
+            -- working from the database had to reconstruct it from description,
+            -- which is a different sentence written for a different purpose.
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS confidence_score    DOUBLE PRECISION;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS primary_domain      TEXT;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS summary_headline    TEXT;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS supporting_headlines TEXT[];
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS metrics_summary     JSONB;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS primary_entity_id   TEXT;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS primary_entity_name TEXT;
+            ALTER TABLE correlations ADD COLUMN IF NOT EXISTS entity_names        TEXT[];
+
+            -- 2,587 distinct rule_ids across 373,887 rows and no index on the
+            -- column, so "what has this rule been doing" -- the natural question
+            -- once the namespace grew -- was a sequential scan every time.
+            CREATE INDEX IF NOT EXISTS corr_rule_time_idx
+                ON correlations(rule_id, detected_at DESC);
+
+            -- The join back to the event that caused the cluster.
+            CREATE INDEX IF NOT EXISTS corr_trigger_event_idx
+                ON correlations(trigger_event_id)
+                WHERE trigger_event_id IS NOT NULL;
+
+            -- Ranking by confidence is the query the new column exists for.
+            CREATE INDEX IF NOT EXISTS corr_confidence_time_idx
+                ON correlations(confidence_score DESC, detected_at DESC)
+                WHERE confidence_score IS NOT NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0014_drop_indexes_covering_no_rows",
+        "sql": """
+            -- Two partial indexes were built for fields the enrichment layer was
+            -- expected to fill and never did: corroboration is null on 100% of
+            -- events and named_entities is empty on 99.9%. An index is a claim
+            -- that a column will be queried and will have values in it; these
+            -- two recorded an intention, cost write amplification on every
+            -- insert, and covered nothing.
+            --
+            -- They are dropped rather than kept empty because a reader who finds
+            -- them assumes the fields are populated. If either field starts
+            -- being written, the index is one statement to restore.
+            DROP INDEX IF EXISTS events_single_sourced_idx;
+            DROP INDEX IF EXISTS events_entities_idx;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0015_agent_prediction_outcomes",
+        "sql": """
+            -- agent_predictions had no column in which an outcome could be
+            -- recorded. Resolution happened in Redis and the durable store kept
+            -- only the claim, so even with the scorer working there was no
+            -- persisted history of what was predicted and what happened -- which
+            -- is the corpus a calibration needs.
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS agent_name    TEXT;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS ticker        TEXT;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS direction     TEXT;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS entry_price   DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS horizon_hours INT;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS resolved_at   TIMESTAMPTZ;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS outcome_correct BOOLEAN;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS brier_score   DOUBLE PRECISION;
+
+            -- Its only index was the primary key, so it could not be queried by
+            -- prediction, by cause or by time without a scan.
+            CREATE INDEX IF NOT EXISTS agent_pred_prediction_idx ON agent_predictions(prediction_id);
+            CREATE INDEX IF NOT EXISTS agent_pred_corr_idx       ON agent_predictions(correlation_id);
+            CREATE INDEX IF NOT EXISTS agent_pred_time_idx       ON agent_predictions(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS agent_pred_unresolved_idx
+                ON agent_predictions(occurred_at DESC)
+                WHERE resolved_at IS NULL;
+        """,
+        "transactional": True
     }
 ]
 

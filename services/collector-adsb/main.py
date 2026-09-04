@@ -60,6 +60,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
+from shared.utils.tasks import safe_create_task
 
 OPENSKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
 OPENSKY_CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET")
@@ -302,7 +303,7 @@ async def main():
         # these prove it is still producing.
         metrics = CollectorMetrics("collector-adsb")
         await metrics.start(redis)
-        hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-adsb"))
+        hb_task = safe_create_task(start_heartbeat_task(redis, "collector-adsb"))
         await collect(producer)
     except KeyboardInterrupt:
         logger.info("Shutting down...")

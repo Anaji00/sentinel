@@ -99,6 +99,17 @@ class StockCorrelationAgent(SentinelAgent):
         """
         Main reasoning loop for incoming events and tick updates.
         """
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
         if not isinstance(message, dict):
             return None
 
@@ -179,25 +190,70 @@ class StockCorrelationAgent(SentinelAgent):
                         MATCH (e)-[r:STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES|SYMPATHY_MOVER|MEMBER_OF|CUSTOMER_OF|SUPPLIER_TO|COMPETES_WITH]-(p)
                         RETURN coalesce(p.name, p.id) AS peer_id,
                                type(r) AS rel,
-                               coalesce(r.coefficient, r.weight, 1.0) AS coef,
-                               coalesce(r.p_value, 0.05) AS p_val,
-                               coalesce(r.lag, 1) AS lag,
-                               coalesce(r.f_stat, 0.0) AS f_stat
+                               coalesce(r.coefficient, r.weight) AS coef,
+                               r.p_value AS p_val,
+                               r.lag AS lag,
+                               r.f_stat AS f_stat
                         LIMIT 10
                     """, {"ticker": target_equity.upper()})
+                    # No coalesce onto plausible numbers.
+                    #
+                    # A missing coefficient defaulted to 1.0 and a missing
+                    # p-value to 0.05, so an edge that had never been measured
+                    # reached the model as "Coef: 1.0, p-val: 0.05" -- a perfect
+                    # correlation, significant at the five percent level, both
+                    # invented by the query that fetched it.
                     for nr in (neo_res or []):
-                        empirical_links.append(
-                            f"{nr['peer_id']} [Relationship: {nr['rel']}, Coef: {nr['coef']}, p-val: {nr['p_val']}, lag: {nr['lag']}]"
-                        )
+                        parts = [f"Relationship: {nr['rel']}"]
+                        coef = nr.get("coef") if hasattr(nr, "get") else nr["coef"]
+                        parts.append(f"Coef: {float(coef):.3f}" if coef is not None else "Coef: unmeasured")
+                        p_val = nr.get("p_val") if hasattr(nr, "get") else nr["p_val"]
+                        if p_val is not None:
+                            parts.append(f"p-val: {float(p_val):.4f}")
+                        lag = nr.get("lag") if hasattr(nr, "get") else nr["lag"]
+                        if lag is not None:
+                            parts.append(f"lag: {lag}")
+                        empirical_links.append(f"{nr['peer_id']} [{', '.join(parts)}]")
                 except Exception as ne:
                     logger.debug(f"Neo4j empirical correlation lookup bypass: {ne}")
 
-            empirical_block = (
-                f"\n- Grounded Empirical Statistics & Graph Links (Computed Deterministically):\n  - "
-                + "\n  - ".join(empirical_links)
-                if empirical_links
-                else "\n- Grounded Empirical Statistics: Live continuous correlation matrix active."
-            )
+            _nl = chr(10)
+            # Says what is there, including when nothing is. The empty case
+            # read "Live continuous correlation matrix active" -- asserting
+            # statistics existed, with none supplied, directly above a task
+            # telling the model to ground its answer in them.
+            if empirical_links:
+                empirical_block = (
+                    _nl + "- Grounded Empirical Statistics & Graph Links "
+                    "(Computed Deterministically):" + _nl + "  - "
+                    + (_nl + "  - ").join(empirical_links)
+                )
+                mechanism_task = (
+                    f"Synthesize the causal economic transmission mechanism explaining WHY "
+                    f"the measured relationship between {target_macro} and {target_equity} "
+                    f"exists (e.g. input cost pressure, discount rate repricing, margin "
+                    f"squeeze, or FX translation). Treat any coefficient marked unmeasured "
+                    f"as unknown strength rather than strong."
+                )
+                grounding_task = (
+                    "Ground your explanation directly in the empirical statistics provided "
+                    "above, maintaining high analytical precision."
+                )
+            else:
+                empirical_block = (
+                    _nl + "- Grounded Empirical Statistics: NONE. No measured "
+                    "relationship between these two instruments exists in the graph."
+                )
+                mechanism_task = (
+                    f"State plainly that no correlation between {target_macro} and "
+                    f"{target_equity} has been measured. Describe at most one mechanism by "
+                    f"which one COULD affect the other, labelled explicitly as a hypothesis "
+                    f"rather than an observation. Do not assert that a correlation exists."
+                )
+                grounding_task = (
+                    "There are no empirical statistics for this pair. Say so rather than "
+                    "describing a relationship as established."
+                )
 
             user_prompt = f"""
             Analyze the real-time market relationship between macro asset {target_macro} (${price_map.get(target_macro, 0):.2f}) and equity {target_equity} (${price_map.get(target_equity, 0):.2f}).
@@ -207,9 +263,9 @@ class StockCorrelationAgent(SentinelAgent):
             {cross_block}
 
             Task Requirements:
-            1. Synthesize the causal economic transmission mechanism explaining WHY the empirically measured correlation between {target_macro} and {target_equity} exists (e.g. input cost pressure, discount rate repricing, margin squeeze, or FX translation).
-            2. For each SYMPATHY MOVER, explain the business causality and structural transmission link (supply chain dependence, shared customer base, sector multiple contagion, or competitor displacement).
-            3. Ground your explanation directly in the empirical statistics provided above, maintaining high analytical precision.
+            1. {mechanism_task}
+            2. For each SYMPATHY MOVER, explain the business causality and structural transmission link (supply chain dependence, shared customer base, sector multiple contagion, or competitor displacement). If no such link exists, omit the mover entirely -- do not name a mechanism from that list to satisfy the format. Returning an empty sympathy_movers list is the correct answer when there is no structural relationship.
+            3. {grounding_task}
             """
 
             brief: Optional[DynamicCorrelationAssessment] = await self._execute_with_telemetry(
@@ -229,7 +285,24 @@ class StockCorrelationAgent(SentinelAgent):
             )
 
             # ── KNOWLEDGE GRAPH GOVERNED PROPOSALS FOR SYMPATHY MOVERS (§3.3) ──
-            if brief.sympathy_movers and self.producer:
+            #
+            # Gated on there being a measured relationship to reason from.
+            #
+            # A SYMPATHY_MOVER edge is not a transient opinion: it is written
+            # into Neo4j, and from there it is read back by this agent's own
+            # empirical lookup above, by statistical_discovery, and by the
+            # correlation service's centrality multiplier -- each of which
+            # treats it as established structure. An edge asserted by a model
+            # that was explicitly told no correlation had been measured would
+            # return, one cycle later, as evidence.
+            if brief.sympathy_movers and self.producer and not empirical_links:
+                logger.info(
+                    "Withheld %d sympathy edge proposal(s) for %s: no measured "
+                    "relationship exists for this pair, so these are hypotheses "
+                    "and do not belong in the graph.",
+                    len(brief.sympathy_movers), brief.equity_ticker,
+                )
+            if brief.sympathy_movers and self.producer and empirical_links:
                 for sm in brief.sympathy_movers:
                     try:
                         await self.producer.send(
@@ -261,10 +334,28 @@ class StockCorrelationAgent(SentinelAgent):
                         logger.warning(f"Failed to publish sympathy edge proposal for {sm.ticker}: {ge}")
 
             # Publish correlation discovery to Kafka & Redis
+            # `detected_covariance` is a field the model fills, and it was
+            # published under a name that reads as a measurement.
+            #
+            # Live: TLT/CPB went out with detected_covariance 0.0 -- literally
+            # "no covariance detected" -- alongside a SYMPATHY_MOVER edge and a
+            # supply-chain narrative between a Treasury bond ETF and a soup
+            # company. Nothing downstream could tell that number from one the
+            # statistical discovery job had actually computed, because the field
+            # name is the same either way.
+            #
+            # The flag travels with the assessment so a reader, a consumer and
+            # the graph writer all see the same thing: whether any measured
+            # relationship existed at all.
+            assessment = brief.model_dump()
+            assessment["covariance_measured"] = bool(empirical_links)
+            if not empirical_links:
+                assessment["detected_covariance"] = None
+
             payload = {
                 "agent": self.name,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "assessment": brief.model_dump(),
+                "assessment": assessment,
             }
 
             if self.producer:
@@ -281,7 +372,23 @@ class StockCorrelationAgent(SentinelAgent):
             )
 
             # Publish AgentBulletin
-            sympathy_summary = f" Sympathy: {', '.join([sm.ticker for sm.ticker in brief.sympathy_movers])}" if brief.sympathy_movers else ""
+            # `for sm in`, not `for sm.ticker in`.
+            #
+            # The comprehension target was an attribute, so each SympathyMover
+            # was assigned into the `.ticker` field of the `sm` still bound by
+            # the loop above, and the comprehension then yielded those objects
+            # rather than their tickers:
+            #
+            #   Stock Correlation Agent processing error:
+            #   sequence item 0: expected str instance, SympathyMover found
+            #
+            # It raised on every brief that had sympathy movers, so this agent's
+            # bulletin never reached the consensus engine -- and on the way past
+            # it overwrote a real mover's ticker with a SympathyMover object.
+            sympathy_summary = (
+                f" Sympathy: {', '.join(sm.ticker for sm in brief.sympathy_movers)}"
+                if brief.sympathy_movers else ""
+            )
             await self.publish_bulletin(
                 bulletin_type="alert",
                 primary_entity_id=brief.equity_ticker,

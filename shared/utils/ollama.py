@@ -187,9 +187,27 @@ DEFAULT_PARALLEL_CAP = max(1, int(os.getenv("OLLAMA_SERVER_PARALLEL", "4")) // i
 OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL_CAP)))
 
 
+# The model to use when nothing names one.
+#
+# This was the string "llama3", written out separately at five call sites. Every
+# deployed service sets AGENT_MODEL, so the default looked harmless -- but
+# llama3:latest is installed, so any service that forgot the variable would
+# silently resolve to it and run. Nothing would have reported the substitution.
+#
+# It also mis-sizes prompts: the budget is computed from the *requested* model,
+# and llama3 advertises 11,760 characters against qwen2.5:1.5b's 7,664. A
+# service defaulting here would build prompts half again too large and have
+# their middles cut on arrival.
+DEFAULT_MODEL = "qwen2.5:1.5b"
+
 # Model Tier Preference Lists
-MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:7b", "llama3:latest"]
-MODEL_TIER_HEAVY       = ["llama3:latest", "qwen2.5:7b", "gemma:2b"]
+#
+# llama3:latest was the first choice of the heavy tier and the last of the
+# lightweight one, which made it reachable as a fallback from anywhere. Both
+# tiers now list installed Qwen and Gemma models only, largest first in the
+# heavy tier and smallest first in the lightweight one.
+MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:1.5b", "qwen2.5:3b"]
+MODEL_TIER_HEAVY       = ["qwen2.5:7b", "qwen2.5:3b", "gemma:2b"]
 
 _GLOBAL_OLLAMA_SEMAPHORE: Optional[asyncio.Semaphore] = None
 _GLOBAL_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None
@@ -238,6 +256,34 @@ def deliverable_prompt_chars(model: Optional[str] = None, num_predict: Optional[
     return max(1024, (context_tokens - reserved) * CHARS_PER_TOKEN)
 
 
+def _calling_site() -> str:
+    """Which prompt is being cut, as file:function.
+
+    The warning named the model and nothing else, so every truncation in the log
+    looked alike and none could be traced to the code that built the prompt. One
+    call site turned out to be unbudgeted; finding it meant reading seventeen by
+    hand.
+
+    Walking the stack is only worth it on a path that is meant to be rare, so it
+    runs inside the truncation branch and nowhere else. It never raises: a
+    diagnostic that can break the call it is diagnosing is worse than no label.
+    """
+    try:
+        import traceback
+        # No slicing: this function lives in ollama.py, so the filename filter
+        # below already skips its own frame. Slicing a fixed number off the end
+        # guesses at the call depth and was wrong -- it dropped the caller too,
+        # and every label came back "unknown".
+        for frame in reversed(traceback.extract_stack()):
+            name = frame.filename.replace("\\", "/")
+            if "/shared/utils/ollama.py" in name:
+                continue
+            return f"{name.rsplit('/', 1)[-1]}:{frame.name}"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _truncate_middle(prompt: str, budget: int) -> str:
     """Keeps the head and the tail, drops what is between them.
 
@@ -273,17 +319,89 @@ def _truncate_middle(prompt: str, budget: int) -> str:
     return prompt[:head_chars] + marker + prompt[-tail_chars:]
 
 
-def _bounded_num_predict(requested: Optional[int], is_small_model: bool) -> int:
-    """The caller's request, honoured up to both the schema ceiling and the host.
+def _schema_default_tokens(schema: Optional[Union[str, dict]], floor: int, ceiling: int) -> int:
+    """How many tokens this schema's answer plausibly needs.
 
-    Two separate limits, and the tighter one wins. The schema ceiling says how
-    many tokens the answer could reasonably need; max_deliverable_tokens() says
-    how many this machine can produce before the client stops waiting. Asking
-    past the second is not ambition, it is a guaranteed timeout that also
-    occupies the one inference slot while it fails.
+    Only ever used to raise the default for a caller that named no budget, and
+    clamped to [floor, ceiling] so it cannot shrink one either. 11 of the 15
+    agent call sites pass no num_predict, and every one of them was sized at a
+    flat 512 whether it asked for three scalars or a dozen nested objects.
+
+    The estimate is deliberately generous and deliberately cheap: it reads the
+    JSON schema already being sent as `format`, so it costs one walk of a dict
+    the caller has built anyway. Getting it wrong in the low direction is
+    recoverable -- the truncation retry doubles and tries again -- so the
+    clamp's lower bound is the old constant and the risk is one-sided.
+    """
+    if not isinstance(schema, dict):
+        return floor
+
+    def cost(node: dict, defs: dict, depth: int) -> int:
+        if depth > 4 or not isinstance(node, dict):
+            return 20
+
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            target = defs.get(ref.rsplit("/", 1)[-1])
+            return cost(target, defs, depth + 1) if isinstance(target, dict) else 40
+
+        node_type = node.get("type")
+        if node_type == "object" or "properties" in node:
+            props = node.get("properties")
+            if not isinstance(props, dict):
+                return 60
+            # Two tokens of punctuation and quoting per key, plus the key itself.
+            return sum(
+                len(str(name)) // 3 + 4 + cost(spec, defs, depth + 1)
+                for name, spec in props.items()
+                if isinstance(spec, dict)
+            )
+        if node_type == "array":
+            items = node.get("items")
+            per_item = cost(items, defs, depth + 1) if isinstance(items, dict) else 25
+            # Unbounded lists are where models spend tokens; assume a handful.
+            return per_item * int(node.get("maxItems") or 5)
+        if node.get("enum"):
+            return 8
+        if node_type == "string":
+            return 45
+        if node_type in ("number", "integer", "boolean"):
+            return 6
+        return 30
+
+    try:
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+        # A margin over the estimate: the model writes whitespace, repeats keys
+        # it was told to, and occasionally reasons in a string field.
+        estimate = int(cost(schema, defs if isinstance(defs, dict) else {}, 0) * 1.6)
+    except Exception:
+        return floor
+
+    return max(floor, min(estimate, ceiling))
+
+
+def _bounded_num_predict(
+    requested: Optional[int],
+    is_small_model: bool,
+    schema: Optional[Union[str, dict]] = None,
+) -> int:
+    """The caller's request, honoured up to both the model's cap and the host's.
+
+    Two separate limits, and the tighter one wins. The model ceiling says how
+    much this model may produce at all; max_deliverable_tokens() says how many
+    tokens this machine can produce before the client stops waiting. Asking past
+    the second is not ambition, it is a guaranteed timeout that also occupies
+    the one inference slot while it fails.
+
+    The ceiling is a property of the model and the host, not of the schema --
+    this docstring used to claim it expressed "how many tokens the answer could
+    reasonably need", which nothing computed. The schema now sizes the
+    *default*, which is the case that was actually wrong: it decides what a
+    caller gets when it names no budget of its own.
     """
     ceiling = SMALL_MODEL_MAX_TOKENS if is_small_model else LARGE_MODEL_MAX_TOKENS
-    default = SMALL_MODEL_DEFAULT_TOKENS if is_small_model else LARGE_MODEL_DEFAULT_TOKENS
+    flat_default = SMALL_MODEL_DEFAULT_TOKENS if is_small_model else LARGE_MODEL_DEFAULT_TOKENS
+    default = _schema_default_tokens(schema, flat_default, ceiling)
     wanted = min(requested or default, ceiling)
 
     deliverable = max_deliverable_tokens()
@@ -324,6 +442,9 @@ class OllamaClient:
         # Set by _call_ollama when Ollama reports it stopped at the token limit,
         # so infer() can tell a truncated answer from a malformed one.
         self.last_truncated: bool = False
+        # The output budget the most recent call ran with, so a truncation
+        # retry can double the number that actually failed.
+        self.last_effective_predict: int = 0
         self._circuit_open_until: Dict[str, float] = {}
         self.failures = self._consecutive_timeouts
         # Stall detection. Started at None rather than "now" so a client that
@@ -600,6 +721,7 @@ class OllamaClient:
                         # malformed, and never sends it the correction prompt it
                         # actually needed.
                         truncated = self.last_truncated
+                        failed_budget = self.last_effective_predict
                         MetricsCollector.observe_latency(f"ollama_latency_{self.service_name}", time.monotonic() - call_start)
                     except (InferenceError, asyncio.TimeoutError) as call_err:
                         MetricsCollector.increment(f"ollama_timeouts_{self.service_name}")
@@ -615,7 +737,15 @@ class OllamaClient:
                             f"({len(raw_text)} chars). Schema needs a larger num_predict."
                         )
                         logger.warning("Ollama attempt %s (%s): %s", attempt + 1, active_model, last_error)
-                        num_predict = min(int((num_predict or SMALL_MODEL_DEFAULT_TOKENS) * 2), LARGE_MODEL_MAX_TOKENS)
+                        # Doubled from the budget that actually failed, which is
+                        # not the same as the one the caller asked for. Most
+                        # callers ask for nothing, and this read
+                        # SMALL_MODEL_DEFAULT_TOKENS in that case -- 384 -- so a
+                        # large model truncating at its 512 default retried at
+                        # 768: one and a half times the budget it had just
+                        # exhausted, from a constant for a different model class.
+                        base = failed_budget or num_predict or LARGE_MODEL_DEFAULT_TOKENS
+                        num_predict = min(int(base * 2), LARGE_MODEL_MAX_TOKENS)
                     else:
                         last_error = f"No valid JSON found in: {raw_text[:300]}"
                         logger.warning(f"Ollama attempt {attempt+1} ({active_model}): no JSON — {last_error[:100]}")
@@ -779,9 +909,19 @@ class OllamaClient:
         # the cap set aside twice the tokens generation could ever use and
         # halved the prompt. Measured: 4,064 chars of budget where 7,664 was
         # available, on a 12,546-char prompt.
-        effective_predict = _bounded_num_predict(num_predict, is_small_model)
+        effective_predict = _bounded_num_predict(num_predict, is_small_model, schema=format)
         reserved = effective_predict + PROMPT_BUDGET_MARGIN_TOKENS
         max_prompt_chars = max(1024, (context_tokens - reserved) * CHARS_PER_TOKEN)
+
+        # What this attempt was actually allowed to produce.
+        #
+        # The retry doubles the budget after a truncation, and it had nothing to
+        # double: the caller's `num_predict` is None at 11 of 15 agent call
+        # sites, so the escalation fell back to a constant belonging to a
+        # different model class. Recorded here, beside last_truncated and under
+        # the same lock discipline, because this is the only frame that knows
+        # the number the request actually ran with.
+        self.last_effective_predict = effective_predict
 
         clean_prompt = prompt
         if len(clean_prompt) > max_prompt_chars:
@@ -790,10 +930,10 @@ class OllamaClient:
             # ignored its instructions, and this one was removing the entire
             # input while every log line reported success.
             logger.warning(
-                "Prompt truncated for %s: %s chars -> %s (%s discarded, %.0f%%). "
+                "Prompt truncated for %s at %s: %s chars -> %s (%s discarded, %.0f%%). "
                 "Head and tail are preserved; the middle is dropped.",
-                resolved_model, len(clean_prompt), max_prompt_chars, discarded,
-                100.0 * discarded / len(clean_prompt),
+                resolved_model, _calling_site(), len(clean_prompt), max_prompt_chars,
+                discarded, 100.0 * discarded / len(clean_prompt),
             )
             clean_prompt = _truncate_middle(clean_prompt, max_prompt_chars)
 

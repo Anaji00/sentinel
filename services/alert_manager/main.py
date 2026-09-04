@@ -38,6 +38,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 
 from services.alert_manager.formatters.telegram import format_correlation, format_scenario, format_intel_brief
 from services.alert_manager.formatters.webhook import format_generic
+from shared.utils.tasks import safe_create_task
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
@@ -237,7 +238,7 @@ async def main():
         manager = AlertManager(session, db_client, redis_client)
 
         # §1.1 Universal heartbeat — silent alert pipeline death is catastrophic
-        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "alert_manager"))
+        hb_task = safe_create_task(start_heartbeat_task(redis_client, "alert_manager"))
         try:
             while True:
                 batches = await consumer.get_batch(timeout_ms=1000)

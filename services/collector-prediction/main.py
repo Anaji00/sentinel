@@ -11,6 +11,7 @@ Anomaly scoring (Whales/EMA) is handled downstream by the Enrichment service.
 import asyncio
 import aiohttp
 import json
+import re
 import logging
 import os
 import sys
@@ -29,6 +30,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,6 +176,72 @@ def _is_binary_market(outcome_names: list) -> bool:
 
 # ── POLYMARKET STREAM ─────────────────────────────────────────────────────────        
 
+# Subjects this platform can actually act on. A prediction market is useful here
+# when its resolution would move an instrument, a currency, a commodity or a
+# border -- that is the only reason the correlation layer has to look at one.
+#
+# Matched on word boundaries against the question and slug, so "fed" does not
+# match "federer" and "war" does not match "warriors" -- both of which are real
+# Polymarket questions that a substring match would have admitted.
+RELEVANT_MARKET_TERMS = frozenset({
+    # Monetary policy and rates
+    "fed", "fomc", "interest", "rate", "rates", "inflation", "cpi", "pce",
+    "recession", "gdp", "unemployment", "jobs", "payrolls", "powell", "ecb",
+    "boj", "treasury", "yield", "yields", "debt", "default", "shutdown",
+    # Instruments and markets
+    "stock", "stocks", "equity", "equities", "nasdaq", "sp500", "dow",
+    "bitcoin", "btc", "ethereum", "eth", "crypto", "etf", "ipo", "earnings",
+    "oil", "opec", "gas", "gold", "commodity", "commodities", "dollar",
+    "yuan", "euro", "yen", "currency",
+    # Geopolitics and conflict
+    "war", "ceasefire", "invasion", "invade", "sanctions", "sanction",
+    "nato", "ukraine", "russia", "china", "taiwan", "iran", "israel",
+    "gaza", "korea", "strait", "blockade", "military", "strike", "missile",
+    "nuclear", "treaty", "tariff", "tariffs", "trade", "embargo",
+    # Government, insofar as it moves the above
+    "election", "president", "presidential", "congress", "senate",
+    "impeach", "cabinet", "resign", "coup", "referendum",
+})
+
+# Subjects that are never actionable here, however liquid. Checked first, so a
+# question that happens to contain "strike" in a sporting sense is still refused.
+EXCLUDED_MARKET_TERMS = frozenset({
+    "nfl", "nba", "mlb", "nhl", "ufc", "soccer", "football", "basketball",
+    "baseball", "hockey", "tennis", "golf", "olympics", "superbowl",
+    "worldcup", "premier", "champions", "playoff", "playoffs", "mvp",
+    "grammy", "oscar", "oscars", "emmy", "billboard", "movie", "album",
+    "netflix", "taylor", "swift", "kardashian", "celebrity", "rotten",
+    "boxoffice", "eurovision", "meme",
+})
+
+# How many questions this collector will track at once. Each costs a Gamma
+# request per sync cycle.
+MAX_WATCHED_SLUGS = 60
+
+_MARKET_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _is_relevant_market(market: dict) -> bool:
+    """True when a prediction market's resolution could move something we watch.
+
+    Polymarket is ordered by volume, and its volume leaders are sports. This is
+    the difference between a prediction feed and a scoreboard.
+    """
+    if not isinstance(market, dict):
+        return False
+    text = " ".join(
+        str(market.get(k) or "")
+        for k in ("question", "slug", "title", "description")
+    ).lower()
+    if not text.strip():
+        return False
+
+    words = set(_MARKET_WORD.findall(text))
+    if words & EXCLUDED_MARKET_TERMS:
+        return False
+    return bool(words & RELEVANT_MARKET_TERMS)
+
+
 async def stream_polymarket(producer: SentinelProducer, redis_client):
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     redis_key = "sentinel:polymarket:watched_slugs"
@@ -198,8 +266,37 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                     async with session.get(markets_url, timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            # Extract unique slugs from the active markets list
-                            dynamic_slugs = list(set(m.get("slug") for m in data if m.get("slug")))
+                            # Filtered by subject, not only by volume.
+                            #
+                            # The request above orders by volume descending and
+                            # takes 100, and Polymarket's volume leaders are
+                            # sports and celebrity questions. Measured on the
+                            # live stream: of 50 consecutive prediction events,
+                            # 3 carried anything a financial or geopolitical
+                            # domain could use. The other 47 occupied the
+                            # collector, the enricher, the embedding store and
+                            # the correlation candidate pool with the outcome of
+                            # football matches.
+                            #
+                            # Volume still decides ordering -- a liquid market is
+                            # a better-priced one -- but relevance decides
+                            # membership. Slugs a person put in Redis by hand are
+                            # never filtered: an explicit human choice outranks
+                            # this heuristic.
+                            dynamic_slugs = sorted({
+                                m.get("slug") for m in data
+                                if m.get("slug") and _is_relevant_market(m)
+                            })
+                            skipped = sum(
+                                1 for m in data
+                                if m.get("slug") and not _is_relevant_market(m)
+                            )
+                            if skipped:
+                                logger.info(
+                                    "Polymarket sweep: kept %d of %d markets; %d were "
+                                    "off-domain (sports, entertainment, novelty).",
+                                    len(dynamic_slugs), len(dynamic_slugs) + skipped, skipped,
+                                )
                             
                             # Add dynamic slugs to Redis for visibility to other services
                             if dynamic_slugs:
@@ -215,6 +312,18 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 if not watched_slugs:
                     watched_slugs = ["us-x-iran-permanent-peace-deal-by"]
                 
+                # Bounded. `sadd` never removes, so this set only ever grew --
+                # every question that was briefly popular stayed subscribed
+                # forever, and each one costs a Gamma request per sync cycle.
+                if len(watched_slugs) > MAX_WATCHED_SLUGS:
+                    logger.info(
+                        "Polymarket watch list at %d slugs, above the %d ceiling; "
+                        "syncing the most recent. A set that only grows eventually "
+                        "spends the whole poll interval on resolved questions.",
+                        len(watched_slugs), MAX_WATCHED_SLUGS,
+                    )
+                    watched_slugs = watched_slugs[-MAX_WATCHED_SLUGS:]
+
                 logger.info(f"Heartbeat | Polymarket sync. Tracked slugs ({len(watched_slugs)}): {watched_slugs}")
                 new_assets = []
 
@@ -316,7 +425,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 logger.info("Connected to Polymarket CLOB")
 
                 async with aiohttp.ClientSession() as session:
-                    injector_task = asyncio.create_task(update_subscriptions(ws, session))
+                    injector_task = safe_create_task(update_subscriptions(ws, session))
 
                     try:
                         while True:
@@ -522,7 +631,7 @@ async def main():
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-prediction")
     await metrics.start(redis_client)
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-prediction"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-prediction"))
 
     try:
         await asyncio.gather(

@@ -24,6 +24,17 @@ logger = logging.getLogger("telemetry.drift_scheduler")
 DRIFT_REPORT_KEY = "sentinel:ml:drift_report"
 
 
+# Observations required on each side before a PSI comparison means anything.
+MIN_DRIFT_SAMPLES = 20
+
+# How much of the live distribution to freeze as the baseline.
+MIN_BASELINE_SNAPSHOT = 500
+
+# The baseline ages out so drift is measured against a recent normal rather
+# than against whatever the system looked like the first time it ran.
+BASELINE_TTL_SEC = 14 * 86400
+
+
 class ModelDriftScheduler:
     """
     Periodic background scheduler for monitoring anomaly distribution drift.
@@ -75,9 +86,40 @@ class ModelDriftScheduler:
             except Exception as e:
                 logger.debug(f"Redis fetch error in drift scheduler: {e}")
 
-        # Fallback simulation if history buffer initializing
-        if len(baseline_scores) < 20 or len(current_scores) < 20:
-            return {"drift_detected": False, "psi": 0.0, "status": "initializing"}
+        # Seed the baseline from the first full sample, then compare against it.
+        #
+        # Nothing wrote either list, so this guard tripped on its first line
+        # every hour and the loop returned drift_detected=False -- an absence
+        # reported as a finding, from the component whose job is catching
+        # exactly that. The scorer now records live scores; the baseline is the
+        # snapshot this takes the first time there are enough of them.
+        if len(current_scores) >= MIN_DRIFT_SAMPLES and len(baseline_scores) < MIN_DRIFT_SAMPLES and self.redis:
+            try:
+                pipe = self.redis.raw.pipeline()
+                pipe.delete("sentinel:ml:baseline_scores")
+                for value in current_scores[:MIN_BASELINE_SNAPSHOT]:
+                    pipe.rpush("sentinel:ml:baseline_scores", float(value))
+                pipe.expire("sentinel:ml:baseline_scores", BASELINE_TTL_SEC)
+                await pipe.execute()
+                logger.info(
+                    "Model drift baseline seeded from %s live scores.",
+                    min(len(current_scores), MIN_BASELINE_SNAPSHOT),
+                )
+            except Exception as e:
+                logger.debug(f"Could not seed drift baseline: {e}")
+            return {"drift_detected": None, "psi": None, "status": "baseline_seeded"}
+
+        if len(baseline_scores) < MIN_DRIFT_SAMPLES or len(current_scores) < MIN_DRIFT_SAMPLES:
+            # drift_detected is None, not False. "We did not measure" and "we
+            # measured and found none" are different answers and were the same
+            # value.
+            return {
+                "drift_detected": None,
+                "psi": None,
+                "status": "insufficient_samples",
+                "baseline_count": len(baseline_scores),
+                "current_count": len(current_scores),
+            }
 
         psi = self.calculate_psi(baseline_scores, current_scores)
         drift_detected = psi >= 0.25

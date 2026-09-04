@@ -24,7 +24,9 @@ services:
       resources:
         limits:
           cpus: '1.0'
-          memory: 256M
+          # 16.6 MiB observed against 256M. Eight times the measured working
+          # set is still generous for a reverse proxy.
+          memory: 128M
         reservations:
           memory: 64M
     depends_on:
@@ -187,6 +189,25 @@ services:
     image: redis:7.2-alpine
     container_name: sentinel-redis
     restart: unless-stopped
+    # RDB snapshots disabled, and maxmemory below the container limit.
+    #
+    # Redis was killed by its own cgroup 65 times:
+    #
+    #   Memory cgroup out of memory: Killed process (redis-server)
+    #   anon-rss:783688kB          (~765MB)
+    #   constraint=CONSTRAINT_MEMCG (the 768M container limit)
+    #
+    # maxmemory governs the dataset, not process RSS. With appendonly *and* the
+    # default save points, "10000 changes in 60 seconds. Saving..." fired
+    # continuously under write load, and each RDB fork's copy-on-write adds
+    # close to the dataset size again. 512MB of data plus a fork exceeds a
+    # 768MB ceiling, so the kernel took it -- with no shutdown log, which is why
+    # the restarts looked like nothing at all.
+    #
+    # Every restart cost the caches, and much of this audit was spent chasing
+    # the symptoms: predictions gone, the macro cache empty, quotes down to six
+    # keys, aircraft:last_seen at zero. AOF still provides durability; the
+    # snapshots were redundant beside it.
     # Eviction policy: volatile-lru, not allkeys-lru.
     #
     # allkeys-lru evicts anything, including state the system means to keep
@@ -206,14 +227,27 @@ services:
     # The 512mb cap is left alone deliberately: the observed peak is 45% over
     # it, so raising it is a host-memory decision rather than a config tidy.
     command: >
-      redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy volatile-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      redis-server --appendonly yes --save "" --maxmemory 400mb --maxmemory-policy volatile-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     volumes:
       - redis_data:/data
     deploy:
       resources:
         limits:
           cpus: '1.0'
-          memory: 768M
+          # 1G, not 768M, because maxmemory sizes the dataset and the kernel
+          # kills the process.
+          #
+          # Redis was killed repeatedly at ~765MB RSS against a 768MB ceiling
+          # while holding a 400MB dataset. Disabling RDB snapshots did not stop
+          # it: Redis 7 uses a multi-part AOF whose base is an RDB file, so the
+          # AOF rewrite forks exactly as bgsave did -- "RDB is base AOF" in its
+          # own startup log -- and that fork's copy-on-write is the missing
+          # 365MB. Base 127MB against current 193MB, rewriting at 100% growth,
+          # means it forks often under this write volume.
+          #
+          # The usual sizing for a forking Redis is twice maxmemory. 400MB of
+          # data in a 1G container is that, with room for the AOF buffers.
+          memory: 1G
     healthcheck:
       test: redis-cli -a ${REDIS_PASSWORD:?REDIS_PASSWORD must be set} ping || exit 1
       interval: 5s
@@ -288,7 +322,20 @@ services:
           # encoding (~945ms/event single, ~454ms batched) and was pinned at its
           # ceiling while its lag grew.
           cpus: '3.0'
-          memory: 1.5G
+          # Raised from 1.5G, which the kernel was enforcing 231 times:
+          #
+          #   Memory cgroup out of memory: Killed process (python)
+          #   anon-rss:1545464kB   constraint=CONSTRAINT_MEMCG
+          #
+          # This service loads a sentence-transformer alongside the statistical
+          # discovery engine, the peer derivation and the Hawkes refit, and its
+          # working set crosses 1.5G during a scan. Every kill restarts the
+          # model load and discards whatever the scan had accumulated.
+          #
+          # The headroom is real rather than borrowed: the whole stack occupies
+          # 5.3 GiB of a 25.44 GiB VM, so these limits are ceilings that guard
+          # against a simultaneous peak the deployment has never approached.
+          memory: 2.0G
     depends_on:
       kafka:
         condition: service_healthy
@@ -463,12 +510,14 @@ services:
           # reload. The two tiers evicted each other in turn, so most of the
           # budget went on loading rather than answering.
           #
-          # 5G and not more: the WSL2 VM is capped at 26 GiB and the whole
-          # stack has to fit inside it (full stack with observability at 5G:
-          # 25.5 GiB). It is enough -- qwen2.5:3b (1.9 GB) plus qwen2.5:1.5b
-          # (1.0 GB) is 2.9 GB of weights, and one resident model measured
-          # 2.22 GiB including KV cache and runtime.
-          memory: 5G
+          # 4.5G, trimmed from 5G to fund the correlation service, which the
+          # kernel was killing 231 times at its own ceiling while this one has
+          # never been observed above 1.9 GiB. The reasoning below is unchanged
+          # and still holds with the half gigabyte removed: qwen2.5:3b (1.9 GB)
+          # plus qwen2.5:1.5b (1.0 GB) is 2.9 GB of weights, one resident model
+          # measured 2.22 GiB including KV cache and runtime, and 4.5G leaves
+          # 1.6 GB above the both-models figure.
+          memory: 4.5G
     healthcheck:
       test: [ "CMD", "ollama", "list" ]
       interval: 10s
@@ -539,6 +588,44 @@ services:
       kafka:
         condition: service_healthy
 
+  collector-filings:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-filings
+    command: python services/collector-filings/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          # Polls SEC EDGAR's submissions JSON on a 90 second cycle and keeps a
+          # small watchlist of CIKs. The documents are not downloaded, only the
+          # filing index, so this stays modest.
+          memory: 256M
+
+  collector-sar:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-sar
+    command: python services/collector-sar/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          # The imagery never lands here. openEO submits a process graph,
+          # Copernicus reduces the raster on its own infrastructure, and what
+          # returns is an aggregate small enough to iterate. One sweep a day.
+          memory: 192M
+
   collector-ais:
     profiles: ["collectors"]
     build: .
@@ -586,6 +673,34 @@ services:
     build: .
     container_name: sentinel-news
     command: python services/collector-news/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services
+      - ./shared:/app/shared
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 384M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # The enrichment pipeline has subscribed to events.raw.social since it was
+  # written -- Topics.RAW_SOCIAL is in its consumer list and routed to the news
+  # enricher, which branches on source_type "primary_social" to emit
+  # SOCIAL_SIGNAL rather than HEADLINE. Nothing ever published to that topic,
+  # because this collector had no service definition: a complete OSINT source
+  # (Telegram public channels, Reddit JSON feeds, an RSS bridge, no API keys
+  # required) sat unrun while a whole branch of the enricher waited for it.
+  collector-social:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-social
+    command: python services/collector-social/main.py
     env_file: .env
     volumes:
       - ./services:/app/services
@@ -788,7 +903,9 @@ services:
           cpus: '1.0'
           # Measured 30MiB under live load. Next.js standalone does not
           # grow with traffic; 512M retains ~17x headroom.
-          memory: 512M
+          # 47.6 MiB observed against 512M, a production Next.js build
+          # serving static output.
+          memory: 384M
     depends_on:
       api-gateway:
         condition: service_healthy

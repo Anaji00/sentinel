@@ -18,7 +18,9 @@ from typing import Optional, List
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, FlightData
 from shared.utils.regions import classify_region
 from shared.utils.sanctions import check_sanctions
+from shared.utils.regions import routine_band_score
 from shared.kafka import Topics
+from shared.utils.source_scorecard import baseline_reliability
 
 from services.enrichment.anomaly_scorer import lift_score
 
@@ -93,20 +95,45 @@ class AviationEnricher:
         if not parsed:
             return []
 
-        # Parallelize scoring and watchlist checks across the batch
-        scoring_tasks = []
+        # The kinematic scores for the whole batch, in one call.
+        #
+        # This built one _score_flight coroutine per aircraft, each of which
+        # called score_kinematic_event -- a singular wrapper whose entire body
+        # constructs a one-item batch and unwraps the result. Aviation is the
+        # highest-volume domain in the platform at 240,984 flight_position
+        # events in 48 hours, nearly three times maritime's 85,115, and it was
+        # the one paying a Redis pipeline round trip and an executor dispatch
+        # per event while maritime called the batch API directly.
+        entities, lats, lons, speeds, headings, timestamps, extras = [], [], [], [], [], [], []
         for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned) in parsed:
-            speed = float(p.get("velocity") or p.get("speed") or 0.0)
-            heading = float(p.get("true_track") or p.get("heading") or 0.0)
-            ts = (raw.occurred_at or datetime.now(timezone.utc)).timestamp()
-            alt_norm = float(p.get("baro_altitude") or p.get("geo_altitude") or 0.0) / 45000.0
+            entities.append(icao24)
+            lats.append(lat)
+            lons.append(lon)
+            speeds.append(float(p.get("velocity") or p.get("speed") or 0.0))
+            headings.append(float(p.get("true_track") or p.get("heading") or 0.0))
+            timestamps.append((raw.occurred_at or datetime.now(timezone.utc)).timestamp())
+            extras.append([float(p.get("baro_altitude") or p.get("geo_altitude") or 0.0) / 45000.0])
 
-            task = self._score_flight(
-                icao24=icao24, callsign=callsign, squawk=squawk, is_emerg=is_emerg,
-                is_sanctioned=is_sanctioned, lat=lat, lon=lon, speed=speed,
-                heading=heading, ts=ts, alt_norm=alt_norm
+        try:
+            kinematic_results = await self.scorer.score_kinematic_event_batch(
+                entities, lats, lons, speeds, headings, timestamps, extras,
             )
-            scoring_tasks.append(task)
+        except Exception as e:
+            # A failed batch must not lose the batch. Each aircraft falls back
+            # to the floor the singular path used, and the reason is recorded
+            # rather than swallowed.
+            logger.error(f"Kinematic batch scoring failed for {len(entities)} aircraft: {e}", exc_info=True)
+            kinematic_results = [{} for _ in entities]
+
+        # Parallelize the per-aircraft work that genuinely is per-aircraft:
+        # squawk floors, watchlist lookups and frequency tracking.
+        scoring_tasks = []
+        for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned), kin in zip(parsed, kinematic_results):
+            scoring_tasks.append(self._score_flight(
+                icao24=icao24, callsign=callsign, squawk=squawk, is_emerg=is_emerg,
+                is_sanctioned=is_sanctioned,
+                kinematic=float((kin or {}).get("score", 0.10) or 0.10),
+            ))
 
         scoring_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
 
@@ -125,9 +152,23 @@ class AviationEnricher:
                 score, is_watched = score_res
 
             # ROUTINE TELEMETRY GUARD:
-            # Routine flight pings (not emergency, not sanctioned, not watched) capped at 0.15
+            # Routine pings are held below the alerting band -- but *ordered*
+            # within it, which `min(ROUTINE_CEILING, score * 0.3)` was not.
+            #
+            # That expression clamps to exactly the ceiling for any score at or
+            # above 0.5, so 291 of 1,204 consecutive enriched events -- 205
+            # aircraft over the Mediterranean and 86 vessels in the South China
+            # Sea, Taiwan Strait, Black Sea and Turkish Straits -- carried the
+            # identical 0.15. Within the watched geographies the system could
+            # not rank one contact above another, and the region's own
+            # sensitivity, which the platform measures, reached the number not
+            # at all.
+            #
+            # Compressed into the band instead of clamped to its top, and scaled
+            # by the region multiplier so a contact in a chokepoint outranks one
+            # in open water without either leaving the routine band.
             if not is_emerg and not is_sanctioned and not is_watched:
-                anomaly = min(0.15, score * 0.3)
+                anomaly = routine_band_score(score, region)
             else:
                 anomaly = min(1.0, score)
 
@@ -184,6 +225,7 @@ class AviationEnricher:
                 type=event_type,
                 occurred_at=raw.occurred_at or datetime.now(timezone.utc),
                 source=raw.source,
+                source_reliability=baseline_reliability(raw.source),
                 primary_entity=Entity(
                     id=icao24,
                     type=EntityType.AIRCRAFT,
@@ -219,27 +261,24 @@ class AviationEnricher:
         return results
 
     async def _score_flight(self, icao24: str, callsign: Optional[str], squawk: str,
-                            is_emerg: bool, is_sanctioned: bool, lat: float, lon: float,
-                            speed: float, heading: float, ts: float, alt_norm: float):
-        """Helper to score a single flight concurrently."""
-        # The kinematic score is always measured, including for aircraft that
-        # already qualify on their squawk or their operator.
-        #
-        # `elif is_sanctioned: raw_score = 0.80` replaced the measurement with a
-        # category, so all 85 flight_anomaly events in a 45-minute window shared
-        # one score: a sanctioned aircraft holding a normal cruise was ranked
-        # identically to one manoeuvring off its filed route. Being sanctioned
-        # is a reason to look, not a description of what the aircraft is doing.
-        #
-        # This is the same correction already made to crypto transfers, where a
-        # watched counterparty was overwriting the size signal instead of
-        # raising it, and 39,262 transfers shared one score for the same reason.
-        res = await self.scorer.score_kinematic_event(
-            icao24, lat=lat, lon=lon, speed=speed, heading=heading,
-            timestamp=ts, extra_features=[alt_norm]
-        )
-        kinematic = float(res.get("score", 0.10) or 0.10)
+                            is_emerg: bool, is_sanctioned: bool, kinematic: float):
+        """Combines a precomputed kinematic score with this aircraft's context.
 
+        The kinematic score arrives already measured, from one batch call for
+        the whole scan rather than a one-item batch per aircraft.
+
+        It is always measured, including for aircraft that already qualify on
+        their squawk or their operator. `elif is_sanctioned: raw_score = 0.80`
+        replaced the measurement with a category, so all 85 flight_anomaly
+        events in a 45-minute window shared one score: a sanctioned aircraft
+        holding a normal cruise was ranked identically to one manoeuvring off
+        its filed route. Being sanctioned is a reason to look, not a description
+        of what the aircraft is doing.
+
+        This is the same correction already made to crypto transfers, where a
+        watched counterparty was overwriting the size signal instead of raising
+        it, and 39,262 transfers shared one score for the same reason.
+        """
         if is_emerg:
             # Squawk codes are standardised and their meanings genuinely differ,
             # so these are floors rather than assertions: 7500 is a hijack, 7700

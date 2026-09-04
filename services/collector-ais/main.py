@@ -51,6 +51,7 @@ from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
 
 logger = setup_sentinel_logging("collector.ais", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -65,8 +66,30 @@ AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
 # GEOGRAPHIC FILTERS (Bounding Boxes)
 # Format: [[min_lat, min_lon], [max_lat, max_lon]]
 # High-interest global maritime chokepoints and economic zones.
+# Named so that a zone delivering nothing can be reported by name rather than
+# being silently absent from the output. See ZONE_COVERAGE_WINDOW_SEC below.
+ZONE_NAMES = [
+    "Strait of Hormuz", "Strait of Malacca", "Bab-el-Mandeb", "Suez Canal",
+    "Red Sea", "Black Sea", "Taiwan Strait", "South China Sea",
+    "Gulf of Guinea",
+]
+
 WATCH_ZONES = [
-    [[24.0, 56.0], [27.0, 60.0]],   # Strait of Hormuz
+    # Strait of Hormuz, drawn around where reception happens rather than around
+    # the water of interest.
+    #
+    # The previous box, 24-27N / 56-60E, contained the strait itself and then
+    # ran east into the open Gulf of Oman. It excluded every port on the
+    # approach: Bandar Abbas sits at 27.18N, a fifth of a degree above the old
+    # northern edge, and Jebel Ali at 55.30E, two thirds of a degree west of the
+    # old western one. Terrestrial AIS is line-of-sight to a shore receiver and
+    # those receivers cluster at ports, so the box was aimed at the one part of
+    # the region with no chance of coverage. It returned zero messages for the
+    # entire life of the system.
+    #
+    # Now 24-27.5N / 54-58E: Abu Dhabi, Jebel Ali, the strait, Bandar Abbas and
+    # Fujairah, and less of the open water that was never going to report.
+    [[24.0, 54.0], [27.5, 58.0]],   # Strait of Hormuz + Persian Gulf approaches
     [[1.0,  103.0], [6.0,  105.0]], # Strait of Malacca
     [[11.5, 43.0],  [13.5, 45.5]],  # Bab-el-Mandeb
     [[29.8, 32.2],  [31.5, 32.8]],  # Suez Canal
@@ -141,7 +164,24 @@ class MessageCounter:
     def __init__(self):
         self.total     = 0
         self.per_type  = {}
+        self.per_zone  = {}
         self._start    = datetime.now(timezone.utc)
+
+    def note_position(self, lat: float, lon: float) -> None:
+        """Records which watch zone a report came from.
+
+        Subscribing to a box is not the same as receiving from it. AISStream is
+        a terrestrial aggregator fed by volunteer receivers, so coverage follows
+        where those receivers are: dense across Europe and East Asia, absent in
+        the Persian Gulf and West Africa. The Strait of Hormuz has been in this
+        subscription throughout and has never delivered a single message --
+        neither has Bab-el-Mandeb -- while Taiwan Strait returns thousands a day.
+        A silently empty zone reads exactly like a quiet one.
+        """
+        for name, ((lat1, lon1), (lat2, lon2)) in zip(ZONE_NAMES, WATCH_ZONES):
+            if lat1 <= lat <= lat2 and lon1 <= lon <= lon2:
+                self.per_zone[name] = self.per_zone.get(name, 0) + 1
+                return
  
     def increment(self, msg_type: str):
         self.total += 1
@@ -152,9 +192,25 @@ class MessageCounter:
         rate    = self.total / elapsed if elapsed > 0 else 0
         detail  = " | ".join(f"{k}:{v}" for k, v in self.per_type.items())
         logger.info(f"AIS: {self.total} msgs @ {rate:.1f}/s — {detail}")
+
+        # Which subscribed zones produced nothing this window. Reported rather
+        # than left to inference: the system claims to watch nine chokepoints
+        # and four of them have never returned a message.
+        silent = [z for z in ZONE_NAMES if not self.per_zone.get(z)]
+        if silent and self.total:
+            logger.info(
+                "AIS zone coverage: %s of %s zones delivering (%s). Silent: %s. "
+                "A subscribed box with no receiver coverage looks identical to "
+                "a quiet one.",
+                len(ZONE_NAMES) - len(silent), len(ZONE_NAMES),
+                ", ".join(f"{z}:{n}" for z, n in sorted(self.per_zone.items(), key=lambda kv: -kv[1])),
+                ", ".join(silent),
+            )
+
         self._start   = datetime.now(timezone.utc)
         self.total    = 0
         self.per_type = {}
+        self.per_zone = {}
 
 # ── COLLECTION LOOP ───────────────────────────────────────────────────────────
 
@@ -162,6 +218,12 @@ class MessageCounter:
 
 async def collect(producer: SentinelProducer, counter: MessageCounter):
     backoff = 1
+    # Built here, not in a sibling function. metrics.ingested() sat in the hot
+    # path referring to a name this scope never defined, and the NameError was
+    # caught by the broad `except Exception` a few lines below -- so messages
+    # still reached Kafka while every one of them took the failure path and no
+    # ingest metric was ever recorded.
+    metrics = CollectorMetrics("collector-ais")
 
     while True:
         try:
@@ -191,6 +253,12 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                         counter.increment(msg_type)
                         meta = data.get("MetaData", {})
                         mmsi = str(meta.get("MMSI", "unknown"))
+                        try:
+                            counter.note_position(
+                                float(meta.get("latitude")), float(meta.get("longitude"))
+                            )
+                        except (TypeError, ValueError):
+                            pass
                         occurred_at = _parse_aisstream_time(meta.get("time_utc", ""))
                         event = RawEvent(
                             source="aisstream",
@@ -242,8 +310,8 @@ async def main():
         # the socket opens, the subscription is acknowledged, and no message ever
         # arrives. Nothing in the connect path can detect that, so the absence
         # of data is what has to be watched.
-        asyncio.create_task(metrics.watch_for_starvation(source="aisstream"))
-        hb_task = asyncio.create_task(start_heartbeat_task(redis, "collector-ais"))
+        safe_create_task(metrics.watch_for_starvation(source="aisstream"))
+        hb_task = safe_create_task(start_heartbeat_task(redis, "collector-ais"))
         await collect(producer, counter)
     except KeyboardInterrupt:
         logger.info("Shutting down AIS Collector...")

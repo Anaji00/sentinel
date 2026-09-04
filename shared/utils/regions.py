@@ -196,6 +196,40 @@ def get_region_sensitivity_multiplier(region: Optional[str]) -> float:
         "Gulf of Oman":         1.1,
         "Barents Sea":          1.1,
         "East China Sea":       1.1,
+
+        # Transit chokepoints.
+        #
+        # Every one of these is a region classify_region can return, and all of
+        # them scored 1.0 -- indistinguishable from open ocean -- in this table
+        # and in STS_TRANSFER_ZONES alike. A closure or an unexplained dark
+        # period in any of them is a different event from one in the Bering Sea,
+        # which is what a multiplier is for.
+        #
+        # Weighted for transit concentration rather than conflict: the traffic
+        # is dense and constrained, so an anomaly is harder to explain away, but
+        # none of these is a sanctions or conflict zone in its own right.
+        "Turkish Straits":      1.3,   # Bosphorus and Dardanelles, Black Sea's only outlet
+        "Singapore Approach":   1.2,   # Malacca's eastern terminus
+        "Strait of Lombok":     1.2,   # the deep-draught alternative to Malacca
+        "Panama Canal":         1.2,
+        "Strait of Gibraltar":  1.2,
+        "Strait of Dover":      1.2,   # the world's busiest shipping lane by transits
+        "Danish Straits":       1.1,   # Baltic outlet, Russian crude export route
+        "Strait of Sicily":     1.1,
+        "Taiwan Territorial":   1.4,   # matches Taiwan Strait rather than sitting below it
+        "Crimean Waters":       1.4,   # matches Ukrainian Waters, which it adjoins
+
+        # Two inconsistencies rather than judgements.
+        #
+        # Yemeni Airspace was rated 1.5 and Yemeni Territorial 1.0, though the
+        # defining Yemeni risk to this platform is shipping in the water, not
+        # aircraft above it. The two now match.
+        #
+        # Gulf of Guinea is one of the nine chokepoints the AIS collector
+        # explicitly watches by name, and it scored as open ocean -- the
+        # platform was told to look there and then told not to care.
+        "Yemeni Territorial":   1.5,
+        "Gulf of Guinea":       1.3,
     }
     return multipliers.get(region, 1.0)
     
@@ -278,3 +312,42 @@ def decode_nav_status(status_code: int) -> str:
     if not label:
         return f"Unknown({status_code})"
     return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label)
+
+
+# The ceiling routine position telemetry is held below. Kept at the value the
+# two enrichers already used, so nothing downstream that filters on it changes
+# meaning -- what changes is that the band now has an interior.
+ROUTINE_TELEMETRY_CEILING = 0.15
+
+# The most sensitive region the platform rates. Used to normalise the multiplier
+# into a share of the band rather than letting a 3.0x region leave it.
+_MAX_REGION_MULTIPLIER = 3.0
+
+
+def routine_band_score(raw_score: float, region: Optional[str]) -> float:
+    """Order routine telemetry within its band instead of clamping it to the top.
+
+    `min(0.15, score * 0.3)` returns exactly 0.15 for any score at or above 0.5,
+    which is how 291 of 1,204 consecutive events came to carry the identical
+    value. Two contacts in different waters, at different speeds, with different
+    histories, were indistinguishable to everything downstream.
+
+    Half the band is the detector's own score and half is the region's measured
+    sensitivity, so a vessel in the Strait of Hormuz sits above one in open
+    ocean without either being promoted out of routine.
+    """
+    try:
+        raw = float(raw_score or 0.0)
+    except (TypeError, ValueError):
+        raw = 0.0
+    raw = max(0.0, min(1.0, raw))
+
+    try:
+        mult = float(get_region_sensitivity_multiplier(region)) if region else 1.0
+    except Exception:
+        mult = 1.0
+    # 1.0 (neutral) -> 0.0, the platform's most sensitive region -> 1.0.
+    region_share = max(0.0, min(1.0, (mult - 1.0) / max(1e-9, _MAX_REGION_MULTIPLIER - 1.0)))
+
+    blended = 0.5 * raw + 0.5 * region_share
+    return round(ROUTINE_TELEMETRY_CEILING * blended, 4)

@@ -39,14 +39,36 @@ class ThresholdCalibrationHarness:
 
         if not outcomes and self.db:
             try:
-                query = "SELECT scenario_id, status, confidence_overall, payload FROM scenarios WHERE LOWER(status) IN ('confirmed', 'denied') ORDER BY created_at DESC LIMIT 500"
+                # `payload` is not a column on scenarios and never has been, so
+                # this query raised every time it ran -- 96 times in one day,
+                # four to nine an hour, all day. The handler logs and returns an
+                # empty list, so evaluate_threshold_combination scored (0, 0, 0)
+                # and no threshold was ever calibrated from an outcome.
+                #
+                # 212 confirmed scenarios were sitting in the table while this
+                # ran. The anomaly score it wants is reachable: a scenario comes
+                # from a correlation, and that correlation names the event that
+                # triggered it.
+                query = """
+                    SELECT s.scenario_id,
+                           s.status,
+                           s.confidence_overall,
+                           e.anomaly_score
+                    FROM scenarios s
+                    LEFT JOIN correlations c ON s.correlation_id = c.correlation_id
+                    LEFT JOIN events e ON e.event_id = c.trigger_event_id
+                    WHERE LOWER(s.status) IN ('confirmed', 'denied')
+                    ORDER BY s.created_at DESC
+                    LIMIT 500
+                """
                 rows = await self.db.query(query)
                 for r in rows:
+                    anomaly = r.get("anomaly_score")
                     outcomes.append({
                         "scenario_id": str(r["scenario_id"]),
                         "status": r["status"],
-                        "confidence": float(r.get("confidence_overall", 50)),
-                        "payload": json.loads(r["payload"]) if isinstance(r.get("payload"), str) else (r.get("payload") or {}),
+                        "confidence": float(r.get("confidence_overall") or 50),
+                        "payload": {"anomaly_score": float(anomaly) if anomaly is not None else 0.5},
                     })
             except Exception as e:
                 logger.warning(f"DB calibration fetch failed: {e}")
@@ -73,7 +95,10 @@ class ThresholdCalibrationHarness:
 
             # Signal triggered if anomaly >= z_score_thresh / 3.0 and conf >= sim_thresh
             triggered = (anomaly >= (z_score_thresh / 3.0)) and (conf >= sim_thresh)
-            is_positive = status == "CONFIRMED"
+            # Case-insensitive: the column stores "confirmed", not "CONFIRMED",
+            # so this comparison was false for every confirmed outcome and the
+            # harness would have scored precision at zero even with data.
+            is_positive = str(status or "").strip().upper() == "CONFIRMED"
 
             if triggered and is_positive:
                 tp += 1
@@ -110,7 +135,6 @@ class ThresholdCalibrationHarness:
             logger.info("No empirical outcome history available for calibration. Returning default thresholds.")
             if self.redis:
                 try:
-                    await self.redis.raw.set("sentinel:calibration:latest", json.dumps(default_config), ex=86400 * 7)
                     await self.redis.raw.set("sentinel:calibration:correlation_thresholds", json.dumps(default_config), ex=86400 * 7)
                 except Exception as e:
                     logger.warning(f"Failed to persist default thresholds to Redis: {e}")
@@ -147,13 +171,27 @@ class ThresholdCalibrationHarness:
 
         if self.redis:
             try:
-                await self.redis.raw.set("sentinel:calibration:latest", json.dumps(calibrated), ex=86400 * 7)
                 await self.redis.raw.set("sentinel:calibration:correlation_thresholds", json.dumps(calibrated), ex=86400 * 7)
             except Exception as e:
                 logger.warning(f"Failed to persist calibrated thresholds to Redis: {e}")
 
         logger.info(f"🎯 Threshold calibration complete | Z-Threshold: {best_z} | Sim-Threshold: {best_sim} | Min-Corr: {calibrated['min_correlation_coef']} | F1: {best_f1:.3f}")
         return calibrated
+
+
+# How much a refuted hypothesis costs the scenario's overall confidence.
+#
+# At 0.8, deny evidence against every hypothesis takes a leading posterior of
+# 45 down to 9, which is below the tracker's DENY_THRESHOLD of 25 and so
+# reaches the denied state that 672 scenarios had never once reached. Deny
+# evidence against only the front-runner costs proportionally less, because
+# less of what was believed has been contradicted.
+DENY_MASS_WEIGHT = 0.8
+
+# Total refutation still leaves a floor rather than zero: the signals are
+# matched heuristically, and a confidence of exactly 0 asserts a certainty the
+# matching cannot support.
+MIN_EVIDENTIAL_SUPPORT = 0.05
 
 
 class DynamicBayesianCalibrator:
@@ -223,7 +261,42 @@ class DynamicBayesianCalibrator:
             updated_hypotheses.append(h_copy)
 
         leading_posterior = max(posteriors) if posteriors else 0.5
-        overall_confidence = int(round(leading_posterior * 100))
+
+        # Confidence in the scenario, not just in its front-runner.
+        #
+        # overall_confidence was max(posteriors) alone. Posteriors are
+        # normalised to sum to 1, so that number measures how far the leading
+        # hypothesis is ahead of its rivals -- a purely relative quantity. It
+        # cannot fall below 1/n: 33 for three hypotheses, 50 for two.
+        #
+        # CONFIRM_THRESHOLD (65) and DENY_THRESHOLD (25) in the tracker read it
+        # as an absolute claim about whether the scenario is true. Against a
+        # floor of 33 the deny branch is unreachable, and the database agreed:
+        # 213 scenarios confirmed and 0 denied out of 672, with the observed
+        # minimum confidence sitting at 35.
+        #
+        # Worse than unreachable, it was inverted. Deny hits on every hypothesis
+        # left confidence at exactly 45 no matter how many fired, because
+        # normalisation divides the shared penalty straight back out. Refuting
+        # the whole scenario changed nothing at all.
+        #
+        # So the refuted share of prior belief is carried separately here. It is
+        # the mass that was believed before this evidence and has since been
+        # contradicted; normalisation cannot cancel it because it is measured
+        # before the division. A scenario with no deny hits is untouched, which
+        # leaves every existing confirmation exactly where it was.
+        refuted_mass = sum(
+            priors[i] for i in range(n) if deny_hits_by_index.get(i)
+        )
+        support = max(
+            MIN_EVIDENTIAL_SUPPORT, 1.0 - DENY_MASS_WEIGHT * refuted_mass
+        )
+        overall_confidence = int(round(leading_posterior * support * 100))
+        if refuted_mass > 0:
+            notes.append(
+                f"scenario support {support:.2f} "
+                f"({refuted_mass:.0%} of prior belief refuted)"
+            )
 
         audit_str = "; ".join(notes) if notes else "Bayesian baseline intact"
         return updated_hypotheses, overall_confidence, audit_str

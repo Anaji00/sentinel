@@ -27,6 +27,7 @@ import time
 from typing import Any, Optional
 
 from shared.utils.metrics import MetricsCollector, bind_redis
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("sentinel.collector_metrics")
 
@@ -114,7 +115,7 @@ class CollectorMetrics:
 
         Run this as a background task alongside the ingest loop:
 
-            asyncio.create_task(metrics.watch_for_starvation(source="aisstream"))
+            safe_create_task(metrics.watch_for_starvation(source="aisstream"))
 
         It never raises and never exits on its own: the collector should keep
         trying, but the operator should be told it is trying in vain.

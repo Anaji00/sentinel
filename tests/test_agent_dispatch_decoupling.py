@@ -56,7 +56,7 @@ def test_shed_is_still_distinguished_from_failure_in_the_callback():
 def test_in_flight_work_is_drained_before_the_session_closes():
     """Dispatches outlive the loop now; closing the HTTP session under a running
     inference would fail it noisily for no reason."""
-    run_fn = BASE[BASE.index("heartbeat_task = asyncio.create_task"):BASE.index("async def _consume_loop")]
+    run_fn = BASE[BASE.index("heartbeat_task = safe_create_task"):BASE.index("async def _consume_loop")]
     drain_at = run_fn.index("asyncio.wait(inflight")
     close_at = run_fn.index("self._session.close()")
     assert drain_at < close_at, "the session is closed before in-flight work is drained"

@@ -164,10 +164,31 @@ def test_aviation_boosts_use_headroom_not_addition():
 
 def test_the_kinematic_score_is_always_measured():
     """It used to be skipped entirely for emergency and sanctioned aircraft,
-    which is why those branches could not discriminate."""
+    which is why those branches could not discriminate.
+
+    The measurement now happens in enrich_batch, in one batch call for the whole
+    scan, and is passed into _score_flight -- so the invariant is stronger than
+    it was: it is computed for every aircraft before any branch can see a squawk
+    or a sanctions flag. This guard was previously written against the singular
+    call site inside _score_flight, which no longer exists.
+    """
     source = (ROOT / "services" / "enrichment" / "enrichers" / "aviation.py").read_text(encoding="utf-8")
+
+    # Measured for the whole batch, unconditionally, before any scoring branch.
+    batch_block = source.split("async def enrich_batch")[1].split("async def ")[0]
+    assert "score_kinematic_event_batch" in batch_block, (
+        "aviation must score kinematics via the batch API; it is the highest-volume domain"
+    )
+
+    # And every branch of the per-aircraft combination uses that measurement.
     block = source.split("async def _score_flight")[1].split("return final_score")[0]
-    assert block.index("score_kinematic_event") < block.index("if is_emerg")
+    assert "kinematic" in block.split("if is_emerg")[0], "kinematic must be in scope before branching"
+    emerg_branch, _, rest = block.partition("if is_emerg")
+    sanctioned_branch = rest.split("else:")[0]
+    assert "kinematic" in sanctioned_branch, (
+        "the emergency and sanctioned branches must still incorporate the measurement, "
+        "not replace it with a category"
+    )
 
 
 # -- bgp: why the score was arithmetically certain -----------------------------

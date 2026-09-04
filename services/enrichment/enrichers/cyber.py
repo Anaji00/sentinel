@@ -23,6 +23,11 @@ HIGH_VALUE_ORGS = {
     "nato", "government", "ministry", "defense",
 }
 
+# How much of a CVE's categorical score survives as a floor after the detector
+# has ranked it. A critical-infrastructure CVE cannot fall to the bottom of the
+# distribution because the week happened to be busy.
+CVE_FLOOR_SHARE = 0.8
+
 ICS_VENDORS = {
     "siemens", "schneider", "rockwell", "honeywell",
     "ge", "abb", "moxa", "emerson", "yokogawa", "mitsubishi",
@@ -112,12 +117,24 @@ class CyberEnricher:
             if count == 1:
                 await self.redis.raw.expire(key, 60)
             
-            if count < threshold:
+            # A step function is not a velocity.
+            #
+            # This returned exactly 0.0 below the threshold and jumped to 0.5
+            # above it, so for a feed whose entities almost never repeat a
+            # hundred times in sixty seconds it was a constant zero -- one of the
+            # two structurally-fixed inputs that left bgp_anomaly with two
+            # distinct scores across thousands of events.
+            #
+            # Repetition rate is a continuous quantity and is worth reporting as
+            # one: a prefix seen five times in a minute is more interesting than
+            # one seen once, long before it reaches a hundred.
+            if count <= 1:
                 return 0.0
-            else:
-                base_score = 0.5
-                scale_factor = (count - threshold) / 1000.0
-                return min(1.0, base_score + scale_factor)
+            # log-scaled against the threshold, so the curve is steep where the
+            # counts actually live and still reaches 1.0 at saturation.
+            import math as _math
+            scaled = _math.log1p(count - 1) / _math.log1p(max(2.0, float(threshold)))
+            return round(min(1.0, scaled), 4)
         except Exception as e:
             logger.error(f"Redis velocity check failed: {e}")
             return 0.0
@@ -286,7 +303,31 @@ class CyberEnricher:
         is_critical_org = any(kw in vendor or kw in product for kw in HIGH_VALUE_ORGS)
         is_ransomware = str(ransomware_use).lower() == "known"
         
-        anomaly = self.cyber_scorer.score_cve(is_critical_org, is_ics_vendor, is_ransomware)
+        # The categorical ladder is the base, and the ML detector ranks within it.
+        #
+        # `score_cve` returns one of five constants, which is why `filing` and
+        # `ransomware` carry two and three distinct scores across hundreds of
+        # events -- a hand-rolled ladder standing in for a scorer, with every
+        # downstream threshold and percentile then computed against a constant.
+        #
+        # `score_cyber_event` -- the ML path, written and never called anywhere
+        # in the tree -- is what the rest of the platform uses to turn a raw
+        # magnitude into a position in the detector's own recent history. The
+        # ladder still decides the floor, because "ICS vendor with known
+        # ransomware use" is real domain knowledge the detector cannot infer;
+        # the detector decides where within that band this CVE sits.
+        categorical = self.cyber_scorer.score_cve(is_critical_org, is_ics_vendor, is_ransomware)
+        anomaly = categorical
+        try:
+            ranked = await self.scorer.score_cyber_event(cve_id, categorical * 10.0)
+            if ranked is not None:
+                # Bounded by the categorical floor so the ML pass can separate
+                # events but never demote a critical-infrastructure CVE below
+                # the band its category earns.
+                anomaly = max(categorical * CVE_FLOOR_SHARE, min(1.0, float(ranked)))
+                anomaly = max(anomaly, categorical * CVE_FLOOR_SHARE)
+        except Exception as e:
+            logger.debug(f"CVE ML ranking unavailable for {cve_id} (using category): {e}")
         
         tags = ["cve_kev", "exploited_vuln", "cve"]
         if is_critical_org: tags.append("critical_infrastructure")

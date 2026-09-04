@@ -67,6 +67,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.tasks import safe_create_task
 
 logger = setup_sentinel_logging("collector.cyber", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -601,7 +602,7 @@ async def collect(producer: SentinelProducer):
     # FIRE AND FORGET:
     # We create the WebSocket stream as a background task. It runs continuously 
     # alongside the `while True` polling loop below without blocking it.
-    asyncio.create_task(stream_bgp(producer))
+    safe_create_task(stream_bgp(producer))
 
     async with aiohttp.ClientSession(connector=connector) as session:
         # Full CISA KEV catalog on startup — catches all historical entries
@@ -657,7 +658,7 @@ async def main():
         # these prove it is still producing.
         metrics = CollectorMetrics("collector-cyber")
         await metrics.start(redis_client)
-        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-cyber"))
+        hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-cyber"))
 
     try:
         await collect(producer)

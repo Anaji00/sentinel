@@ -33,6 +33,7 @@ from shared.utils.equities import is_valid_primary_equity
 
 from regime import MarketRegime
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
@@ -42,26 +43,89 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
 
+# How long a per-ticker volume baseline is kept.
+#
+# Long enough that a ticker trading weekly keeps its history, short enough that
+# the long tail of 11,631 evaluated symbols does not accumulate forever.
+BASELINE_TTL_SEC = 14 * 86400
+
+# A z-score needs a distribution behind it.
+#
+# The baseline carried no observation count, so the second bar a ticker ever
+# traded was measured against a variance built from one -- effectively zero --
+# and came back thousands of sigma from a mean of almost nothing. Measured over
+# 24 hours: 2,918 volume-spike events, median z 3.42, and 91 of them above
+# 1,000, topping out at 78,542.32. A z of 78,542 is not a large measurement; it
+# is a division by a variance that collapsed.
+#
+# Below this count the ticker is still tracked and its baseline still updated,
+# but no spike is emitted: the honest answer for an instrument the platform has
+# barely seen is that it does not yet know what normal looks like. This is the
+# same rule the aviation gap detector applies with its sixty-sample floor.
+MIN_BASELINE_OBSERVATIONS = 20
+
+# The variance floor was `max(1.0, var)` -- one share, absolute.
+#
+# For a ticker whose mean bar is 800 shares that is no floor at all, and for one
+# whose mean bar is 2,000,000 it is meaninglessly small. Volume is heteroscedastic
+# across instruments, so the floor has to scale with the instrument: a standard
+# deviation is never taken as less than this share of the mean. 0.10 is
+# deliberately loose -- it bounds the pathology without flattening genuine
+# low-variance names.
+MIN_CV_FLOOR = 0.10
+
+# Beyond this, the number describes the denominator rather than the trade. Kept
+# generous -- a genuine 30-sigma volume event is real and should still read as
+# extraordinary -- but bounded, because everything downstream treats this as a
+# continuous magnitude: radar multiplies it, correlation derives confidence from
+# it, and the reasoning prompt prints it to a model.
+Z_SCORE_REPORTING_CAP = 50.0
+
+
 class QuantRadar:
     def __init__(self, redis_client):
         self.redis = redis_client
     
-    async def _get_baseline(self, ticker: str) -> Tuple[float, float]:
+    async def _get_baseline(self, ticker: str) -> Tuple[float, float, int]:
         mean_key = f"sentinel:radar:1m_mean:{ticker}"
         var_key = f"sentinel:radar:1m_var:{ticker}"
+        n_key = f"sentinel:radar:1m_n:{ticker}"
 
         mean = float(await self.redis.raw.get(mean_key) or 0.0)
         var = float(await self.redis.raw.get(var_key) or 0.0)
+        # How many bars this baseline is built from. Without it there is no way
+        # to tell a settled distribution from one observation.
+        try:
+            n = int(await self.redis.raw.get(n_key) or 0)
+        except (TypeError, ValueError):
+            n = 0
 
-        return mean, var
+        return mean, var, n
     
     async def _update_baseline(self, ticker: str, current_vol: float, mean: float, var: float, alpha: float):
         new_mean = (alpha * current_vol) + ((1 - alpha) * mean)
         new_var = (alpha * (current_vol - mean)**2) + ((1 - alpha) * var)
 
+        # An expiry, so the baseline can be evicted.
+        #
+        # The radar evaluates 11,631 symbols a scan and wrote two permanent keys
+        # per ticker: 3,548 of them with no TTL, the largest non-evictable family
+        # in the instance. Under volatile-lru Redis may only reclaim keys that
+        # carry a TTL, so these accumulated until every write began returning
+        # "command not allowed when used memory > 'maxmemory'" -- which took the
+        # supervisor's dispatch down with it.
+        #
+        # A volume baseline for a ticker nobody has traded in a month is not
+        # worth holding, and an active ticker rewrites its own key on every
+        # scan, so the expiry never bites on anything in use.
         pipe = self.redis.raw.pipeline()
-        pipe.set(f"sentinel:radar:1m_mean:{ticker}", new_mean)
-        pipe.set(f"sentinel:radar:1m_var:{ticker}", new_var)
+        pipe.set(f"sentinel:radar:1m_mean:{ticker}", new_mean, ex=BASELINE_TTL_SEC)
+        pipe.set(f"sentinel:radar:1m_var:{ticker}", new_var, ex=BASELINE_TTL_SEC)
+        # Counted with the same expiry as the moments it describes, so a
+        # baseline and its observation count can never disagree about how much
+        # history there is.
+        pipe.incr(f"sentinel:radar:1m_n:{ticker}")
+        pipe.expire(f"sentinel:radar:1m_n:{ticker}", BASELINE_TTL_SEC)
         await pipe.execute()
 
     async def evaluate_volume(self, ticker:str, current_vol: float, current_price: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
@@ -79,10 +143,41 @@ class QuantRadar:
         vwap_mult = MarketRegime.get_intraday_volume_multiplier()
         normalized_vol = current_vol / vwap_mult
 
-        mean, var = await self._get_baseline(ticker)
-        std_dev = math.sqrt(max(1.0, var))
-        z_score = (normalized_vol - mean) / std_dev if mean > 0 else 0.0
+        mean, var, n = await self._get_baseline(ticker)
+
+        # The baseline is updated whether or not a spike is emitted, so a
+        # warming-up ticker still accumulates history. It is updated *after* the
+        # comparison, so a spike is measured against the market before it rather
+        # than against a baseline it has already moved -- the mistake that made
+        # a first-ever earnings surprise look unremarkable.
         await self._update_baseline(ticker, current_vol, mean, var, alpha)
+
+        if n < MIN_BASELINE_OBSERVATIONS or mean <= 0:
+            # Not enough history to say what unusual means here.
+            return False, 0.0
+
+        # The floor scales with the instrument. `max(1.0, var)` was one share,
+        # which for a thinly-traded name is no floor at all -- and it is exactly
+        # the thin names that produced the four- and five-figure z-scores, where
+        # the flows were *smaller* than the ones scoring in the twenties.
+        std_dev = max(math.sqrt(max(0.0, var)), mean * MIN_CV_FLOOR)
+        if std_dev <= 0:
+            return False, 0.0
+
+        z_score = (normalized_vol - mean) / std_dev
+
+        # A z above this is not a measurement of the market, it is a
+        # measurement of the baseline. Reported at its cap and logged, rather
+        # than published as though 78,542 sigma were a finding.
+        if z_score > Z_SCORE_REPORTING_CAP:
+            logger.warning(
+                "%s z-score %.1f exceeds the reporting cap (%d bars of history, "
+                "mean %.0f, sd %.1f). Capped -- a z this size measures the "
+                "baseline, not the flow.",
+                ticker, z_score, n, mean, std_dev,
+            )
+            z_score = Z_SCORE_REPORTING_CAP
+
         return z_score > z_threshold, z_score
 
 async def fetch_tradable_universe(session: aiohttp.ClientSession) -> List[str]:
@@ -251,14 +346,14 @@ async def main():
     regime = MarketRegime(redis_client)
 
     state = {"total_evaluated": 0, "total_anomalies": 0, "polls": 0}
-    heartbeat_task = asyncio.create_task(heartbeat_loop(state))
+    heartbeat_task = safe_create_task(heartbeat_loop(state))
 
     # §1.1 Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-radar")
     await metrics.start(redis_client)
-    hb_shared_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-radar"))
+    hb_shared_task = safe_create_task(start_heartbeat_task(redis_client, "collector-radar"))
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -266,7 +361,7 @@ async def main():
         # A collector that connects and then evaluates nothing is the hardest
         # failure to see: no exception, no restart, a healthy heartbeat, an empty
         # panel indistinguishable from a quiet market.
-        asyncio.create_task(metrics.watch_for_starvation(source="alpaca"))
+        safe_create_task(metrics.watch_for_starvation(source="alpaca"))
         refresh_every = 60          # cycles; one cycle is ~60s
         try:
             while True:

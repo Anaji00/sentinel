@@ -55,6 +55,12 @@ _GAP_SAMPLES_KEY = "sentinel:aviation:gap_samples:{region}"
 _GAP_SAMPLE_CAP = 500
 _MIN_GAP_SAMPLES = 60
 
+# How long an already-reported gap stays reported.
+#
+# Long enough to survive a deploy, which is the failure this replaces, and
+# short enough that an aircraft dark for days is eventually raised again.
+SEEN_GAP_TTL_SEC = 7 * 86400
+
 # Where a gap has to sit in its region's own distribution before it is an event.
 # At or below the median it is what this airspace does all day.
 _NOTABLE_PERCENTILE = 0.90
@@ -80,7 +86,19 @@ class AviationGapDetector:
         self.scorer = scorer
         self.db_writer = db_writer
         self.redis = redis_client
-        self._seen_gaps = set()  # Deduplication set: {icao24}:{region}
+        # Deduplication lives in Redis, not in this process.
+        #
+        # An in-memory set is empty after every restart, so the first scan of a
+        # new container re-emits every aircraft currently in a gap as though it
+        # had just gone dark. Measured: 200 events in one hour, 262 in the next
+        # and 15 in a single second on the first scan after a deploy, against a
+        # steady-state rate of one or two an hour. 462 of 464 "detections" in a
+        # six-hour window were an artifact of redeploying, and they are
+        # indistinguishable in the database from real ones.
+        #
+        # The TTL is what makes an aircraft eligible to be reported again after
+        # it has genuinely returned and gone dark a second time.
+        self._seen_key = "sentinel:aviation:seen_gaps"
 
     async def run(self):
         logger.info("Starting Aviation Gap Detector background task")
@@ -111,7 +129,12 @@ class AviationGapDetector:
             if self.db_writer:
                 await self.db_writer.write_events_batch([degraded_event])
             if self.producer:
-                await self.producer.send(Topics.ALERTS, degraded_event.model_dump(mode="json"))
+                payload = degraded_event.model_dump(mode="json")
+                # See the note at the emission site below: alerts.outbound has
+                # no consumer, so a dark event that goes only there is invisible
+                # to every rule written about it.
+                await self.producer.send(Topics.ENRICHED_EVENTS, payload)
+                await self.producer.send(Topics.ALERTS, payload)
             return
 
         fired = 0
@@ -235,13 +258,26 @@ class AviationGapDetector:
 
                 dedup_key = f"{icao24}:{region}"
                 if gap_hours < threshold:
-                    self._seen_gaps.discard(dedup_key)
+                    # Back inside its normal range: forget it, so a later gap is
+                    # reported as the new event it is.
+                    try:
+                        await self.redis.raw.hdel(self._seen_key, dedup_key)
+                    except Exception:
+                        pass
                     continue
-                    
-                if dedup_key in self._seen_gaps:
-                    continue
-                    
-                self._seen_gaps.add(dedup_key)
+
+                # Marked seen only once an event is actually emitted, not here.
+                #
+                # The set was recorded before the percentile test, so an
+                # aircraft whose gap was ordinary for its airspace was still
+                # marked as reported -- and when that same aircraft later went
+                # genuinely dark, it was skipped as a duplicate of an alert that
+                # was never raised. The suppression outlived the reason for it.
+                try:
+                    if await self.redis.raw.hexists(self._seen_key, dedup_key):
+                        continue
+                except Exception:
+                    pass
                 
                 # How unusual is this silence, for this airspace?
                 samples = region_samples.get(region, [])
@@ -281,9 +317,28 @@ class AviationGapDetector:
                     region=region
                 )
                 
+                try:
+                    await self.redis.raw.hset(self._seen_key, dedup_key, now.isoformat())
+                    await self.redis.raw.expire(self._seen_key, SEEN_GAP_TTL_SEC)
+                except Exception as e:
+                    logger.debug(f"Could not record seen gap {dedup_key}: {e}")
+
                 events_to_write.append(event)
                 if self.producer:
-                    await self.producer.send(Topics.ALERTS, event.model_dump(mode="json"))
+                    # Dark events reach the correlation window as well as the
+                    # alert topic.
+                    #
+                    # These were sent only to Topics.ALERTS (alerts.outbound),
+                    # which has no consumer anywhere in the tree, while the
+                    # correlation service subscribes to ENRICHED_EVENTS alone.
+                    # Measured: 0 of 214,360 correlation-window members were
+                    # flight_dark, and the chokepoint rule's 1,640 supporting
+                    # events were 100% flight_anomaly despite its clause naming
+                    # flight_dark explicitly. The detector this audit spent its
+                    # longest stretch recalibrating was emitting into a dead end.
+                    payload = event.model_dump(mode="json")
+                    await self.producer.send(Topics.ENRICHED_EVENTS, payload)
+                    await self.producer.send(Topics.ALERTS, payload)
                 fired += 1
                 
             except Exception as e:

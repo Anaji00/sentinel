@@ -26,6 +26,7 @@ from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale, get_redis
 from shared.utils.metrics import MetricsCollector
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.tasks import safe_create_task
 
 try:
     from drift_scheduler import ModelDriftScheduler
@@ -82,12 +83,43 @@ async def process_telemetry(consumer, db):
                                     confidence, simulated_vector, recommendations, occurred_at
                                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                             """,
-                                str(data.get("prediction_id") or data.get("trace_id") or "wargame_sim"),
-                                str(data.get("correlation_id") or ""),
+                                # Keys the wargamer actually publishes.
+                                #
+                                # Five of the six columns read names that appear
+                                # in no message it sends. Measured over all 30
+                                # rows: prediction_id was the literal
+                                # "wargame_sim" every time, correlation_id was
+                                # empty every time -- so no row could be joined
+                                # back to the cluster that caused it --
+                                # confidence was 0.0 every time, and both jsonb
+                                # columns were empty. Only predicted_target
+                                # carried anything.
+                                #
+                                # A live message reads:
+                                #   simulation_run_id, primary_vulnerability_isolated,
+                                #   cascade_failure_probability, predicted_next_target_entity_id,
+                                #   remediation_recommendation, agent, agent_run_id,
+                                #   source_correlation_id
+                                # The older names are kept as fallbacks so a
+                                # different producer on this topic still lands.
+                                str(data.get("simulation_run_id") or data.get("prediction_id")
+                                    or data.get("trace_id") or "wargame_sim"),
+                                str(data.get("source_correlation_id") or data.get("correlation_id") or ""),
                                 str(data.get("predicted_next_target_entity_id") or data.get("predicted_target") or "unknown"),
-                                float(data.get("simulation_confidence") or data.get("confidence") or 0.0),
-                                json.dumps(data.get("simulated_trajectory_vector", [])),
-                                json.dumps(data.get("preemptive_recommendations", [])),
+                                # cascade_failure_probability is the only number
+                                # the wargamer quantifies, published 0-100. It is
+                                # the model's probability of cascade failure, not
+                                # a self-reported confidence in the prediction;
+                                # it is stored here because the column is
+                                # otherwise dead, and readers should treat it as
+                                # that probability on a 0-1 scale.
+                                _prediction_confidence(data),
+                                # The objects themselves. The pool's jsonb codec
+                                # encodes with json.dumps already, so serialising
+                                # here stored a jsonb *string* -- true of all 30
+                                # rows for both columns.
+                                data.get("simulated_trajectory_vector") or [],
+                                _recommendations(data),
                                 datetime.now(timezone.utc)
                             )
                             MetricsCollector.increment("agent_predictions_consumed_total")
@@ -116,6 +148,36 @@ async def process_telemetry(consumer, db):
             logger.error(f"Batch execution failed. Backing off 5s. Error: {batch_error}")
             await asyncio.sleep(5)
 
+def _prediction_confidence(data: dict) -> float:
+    """A 0-1 figure from whatever the producer quantified.
+
+    cascade_failure_probability arrives as 0-100; the explicit confidence keys,
+    when a producer sends them, are already 0-1.
+    """
+    cascade = data.get("cascade_failure_probability")
+    if cascade is not None:
+        try:
+            return max(0.0, min(1.0, float(cascade) / 100.0))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(data.get("simulation_confidence") or data.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _recommendations(data: dict) -> list:
+    """The recommendation list, or the single remediation string as one.
+
+    preemptive_recommendations is never sent; remediation_recommendation is.
+    """
+    listed = data.get("preemptive_recommendations")
+    if isinstance(listed, list) and listed:
+        return listed
+    single = data.get("remediation_recommendation")
+    return [single] if single else []
+
+
 async def main():
     logger.info("Starting Telemetry Worker")
     db = await get_timescale()
@@ -127,6 +189,23 @@ async def main():
     except Exception as re:
         logger.warning(f"Redis unavailable for drift scheduler: {re}")
 
+    # Published to Redis so the gateway's /metrics can see them.
+    #
+    # bind_redis() is what moves a process-local counter into the cross-process
+    # aggregate the /metrics endpoint sums. Only the collectors, the agents and
+    # the reasoning engine were calling it, so this service's counters --
+    # model_drift_detected_total, agent_predictions_consumed_total and the
+    # drift_scheduler_active gauge -- incremented into a dict nothing read and
+    # a restart discarded. A drift detection nobody can see is the same as no
+    # drift detection, and this is the service whose entire job is noticing that
+    # the models have stopped describing the world.
+    if redis_client:
+        try:
+            from shared.utils.metrics import bind_redis
+            await bind_redis(redis_client, service_name=os.getenv("SENTINEL_SERVICE", "telemetry-worker"))
+        except Exception as e:
+            logger.debug("Metrics binding skipped: %s", e)
+
     producer = SentinelProducer()
     await producer.start()
 
@@ -136,7 +215,7 @@ async def main():
         producer=producer,
         check_interval_sec=3600,
     )
-    drift_task = asyncio.create_task(drift_scheduler.start())
+    drift_task = safe_create_task(drift_scheduler.start())
 
     # Regression Guard: Confirm background task is running (§6.2)
     await asyncio.sleep(0.05)
@@ -155,7 +234,7 @@ async def main():
     await consumer.start()
 
     # §1.1 Universal heartbeat
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "telemetry-worker"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "telemetry-worker"))
     
     try:
         await process_telemetry(consumer, db)

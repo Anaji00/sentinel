@@ -6,15 +6,39 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 from shared.models.events import entity_cache_key
+from shared.models.events import FilingData, ThirteenFData
 from shared.kafka import Topics
+from shared.utils.source_scorecard import baseline_reliability
+from services.enrichment.anomaly_scorer import lift_score
 from shared.models import (
     NormalizedEvent, EventType, Entity, EntityType, FinancialData,
     AnomalyBreakdown, MarketMicrostructure, ScoreAdjustment
 )
 from shared.utils import quant_calc
+from shared.utils.equities import is_valid_primary_equity
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 import re 
 
 logger = logging.getLogger("enrichment.tradfi")
+
+
+# What a 13F is worth before its own movement is considered. A mandatory
+# quarterly disclosure from a large institution is worth reading; that is the
+# floor, not the whole score.
+# What a single print has to be worth before it is called institutional.
+# Round-lot retail and algorithmic child orders live well below this; a genuine
+# institutional block does not.
+INSTITUTIONAL_NOTIONAL_USD = 1_000_000.0
+
+THIRTEEN_F_BASE_SCORE = 0.60
+
+# How far the headroom above the base may be lifted by movement, and the scale
+# of the curve that gets there. Applied through tanh, so the lift approaches the
+# cap without ever reaching it: two z-scores of change against a filer's own
+# history is a substantially different book, and five is more different still.
+THIRTEEN_F_MAX_LIFT = 0.5
+THIRTEEN_F_MOVEMENT_SCALE = 2.0
+
 
 # Pre-announcement earnings scoring.
 #
@@ -78,6 +102,26 @@ EARNINGS_LOOKAHEAD_DAYS = int(os.getenv("EARNINGS_LOOKAHEAD_DAYS", "7"))
 MAX_TOTAL_LIFT_SHARE = float(os.getenv("TRADFI_MAX_TOTAL_LIFT", "0.55"))
 
 
+# Shares per option contract. One contract is a hundred shares on every US
+# listed equity option; the figure is a market convention, not a guess.
+OPTION_CONTRACT_MULTIPLIER = 100
+
+
+def _option_notional(strike, contracts) -> Optional[float]:
+    """What an options position controls, as opposed to what it cost.
+
+    None when the strike is unknown, because inventing a notional is worse than
+    admitting the trade cannot be sized -- 46 of 896 sweeps arrive without one.
+    """
+    try:
+        if strike is None:
+            return None
+        value = float(strike) * float(contracts or 0) * OPTION_CONTRACT_MULTIPLIER
+    except (TypeError, ValueError):
+        return None
+    return round(value, 2) if value > 0 else None
+
+
 def _lift(anomaly: float, weight: float, spent: float = 0.0) -> float:
     """Raises a score by a share of the headroom left above it.
 
@@ -112,6 +156,30 @@ def _lift(anomaly: float, weight: float, spent: float = 0.0) -> float:
 
 
 # SEC Form 4 Classifications
+# Role labels EDGAR puts in the same parenthesised position as an identifier.
+# None of them is a company.
+FORM4_ROLE_LABELS = {
+    "ISSUER", "FILER", "REPORTING", "SUBJECT", "OWNER", "CHUCK",
+}
+
+# What a filing is worth when its dollar value is not stated. These are ordered
+# by how much the transaction kind alone tells you: an open-market purchase is a
+# decision, a grant is a schedule, a tax withholding is an administrative
+# consequence of one. Every one of them sits above the 0.15 correlation-window
+# floor except the ones that should not enter it.
+FORM4_UNSIZED_BASE = {
+    "P": 0.45,   # open market buy -- a decision to spend own money
+    "S": 0.30,   # open market sale -- a decision, with many innocent reasons
+    "M": 0.18,   # option exercise
+    "X": 0.18,
+    "C": 0.16,   # conversion
+    "G": 0.05,   # gift
+    "A": 0.05,   # grant/award -- compensation, on a schedule
+    "F": 0.05,   # tax withholding -- automatic
+    "D": 0.05,
+    "J": 0.10,   # other/unrecognised
+}
+
 FORM4_CODES = {
     "P": "Open Market Buy",
     "S": "Open Market Sale",
@@ -329,7 +397,7 @@ class TradFiEnricher:
         )
         
         # Phase 2: Batch ML Scoring
-        scores = await self.scorer.score_financial_trade_batch("tradfi", trades_for_scoring)
+        score_results = await self.scorer.score_financial_trade_batch("tradfi", trades_for_scoring)
         
         # Batch watchlist and frequency checks concurrently
         check_tasks = []
@@ -344,7 +412,12 @@ class TradFiEnricher:
         results = []
         set_pipe = self.redis_client.raw.pipeline()
         for i, (raw, p, ticker, price, volume, notional) in enumerate(parsed_events):
-            anomaly = scores[i]
+            score_dict = score_results[i] if i < len(score_results) else {}
+            anomaly = float(score_dict.get("score", 0.5) or 0.5)
+            # The calibrated per-domain gate's answer, in place of a
+            # hardcoded `anomaly >= 0.65`. The gate knows this domain's own
+            # distribution; the constant did not.
+            gate_significant = bool(score_dict.get("is_significant", False))
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
             base_score = anomaly
@@ -410,7 +483,7 @@ class TradFiEnricher:
                     logger.debug(f"Candle evaluation warning for {ticker}: {candle_err}")
 
             if price > 0:
-                set_pipe.set(f"sentinel:quotes:latest:{ticker}", price, ex=3600)
+                set_pipe.set(quote_key(ticker), price, ex=QUOTE_CACHE_TTL_SEC)
                 
             from shared.utils.candles import get_domain_tag
             domain_tag = get_domain_tag("tradfi", ticker)
@@ -442,7 +515,22 @@ class TradFiEnricher:
             sell_vol = volume if aggressor_side == "SELL" else 0.0
             voi = buy_vol - sell_vol
 
-            if volume > 0 and abs(voi) / volume >= 0.60:
+            # Size as well as direction.
+            #
+            # `abs(voi) / volume` is identically 1.0 for a single trade -- voi is
+            # the whole volume signed one way -- so the 0.60 test passed on every
+            # block that had an aggressor side at all, and 200 shares of QQQ was
+            # tagged "institutional_accumulation". 45% of the events this branch
+            # labelled institutional were under $250,000.
+            #
+            # The imbalance test is kept for the multi-trade case; what is added
+            # is that the word "institutional" now requires a size an
+            # institution would actually trade.
+            if (
+                volume > 0
+                and abs(voi) / volume >= 0.60
+                and notional >= INSTITUTIONAL_NOTIONAL_USD
+            ):
                 pre_voi = anomaly
                 if voi > 0:
                     tags.append("institutional_accumulation")
@@ -492,6 +580,7 @@ class TradFiEnricher:
             results.append(self._finalize_equity_trade(
                 raw, p, ticker, price, volume, notional, tags, direction_str,
                 anomaly, hawkes_ratio, adjustments, earnings,
+                gate_significant=gate_significant,
             ))
             
         await set_pipe.execute()
@@ -499,7 +588,7 @@ class TradFiEnricher:
         final_events = await asyncio.gather(*results) if results else []
         return [e for e in final_events if e]
 
-    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None):
+    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None, gate_significant: bool = False):
         if score_adjustments is None:
             score_adjustments = []
             # Shared adjustment allowance, reset per event.
@@ -554,20 +643,55 @@ class TradFiEnricher:
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
         # Microstructure calculations — rolling trade buffer (mirrors crypto.py pattern)
-        aggressor_side = p.get("aggressor_side", p.get("side", "UNKNOWN")).upper()
-        buy_vol = volume if aggressor_side == "BUY" else 0.0
-        sell_vol = volume if aggressor_side == "SELL" else 0.0
-        ofi = quant_calc.order_flow_imbalance(buy_vol, sell_vol)
+        #
+        # Order flow imbalance was measured on the single trade in hand:
+        #   buy_vol = volume if side == "BUY" else 0
+        # The equity feed does not state an aggressor -- `side` is null on every
+        # block -- so both legs were 0 and OFI was 0.0000 on 167 of 167 blocks,
+        # rendered to four decimals as though price impact had been measured and
+        # found negligible. It also silently disabled the liquidity-adjusted
+        # stop below, whose write condition can only be met by a non-zero OFI.
+        #
+        # Two corrections. Where the venue does not label the aggressor, infer
+        # it with the tick rule -- a trade above the previous print is buyer-
+        # initiated -- which is the standard treatment and uses prices already
+        # in the buffer. And imbalance is a property of a *window*: one trade is
+        # wholly one side or the other, so a single-trade OFI can only ever be
+        # -1, 0 or +1 and says nothing about flow.
+        aggressor_side = str(p.get("aggressor_side") or p.get("side") or "UNKNOWN").upper()
 
         # Maintain a 30-trade rolling buffer in Redis for windowed microstructure
         import json
         micro_key = f"sentinel:microstructure:tradfi:{ticker}"
+        # Unmeasured until the window says otherwise. `ofi_measured` is what the
+        # stop-loss write below keys on, so a value that is zero because nothing
+        # was measured is never mistaken for a measured balance of zero.
+        ofi = 0.0
+        ofi_measured = False
         k_lambda = 0.0
         ami = 0.0
         v_wap = price  # fallback
 
         try:
-            signed_vol = volume if aggressor_side == "BUY" else (-volume if aggressor_side == "SELL" else 0.0)
+            if aggressor_side == "BUY":
+                signed_vol = volume
+            elif aggressor_side == "SELL":
+                signed_vol = -volume
+            else:
+                # Tick rule against the most recent buffered print. An unlabelled
+                # trade at an unchanged price stays 0, which is the honest answer
+                # rather than a guess.
+                signed_vol = 0.0
+                try:
+                    prev_raw = await self.redis_client.raw.lindex(micro_key, 0)
+                    if prev_raw:
+                        prev_price = float(json.loads(prev_raw)["p"])
+                        if price > prev_price:
+                            signed_vol = volume
+                        elif price < prev_price:
+                            signed_vol = -volume
+                except Exception as tick_err:
+                    logger.debug(f"Tick-rule aggressor inference unavailable for {ticker}: {tick_err}")
             trade_record = json.dumps({
                 "p": price, "v": volume, "sv": signed_vol, "n": notional,
             })
@@ -591,6 +715,13 @@ class TradFiEnricher:
                         continue
 
                 if len(prices_buf) >= 5:
+                    # Windowed order flow imbalance over the buffered trades.
+                    buy_window = sum(v for v in signed_vols_buf if v > 0)
+                    sell_window = -sum(v for v in signed_vols_buf if v < 0)
+                    if (buy_window + sell_window) > 0:
+                        ofi = quant_calc.order_flow_imbalance(buy_window, sell_window)
+                        ofi_measured = True
+
                     # Kyle's λ: ΔP vs signed volume (guarded by n≥10 inside kyle_lambda)
                     price_changes = [prices_buf[i] - prices_buf[i + 1] for i in range(len(prices_buf) - 1)]
                     signed_flows = signed_vols_buf[:-1]  # align with price_changes
@@ -609,14 +740,27 @@ class TradFiEnricher:
         # Dynamic Microstructure Trailing Stop Guard
         try:
             stop_mult = quant_calc.microstructure_stop_distance(atr=1.0, ofi=ofi, kyle_lambda=k_lambda)
-            if stop_mult < 1.0:
-                tags.append("microstructure_stop_tightened")
+            # The write was gated on `stop_mult < 1.0`, which the function can
+            # only return for a negative OFI or a large Kyle's lambda. With both
+            # inputs pinned at zero the branch was unreachable, so the key was
+            # never written, and the advisory that reads it fell back to the
+            # flat 1.5 this measurement exists to replace -- a reader wired to a
+            # key with no writer.
+            #
+            # A measured multiplier is worth storing whatever its value: 1.5
+            # from measured inputs is a statement about a deep book, and the
+            # reader can tell it apart from a fallback because the record says
+            # what it was derived from.
+            if ofi_measured:
+                if stop_mult < 1.0:
+                    tags.append("microstructure_stop_tightened")
                 stop_data = {
                     "ticker": ticker,
                     "multiplier": stop_mult,
                     "ofi": ofi,
                     "kyle_lambda": k_lambda,
                     "trigger_price": price,
+                    "measured": True,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
                 await self.redis_client.raw.set(f"sentinel:stop_loss:{ticker}", json.dumps(stop_data), ex=3600)
@@ -635,12 +779,40 @@ class TradFiEnricher:
             volume_z_score=round(anomaly * 2.0, 2),
             cross_domain_correlation_score=round(hawkes_ratio, 4),
             domain="tradfi",
-            is_significant=anomaly >= 0.65,
+            is_significant=gate_significant,
         )
         
+        # Only the metrics that were actually computed are stated.
+        #
+        # This rendered all four unconditionally, so a block with no
+        # microstructure window behind it published "Order Flow Imbalance:
+        # +0.00, Kyle's Lambda: 0.0000, Amihud Illiquidity: 0.000000" -- and
+        # Kyle's lambda was 0.0000 in 167 of 167 sampled blocks, because it is
+        # guarded by n>=10 inside quant_calc and the buffer rarely holds ten.
+        #
+        # A metric printed to four decimals asserts that price impact was
+        # measured and found negligible. That is a different claim from "not
+        # enough trades to measure it", and this string is what the reasoning
+        # model reads as context -- so the assertion propagated into scenarios
+        # as though it were a finding.
+        micro_parts = []
+        if ofi_measured:
+            micro_parts.append(f"Order Flow Imbalance: {ofi:+.2f}")
+        if v_wap and v_wap != price:
+            micro_parts.append(f"VWAP: ${v_wap:.2f}")
+        if k_lambda:
+            micro_parts.append(f"Kyle's Lambda: {k_lambda:.4f}")
+        if ami:
+            micro_parts.append(f"Amihud Illiquidity: {ami:.6f}")
+        micro_str = (
+            ", ".join(micro_parts) + "."
+            if micro_parts
+            else "Microstructure not measured (insufficient trade history for this name)."
+        )
+
         summary_str = (
             f"Institutional Market Intelligence for {ticker}: {direction_str} of ${notional:,.2f} at ${price:.2f} ({volume:,.0f} shares). "
-            f"Order Flow Imbalance: {ofi:+.2f}, VWAP: ${v_wap:.2f}, Kyle's Lambda: {k_lambda:.4f}, Amihud Illiquidity: {ami:.6f}. "
+            f"{micro_str} "
             f"Anomaly Score: {anomaly:.2f}."
         )
 
@@ -649,6 +821,7 @@ class TradFiEnricher:
             type=EventType.EQUITY_BLOCK,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker, 
@@ -708,9 +881,7 @@ class TradFiEnricher:
         # Cache the absolute latest price so the Cointegration Engine can reference it
         if close_p > 0:
             try:
-                await self.redis_client.raw.set(f"sentinel:quotes:latest:{ticker}", close_p, ex=3600)
-                if ticker in ("^VIX", "VIX"):
-                    await self.redis_client.raw.set("sentinel:macro:vix", close_p, ex=86400)
+                await self.redis_client.raw.set(quote_key(ticker), close_p, ex=QUOTE_CACHE_TTL_SEC)
             except Exception as e:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
@@ -756,7 +927,7 @@ class TradFiEnricher:
         )
         
         events = []
-        for tf, block, features, anomaly in anomalous_frames:
+        for tf, block, features, anomaly, gate_significant in anomalous_frames:
             price_change_pct = features[0]
             volatility_pct = features[1]
             notional = features[2]
@@ -864,7 +1035,7 @@ class TradFiEnricher:
                 volatility_z_score=round(volatility_pct * 10.0, 2),
                 cross_domain_correlation_score=round(bar_hawkes_ratio, 4),
                 domain="tradfi",
-                is_significant=anomaly >= 0.65,
+                is_significant=gate_significant,
             )
             
             bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson:.4f}. Anomaly Score: {anomaly:.2f}."
@@ -883,6 +1054,7 @@ class TradFiEnricher:
                 type=EventType.MARKET_ANOMALY,
                 occurred_at=datetime.fromisoformat(block["start_ts"]),
                 source=raw.source,
+                source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
                 financial_data=FinancialData(
                     ticker=ticker, 
@@ -946,11 +1118,34 @@ class TradFiEnricher:
         ticker = (p.get("ticker") or "").upper()
         if not ticker:
             title = p.get("title", "")
-            match = re.search(r'\(\s*([A-Za-z]+)\s*\)', title)
-            if match:
-                ticker = match.group(1).upper()
-            else:
-                logger.debug(f"Failed to extract ticker from Form 4 payload: {title}")
+            # EDGAR titles read "4 - ISABELLA BANK CORP (0000842517) (ISSUER)".
+            #
+            # The alphabetic match here skipped the numeric CIK and landed on
+            # the trailing role, so 497 insider events in six hours carried five
+            # distinct entities between them: CHUCK, FILER, ISSUER, REPORTING,
+            # SUBJECT. CHUCK is the tell -- the title was
+            # "SCHWAB CHARLES (0000316709) (CHUCK)".
+            #
+            # The CIK is cleanly extractable in every case and is the issuer's
+            # actual identifier, so it is read first and resolved through the
+            # map the platform already maintains. A role label is never an
+            # entity, so those are excluded by name rather than by position.
+            ticker = None
+            cik_match = re.search(r'\(\s*(\d{6,10})\s*\)', title)
+            if cik_match:
+                ticker = await self._resolve_cik(cik_match.group(1))
+
+            if not ticker:
+                for cand in re.findall(r'\(\s*([A-Za-z.\-]{1,6})\s*\)', title):
+                    if cand.upper() not in FORM4_ROLE_LABELS:
+                        ticker = cand.upper()
+                        break
+
+            if not ticker:
+                # An issuer that cannot be named is not an insider signal about
+                # anybody. Recording it under a role label is worse than
+                # dropping it, because it groups unrelated companies together.
+                logger.debug(f"Form 4 skipped: no resolvable issuer in title {title!r}")
                 return None
         
         # Robustly parse code, value, and role from summary HTML if absent from raw_payload
@@ -961,18 +1156,33 @@ class TradFiEnricher:
             code_match = re.search(r'(?:<b>Code:</b>|Code:)\s*([A-Z])', summary_html, re.IGNORECASE)
             code = code_match.group(1).upper() if code_match else "J"
             
+        # An unparseable value means the size is unknown, which is not the same
+        # fact as a size of zero.
+        #
+        # The EDGAR summary carries only Filed:, AccNo: and Size:, so the Value:
+        # regex found nothing and every filing was priced at $0. The score below
+        # is `value / 10_000_000 * 0.3`, so insider_trade averaged 0.0053 with a
+        # daily maximum of 0.20 against a correlation-window floor of 0.15 --
+        # 679 events in twenty-four hours and exactly one cleared it. Two rules
+        # written for this signal have never fired.
         value = p.get("transaction_value_usd")
-        if not value:
+        value_known = False
+        if value:
+            value = float(value)
+            value_known = True
+        else:
             val_match = re.search(r'(?:<b>Value:</b>|Value:)\s*\$([0-9,]+(?:\.[0-9]+)?)', summary_html, re.IGNORECASE)
+            if not val_match:
+                # EDGAR's own field name for the same quantity.
+                val_match = re.search(r'(?:<b>Size:</b>|Size:)\s*\$?([0-9,]+(?:\.[0-9]+)?)', summary_html, re.IGNORECASE)
             if val_match:
                 try:
                     value = float(val_match.group(1).replace(",", ""))
+                    value_known = True
                 except ValueError:
-                    value = 0.0
+                    value = None
             else:
-                value = 0.0
-        else:
-            value = float(value)
+                value = None
             
         title = p.get("role") or p.get("title") or ""
         if not title:
@@ -983,15 +1193,25 @@ class TradFiEnricher:
                 title = p.get("title") or ""
         title = title.upper()
         
-        # Suppress noise: Ignore standard compensation & tax withholding below $500k
-        if code in ("A", "F") and value < 500_000:
+        # Suppress noise: standard compensation and tax withholding below $500k.
+        # Only where the size is actually known -- an unsizeable award is not
+        # evidence that it was small.
+        if code in ("A", "F") and value_known and value < 500_000:
             return None
             
         code_label = FORM4_CODES.get(code, "Transaction")
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
         
         # Role-based weighting multiplier
-        anomaly = min(1.0, value / 10_000_000 * 0.3)
+        # The base is the size where the size is known, and the transaction's own
+        # kind where it is not. An open-market purchase by an officer is the
+        # highest-signal thing Form 4 reports whatever its dollar value, and
+        # scoring it zero for want of a number the filing did not print is what
+        # kept the entire insider path below every downstream floor.
+        if value_known:
+            anomaly = min(1.0, value / 10_000_000 * 0.3)
+        else:
+            anomaly = FORM4_UNSIZED_BASE.get(code, 0.05)
         if "CEO" in title:
             anomaly = _lift(anomaly, 0.5, lift_spent)
             lift_spent += 0.5
@@ -1030,14 +1250,50 @@ class TradFiEnricher:
             type=EventType.INSIDER_TRADE,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker, instrument_type="equity", premium_usd=value
             ),
-            headline=f"Insider {code_label}: {ticker} ${value/1e6:.1f}M by {title}",
-            tags=["tradfi", "insider_trade", ticker.lower(), code_label.lower().replace(" ", "_")],
+            headline=(
+                f"Insider {code_label}: {ticker} ${value/1e6:.1f}M by {title}"
+                if value_known else
+                f"Insider {code_label}: {ticker} by {title} (size not disclosed)"
+            ),
+            tags=(
+                ["tradfi", "insider_trade", ticker.lower(), code_label.lower().replace(" ", "_")]
+                + ([] if value_known else ["size_unknown"])
+            ),
             anomaly_score=round(anomaly, 3),
         )
+
+    async def _resolve_cik(self, cik: str) -> Optional[str]:
+        """Issuer ticker for an SEC CIK, or None.
+
+        The newer filings collector starts from a ticker and resolves forward,
+        so it never needed this. The Form 4 path runs backwards from an EDGAR
+        title and had no map at all, which is why it fell through to matching
+        the role label instead.
+
+        `sentinel:sec:ticker_by_cik` is written by the filings collector as it
+        walks its watchlist -- the reverse of the map it already kept, which
+        only ran ticker to CIK. A miss returns None rather than a guess: an
+        issuer that cannot be named is not an insider signal about anybody.
+        """
+        if not cik:
+            return None
+        key = str(cik).lstrip("0") or "0"
+        try:
+            for candidate in (str(cik), key, str(cik).zfill(10)):
+                hit = await self.redis_client.raw.hget("sentinel:sec:ticker_by_cik", candidate)
+                if hit:
+                    resolved = hit.decode() if isinstance(hit, bytes) else str(hit)
+                    resolved = resolved.strip().upper()
+                    if resolved and is_valid_primary_equity(resolved):
+                        return resolved
+        except Exception as e:
+            logger.debug(f"CIK resolution unavailable for {cik}: {e}")
+        return None
 
     async def _enrich_options_flow(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
@@ -1081,12 +1337,24 @@ class TradFiEnricher:
             
         entity = Entity(id=ticker, type=EntityType.COMPANY, name=ticker)
         
+        # Sector, industry and index membership for the underlying. The
+        # equity path has fetched these for some time; this one never did,
+        # so every options sweep reached the reasoning layer unable to say
+        # what it was exposed to.
+        ref_data = None
+        try:
+            from services.enrichment.ref_data import get_reference_data
+            ref_data = await get_reference_data(self.redis_client, ticker)
+        except Exception as e:
+            logger.debug(f"Reference data lookup failed for {ticker}: {e}")
+
         return NormalizedEvent(
             event_id=raw.event_id,
             trace_id=raw.trace_id,
             type=EventType.OPTIONS_FLOW,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker,
@@ -1096,11 +1364,33 @@ class TradFiEnricher:
                 strike=float(strike) if strike is not None else None,
                 expiry=expiry,
                 premium_usd=premium,
+                # Contract notional, not the premium.
+                #
+                # notional_usd was null on all 896 options_flow events in a
+                # two-hour window while strike and volume were both present, so
+                # it was never missing information -- only uncomputed. This is
+                # the same confusion already corrected on the equity_block path,
+                # where every consumer reading the obvious field saw nothing and
+                # had to know to look in the wrong one.
+                #
+                # Premium is what the position cost; notional is what it
+                # controls, and the two differ by orders of magnitude on an
+                # out-of-the-money sweep. A size filter written against either
+                # one means something quite different.
+                notional_usd=_option_notional(strike, volume),
                 underlying_price=price,
+                close_price=price,
                 volume=int(volume),
                 open_interest=open_interest,
                 implied_volatility=implied_volatility,
                 option_type=option_type,
+                # Reference data was fetched for the equity path and not this
+                # one, so an options sweep reached the reasoning layer with no
+                # sector attached and nothing could say what it was exposed to.
+                sector=(ref_data or {}).get("sector"),
+                industry=(ref_data or {}).get("industry"),
+                exchange=(ref_data or {}).get("exchange"),
+                index_membership=(ref_data or {}).get("index_membership", []),
             ),
             headline=f"🐋 OPTIONS FLOW {option_type} Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
             tags=tags,
@@ -1159,6 +1449,7 @@ class TradFiEnricher:
             type=EventType.MARKET_ANOMALY,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker,
@@ -1242,6 +1533,13 @@ class TradFiEnricher:
             event_type = EventType.EARNINGS_REPORT
 
         # Anomaly scoring — dynamic EMA z-score on abs(surprise_pct)
+        ref_data = None
+        try:
+            from services.enrichment.ref_data import get_reference_data
+            ref_data = await get_reference_data(self.redis_client, ticker)
+        except Exception as e:
+            logger.debug(f"Reference data lookup failed for {ticker}: {e}")
+
         # Pre-announcement scoring.
         #
         # This was a flat 0.3, which made all 183 upcoming-earnings events in a
@@ -1344,6 +1642,7 @@ class TradFiEnricher:
             type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             financial_data=FinancialData(
                 ticker=ticker,
@@ -1356,6 +1655,15 @@ class TradFiEnricher:
                 eps_surprise_pct=float(eps_surprise_pct) if eps_surprise_pct is not None else None,
                 revenue_estimate=float(revenue_estimate) if revenue_estimate is not None else None,
                 revenue_actual=float(revenue_actual) if revenue_actual is not None else None,
+                # Which sector is reporting.
+                #
+                # "Bad earnings at X moves its peers" is the question this event
+                # exists to feed, and it cannot be asked of a record that does
+                # not say what X is comparable to. The lookup is a Redis read
+                # the equity and options paths already make.
+                sector=(ref_data or {}).get("sector"),
+                industry=(ref_data or {}).get("industry"),
+                index_membership=(ref_data or {}).get("index_membership", []),
             ),
             headline=headline,
             tags=tags,
@@ -1428,6 +1736,45 @@ class TradFiEnricher:
 
         entity = Entity(id=filer_id, type=EntityType.COMPANY, name=filer_name)
 
+        # Scored against the filer's own history rather than published flat.
+        #
+        # This was `anomaly_score=0.60`, a constant, so every 13F ever emitted
+        # carried the same number and the field ranked nothing: a manager whose
+        # book doubled and one who reported an unchanged portfolio were
+        # identical to every consumer, including the correlation layer that
+        # derives confidence from anomaly and the reasoning scheduler that
+        # decides what is worth an inference slot.
+        #
+        # A 13F is a quarterly snapshot, so what makes one notable is movement
+        # against that filer's own previous filings -- not the absolute size of
+        # the book, which says only how large the manager is. Both magnitudes
+        # are on the event already; the same EMA normaliser the rest of the
+        # system scores against turns them into a position in that filer's own
+        # distribution.
+        anomaly = THIRTEEN_F_BASE_SCORE
+        try:
+            norm_value, norm_count = await self.scorer._dynamic_normalize_batch([
+                (f"13f:{filer_id}", "total_value_usd", total_val),
+                (f"13f:{filer_id}", "positions_count", float(pos_count)),
+            ])
+            # A filing is interesting in proportion to how far it moved, in
+            # either direction: a manager who halved a book is as notable as one
+            # who doubled it.
+            movement = max(abs(float(norm_value)), abs(float(norm_count)))
+            # tanh, not min(). A hard `min(MAX_LIFT, movement / SCALE)` is
+            # exhausted the moment movement reaches one sigma, which would put
+            # every substantial filing back on a single value -- the same cliff
+            # this change exists to remove, one level up.
+            anomaly = lift_score(
+                THIRTEEN_F_BASE_SCORE,
+                THIRTEEN_F_MAX_LIFT * math.tanh(movement / THIRTEEN_F_MOVEMENT_SCALE),
+            )
+        except Exception as e:
+            # The base score is a defensible floor: a 13F is a mandatory
+            # disclosure from a large institution and is worth reading whether
+            # or not this normalisation succeeded.
+            logger.debug("13F movement scoring fell back to base for %s: %s", filer_id, e)
+
         return NormalizedEvent(
             event_id=raw.event_id,
             trace_id=raw.trace_id,
@@ -1448,5 +1795,5 @@ class TradFiEnricher:
             headline=headline,
             summary=summary,
             tags=tags,
-            anomaly_score=0.60,
+            anomaly_score=round(anomaly, 3),
         )

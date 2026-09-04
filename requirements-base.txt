@@ -14,3 +14,9 @@ uvicorn[standard]==0.27.0
 yfinance==0.2.44
 pyahocorasick==2.0.0
 simplefix==1.0.12
+
+# Copernicus Sentinel-1 radar, for the four chokepoints AIS has never covered.
+# Justified as a dependency rather than hand-rolled: it carries the OIDC client
+# credentials flow, process-graph construction and batch-job polling, and
+# reimplementing those over aiohttp would be a large surface to get subtly wrong.
+openeo==0.51.0

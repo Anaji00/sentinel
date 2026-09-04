@@ -7,6 +7,23 @@ from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 import json
 
+
+# What a graph edge is worth when nothing rated it.
+#
+# One concept had four values: GraphTriple.confidence defaulted to 0.8, so a
+# relationship the model declined to rate was stored as 80% confident; the
+# knowledge-graph parser fell back to 0.8 again when the value would not cast;
+# and three Cypher reads then substituted their own -- coalesce(r.confidence,
+# 0.5) in the quant engine and the edge validator, coalesce(r.confidence, 0.8)
+# in the graph API. The same unrated edge was therefore 0.8 or 0.5 depending on
+# who asked.
+#
+# 0.5 is the honest one. An edge nobody scored carries no information about its
+# own reliability, and 0.8 is an assertion the system never earned -- it also
+# sits above most thresholds that gate on confidence, so an unrated edge was
+# outranking rated ones.
+UNRATED_EDGE_CONFIDENCE: float = 0.5
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -423,6 +440,15 @@ class CryptoData(BaseModel):
     low_price: Optional[float] = None
     close_price: Optional[float] = None
     size_tokens: float
+
+    # What the transfer was worth, as distinct from how many tokens moved.
+    #
+    # size_tokens carried the USD notional and price was pinned to 1.0 to keep
+    # that self-consistent -- defensible for a stablecoin and wrong for
+    # everything else. WBTC came through at price 1.0000 on 180 events. With
+    # both fields present, each can mean what its name says.
+    notional_usd: Optional[float] = None
+
     leverage: Optional[float] = None
     funding_rate: Optional[float] = None
     mark_price: Optional[float] = None

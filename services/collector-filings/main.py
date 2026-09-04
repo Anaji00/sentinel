@@ -40,6 +40,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
 
 try:
     from thirteen_f import (
@@ -59,8 +60,15 @@ except (ImportError, ModuleNotFoundError):
     generate_curated_seed_13f = thirteen_f_mod.generate_curated_seed_13f
     ThirteenFPortfolioReport = thirteen_f_mod.ThirteenFPortfolioReport
 
+# SEC fair-access requires a User-Agent that identifies the requester with a
+# contact address they actually read. research@sentinel.local is not
+# deliverable, and EDGAR blocks by IP for repeated anonymous traffic -- so this
+# is configurable, and says so when it is still the placeholder.
+SEC_USER_AGENT = os.getenv(
+    "SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local"
+)
 SEC_HEADERS = {
-    "User-Agent": "Sentinel-Intelligence-Platform/1.0 research@sentinel.local",
+    "User-Agent": SEC_USER_AGENT,
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -139,10 +147,38 @@ class FilingDeduplicator:
             logger.debug(f"Filing dedup error: {e}")
 
 
+# CIK -> ticker. The forward map exists because this collector starts from a
+# ticker; the Form 4 enricher starts from an EDGAR title, gets a CIK out of it,
+# and had nothing to resolve it with -- which is why it fell through to matching
+# the parenthesised role label and filed 497 events under CHUCK, FILER, ISSUER,
+# REPORTING and SUBJECT.
+CIK_TO_TICKER_KEY = "sentinel:sec:ticker_by_cik"
+
+
+async def _remember_cik(redis_client, ticker: str, cik: str) -> None:
+    """Record both directions of a resolution, so either end can start."""
+    if not (redis_client and ticker and cik):
+        return
+    try:
+        raw_redis = getattr(redis_client, "raw", redis_client)
+        t = ticker.upper().strip()
+        c = str(cik).strip()
+        await raw_redis.hset("sentinel:sec:cik_map", t, c)
+        # Both the padded and unpadded forms, because EDGAR prints the padded
+        # one in titles and the API takes either.
+        await raw_redis.hset(CIK_TO_TICKER_KEY, c.lstrip("0") or "0", t)
+        await raw_redis.hset(CIK_TO_TICKER_KEY, c.zfill(10), t)
+    except Exception as e:
+        logger.debug(f"CIK map write skipped for {ticker}: {e}")
+
+
 async def get_cik_for_ticker(ticker: str, redis_client) -> Optional[str]:
     """Resolves ticker to SEC CIK with Redis caching."""
     t_clean = ticker.upper().strip()
     if t_clean in BASE_CIK_MAP:
+        # The hardcoded table is the seed for the reverse map: it is the only
+        # resolution available before the first poll completes.
+        await _remember_cik(redis_client, t_clean, BASE_CIK_MAP[t_clean])
         return BASE_CIK_MAP[t_clean]
 
     if redis_client:
@@ -150,7 +186,9 @@ async def get_cik_for_ticker(ticker: str, redis_client) -> Optional[str]:
             raw_redis = getattr(redis_client, "raw", redis_client)
             cached_cik = await raw_redis.hget("sentinel:sec:cik_map", t_clean)
             if cached_cik:
-                return cached_cik.decode("utf-8") if isinstance(cached_cik, bytes) else str(cached_cik)
+                cik = cached_cik.decode("utf-8") if isinstance(cached_cik, bytes) else str(cached_cik)
+                await _remember_cik(redis_client, t_clean, cik)
+                return cik
         except Exception:
             pass
 
@@ -309,6 +347,15 @@ async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL SEC EDGAR CORPORATE FILINGS & 13F COLLECTOR")
     logger.info(f"Prominent Institutional Filers: {len(PROMINENT_FILERS)}")
+    if "sentinel.local" in SEC_USER_AGENT:
+        # Said once at startup rather than buried. EDGAR throttles and then
+        # blocks by IP, and the block arrives as empty responses rather than
+        # an error, which would look exactly like a quiet filing day.
+        logger.warning(
+            "SEC_USER_AGENT is still the placeholder (%s). SEC fair-access "
+            "expects a contact address that is read; set SEC_USER_AGENT in .env "
+            "to avoid being throttled or blocked.", SEC_USER_AGENT,
+        )
     logger.info("=" * 60)
 
     producer = SentinelProducer(service_name="collector-filings")
@@ -322,7 +369,7 @@ async def main():
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-filings")
     await metrics.start(redis_client)
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-filings"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-filings"))
 
     connector = aiohttp.TCPConnector(limit=10)
     try:

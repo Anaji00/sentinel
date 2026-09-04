@@ -212,7 +212,15 @@ class SoftCorrelator:
 
                 qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
                 self._client = AsyncQdrantClient(host=qdrant_host, port=6333)
-                for collection in [EVENT_COLLECTION, "sentinel_concepts"]:
+                # Only the collection this correlator actually uses.
+                #
+                # "sentinel_concepts" was created on every connect and appears
+                # nowhere else in the tree -- no writer, no query. It has held
+                # zero points for the life of the deployment with a `grey`
+                # status, which is Qdrant reporting that no shard was ever
+                # brought up for it: infrastructure provisioned for a capability
+                # that was never built.
+                for collection in [EVENT_COLLECTION]:
                     exists = await self._client.collection_exists(collection)
                     if not exists:
                         try:
@@ -412,54 +420,8 @@ class SoftCorrelator:
         
     # ─── AGENTIC ONTOLOGY METHODS ──────────────────────────────────────────
 
-    async def embed_text(self, text: str) -> List[float]:
-        """Embeds raw concept strings efficiently on the background thread."""
-        if not self._enabled: return []
-        
-        loop = asyncio.get_running_loop()
-        try:
-            embedding_array = await loop.run_in_executor(None, self._model.encode, text)
-            return embedding_array.tolist()
-        except Exception as e:
-            logger.error(f"Text embedding failed for '{text}': {e}")
-            return []
 
-    async def register_concept(self, concept_name: str, embedding: List[float]):
-        """Stores a newly discovered ontology concept asynchronously."""
-        if not self._enabled or not self._client: return
-        
-        try:
-            concept_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, concept_name))
-            
-            await self._client.upsert(
-                collection_name="sentinel_concepts",
-                points=[{
-                    "id": concept_uuid, 
-                    "vector": embedding, 
-                    "payload": {
-                        "concept_name": concept_name,
-                        "created_at": datetime.now(timezone.utc).isoformat()
-                    },
-                }]
-            )
-        except Exception as e:
-            logger.error(f"Qdrant async concept registration failed: {e}")
 
-    async def find_similar_concepts(self, embedding: List[float], limit: int = 1) -> List[Dict]:
-        """Checks if a proposed concept is semantically identical to an existing one."""
-        if not self._enabled or not self._client: return []
-        
-        try:
-            results = await self._client.search(
-                collection_name="sentinel_concepts",
-                query_vector=embedding,
-                limit=limit,
-                score_threshold=0.85, 
-            )
-            return [{"concept_name": r.payload["concept_name"], "score": r.score} for r in results]
-        except Exception as e:
-            logger.debug(f"Qdrant concept search empty or failed: {e}")
-            return []
         
     
  

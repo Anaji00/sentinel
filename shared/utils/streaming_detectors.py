@@ -1166,4 +1166,30 @@ def sts_zone_risk_multiplier(region: Optional[str]) -> float:
     """
     if region is None:
         return 1.0
-    return STS_TRANSFER_ZONES.get(region, 1.0)
+
+    # Falls back to the platform's general region sensitivity rather than to
+    # open ocean.
+    #
+    # This table and get_region_sensitivity_multiplier were written separately
+    # and never reconciled. Measured against the 69 regions classify_region can
+    # actually return: 18 that the platform rates sensitive were open ocean
+    # here, and every one of the 10 regions present in both tables carried a
+    # different number.
+    #
+    # The two highest-traffic regions in the data were among the 18. Strait of
+    # Malacca and Taiwan Strait -- 30,611 and 40,891 events in a week, the
+    # busiest waterway on earth and the most contested -- returned 1.0, so a
+    # vessel going dark there scored exactly as if it had gone dark in open
+    # ocean. A 32.6-hour gap in Malacca scored 0.679 where the same gap in the
+    # South China Sea scored 1.000.
+    #
+    # The maximum of the two, because this table exists to *amplify* for
+    # ship-to-ship transfer risk. A genuine STS hub keeps its higher weight --
+    # Hormuz stays 3.0 against the general table's 1.5 -- and nowhere can score
+    # lower than the platform's own view of the region.
+    sts = STS_TRANSFER_ZONES.get(region, 1.0)
+    try:
+        from shared.utils.regions import get_region_sensitivity_multiplier
+        return max(sts, get_region_sensitivity_multiplier(region))
+    except Exception:
+        return sts

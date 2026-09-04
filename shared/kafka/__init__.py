@@ -125,6 +125,12 @@ class Topics:
     RULES_FEEDBACK       = "agents.rules.feedback"
     RULES_SYNTHESIZED    = "agents.rules.synthesized"
     CONSENSUS_REPORTS    = "agents.consensus.reports"
+    # Declared, never produced to. Heartbeats travel through Redis
+    # (sentinel:heartbeat:{component}), which is where every reader already
+    # looks; this topic had two subscribers and no producer anywhere in the
+    # tree, so each was a consumer-group assignment and a rebalance participant
+    # for a stream that has never carried a message. Kept as a constant only so
+    # an external reference does not break on import.
     SYSTEM_HEARTBEAT     = "sentinel.system.heartbeat"
     RADAR_DECISIONS      = "agents.radar.decisions"
     TELEMETRY            = "agents.telemetry"
@@ -144,7 +150,6 @@ class Topics:
     # When our engine notices a pattern (e.g., 2 vessels meeting at night), it
     # bundles those events together into a Correlation and puts it here.
     CORRELATIONS = "sentinel.correlations"
-    NORMALIZED     = "events.normalized"
     # ALERTS: The "Megaphone".
     # High-priority stuff that needs to go to a Dashboard, SMS, or Email immediately.
     ALERTS = "alerts.outbound"

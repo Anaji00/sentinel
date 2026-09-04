@@ -52,6 +52,13 @@ _DEGREE_KEY = "sentinel:crypto:counterparties:{address}"
 # address which stops behaving like a venue is eventually reassessed.
 _DEGREE_TTL_SEC = 14 * 86400
 
+# First-sighting marker, held only long enough to recognise a second one.
+# An address that transacts once and never again is not a venue and does not
+# need a cardinality estimate; this is what keeps the long tail from becoming
+# three fifths of the key space.
+_SEEN_KEY = "sentinel:crypto:seen:{address}"
+_SEEN_TTL_SEC = 6 * 3600
+
 _HEX_ADDRESS = re.compile(r"^0x[0-9a-f]{40}$")
 
 
@@ -81,11 +88,33 @@ async def note_counterparty(redis_client, address: str, other: str) -> None:
     HyperLogLog rather than a set: an exchange hot wallet would otherwise store
     millions of members to answer a question that only needs an order of
     magnitude.
+
+    The estimate is only started once an address has been seen more than once.
+    A HyperLogLog is small but not free, and one was being created for every
+    address the chain ever mentioned -- 62,281 keys, 60.7% of the entire Redis
+    instance and more than the rest of the deployment combined. The question it
+    answers is "is this a venue", and an address seen exactly once is not: the
+    long tail was paying for a structure that could only ever hold one member.
     """
     if not address or not other or address == other:
         return
     try:
-        key = _DEGREE_KEY.format(address=str(address).lower())
+        addr = str(address).lower()
+        key = _DEGREE_KEY.format(address=addr)
+
+        # Promote on second sighting. The seen-marker is a single byte with a
+        # short life, against a HyperLogLog held for a fortnight.
+        exists = await redis_client.raw.exists(key)
+        if not exists:
+            seen_key = _SEEN_KEY.format(address=addr)
+            # SET NX returns true only for the first sighting.
+            first_sight = await redis_client.raw.set(seen_key, "1", ex=_SEEN_TTL_SEC, nx=True)
+            if first_sight:
+                return
+            # Second sighting: the marker did its job and the estimate takes
+            # over from here.
+            await redis_client.raw.delete(seen_key)
+
         await redis_client.raw.pfadd(key, str(other).lower())
         await redis_client.raw.expire(key, _DEGREE_TTL_SEC)
     except Exception as e:

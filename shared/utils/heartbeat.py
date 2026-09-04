@@ -14,6 +14,53 @@ from typing import Optional, Any, Callable, Union
 
 logger = logging.getLogger("shared.heartbeat")
 
+# What a component has to report for its work to be graded, and the thresholds
+# at which the report means it is not keeping up. All optional: a component that
+# publishes none of these is graded on liveness alone.
+#
+#   consumer_lag   -- messages behind on its input topics
+#   lag_growing    -- True when that backlog grew across the last two samples
+#   processed      -- lifetime count, so a frozen value across samples is a stall
+#   error_rate     -- errors as a share of messages handled
+CONSUMER_LAG_DEGRADED = 10_000
+ERROR_RATE_DEGRADED = 0.05
+
+
+def _work_impediment(meta) -> Optional[str]:
+    """Why this component is not keeping up, or None if it is.
+
+    Returns a sentence rather than a boolean because a status that changes with
+    no stated cause sends the reader to the logs to find out what a health
+    endpoint should have told them.
+    """
+    if not isinstance(meta, dict):
+        return None
+
+    try:
+        lag = meta.get("consumer_lag")
+        if lag is not None and float(lag) >= CONSUMER_LAG_DEGRADED:
+            growing = " and growing" if meta.get("lag_growing") else ""
+            return f"{int(float(lag)):,} messages behind{growing}"
+
+        # A backlog that is growing is a problem at any size: it does not drain.
+        if meta.get("lag_growing") and lag is not None and float(lag) > 0:
+            return f"backlog growing ({int(float(lag)):,} behind)"
+
+        stalled_for = meta.get("stalled_seconds")
+        if stalled_for is not None and float(stalled_for) >= 120.0:
+            return f"no messages processed in {int(float(stalled_for))}s"
+
+        err = meta.get("error_rate")
+        if err is not None and float(err) >= ERROR_RATE_DEGRADED:
+            return f"error rate {float(err):.1%}"
+    except (TypeError, ValueError):
+        # A malformed report is not evidence of ill health, but it is not
+        # evidence of health either -- say so rather than silently passing.
+        return "progress metadata unreadable"
+
+    return None
+
+
 async def touch_heartbeat(redis_client: Any, component: str, ttl: int = 120, metadata: Optional[dict] = None) -> bool:
     """
     Touches the heartbeat key in Redis for a specific component.
@@ -151,19 +198,43 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
 
             if age <= 45.0:
                 status = "HEALTHY"
-                healthy_count += 1
             elif age <= 120.0:
                 status = "DEGRADED"
-                degraded_count += 1
             else:
                 status = "DEAD"
+
+            # Liveness is not health.
+            #
+            # `age_seconds` answers whether a process wrote a heartbeat recently,
+            # and every component does. So a consumer 68,937 messages behind and
+            # diverging at 7.8 a second was HEALTHY, degraded_count was
+            # structurally zero -- no input existed by which anything could be
+            # graded degraded -- and the surface reported OPERATIONAL at 89.5%.
+            #
+            # This is the wedged-Ollama defect generalised: a probe that cannot
+            # see the thing the service exists to do. A component that reports
+            # its own progress is now graded on it, and one that reports nothing
+            # is graded on liveness exactly as before, so nothing regresses for
+            # components that have not been taught to publish it.
+            impediment = _work_impediment(meta)
+            if impediment and status == "HEALTHY":
+                status = "DEGRADED"
+
+            if status == "HEALTHY":
+                healthy_count += 1
+            elif status == "DEGRADED":
+                degraded_count += 1
+            else:
                 dead_count += 1
 
             results[comp] = {
                 "status": status,
                 "age_seconds": round(age, 1),
                 "last_seen": last_hb.isoformat(),
-                "metadata": meta
+                "metadata": meta,
+                # Named so an operator reading the endpoint learns why, rather
+                # than seeing a status change with no stated cause.
+                "impediment": impediment,
             }
         except Exception as e:
             results[comp] = {

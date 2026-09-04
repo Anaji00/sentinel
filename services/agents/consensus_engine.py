@@ -280,7 +280,7 @@ class ConsensusEngine(SentinelAgent):
             args = args[1:]
 
         kwargs.setdefault("agent_name", "consensus_engine")
-        kwargs.setdefault("input_topics", [Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE, Topics.RULES_FEEDBACK, Topics.SYSTEM_HEARTBEAT])
+        kwargs.setdefault("input_topics", [Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE, Topics.RULES_FEEDBACK])
         kwargs.setdefault("db_client", None)
         kwargs.setdefault("neo4j_client", None)
         kwargs.setdefault("producer", producer)

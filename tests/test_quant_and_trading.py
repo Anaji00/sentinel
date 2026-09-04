@@ -448,6 +448,15 @@ def test_financial_advisor_scheduled_review():
         agent._execute_with_telemetry = AsyncMock(return_value=mock_brief)
         agent.write_agent_memory = AsyncMock()
 
+        # Admission is checked before the context is assembled now, so a test
+        # about what the review produces has to grant the slot it would take.
+        # Without this the advisory correctly returns None -- the budget is
+        # unavailable against a mock Redis -- and the test would be asserting
+        # on shed work rather than on the brief.
+        budget = MagicMock()
+        budget.is_available = AsyncMock(return_value=True)
+        agent._budget_instance = budget
+
         res = await agent.run_scheduled_review()
         assert res is not None
 

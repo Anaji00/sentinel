@@ -225,9 +225,15 @@ def test_one_checkable_hypothesis_is_enough_to_lift_the_cap():
     from services.reasoning.scenario_generator import _supported_confidence
 
     class _H:
-        def __init__(self, probability, watch):
+        # deny_signals is declared on the real model with default_factory=list,
+        # so a hypothesis always carries the attribute. The stub omitted it, and
+        # a draft with no deny signal anywhere now carries its own ceiling --
+        # this test is about the watch cap, so the stub models a draft that has
+        # both rather than entangling the two rules.
+        def __init__(self, probability, watch, deny=("refuting observation",)):
             self.probability = probability
             self.watch_signals = watch
+            self.deny_signals = list(deny)
 
     class _O:
         def __init__(self, hypotheses):
@@ -251,6 +257,29 @@ def test_the_cap_is_the_lowest_of_them():
     )
 
 
+# The JSON example the model copies, located by its own opening rather than by
+# the section header above it.
+#
+# Both slices below used to key on that header's exact wording. Renaming it
+# while compressing the prompt broke two tests without changing anything either
+# one asserts, and a header name is presentation. The opening of the example is
+# the thing being tested, so it is the anchor.
+#
+# _example_start raises rather than returning a default: a boundary that quietly
+# came back as 0 would make both slices empty, and an empty slice satisfies
+# every `not in` assertion in this file.
+_EXAMPLE_OPENING = "{" + chr(10) + '  "headline"'
+
+
+def _example_start(source: str) -> int:
+    at = source.find(_EXAMPLE_OPENING)
+    assert at != -1, (
+        "the JSON example in SCENARIO_SYSTEM_PROMPT no longer opens with a "
+        "headline field; re-anchor these tests before trusting them"
+    )
+    return at
+
+
 def test_the_json_example_stays_valid_json():
     """Rule 1 tells the model to return only valid JSON, and the example below
     it is what a 1.5B model actually copies.
@@ -263,7 +292,7 @@ def test_the_json_example_stays_valid_json():
     import re
 
     source = (ROOT / "services/reasoning/scenario_generator.py").read_text(encoding="utf-8")
-    block = source[source.index("OUTPUT SCHEMA:"):source.index('"time_horizon": "immediate')]
+    block = source[_example_start(source):source.index('"time_horizon": "immediate')]
     assert "//" not in block, "a comment is inside the JSON the model copies"
     assert "_note" not in block, "a pseudo-field is inside the JSON the model copies"
 
@@ -271,6 +300,6 @@ def test_the_json_example_stays_valid_json():
 def test_the_watch_signal_requirement_is_stated_in_the_rules():
     """One scenario in nine came back with three hypotheses and no signals."""
     source = (ROOT / "services/reasoning/scenario_generator.py").read_text(encoding="utf-8")
-    rules = source[source.index("1. Return ONLY valid JSON"):source.index("OUTPUT SCHEMA:")]
+    rules = source[source.index("1. Return ONLY valid JSON"):_example_start(source)]
     assert "at least one watch_signal" in rules
     assert "Never a category" in rules

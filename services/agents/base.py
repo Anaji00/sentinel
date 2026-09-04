@@ -6,13 +6,14 @@ import time
 import uuid
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 from pydantic import BaseModel, Field, field_validator
 
 from shared.utils.freshness import is_stale
+from shared.utils.live_feed import agent_narrative
 from shared.utils.inference_budget import (
     DEFAULT_COOLDOWN_SEC,
     InferenceBudget,
@@ -69,10 +70,34 @@ def _message_domain(message: Dict[str, Any]) -> str:
     source = message.get("source")
     return str(source) if source else ""
 
+from shared.utils.tasks import safe_create_task
+from shared.utils.heartbeat import touch_heartbeat
+from shared.utils.text import clip
 from shared.utils.ollama import (
+    DEFAULT_MODEL,
     OllamaClient, SchemaViolationError, InferenceError,
     OLLAMA_MODEL, OLLAMA_FALLBACK_MODEL, OLLAMA_URL
 )
+
+# How long a subject stays "already considered", by how fast the subject moves.
+#
+# Five different windows were in use -- 600s in the stock correlation agent,
+# 1800s in the quant engine and the volatility surface, 3600s in the rates
+# engine and the knowledge graph -- and three were bare literals with nothing
+# stating why one subject deserves ten minutes and another an hour. They may all
+# have been right; there was no way to tell, and no way to change one without
+# guessing at what it was for.
+#
+# Named by what they are about rather than by their duration, so a future change
+# is an argument about the subject rather than about a number:
+#
+#   FAST    a price or a correlation, which can genuinely be new within minutes
+#   MEDIUM  a position or a surface, which re-derives on a slower cadence
+#   SLOW    a regime or an ontology, where a second look inside the hour is
+#           almost always the same look
+DEDUP_WINDOW_FAST_SEC = 600
+DEDUP_WINDOW_MEDIUM_SEC = 1800
+DEDUP_WINDOW_SLOW_SEC = 3600
 
 # Task Queue Keys
 TASK_QUEUE_HIGH   = "sentinel:tasks:high"
@@ -84,6 +109,37 @@ HEARTBEAT_INTERVAL = 60
 
 # ── STRUCTURED AGENT COMMUNICATION PROTOCOL ──────────────────────────────────
 
+# Confidence assigned to an agent result that states none.
+#
+# Was 0.85, which put every silent agent above most measured findings.
+AGENT_UNSTATED_CONFIDENCE = 0.30
+
+
+class _NoBriefToPublish(Exception):
+    """The agent returned no prose, so there is nothing to show a person."""
+
+
+class _QuoteCacheMiss(Exception):
+    """The one-hour quote cache had nothing. Storage is asked next."""
+
+
+def _as_probability_value(value):
+    """A model-supplied probability, normalised to 0-1.
+
+    Shared by AgentPrediction and AgentBulletin so the two cannot diverge
+    again. Normalises rather than raises: both recorders swallow exceptions and
+    return quietly, so raising would convert a recoverable value into a
+    silently missing record.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if 1.0 < number <= 100.0:
+        number /= 100.0
+    return min(1.0, max(0.0, number))
+
+
 class AgentBulletin(BaseModel):
     """Typed inter-agent communication message. Replaces free-text episodic memory."""
     agent_name: str
@@ -92,6 +148,30 @@ class AgentBulletin(BaseModel):
     primary_entity_name: Optional[str] = None
     ticker: Optional[str] = None
     conviction: float = 0.5  # 0.0 - 1.0
+
+    @field_validator("conviction", mode="before")
+    @classmethod
+    def _bulletin_probability(cls, value):
+        """The same contract AgentPrediction.conviction enforces.
+
+        That validator was added because a model filled a bare float field with
+        55.0 and every consumer read it as 0-1. AgentBulletin carried the
+        identical field, with the identical "# 0.0 - 1.0" comment and no
+        validator, and it is fed by the same models -- macro's
+        tail_risk_conviction is a bare float the model writes, and it reaches
+        publish_bulletin unchanged.
+
+        Bulletins land in the consensus engine's Subjective Logic fusion, where
+        a conviction above 1.0 does not merely overweight the opinion, it breaks
+        the algebra. For a bearish bulletin at conviction 85:
+
+            r = (1.0 - 85.0) * evidence_count * 0.3   ->  negative
+            b = r / (r + s + W)                       ->  -0.419
+
+        Belief, disbelief and uncertainty are masses in [0,1] summing to 1, so a
+        negative belief is not a wrong answer, it is not an answer.
+        """
+        return _as_probability_value(value)
     expected_direction: Optional[str] = None  # "up", "down", "neutral"
     payload: Dict[str, Any] = Field(default_factory=dict)
     summary: str = ""
@@ -132,13 +212,7 @@ class AgentPrediction(BaseModel):
         silently missing prediction, which is the failure this whole path was
         just dug out of.
         """
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return value
-        if 1.0 < number <= 100.0:
-            number /= 100.0
-        return min(1.0, max(0.0, number))
+        return _as_probability_value(value)
     time_horizon_hours: int = 24
     entry_price: float = 0.0
     target_price: float = 0.0
@@ -147,6 +221,18 @@ class AgentPrediction(BaseModel):
     # "up or down on candidate X" is not the claim an analyst is making. When
     # outcome_space is populated the prediction is about *which* outcome wins,
     # and `direction` does not describe it.
+    # What kind of claim this is, so the resolver does not have to infer it.
+    #
+    # The wargamer names an entity it expects to be targeted next; that is not a
+    # price bet, and it was being handed to the directional scorer, which asks
+    # for a price on "airlines, airports" and gives up. It also passes
+    # entry_price=0.0, and the scorer's first guard rejects a falsy entry price,
+    # so those predictions returned None before anything was even looked up.
+    # Recorded, stored, never once resolved.
+    #
+    # Defaulted to "price" so every prediction already in Redis keeps the exact
+    # behaviour it had.
+    prediction_kind: str = "price"
     outcome_space: List[str] = Field(default_factory=list)
     predicted_outcome: Optional[str] = None
     market_key: Optional[str] = None
@@ -154,6 +240,25 @@ class AgentPrediction(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     verified: bool = False
     outcome_correct: Optional[bool] = None
+
+
+# A prediction record with nothing in it. 0.5 is the Brier score of a forecaster
+# who says "even chance" every time -- uninformative rather than wrong.
+UNPROVEN_BRIER = 0.5
+
+# The floor keeps a consistently wrong agent contributing something rather than
+# being silenced outright; being reliably wrong is information.
+MIN_CONSENSUS_WEIGHT = 0.1
+
+
+def consensus_weight_for(brier_score: float) -> float:
+    """How much an agent's opinion counts, given its calibration.
+
+    One function so the stored default and the value written at calibration
+    time cannot drift apart, which is exactly what had happened: the default
+    said 1.0 and this formula says 0.5 for the same Brier score.
+    """
+    return max(MIN_CONSENSUS_WEIGHT, 1.0 - float(brier_score))
 
 
 class AgentScorecard(BaseModel):
@@ -164,8 +269,21 @@ class AgentScorecard(BaseModel):
     predictions_wrong: int = 0
     mean_conviction_on_correct: float = 0.0
     mean_conviction_on_wrong: float = 0.0
-    brier_score: float = 0.5  # Lower is better (0=perfect, 1=worst)
-    consensus_weight: float = 1.0  # Multiplier in consensus engine
+    brier_score: float = UNPROVEN_BRIER  # Lower is better (0=perfect, 1=worst)
+    # Derived from the starting Brier rather than set to 1.0.
+    #
+    # It was 1.0, and update_scorecard sets it to consensus_weight_for(brier).
+    # An agent that had never resolved a prediction therefore carried the weight
+    # of a flawless one -- only a Brier of 0.0 reaches 1.0 -- and the moment it
+    # resolved its first prediction the weight halved to 0.5.
+    #
+    # The consensus engine multiplies this by 10 to get an evidence count for
+    # Subjective Logic fusion, so an unevaluated agent moved the fused opinion
+    # twice as hard as one measured at the same Brier it starts from. Absence of
+    # evidence was being read as evidence of accuracy, and it was not a
+    # theoretical exposure: there are no scorecards in Redis at all, so every
+    # agent in the swarm is currently weighted through this default.
+    consensus_weight: float = consensus_weight_for(UNPROVEN_BRIER)
     last_calibrated_at: Optional[str] = None
 
 class ThrottledLogger:
@@ -275,7 +393,7 @@ class InferenceBatcher:
                 self._timer.cancel()
                 self._timer = None
             elif not self._timer:
-                self._timer = asyncio.create_task(self._flush_after_wait())
+                self._timer = safe_create_task(self._flush_after_wait())
 
         if should_flush:
             # Detached, not awaited inline. Awaiting here put the whole flush --
@@ -283,7 +401,7 @@ class InferenceBatcher:
             # the caller that happened to complete the batch was unbounded while
             # every other caller was protected. It also made one arbitrary
             # caller bear the cost of the batch on behalf of the rest.
-            asyncio.create_task(self._flush())
+            safe_create_task(self._flush())
 
         # Bounded, always.
         #
@@ -359,7 +477,7 @@ class InferenceBatcher:
 
 class SentinelAgent(ABC):
     _global_received_count = 0
-    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model="llama3", fallback_model: Optional[str] = None):
+    def __init__(self, agent_name: str, input_topics: List[str], redis_client, db_client, neo4j_client, producer, consumer, dlq, model=DEFAULT_MODEL, fallback_model: Optional[str] = None):
         self.name = agent_name
         self.input_topics = input_topics
         self.redis = redis_client 
@@ -430,10 +548,10 @@ class SentinelAgent(ABC):
         await self._consumer.start()
         await self._producer.start()
         await self._dlq.start()
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        heartbeat_task = safe_create_task(self._heartbeat_loop())
         # Without this, predictions expire unscored and every scorecard
         # stays at its default -- see _resolve_predictions_loop.
-        resolver_task = asyncio.create_task(self._resolve_predictions_loop())
+        resolver_task = safe_create_task(self._resolve_predictions_loop())
 
         try:
             await self._consume_loop()
@@ -459,6 +577,15 @@ class SentinelAgent(ABC):
             await self._dlq.close()
 
 
+    # Event types this agent can act on, or None for "everything".
+    #
+    # Declared per agent and enforced before the dispatch semaphore, so an agent
+    # is not spending its concurrency limit deserialising and queueing telemetry
+    # it will reject on the first line of handle(). None is the safe default:
+    # an agent whose interests have not been written down keeps receiving
+    # everything it did before.
+    INTERESTED_EVENT_TYPES = None
+
     async def _consume_loop(self):
         loop = asyncio.get_running_loop()
         self._inflight: set = getattr(self, "_inflight", set())
@@ -477,7 +604,7 @@ class SentinelAgent(ABC):
                     for msg in msg_list:
                         try:
                             payload = json.loads(msg.value.decode('utf-8'))
-                            tasks.append(asyncio.create_task(self._dispatch(payload)))
+                            tasks.append(safe_create_task(self._dispatch(payload)))
                         except json.JSONDecodeError as e:
                             self.logger.error(f"POISON PILL dropped: {e}")
                             await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
@@ -554,7 +681,7 @@ class SentinelAgent(ABC):
             payload = json.loads(msg.value.decode("utf-8"))
         except Exception:
             payload = {"raw": str(msg.value)}
-        asyncio.create_task(
+        safe_create_task(
             self._send_dlq(payload, f"UnhandledException: {type(err).__name__}: {err}", topic_name)
         )
 
@@ -610,6 +737,35 @@ class SentinelAgent(ABC):
                 )
             return
 
+        # Type filtering before the dispatch slot, not inside handle().
+        #
+        # Every agent subscribes to ENRICHED_EVENTS, which is 90% position and
+        # transfer telemetry, and each agent then rejects what it does not want
+        # on the first lines of its own handle(). That rejection is correct and
+        # it happens too late: the message has already taken a slot on the
+        # dispatch semaphore, so the whole firehose is serialised through a
+        # concurrency limit sized for real work.
+        #
+        # The radar orchestrator was 68,937 messages behind and diverging at 7.8
+        # a second on exactly this. An agent that declares the event types it
+        # can act on now drops the rest at parse speed. Agents that declare
+        # nothing are unaffected, so this cannot silently narrow an agent whose
+        # interests were never written down.
+        interests = getattr(self, "INTERESTED_EVENT_TYPES", None)
+        if interests:
+            etype = raw.get("type") or raw.get("event_type")
+            # Only filter messages that carry a type. A correlation cluster, a
+            # bulletin and an agent brief have their own shapes, and an agent
+            # subscribing to those topics must keep receiving them.
+            if etype and str(etype) not in interests:
+                self._filtered_out = getattr(self, "_filtered_out", 0) + 1
+                if self._filtered_out % 50000 == 1:
+                    self.logger.debug(
+                        "%s: %s message(s) dropped before dispatch as uninteresting types.",
+                        self.name, self._filtered_out,
+                    )
+                return
+
         async with self._dispatch_semaphore:
             t0 = time.monotonic()
             try:
@@ -623,6 +779,27 @@ class SentinelAgent(ABC):
                     # Broadcast agent decision brief to Redis PubSub for live WebSocket UI streaming
                     try:
                         res_dict = result if isinstance(result, dict) else (result.model_dump() if hasattr(result, "model_dump") else {})
+
+                        # An agent that produced no prose has no brief to show.
+                        #
+                        # The summary fell back to str(res_dict)[:200], so a
+                        # graph-write confirmation reached the feed as an
+                        # executive summary:
+                        #
+                        #   {'agent': 'supervisor', 'action': 'single_commit',
+                        #    'entity_id': '8881EF'}
+                        #
+                        # scored 0.85 because that was the default when an
+                        # agent stated no confidence. Bookkeeping presented as
+                        # intelligence, ranked above most real findings.
+                        narrative = agent_narrative(res_dict)
+                        if not narrative:
+                            raise _NoBriefToPublish
+
+                        stated_confidence = res_dict.get("confidence")
+                        if stated_confidence is None:
+                            stated_confidence = res_dict.get("anomaly_score")
+
                         agent_pub_payload = {
                             "event_id": str(res_dict.get("agent_run_id") or uuid.uuid4()),
                             "type": f"agent_{self.name}",
@@ -631,13 +808,21 @@ class SentinelAgent(ABC):
                             "primary_entity_id": str(res_dict.get("primary_entity") or res_dict.get("ticker") or self.name),
                             "primary_entity_name": str(res_dict.get("primary_entity") or res_dict.get("name") or self.name.replace("_", " ").title()),
                             "entity_name": str(res_dict.get("primary_entity") or res_dict.get("name") or self.name.replace("_", " ").title()),
-                            "headline": f"🤖 AGENT [{self.name.upper()}]: {res_dict.get('headline') or res_dict.get('summary') or res_dict.get('hypothesis') or res_dict.get('recommendation') or 'Intelligence Brief Synthesized'}",
-                            "summary": str(res_dict.get("summary") or res_dict.get("rationale") or res_dict.get("narrative") or str(res_dict)[:200]),
-                            "anomaly_score": float(res_dict.get("confidence") or res_dict.get("anomaly_score") or 0.85),
+                            "headline": f"🤖 AGENT [{self.name.upper()}]: {res_dict.get('headline') or clip(narrative, 120)}",
+                            "summary": narrative,
+                            # No invented confidence. An agent that did not
+                            # state one gets the floor rather than 0.85, which
+                            # ranked every silent agent above most measured
+                            # findings.
+                            "anomaly_score": float(stated_confidence) if stated_confidence is not None else AGENT_UNSTATED_CONFIDENCE,
                             "region": "GLOBAL",
                             "tags": ["agent_output", f"agent:{self.name}"],
                         }
                         await self.redis.raw.publish("sentinel:events:live", json.dumps(agent_pub_payload))
+                    except _NoBriefToPublish:
+                        self.logger.debug(
+                            "%s produced no narrative; nothing to put in the feed.", self.name
+                        )
                     except Exception as pub_err:
                         self.logger.debug(f"Agent live feed pub bypass: {pub_err}")
                 self._processed += 1
@@ -679,11 +864,61 @@ class SentinelAgent(ABC):
             self.logger.error(f"DLQ send failed: {e}")
 
     async def _heartbeat_loop(self):
+        # Last sample, so the rate below can be windowed rather than lifetime.
+        last_processed = self._processed
+        last_sample_at = datetime.now(timezone.utc)
+        stalled_since = None
+
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            elapsed = (datetime.now(timezone.utc) - self._started_at).total_seconds()
-            rate = self._processed / elapsed if elapsed > 0 else 0
-            self.logger.info(f"♥ {self.name} | processed={self._processed} errors={self._errors} rate={rate:.2f}/s")
+            now = datetime.now(timezone.utc)
+            elapsed = (now - self._started_at).total_seconds()
+
+            # The rate was `processed / uptime` -- a lifetime average.
+            #
+            # Over a five-hour run a total stall moves that figure by a rounding
+            # error, so radar_agent printed an unchanged processed=15738 on two
+            # consecutive lines a minute apart and reported rate=0.80/s on both.
+            # The heartbeats exist to make a silent agent audible and the metric
+            # chosen could not express the condition they were added to detect.
+            window_s = max(1e-9, (now - last_sample_at).total_seconds())
+            window_delta = self._processed - last_processed
+            window_rate = window_delta / window_s
+            lifetime_rate = self._processed / elapsed if elapsed > 0 else 0.0
+
+            if window_delta == 0:
+                stalled_since = stalled_since or last_sample_at
+            else:
+                stalled_since = None
+            stalled_seconds = (now - stalled_since).total_seconds() if stalled_since else 0.0
+
+            stall_note = f" STALLED {int(stalled_seconds)}s" if stalled_seconds >= HEARTBEAT_INTERVAL else ""
+            self.logger.info(
+                f"♥ {self.name} | processed={self._processed} errors={self._errors} "
+                f"rate={window_rate:.2f}/s (lifetime {lifetime_rate:.2f}/s){stall_note}"
+            )
+
+            last_processed = self._processed
+            last_sample_at = now
+
+            # What the platform health surface grades this agent on. Without it
+            # a component is scored on liveness alone, which is what let a
+            # consumer 68,000 messages behind report HEALTHY.
+            try:
+                error_rate = (self._errors / self._processed) if self._processed else 0.0
+                await touch_heartbeat(
+                    self.redis, self.name,
+                    metadata={
+                        "processed": self._processed,
+                        "window_rate": round(window_rate, 4),
+                        "stalled_seconds": round(stalled_seconds, 1),
+                        "error_rate": round(error_rate, 4),
+                        "consumer_lag": getattr(self, "_consumer_lag", None),
+                        "lag_growing": getattr(self, "_lag_growing", None),
+                    },
+                )
+            except Exception as hb_err:
+                self.logger.debug(f"Progress heartbeat failed for {self.name}: {hb_err}")
             try:
                 await self.redis.raw.set(
                     f"sentinel:agents:health:{self.name}",
@@ -796,7 +1031,7 @@ class SentinelAgent(ABC):
                 cons = json.loads(raw_consensus if isinstance(raw_consensus, str) else raw_consensus.decode("utf-8"))
                 summary = cons.get("summary") or cons.get("consensus_summary")
                 if summary:
-                    lines.append(f"Swarm Consensus: {summary[:200]}")
+                    lines.append(f"Swarm Consensus: {clip(summary, 200)}")
         except Exception as e:
             self.logger.debug(f"Consensus fetch error: {e}")
 
@@ -858,6 +1093,23 @@ class SentinelAgent(ABC):
                 key += f":{ticker.upper()}"
             await self.redis.raw.set(key, bulletin.model_dump_json(), ex=ttl_seconds)
 
+            # A bulletin is the agent's conclusion, so it is also the memory
+            # worth sharing.
+            #
+            # write_agent_memory had no call site anywhere, so
+            # sentinel:agents:episodic_memory held zero entries -- while
+            # read_agent_memories is called by the macro engine on every
+            # relevant dispatch and therefore returned nothing, every time.
+            # Both halves were built; only the write was never wired.
+            #
+            # Hooking it here rather than asking each agent to remember
+            # separately keeps the two in step: an agent that publishes a
+            # conclusion has, by construction, something worth recalling.
+            await self.write_agent_memory(
+                f"[{bulletin_type}] {summary}"
+                + (f" (conviction {bulletin.conviction:.2f})" if bulletin.conviction else "")
+            )
+
             # Also publish to PubSub for real-time listeners
             await self.redis.raw.publish(
                 "sentinel:bulletins:stream",
@@ -871,7 +1123,7 @@ class SentinelAgent(ABC):
         """
         Launches an async coroutine as a background task with exception logging callback.
         """
-        task = asyncio.create_task(coro, name=task_name)
+        task = safe_create_task(coro, name=task_name)
         def _on_done(t: asyncio.Task):
             try:
                 if not t.cancelled() and t.exception():
@@ -965,6 +1217,7 @@ class SentinelAgent(ABC):
         entry_price: float,
         target_price: float = 0.0,
         time_horizon_hours: int = 24,
+        prediction_kind: str = "price",
     ) -> str:
         """
         Records a prediction for later verification.
@@ -990,7 +1243,7 @@ class SentinelAgent(ABC):
             try:
                 is_new = await self.redis.raw.set(claim_key, "1", nx=True, ex=claim_ttl)
                 if not is_new:
-                    logger.debug(
+                    self.logger.debug(
                         "Prediction for %s %s already stands; not recording a duplicate.",
                         ticker, direction,
                     )
@@ -998,7 +1251,7 @@ class SentinelAgent(ABC):
             except Exception as e:
                 # A failed claim must not lose the prediction. Recording a
                 # duplicate is a smaller harm than dropping a forecast.
-                logger.debug(f"Prediction dedupe claim failed for {ticker}: {e}")
+                self.logger.debug(f"Prediction dedupe claim failed for {ticker}: {e}")
 
             pred = AgentPrediction(
                 agent_name=self.name,
@@ -1008,6 +1261,7 @@ class SentinelAgent(ABC):
                 entry_price=entry_price,
                 target_price=target_price,
                 time_horizon_hours=time_horizon_hours,
+                prediction_kind=prediction_kind,
             )
             key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
             # Horizon plus a generous window to be resolved in.
@@ -1230,7 +1484,7 @@ class SentinelAgent(ABC):
 
             # Adjust consensus weight based on calibration
             # Well-calibrated agents (low Brier) get higher weight
-            card.consensus_weight = max(0.1, 1.0 - card.brier_score)
+            card.consensus_weight = consensus_weight_for(card.brier_score)
             card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
 
             await self.redis.raw.set(key, card.model_dump_json(), ex=604800)  # 7 day TTL
@@ -1347,16 +1601,66 @@ class SentinelAgent(ABC):
             except Exception as rx:
                 self.logger.debug(f"Rates regime cache miss in global context: {rx}")
 
+            # The macro engine's latest synthesis, as ambient context.
+            #
+            # This brief already goes to Topics.INTEL_BRIEFS, which six agents
+            # subscribe to -- but that is event-driven, so an agent sees it only
+            # while it happens to be processing that message. The Redis copy was
+            # written on every macro review and read by nothing, which left the
+            # other nine agents with no view of the macro regime unless a brief
+            # arrived in their queue at the right moment. Reading it here makes
+            # the macro engine's conclusions available to every agent building
+            # any prompt, which is what the key was evidently written for.
+            try:
+                brief_raw = await self.redis.raw.get("sentinel:macro:latest_brief")
+                if brief_raw:
+                    payload = json.loads(
+                        brief_raw.decode("utf-8") if isinstance(brief_raw, bytes) else brief_raw
+                    )
+                    brief_body = payload.get("brief") or {}
+                    headline = brief_body.get("headline") or brief_body.get("strategic_summary")
+                    if headline:
+                        context += "\nLATEST STRATEGIC MACRO BRIEF (MacroIntelligenceEngine):\n"
+                        context += f"- {clip(headline, 200)}\n"
+                        summary = brief_body.get("summary") or brief_body.get("strategic_summary")
+                        if summary and summary != headline:
+                            context += f"- {clip(summary, 240)}\n"
+                        context += f"- Severity: {payload.get('computed_severity', 'N/A')} | As of: {payload.get('created_at', 'unknown')}\n"
+            except Exception as bx:
+                self.logger.debug(f"Macro brief cache miss in global context: {bx}")
+
             # Ingest recent shared agent memories
             try:
-                mems = await self.redis.raw.zrevrange("sentinel:memory:shared", 0, 4)
+                # The key that is actually written. This read sentinel:memory:shared,
+                # which appears exactly once in the tree -- here -- and is written
+                # by nothing, so this section has always been empty while
+                # write_agent_memory wrote to a key nothing in this path read.
+                mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, 4)
                 if mems:
                     context += "\nSHARED SWARM MEMORIES & INTEL:\n"
                     for m in mems:
                         text = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                        # Stored as JSON by write_agent_memory.
+                        try:
+                            _entry = json.loads(text)
+                            text = f"[{_entry.get('agent', '?')}] {_entry.get('text', '')}"
+                        except (ValueError, TypeError):
+                            pass
                         context += f"- {text}\n"
             except Exception as mx:
                 self.logger.debug(f"Shared memory miss in global context: {mx}")
+
+            # Other agents' active conclusions.
+            #
+            # get_bulletins_for_prompt builds exactly this block and had no
+            # call site anywhere, so no agent has ever seen another agent's
+            # bulletins in its own prompt -- the mechanism by which the swarm
+            # would be a swarm rather than ten independent readers of one
+            # event stream.
+            try:
+                context += await self.get_bulletins_for_prompt(limit=5)
+            except Exception as bx:
+                self.logger.debug(f"Bulletin context unavailable: {bx}")
 
             return context + "\n"
         except Exception as e:
@@ -1429,7 +1733,11 @@ class SentinelAgent(ABC):
         try:
             raw = await self.redis.raw.get(f"sentinel:quotes:latest:{ticker.upper()}")
             if not raw:
-                return None
+                # A cache miss is the ordinary case, not the end of the search:
+                # this key expires after an hour and predictions are resolved a
+                # day later. Returning here is what made the fallback below
+                # unreachable for exactly the tickers that needed it.
+                raise _QuoteCacheMiss
             text = raw if isinstance(raw, str) else raw.decode("utf-8")
 
             # The collectors write a bare number here -- "93.23" -- not an
@@ -1452,8 +1760,56 @@ class SentinelAgent(ABC):
                 for field in ("price", "close", "last", "c"):
                     if quote.get(field) is not None:
                         return float(quote[field])
+        except _QuoteCacheMiss:
+            pass
         except Exception:
+            pass
+
+        # The cache is not a price history.
+        #
+        # sentinel:quotes:latest carries a one-hour TTL, and a prediction with a
+        # 24-hour horizon is resolved the next day -- by which time the key has
+        # expired. Measured after the close: two quote keys survived for a
+        # fifty-symbol watchlist. _score_directional reads None as "unverifiable,
+        # so uncounted", so a prediction that survived eviction would still
+        # never be scored, and no scorecard could ever move.
+        #
+        # Both fallbacks read what the system already stores durably rather than
+        # adding anything: the crypto candle lists are trimmed rather than
+        # expired, and tradfi_bars is the equity history the rest of the
+        # platform measures against.
+        return await self._durable_price(ticker)
+
+    async def _durable_price(self, ticker: str) -> Optional[float]:
+        """Last known close from storage, when the quote cache has expired."""
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
             return None
+
+        # Crypto: newest entry of the one-minute candle list.
+        try:
+            newest = await self.redis.raw.lindex(f"sentinel:candles:1m:{symbol}", 0)
+            if newest:
+                text = newest if isinstance(newest, str) else newest.decode("utf-8")
+                close = json.loads(text).get("close")
+                if close is not None:
+                    return float(close)
+        except Exception:
+            pass
+
+        # Equities: the most recent bar this platform recorded.
+        try:
+            if self.db:
+                rows = await self.db.query(
+                    "SELECT close FROM tradfi_bars WHERE ticker = $1 "
+                    "ORDER BY time DESC LIMIT 1",
+                    symbol,
+                )
+                if rows and rows[0].get("close") is not None:
+                    return float(rows[0]["close"])
+        except Exception as e:
+            self.logger.debug(f"Durable price lookup failed for {symbol}: {e}")
+
         return None
 
     async def _score_directional(self, pred: "AgentPrediction") -> Optional[bool]:
@@ -1466,7 +1822,30 @@ class SentinelAgent(ABC):
         unless the agent actually predicted flat.
         """
         current = await self._latest_price(pred.ticker)
-        if current is None or not pred.entry_price:
+        if current is None:
+            return None
+
+        # `not pred.entry_price` was the guard here, and 0.0 is falsy.
+        #
+        # That was written for the wargamer, which records an entity claim with
+        # entry_price=0.0 and has since been given its own scoring path. The
+        # quant engine then began publishing price predictions with a zero
+        # entry, and every one of them returned here before a price was looked
+        # up -- unjudgeable, uncounted, so no scorecard was ever written and
+        # every agent stayed pinned at the 0.5 unproven default in the fusion.
+        #
+        # A zero entry price is now a defect to report rather than a silent
+        # skip: the producer is guarded, so one arriving means the guard was
+        # bypassed. None is still returned, because scoring against a zero
+        # denominator would be arithmetic on nothing.
+        if pred.entry_price is None:
+            return None
+        if not isinstance(pred.entry_price, (int, float)) or pred.entry_price <= 0:
+            self.logger.warning(
+                "Prediction %s on %s carries a non-positive entry price (%r) and "
+                "cannot be resolved. The producer should not have recorded it.",
+                getattr(pred, "prediction_id", "?"), pred.ticker, pred.entry_price,
+            )
             return None
 
         direction = (pred.direction or "").strip().lower()
@@ -1486,6 +1865,94 @@ class SentinelAgent(ABC):
         # credited the agent for a word the resolver did not understand.
         self.logger.debug("Unscoreable direction %r on %s", pred.direction, pred.ticker)
         return None
+
+    # What counts as an entity having been targeted. Matches the partial index
+    # on events(anomaly_score DESC, occurred_at DESC) WHERE anomaly_score > 0.5,
+    # so the lookup below uses it rather than scanning.
+    APPEARANCE_ANOMALY_FLOOR = 0.5
+
+    @staticmethod
+    def _entity_claim(text: str) -> str:
+        """The entity a free-text prediction is actually naming.
+
+        Deliberately narrow. Two annotations recur because the model appends its
+        own commentary to the name -- "CSN5086 (Centrality Multiplier: 1.00x)"
+        and "MEA305 Entity" -- and both name a real entity that an exact match
+        would miss. Nothing fuzzier is done here on purpose: keyword and
+        substring matching is what made the old resolution signals fire on 89%
+        of events and resolve nothing honestly.
+        """
+        claim = str(text or "").strip()
+        if "(" in claim:
+            claim = claim.split("(", 1)[0].strip()
+        if claim.lower().endswith(" entity"):
+            claim = claim[: -len(" entity")].strip()
+        return claim
+
+    async def _score_entity_appearance(self, pred: "AgentPrediction") -> Optional[bool]:
+        """Was the entity the agent named actually targeted inside the horizon?
+
+        Unlike a price call, absence is a real answer here: the horizon elapsed
+        and the named entity did not turn up in anything anomalous. That is what
+        lets these predictions score wrong rather than merely go unresolved, and
+        it is the whole reason the wargamer's record could never move.
+
+        The distinction that makes the negative honest is between an entity the
+        platform never sees at all and one it sees and had nothing to report.
+        The first cannot be judged and returns None; only the second is False.
+        Scoring an unmatchable name as wrong would grade the agent on whether
+        its phrasing happened to match a database column.
+        """
+        if not self.db:
+            return None
+
+        claim = self._entity_claim(pred.ticker)
+        if not claim:
+            return None
+
+        try:
+            created = datetime.fromisoformat(pred.created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            deadline = created + timedelta(hours=pred.time_horizon_hours)
+
+            # Is this an entity this platform can observe at all? Asked without
+            # a time bound, because the question is whether it is visible, not
+            # whether it was busy.
+            known = await self.db.query(
+                """
+                SELECT 1 FROM events
+                WHERE upper(primary_entity_name) = upper($1)
+                   OR upper(primary_entity_id)   = upper($1)
+                LIMIT 1
+                """,
+                claim,
+            )
+            if not known:
+                self.logger.debug(
+                    "Prediction %s names %r, which this platform has never "
+                    "observed; left unresolved rather than scored wrong.",
+                    pred.prediction_id[:8], claim,
+                )
+                return None
+
+            hit = await self.db.query(
+                """
+                SELECT 1 FROM events
+                WHERE occurred_at > $1 AND occurred_at <= $2
+                  AND anomaly_score > $3
+                  AND (upper(primary_entity_name) = upper($4)
+                       OR upper(primary_entity_id) = upper($4))
+                LIMIT 1
+                """,
+                created, deadline, self.APPEARANCE_ANOMALY_FLOOR, claim,
+            )
+            return bool(hit)
+        except Exception as e:
+            # Uncounted rather than guessed, the same rule the price scorers use.
+            self.logger.debug("Could not score entity appearance for %s: %s",
+                              pred.prediction_id[:8], e)
+            return None
 
     async def _score_categorical(self, pred: "AgentPrediction") -> Optional[bool]:
         """Did the predicted outcome lead its field at the horizon?
@@ -1581,7 +2048,9 @@ class SentinelAgent(ABC):
                 if (now - created).total_seconds() < pred.time_horizon_hours * 3600:
                     continue        # still open; the market has not answered yet
 
-                if pred.outcome_space:
+                if pred.prediction_kind == "entity_appearance":
+                    correct = await self._score_entity_appearance(pred)
+                elif pred.outcome_space:
                     correct = await self._score_categorical(pred)
                 else:
                     correct = await self._score_directional(pred)
@@ -1761,7 +2230,7 @@ class SentinelAgent(ABC):
         Uses an LLM agentic verification step to double-check that a symbol is a valid 
         primary US common equity (or BTC) and NOT a derivative ETF, option, or crypto altcoin.
         """
-        from shared.utils.equities import is_major_crypto, is_supported_asset
+        from shared.utils.equities import is_major_crypto, is_supported_asset, is_valid_primary_equity
 
         if not ticker or not isinstance(ticker, str):
             return False

@@ -20,7 +20,7 @@ and named_entities. Not perfect — Phase 3 will use embedding similarity.
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
  
 from shared.db import get_timescale, get_redis
 from shared.models import ScenarioStatus
@@ -34,6 +34,47 @@ from .calibration_harness import DynamicBayesianCalibrator
 
 CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
 DENY_THRESHOLD = 25     # Confidence % below which we deny a scenario
+
+# ── EXPIRY DECAY ─────────────────────────────────────────────────────────────
+#
+# A forecast that did not happen is wrong, and nothing here was saying so.
+#
+# Confidence moved only when a signal matched: a watch hit raised it, a deny hit
+# lowered it. But the ordinary way a scenario is wrong is that the thing it
+# predicted simply never occurs -- no deny signal fires, because nothing
+# happened at all. Absence of the predicted event moved the number not at all.
+#
+# Measured over the corpus: 723 scenarios, 219 confirmed, 0 denied, and the
+# lowest confidence ever recorded was 34 against a deny threshold of 25. The
+# threshold was unreachable, so the confirm/deny loop was a confirm loop, and
+# every calibration statistic derived from it -- the pattern library's outcome
+# records, the Brier scores, the source scorecards -- was computed over a
+# population from which the losses had been silently excluded.
+#
+# Decay is what makes DENY_THRESHOLD reachable. Past its own stated horizon, a
+# scenario whose watch signals have not fired loses confidence per elapsed
+# horizon, so a prediction that never came true eventually resolves as denied
+# instead of sitting at "hypothesis" indefinitely -- the oldest was ten days old
+# and still open.
+SCENARIO_HORIZON_HOURS = {
+    "immediate": 6,
+    "24h": 24,
+    "72h": 72,
+    "1week": 168,
+    "1month": 720,
+}
+
+# Used when a scenario states no horizon, or states one that is not recognised.
+DEFAULT_HORIZON_HOURS = 72
+
+# Confidence points lost per horizon elapsed without the predicted signals
+# firing. At 12 a 50-point scenario reaches the deny threshold after roughly two
+# unfulfilled horizons, which is a fair hearing rather than a hair trigger.
+EXPIRY_DECAY_PER_HORIZON = 12
+
+# Decay never starts before the horizon the scenario itself claimed. A 1-month
+# forecast is not wrong on day two.
+EXPIRY_GRACE_HORIZONS = 1.0
 
 def _signal_parts(signal) -> tuple:
     """(entity, text) from either shape a signal can arrive in.
@@ -69,6 +110,52 @@ def _checkable(signals) -> list:
     """
     named = [s for s in signals if _signal_parts(s)[0]]
     return named or list(signals)
+
+
+def _horizon_hours(hypotheses) -> int:
+    """The longest horizon any of this scenario's hypotheses claimed.
+
+    The longest, not the shortest: a scenario is not overdue until every branch
+    of it is.
+    """
+    hours = 0
+    for h in (hypotheses or []):
+        if not isinstance(h, dict):
+            continue
+        raw = str(h.get("time_horizon") or "").strip().lower()
+        hours = max(hours, SCENARIO_HORIZON_HOURS.get(raw, 0))
+    return hours or DEFAULT_HORIZON_HOURS
+
+
+def _expiry_decay(scenario: Dict, hypotheses, now: datetime) -> Tuple[int, str]:
+    """Confidence lost to a horizon that passed without the predicted signals.
+
+    Returns (points, note). Zero and an empty note while the scenario is still
+    within the time it gave itself.
+    """
+    created = scenario.get("created_at")
+    if not isinstance(created, datetime):
+        return 0, ""
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+
+    horizon = _horizon_hours(hypotheses)
+    elapsed_hours = (now - created).total_seconds() / 3600.0
+    horizons_elapsed = elapsed_hours / max(1.0, float(horizon))
+
+    overdue = horizons_elapsed - EXPIRY_GRACE_HORIZONS
+    if overdue <= 0:
+        return 0, ""
+
+    points = int(round(overdue * EXPIRY_DECAY_PER_HORIZON))
+    if points <= 0:
+        return 0, ""
+    return points, (
+        f"No predicted signal in {elapsed_hours:.0f}h against a stated "
+        f"{horizon}h horizon ({horizons_elapsed:.1f} horizons); "
+        f"-{points} for an unfulfilled forecast"
+    )
+
 
 
 class ScenarioTracker:
@@ -130,6 +217,20 @@ class ScenarioTracker:
 
         status_change = None
 
+        # An overdue forecast loses confidence whether or not anything fired.
+        # Applied only when no watch signal hit on this pass: a scenario that is
+        # still producing confirming evidence is not overdue, it is running late.
+        decay_note = ""
+        if not watch_hits_by_index:
+            decay, decay_note = _expiry_decay(
+                scenario, hypotheses, datetime.now(timezone.utc)
+            )
+            if decay:
+                confidence = max(0, confidence - decay)
+                notes.append(decay_note)
+                if confidence <= DENY_THRESHOLD:
+                    status_change = ScenarioStatus.DENIED
+
         if watch_hits_by_index or deny_hits_by_index:
             updated_hypotheses, confidence, bayes_notes = DynamicBayesianCalibrator.recalibrate_hypotheses(
                 hypotheses, watch_hits_by_index, deny_hits_by_index
@@ -142,7 +243,13 @@ class ScenarioTracker:
             elif confidence <= DENY_THRESHOLD:
                 status_change = ScenarioStatus.DENIED
 
-        if confidence != original_confidence or status_change or watch_hits_by_index or deny_hits_by_index:
+        if (
+            confidence != original_confidence
+            or status_change
+            or watch_hits_by_index
+            or deny_hits_by_index
+            or decay_note
+        ):
             await self._update_scenario(
                 scenario_id, 
                 confidence, 
@@ -328,6 +435,21 @@ class ScenarioTracker:
             return []
 
     async def _fetch_active_scenarios(self) -> List[Dict]:
+        """The open scenarios due for evaluation, least recently touched first.
+
+        This was ORDER BY confidence_overall DESC, which made the window a
+        one-way door. Being evaluated lowers confidence; lower confidence falls
+        out of a window ordered by confidence; and outside the window a scenario
+        is never evaluated again. Measured against 494 open scenarios: of the
+        top 100, not one had ever been revisited, while 111 of the other 394
+        had -- and those averaged 66.1 confidence against the window's 85.8. The
+        scenarios that had started to look doubtful were exactly the ones the
+        ordering removed from the process that would have refuted them.
+
+        Ordering by staleness sweeps the whole corpus round-robin: evaluating a
+        scenario sets updated_at, which sends it to the back of the queue, so
+        every open scenario is reached regardless of what its confidence does.
+        """
         try:
             return await self._db.query("""
                 SELECT scenario_id, headline, status, confidence_overall,
@@ -335,7 +457,7 @@ class ScenarioTracker:
                 FROM scenarios
                 WHERE status IN ('hypothesis', 'developing')
                   AND created_at > NOW() - INTERVAL '30 days'
-                ORDER BY confidence_overall DESC
+                ORDER BY updated_at ASC NULLS FIRST
                 LIMIT 100
             """)
         except Exception as e:
@@ -351,13 +473,30 @@ class ScenarioTracker:
         hypotheses:     Optional[List[Dict]] = None,
     ):
         try:
-            history_entry = json.dumps([{
+            # The objects themselves, not json.dumps(...) of them.
+            #
+            # The pool registers a jsonb codec whose encoder is already
+            # json.dumps (shared/db/__init__.py), so a pre-serialised string is
+            # encoded a second time. The insert path in reasoning/main.py was
+            # corrected for exactly this; these two writes were missed because
+            # they carry an explicit ::jsonb cast, which looks like it settles
+            # the question and does not.
+            #
+            # What it cost: every appended confidence_history entry landed as a
+            # JSON *string* inside the array rather than an object, so
+            # `entry->>'confidence'` returned null on all 672 scenarios. The
+            # tracker computes watch/deny hits and Bayesian confidence updates
+            # and then wrote them where nothing could read them back -- the
+            # learning loop recorded its results in a form it cannot itself
+            # consume. Measured live: hypotheses came back as jsonb "string" on
+            # 324 of 672 rows, and confidence_history on every row that had one.
+            history_entry = [{
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "confidence": new_confidence,
                 "notes": notes
-            }])
+            }]
 
-            hyp_json = json.dumps(hypotheses) if hypotheses else None
+            hyp_json = hypotheses if hypotheses else None
 
             if new_status:
                 if hyp_json:

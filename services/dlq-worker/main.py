@@ -7,6 +7,7 @@ Pings an admin via Telegram with a strict rate limit to prevent spam loops.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ batch_logger = BatchLogger(logger, "dlq-worker", flush_interval_sec=10.0)
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale, get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.tasks import safe_create_task
 
 # --- SECRETS & CONFIG ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -64,7 +66,61 @@ async def _send_telegram_alert(session: aiohttp.ClientSession, topic: str, error
     except Exception as e:
         logger.error(f"Failed to reach Telegram API: {e}")
 
-async def _consume_loop(consumer, db, session, producer):
+
+# Retries are capped so a message that cannot be handled stops circulating.
+MAX_RETRIES = 3
+# How long a retry counter outlives its message. Long enough that a retry storm
+# is bounded, short enough that a genuinely transient failure hours later gets
+# a fresh set of attempts rather than inheriting an exhausted one.
+RETRY_COUNTER_TTL_SEC = 3600
+
+
+def _message_fingerprint(topic: str, raw_data) -> str:
+    """Stable identity for a dead letter, whatever shape its payload has.
+
+    The retry counter cannot live inside the payload: the payloads are of
+    unrelated shapes and adding a field to an arbitrary one corrupts it for the
+    consumer it is being replayed to.
+    """
+    try:
+        body = json.dumps(raw_data, sort_keys=True, default=str)
+    except Exception:
+        body = str(raw_data)
+    digest = hashlib.sha256(f"{topic}|{body}".encode("utf-8", "replace")).hexdigest()[:32]
+    return f"sentinel:dlq:retry:{digest}"
+
+
+async def _get_retry_count(redis_client, key: str) -> int:
+    """Current attempt count. A store that cannot answer returns 0, which
+    retries rather than discards -- losing a recoverable event is the worse
+    of the two failures."""
+    try:
+        raw = await redis_client.raw.get(key)
+        return int(raw) if raw is not None else 0
+    except Exception as e:
+        logger.debug(f"Retry counter read failed for {key} (treating as first attempt): {e}")
+        return 0
+
+
+async def _set_retry_count(redis_client, key: str, value: int) -> None:
+    try:
+        await redis_client.raw.set(key, str(value), ex=RETRY_COUNTER_TTL_SEC)
+    except Exception as e:
+        # A counter that cannot be written means the ceiling cannot be enforced
+        # for this message, which is the defect this replaces. Say so loudly.
+        logger.warning(f"Retry counter write failed for {key}; retry ceiling not enforced: {e}")
+
+
+async def _republish_after_backoff(producer, topic: str, raw_data, attempt: int) -> None:
+    """Wait out the backoff off the consume loop, then republish."""
+    await asyncio.sleep(min(2 ** attempt, 30))
+    try:
+        await producer.send(topic, raw_data)
+    except Exception as e:
+        logger.error(f"Failed to re-publish to {topic}: {e}")
+
+
+async def _consume_loop(consumer, db, session, producer, redis_client):
     """Blocking loop that reads from Kafka and writes to Postgres with retry logic."""
     last_alert_time = 0
 
@@ -95,13 +151,22 @@ async def _consume_loop(consumer, db, session, producer):
                         except Exception as parse_err:
                             logger.debug(f"DLQ raw payload JSON parse failed (non-fatal): {parse_err}")
 
-                    # Resolve retry count from envelope or nested event payload
+                    # Resolve the retry count.
+                    #
+                    # This was read from and written to `raw_data["raw_payload"]`,
+                    # a key only event-shaped messages carry. An ontology
+                    # proposal is {entity_id, action, data} and has no such key,
+                    # so the count was never persisted: the republished message
+                    # failed again, was wrapped in a fresh envelope with no
+                    # counter, and resolved to 0 on every pass. The `< 3`
+                    # ceiling was unreachable and the retry could not terminate.
+                    #
+                    # The counter now lives in Redis under a fingerprint of the
+                    # message itself, which every payload shape has.
+                    fingerprint = _message_fingerprint(original_topic, raw_data)
                     retry_count = payload.get("retry_count")
                     if retry_count is None:
-                        if isinstance(raw_data, dict):
-                            retry_count = raw_data.get("raw_payload", {}).get("_sentinel_retry_count", 0)
-                        else:
-                            retry_count = 0
+                        retry_count = await _get_retry_count(redis_client, fingerprint)
 
                     # 1. Evaluate Retry vs Permanent Failure
                     is_poison_pill = not isinstance(raw_data, dict) or any(
@@ -111,26 +176,27 @@ async def _consume_loop(consumer, db, session, producer):
                             "type=", "input_value=", "rawevent", "dict expected", "unparseable"
                         )
                     )
-                    
-                    if retry_count < 3 and original_topic != "unknown" and not is_poison_pill:
+
+                    if retry_count < MAX_RETRIES and original_topic != "unknown" and not is_poison_pill:
                         retry_count += 1
-                        logger.info(f"Retrying failed event from {original_topic}, attempt {retry_count}")
-                        # Exponential backoff based on retry count
-                        await asyncio.sleep(2 ** retry_count)
-                        
-                        # Propagate retry count in event payload to prevent infinite retry loops
-                        if isinstance(raw_data, dict) and "raw_payload" in raw_data:
-                            raw_data["raw_payload"]["_sentinel_retry_count"] = retry_count
-                        
-                        payload["retry_count"] = retry_count
-                        try:
-                            await producer.send(original_topic, raw_data) # Send raw data back
-                            continue # Skip DB insertion since it was retried
-                        except Exception as e:
-                            logger.error(f"Failed to re-publish to {original_topic}: {e}")
-                    
+                        await _set_retry_count(redis_client, fingerprint, retry_count)
+                        logger.info(
+                            f"Retrying failed event from {original_topic}, attempt {retry_count}/{MAX_RETRIES}"
+                        )
+                        # The backoff used to be `await asyncio.sleep(2 ** n)`
+                        # inside this loop, so every dead letter waited behind
+                        # the one before it -- a single worker draining at most
+                        # 0.5 messages a second against a queue of 96,874.
+                        # The republish is now scheduled with its own delay and
+                        # the loop keeps consuming.
+                        safe_create_task(
+                            _republish_after_backoff(producer, original_topic, raw_data, retry_count),
+                            name=f"dlq-retry-{original_topic}",
+                        )
+                        continue
+
                     # 2. Save to PostgreSQL (permanently failed or couldn't retry)
-                    permanently_failed = (retry_count >= 3) or is_poison_pill
+                    permanently_failed = (retry_count >= MAX_RETRIES) or is_poison_pill
                     try:
                         await db.execute("""
                             INSERT INTO failed_events (original_topic, error_message, raw_payload, retry_count, permanently_failed)
@@ -149,7 +215,7 @@ async def _consume_loop(consumer, db, session, producer):
                     now = time.time()
                     if permanently_failed and (now - last_alert_time >= ALERT_COOLDOWN_SECONDS):
                         last_alert_time = now
-                        asyncio.create_task(_send_telegram_alert(session, original_topic, error_msg))
+                        safe_create_task(_send_telegram_alert(session, original_topic, error_msg))
                     
             await consumer.commit()  # Commit offsets after processing the batch
 
@@ -180,13 +246,13 @@ async def main():
     await consumer.start()
 
     # §1.1 Universal heartbeat — silent DLQ death is catastrophic
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "dlq-worker"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "dlq-worker"))
     
     connector = aiohttp.TCPConnector(limit=5)
     
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            await _consume_loop(consumer, db, session, producer)
+            await _consume_loop(consumer, db, session, producer, redis_client)
     finally:
         hb_task.cancel()
         await producer.close()

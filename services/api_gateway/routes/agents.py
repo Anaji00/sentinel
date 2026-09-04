@@ -1,7 +1,7 @@
 import json
 import logging
 from fastapi import APIRouter, Depends, Query
-from services.api_gateway.dependencies import get_redis_client, require_pro
+from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
 from shared.utils.heartbeat import get_all_heartbeats_status
 
 logger = logging.getLogger("api-gateway.agents")
@@ -110,7 +110,7 @@ async def get_agent_processes(redis = Depends(get_redis_client)):
 
 
 @router.get("/swarm", dependencies=[Depends(require_pro("reasoning"))])
-async def get_swarm_intelligence(redis=Depends(get_redis_client)):
+async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get_db)):
     """What the swarm currently believes, as opposed to whether it is running.
 
     /processes answers "are the agents alive". Nothing answered "what have they
@@ -175,6 +175,56 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client)):
     except Exception:
         pass
 
+    # The wargamer's predictions, which until now nothing read.
+    #
+    # agent_predictions had no reader anywhere in the codebase. That is why five
+    # of its six columns could sit at their defaults across all 30 rows without
+    # anything noticing: prediction_id was the literal "wargame_sim", confidence
+    # was 0.0, and correlation_id was empty, so no row could be joined back to
+    # the cluster that caused it. A write-only table cannot report that what it
+    # holds is wrong.
+    #
+    # The correlation_id is matched against the uuid pattern before casting.
+    # Rows written before the field mapping was corrected hold an empty string,
+    # and casting those raises rather than returning null.
+    wargame_predictions = []
+    try:
+        rows = await db.query("""
+            WITH recent AS (
+                SELECT prediction_id, correlation_id, predicted_target,
+                       confidence, recommendations, occurred_at,
+                       CASE WHEN correlation_id ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                            THEN correlation_id::uuid END AS cid
+                FROM agent_predictions
+                ORDER BY occurred_at DESC
+                LIMIT 24
+            )
+            SELECT r.prediction_id, r.correlation_id, r.predicted_target,
+                   r.confidence, r.recommendations, r.occurred_at,
+                   c.rule_name
+            FROM recent r
+            LEFT JOIN correlations c ON c.correlation_id = r.cid
+            ORDER BY r.occurred_at DESC
+        """)
+        for row in rows or []:
+            wargame_predictions.append({
+                "prediction_id": row.get("prediction_id"),
+                "correlation_id": row.get("correlation_id") or None,
+                "predicted_target": row.get("predicted_target"),
+                # Published by the wargamer as cascade_failure_probability and
+                # stored 0-1. It is that probability, not a self-reported
+                # confidence in the prediction, and is labelled accordingly.
+                "cascade_probability": row.get("confidence"),
+                "recommendations": row.get("recommendations") or [],
+                "occurred_at": (
+                    row["occurred_at"].isoformat() if row.get("occurred_at") else None
+                ),
+                "caused_by": row.get("rule_name"),
+            })
+    except Exception as e:
+        # Empty is a real answer here, as everywhere else in this response.
+        logger.debug("Wargame predictions unavailable: %s", e)
+
     calibration = {"paired_forecasts": 0, "resolved": 0}
     try:
         calibration["paired_forecasts"] = int(
@@ -207,5 +257,6 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client)):
             scorecards, key=lambda s: s.get("consensus_weight") or 0, reverse=True
         ),
         "open_predictions": open_predictions,
+        "wargame_predictions": wargame_predictions,
         "calibration": calibration,
     }

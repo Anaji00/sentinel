@@ -376,6 +376,18 @@ class RadarAgent(SentinelAgent):
 
         return closes, "1h"
 
+    # Radar acts on equities and their derivatives. It subscribes to
+    # ENRICHED_EVENTS for those, and that topic is 90% flight_position,
+    # crypto_transfer and vessel_position -- none of which reaches past the
+    # first filter in handle() below. Declaring the types here drops them
+    # before they take a dispatch slot, which is what the 68,937-message
+    # backlog was made of.
+    INTERESTED_EVENT_TYPES = frozenset({
+        "equity_block", "market_anomaly", "options_flow", "volume_anomaly",
+        "earnings_report", "earnings_surprise", "insider_trade",
+        "filing", "thirteen_f", "headline",
+    })
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ticker, z_score, notional_usd = self._extract_radar_params(message)
 

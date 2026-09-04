@@ -121,7 +121,17 @@ def test_the_intel_bulletin_names_its_subject():
     and then sits outside every comparison the swarm exists to make.
     """
     source = (ROOT / "services/agents/knowledge_graph_engine.py").read_text(encoding="utf-8")
-    block = source[source.index("asyncio.create_task(self.publish_bulletin("):]
+    block = source[source.index("safe_create_task(self.publish_bulletin("):]
     block = block[: block.index("ttl_seconds")]
-    assert 'primary_entity_id=message.get("primary_entity_id")' in block
-    assert 'primary_entity_name=message.get("primary_entity_name")' in block
+
+    # Attribution now falls back to the brief's own subject when the message
+    # carries none, which is the case that was actually failing: the message
+    # had no primary_entity_id, so reading only from it produced a bulletin
+    # about an aircraft that named no aircraft.
+    assert "primary_entity_id=subject_id" in block
+    assert "primary_entity_name=subject_name" in block
+
+    resolution = source[source.index("subject_id = "):source.index("safe_create_task(self.publish_bulletin(")]
+    assert 'message.get("primary_entity_id")' in resolution, "the message is still asked first"
+    assert "brief.primary_entity" in resolution, "the brief must be the fallback"
+    assert "brief.entities" in resolution, "and its entity list the last resort"

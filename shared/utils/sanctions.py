@@ -13,6 +13,7 @@ Phase 2: replace keyword matching with full OFAC SDN list sync
 """
 
 import logging
+import re
 from typing import List
 
 logger = logging.getLogger("shared.sanctions")
@@ -22,6 +23,28 @@ try:
     HAS_AHOCORASICK = True
 except ImportError:
     HAS_AHOCORASICK = False
+
+# ── Matching discipline ───────────────────────────────────────────────────────
+# A vessel name is matched against sanctions keywords by containment. Two rules
+# below exist because the naive form of that test produced 812 falsely flagged
+# vessels from 243 keywords, 336 of them from four-character tokens:
+#
+#   "ific" matched PACIFIC.  "chem" matched every chemical tanker.
+#   "star", "atlas", "titan", "maria", "lily" are the commonest words in
+#   merchant-vessel naming and are also surnames on the SDN list.
+#
+# MIN_SYNCED_KEYWORD_LEN  — an auto-synced alias shorter than this cannot
+#   identify anything on its own. The curated list below is exempt: "irgc",
+#   "dprk" and "nioc" are short *because* they are unambiguous.
+# Word-boundary verification — the automaton finds substrings, so every hit is
+#   re-checked against token boundaries before it counts. This is what stops
+#   "ific" inside "PACIFIC" while still matching "PACIFIC" as a whole word.
+MIN_SYNCED_KEYWORD_LEN = 8
+
+# SDN entries typed as individuals are people. Matching a person's surname
+# against a ship's name is what produced most of the false positives, so the
+# sync keeps only vessel and entity (company) rows.
+OFAC_MATCHABLE_TYPES = {"vessel", "entity", "-0-", ""}
 
 SANCTIONED_KEYWORDS = [
     # Iran
@@ -86,19 +109,74 @@ MMSI_COUNTRY: dict = {
 
 _automaton = None
 
+# The curated list is trusted at any length; anything the sync adds must earn
+# its place. Held as a set so the length rule can exempt exactly these.
+_CURATED = {k.lower() for k in SANCTIONED_KEYWORDS}
+
+
+def is_usable_keyword(kw: str) -> bool:
+    """Can this keyword identify a sanctioned party on its own?
+
+    A curated term is trusted however short -- "irgc" and "dprk" are short
+    because they are unambiguous. A synced alias has to be long enough that
+    matching it is evidence: a four-letter token is a fragment or a surname,
+    and both produce false positives at scale.
+    """
+    k = (kw or "").strip().lower()
+    if not k:
+        return False
+    if k in _CURATED:
+        return True
+    if len(k) >= MIN_SYNCED_KEYWORD_LEN:
+        return True
+    # Two or more words is distinctive even when short ("bank melli").
+    return len(k.split()) >= 2 and len(k) >= 6
+
+
+def _matches_on_boundary(haystack: str, needle: str, end_index: int) -> bool:
+    """Verify an automaton hit sits on token boundaries.
+
+    Aho-Corasick reports substrings, which is how "ific" was matching PACIFIC.
+    The characters either side of the hit must not be alphanumeric for it to be
+    a genuine name match rather than a fragment of a longer word.
+    """
+    start = end_index - len(needle) + 1
+    if start > 0 and haystack[start - 1].isalnum():
+        return False
+    after = end_index + 1
+    if after < len(haystack) and haystack[after].isalnum():
+        return False
+    return True
+
+
 def _init_automaton(keywords: List[str] = None):
     global _automaton
     if not HAS_AHOCORASICK:
         return
-        
+
     automaton = ahocorasick.Automaton()
     keywords_to_load = keywords if keywords is not None else SANCTIONED_KEYWORDS
-        
+
+    loaded = 0
     for idx, kw in enumerate(keywords_to_load):
+        if not is_usable_keyword(kw):
+            continue
         automaton.add_word(kw.lower(), (idx, kw))
-        
+        loaded += 1
+
+    if loaded == 0:
+        # Never leave the matcher with an empty automaton: an automaton that
+        # matches nothing and one that was never built are indistinguishable at
+        # the call site, and the second falls through to the slow path.
+        logger.warning("No usable sanctions keywords after filtering; keeping previous automaton.")
+        return
+
     automaton.make_automaton()
     _automaton = automaton  # Atomic pointer swap
+    logger.info(
+        "Sanctions automaton built with %d usable keyword(s) of %d supplied.",
+        loaded, len(keywords_to_load),
+    )
 
 if HAS_AHOCORASICK:
     _init_automaton() # Boot with hardcoded defaults
@@ -145,27 +223,39 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     if not name_lower:
         return flags
 
-    matched = False
+    # Every candidate hit is collected and the longest one wins. Breaking on the
+    # first match recorded whichever term the automaton reached first, so a
+    # vessel matching both a real entity and a junk token was tagged with
+    # whichever came first in insertion order -- an arbitrary provenance on a
+    # flag that drives the CRITICAL tier.
+    matched_kw = None
     if _automaton is not None:
-        # Aho-Corasick fast path: O(N) where N is length of name_lower
+        # Aho-Corasick fast path: O(N) where N is length of name_lower.
+        # Boundary-verified, because the automaton reports substrings.
         for end_index, (insert_order, original_value) in _automaton.iter(name_lower):
-            flags.append("sanctioned_ofac")
-            flags.append(f"sanctioned_kw:{original_value}")
-            matched = True
-            break
+            if not _matches_on_boundary(name_lower, original_value.lower(), end_index):
+                continue
+            if matched_kw is None or len(original_value) > len(matched_kw):
+                matched_kw = original_value
     else:
-        # Fallback slow path
+        # Fallback slow path, held to the same two rules.
         for kw in SANCTIONED_KEYWORDS:
-            if kw in name_lower:
-                flags.append("sanctioned_ofac")
-                flags.append(f"sanctioned_kw:{kw}")
-                matched = True
-                break
+            if not is_usable_keyword(kw):
+                continue
+            if re.search(rf"(?<![0-9a-z]){re.escape(kw.lower())}(?![0-9a-z])", name_lower):
+                if matched_kw is None or len(kw) > len(matched_kw):
+                    matched_kw = kw
 
-    # Fuzzy matching for names >= 5 chars if exact/substring match didn't trigger
-    if not matched and HAS_RAPIDFUZZ and len(name_lower) >= 5:
+    if matched_kw:
+        flags.append("sanctioned_ofac")
+        flags.append(f"sanctioned_kw:{matched_kw}")
+
+    # Fuzzy matching only where an exact match did not trigger, and only for
+    # keywords long enough that near-misses mean something. The old guard was
+    # len(kw) >= 5, which is below the length at which a token is distinctive.
+    if not matched_kw and HAS_RAPIDFUZZ and len(name_lower) >= MIN_SYNCED_KEYWORD_LEN:
         for kw in SANCTIONED_KEYWORDS:
-            if len(kw) >= 5 and fuzz.token_set_ratio(name_lower, kw) >= 88.0:
+            if len(kw) >= MIN_SYNCED_KEYWORD_LEN and fuzz.token_set_ratio(name_lower, kw) >= 92.0:
                 flags.append("sanctioned_ofac")
                 flags.append(f"sanctioned_fuzzy:{kw}")
                 break

@@ -14,6 +14,7 @@ Preserves 100% of existing Kafka topics, Redis keys, and output schemas.
 
 import asyncio
 import json
+import math
 import logging
 import os
 import sys
@@ -23,9 +24,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import _as_probability_value, SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_SLOW_SEC, DEDUP_WINDOW_MEDIUM_SEC
 from shared.kafka import Topics
 from shared.utils import quant_calc
 from shared.utils.tasks import safe_create_task
@@ -58,6 +59,14 @@ TICKER_METADATA_REGISTRY: Dict[str, str] = {
 
 # ── OUTPUT SCHEMAS ────────────────────────────────────────────────────────────
 
+# How long a failed rates evaluation blocks the next attempt.
+#
+# Long enough that a burst of macro ticks does not all evaluate the same hour at
+# once, short enough that a transient failure costs minutes rather than the
+# whole hour the successful path reserves.
+RATES_RETRY_COOLDOWN_SEC = 300
+
+
 class RatesRegimeBrief(BaseModel):
     curve_state: str  # "Inverted", "Disinverted", "Normal Steepening", "Flat"
     yield_spread_2y10y_bps: float
@@ -72,9 +81,36 @@ class RatesRegimeBrief(BaseModel):
 class VolatilitySurfaceBrief(BaseModel):
     ticker: str
     put_call_volume_ratio: float
-    iv_skew_25d_bps: float
+    # Optional, and overwritten with the measured value after inference.
+    #
+    # The model was required to return a float here and was handed the skew in
+    # its prompt, so it echoed it -- which is how a stored brief came to read
+    # -375.0, the product of DEFAULT_CALL_IV and PUT_IV_SKEW, presented as an
+    # observation. Requiring a number from a model that has not measured one
+    # guarantees a fabricated number; the measurement belongs to the caller and
+    # the analysis belongs to the model.
+    iv_skew_25d_bps: Optional[float] = None
     volatility_regime: str
     tail_risk_conviction: float
+
+    @field_validator("tail_risk_conviction", mode="before")
+    @classmethod
+    def _conviction_is_a_probability(cls, value):
+        """The third field to carry this defect, and the third to be bounded.
+
+        AgentPrediction.conviction was fixed after a model wrote 55.0 into it,
+        and the note on that fix said the repair belonged on the shared contract
+        rather than the one caller that exposed it. AgentBulletin.conviction was
+        the second. This is a bare float on the brief model, filled by the same
+        models, with the same 0.0-1.0 intent in its name and nothing enforcing
+        it -- a live brief carried 49.47.
+
+        It is worse here than an overweighted opinion. The model reads its own
+        output back when it writes analytical_summary, and reported the number
+        as an implied volatility level: "the implied volatility regime is stable
+        at 49.47%", on a surface whose skew is explicitly not measured.
+        """
+        return _as_probability_value(value)
     hedging_recommendations: List[str] = Field(default_factory=list)
     analytical_summary: str
 
@@ -89,6 +125,105 @@ class UnifiedMacroAssessment(BaseModel):
 
 # ── CONSOLIDATED MACRO ENGINE ──────────────────────────────────────────────────
 
+# There is no assumed implied volatility any more.
+#
+# DEFAULT_CALL_IV = 0.25 and PUT_IV_SKEW = 1.15 stood here, and _as_iv ended its
+# fallback chain in them. Their product was published as a measured 25-delta
+# skew of 375.0 bps on every surface whose IVs were not cached -- which is most
+# of them, since 75.5% of options events carry no implied volatility at all.
+# A surface with nothing observed now reports "not measured".
+
+
+def _measured_iv(cached, measured):
+    """An implied volatility that was actually observed, or None.
+
+    Replaces the fallback chain that ended in DEFAULT_CALL_IV. Returning None
+    is what lets the caller distinguish an unmeasured surface from a flat one,
+    and a stated "not measured" is a fact the analyst needs where a plausible
+    0.25 is a fabrication the analyst cannot see.
+    """
+    for candidate in (cached, measured):
+        if candidate is None:
+            continue
+        try:
+            if isinstance(candidate, bytes):
+                candidate = candidate.decode("utf-8")
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+# Statistical guards on the macro/equity correlation, matching the ones the peer
+# graph already applies to the same hazard.
+#
+# The peer graph published six pairs at |r| = 1.000 on its first live run,
+# because twelve macro anchors were being polled every thirty seconds and
+# republished unchanged: a series of one repeated print correlates perfectly
+# with any other series of one repeated print on the few bars that did move.
+# It gained a distinct-value ratio and a significance test; this path, doing the
+# same arithmetic on the same feeds, did not.
+MIN_CORRELATION_RETURNS = 14
+INVERSE_CORRELATION_THRESHOLD = -0.55
+
+# A series that is mostly one repeated value is not a price history. 0.40 is the
+# peer graph's figure, kept identical so the two agree about what stale means.
+MIN_DISTINCT_RATIO = 0.40
+
+# Two-tailed p < 0.01, the peer graph's bar. At fourteen returns a coefficient
+# of -0.55 clears the naive threshold above and lands near p = 0.04, which is
+# not a finding worth publishing as "strong".
+MAX_CORRELATION_P_VALUE = 0.01
+
+
+def _both_series_move(x_vec, y_vec) -> bool:
+    """Whether either leg is mostly a repeated print."""
+    for series in (x_vec, y_vec):
+        values = list(series or [])
+        if not values:
+            return False
+        if (len(set(values)) / len(values)) < MIN_DISTINCT_RATIO:
+            return False
+    return True
+
+
+def _is_significant(pearson_corr: float, n_returns: int) -> bool:
+    """Two-tailed Student-t test on the correlation coefficient."""
+    if n_returns < 3:
+        return False
+    r = max(-0.999999, min(0.999999, float(pearson_corr)))
+    try:
+        from scipy import stats
+        t = r * math.sqrt((n_returns - 2) / (1.0 - r * r))
+        p = 2.0 * (1.0 - stats.t.cdf(abs(t), n_returns - 2))
+    except Exception:
+        # Without scipy, require a coefficient strong enough that p < 0.01 holds
+        # for any sample this path accepts rather than guessing at the p-value.
+        return abs(r) >= 0.66
+    return p <= MAX_CORRELATION_P_VALUE
+
+
+def _render_metrics(rows: Optional[List[Dict[str, Any]]], label: str) -> str:
+    """How a metrics query's result is stated to the model.
+
+    `[]` was used for both "the query failed" and "the window was empty", and
+    those are opposite claims. A model reading `Sector Risk Metrics: []` sees
+    the strongest available statement that nothing is wrong -- produced, in the
+    failure case, by an outage. Absence of evidence was being rendered as
+    evidence of absence, in the one place least able to tell the difference.
+    """
+    if rows is None:
+        return (
+            f"UNAVAILABLE - the {label} query failed this cycle. "
+            f"This is missing data, not an absence of risk; do not treat it as reassurance."
+        )
+    if not rows:
+        return f"[] - queried successfully, no {label} rows in the last 24 hours."
+    return json.dumps(rows, separators=(',', ':'), default=str)
+
+
 class MacroIntelligenceEngine(SentinelAgent):
     """
     Unified Macro Intelligence Engine.
@@ -102,7 +237,7 @@ class MacroIntelligenceEngine(SentinelAgent):
 
     async def run(self):
         """Launches background scheduled macro trend reviews alongside the reactive handler."""
-        review_task = asyncio.create_task(self._run_scheduled_macro_review())
+        review_task = safe_create_task(self._run_scheduled_macro_review())
         try:
             await super().run()
         finally:
@@ -153,6 +288,18 @@ class MacroIntelligenceEngine(SentinelAgent):
     # ── SUB-ENGINE 1: RATES & REGIME ──────────────────────────────────────────
 
     async def _process_rates_and_macro_regime(self, message: Dict[str, Any], ticker: str) -> Optional[Dict[str, Any]]:
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
+
         # Single atomic Redis mget for all macro quote dependencies
         keys = [
             "sentinel:quotes:latest:US2Y",
@@ -229,9 +376,21 @@ class MacroIntelligenceEngine(SentinelAgent):
             await pipe.execute()
 
         dedup_key = f"macro_regime:{int(time.time() // 3600)}"
-        if await self.is_recently_processed(dedup_key, window_seconds=3600):
+        if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_SLOW_SEC):
             return None
-        await self.mark_processed(dedup_key, window_seconds=3600)
+        # Claimed briefly here, confirmed for the full hour only on success.
+        #
+        # This marked the hour as done before the work was attempted, so a
+        # failure still consumed the slot. Observed exactly that: the first
+        # evaluation ever to get past the yield guard crashed two seconds later
+        # on an unguarded format, and the engine then declined to try again for
+        # an hour -- while the inputs it had been missing arrived four minutes
+        # after the crash.
+        #
+        # A short claim still stops the same hour being evaluated concurrently
+        # by every macro tick that arrives, which is what the dedup is for; it
+        # just no longer treats "we tried and failed" as "we have a reading".
+        await self.mark_processed(dedup_key, window_seconds=RATES_RETRY_COOLDOWN_SEC)
 
         logger.info(f"📊 Macro Rates Evaluation | 2Y: {y2:.2f}% | 10Y: {y10:.2f}% | Spread: {spread_2y10y_bps:+.1f} bps")
 
@@ -241,6 +400,20 @@ class MacroIntelligenceEngine(SentinelAgent):
             f"{breakeven_inflation_bps:.1f} bps" if breakeven_inflation_bps is not None
             else "not measured"
         )
+        # Guarded like the two above it, which it was not.
+        #
+        # credit_ratio is None whenever HYG or LQD is missing, and it went into
+        # the prompt as {credit_ratio:.4f} with no check, so the whole rates
+        # path died on:
+        #
+        #   unsupported format string passed to NoneType.__format__
+        #
+        # It had never run. The function returns early unless both US2Y and
+        # US10Y are present, and nothing wrote those keys until this session, so
+        # this line was unreachable for the life of the deployment -- and the
+        # first evaluation that got past the yield guard hit it two seconds
+        # later, losing the brief, both Redis keys and the bulletin.
+        credit_str = f"{credit_ratio:.4f}" if credit_ratio is not None else "not measured"
 
         cross_context = await self.get_cross_agent_context(ticker="US10Y", limit=2)
         cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
@@ -251,7 +424,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         - 2Y-10Y Spread: {spread_2y10y_bps:+.1f} bps
         - 10Y TIPS Real Yield: {tips_str}
         - Breakeven Inflation: {breakeven_str}
-        - HYG/LQD Credit Ratio: {credit_ratio:.4f}
+        - HYG/LQD Credit Ratio: {credit_str}
         {cross_block}
         """
 
@@ -285,7 +458,21 @@ class MacroIntelligenceEngine(SentinelAgent):
             await self.redis.raw.set("sentinel:macro:latest_rates_regime", json.dumps(res_payload["brief"]), ex=86400)
 
             # Publish structured AgentBulletin for Consensus Engine
-            direction = "down" if "inverted" in brief.curve_state.lower() else "up"
+            # The 2s10s spread is in this same object, computed from measured
+            # yields. The direction was taken by searching curve_state for the
+            # substring "inverted" -- a field declared as one of four enum values
+            # that live holds a whole sentence ("The Treasury yield curve shows a
+            # steep upward trend..."), so "no longer inverted" and "not inverted",
+            # both natural ways to describe an upward curve, publish "down".
+            #
+            # An inverted curve is a negative spread. That is the definition, and
+            # the number is right here.
+            if spread_2y10y_bps is None:
+                direction = "neutral"
+            elif spread_2y10y_bps < 0:
+                direction = "down"
+            else:
+                direction = "up"
             safe_create_task(
                 self.publish_bulletin(
                     bulletin_type="regime_change",
@@ -299,15 +486,116 @@ class MacroIntelligenceEngine(SentinelAgent):
                 name="macro-rates-bulletin"
             )
 
+            # The unified assessment the rest of the swarm has been subscribed to.
+            #
+            # agents.macro.assessment carries zero messages and has six
+            # subscribers: Topics.MACRO_ASSESSMENT appears seven times in the
+            # tree as a subscription and never once as a send, and
+            # UnifiedMacroAssessment -- the model it would carry -- was defined
+            # and never instantiated. Six agents declared a dependency on a
+            # capability the system did not have, each one a consumer-group
+            # assignment and a rebalance participant for a topic that has never
+            # had a producer.
+            #
+            # Both halves of the assessment now exist: the rates brief is in
+            # hand here, and the volatility surface is cached by the sub-engine
+            # that produces it. Publishing what is measured -- and saying so
+            # when the second half has not been -- is what makes those seven
+            # subscription edges mean something.
+            await self._publish_macro_assessment(brief, res_payload)
+
+            # Confirmed only now, with a brief actually in hand.
+            await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_SLOW_SEC)
             return res_payload
 
         except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Rates regime LLM error: {e}")
             return None
 
+    async def _publish_macro_assessment(self, rates_brief, rates_payload: Dict[str, Any]) -> None:
+        """Assemble and publish the unified macro assessment.
+
+        The volatility half is read from the cache the surface sub-engine writes
+        rather than being recomputed: an assessment is a view of what has been
+        measured, and forcing a second inference to fill it in would spend a slot
+        on a host that completes about thirty-five an hour to restate something
+        already known.
+        """
+        try:
+            vol_brief = None
+            try:
+                cached = await self.redis.raw.get("sentinel:options:vol_surface:latest")
+                if cached:
+                    vol_brief = VolatilitySurfaceBrief(
+                        **json.loads(cached.decode() if isinstance(cached, bytes) else cached)
+                    )
+            except Exception as ve:
+                logger.debug(f"No cached volatility surface for the macro assessment: {ve}")
+
+            risk_map = {"LOW": 0.2, "MODERATE": 0.5, "ELEVATED": 0.7, "HIGH": 0.85, "CRITICAL": 0.95}
+            macro_risk_score = risk_map.get(str(rates_brief.macro_risk_level).upper(), 0.5)
+
+            catalysts = []
+            spread = (rates_payload.get("metrics") or {}).get("spread_2y10y_bps")
+            if spread is not None and float(spread) < 0:
+                # A negative 2s10s is an inversion by definition, which is the
+                # measurement the direction signal now reads instead of grepping
+                # a paragraph for the word.
+                catalysts.append(f"2s10s inverted at {float(spread):+.1f}bps")
+            if rates_brief.credit_spread_widening_signal:
+                catalysts.append(str(rates_brief.credit_spread_widening_signal))
+            if vol_brief is not None and vol_brief.iv_skew_25d_bps is not None:
+                catalysts.append(f"25d skew {vol_brief.iv_skew_25d_bps:+.0f}bps")
+
+            summary = (
+                f"Rates {rates_brief.curve_state}; risk {rates_brief.macro_risk_level}"
+                + (f"; vol regime {vol_brief.volatility_regime}" if vol_brief else
+                   "; volatility surface not measured this cycle")
+            )
+
+            payload = {
+                "agent": self.name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "rates_regime": rates_brief.model_dump(),
+                # Stated as absent rather than filled with a plausible default:
+                # this file has already published a fabricated 375bp skew once,
+                # from exactly that instinct.
+                "volatility_regime": vol_brief.model_dump() if vol_brief else None,
+                "macro_risk_score": macro_risk_score,
+                "strategic_summary": summary,
+                "key_catalysts": catalysts,
+                "metrics": rates_payload.get("metrics", {}),
+            }
+
+            if self._producer:
+                await self._producer.send(Topics.MACRO_ASSESSMENT, payload, key="macro")
+            await self.redis.raw.set(
+                "sentinel:macro:assessment:latest", json.dumps(payload), ex=86400
+            )
+            logger.info(
+                "Published unified macro assessment (risk %.2f, %d catalyst(s), volatility %s).",
+                macro_risk_score, len(catalysts), "measured" if vol_brief else "not measured",
+            )
+        except Exception as e:
+            # An assessment that cannot be assembled must not take the rates
+            # brief down with it -- that brief is the thing that took an
+            # inference to produce.
+            logger.warning(f"Macro assessment publish skipped: {e}")
+
     # ── SUB-ENGINE 2: OPTIONS VOLATILITY SURFACE ─────────────────────────────
 
     async def _process_volatility_surface(self, message: Dict[str, Any], ticker: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
         fd = message.get("financial_data") or {}
         option_type = str(raw.get("option_type") or fd.get("side") or "CALL").upper()
         size = int(raw.get("size") or raw.get("volume") or fd.get("volume") or 1)
@@ -330,19 +618,56 @@ class MacroIntelligenceEngine(SentinelAgent):
         puts_vol = int(vals[1] or (size if option_type == "PUT" else 100))
         pc_ratio = round(puts_vol / max(1, calls_vol), 3)
 
-        call_iv_val = float(vals[2].decode("utf-8") if isinstance(vals[2], bytes) else (vals[2] or (measured_iv if option_type == "CALL" else 0.25)))
-        put_iv_val = float(vals[3].decode("utf-8") if isinstance(vals[3], bytes) else (vals[3] or (measured_iv if option_type == "PUT" else call_iv_val * 1.15)))
+        # measured_iv is frequently absent, and this read path did not allow for
+        # it while the write path four lines above already did.
+        #
+        # For a CALL with nothing cached, `vals[2] or (measured_iv if CALL ...)`
+        # resolved to None whenever the payload carried no implied_volatility,
+        # and float(None) raised. The dispatcher caught it as a transient error
+        # and moved on, so the failure was invisible except as a count:
+        #
+        #   Transient or unhandled dispatch error: float() argument must be a
+        #   string or a real number, not 'NoneType'    x516 in one day
+        #
+        # Every options_flow message without an IV field killed this agent's
+        # dispatch, which is most of them. The engine has been producing nothing.
+        call_iv = _measured_iv(vals[2], measured_iv if option_type == "CALL" else None)
+        put_iv = _measured_iv(vals[3], measured_iv if option_type == "PUT" else None)
 
-        call_iv = call_iv_val
-        put_iv = put_iv_val
-        iv_skew_bps = round((put_iv - call_iv) * 10000.0, 1)
+        # A skew needs both legs measured.
+        #
+        # This computed one regardless, from DEFAULT_CALL_IV and PUT_IV_SKEW:
+        #
+        #   call_iv = 0.25            (assumed)
+        #   put_iv  = 0.25 * 1.15     (assumed, derived from the assumption)
+        #   skew    = (0.2875 - 0.25) * 10000 = 375.0 bps, always
+        #
+        # and published it as a measurement. A stored brief reads
+        # "iv_skew_25d_bps": -375.0 with "tail_risk_conviction": 1.0 -- maximum
+        # confidence in the product of two constants. 75.5% of options events
+        # carry no implied volatility at all, so this was the ordinary case
+        # rather than an edge one, and the assumed 0.25 is less than half the
+        # 0.5382 median of the IVs that do arrive.
+        #
+        # One measured leg is not enough either: a skew between a real number
+        # and an assumed one measures the assumption.
+        iv_skew_bps = (
+            round((put_iv - call_iv) * 10000.0, 1)
+            if (call_iv is not None and put_iv is not None) else None
+        )
+        skew_str = f"{iv_skew_bps:+.1f} bps" if iv_skew_bps is not None else "not measured"
+        call_iv_str = f"{call_iv:.2%}" if call_iv is not None else "not measured"
+        put_iv_str = f"{put_iv:.2%}" if put_iv is not None else "not measured"
 
         dedup_key = f"vol_surface_eval:{ticker}:{int(time.time() // 1800)}"
-        if await self.is_recently_processed(dedup_key, window_seconds=1800):
+        if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC):
             return None
-        await self.mark_processed(dedup_key, window_seconds=1800)
+        await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC)
 
-        logger.info(f"⚡ Options Vol Surface | {ticker} | P/C Ratio: {pc_ratio:.2f} | IV Skew: {iv_skew_bps:+.1f} bps")
+        logger.info(
+            "⚡ Options Vol Surface | %s | P/C Ratio: %.2f | IV Skew: %s",
+            ticker, pc_ratio, skew_str,
+        )
 
         global_context, cross_context = await asyncio.gather(
             self.fetch_global_context(),
@@ -354,8 +679,8 @@ class MacroIntelligenceEngine(SentinelAgent):
         Evaluate options surface metrics:
         - Symbol: {ticker}
         - P/C Ratio: {pc_ratio:.3f}
-        - 25D IV Skew: {iv_skew_bps:+.1f} bps
-        - Call IV: {call_iv:.2%} | Put IV: {put_iv:.2%}
+        - 25D IV Skew: {skew_str}
+        - Call IV: {call_iv_str} | Put IV: {put_iv_str}
 
         GLOBAL CONTEXT:
         {global_context}
@@ -370,6 +695,10 @@ class MacroIntelligenceEngine(SentinelAgent):
                 schema=VolatilitySurfaceBrief,
                 temperature=0.1,
             )
+
+            # The measured value wins over whatever the model wrote, including
+            # None when neither leg of the surface was observed.
+            brief.iv_skew_25d_bps = iv_skew_bps
 
             res_payload = {
                 "agent": self.name,
@@ -391,9 +720,9 @@ class MacroIntelligenceEngine(SentinelAgent):
             await self._producer.send(Topics.VOL_SURFACE, res_payload, key=ticker)
 
             # Publish structured AgentBulletin
-            asyncio.create_task(self.publish_bulletin(
+            safe_create_task(self.publish_bulletin(
                 bulletin_type="alert",
-                summary=f"Vol Surface {ticker}: P/C {pc_ratio:.2f}, Skew {iv_skew_bps:+.0f}bps ({brief.volatility_regime})",
+                summary=f"Vol Surface {ticker}: P/C {pc_ratio:.2f}, Skew {skew_str} ({brief.volatility_regime})",
                 ticker=ticker,
                 conviction=brief.tail_risk_conviction,
                 expected_direction="down" if pc_ratio > 1.5 else "neutral",
@@ -401,7 +730,15 @@ class MacroIntelligenceEngine(SentinelAgent):
                 ttl_seconds=3600,
             ))
 
-            return res_payload
+            # Deliberately returns nothing.
+            #
+            # The agent's output_topic is RATES_REGIME, and the base publishes
+            # whatever a handler returns to it. This path already publishes to
+            # VOL_SURFACE above, so returning the payload put a
+            # VolatilitySurfaceBrief on agents.macro.rates_regime -- it was the
+            # most recent message on that topic, and any consumer reading it for
+            # a curve state received an options surface instead.
+            return None
 
         except (SchemaViolationError, InferenceError) as e:
             logger.error(f"Vol surface LLM error for {ticker}: {e}")
@@ -476,10 +813,12 @@ class MacroIntelligenceEngine(SentinelAgent):
             y_arr = np.array(y_vec)
             x_returns = np.diff(np.log(np.maximum(1e-4, x_arr)))
             y_returns = np.diff(np.log(np.maximum(1e-4, y_arr)))
-            if len(x_returns) >= 14:
+            if len(x_returns) >= MIN_CORRELATION_RETURNS and _both_series_move(x_vec, y_vec):
                 corr_matrix = np.corrcoef(x_returns, y_returns)
                 pearson_corr = float(corr_matrix[0, 1])
-                if not np.isnan(pearson_corr) and pearson_corr <= -0.55:
+                if (not np.isnan(pearson_corr)
+                        and pearson_corr <= INVERSE_CORRELATION_THRESHOLD
+                        and _is_significant(pearson_corr, len(x_returns))):
                     reasoning = f"Strong inverse correlation ({pearson_corr:.2f}) detected: Rising {macro_asset} (${x_vec[-1]:.2f}) is exerting margin pressure on {micro_ticker} (${y_vec[-1]:.2f})."
                     logger.warning(f"🔴 DYNAMIC MACRO SHOCK | {reasoning}")
                     await self.redis.raw.set(
@@ -537,7 +876,15 @@ class MacroIntelligenceEngine(SentinelAgent):
                 if micro_ticker in TICKER_METADATA_REGISTRY:
                     payload["micro_ticker_name"] = TICKER_METADATA_REGISTRY[micro_ticker]
 
-                await self.redis.raw.set("sentinel:macro:decoupling:latest", json.dumps(payload), ex=3600)
+                # Published to the topic only.
+                #
+                # This also wrote sentinel:macro:decoupling:latest, which
+                # nothing read. Unlike the macro brief, there is no case for
+                # ambient access here: MACRO_DECOUPLING has two live consumers
+                # and 33,667 messages through it, and a decoupling is an event
+                # about a moment rather than a standing state worth carrying
+                # into every prompt. The last one is only "latest" until the
+                # next tick.
                 await self._producer.send(Topics.MACRO_DECOUPLING, payload, key=macro_asset)
 
     # ── SUB-ENGINE 4: SCHEDULED MACRO TREND REVIEWS ──────────────────────────
@@ -552,6 +899,17 @@ class MacroIntelligenceEngine(SentinelAgent):
             await asyncio.sleep(300)
 
     async def _run_macro_review_now(self, trigger_event: Optional[dict] = None):
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
         logger.info("Initiating Master Macro Trend Review...")
         cooccurrence = await self.redis.raw.zrevrange("sentinel:ontology:cooccurrence", 0, 10, withscores=True)
 
@@ -563,8 +921,13 @@ class MacroIntelligenceEngine(SentinelAgent):
         """
         try:
             event_type_metrics = await self.db.query(query)
-        except Exception:
-            event_type_metrics = []
+        except Exception as e:
+            # None, not []. An empty list is a claim -- "nothing happened in the
+            # last 24 hours" -- and this branch does not know that. It knows the
+            # query failed. Rendered below as an explicit unavailability so the
+            # model is not told the world is calm because the database was down.
+            self.logger.warning("Event-type metrics query failed: %s", e)
+            event_type_metrics = None
 
         # Real sector-level metrics (populated once Phase 2 ref data is live)
         sector_query = """
@@ -579,8 +942,9 @@ class MacroIntelligenceEngine(SentinelAgent):
         """
         try:
             sector_metrics = await self.db.query(sector_query)
-        except Exception:
-            sector_metrics = []
+        except Exception as e:
+            self.logger.warning("Sector risk metrics query failed: %s", e)
+            sector_metrics = None
 
         global_context, agent_memories = await asyncio.gather(
             self.fetch_global_context(),
@@ -589,8 +953,8 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         user_prompt = f"""=== SYSTEMIC MACRO INTELLIGENCE REVIEW ===
 Ontology Co-occurrences: {cooccurrence}
-Event Type Distribution Metrics: {json.dumps(event_type_metrics, separators=(',', ':'), default=str)}
-Sector Risk Metrics: {json.dumps(sector_metrics, separators=(',', ':'), default=str)}
+Event Type Distribution Metrics: {_render_metrics(event_type_metrics, "event-type distribution")}
+Sector Risk Metrics: {_render_metrics(sector_metrics, "sector risk")}
 Global Macro Context: {global_context}
 {agent_memories}
 

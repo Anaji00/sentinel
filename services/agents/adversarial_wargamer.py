@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, InferenceShed
 from shared.kafka import Topics
 from shared.utils.tasks import safe_create_task
+from shared.utils.text import clip
 
 logger = logging.getLogger("agent.adversarial_wargamer")
 
@@ -250,17 +251,27 @@ class AdversarialWargamerAgent(SentinelAgent):
             self.logger.info(
                 f"⚔️ WARGAME COMPLETED | Target: {synthesis.predicted_next_target_entity_id} | "
                 f"Cascade Risk: {synthesis.cascade_failure_probability}% | "
-                f"Vuln: {synthesis.primary_vulnerability_isolated[:60]}"
+                f"Vuln: {clip(synthesis.primary_vulnerability_isolated, 60)}"
             )
 
             # Record prediction on agent scorecard
             if synthesis.predicted_next_target_entity_id and synthesis.predicted_next_target_entity_id != "NONE":
+                # An entity claim, not a price one.
+                #
+                # This recorded against the directional scorer, which wants a
+                # price for a "ticker" like "airlines, airports" -- and rejects
+                # the record outright anyway, because entry_price=0.0 is falsy
+                # and its first guard tests exactly that. Every wargame
+                # prediction ever made was stored and left permanently
+                # unresolved, so the agent's Brier score never moved off its
+                # 0.5 starting value no matter how well or badly it predicted.
                 await self.record_prediction(
                     ticker=synthesis.predicted_next_target_entity_id,
                     direction="bearish" if synthesis.cascade_failure_probability >= 50 else "neutral",
                     conviction=min(1.0, synthesis.cascade_failure_probability / 100.0),
                     entry_price=0.0,
-                    time_horizon_hours=24
+                    time_horizon_hours=24,
+                    prediction_kind="entity_appearance",
                 )
 
             # Publish structured AgentBulletin for Consensus Engine & UI

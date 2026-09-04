@@ -22,8 +22,67 @@ from typing import Dict, List, Any, Optional
  
 from shared.db import get_timescale, get_neo4j
 from shared.models import CorrelationCluster
+from shared.models.events import UNRATED_EDGE_CONFIDENCE
  
 logger = logging.getLogger("reasoning.context")
+
+def _money(value) -> str:
+    """A dollar figure at a unit that shows it."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}k"
+    return f"${v:.0f}"
+
+
+def _financial_facts(evt: dict) -> str:
+    """The structured facts a headline does not carry.
+
+    Deliberately terse. This is appended to every financial row in a prompt
+    already cut to a character budget, so it earns its space by carrying only
+    what the prose cannot: sector, because contagion runs along it; notional,
+    because premium is what a position cost and notional is what it controls,
+    and on a live sweep the two differed by 34x; and strike and expiry, because
+    a directional bet is not readable without them.
+    """
+    fin = evt.get("financial_data") or {}
+    if not isinstance(fin, dict):
+        return ""
+
+    parts = []
+    sector = fin.get("sector")
+    if sector:
+        parts.append(str(sector)[:18])
+
+    # Appended only if it formats. A truthy-but-unparseable value such as the
+    # string "abc" otherwise yields a bare "notional " that tells the model
+    # less than nothing.
+    notional = _money(fin.get("notional_usd"))
+    if notional:
+        parts.append(f"notional {notional}")
+
+    strike, expiry = fin.get("strike"), fin.get("expiry")
+    try:
+        if strike is not None and expiry:
+            parts.append(f"K{float(strike):g}@{str(expiry)[:10]}")
+    except (TypeError, ValueError):
+        pass
+
+    iv = fin.get("implied_volatility")
+    if iv:
+        try:
+            parts.append(f"IV{float(iv) * 100:.0f}%")
+        except (TypeError, ValueError):
+            pass
+
+    return f" [{'; '.join(parts)}]" if parts else ""
+
 
 class ContextBuilder:
     def __init__(self, db_client):
@@ -99,11 +158,20 @@ class ContextBuilder:
             headline = evt.get("headline") or evt.get("summary")
             if headline:
                 detail = str(headline)[:60]
+                # The headline is prose and carries none of the structured
+                # fields the enrichment layer works to attach. A financial
+                # event always has one, so this branch made the financial
+                # detail below unreachable and the model never saw a sector or
+                # a notional -- the two facts that let it reason about which
+                # other issuers a move should touch, and how large the position
+                # actually is as opposed to what it cost.
+                detail += _financial_facts(evt)
             elif evt.get("financial_data"):
                 fin = evt["financial_data"]
                 ticker = fin.get("ticker", "")
                 prem = fin.get("premium_usd")
                 detail = f"{ticker} Prem: ${prem:,.0f}" if prem else f"Financial {ticker}"
+                detail += _financial_facts(evt)
             elif evt.get("vessel_data"):
                 vessel = evt["vessel_data"]
                 mmsi = vessel.get("mmsi", "")
@@ -191,10 +259,10 @@ class ContextBuilder:
                        coalesce(n.name, n.mmsi, n.id) as connected,
                        labels(n) as labels,
                        coalesce(r[0].weight, 1.0) as weight,
-                       coalesce(r[0].confidence, 0.8) as confidence,
+                       coalesce(r[0].confidence, $unrated) as confidence,
                        coalesce(r[0].last_updated, r[0].updated_at, 0) as last_updated
                 LIMIT 100
-            """, {"ids": targets})
+            """, {"ids": targets, "unrated": UNRATED_EDGE_CONFIDENCE})
             
             flag_task = neo4j_client.query("""
                 MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
@@ -217,7 +285,7 @@ class ContextBuilder:
                 # Exponential decay: 30-day half-life decay factor
                 age_days = max(0.0, (now_ts - updated_s) / 86400.0) if updated_s > 0 else 60.0
                 decay_factor = math.exp(-0.693 * age_days / 30.0) if age_days < 365.0 else 0.05
-                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", 0.8))
+                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", UNRATED_EDGE_CONFIDENCE))
                 decayed_weight = round(base_weight * decay_factor, 4)
                 
                 r_enriched = dict(r)

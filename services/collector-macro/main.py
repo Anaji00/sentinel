@@ -43,6 +43,8 @@ from shared.kafka import SentinelProducer, Topics
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
+from shared.utils.tasks import safe_create_task
 
 try:
     from economic_calendar import EconomicCalendarCollector
@@ -73,7 +75,13 @@ MACRO_TICKERS = {
     "ES=F": "S&P 500 Futures",
     "VXX":  "Volatility Index ETN",
     "TIP":  "iShares TIPS Bond ETF",
-    "TLT":  "20+ Year Treasury Bond ETF"
+    "TLT":  "20+ Year Treasury Bond ETF",
+    # Read by the macro engine for the credit spread and tracked by nothing.
+    # The quote cache is populated from the tradfi collector's equity
+    # watchlist, which is where these two fell between the desks: they are
+    # macro instruments, so they belong to the macro collector.
+    "HYG":  "High Yield Corporate Bond ETF",
+    "LQD":  "Investment Grade Corporate Bond ETF",
 }
 
 # Proxy ETF map for Alpaca & Finnhub APIs
@@ -305,6 +313,158 @@ async def fetch_live_sofr_rate(session: aiohttp.ClientSession) -> dict:
 _last_published: Dict[str, tuple] = {}
 
 
+# Constant-maturity Treasury yields, published daily by the Treasury itself.
+#
+# The macro engine reads sentinel:quotes:latest:US2Y and :US10Y and refuses to
+# publish a rates regime without both. Nothing in the codebase had ever written
+# either key, so the refusal was permanent: every 2s10s spread, curve-inversion
+# signal and rates regime this platform could produce was unavailable, and the
+# engine correctly logged that it was skipping rather than inventing a curve.
+#
+# The audit's standing note said closing this needed a data source rather than a
+# code change, and named FRED -- which requires an API key nobody had issued.
+# The Treasury publishes the same constant-maturity series itself, as CSV, with
+# no key and no registration.
+TREASURY_YIELD_CSV = (
+    "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+    "daily-treasury-rates.csv/{year}/all"
+    "?type={series}&field_tdr_date_value={year}&page&_format=csv"
+)
+
+# A yield, not a price. The TIP ETF trades near 107 and was once written to a
+# yield key, which produced a fabricated 230bp breakeven; the macro engine now
+# rejects that on read, and this rejects it on write.
+YIELD_PLAUSIBLE_RANGE = (-5.0, 25.0)
+
+# Column headings in the Treasury CSVs.
+#
+# The two series do not agree on capitalisation -- the nominal curve publishes
+# "10 Yr" and the real curve "10 YR" -- so they are listed separately rather
+# than shared. A single map would have matched one series and silently returned
+# nothing for the other, which is the failure mode this whole collector exists
+# to end.
+TREASURY_COLUMNS = {
+    "US2Y":  "2 Yr",
+    "US10Y": "10 Yr",
+    "US30Y": "30 Yr",
+}
+
+# The real (inflation-indexed) curve. Its ten-year point is the TIPS yield the
+# macro engine reads, and nominal minus real is the inflation breakeven -- the
+# number that was once fabricated at 230bp by treating the TIP ETF's price as a
+# yield. Measured today it is 4.79 - 2.45, or 234bp.
+TREASURY_REAL_COLUMNS = {
+    "TIPS_YIELD": "10 YR",
+}
+
+
+def _parse_treasury_csv(text: str, columns: dict) -> dict:
+    """The most recent row of a Treasury rates CSV, as {key: yield}.
+
+    Rows are newest-first in the published file, but that is not relied on --
+    the date column is parsed and the latest row wins, so a change in the
+    Treasury's ordering cannot silently start returning January's curve.
+    """
+    import csv, io
+    from datetime import datetime as _dt
+
+    latest_date, latest_row = None, None
+    for row in csv.DictReader(io.StringIO(text)):
+        raw_date = (row.get("Date") or "").strip()
+        if not raw_date:
+            continue
+        try:
+            parsed = _dt.strptime(raw_date, "%m/%d/%Y")
+        except ValueError:
+            continue
+        if latest_date is None or parsed > latest_date:
+            latest_date, latest_row = parsed, row
+
+    if latest_row is None:
+        return {}
+
+    out = {"__date__": latest_date.strftime("%Y-%m-%d")}
+    lo, hi = YIELD_PLAUSIBLE_RANGE
+    for key, column in columns.items():
+        raw = (latest_row.get(column) or "").strip()
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if not (lo < value < hi):
+            logger.warning(
+                "Discarding %s=%s from the Treasury feed: outside the range a "
+                "yield occupies.", key, value,
+            )
+            continue
+        out[key] = value
+    return out
+
+
+async def fetch_treasury_yields(session: aiohttp.ClientSession, redis_client) -> dict:
+    """Writes the constant-maturity curve to the quote cache.
+
+    Returns what was written, empty when nothing could be. A yield that cannot
+    be fetched leaves the key absent rather than stale-but-plausible: the macro
+    engine's refusal is the correct behaviour on a missing input, and this must
+    not defeat it by writing a guess.
+    """
+    if not redis_client:
+        return {}
+
+    year = datetime.now(timezone.utc).year
+    written = {}
+    series = (
+        ("daily_treasury_yield_curve", TREASURY_COLUMNS),
+        # Fetched separately because the two curves publish on their own
+        # schedules -- the real curve is often a day ahead of the nominal one --
+        # and a failure on either must not cost the other.
+        ("daily_treasury_real_yield_curve", TREASURY_REAL_COLUMNS),
+    )
+    try:
+        parsed = {}
+        for series_name, columns in series:
+            url = TREASURY_YIELD_CSV.format(year=year, series=series_name)
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=20.0)) as resp:
+                    if resp.status != 200:
+                        logger.warning("Treasury %s returned HTTP %s", series_name, resp.status)
+                        continue
+                    body = await resp.text()
+            except Exception as se:
+                logger.warning("Treasury %s fetch failed: %s", series_name, se)
+                continue
+            for key, value in _parse_treasury_csv(body, columns).items():
+                # Each series reports its own date; the later one wins the label.
+                if key == "__date__":
+                    parsed[key] = max(parsed.get(key, ""), value)
+                else:
+                    parsed[key] = value
+
+        for key, value in parsed.items():
+            if key.startswith("__"):
+                continue
+            # Two days, so a long weekend or a federal holiday does not empty
+            # the cache while the curve is simply unchanged.
+            await redis_client.raw.set(
+                f"sentinel:quotes:latest:{key}", str(value), ex=2 * 86400,
+            )
+            written[key] = value
+
+        if written:
+            logger.info(
+                "Treasury curve %s: %s",
+                parsed.get("__date__", "?"),
+                " ".join(f"{k}={v:.2f}%" for k, v in sorted(written.items())),
+            )
+    except Exception as e:
+        logger.warning("Treasury yield fetch failed: %s", e)
+
+    return written
+
+
 def _quote_fingerprint(quote: dict) -> tuple:
     """What has to change before a quote counts as a new observation."""
     return (
@@ -315,7 +475,7 @@ def _quote_fingerprint(quote: dict) -> tuple:
     )
 
 
-async def fetch_and_publish(producer: SentinelProducer):
+async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
     logger.info("Fetching real macro market quotes across 3-Tier API provider chain...")
     tickers = list(MACRO_TICKERS.keys())
     now = datetime.now(timezone.utc).isoformat()
@@ -374,16 +534,36 @@ async def fetch_and_publish(producer: SentinelProducer):
                     logger.warning(f"No real market quote returned for {ticker}. Skipping ticker.")
                     continue
 
+                fingerprint = _quote_fingerprint(q)
+                current_price = q["close"]
+
+                # The cache is refreshed before the dedup check, not after it.
+                #
+                # This is a latest-known-value store, not an event stream: an
+                # unchanged price is still the current price. Writing it below
+                # the `continue` meant the cache only refreshed while the market
+                # was moving, so the moment it went quiet the entries aged out
+                # and HYG, LQD and TIP disappeared from what the macro engine
+                # reads. The dedup below is right -- it governs publication,
+                # which is a claim that something happened -- and it should not
+                # govern a cache whose only claim is "this is the last price we
+                # saw".
+                if redis_client:
+                    try:
+                        await redis_client.raw.set(
+                            quote_key(ticker), str(current_price), ex=QUOTE_CACHE_TTL_SEC,
+                        )
+                    except Exception as qe:
+                        logger.debug("Quote cache write failed for %s: %s", ticker, qe)
+
                 # A quote that has not moved since the last cycle is the same
                 # observation, not a new one. Skipping it is what keeps the
                 # overnight window honest: gaps where the market was closed,
                 # rather than rows asserting a print that never happened.
-                fingerprint = _quote_fingerprint(q)
                 if _last_published.get(ticker) == fingerprint:
                     unchanged += 1
                     continue
 
-                current_price  = q["close"]
                 previous_price = q["open"]
                 high_val       = q["high"]
                 low_val        = q["low"]
@@ -418,6 +598,7 @@ async def fetch_and_publish(producer: SentinelProducer):
                 }
 
                 await producer.send(Topics.RAW_TRADFI, payload, key=ticker)
+
                 _last_published[ticker] = fingerprint
                 published += 1
                 logger.info(f"📊 Real Macro Tick Published | {ticker} ({MACRO_TICKERS[ticker]}): ${current_price:.2f} via {provider}")
@@ -456,7 +637,7 @@ async def main():
         # these prove it is still producing.
         metrics = CollectorMetrics("collector-macro")
         await metrics.start(redis_client)
-        hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-macro"))
+        hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-macro"))
 
     calendar_collector = EconomicCalendarCollector(producer=producer, poll_interval_sec=120)
 
@@ -516,14 +697,43 @@ async def main():
                     logger.debug(f"Regulatory poll notice: {re_err}")
                 await asyncio.sleep(300)
 
-    calendar_task = asyncio.create_task(_calendar_polling_loop())
-    freight_task = asyncio.create_task(_freight_polling_loop())
-    reg_task = asyncio.create_task(_regulatory_polling_loop())
+    async def _treasury_polling_loop():
+        """The constant-maturity curve, refreshed on a business-day cadence.
+
+        Yields are published once each business day, so polling faster only
+        re-reads the same row. Hourly is frequent enough to pick up the day's
+        publication without waiting most of a day for it, and cheap enough that
+        a missed fetch costs nothing -- the keys carry a two-day TTL, which
+        spans a weekend or a federal holiday.
+        """
+        logger.info("🏦 Treasury constant-maturity yield loop initialized.")
+        connector = aiohttp.TCPConnector(limit=4)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while True:
+                try:
+                    written = await fetch_treasury_yields(session, redis_client)
+                    if not written:
+                        # Said out loud. An empty write means the macro engine
+                        # will keep refusing to publish a rates regime, and a
+                        # silent failure here is indistinguishable from the
+                        # years in which nothing wrote these keys at all.
+                        logger.warning(
+                            "Treasury yields unavailable this cycle; the rates "
+                            "regime stays unpublished."
+                        )
+                except Exception as te:
+                    logger.warning(f"Treasury poll notice: {te}")
+                await asyncio.sleep(3600)
+
+    treasury_task = safe_create_task(_treasury_polling_loop())
+    calendar_task = safe_create_task(_calendar_polling_loop())
+    freight_task = safe_create_task(_freight_polling_loop())
+    reg_task = safe_create_task(_regulatory_polling_loop())
 
     try:
         while True:
             try:
-                await fetch_and_publish(producer)
+                await fetch_and_publish(producer, redis_client)
             except Exception as e:
                 logger.error(f"Macro feed iteration error: {e}", exc_info=True)
 
@@ -531,6 +741,7 @@ async def main():
     finally:
         if hb_task:
             hb_task.cancel()
+        treasury_task.cancel()
         calendar_task.cancel()
         freight_task.cancel()
         reg_task.cancel()

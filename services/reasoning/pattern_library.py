@@ -116,6 +116,20 @@ class PatternLibrary:
                     LIMIT $3
                 """, list(tags), rule_id, int(remaining_limit), int(min_overlap))
                 rows += extra
+
+            # Both outcomes, when both exist.
+            #
+            # Precedents are ordered by recency alone, and the corpus is 216
+            # confirmed against 0 denied -- so every precedent ever injected
+            # into a synthesis prompt was a scenario that had been borne out.
+            # A model shown only confirmations is being taught that scenarios
+            # of this shape come true.
+            #
+            # Denial only became reachable when the confidence arithmetic was
+            # corrected, so the imbalance will persist for a while yet. This
+            # reserves room for the minority outcome rather than waiting for it
+            # to win on recency, which on these volumes it never would.
+            rows = self._balance_outcomes(rows, limit)
             return [self._format_pattern(r) for r in rows]
         
         except Exception as e:
@@ -150,6 +164,26 @@ class PatternLibrary:
         except Exception as e:
             logger.error(f"Error recording pattern outcome for scenario {scenario_id}: {e}")
     
+    @staticmethod
+    def _balance_outcomes(rows: list, limit: int) -> list:
+        """Keeps both outcomes represented, in recency order within each.
+
+        A minority outcome gets up to half the slots; anything it does not use
+        goes back to the majority, so a corpus with one outcome is returned
+        unchanged rather than truncated.
+        """
+        confirmed = [r for r in rows if str(r.get("status")) == "confirmed"]
+        denied = [r for r in rows if str(r.get("status")) == "denied"]
+        if not confirmed or not denied:
+            return rows[:limit]
+
+        minority, majority = (denied, confirmed) if len(denied) <= len(confirmed) else (confirmed, denied)
+        keep_minority = min(len(minority), max(1, limit // 2))
+        selected = minority[:keep_minority] + majority[: limit - keep_minority]
+        # Recency order restored across the combined set.
+        selected.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
+        return selected[:limit]
+
     def _format_pattern(self, row) -> Dict:
         """Safely formats the row regardless of cursor type."""
         try:

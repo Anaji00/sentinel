@@ -99,7 +99,10 @@ def test_predictions_are_actually_scored():
 def test_the_resolver_runs_on_its_own():
     """A resolver nothing starts is the same defect one level up."""
     assert "_resolve_predictions_loop" in BASE
-    assert "asyncio.create_task(self._resolve_predictions_loop())" in BASE
+    # safe_create_task, not a bare create_task: the helper logs the exception
+    # instead of letting a dead loop fail silently, which is the same defect
+    # class this test exists to catch.
+    assert "safe_create_task(self._resolve_predictions_loop())" in BASE
 
 
 def test_an_unverifiable_prediction_is_not_counted():
@@ -158,7 +161,7 @@ def test_registered_edges_are_retested():
 
 def test_the_retest_is_scheduled():
     assert "_edge_retest_loop" in CORRELATION_MAIN
-    assert "asyncio.create_task(_edge_retest_loop())" in CORRELATION_MAIN
+    assert "safe_create_task(_edge_retest_loop())" in CORRELATION_MAIN
     assert "discovery_engine.retest_due_edges()" in CORRELATION_MAIN
 
 

@@ -225,7 +225,12 @@ def test_aviation_enricher_batching_and_routine_telemetry_retention():
         graph.producer = AsyncMock()
 
         scorer = AsyncMock()
-        scorer.score_kinematic_event.return_value = {"score": 0.05}
+        # Aviation scores kinematics for the whole scan in one call now, rather
+        # than one single-item batch per aircraft. Sized to the input so the
+        # zip() against `parsed` in enrich_batch stays honest.
+        async def _kinematic_batch(entities, *args, **kwargs):
+            return [{"score": 0.05} for _ in entities]
+        scorer.score_kinematic_event_batch.side_effect = _kinematic_batch
         scorer.check_watchlist.return_value = False
         scorer.track_frequency.return_value = 0.0
 

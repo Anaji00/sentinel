@@ -98,6 +98,25 @@ def periods_per_year(timeframe: str, asset_class: str = "equity") -> float:
     return _ACTIVE_MINUTES_PER_YEAR[ac] / float(minutes)
 
 
+def percentile_rank(samples: Sequence[float], value: float) -> float:
+    """Fraction of observed samples strictly below `value`.
+
+    The null model behind both dark-object detectors: an absolute threshold
+    cannot say whether a silence is unusual, because what counts as a long gap
+    depends entirely on what the region normally produces. Asking where an
+    observation sits in its own empirical distribution answers that with no
+    constant to tune.
+
+    Shared rather than duplicated because the aviation detector and the maritime
+    scorer had drifted six times apart on the same phenomenon, and a common
+    definition is what keeps them from drifting again.
+    """
+    if not samples:
+        return 0.0
+    below = sum(1 for s in samples if s < value)
+    return below / len(samples)
+
+
 def simple_returns(closes: Sequence[float]) -> List[float]:
     """Period returns from a close series, skipping bars that cannot produce one.
 
@@ -357,8 +376,19 @@ def var_historical(
     
     arr = np.array(returns, dtype=np.float64)
     cutoff = np.percentile(arr, (1.0 - confidence) * 100)
-    
-    return round(abs(cutoff) * position_value, 4)
+
+    # max(0, -cutoff), not abs(cutoff).
+    #
+    # VaR is the loss at the confidence level. When the cutoff return is
+    # negative the two agree, which is why this held for as long as it did --
+    # but when the worst 5% of outcomes is still a gain, abs() reports that
+    # gain as a loss. A series returning +1% every period came back with a 95%
+    # VaR of 0.01, describing a loss that cannot occur.
+    #
+    # var_parametric on the same input returns max(0.0, var) and gets it right,
+    # so the two implementations disagreed on the same series. This one is the
+    # non-parametric path the quant engine uses for position sizing.
+    return round(max(0.0, -cutoff) * position_value, 4)
 
 
 def var_parametric(
@@ -418,8 +448,11 @@ def cvar_historical(
     
     if len(tail) == 0:
         return var_historical(returns, confidence, position_value)
-    
-    return round(abs(np.mean(tail)) * position_value, 4)
+
+    # Same correction as var_historical above: the mean of the tail is a loss
+    # only when it is negative, and a tail that is entirely gains is not a loss
+    # of that size.
+    return round(max(0.0, -float(np.mean(tail))) * position_value, 4)
 
 
 def scale_var_to_horizon(var_value: float, from_periods: float, to_periods: float) -> float:

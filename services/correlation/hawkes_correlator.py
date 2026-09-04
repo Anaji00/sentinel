@@ -44,6 +44,10 @@ SENTINEL_DOMAINS = [
 ]
 
 
+
+# Members fetched per round trip when loading history for the Hawkes fit.
+HAWKES_SCAN_BATCH = 2000
+
 class HawkesMLE:
     """
     Maximum Likelihood Estimator for a multivariate exponential Hawkes process.
@@ -573,13 +577,30 @@ class CrossDomainHawkesCorrelator:
             # Try Redis sorted set first (fast path)
             if self._redis:
                 cutoff = time.time() - (self.FIT_WINDOW_HOURS * 3600)
-                raw_results = await self._redis.raw.zrange(
-                    "events:recent_window",
-                    "+inf",
-                    cutoff,
-                    desc=True,
-                    byscore=True,
-                )
+                # Batched for the same reason as EventStore.get_recent: a single
+                # ZRANGE over this set makes Redis build a 98.7 MB reply, which
+                # takes used_memory to the eviction ceiling and costs the anomaly
+                # baselines. This one runs every six hours rather than per event,
+                # so it was the smaller half of the same problem.
+                #
+                # Every member is still read -- the fit needs the whole history,
+                # and only the peak buffer changes.
+                raw_results = []
+                offset = 0
+                while True:
+                    batch = await self._redis.raw.zrange(
+                        "events:recent_window",
+                        "+inf",
+                        cutoff,
+                        desc=True,
+                        byscore=True,
+                        offset=offset,
+                        num=HAWKES_SCAN_BATCH,
+                    )
+                    if not batch:
+                        break
+                    raw_results.extend(batch)
+                    offset += len(batch)
                 for raw in raw_results:
                     try:
                         e = json.loads(raw)

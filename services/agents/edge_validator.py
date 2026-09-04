@@ -20,7 +20,9 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 from shared.kafka import Topics
+from shared.models.events import UNRATED_EDGE_CONFIDENCE
 from services.agents.base import SentinelAgent
+from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("agent.edge_validator")
 
@@ -50,12 +52,12 @@ async def validate_edges(
     query = """
     MATCH (a:Entity)-[r:SUPPLIES|COMMODITY_EXPOSURE|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO]->(b:Entity {type: 'instrument'})
     RETURN a.id AS source_id, type(r) AS predicate, b.id AS ticker,
-           coalesce(r.confidence, 0.5) AS confidence,
+           coalesce(r.confidence, $unrated) AS confidence,
            coalesce(r.validation_samples, 0) AS samples
     """
 
     try:
-        edges = await neo4j_client.query(query)
+        edges = await neo4j_client.query(query, {"unrated": UNRATED_EDGE_CONFIDENCE})
     except Exception as e:
         logger.error(f"Failed querying Neo4j exposure edges: {e}")
         return {"validated": 0, "promoted": 0, "decayed": 0}
@@ -205,7 +207,7 @@ class EdgeValidatorAgent(SentinelAgent):
 
     async def run(self):
         """Launches the periodic edge validation loop alongside reactive handler."""
-        validation_task = asyncio.create_task(self._run_scheduled_validation())
+        validation_task = safe_create_task(self._run_scheduled_validation())
         try:
             await super().run()
         finally:

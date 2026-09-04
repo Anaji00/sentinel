@@ -13,6 +13,7 @@ Preserves 100% of existing Kafka topics, Redis keys, and output schemas.
 
 import asyncio
 import json
+from functools import partial
 import logging
 import math
 import os
@@ -23,12 +24,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_MEDIUM_SEC
 from shared.kafka import Topics
 from shared.utils import quant_calc
+from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.tasks import safe_create_task
 import numpy as np
-from shared.models.events import entity_cache_key
+from shared.models.events import entity_cache_key, UNRATED_EDGE_CONFIDENCE
+from shared.models.events import AlertTier, CorrelationCluster
 from shared.utils.equities import is_major_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
@@ -47,6 +50,31 @@ UNPROVEN_POSITION_PCT = 0.02    # Cap while the win rate is still below the samp
 DEFAULT_PAYOFF_RATIO = 1.0      # Assume no edge in payoff until measured
 MAX_PAYOFF_RATIO = 3.0          # Clamp outlier backtest payoffs from tiny samples
 
+# The strategy_type values the backtester recognises. It composes its
+# strategy_id as f"{strategy_type}_{ticker.lower()}", so anything not spelled
+# exactly as it spells it is a key that will never exist.
+BACKTEST_STRATEGIES = ("momentum_trend", "covered_call", "mean_reversion")
+
+# What a Granger test is worth in either direction. The penalty is smaller than
+# the lift: failing to establish causality on a short hourly series is weaker
+# evidence against a relationship than establishing it is evidence for one.
+PEER_VERIFIED_LIFT = 0.15
+PEER_REFUTED_PENALTY = 0.10
+
+# Bars required before a Sharpe ratio or a drawdown is a measurement rather than
+# an artefact of a short series.
+MIN_BARS_FOR_QUALITY_METRICS = 10
+
+# How long a cached backtest is treated as current. The backtester writes with a
+# seven-day expiry; refreshing daily keeps the payoff ratio responsive to a
+# regime change without re-running a 500-bar replay on every advisory.
+BACKTEST_REFRESH_SEC = 86400
+
+# Bars per replay during the scheduled refresh. The API route uses 500 for an
+# interactive request; this runs unattended alongside the review sweep, so it
+# takes the smaller window that still clears MIN_TRADES_FOR_PAYOFF.
+BACKTEST_REFRESH_BARS = 300
+
 
 # ── FORM 4 INSIDER MODELS ─────────────────────────────────────────────────────
 
@@ -60,10 +88,43 @@ class InsiderClusterBrief(BaseModel):
 
 # ── PEER DISCOVERY & RESEARCH MODELS ──────────────────────────────────────────
 
+# Bars the advisory needs before it will compute anything.
+MIN_ADVISORY_BARS = 5
+
+# How much durable history to pull when the cache is short. Enough for the
+# indicators the advisory computes without dragging a year of bars per message.
+DURABLE_BAR_LIMIT = 200
+
+
+def _positive_or_none(*candidates):
+    """The first candidate that is a positive number, else None.
+
+    Financial quantities are positive by construction: a share count of zero is
+    not a trade and a price of zero is not a price. Returning None keeps an
+    unstated quantity distinguishable from a stated one, which a 0.0 default
+    does not.
+    """
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 class PeerTicker(BaseModel):
     ticker: str
     relation: str
     discovery_confidence: float
+    # Whether the statistics were able to support this peer, and how far they
+    # got. Defaults to untested so a peer that never reaches the Granger step
+    # is never mistaken for one that passed it. The model does not fill this --
+    # it is set below from the test's own outcome.
+    verification: str = "untested"
 
 class MacroInstrument(BaseModel):
     symbol: str
@@ -98,7 +159,6 @@ class SmartMoneyConvergence(BaseModel):
     insider_buyer_role: Optional[str] = None
     insider_notional_usd: Optional[float] = None
     option_sweep_premium_usd: Optional[float] = None
-    conviction_boost: float = 0.0
 
 class PortfolioMetrics(BaseModel):
     var_95_pct: Optional[float] = None
@@ -238,7 +298,7 @@ class QuantTradingEngine(SentinelAgent):
         producer=None,
         consumer=None,
         dlq=None,
-        model: str = "llama3",
+        model: str = DEFAULT_MODEL,
         fallback_model: Optional[str] = None,
     ):
         super().__init__(
@@ -350,13 +410,24 @@ class QuantTradingEngine(SentinelAgent):
     # ── SUB-ENGINE 2: QUANT PEER DISCOVERY ───────────────────────────────────
 
     async def _process_peer_discovery(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
         if not await self.flags.is_enabled("peer_discovery", ticker=ticker):
             return None
 
         dedup_key = f"quant_discovery:{ticker}:{int(time.time() // 1800)}"
-        if await self.is_recently_processed(dedup_key, window_seconds=1800):
+        if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC):
             return None
-        await self.mark_processed(dedup_key, window_seconds=1800)
+        await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC)
 
         # Concurrent context hydration
         news_context, graph_context, global_context, cross_context, earnings_ctx, funding_ctx = await asyncio.gather(
@@ -393,12 +464,35 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             # Test Granger causality on discovered peers if historical prices exist
             verified_peers = []
             x_prices, _, _ = await self._fetch_prices(ticker)
+            # Verification that can fail, not only confirm.
+            #
+            # This raised confidence by 0.15 when Granger causality held and did
+            # nothing when it did not, so a peer that had ample data and failed
+            # the test kept whatever confidence the model had assigned it and was
+            # published beside one the statistics had actually supported. Live:
+            # CMF -- the iShares California Muni Bond ETF -- was given CAT and
+            # BRK.B as peers at 0.6, and nothing in the payload distinguished
+            # that from a measured relationship.
+            #
+            # A test that can only confirm is not a test. Three outcomes are now
+            # distinguished and travel with the peer: supported, tested and not
+            # supported, and untested for want of data.
             for peer in discovery.peer_tickers:
                 y_prices, _, _ = await self._fetch_prices(peer.ticker)
                 if len(x_prices) >= 20 and len(y_prices) >= 20:
                     causality = quant_calc.granger_causality(x_prices, y_prices, max_lag=3)
                     if causality.get("x_granger_causes_y"):
-                        peer.discovery_confidence = min(1.0, peer.discovery_confidence + 0.15)
+                        peer.discovery_confidence = min(1.0, peer.discovery_confidence + PEER_VERIFIED_LIFT)
+                        peer.verification = "granger_supported"
+                    else:
+                        # Tested against enough history and not supported. The
+                        # peer is kept -- an untested hunch is not disproof --
+                        # but it may no longer clear the 0.65 gate that puts a
+                        # ticker on the watchlist and into the graph.
+                        peer.discovery_confidence = max(0.0, peer.discovery_confidence - PEER_REFUTED_PENALTY)
+                        peer.verification = "granger_not_supported"
+                else:
+                    peer.verification = "untested_insufficient_history"
                 verified_peers.append(peer)
             discovery.peer_tickers = verified_peers
 
@@ -408,7 +502,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                     await self.redis.raw.zadd("sentinel:watched:equities", mapping={p.ticker: time.time()})
 
             closes, _, _ = await self._fetch_prices(ticker)
-            if len(closes) >= 10:
+            if len(closes) >= MIN_BARS_FOR_QUALITY_METRICS:
                 # Annualized on the frequency the series is actually sampled at.
                 # This called sharpe_ratio(returns) bare, taking the default
                 # trading_days=252 -- the daily equity convention -- on a series
@@ -424,7 +518,15 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 sr = quant_calc.sharpe_ratio(returns, annualize=True, trading_days=bars_per_year)
                 mdd, _, _ = quant_calc.max_drawdown(closes)
             else:
-                sr, mdd = 0.0, 0.0
+                # Not measured, and said so.
+                #
+                # This published 0.0 for both, which reads as "a Sharpe ratio of
+                # zero was computed" -- a real and damning finding about a
+                # strategy. The truth is that the candle cache did not hold ten
+                # bars for this name, which is a fact about the cache. Every
+                # discovery in the deployment carried sharpe_ratio 0.0 and
+                # max_drawdown 0.0 for exactly this reason.
+                sr, mdd = None, None
 
             discovery_dict = discovery.model_dump()
             res_payload = {
@@ -435,6 +537,11 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 "quality_metrics": {
                     "sharpe_ratio": sr,
                     "max_drawdown": mdd,
+                    # So a consumer can tell an unmeasured metric from a
+                    # measured one without inferring it from a null.
+                    "measured": sr is not None,
+                    "bars_available": len(closes),
+                    "bars_required": MIN_BARS_FOR_QUALITY_METRICS,
                 },
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -502,9 +609,61 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 
     # ── SUB-ENGINE 3: FINANCIAL ADVISORY & RISK SIGNALS ─────────────────────
 
+    # The producer's own range, so this consumer cannot reject what the
+    # measurement is capable of producing: microstructure_stop_distance()
+    # returns round(max(0.50, min(2.50, mult))), built from a base_multiplier
+    # whose default is 1.5 -- the same constant this advisory had hardcoded.
+    # The measured value is therefore a liquidity-adjusted version of exactly
+    # the number it replaces, not a different quantity.
+    #
+    # Note the enricher only persists a multiplier when it comes out below 1.0,
+    # so an absent key means "no tightening warranted" and the default is the
+    # correct answer rather than a fallback.
+    MIN_STOP_MULTIPLIER = 0.50
+    MAX_STOP_MULTIPLIER = 2.50
+    DEFAULT_STOP_MULTIPLIER = 1.5
+
+    async def _measured_stop_multiplier(self, ticker: str) -> float:
+        """The liquidity-adjusted ATR multiplier for this ticker, or the default.
+
+        Reads what the tradfi enricher measured from order-flow imbalance and
+        Kyle's lambda. Returns DEFAULT_STOP_MULTIPLIER when nothing has been
+        measured, which is the constant this replaced, so an unmeasured ticker
+        behaves exactly as before.
+        """
+        symbol = str(ticker or "").upper().strip()
+        if not symbol or not self.redis:
+            return self.DEFAULT_STOP_MULTIPLIER
+        try:
+            raw = await self.redis.raw.get(f"sentinel:stop_loss:{symbol}")
+            if not raw:
+                return self.DEFAULT_STOP_MULTIPLIER
+            data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            multiplier = float(data.get("multiplier"))
+        except (TypeError, ValueError, AttributeError, json.JSONDecodeError) as e:
+            self.logger.debug("Stop multiplier unreadable for %s: %s", symbol, e)
+            return self.DEFAULT_STOP_MULTIPLIER
+        except Exception as e:
+            self.logger.debug("Stop multiplier lookup failed for %s: %s", symbol, e)
+            return self.DEFAULT_STOP_MULTIPLIER
+        if multiplier != multiplier or multiplier <= 0:      # NaN or nonsense
+            return self.DEFAULT_STOP_MULTIPLIER
+        return min(self.MAX_STOP_MULTIPLIER, max(self.MIN_STOP_MULTIPLIER, multiplier))
+
     async def _process_trading_advisory(self, message: Dict[str, Any], ticker: str, anomaly_score: float) -> Optional[Dict[str, Any]]:
+        # Admission is checked before the context is built, not after.
+        #
+        # The wargamer, the knowledge graph and the reasoning service already
+        # guard here. These three did not: they queried TimescaleDB, read Redis
+        # and assembled a prompt, and only then reached the budget check inside
+        # _execute_with_telemetry, which sheds the request. Nothing bypassed
+        # admission, so this is wasted preparation rather than unfairness -- but
+        # on a host that affords about thirty-five inferences an hour, the
+        # preparation is most of what a shed request costs.
+        if not await self._inference_budget.is_available():
+            return None
         closes, highs, lows = await self._fetch_prices(ticker)
-        if len(closes) < 5:
+        if len(closes) < MIN_ADVISORY_BARS:
             return None
 
         # Calculate TA indicators
@@ -650,10 +809,10 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 graph_query = """
                 MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES*1..2]-(inst:Entity)
                 WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
-                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, 0.6) AS confidence
+                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, $unrated) AS confidence
                 LIMIT 5
                 """
-                rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper()})
+                rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper(), "unrated": UNRATED_EDGE_CONFIDENCE})
                 if rows:
                     graph_correlations = [
                         f"{r['correlated_entity']} -[{r['predicate']}]-> {ticker} (confidence: {r['confidence']:.2f})"
@@ -707,9 +866,40 @@ Return raw JSON matching schema:"""
 
             # Post-hoc deterministic trade signal construction and risk limits enforcement
             max_kelly_pct = round(kelly_pct * 100.0, 2)
+
+            # The stop multiplier the enrichment layer already measured for this
+            # ticker, in place of a flat 1.5.
+            #
+            # `sentinel:stop_loss:{ticker}` carries a multiplier derived from
+            # order-flow imbalance and Kyle's lambda -- how far price moves per
+            # unit of volume, which is precisely what should widen a stop in a
+            # thin book and tighten it in a deep one. It was written on every
+            # tradfi enrichment and read by nothing, while this line used a
+            # constant 1.5 for every name regardless of liquidity. Falling back
+            # to 1.5 keeps the previous behaviour whenever no measurement
+            # exists for the ticker.
+            stop_multiplier = await self._measured_stop_multiplier(ticker)
+
+            # An advisory without a price is not an advisory.
+            #
+            # `entry_level` was assigned unconditionally from `current_price`,
+            # with no guard anywhere in this function testing it. Where the
+            # price lookup returned nothing the engine published
+            # "BUY EQIX @ $0.00 -> $0.00 (Kelly 2.0%)" -- an instruction that
+            # cannot be followed -- and recorded a prediction whose entry price
+            # of 0.0 the resolver rejects as falsy, so it could never be scored.
+            # Refusing here is what keeps both halves honest.
+            if not isinstance(current_price, (int, float)) or not math.isfinite(current_price) or current_price <= 0:
+                logger.warning(
+                    "Advisory for %s abandoned: no usable current price (%r). "
+                    "A play priced at zero cannot be executed or resolved.",
+                    ticker, current_price,
+                )
+                return None
+
             for play in brief.highest_conviction_plays:
                 play.entry_level = round(current_price, 2)
-                stop_distance = atr * 1.5
+                stop_distance = atr * stop_multiplier
                 
                 # Conviction-tiered Risk-Reward ratio selection
                 if play.conviction_score < 0.6:
@@ -767,7 +957,16 @@ Return raw JSON matching schema:"""
                 except Exception:
                     pass
 
-            raw_watchlist = await self.redis.raw.zrange("sentinel:watchlist:equities", 0, -1)
+            # sentinel:watched:equities, not :watchlist:.
+            #
+            # The same file writes sentinel:watched:equities and reads it
+            # correctly elsewhere; this one site had the wrong name, so the
+            # zrange always came back empty. watched_set then resolved to None,
+            # and generate_covered_call_recommendation skips its scoping check
+            # entirely when that argument is None -- so the overlay was
+            # evaluated for every ticker rather than the 44 on the watchlist.
+            # It failed open, which is why nothing ever looked wrong.
+            raw_watchlist = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
             watched_set = {s.decode() if isinstance(s, bytes) else str(s) for s in raw_watchlist} if raw_watchlist else None
 
             # Evaluate closed-form Covered Call recommendation if flag enabled and CAGG Z-score >= +2.5 (§2.3, §2.6, §B.3)
@@ -884,6 +1083,18 @@ Return raw JSON matching schema:"""
             if not tickers:
                 tickers = ["AAPL", "MSFT", "NVDA", "BTC-USD", "ETH-USD"]
 
+            # Refresh the backtest store before the sweep reads from it.
+            #
+            # Nothing in the deployment had ever written a backtest: the store
+            # was populated only as a side effect of somebody calling the REST
+            # route by hand, and `sentinel:backtest:*` held zero keys. So
+            # _fetch_realized_payoff_ratio returned its conservative fallback
+            # every time, and Kelly -- which scales inversely with the payoff
+            # term -- sized every position as though no strategy had any
+            # measured edge. The backtester, its validation gate and its
+            # calibration curve were all built and none of them ran.
+            await self._refresh_backtests(tickers[:5])
+
             results = []
             for ticker in tickers[:5]:  # Sweep top 5 watched tickers
                 res = await self._process_trading_advisory({"ticker": ticker, "anomaly_score": 0.75}, ticker, 0.75)
@@ -900,6 +1111,58 @@ Return raw JSON matching schema:"""
     # statistic derived from those bars must be scaled with this, not assumed daily.
     PRICE_TIMEFRAME = "1h"
 
+    async def _refresh_backtests(self, tickers: List[str]) -> None:
+        """Replay each watched ticker through the strategies and cache the result.
+
+        Idempotent and cheap to call: a strategy whose cached report is still
+        within BACKTEST_REFRESH_SEC is skipped, so the sweep only pays for what
+        has actually gone stale.
+
+        The replay itself is CPU-bound and synchronous -- it walks several
+        hundred bars building trades -- so it is offloaded rather than run on the
+        event loop, which is servicing every other agent in this process.
+        """
+        if not self.redis or not tickers:
+            return
+        try:
+            from services.reasoning.strategy_backtester import StrategyBacktester
+        except Exception as e:
+            logger.debug(f"Backtester unavailable, payoff ratios stay at default: {e}")
+            return
+
+        backtester = StrategyBacktester(db_client=self.db, redis_client=self.redis)
+        loop = asyncio.get_running_loop()
+
+        for ticker in tickers:
+            for strategy in BACKTEST_STRATEGIES:
+                key = f"sentinel:backtest:results:{strategy}_{ticker.lower()}"
+                try:
+                    # TTL tells us the age without deserialising the report:
+                    # written at 7 days, so anything above (7d - refresh) is
+                    # still fresh.
+                    ttl = await self.redis.raw.ttl(key)
+                    if ttl and ttl > (86400 * 7 - BACKTEST_REFRESH_SEC):
+                        continue
+
+                    bars = await backtester.fetch_historical_bars(
+                        ticker=ticker, timeframe="5m", limit=BACKTEST_REFRESH_BARS
+                    )
+                    if not bars:
+                        continue
+
+                    # backtest_strategy is synchronous and CPU-bound.
+                    await loop.run_in_executor(
+                        None,
+                        partial(
+                            backtester.backtest_strategy,
+                            ticker=ticker,
+                            bars=bars,
+                            strategy_type=strategy,
+                        ),
+                    )
+                except Exception as e:
+                    logger.debug(f"Backtest refresh failed for {strategy}_{ticker}: {e}")
+
     async def _fetch_realized_payoff_ratio(self, ticker: str) -> float:
         """Returns the realized average-win / average-loss ratio for *ticker*.
 
@@ -912,7 +1175,11 @@ Return raw JSON matching schema:"""
         if not self.redis:
             return DEFAULT_PAYOFF_RATIO
         try:
-            for strategy in ("momentum", "covered_call", "mean_reversion"):
+            # These must be the backtester's own strategy_type values, which is
+            # what it builds `strategy_id` from. This read "momentum", and the
+            # backtester writes "momentum_trend", so the momentum key could
+            # never have been found even once the store was populated.
+            for strategy in BACKTEST_STRATEGIES:
                 raw = await self.redis.raw.get(
                     f"sentinel:backtest:results:{strategy}_{ticker.lower()}"
                 )
@@ -939,18 +1206,76 @@ Return raw JSON matching schema:"""
         return DEFAULT_PAYOFF_RATIO
 
     async def _fetch_prices(self, ticker: str) -> Tuple[List[float], List[float], List[float]]:
-        key = candle_cache_key(ticker, self.PRICE_TIMEFRAME)
-        raw = await self.redis.raw.lrange(key, 0, -1)
+        """Bars for a ticker, from the cache when it has them and the database
+        when it does not.
+
+        This read the Redis candle cache alone, and the advisory below refuses
+        to run on fewer than five bars. Measured across 572 tickers with an
+        hourly list: not one had five. The deepest was four, because the candle
+        lists carry a TTL, which made them evictable, and Redis was evicting
+        about forty-seven keys a second to make room for a structure that had no
+        TTL and so could not be evicted at all.
+
+        With the eviction stopped the cache does accumulate -- but it still
+        needs five hours of uninterrupted uptime to reach five hourly bars, and
+        a restart puts it back to zero. tradfi_bars_1h already held 42 to 46
+        bars for the same tickers throughout, durably, and nothing was reading
+        it. The whole financial advisory path had therefore never produced an
+        output, on a cache that could not hold enough history to let it.
+        """
         closes, highs, lows = [], [], []
-        for item in raw:
-            try:
-                bar = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
-                closes.append(float(bar.get("close", 0)))
-                highs.append(float(bar.get("high", bar.get("close", 0))))
-                lows.append(float(bar.get("low", bar.get("close", 0))))
-            except Exception:
-                pass
+        try:
+            key = candle_cache_key(ticker, self.PRICE_TIMEFRAME)
+            raw = await self.redis.raw.lrange(key, 0, -1)
+            for item in raw:
+                try:
+                    bar = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
+                    closes.append(float(bar.get("close", 0)))
+                    highs.append(float(bar.get("high", bar.get("close", 0))))
+                    lows.append(float(bar.get("low", bar.get("close", 0))))
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.debug("Candle cache read failed for %s: %s", ticker, e)
+
+        if len(closes) >= MIN_ADVISORY_BARS:
+            return closes, highs, lows
+
+        # The cache is short. The database is the same series, kept.
+        durable = await self._fetch_prices_durable(ticker)
+        if durable and len(durable[0]) > len(closes):
+            return durable
         return closes, highs, lows
+
+    async def _fetch_prices_durable(self, ticker: str) -> Optional[Tuple[List[float], List[float], List[float]]]:
+        """Hourly bars from TimescaleDB, oldest first to match the cache."""
+        if not self.db:
+            return None
+        try:
+            rows = await self.db.query(
+                """
+                SELECT close, high, low
+                FROM tradfi_bars_1h
+                WHERE ticker = $1 AND close IS NOT NULL
+                ORDER BY bucket_time DESC
+                LIMIT $2
+                """,
+                ticker.upper(), DURABLE_BAR_LIMIT,
+            )
+        except Exception as e:
+            self.logger.debug("Durable bar lookup failed for %s: %s", ticker, e)
+            return None
+
+        closes, highs, lows = [], [], []
+        for row in reversed(rows or []):
+            try:
+                close = float(row["close"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            closes.append(close)
+            highs.append(float(row.get("high") or close))
+            lows.append(float(row.get("low") or close))
+        return (closes, highs, lows) if closes else None
 
     def _compute_ta(self, closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
         return compute_ta_indicators(closes, highs, lows)
@@ -980,8 +1305,8 @@ Return raw JSON matching schema:"""
             neo4j_client = self.neo4j or await get_neo4j()
             if not neo4j_client:
                 return []
-            q = "MATCH (e:Entity)-[r]-(t:Entity {id: $ticker}) RETURN e.id AS related_id, type(r) AS rel_type, coalesce(r.confidence, 0.5) AS confidence LIMIT 10"
-            rows = await neo4j_client.query(q, {"ticker": ticker.upper()})
+            q = "MATCH (e:Entity)-[r]-(t:Entity {id: $ticker}) RETURN e.id AS related_id, type(r) AS rel_type, coalesce(r.confidence, $unrated) AS confidence LIMIT 10"
+            rows = await neo4j_client.query(q, {"ticker": ticker.upper(), "unrated": UNRATED_EDGE_CONFIDENCE})
             return rows or []
         except Exception as e:
             logger.debug(f"Graph context fetch error for {ticker}: {e}")
@@ -1085,13 +1410,49 @@ Return raw JSON matching schema:"""
             "Executive/Director"
         ).strip()
 
-        tx_code = str(raw.get("transaction_code") or raw.get("trade_type") or "P").upper()
-        is_buy = tx_code in ("P", "PURCHASE", "BUY", "ACQUISITION")
-        tx_type = "BUY" if is_buy else "SELL"
+        # An unrecognised transaction code is not a sale.
+        #
+        # This defaulted a missing code to "P" and then classified anything not
+        # in the buy list as a SELL, so every Form 4 code outside four strings
+        # became insider selling. Form 4 defines more than a dozen -- A (award),
+        # G (gift), M (option exercise), F (tax withholding), J (other) -- and
+        # the enricher's own fallback for an unparseable code is "J", which
+        # would have been counted as a sale against the buying side of the
+        # cluster gate.
+        #
+        # OTHER trades are recorded and excluded from the buy/sell arithmetic:
+        # the filing happened, and what it was is unknown.
+        tx_code = str(raw.get("transaction_code") or raw.get("trade_type") or "").upper()
+        if tx_code in ("P", "PURCHASE", "BUY", "ACQUISITION"):
+            tx_type = "BUY"
+        elif tx_code in ("S", "SALE", "SELL", "D", "DISPOSITION"):
+            tx_type = "SELL"
+        else:
+            tx_type = "OTHER"
 
-        shares = float(raw.get("shares") or raw.get("qty") or raw.get("shares_transacted") or 1000.0)
-        price = float(raw.get("price") or raw.get("price_per_share") or raw.get("transaction_price") or 0.0)
-        total_usd = float(raw.get("total_value_usd") or raw.get("notional_usd") or (shares * price))
+        # A filing that does not state a quantity is not a thousand shares.
+        #
+        # shares defaulted to 1000.0 and price to 0.0, and total_usd was
+        # shares * price -- so a Form 4 missing its share count was sized at a
+        # thousand shares times whatever price it did carry. At a $150 print
+        # that invents $150,000 of insider buying, and the cluster gate below
+        # fires on two distinct buyers and $250,000 net: two such filings
+        # publish an insider accumulation cluster that never happened.
+        #
+        # The dollar value drives the gate and the z-score, so an unsizeable
+        # trade contributes None rather than a number. The trade itself is
+        # still real and still counts toward the distinct-buyer requirement --
+        # what is unknown is how large it was.
+        shares = _positive_or_none(
+            raw.get("shares"), raw.get("qty"), raw.get("shares_transacted")
+        )
+        price = _positive_or_none(
+            raw.get("price"), raw.get("price_per_share"), raw.get("transaction_price")
+        )
+        stated_total = _positive_or_none(raw.get("total_value_usd"), raw.get("notional_usd"))
+        total_usd = stated_total if stated_total is not None else (
+            shares * price if (shares is not None and price is not None) else None
+        )
 
         now_ts = time.time()
         tx_record = {
@@ -1130,8 +1491,16 @@ Return raw JSON matching schema:"""
             buy_trades = [t for t in all_trades if t.get("tx_type") == "BUY"]
             unique_buyers = list(set(t.get("insider_name") for t in buy_trades if t.get("insider_name")))
             
-            total_buy_usd = sum(t.get("total_usd", 0) for t in buy_trades)
-            total_sell_usd = sum(t.get("total_usd", 0) for t in all_trades if t.get("tx_type") == "SELL")
+            # Unsizeable trades contribute no dollars. They were contributing
+            # a fabricated 1000-share notional, which is what the gate below
+            # measured.
+            total_buy_usd = sum(
+                t["total_usd"] for t in buy_trades if t.get("total_usd") is not None
+            )
+            total_sell_usd = sum(
+                t["total_usd"] for t in all_trades
+                if t.get("tx_type") == "SELL" and t.get("total_usd") is not None
+            )
             net_buy_usd = max(0.0, total_buy_usd - total_sell_usd)
 
             # Statistical Significance Gate: >= 2 distinct buyers and >= $250k net bought

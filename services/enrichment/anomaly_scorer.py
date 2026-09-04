@@ -1,10 +1,12 @@
 import asyncio
+import math
 import os
 import json
 import time
 import numpy as np
 import logging
 from shared.utils.metrics import MetricsCollector
+from shared.utils import quant_calc
 from shared.utils.streaming_detectors import (
     RRCFDetector,
     KalmanResidualFilter,
@@ -16,6 +18,21 @@ from shared.utils.streaming_detectors import (
 from shared.utils.model_registry import ModelRegistry, ConformalZScoreCalibrator
 
 from typing import Optional, List, Dict, Any, Tuple
+
+# The maritime gap distribution, mirroring the aviation detector's.
+#
+# Same phenomenon, same null model, same band -- the two had drifted six times
+# apart while scoring the same thing, and these constants are deliberately
+# identical to _GAP_SAMPLE_CAP / _MIN_GAP_SAMPLES / _NOTABLE_PERCENTILE /
+# _SCORE_FLOOR / _SCORE_CEILING in aviation_gap_detector.py so they cannot
+# quietly diverge again.
+_VESSEL_GAP_SAMPLES_KEY = "sentinel:maritime:gap_samples:{region}"
+_VESSEL_GAP_SAMPLE_CAP = 500
+_MIN_VESSEL_GAP_SAMPLES = 60
+_VESSEL_NOTABLE_PERCENTILE = 0.90
+_VESSEL_SCORE_FLOOR = 0.35
+_VESSEL_SCORE_CEILING = 0.92
+
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
@@ -45,36 +62,79 @@ redis.call('SET', var_key, tostring(new_v), 'EX', 604800)
 return tostring(norm_score)
 """
 
+# The significance gate.
+#
+# `mean + z*std` is an unbounded test applied to a bounded variable, and for
+# four of the six live domains it had drifted past the top of the scale: to be
+# significant, a crypto_trade needed 1.30, a crypto_candle 1.11, a kinematic
+# event 1.03, and a bgp_anomaly 0.90 against a maximum observed score of 0.85.
+# A domain whose scores are both high and variable could never produce a
+# significant event, which is exactly backwards -- and the feedback made it
+# worse over time, since every anomaly a domain emits raises its own bar.
+#
+# The form was the problem, not the constant. `mean + z*std` is an additive
+# offset on a variable that cannot exceed 1.0, so for a wide distribution the
+# bar leaves the scale entirely, and for a tight one it sits just above the
+# maximum -- either way, unreachable. Capping it does not help: a cap turns the
+# gate into "above this domain's average", which fired on two thirds of a flat
+# series when measured.
+#
+# So the test is now the same null model the gap detectors use: where does this
+# score sit in the distribution of what this domain actually produces? That is
+# always answerable, always reachable, and fixes the false-alarm rate at
+# roughly 1 - SIGNIFICANCE_PERCENTILE by construction -- which is what the
+# conformal calibrator's target_far was reaching for and could not deliver
+# through an additive threshold.
 EMA_GATEKEEPER_LUA = """
-local mean_key = KEYS[1]
-local var_key = KEYS[2]
-local alpha = tonumber(ARGV[1])
-local z_thresh = tonumber(ARGV[2])
+local samples_key = KEYS[1]
+local cap = tonumber(ARGV[1])
+local min_samples = tonumber(ARGV[2])
+local pct = tonumber(ARGV[3])
 
-local current_m = tonumber(redis.call('GET', mean_key) or "0.5")
-local current_v = tonumber(redis.call('GET', var_key) or "0.05")
+local raw = redis.call('LRANGE', samples_key, 0, cap - 1)
+local vals = {}
+for i = 1, #raw do
+    local n = tonumber(raw[i])
+    if n then table.insert(vals, n) end
+end
+
+local threshold = nil
+if #vals >= min_samples then
+    table.sort(vals)
+    local idx = math.ceil(pct * #vals)
+    if idx < 1 then idx = 1 end
+    if idx > #vals then idx = #vals end
+    threshold = vals[idx]
+end
 
 local results = {}
-for i = 3, #ARGV do
+for i = 4, #ARGV do
     local score = tonumber(ARGV[i])
-    local current_std = math.sqrt(current_v)
-    local dynamic_thresh = current_m + (z_thresh * current_std)
-    if score > dynamic_thresh then
+    if threshold ~= nil and score > threshold then
         table.insert(results, 1)
     else
         table.insert(results, 0)
     end
-    
-    local old_m = current_m
-    current_m = (alpha * score) + ((1.0 - alpha) * current_m)
-    current_v = (alpha * (score - old_m)^2) + ((1.0 - alpha) * current_v)
+    redis.call('LPUSH', samples_key, tostring(score))
 end
 
-redis.call('SET', mean_key, tostring(current_m))
-redis.call('SET', var_key, tostring(current_v))
+redis.call('LTRIM', samples_key, 0, cap - 1)
+redis.call('EXPIRE', samples_key, 604800)
 
 return results
 """
+
+# How many recent scores define a domain's distribution, and the minimum before
+# the gate is allowed to call anything significant. Mirrors the gap detectors'
+# _GAP_SAMPLE_CAP / _MIN_GAP_SAMPLES, for the same reason.
+SIGNIFICANCE_SAMPLE_CAP = 500
+SIGNIFICANCE_MIN_SAMPLES = 60
+
+# Where in its own distribution a score becomes notable. The same 0.90 the gap
+# detectors use, and it fixes the false-alarm rate at roughly 10% by
+# construction -- which is what the conformal calibrator's target_far was
+# reaching for and could not deliver through an additive threshold.
+SIGNIFICANCE_PERCENTILE = 0.90
 
 # BGP hijack scoring. A confirmed hijack starts here and the structural signals
 # decide where in the remaining headroom it lands, so two hijacks stay rankable
@@ -86,6 +146,14 @@ HIJACK_BASE_SCORE = 0.70
 HIJACK_NOVELTY_WEIGHT = 0.5
 HIJACK_CENTRALITY_WEIGHT = 0.3
 HIJACK_VELOCITY_WEIGHT = 0.2
+
+# Two features the graph can measure without the GDS plugin. Weighted below the
+# three above because they describe the announcing AS rather than the event, and
+# scaled against a reference degree so a well-connected transit provider does
+# not saturate the term on its own.
+BGP_DEGREE_WEIGHT = 0.25
+BGP_SPECIFICITY_WEIGHT = 0.25
+BGP_DEGREE_REFERENCE = 200.0
 
 
 def _as_float(value):
@@ -152,6 +220,8 @@ class DynamicAnomalyScorer:
         self._thresholds_cache = {}
         self._thresholds_last_loaded = 0.0
         self._thresholds_ttl = 60.0  # 60 seconds config cache TTL
+        # Said once per process, not once per event.
+        self._thresholds_announced = False
 
         # ── PER-DOMAIN STREAMING RRCF DETECTORS (§1.1) ───────────────────────
         # Distinct, independent RRCF models for all 8 Sentinel domains
@@ -216,22 +286,120 @@ class DynamicAnomalyScorer:
         return self._thresholds_cache
 
     async def _get_thresholds_config(self, key: str) -> dict:
-        import time
+        """Operator overrides for a scorer's constants, from sentinel:ml:thresholds.
+
+        Two things were wrong here, and they hid each other.
+
+        The key has never existed. Every scorer is written as
+        `config = {hardcoded defaults}; config.update(await
+        self._get_thresholds_config(name))`, so the update was always empty and
+        the hardcoded value always won -- vessel_dark's 48-hour divisor, the
+        prediction-trade divisor and the rest were effectively constants while
+        reading like configuration. That is now said out loud, once, so the
+        control surface is discoverable instead of theoretical.
+
+        And the absence was never cached: `_thresholds_last_loaded` was only
+        advanced when a value came back, so a missing key meant a fresh Redis
+        GET on every scored event rather than one per TTL. At 240,984 aviation
+        events in 48 hours that is a round trip per event to learn the same
+        nothing.
+        """
         now = time.time()
-        if self._thresholds_cache and (now - self._thresholds_last_loaded < self._thresholds_ttl):
+        if now - self._thresholds_last_loaded < self._thresholds_ttl:
             return self._thresholds_cache.get(key, {})
-            
+
+        # Advanced before the read, so a miss and an error are both cached for
+        # the TTL rather than retried on the hot path.
+        self._thresholds_last_loaded = now
         try:
             if self.redis:
                 raw_cfg = await self.redis.raw.get("sentinel:ml:thresholds")
                 if raw_cfg:
                     self._thresholds_cache = json.loads(raw_cfg)
-                    self._thresholds_last_loaded = now
+                    if not self._thresholds_announced:
+                        self._thresholds_announced = True
+                        logger.info(
+                            "Scorer threshold overrides loaded from sentinel:ml:thresholds: %s",
+                            sorted(self._thresholds_cache.keys()),
+                        )
+                elif not self._thresholds_announced:
+                    self._thresholds_announced = True
+                    logger.info(
+                        "No sentinel:ml:thresholds key present; every scorer is running on its "
+                        "hardcoded defaults. Write a JSON object keyed by scorer name to that "
+                        "key to override them."
+                    )
         except Exception as e:
             logger.debug(f"Could not load custom ml thresholds from Redis: {e}")
-            
+
         return self._thresholds_cache.get(key, {})
         
+    # Event types whose feature vectors are a different quantity from the rest
+    # of their domain's and therefore need their own detector history.
+    #
+    # A detector's score is an empirical percentile against what it has recently
+    # seen, which is only meaningful if the observations are commensurable. The
+    # crypto detector was being fed four unrelated feature families:
+    #
+    #   crypto_trade          [normalised notional z, normalised qty z, 0, 0, 0]
+    #   crypto_perp_funding   [funding bps, basis bps, mark/index ratio, 0, 0]
+    #   crypto_candle         [range %, body %, normalised notional, ...]
+    #   crypto_liquidation    [notional, ...]
+    #
+    # Funding rates in basis points are numerically an order of magnitude above
+    # normalised z-scores, so a funding observation was extreme against a history
+    # made mostly of trades no matter what the funding rate actually was.
+    # Measured: 97.9% of published crypto_perp_funding events scored above 0.8,
+    # and 100% of crypto_trade did. The percentile was ranking feature families
+    # against each other rather than each event against its own kind.
+    _OWN_DETECTOR_EVENT_TYPES = frozenset({
+        "crypto_perp_funding",
+        "crypto_candle",
+        "crypto_liquidation",
+        "options_flow",
+    })
+
+    def _detector_key(self, event_type: str) -> str:
+        """Which detector history this event type is scored against.
+
+        Its own where the feature vector is a different quantity from the rest of
+        the domain's, the shared domain detector otherwise -- pooling is what
+        gives a sparse domain enough history for a percentile to mean anything,
+        and is right wherever the features are commensurable.
+        """
+        evt = (event_type or "").lower()
+        if evt in self._OWN_DETECTOR_EVENT_TYPES:
+            return evt
+        return self._get_domain(event_type)
+
+    def _detector_for(self, event_type: str) -> Optional[RRCFDetector]:
+        """The detector for this event type, created on first use.
+
+        Built from the same parameters as its domain's, so an event type that
+        splits off is not also silently re-tuned.
+        """
+        key = self._detector_key(event_type)
+        detector = self._rrcf_detectors.get(key)
+        if detector is not None:
+            return detector
+
+        domain = self._get_domain(event_type)
+        domain_detector = self._rrcf_detectors.get(domain)
+        if domain_detector is None:
+            return None
+        detector = RRCFDetector(
+            num_trees=domain_detector.num_trees,
+            window_size=domain_detector.window_size,
+            shingle_size=getattr(domain_detector, "shingle_size", 1),
+        )
+        self._rrcf_detectors[key] = detector
+        logger.info(
+            "Split %s onto its own detector: its features are not commensurable "
+            "with the rest of the %s domain's.",
+            key, domain,
+        )
+        return detector
+
     def _get_domain(self, event_type: str) -> str:
         """Map event type to explicit per-domain model key (§1.1)."""
         evt = (event_type or "").lower()
@@ -295,11 +463,13 @@ class DynamicAnomalyScorer:
         if not self.redis or not getattr(self.redis, "raw", None):
             return [score > 0.60 for score in raw_scores]
 
-        mean_key = f"sentinel:ml:ema_mean:{event_type}"
-        var_key = f"sentinel:ml:ema_var:{event_type}"
-        
+        samples_key = f"sentinel:ml:score_samples:{event_type}"
+
         res = await self.redis.raw.eval(
-            EMA_GATEKEEPER_LUA, 2, mean_key, var_key, float(self.alpha), float(z_thresh), *[float(s) for s in raw_scores]
+            EMA_GATEKEEPER_LUA, 1, samples_key,
+            int(SIGNIFICANCE_SAMPLE_CAP), int(SIGNIFICANCE_MIN_SAMPLES),
+            float(SIGNIFICANCE_PERCENTILE),
+            *[float(s) for s in raw_scores]
         )
         return [bool(r) for r in res]
 
@@ -316,10 +486,33 @@ class DynamicAnomalyScorer:
         res = await self.score_event_batch(event_type, [entity_id], [features])
         return res[0]
         
+    # Score samples retained for drift comparison. A thousand is enough for a
+    # stable PSI and small enough that the list stays a rounding error in Redis.
+    DRIFT_SAMPLE_CAP = 1000
+    DRIFT_SAMPLE_TTL_SEC = 14 * 86400
+
+    async def _record_score_sample(self, scores: list) -> None:
+        """Records anomaly scores for the model-drift monitor.
+
+        Best-effort and never raises: this sits on the hot scoring path, and a
+        telemetry write must not be able to fail an enrichment.
+        """
+        if not scores or not self.redis or not getattr(self.redis, "raw", None):
+            return
+        try:
+            pipe = self.redis.raw.pipeline()
+            for score in scores[:50]:
+                pipe.lpush("sentinel:ml:current_scores", float(score))
+            pipe.ltrim("sentinel:ml:current_scores", 0, self.DRIFT_SAMPLE_CAP - 1)
+            pipe.expire("sentinel:ml:current_scores", self.DRIFT_SAMPLE_TTL_SEC)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug("Drift sample not recorded: %s", e)
+
     async def score_event_batch(self, event_type: str, entities: list, features_list: list) -> list:
         """Score events using streaming RRCF detectors (replaces ONNX IsolationForest)."""
         domain = self._get_domain(event_type)
-        detector = self._rrcf_detectors.get(domain)
+        detector = self._detector_for(event_type)
         
         if not detector or not features_list:
             MetricsCollector.increment("streaming_scoring_uninitialized_total")
@@ -334,6 +527,15 @@ class DynamicAnomalyScorer:
             scores = await loop.run_in_executor(None, detector.insert_batch, points)
             
             is_significant_list = await self._check_ema_gatekeeper_batch(event_type, scores)
+            # Feed the drift monitor, which had nothing to measure.
+            #
+            # The scheduler reads sentinel:ml:current_scores and
+            # sentinel:ml:baseline_scores, needs twenty observations in each,
+            # and nothing wrote either -- so it returned
+            # {"drift_detected": false, "psi": 0.0, "status": "initializing"}
+            # every hour for the life of the deployment, reporting an absence
+            # as a finding.
+            await self._record_score_sample(scores)
             return [{"score": round(s, 4), "is_significant": sig, "domain": domain}
                     for s, sig in zip(scores, is_significant_list)]
                 
@@ -580,10 +782,32 @@ class DynamicAnomalyScorer:
         #    stay comparable.
         base = HIJACK_BASE_SCORE if is_hijack else rrcf_score
         headroom = max(0.0, 1.0 - base)
+        #    The blend above is correct and its inputs were not.
+        #
+        #    Re-measured after that fix: bgp_anomaly still carried exactly two
+        #    distinct scores across 2,723 events a day. The arithmetic explains
+        #    it. betweenness_centrality is permanently 0 -- this Neo4j has no GDS
+        #    plugin -- velocity is a step function that returns exactly 0.0 below
+        #    its threshold and a BGP prefix rarely repeats a hundred times in a
+        #    minute, and path_novelty is 1.0 for a hijack by definition. Three
+        #    weighted terms, two structurally zero and one structurally one, so
+        #    a hijack always scored 0.70 + 0.30 x 0.5 = 0.85.
+        #
+        #    degree and prefix_specificity do vary per AS and per prefix, are
+        #    already extracted, and were only being fed to the RRCF detector --
+        #    whose answer is then discarded for hijacks, because `base` replaces
+        #    it. Including them is what gives the detector something to rank by
+        #    on the evidence this deployment can actually collect.
+        degree = float(graph_features.get("degree") or 0.0)
+        # Log-scaled: an AS with 400 peers is not forty times more interesting
+        # than one with ten, and the raw count would swamp every other term.
+        degree_signal = min(1.0, math.log1p(degree) / math.log1p(BGP_DEGREE_REFERENCE))
         contribution = (
             HIJACK_NOVELTY_WEIGHT * min(1.0, float(graph_features.get("path_novelty") or 0.0))
             + HIJACK_CENTRALITY_WEIGHT * min(1.0, float(graph_features.get("betweenness_centrality") or 0.0))
             + HIJACK_VELOCITY_WEIGHT * min(1.0, float(velocity or 0.0))
+            + BGP_DEGREE_WEIGHT * degree_signal
+            + BGP_SPECIFICITY_WEIGHT * min(1.0, float(graph_features.get("prefix_specificity") or 0.0))
         )
         rrcf_score = round(min(1.0, base + headroom * min(1.0, contribution)), 4)
         
@@ -600,32 +824,99 @@ class DynamicAnomalyScorer:
         }
 
     async def score_vessel_dark(self, mmsi: str, gap_hours: float, region: Optional[str], flags: list, heading: int) -> float:
-        """Score a vessel dark event with contextual STS zone significance.
-        
-        A 3-hour gap near a known STS transfer zone is NOT the same event
-        as a 3-hour gap in open ocean — per current maritime-intel practice.
-        Gap anomaly weight scales with dwell time × proximity to sanctioned-transfer zone.
-        """
-        config = {"base_divisor": 48.0, "sanctioned_multiplier": 1.5}
-        try:
-            cfg = await self._get_thresholds_config("vessel_dark")
-            config.update(cfg)
-        except Exception:
-            pass
+        """How unusual this vessel's silence is, for the water it went quiet in.
 
-        base = min(1.0, gap_hours / config["base_divisor"])
+        A 3-hour gap near a known STS transfer zone is NOT the same event as a
+        3-hour gap in open ocean — per current maritime-intel practice.
+
+        This scored `gap_hours / 48.0`, which is the shape the aviation detector
+        was rebuilt away from during this audit. The two are the same
+        phenomenon — a tracked object stops transmitting — and they were scored
+        six times apart: over thirty hours, 906 flight_dark events averaged
+        0.632 while 46 vessel_dark events averaged 0.111, and no vessel cleared
+        0.2. An absolute divisor cannot express "unusual", only "long": it says
+        a ship must be silent for two full days before its silence means
+        anything, regardless of whether every ship in that region reports
+        hourly or daily.
+
+        The null model is the same one aviation uses. Record what gaps this
+        region actually produces, and ask where this one sits among them.
+        """
+        # Every gap feeds the distribution, including the unremarkable ones.
+        # A distribution built only from gaps that scored well is truncated at
+        # its own threshold, which is the circularity that makes every
+        # observation look extreme.
+        await self._record_vessel_gap(region, gap_hours)
+
+        samples = await self._vessel_gap_samples(region)
+        if len(samples) < _MIN_VESSEL_GAP_SAMPLES:
+            # Not enough history to say anything about this region yet. The old
+            # absolute divisor is the bootstrap rather than the answer, and it
+            # is deliberately kept so a cold start still produces an ordering.
+            config = {"base_divisor": 48.0, "sanctioned_multiplier": 1.5}
+            try:
+                config.update(await self._get_thresholds_config("vessel_dark"))
+            except Exception as e:
+                logger.debug("vessel_dark threshold config unavailable: %s", e)
+            base = min(1.0, gap_hours / config["base_divisor"])
+        else:
+            rank = quant_calc.percentile_rank(samples, gap_hours)
+            if rank < _VESSEL_NOTABLE_PERCENTILE:
+                # More ordinary than 90% of what this region produces. Scored
+                # low rather than suppressed: unlike the aviation detector this
+                # is a scoring function, and its caller has already decided the
+                # event exists.
+                base = round(_VESSEL_SCORE_FLOOR * (rank / max(1e-9, _VESSEL_NOTABLE_PERCENTILE)), 4)
+            else:
+                tail = (rank - _VESSEL_NOTABLE_PERCENTILE) / max(1e-9, 1.0 - _VESSEL_NOTABLE_PERCENTILE)
+                base = round(_VESSEL_SCORE_FLOOR + tail * (_VESSEL_SCORE_CEILING - _VESSEL_SCORE_FLOOR), 4)
+            config = {"sanctioned_multiplier": 1.5}
+            try:
+                config.update(await self._get_thresholds_config("vessel_dark"))
+            except Exception as e:
+                logger.debug("vessel_dark threshold config unavailable: %s", e)
+
         if "sanctioned" in " ".join(flags).lower():
-            base = min(1.0, base * config["sanctioned_multiplier"])
-        
+            base = min(1.0, base * config.get("sanctioned_multiplier", 1.5))
+
         # Contextual gap significance: STS transfer zone proximity multiplier
         zone_mult = sts_zone_risk_multiplier(region)
         base = min(1.0, base * zone_mult)
-        
+
         return round(min(1.0, base), 3)
 
-    async def score_crypto_trade(self, asset: str, notional: float, qty: float) -> float:
-        res = await self.score_crypto_trade_batch([(asset, notional, qty)])
-        return res[0]
+    async def _record_vessel_gap(self, region: Optional[str], gap_hours: float) -> None:
+        """Adds this observation to its region's empirical gap distribution."""
+        try:
+            if not self.redis or gap_hours is None or gap_hours < 0 or gap_hours >= 48.0:
+                return
+            key = _VESSEL_GAP_SAMPLES_KEY.format(region=region or "Default")
+            pipe = self.redis.raw.pipeline()
+            pipe.lpush(key, round(float(gap_hours), 3))
+            pipe.ltrim(key, 0, _VESSEL_GAP_SAMPLE_CAP - 1)
+            pipe.expire(key, 30 * 86400)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug("Failed recording vessel gap sample: %s", e)
+
+    async def _vessel_gap_samples(self, region: Optional[str]) -> list:
+        """This region's observed gaps, newest first."""
+        try:
+            if not self.redis:
+                return []
+            key = _VESSEL_GAP_SAMPLES_KEY.format(region=region or "Default")
+            raw = await self.redis.raw.lrange(key, 0, _VESSEL_GAP_SAMPLE_CAP - 1)
+            out = []
+            for item in raw or []:
+                try:
+                    out.append(float(item if isinstance(item, (str, int, float)) else item.decode("utf-8")))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception as e:
+            logger.debug("Failed reading vessel gap samples: %s", e)
+            return []
+
 
     async def score_crypto_trade_batch(self, trades: list) -> list:
         if not trades: return []
@@ -644,7 +935,7 @@ class DynamicAnomalyScorer:
         res = await self.score_event_batch("crypto_trade", entities, features_list)
         return [r["score"] for r in res]
 
-    async def score_crypto_candle(self, asset: str, features: list) -> float:
+    async def score_crypto_candle(self, asset: str, features: list) -> Dict[str, Any]:
         """Scores a candle. The caller's feature list is left as it was found.
 
         This normalised in place -- `features[2] = ...` on the list the caller
@@ -666,12 +957,13 @@ class DynamicAnomalyScorer:
         scored = list(features)
         if len(scored) >= 3:
             scored[2] = await self._dynamic_normalize(f"crypto:{asset}", "candle_notional", scored[2])
-        res = await self.score_event("crypto_candle", asset, (scored + [0.0] * 5)[:5])
-        return res["score"]
+        # Full result: the per-domain significance gate's answer travels with
+        # the score rather than being computed and dropped.
+        return await self.score_event("crypto_candle", asset, (scored + [0.0] * 5)[:5])
 
     async def score_financial_trade(self, domain: str, ticker: str, notional: float, volume: float) -> float:
         res = await self.score_financial_trade_batch(domain, [(ticker, notional, volume)])
-        return res[0]
+        return float(res[0].get("score", 0.5)) if res else 0.5
         
     async def score_financial_trade_batch(self, domain: str, trades: list) -> list:
         if not trades: return []
@@ -687,26 +979,22 @@ class DynamicAnomalyScorer:
             features_list.append([n, v, 0.0, 0.0, 0.0])
             entities.append(t[0])
             
-        res = await self.score_event_batch("tradfi_trade", entities, features_list)
-        return [r["score"] for r in res]
+        # The full result, not just the score.
+        #
+        # This returned [r["score"] for r in res] and dropped `is_significant`
+        # on the floor -- the calibrated per-domain gate runs on every batch and
+        # its answer had no reader anywhere in the platform, while consumers
+        # downstream re-derived significance as `anomaly >= 0.65`, a hardcoded
+        # constant that knows nothing about the domain's distribution.
+        return await self.score_event_batch("tradfi_trade", entities, features_list)
 
-    async def score_market_candle(self, domain: str, ticker: str, features: list) -> float:
+    async def score_market_candle(self, domain: str, ticker: str, features: list) -> Dict[str, Any]:
         """As score_crypto_candle: scores a copy, never the caller's list."""
         scored = list(features)
         if len(scored) >= 3:
             scored[2] = await self._dynamic_normalize(f"{domain}:{ticker}", "candle_notional", scored[2])
-        res = await self.score_event("tradfi_candle", ticker, (scored + [0.0] * 5)[:5])
-        return res["score"]
+        return await self.score_event("tradfi_candle", ticker, (scored + [0.0] * 5)[:5])
 
-    async def score_prediction_trade(self, asset_id: str, notional: float) -> float:
-        config = {"divisor": 100_000.0}
-        try:
-            cfg = await self._get_thresholds_config("prediction_trade")
-            config.update(cfg)
-        except Exception:
-            pass
-        res = await self.score_event("prediction_market_trade", asset_id, [notional / config["divisor"], 0.0, 0.0, 0.0, 0.0])
-        return res["score"]
 
     async def score_prediction_anomaly(
         self, 
@@ -951,111 +1239,7 @@ class DynamicAnomalyScorer:
         res = await self.score_event("cyber_anomaly", cve_id, [severity_score / config["divisor"], 0.0, 0.0, 0.0, 0.0])
         return res["score"]
 
-    async def score_aviation_batch(self, flights: list) -> list:
-        """Score batched flight events using Kalman residuals + RRCF.
-        
-        Each flight entry should be a dict with keys like:
-        altitude, speed, latitude, longitude, heading, timestamp
-        """
-        if not flights:
-            return []
-        
-        entities = []
-        lats = []
-        lons = []
-        speeds = []
-        headings = []
-        timestamps = []
-        extra_features = []
-        
-        for f in flights:
-            if isinstance(f, dict):
-                entities.append(str(f.get('icao24', f.get('callsign', 'unknown'))))
-                lats.append(float(f.get('latitude', 0)))
-                lons.append(float(f.get('longitude', 0)))
-                speeds.append(float(f.get('speed', 0)))
-                headings.append(float(f.get('heading', 0)))
-                timestamps.append(float(f.get('timestamp', time.time())))
-                extra_features.append([
-                    float(f.get('altitude', 0)) / 45000.0,  # Normalized altitude
-                ])
-            else:
-                entities.append('unknown')
-                lats.append(0.0)
-                lons.append(0.0)
-                speeds.append(0.0)
-                headings.append(0.0)
-                timestamps.append(time.time())
-                extra_features.append([0.0])
-        
-        results = await self.score_kinematic_event_batch(
-            entities, lats, lons, speeds, headings, timestamps, extra_features
-        )
-        return [r["score"] for r in results]
 
-    async def composite_score_event(
-        self,
-        event_type: str,
-        entity_id: str,
-        features: list,
-        volume_raw: float = 0.0,
-        volatility_raw: float = 0.0,
-        hawkes_ratio: float = 0.0,
-    ) -> dict:
-        """
-        Composite anomaly scoring with dimensional breakdown.
-        Returns an AnomalyBreakdown dict with per-dimension sub-scores
-        so agents receive structured reasoning inputs instead of opaque floats.
-        """
-        domain = self._get_domain(event_type)
-        base_result = await self.score_event(event_type, entity_id, features)
-        base_score = base_result.get("score", 0.0)
-
-        # Dimensional sub-scores
-        spatial_score = base_score if domain == "spatial" else 0.0
-        temporal_score = base_score if domain == "temporal" else 0.0
-
-        # Volume z-score via dynamic normalization
-        volume_z = 0.0
-        if volume_raw > 0:
-            try:
-                volume_z = await self._dynamic_normalize(entity_id, "volume", volume_raw)
-            except Exception:
-                pass
-
-        # Volatility z-score
-        volatility_z = 0.0
-        if volatility_raw > 0:
-            try:
-                volatility_z = await self._dynamic_normalize(entity_id, "volatility", volatility_raw)
-            except Exception:
-                pass
-
-        # EWMA volatility from recent returns stored in Redis
-        ewma_vol = await self._compute_ewma_volatility(entity_id, volatility_raw)
-
-        # Composite: weighted combination of dimensional scores
-        composite = (
-            0.35 * base_score
-            + 0.20 * min(1.0, max(0.0, abs(volume_z) / 3.0))
-            + 0.20 * min(1.0, max(0.0, abs(volatility_z) / 3.0))
-            + 0.25 * temporal_score
-        )
-        composite = round(min(1.0, max(0.0, composite)), 4)
-
-        is_significant = base_result.get("is_significant", False) or composite > 0.65
-
-        return {
-            "composite_score": composite,
-            "spatial_score": round(spatial_score, 4),
-            "temporal_score": round(temporal_score, 4),
-            "volume_z_score": round(volume_z, 4),
-            "volatility_z_score": round(volatility_z, 4),
-            "cross_domain_correlation_score": round(hawkes_ratio, 4),
-            "ewma_volatility": round(ewma_vol, 6),
-            "is_significant": is_significant,
-            "domain": domain,
-        }
 
     async def _compute_ewma_volatility(
         self, entity_id: str, new_return: float, lam: float = 0.94

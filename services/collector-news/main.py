@@ -44,6 +44,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -330,7 +331,7 @@ async def main():
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-news")
     await metrics.start(redis_client)
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-news"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-news"))
 
     try:
         await collect(producer, redis_client)

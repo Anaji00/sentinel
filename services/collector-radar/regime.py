@@ -10,6 +10,8 @@ to adjust baseline anomaly scoring dynamically.
 from datetime import datetime, timezone
 import math
 
+from shared.utils.volatility import REALISED_VOL_KEY, threshold_for
+
 class MarketRegime:
     def __init__(self, redis_client):
         self.redis = redis_client
@@ -20,23 +22,30 @@ class MarketRegime:
         Scales Z_threshold dynamically with VIX: Z_th = 3.0 * (VIX / 20.0),
         bounded between 2.5 and 5.0 to prevent false-positive anomaly surges.
         """
+        # Measured volatility, not an assumed one.
+        #
+        # This read `sentinel:macro:vix`, which nothing has ever written: VIX
+        # appears in no collector on this platform. The fallback resolved to
+        # 20.0 on every call, so the threshold was always 3.0 * (20/20) = 3.0
+        # and alpha always 0.10 -- a function documented as scaling with the
+        # market that had never once scaled.
+        #
+        # Realised volatility of the index the platform already records is not
+        # VIX; VIX is implied and forward-looking and this is neither. It does
+        # move with what the threshold actually cares about, which is whether
+        # the session is calm or violent, and it can be measured rather than
+        # assumed.
+        volatility = None
         try:
-            raw_vix = await self.redis.raw.get("sentinel:macro:vix")
-            vix_current = float(raw_vix) if raw_vix else 20.0
+            raw = await self.redis.raw.get(REALISED_VOL_KEY)
+            if raw:
+                volatility = float(raw)
+        except (TypeError, ValueError):
+            volatility = None
         except Exception:
-            vix_current = 20.0
+            volatility = None
 
-        # Dynamic VIX-regime scaling
-        z_threshold = max(2.5, min(5.0, round(3.0 * (vix_current / 20.0), 2)))
-
-        if vix_current < 12.0:
-            alpha = 0.05
-        elif vix_current > 25.0:
-            alpha = 0.20
-        else:
-            alpha = 0.10
-
-        return alpha, z_threshold
+        return threshold_for(volatility)
 
     @staticmethod
     def get_intraday_volume_multiplier() -> float:

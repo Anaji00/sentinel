@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.utils.candles import candle_cache_key
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
@@ -40,6 +41,47 @@ from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symb
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.tasks import safe_create_task
+
+# What counts as a block, per instrument rather than per market.
+#
+# `notional >= 50_000` was applied to every ticker regardless of liquidity.
+# Measured over three hours of live market data: 8,174 block trades, median
+# notional $71,764, and 7,371 of them (90%) between $50K and $200K -- below the
+# conventional $200K threshold everywhere, and in a mega-cap far below anything
+# a desk would call a block. A $0.10M AMZN print is 0.002% of that name's daily
+# volume and was emitted as "SELL BLOCK" at logger.warning.
+#
+# A block is a trade that is large *for this instrument*, so the floor scales
+# with what the instrument usually trades. The rolling notional the collector
+# already maintains is the measurement; the absolute floor below it is the
+# cold-start answer for a ticker with no history yet.
+BLOCK_FLOOR_USD = float(os.getenv("BLOCK_FLOOR_USD", "200000"))
+BLOCK_MULTIPLE_OF_TYPICAL = float(os.getenv("BLOCK_MULTIPLE_OF_TYPICAL", "8.0"))
+_TYPICAL_NOTIONAL: dict = {}
+_TYPICAL_ALPHA = 0.02  # slow EWMA: a block must not raise the bar it is judged against
+
+
+def _is_block_trade(ticker: str, notional: float) -> bool:
+    """Is this trade large for this instrument?
+
+    The running average is updated *after* the comparison, so a large print is
+    measured against the market before it rather than against a baseline it has
+    already moved -- the mistake that made a first-ever earnings surprise look
+    unremarkable, recorded elsewhere in this audit.
+    """
+    typical = _TYPICAL_NOTIONAL.get(ticker)
+
+    if typical is None or typical <= 0:
+        is_block = notional >= BLOCK_FLOOR_USD
+    else:
+        is_block = notional >= max(BLOCK_FLOOR_USD, typical * BLOCK_MULTIPLE_OF_TYPICAL)
+
+    prev = typical if typical is not None else notional
+    _TYPICAL_NOTIONAL[ticker] = prev + _TYPICAL_ALPHA * (notional - prev)
+    return is_block
+
+
 
 logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -216,8 +258,26 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=include&count=40&output=atom"
     loop = asyncio.get_event_loop()
     try:
-        async with session.get(url, timeout=15, headers={"User-Agent": "SENTINEL/1.0"}) as resp:
+        # A User-Agent SEC accepts, and a log when it does not.
+        #
+        # This sent "SENTINEL/1.0", which carries no contact address, and SEC
+        # fair-access returns 403 for it -- verified directly: "SENTINEL/1.0"
+        # gives HTTP 403 while a UA with a contact address gives HTTP 200 and
+        # 22,643 bytes of Form 4 atom feed.
+        #
+        # The rejection then returned silently, so the poller has been blocked
+        # for the life of the deployment with nothing logged. That is why there
+        # are zero insider_trade events in the database and why the insider
+        # clustering, the insider correlation rule and the Form 4 enricher have
+        # all sat idle: not a routing defect, a 403 nobody could see.
+        async with session.get(url, timeout=15, headers={"User-Agent": SEC_USER_AGENT}) as resp:
             if resp.status != 200:
+                logger.warning(
+                    "SEC Form 4 feed returned HTTP %s. Insider events will not "
+                    "be produced this cycle; 403 usually means the User-Agent "
+                    "lacks a contact address (set SEC_USER_AGENT in .env).",
+                    resp.status,
+                )
                 return
             content = await resp.read()
 
@@ -280,6 +340,15 @@ class OHLCVAggregator:
             redis.call("LPUSH", key, new_candle)
             redis.call("LTRIM", key, 0, max_len - 1)
         end
+        -- Expiry, so the list can be evicted.
+        --
+        -- These were written without one. Under allkeys-lru that was invisible;
+        -- under volatile-lru Redis may only evict keys that carry a TTL, so
+        -- 3,436 permanent candle lists at up to 1,440 entries each filled the
+        -- instance and every write began returning "command not allowed when
+        -- used memory > maxmemory" -- including aircraft:last_seen, which left
+        -- the dark-flight detector with nothing to scan.
+        redis.call("EXPIRE", key, 604800)
     end
     return 1
     """
@@ -349,6 +418,9 @@ class OHLCVAggregator:
                         candle_json = json.dumps({"ts": now.isoformat(), **candle})
                         pipe.lpush(redis_list_key, candle_json)
                         pipe.ltrim(redis_list_key, 0, 1439)
+                        # See the EXPIRE in the Lua aggregator above: a list
+                        # with no TTL cannot be evicted under volatile-lru.
+                        pipe.expire(redis_list_key, 604800)
                         
                         # Aggregate higher timeframes atomically via Lua script
                         for tf, cfg in self.TIMEFRAMES.items():
@@ -481,8 +553,8 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
                 logger.info("Connected to Finnhub WebSocket")
-                sync_task = asyncio.create_task(sync_subscriptions(ws))
-                flush_task = asyncio.create_task(flush_aggregator())
+                sync_task = safe_create_task(sync_subscriptions(ws))
+                flush_task = safe_create_task(flush_aggregator())
                 last_message_at = time.monotonic()
 
                 try:
@@ -549,7 +621,7 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
 
                                 aggregator.add_trade(ticker, price, volume)
 
-                                if notional > 50_000:
+                                if _is_block_trade(ticker, notional):
                                     if tick_direction == "DownTick":
                                         logger.warning("🔴 SELL BLOCK: %s $%.2fM at $%.2f", ticker, notional / 1e6, price)
                                     elif tick_direction == "UpTick":
@@ -667,7 +739,7 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                                 aggregator.add_trade(ticker, price, volume)
                                 ingested_count += 1
 
-                                if notional >= 50_000:
+                                if _is_block_trade(ticker, notional):
                                     tag = "🔴 SELL BLOCK" if tick_dir == "DownTick" else ("🟢 BUY BLOCK" if tick_dir == "UpTick" else "⚪ NEUTRAL BLOCK")
                                     logger.warning("%s [%s]: %s $%.2fM at $%.2f", tag, session_name, ticker, notional / 1e6, price)
 
@@ -686,7 +758,9 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
 
-                                await redis_client.raw.set(f"sentinel:quotes:latest:{ticker}", str(price), ex=3600)
+                                await redis_client.raw.set(
+                                    quote_key(ticker), str(price), ex=QUOTE_CACHE_TTL_SEC,
+                                )
 
                             if ingested_count > 0:
                                 logger.info(f"📈 Extended-Hours Poller [{session_name}]: Ingested {ingested_count} updates across {len(symbols)} watched symbols.")
@@ -701,6 +775,77 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                 logger.error(f"Extended-hours equities polling error: {e}", exc_info=True)
 
             await asyncio.sleep(60)
+
+
+# The last option trade published per contract, so an unchanged snapshot is not
+# republished. Bounded below by _prune_option_fingerprints: contracts expire and
+# the chain rolls, so this would otherwise grow for the life of the process.
+_last_option_trade: dict = {}
+
+# Contracts to remember before pruning. A day's chain across the watchlist is a
+# few thousand; this keeps well clear of that without growing without bound.
+_MAX_OPTION_FINGERPRINTS = 20000
+
+
+async def _option_trade_is_new(redis_client, contract: str, fingerprint: str) -> bool:
+    """Whether this contract's last trade differs from the one already seen.
+
+    Redis-backed so a restart does not republish the entire chain. Falls back
+    to the in-process map when Redis is unavailable, which is worse than Redis
+    and much better than republishing everything on every poll.
+    """
+    key = f"sentinel:options:last_trade:{contract}"
+    if redis_client is not None and getattr(redis_client, "raw", None) is not None:
+        try:
+            # SET NX returns None when the key exists, so an unchanged trade is
+            # a single round trip and no write.
+            stored = await redis_client.raw.get(key)
+            if stored is not None:
+                stored = stored.decode("utf-8") if isinstance(stored, bytes) else str(stored)
+                if stored == fingerprint:
+                    return False
+            await redis_client.raw.set(key, fingerprint, ex=_OPTION_FINGERPRINT_TTL_SEC)
+            return True
+        except Exception:
+            pass    # fall through to the process-local map
+
+    if _last_option_trade.get(contract) == fingerprint:
+        return False
+    _last_option_trade[contract] = fingerprint
+    return True
+
+
+# Contracts expire and the chain rolls, so a fingerprint outlives its usefulness
+# quickly. Two days spans a weekend without holding a quarter of stale keys.
+_OPTION_FINGERPRINT_TTL_SEC = 2 * 86400
+
+
+def _prune_option_fingerprints() -> None:
+    """Drops the oldest half once the map gets large.
+
+    Insertion order is preserved by dict, so the oldest entries are the ones
+    whose contracts stopped trading -- expired, or rolled off the chain.
+    """
+    if len(_last_option_trade) <= _MAX_OPTION_FINGERPRINTS:
+        return
+    for key in list(_last_option_trade)[: len(_last_option_trade) // 2]:
+        _last_option_trade.pop(key, None)
+
+
+# SEC fair-access requires a User-Agent naming the requester with a contact
+# address they read. The collector-filings service takes the same variable, so
+# one setting covers both SEC callers.
+SEC_USER_AGENT = os.getenv(
+    "SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local"
+)
+
+
+# Floor for the EPS surprise denominator.
+#
+# A nickel. Consensus below this is statistically indistinguishable from zero
+# for percentage purposes, and dividing by it turns a small absolute miss into a
+# four-figure percentage.
+MIN_EPS_SURPRISE_DENOMINATOR = 0.05
 
 
 # ── ALPACA OPTIONS FLOW (REST POLLING) ────────────────────────────────────────
@@ -781,6 +926,52 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 premium = price * size * 100.0
 
                                 if premium >= 50000.0 or size >= 100.0:
+                                    # One fill, published once.
+                                    #
+                                    # latestTrade is the contract's last trade,
+                                    # so it does not change between polls unless
+                                    # the contract trades again -- and this loop
+                                    # republished it every cycle regardless. The
+                                    # macro collector had the identical defect
+                                    # against the identical Alpaca field and was
+                                    # fixed with a fingerprint; this path was
+                                    # missed.
+                                    #
+                                    # Measured over 24 hours: 15,970 options
+                                    # events carrying 1,392 distinct contracts,
+                                    # 91.3% duplicates, one contract published
+                                    # 200 times. Every copy was scored,
+                                    # correlated and counted, so a single
+                                    # $5.8m TEX sweep became 200 anomalies at a
+                                    # score of 1.000.
+                                    #
+                                    # The trade's own timestamp is the identity:
+                                    # a genuine new fill carries a new one, and
+                                    # the price and size are included so a
+                                    # feed that omits the timestamp still
+                                    # deduplicates on the trade itself.
+                                    trade_fp = "|".join(str(x) for x in (
+                                        latest_trade.get("t") or latest_trade.get("timestamp"),
+                                        price,
+                                        size,
+                                    ))
+                                    # Kept in Redis rather than process memory.
+                                    #
+                                    # The in-process map meant every restart
+                                    # republished the whole chain once -- 36
+                                    # events per deploy. The aviation gap
+                                    # detector had the identical shape earlier
+                                    # in this audit, where 462 of 464 events
+                                    # turned out to be redeploys re-emitting a
+                                    # backlog, and the fix there was the same
+                                    # move.
+                                    #
+                                    # A miss falls through and publishes, which
+                                    # is the safe direction: a duplicate costs
+                                    # a row, a false suppression loses a fill.
+                                    if not await _option_trade_is_new(redis_client, contract, trade_fp):
+                                        continue
+
                                     parsed = parse_occ_option_symbol(contract) or {}
                                     opt_type = parsed.get("option_type", "CALL")
                                     strike_val = parsed.get("strike")
@@ -822,7 +1013,12 @@ async def poll_options(producer: SentinelProducer, redis_client):
                             else:
                                 logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
 
-                logger.info(f"⏱️ Options Poller Heartbeat: Checked {len(symbols[:50])} equity tickers | Sweeps published: {total_sweeps}")
+                _prune_option_fingerprints()
+                logger.info(
+                    "⏱️ Options Poller Heartbeat: Checked %s equity tickers | "
+                    "Sweeps published: %s | Contracts tracked: %s",
+                    len(symbols[:50]), total_sweeps, len(_last_option_trade),
+                )
             except Exception as e:
                 logger.error(f"Error in Options flow collector: {e}", exc_info=True)
 
@@ -909,9 +1105,36 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
 
                     await redis_client.raw.set(dedup_key, fingerprint, ex=604800)
 
+                    # A percentage surprise divided by a near-zero estimate
+                    # measures the estimate, not the miss.
+                    #
+                    # The only guard was `eps_estimate != 0`, so an estimate of
+                    # $0.0051 passed it. Live rows:
+                    #
+                    #   SECZ  actual -2.37   estimate 0.0051  ->  <span> -46,570.6%
+                    #   RRGB  actual  0.12   estimate 0.0034  ->   +3,429.4%
+                    #   MLCI  actual -0.37   estimate 0.0102  ->   -3,727.5%
+                    #
+                    # None of those describe the size of a miss; they describe
+                    # how close a consensus sat to zero. 70 of 101 surprises
+                    # cleared the radar agent's 10% gate on this arithmetic.
+                    #
+                    # The denominator is floored at a nickel, which bounds the
+                    # artifact without discarding a real miss, and the absolute
+                    # difference is published beside it so a consumer can judge
+                    # magnitude directly rather than inferring it from a ratio.
                     eps_surprise_pct = None
-                    if eps_actual is not None and eps_estimate is not None and eps_estimate != 0:
-                        eps_surprise_pct = ((float(eps_actual) - float(eps_estimate)) / abs(float(eps_estimate))) * 100.0
+                    eps_surprise_abs = None
+                    if eps_actual is not None and eps_estimate is not None:
+                        try:
+                            actual_f = float(eps_actual)
+                            estimate_f = float(eps_estimate)
+                        except (TypeError, ValueError):
+                            actual_f = estimate_f = None
+                        if actual_f is not None:
+                            eps_surprise_abs = round(actual_f - estimate_f, 4)
+                            denominator = max(abs(estimate_f), MIN_EPS_SURPRISE_DENOMINATOR)
+                            eps_surprise_pct = ((actual_f - estimate_f) / denominator) * 100.0
 
                     has_actual = eps_actual is not None
                     trade_type = "EARNINGS_SURPRISE" if has_actual else "EARNINGS_REPORT"
@@ -962,6 +1185,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                         "eps_estimate": float(eps_estimate) if eps_estimate is not None else None,
                         "eps_actual": float(eps_actual) if eps_actual is not None else None,
                         "eps_surprise_pct": round(eps_surprise_pct, 2) if eps_surprise_pct is not None else None,
+                            "eps_surprise_abs": eps_surprise_abs,
                         "revenue_estimate": float(revenue_estimate) if revenue_estimate is not None else None,
                         "revenue_actual": float(revenue_actual) if revenue_actual is not None else None,
                         "trade_type": trade_type,
@@ -987,6 +1211,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                             "eps_estimate": float(eps_estimate) if eps_estimate is not None else None,
                             "eps_actual": float(eps_actual) if eps_actual is not None else None,
                             "eps_surprise_pct": round(eps_surprise_pct, 2) if eps_surprise_pct is not None else None,
+                            "eps_surprise_abs": eps_surprise_abs,
                             "revenue_estimate": float(revenue_estimate) if revenue_estimate is not None else None,
                             "revenue_actual": float(revenue_actual) if revenue_actual is not None else None,
                         },
@@ -1179,10 +1404,10 @@ async def main():
     # these prove it is still producing.
     metrics = CollectorMetrics("collector-tradfi")
     await metrics.start(redis_client)
-    hb_task = asyncio.create_task(start_heartbeat_task(redis_client, "collector-tradfi"))
+    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-tradfi"))
 
     # §0.3 — PubSub listener for instant watchlist sync
-    pubsub_task = asyncio.create_task(_watchlist_pubsub_listener(redis_client, watchlist_sync_event))
+    pubsub_task = safe_create_task(_watchlist_pubsub_listener(redis_client, watchlist_sync_event))
 
     try:
         await asyncio.gather(

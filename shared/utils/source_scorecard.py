@@ -1,3 +1,4 @@
+import re
 """
 shared/utils/source_scorecard.py
 
@@ -63,3 +64,89 @@ async def update_source_scorecard(
     client = getattr(redis_client, "raw", redis_client)
     await client.set(key, card.model_dump_json(), ex=2592000)  # 30 day TTL (sources move slower than agents)
     return card
+
+
+# ── STRUCTURAL SOURCE RELIABILITY ────────────────────────────────────────────
+#
+# What a feed is worth before any of its claims have been scored.
+#
+# The scorecard above learns a source's reliability from whether its stories are
+# later confirmed, and it is the right mechanism -- but it only ever ran on the
+# news path, and every other enricher left source_reliability at the model
+# default of 1.0. Measured across 1,204 live events: 1,201 carried exactly 1.0.
+# A volunteer-fed terrestrial ADS-B aggregator, a volunteer-fed AIS aggregator,
+# a raw chain RPC and a licensed equities vendor were rated identically and
+# maximally, so the field ranked nothing and the one mechanism the platform has
+# for discounting a weak source returned a constant.
+#
+# These are structural properties of the feeds, not judgements about individual
+# messages, which is why they are written down rather than learned:
+#
+#   - A terrestrial ADS-B or AIS aggregator has coverage holes by construction.
+#     Its *positions* are trustworthy; its *absences* are receiver geography,
+#     and it cannot tell you which is which.
+#   - A chain RPC reports what is in a block. That is authoritative about the
+#     chain and says nothing about who controls an address.
+#   - An exchange or licensed market-data vendor is reporting its own book.
+#   - A regulatory filing is the registrant's own signed statement.
+#
+# Anything not listed keeps the previous behaviour of 1.0, so adding a feed
+# never silently discounts it.
+SOURCE_RELIABILITY_BASELINE = {
+    # Regulatory and exchange-of-record: the source *is* the fact.
+    "sec_form4": 0.99,
+    "sec_filings": 0.99,
+    "sec": 0.99,
+    "fred": 0.98,
+    "treasury": 0.98,
+    # Venues reporting their own book.
+    "coinbase_candles": 0.95,
+    "coinbase": 0.95,
+    "binance": 0.95,
+    "okx": 0.95,
+    "kraken": 0.95,
+    "finnhub_equities": 0.92,
+    "finnhub": 0.92,
+    "polygon": 0.92,
+    "alpaca": 0.92,
+    # Authoritative about the chain, silent about attribution.
+    "ethereum_rpc": 0.90,
+    "eth_rpc": 0.90,
+    "etherscan": 0.85,
+    # Prediction venues: a real price, a thin book.
+    "polymarket": 0.80,
+    "kalshi": 0.80,
+    # Volunteer-fed aggregators. Good positions, structurally incomplete
+    # coverage -- which is precisely why a gap in one is not an event.
+    "opensky": 0.70,
+    "adsb": 0.70,
+    "adsbexchange": 0.70,
+    "aisstream": 0.70,
+    "ais": 0.70,
+    # Open telemetry and community feeds.
+    "ripe_ris": 0.75,
+    "bgpstream": 0.75,
+    "gdelt": 0.65,
+    "reddit": 0.45,
+    "telegram": 0.40,
+    "twitter": 0.40,
+    "social": 0.40,
+}
+
+# Feeds not in the table keep the previous behaviour.
+DEFAULT_SOURCE_RELIABILITY = 1.0
+
+
+def baseline_reliability(source_name: str) -> float:
+    """The structural reliability of a feed, before its record is considered.
+
+    Matched on the leading token as well as the whole name, so "opensky_rest"
+    and "binance_ws" resolve without a row each.
+    """
+    if not source_name:
+        return DEFAULT_SOURCE_RELIABILITY
+    key = str(source_name).strip().lower()
+    if key in SOURCE_RELIABILITY_BASELINE:
+        return SOURCE_RELIABILITY_BASELINE[key]
+    head = re.split(r"[^a-z0-9]+", key)[0] if key else ""
+    return SOURCE_RELIABILITY_BASELINE.get(head, DEFAULT_SOURCE_RELIABILITY)

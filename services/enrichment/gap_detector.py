@@ -24,6 +24,12 @@ from shared.utils.heartbeat import is_component_healthy
  
 logger = logging.getLogger("enrichment.gap_detector")
  
+# How long an already-reported dark vessel stays reported.
+#
+# Long enough to survive a deploy -- which is the failure this replaces -- and
+# short enough that a vessel dark for a fortnight is eventually raised again.
+SEEN_GAP_TTL_SEC = 7 * 86400
+
 DARK_THRESHOLDS = {
     "Strait of Hormuz":    1,
     "Iranian Territorial": 1,
@@ -45,7 +51,15 @@ class VesselGapDetector:
         self.scorer = scorer
         self.db_writer = db_writer
         self.redis = redis_client
-        self._seen_gaps = set()  # To avoid duplicate gap events for the same vessel
+        # Deduplication in Redis, not in this process.
+        #
+        # The aviation twin of this detector held the same set in memory, and
+        # every restart emptied it: the next scan re-reported every aircraft
+        # already dark as though it had just gone silent, producing 200 and 262
+        # events in the two hours of a deploy against a steady rate of a few.
+        # Those records are indistinguishable in the database from real ones.
+        # This detector had the identical defect and the same exposure.
+        self._seen_key = "sentinel:maritime:seen_gaps"
 
     async def run(self):
         logger.info("Starting Vessel Gap Detector background task")
@@ -75,7 +89,12 @@ class VesselGapDetector:
             if self.db_writer:
                 await self.db_writer.write_events_batch([degraded_event])
             if self.producer:
-                await self.producer.send(Topics.ALERTS, degraded_event.model_dump(mode="json"))
+                # alerts.outbound has no consumer; the correlation service reads
+                # ENRICHED_EVENTS, so a vessel_dark event sent only to the alert
+                # topic can never enter the window the rules about it query.
+                payload = degraded_event.model_dump(mode="json")
+                await self.producer.send(Topics.ENRICHED_EVENTS, payload)
+                await self.producer.send(Topics.ALERTS, payload)
             return
 
         fired = 0
@@ -146,13 +165,20 @@ class VesselGapDetector:
                 dedup_key = f"{mmsi}:{region}"
                 if gap_hours < threshold:
                     # Ship is active. Remove from seen_gaps if it was previously dark.
-                    self._seen_gaps.discard(dedup_key)
+                    try:
+                        await self.redis.raw.hdel(self._seen_key, dedup_key)
+                    except Exception:
+                        pass
                     continue
                     
-                if dedup_key in self._seen_gaps:
-                    continue # Ship is STILL dark. Do not fire a duplicate alert.
-                    
-                self._seen_gaps.add(dedup_key)
+                try:
+                    if await self.redis.raw.hexists(self._seen_key, dedup_key):
+                        continue  # Ship is STILL dark; not a new alert.
+                except Exception:
+                    pass  # A store failure must not suppress a real alert.
+
+                # Marked where the event is emitted, not here. Marking before
+                # the decision suppresses alerts that were never raised.
                 
                 # Queue for enrichment
                 anomalous_mmsis.append(mmsi)
@@ -216,6 +242,30 @@ class VesselGapDetector:
                 ])),
                 anomaly_score=score,
             )
+
+            try:
+                # Rebuilt from this loop's own mmsi and region.
+                #
+                # `dedup_key` is bound in the scanning loop above, not this one,
+                # so reading it here would record the last vessel scanned rather
+                # than the one being emitted -- every alert marking the wrong
+                # ship as seen, and the right ones re-firing forever. The
+                # aviation twin had this exact shape.
+                # Built from the stored region, not the display one.
+                #
+                # `reg` carries a "unknown waters" fallback for the headline
+                # that the scanning loop does not apply, so keying on it would
+                # write "123:unknown waters" against a scan that looked up
+                # "123:None" -- a mismatch on exactly the vessels with no region,
+                # which would then re-fire on every pass forever.
+                await self.redis.raw.hset(
+                    self._seen_key,
+                    f"{mmsi}:{data.get('region')}",
+                    now.isoformat(),
+                )
+                await self.redis.raw.expire(self._seen_key, SEEN_GAP_TTL_SEC)
+            except Exception as e:
+                logger.debug(f"Could not record seen vessel gap {mmsi}: {e}")
 
             events_to_write.append(event)
             await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=mmsi)

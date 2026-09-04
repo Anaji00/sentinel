@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from services.api_gateway.dependencies import get_graph, get_db
+from shared.models.events import UNRATED_EDGE_CONFIDENCE
 
 logger = logging.getLogger("api-gateway.graph")
 router = APIRouter(prefix="/api/v1/graph", tags=["Graph Analysis"])
@@ -102,7 +103,7 @@ async def get_entity_graph(
                    type(r) as relationship, connected.id as target_id, coalesce(connected.name, connected.id) as target_name, 
                    coalesce(connected.type, head(labels(connected)), 'ENTITY') as target_type,
                    coalesce(r.weight, 1.0) as weight,
-                   coalesce(r.confidence, 0.8) as confidence,
+                   coalesce(r.confidence, $unrated) as confidence,
                    coalesce(r.last_updated, r.updated_at, 0) as last_updated,
                    r.coefficient as coefficient,
                    r.p_value as p_value,
@@ -125,7 +126,7 @@ async def get_entity_graph(
                    type(rel) as relationship, coalesce(tn.id, tn.name) as target_id, coalesce(tn.name, tn.id) as target_name,
                    coalesce(tn.type, head(labels(tn)), 'ENTITY') as target_type,
                    coalesce(rel.weight, 1.0) as weight,
-                   coalesce(rel.confidence, 0.8) as confidence,
+                   coalesce(rel.confidence, $unrated) as confidence,
                    coalesce(rel.last_updated, rel.updated_at, 0) as last_updated,
                    rel.coefficient as coefficient,
                    rel.p_value as p_value,
@@ -137,7 +138,7 @@ async def get_entity_graph(
                    path_len as hop_level
             LIMIT 120
             """
-        records = await graph.query(query, {"entity_id": entity_id})
+        records = await graph.query(query, {"entity_id": entity_id, "unrated": UNRATED_EDGE_CONFIDENCE})
         now_ts = time.time()
         connections = []
 
@@ -156,7 +157,7 @@ async def get_entity_graph(
                 updated_s = (raw_updated / 1000.0) if raw_updated > 1e11 else float(raw_updated)
                 age_days = max(0.0, (now_ts - updated_s) / 86400.0) if updated_s > 0 else 60.0
                 decay_factor = math.exp(-0.693 * age_days / 30.0) if age_days < 365.0 else 0.05
-                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", 0.8))
+                base_weight = float(r.get("weight", 1.0)) * float(r.get("confidence", UNRATED_EDGE_CONFIDENCE))
                 decayed_weight = round(base_weight * decay_factor, 4)
 
                 conn_obj = {
@@ -167,7 +168,7 @@ async def get_entity_graph(
                     "target_name": t_name,
                     "target_type": r.get("target_type"),
                     "weight": float(r.get("weight", 1.0)),
-                    "confidence": float(r.get("confidence", 0.8)),
+                    "confidence": float(r.get("confidence", UNRATED_EDGE_CONFIDENCE)),
                     "last_updated": updated_s,
                     "decayed_weight": decayed_weight,
                     "hop_level": r.get("hop_level", 1),
@@ -204,9 +205,11 @@ async def get_entity_graph(
                         "target_name": target_name,
                         "target_type": "VESSEL" if "vessel" in rel_type.lower() else ("INFRASTRUCTURE" if "bgp" in rel_type.lower() or "cyber" in rel_type.lower() else "ENTITY"),
                         "weight": 1.0,
-                        "confidence": 0.8,
+                        # Synthesised from an event, not read from a rated
+                        # edge: it carries no confidence of its own.
+                        "confidence": UNRATED_EDGE_CONFIDENCE,
                         "last_updated": now_ts,
-                        "decayed_weight": 0.8,
+                        "decayed_weight": UNRATED_EDGE_CONFIDENCE,
                         "hop_level": 1,
                     })
                     

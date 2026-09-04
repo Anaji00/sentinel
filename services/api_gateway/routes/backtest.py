@@ -54,8 +54,11 @@ async def get_all_backtest_results(redis=Depends(get_redis_optional), db=Depends
     results = []
     if redis:
         try:
-            keys = await redis.raw.keys("sentinel:backtest:results:*")
-            for k in keys:
+            # SCAN, not KEYS. KEYS blocks the single-threaded server for the
+            # whole traversal, and this instance carries six figures of keys --
+            # one unauthenticated call to a reporting endpoint would stall every
+            # collector, agent and enricher sharing the connection.
+            async for k in redis.raw.scan_iter(match="sentinel:backtest:results:*", count=100):
                 raw = await redis.raw.get(k)
                 if raw:
                     results.append(json.loads(raw if isinstance(raw, str) else raw.decode("utf-8")))

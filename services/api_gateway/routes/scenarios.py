@@ -7,12 +7,14 @@ and raw correlation clusters from the TimescaleDB database.
 """
 
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Depends
 from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
+from shared.utils.rbac import require_role, Role
 from pydantic import BaseModel
 import json
 
@@ -359,7 +361,14 @@ class OrderExecutionRequest(BaseModel):
     kelly_allocation_pct: float
 
 
-@router.post("/trading/orders/execute")
+@router.post(
+    "/trading/orders/execute",
+    # Every other financial router gates on a role -- portfolio 5/5,
+    # watchlists 4/4, filings 4/4, flags 4/4 -- and this, the only route that
+    # reaches a broker, did not. An API key valid for reading a chart was
+    # valid for placing a trade.
+    dependencies=[Depends(require_role(Role.ANALYST))],
+)
 async def execute_trade_order(
     order: OrderExecutionRequest,
     redis = Depends(get_redis_client),
@@ -372,10 +381,32 @@ async def execute_trade_order(
     side = OrderSide.BUY if order.action.upper() == "BUY" else OrderSide.SELL
     order_type = OrderType.LIMIT if (order.order_type or "").upper() == "LIMIT" else OrderType.MARKET
 
+    # An entry price is required, not defaulted.
+    #
+    # This read `max(0.01, order.entry_price)`, written to avoid a division by
+    # zero. A zero entry price therefore divided the position by a penny: a
+    # $2,000 Kelly-sized position became an order for 200,000 shares, and the
+    # `shares < 1` check below is satisfied more comfortably the worse the
+    # input gets. The quant engine does publish zero entry prices, so this was
+    # reachable from the UI with one click.
+    if not math.isfinite(order.entry_price) or order.entry_price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"entry_price must be a positive number; got {order.entry_price}. "
+                f"No order was submitted for {order.ticker}."
+            ),
+        )
+    if not math.isfinite(order.position_size_usd) or order.position_size_usd <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"position_size_usd must be positive; got {order.position_size_usd}.",
+        )
+
     # Whole shares: a protected order is submitted as a bracket, and brackets
     # are rejected on fractional quantities. Rounding to 2dp produced orders the
     # venue would not accept.
-    shares = float(int(order.position_size_usd / max(0.01, order.entry_price)))
+    shares = float(int(order.position_size_usd / order.entry_price))
     if shares < 1:
         raise HTTPException(
             status_code=400,

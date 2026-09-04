@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import re
+import uuid
 from typing import List, Dict, Any, Optional
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
@@ -64,6 +65,53 @@ def _as_unit_interval(value, default: float = 1.0) -> float:
 UNDIRECTED = "undirected"
 
 
+# How long a graph write may hold an entity before the lease lapses.
+#
+# Named rather than inlined because release_lock reports against it: when a
+# batch outruns this, the log line needs to say what it outran.
+LOCK_TTL_SEC: int = 15
+
+
+def _describe_proposals(proposals: List[dict]) -> str:
+    """What these proposals changed in the graph, in words.
+
+    Names the entities and relationships written rather than counting the write
+    itself, so a reader downstream can tell what the supervisor did without
+    re-deriving it from the payload.
+    """
+    if not proposals:
+        return "No graph changes committed."
+
+    nodes: List[str] = []
+    links: List[str] = []
+    tagged: List[str] = []
+    for p in proposals:
+        if not isinstance(p, dict):
+            continue
+        action = str(p.get("action") or "")
+        entity_id = str(p.get("entity_id") or "?")
+        data = p.get("data") if isinstance(p.get("data"), dict) else {}
+        target = data.get("target_id") or data.get("sympathy_ticker")
+        if action == "MERGE_ONTOLOGY_NODE":
+            nodes.append(f"{entity_id} ({data.get('label', 'Entity')})")
+        elif target:
+            predicate = data.get("predicate") or data.get("relationship") or "RELATED_TO"
+            links.append(f"{entity_id} -[{predicate}]-> {target}")
+        elif data.get("tags"):
+            tagged.append(entity_id)
+        else:
+            nodes.append(entity_id)
+
+    parts: List[str] = []
+    if nodes:
+        parts.append(f"Entities merged: {', '.join(nodes[:5])}" + (f" (+{len(nodes) - 5} more)" if len(nodes) > 5 else ""))
+    if links:
+        parts.append(f"Relationships written: {'; '.join(links[:5])}" + (f" (+{len(links) - 5} more)" if len(links) > 5 else ""))
+    if tagged:
+        parts.append(f"Entities tagged: {', '.join(tagged[:5])}" + (f" (+{len(tagged) - 5} more)" if len(tagged) > 5 else ""))
+    return " | ".join(parts) if parts else "No graph changes committed."
+
+
 class GraphSupervisor(SentinelAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -73,25 +121,85 @@ class GraphSupervisor(SentinelAgent):
         return Topics.ONTOLOGY_UPDATES
 
     async def handle(self, message: Any) -> Optional[Dict[str, Any]]:
+        """Commits a graph proposal and reports what was committed.
+
+        The return value used to be a receipt -- {"action": "single_commit",
+        "entity_id": ...} -- which is bookkeeping about the write rather than a
+        statement of what changed in the graph. That shape reached an operator's
+        screen labelled "Intelligence Brief Synthesized" with an anomaly score
+        beside it, because a reader downstream had no way to tell a commit
+        acknowledgement from an analytical result. The live feed filters those
+        now, so the symptom is gone; this is the cause.
+        """
         if isinstance(message, list):
             await self.execute_batch_proposals(message)
-            return {"agent": self.name, "action": "batch_commit", "proposals_processed": len(message)}
+            return {
+                "agent": self.name,
+                "action": "batch_commit",
+                "proposals_processed": len(message),
+                "summary": _describe_proposals(message),
+            }
         elif isinstance(message, dict):
             await self.execute_proposal(message)
-            return {"agent": self.name, "action": "single_commit", "entity_id": message.get("entity_id")}
+            return {
+                "agent": self.name,
+                "action": "single_commit",
+                "entity_id": message.get("entity_id"),
+                "summary": _describe_proposals([message]),
+            }
         return None
 
-    async def acquire_lock(self, entity_id: str, timeout: int = 10) -> bool:
+    async def acquire_lock(self, entity_id: str, timeout: int = 10) -> Optional[str]:
+        """Takes the entity's write lock, returning the token that owns it.
+
+        The token is what makes the release safe. Every holder used to write the
+        literal string "locked", so a lock was indistinguishable from any other
+        lock on the same key -- see release_lock for what that cost.
+        """
         lock_key = f"sentinel:lock:neo4j:{entity_id}"
+        token = uuid.uuid4().hex
         end_time = time.time() + timeout
         while time.time() < end_time:
-            if await self.redis.raw.set(lock_key, "locked", nx=True, ex=15):
-                return True
+            if await self.redis.raw.set(lock_key, token, nx=True, ex=LOCK_TTL_SEC):
+                return token
             await asyncio.sleep(0.05)
-        return False
+        return None
 
-    async def release_lock(self, entity_id: str):
-        await self.redis.raw.delete(f"sentinel:lock:neo4j:{entity_id}")
+    async def release_lock(self, entity_id: str, token: Optional[str] = None) -> bool:
+        """Releases the lock only if this caller still holds it.
+
+        The unconditional DELETE this replaces could free a lock the caller no
+        longer owned. The sequence is ordinary rather than exotic: a Neo4j batch
+        runs past the 15-second TTL, the lock expires, the next waiter acquires
+        it, and then the first batch reaches its `finally` and deletes the new
+        holder's lock. Two writers are then inside a section built for one, and
+        nothing anywhere reports it.
+
+        Compare-and-delete has to be atomic, or it reintroduces the same race in
+        the gap between the GET and the DELETE.
+        """
+        lock_key = f"sentinel:lock:neo4j:{entity_id}"
+        if not token:
+            # No token means the caller never successfully acquired. Deleting on
+            # its way out would be exactly the bug this guards against.
+            return False
+        try:
+            released = await self.redis.raw.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1, lock_key, token,
+            )
+            if not released:
+                # The TTL lapsed and someone else holds it now. Worth saying:
+                # it means a graph write ran longer than the lease it held.
+                logger.warning(
+                    "Lock for %s had already been taken over before release; "
+                    "the batch outran its %ss lease.", entity_id, LOCK_TTL_SEC,
+                )
+            return bool(released)
+        except Exception as e:
+            logger.warning("Lock release failed for %s: %s", entity_id, e)
+            return False
 
     async def execute_batch_proposals(self, proposals: List[dict]):
         """
@@ -111,10 +219,11 @@ class GraphSupervisor(SentinelAgent):
             if tid:
                 entity_ids.add(tid)
 
-        acquired_locks = []
+        acquired_locks: Dict[str, str] = {}
         for eid in entity_ids:
-            if await self.acquire_lock(eid):
-                acquired_locks.append(eid)
+            token = await self.acquire_lock(eid)
+            if token:
+                acquired_locks[eid] = token
             else:
                 logger.warning(f"Lock timeout for entity {eid} in batch proposal. Continuing with remaining locks.")
 
@@ -228,8 +337,8 @@ class GraphSupervisor(SentinelAgent):
             logger.error(f"UNWIND batch commit failed: {e}")
             raise
         finally:
-            for eid in acquired_locks:
-                await self.release_lock(eid)
+            for eid, token in acquired_locks.items():
+                await self.release_lock(eid, token)
 
     async def execute_proposal(self, payload: dict):
         """Maps trusted JSON structs to Cypher queries with centralized validation."""
@@ -240,7 +349,8 @@ class GraphSupervisor(SentinelAgent):
         if not entity_id or not action:
             return
 
-        if not await self.acquire_lock(entity_id):
+        lock_token = await self.acquire_lock(entity_id)
+        if not lock_token:
             logger.warning(f"Lock timeout for entity {entity_id}. Dropping proposal.")
             return
 
@@ -362,7 +472,7 @@ class GraphSupervisor(SentinelAgent):
             logger.error(f"Neo4j commit failed for {entity_id}: {e}")
             raise
         finally:
-            await self.release_lock(entity_id)
+            await self.release_lock(entity_id, lock_token)
 
 
 async def start_supervisor():

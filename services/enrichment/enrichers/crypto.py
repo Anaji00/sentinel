@@ -13,17 +13,37 @@ from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData, MarketMicrostructure
 from shared.kafka import Topics
+from shared.utils.source_scorecard import baseline_reliability
 from shared.utils import quant_calc
 import asyncio
 import math
 from shared.utils.metrics import MetricsCollector
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
+from shared.utils.tasks import safe_create_task
 from shared.utils.counterparty import (
     choose_primary, is_infrastructure, is_null_address, note_counterparty,
 )
 from services.enrichment.anomaly_scorer import lift_score
+from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
 logger = logging.getLogger("enrichment.crypto")
 
+
+# Snapshots required before an open-interest z-score is trusted. Below this the
+# EMA variance describes almost nothing and the z describes the denominator.
+OI_MIN_OBSERVATIONS = 10
+
+# A standard deviation is never taken as less than this share of the mean.
+# Open interest is heteroscedastic across symbols -- millions of contracts on
+# BTC perps, thousands on a minor pair -- so an absolute floor cannot serve both.
+OI_MIN_CV_FLOOR = 0.05
+
+# Divisor inside tanh. Chosen so the curve tracks the previous linear ramp over
+# the range that ramp was sensible on, and keeps ordering past it. Bounded by
+# the same FALLBACK_MAX_SCORE the streaming detectors use, so no path in this
+# system publishes certainty: tanh rounds to 1.0000 past about z=40, and the
+# most extreme thing seen so far is still only that.
+OI_ANOMALY_SCALE = 4.6
 
 # What actually counts as a whale on-chain movement, in USD.
 WHALE_NOTIONAL_USD = 1_000_000.0
@@ -63,6 +83,21 @@ _SUSPECT_LIFT_WEIGHT = 0.45
 
 # Where it saturates. A move this large is as anomalous as the scale reports.
 _NOTIONAL_CEILING_USD = 100_000_000.0
+
+
+def _implied_price(notional_usd: float, token_amount: float) -> float:
+    """What one token was worth in this transfer.
+
+    Derived rather than assumed. The previous constant 1.0 was a convenience
+    that happened to hold for USDT, USDC and DAI and failed silently on
+    everything else.
+    """
+    try:
+        if token_amount and token_amount > 0:
+            return round(float(notional_usd) / float(token_amount), 8)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0.0
 
 
 def _notional_score(notional: float) -> float:
@@ -192,10 +227,10 @@ class CryptoEnricher:
                 if self.redis and hasattr(self.redis, "raw") and price > 0:
                     clean_asset = asset.replace("USDT", "").replace("USD", "").upper()
                     pipe = self.redis.raw.pipeline()
-                    pipe.set(f"sentinel:quotes:latest:{clean_asset}", str(price), ex=3600)
-                    pipe.set(f"sentinel:quotes:latest:{clean_asset}USD", str(price), ex=3600)
-                    pipe.set(f"sentinel:quotes:latest:{clean_asset}USDT", str(price), ex=3600)
-                    asyncio.create_task(pipe.execute())
+                    pipe.set(quote_key(clean_asset), str(price), ex=QUOTE_CACHE_TTL_SEC)
+                    pipe.set(quote_key(f"{clean_asset}USD"), str(price), ex=QUOTE_CACHE_TTL_SEC)
+                    pipe.set(quote_key(f"{clean_asset}USDT"), str(price), ex=QUOTE_CACHE_TTL_SEC)
+                    safe_create_task(pipe.execute(), name=f"quote-cache-{clean_asset}")
             except Exception as e:
                 # Quote cache write. Non-fatal for this event, but a persistent
                 # failure means every downstream consumer reads stale prices,
@@ -262,6 +297,7 @@ class CryptoEnricher:
                 type=EventType.CRYPTO_TRADE,
                 occurred_at=raw.occurred_at or datetime.now(timezone.utc),
                 source=raw.source,
+                source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
                 crypto_data=CryptoData(
                     pair=asset,
@@ -402,7 +438,11 @@ class CryptoEnricher:
             0.0,
             0.0,
         ]
-        score_result = await self.scorer.score_event("crypto_trade", asset, features)
+        # Scored as funding, not as a trade. This passed "crypto_trade", so a
+        # funding observation -- basis points and a mark/index ratio -- was
+        # ranked against a history of normalised trade z-scores an order of
+        # magnitude smaller, and came back near the top whatever the rate was.
+        score_result = await self.scorer.score_event("crypto_perp_funding", asset, features)
         anomaly = score_result["score"]
 
         # Watchlist boost
@@ -451,6 +491,7 @@ class CryptoEnricher:
             type=EventType.CRYPTO_PERP_FUNDING,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             crypto_data=CryptoData(
                 # The instrument, not the asset. Entity stays the asset (BTC),
@@ -496,18 +537,36 @@ class CryptoEnricher:
             ema_alpha = float(os.getenv("OI_EMA_ALPHA", "0.05"))
             ema_key = f"sentinel:crypto:oi_ema:{symbol}"
             var_key = f"sentinel:crypto:oi_var:{symbol}"
+            n_key = f"sentinel:crypto:oi_n:{symbol}"
             raw_mean = await self.redis.raw.get(ema_key)
             raw_var = await self.redis.raw.get(var_key)
             ema_mean = float(raw_mean) if raw_mean else oi_value
             ema_var = float(raw_var) if raw_var else 1.0
-            std = max(ema_var ** 0.5, 1e-5)
-            oi_z = (oi_value - ema_mean) / std
+            # How many snapshots this baseline is built from. Without it the
+            # second observation for a symbol is measured against a variance
+            # seeded from one, and 1e-5 is not a floor -- open interest is
+            # quoted in millions of contracts, so a standard deviation of
+            # 0.00001 turns any ordinary drift into a z in the thousands. This
+            # is what put 163 market_anomaly events at exactly 1.000.
+            try:
+                oi_n = int(await self.redis.raw.get(n_key) or 0)
+            except (TypeError, ValueError):
+                oi_n = 0
+            # The floor scales with the quantity being measured, as it must for
+            # a series whose absolute size varies by orders of magnitude across
+            # symbols.
+            std = max(ema_var ** 0.5, abs(ema_mean) * OI_MIN_CV_FLOOR, 1e-5)
+            oi_z = (oi_value - ema_mean) / std if oi_n >= OI_MIN_OBSERVATIONS else 0.0
             # Update EMA
             new_mean = ema_alpha * oi_value + (1 - ema_alpha) * ema_mean
             new_var = ema_alpha * (oi_value - ema_mean) ** 2 + (1 - ema_alpha) * ema_var
             pipe = self.redis.raw.pipeline()
             pipe.set(ema_key, str(new_mean), ex=604800)
             pipe.set(var_key, str(new_var), ex=604800)
+            # Counted with the same expiry as the moments it describes, so the
+            # baseline and its observation count cannot disagree.
+            pipe.incr(n_key)
+            pipe.expire(n_key, 604800)
             await pipe.execute()
         except Exception as e:
             # EMA baseline write. Losing this silently means the open-interest
@@ -531,7 +590,16 @@ class CryptoEnricher:
         except Exception:
             pass
 
-        anomaly = min(1.0, abs(oi_z) / 5.0)  # Scale z-score to 0-1 range
+        # A saturating ramp, not a cliff.
+        #
+        # This was `min(1.0, abs(oi_z) / 5.0)`, which returns exactly 1.0 for
+        # every |z| at or above 5 -- so a z of 5.1 and a z of 900 were published
+        # as the same number, and the top of the scale held no information at
+        # all. tanh keeps the same shape where the observations live (z=2 reads
+        # 0.40, z=5 reads 0.80, matching the old ramp closely) and stays ordered
+        # above it: z=10 reads 0.96, z=20 reads 0.999. Never exactly 1.0,
+        # because there is always something worse.
+        anomaly = min(FALLBACK_MAX_SCORE, math.tanh(abs(oi_z) / OI_ANOMALY_SCALE))
         direction = "surging" if oi_z > 0 else "collapsing"
         headline = (
             f"📊 OPEN INTEREST {direction.upper()} | {asset} | "
@@ -546,6 +614,7 @@ class CryptoEnricher:
             type=EventType.MARKET_ANOMALY,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             crypto_data=CryptoData(
                 pair=asset,
@@ -583,7 +652,7 @@ class CryptoEnricher:
         )
         
         events = []
-        for tf, block, features, anomaly in anomalous_frames:
+        for tf, block, features, anomaly, gate_significant in anomalous_frames:
             price_change_pct = features[0]
             volatility_pct = features[1]
             notional = features[2]
@@ -615,6 +684,7 @@ class CryptoEnricher:
                 type=EventType.MARKET_ANOMALY,
                 occurred_at=datetime.fromisoformat(block["start_ts"]),
                 source=raw.source,
+                source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
                 crypto_data=CryptoData(
                     pair=asset, 
@@ -646,6 +716,12 @@ class CryptoEnricher:
         except (ValueError, TypeError):
             notional = 0.0
 
+        # The token count, as distinct from what it was worth.
+        try:
+            token_amount = float(p.get("amount") or 0.0)
+        except (ValueError, TypeError):
+            token_amount = 0.0
+
         # Size and provenance are separate signals and are no longer conflated.
         #
         # `notional < 1_000_000 and not is_suspect` meant a transfer from a
@@ -672,8 +748,15 @@ class CryptoEnricher:
             tags = ["crypto", "transfer", "baseline_data"]
             # The provenance still travels with the event even when it is not
             # promoted; a reader filtering for watched wallets still finds it.
+            #
+            # Named distinctly from the promoted case. Carrying "baseline_data"
+            # and "suspect_wallet" in the same tag list -- which 248 of 248
+            # sampled transfers did -- reads as the pipeline asserting that the
+            # event is routine and that its counterparty is suspect at the same
+            # time, and gives a reader no way to tell a dust movement from a
+            # promoted one by its tags.
             if is_suspect:
-                tags.append("suspect_wallet")
+                tags.append("suspect_wallet_below_threshold")
             headline = f"Transfer: {_money(notional)} {asset}"
         else:
             anomaly = size_score
@@ -748,13 +831,29 @@ class CryptoEnricher:
             type=getattr(EventType, "CRYPTO_TRANSFER", EventType.CRYPTO_TRANSFER), 
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             crypto_data=CryptoData(
                 pair=asset,
-                trade_type="WHALE_TRANSFER",
+                # The label the payload carries has to agree with the one the
+                # headline carries. Every transfer was written as
+                # WHALE_TRANSFER -- 6,960 in an hour, from a size of 0.00 to
+                # 356,965,122 -- so anything filtering on it received the dust
+                # as well, which is the whole population.
+                trade_type="WHALE_TRANSFER" if is_whale else "TRANSFER",
                 side="TRANSFER",
-                price=1.0, # Assumes 1.0 peg for calculation simplicity on raw transfers
-                size_tokens=notional
+                # Real values, all of which the collector was already sending
+                # and this enricher was throwing away.
+                #
+                # size_tokens held the USD notional, and price was pinned to 1.0
+                # to make that arithmetic self-consistent. It is defensible for
+                # a stablecoin and wrong for anything else: WBTC came through at
+                # price 1.0000 on 180 events, understating the position by five
+                # orders of magnitude, and a reader taking "size_tokens" to mean
+                # tokens was misled on every asset.
+                price=_implied_price(notional, token_amount),
+                size_tokens=token_amount if token_amount else notional,
+                notional_usd=notional,
             ),
             headline=headline,
             tags=tags,
@@ -823,6 +922,7 @@ class CryptoEnricher:
             type=getattr(EventType, "CRYPTO_LIQUIDATION", EventType.CRYPTO_LIQUIDATION),
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
             crypto_data=CryptoData(
                 pair=asset,

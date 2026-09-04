@@ -175,7 +175,11 @@ async def test_tradfi_enricher_graph_and_correlation_ids_promotion():
     await redis.sadd("sentinel:correlation:active_ids:NVDA", "corr:stat:NVDA:TSM", "granger:NVDA:AMD:lag1")
 
     mock_scorer = MagicMock()
-    mock_scorer.score_financial_trade_batch = AsyncMock(return_value=[0.85])
+    # Returns the scorer's full result now, not a bare score: the
+    # per-domain significance gate's answer travels with it.
+    mock_scorer.score_financial_trade_batch = AsyncMock(
+        return_value=[{"score": 0.85, "is_significant": True, "domain": "tradfi"}]
+    )
     mock_scorer.check_watchlist = AsyncMock(return_value=False)
     mock_scorer.track_frequency = AsyncMock(return_value=0.0)
     mock_scorer.get_hawkes_intensity = MagicMock(return_value=1.0)
