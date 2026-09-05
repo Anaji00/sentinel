@@ -1489,14 +1489,23 @@ async def main():
                         embedding,
                         exclude_domain="__none__",  # Don't exclude any domain
                         limit=5,
+                        for_calibration=True,
                     )
                     for sd_event in same_domain_similar:
                         if sd_event.get("domain") == event_domain:
-                            # This is a same-domain similarity score → null distribution
-                            # We approximate the score from the Qdrant result ordering
-                            soft_correlator._similarity_calibrator.observe_null_score(
-                                soft_correlator._similarity_calibrator.threshold  # Use threshold as proxy
-                            )
+                            # A same-domain pair is the negative control: these
+                            # events should NOT produce a cross-domain link, so
+                            # their similarity is a draw from the null.
+                            #
+                            # This used to pass the calibrator its own threshold
+                            # -- "use threshold as proxy" -- which made the
+                            # quantile of the buffer reproduce the threshold
+                            # exactly. Measured: 500 observations left it on
+                            # 0.6500, its hardcoded default, while get_status()
+                            # reported calibrated=True. Fed real scores it moves.
+                            _sim = sd_event.get("_similarity")
+                            if _sim is not None:
+                                soft_correlator._similarity_calibrator.observe_null_score(float(_sim))
                 except Exception:
                     pass  # Non-critical calibration path
                 

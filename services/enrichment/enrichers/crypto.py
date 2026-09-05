@@ -296,12 +296,17 @@ class CryptoEnricher:
             anomaly = apply_materiality(anomaly, notional, "crypto_trade")
             anomaly = lift_score(anomaly, w_boost)
             anomaly = lift_score(anomaly, f_boost, w_boost)
-            
+            _spent = w_boost + f_boost
+
             # Hawkes cross-domain excitation: tradfi/prediction events boost crypto intensity
             hawkes_ratio = self.scorer.get_hawkes_intensity("crypto")
             if hawkes_ratio > 1.5:
                 hawkes_boost = min(0.15, (hawkes_ratio - 1.0) * 0.05)
-                anomaly = lift_score(anomaly, hawkes_boost)
+                # Threaded through the budget like the two lifts above it. This
+                # passed no `spent`, so the one path that stacks three boosts
+                # handed the third a fresh full MAX_TOTAL_LIFT_SHARE after the
+                # first two had already drawn on it.
+                anomaly = lift_score(anomaly, hawkes_boost, _spent)
             
             # Record anomalous events in Hawkes tracker for reciprocal cross-excitation
             if anomaly >= 0.5:

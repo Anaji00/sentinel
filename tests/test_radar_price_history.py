@@ -203,7 +203,11 @@ async def test_the_timeframe_is_returned_with_the_series():
 
     closes, label = await agent._fetch_close_history("MSFT")
     assert len(closes) == 40
-    assert label in ("1h", "15m", "5m")
+    # 30m joined the ladder when its continuous aggregate was added; the
+    # streaming evaluator had always scored that timeframe and the database
+    # had nowhere to store it. Enumerated rather than left open so that a
+    # timeframe appearing here without an aggregate behind it still fails.
+    assert label in ("1h", "30m", "15m", "5m")
 
 
 def test_finer_timeframes_are_tried_when_the_hourly_series_is_thin():

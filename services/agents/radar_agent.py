@@ -396,7 +396,18 @@ class RadarAgent(SentinelAgent):
         # number means: volatility over 5-minute bars is not volatility over
         # hourly ones, and telling a model "GARCH volatility 3%" without saying
         # over what is how a figure gets read as something it is not.
+        # 30m fills a real gap in the ladder; 4h deliberately does not lead.
+        #
+        # The chain takes the first timeframe holding enough bars for a regime
+        # estimate, so the head of it is the coarsest bucket worth trying. 4h
+        # is coarser than 1h but holds a quarter as many bars, and history here
+        # equals uptime -- against the 42 to 68 hourly bars actually observed,
+        # a 4h series carries 10 to 17, below MIN_REGIME_BARS. Leading with it
+        # would spend a query per call to fall through every time. The 4h
+        # aggregate exists for consumers that want that horizon; this chain is
+        # not one of them.
         for table, label in (("tradfi_bars_1h", "1h"),
+                             ("tradfi_bars_30m", "30m"),
                              ("tradfi_bars_15m", "15m"),
                              ("tradfi_bars_5m", "5m")):
             try:
@@ -481,7 +492,19 @@ class RadarAgent(SentinelAgent):
         if len(closes) >= self.MIN_REGIME_BARS:
             returns = quant_calc.simple_returns(closes)
             hurst_val = quant_calc.hurst_exponent(closes)
-            garch_vol = quant_calc.garch_volatility(returns, annualize=True)
+            # Annualised against the timeframe these closes actually are.
+            #
+            # garch_volatility defaults trading_days=252, so calling it with
+            # annualize=True on hourly bars applied the daily constant to
+            # hourly returns -- the exact error periods_per_year exists to
+            # prevent, and which its own docstring describes as understating an
+            # annualised figure "by roughly 2.5x for equities". The helper was
+            # written, the warning was written, and this call site was never
+            # wired to it.
+            _bars_per_year = quant_calc.periods_per_year(tf_label, "equity")
+            garch_vol = quant_calc.garch_volatility(
+                returns, annualize=True, trading_days=int(max(1.0, _bars_per_year))
+            )
             # The timeframe is stated. A GARCH figure means something different
             # over 5-minute bars than over hourly ones, and an unqualified
             # percentage invites the reader to assume the wrong one.

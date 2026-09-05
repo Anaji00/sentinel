@@ -45,6 +45,7 @@ from typing import Optional, List, Dict, Any, Literal
 
 import aiohttp
 from pydantic import BaseModel, Field
+from shared.utils.untrusted_text import quote_untrusted_block
 from shared.models.events import ResolutionSignal
 
 from shared.models import CorrelationCluster, Scenario, ScenarioStatus
@@ -1288,7 +1289,17 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
             )
 
         headlines = context.get("recent_headlines", [])[:5]
-        headlines_section = "\n".join(f"• {h}" for h in headlines) if headlines else "None available"
+        # Fenced and marked untrusted, not interpolated.
+        #
+        # This joined the raw strings straight into the prompt -- text from 51
+        # external feeds, with no delimiting and nothing telling the model it
+        # was quoted evidence rather than direction. Anyone able to place a
+        # line in a syndicated feed was writing into the context of the model
+        # that produces scenarios, whose output moves discovery_confidence and
+        # reaches an advisory path.
+        headlines_section = quote_untrusted_block(
+            headlines, label="RECENT HEADLINES", max_items=5
+        )
 
         agent_intel = context.get("agent_intel_briefs", [])
         agent_section = ""

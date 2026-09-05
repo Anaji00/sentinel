@@ -246,6 +246,50 @@ class SubjectiveOpinion(BaseModel):
                    base_rate=round(max(0.0, min(1.0, float(base_rate))), 6))
 
     @classmethod
+    def averaging_fuse(cls, opinions: List["SubjectiveOpinion"]) -> "SubjectiveOpinion":
+        """Josang averaging fusion, for opinions that are NOT independent.
+
+        Cumulative fusion is defined for independent sources of evidence about
+        one proposition, and adding a source there reduces uncertainty because
+        it brings new evidence. These agents subscribe to overlapping topic sets
+        and reason over the same enriched events, so their agreement is largely
+        the same evidence counted repeatedly.
+
+        Measured on the cumulative rule: fusing eight copies of a single opinion
+        -- eight agents agreeing because they read one thing, contributing
+        nothing new -- drove uncertainty from 0.300 to 0.051 and belief from
+        0.600 to 0.814. Confidence grew with the number of agents rather than
+        with the amount of evidence.
+
+        Averaging fusion is the operator Josang defines for exactly this case:
+        fusing identical opinions returns that opinion unchanged, and
+        disagreement widens uncertainty instead of narrowing it.
+        """
+        opinions = [o for o in opinions if o is not None]
+        if not opinions:
+            return cls()
+        if len(opinions) == 1:
+            return opinions[0].model_copy()
+
+        # Uncertainty-weighted average: an opinion that claims less uncertainty
+        # carries more weight, which is the averaging analogue of the
+        # cumulative rule's u2/(u1+u2) weighting.
+        eps = 1e-12
+        weights = [1.0 / max(eps, o.uncertainty) for o in opinions]
+        total_w = sum(weights) or 1.0
+
+        b = sum(o.belief * w for o, w in zip(opinions, weights)) / total_w
+        d = sum(o.disbelief * w for o, w in zip(opinions, weights)) / total_w
+        u = sum(o.uncertainty * w for o, w in zip(opinions, weights)) / total_w
+        a = sum(o.base_rate * w for o, w in zip(opinions, weights)) / total_w
+
+        total = b + d + u
+        if total > eps:
+            b, d, u = b / total, d / total, u / total
+        return cls(belief=round(b, 6), disbelief=round(d, 6),
+                   uncertainty=round(u, 6), base_rate=round(a, 6))
+
+    @classmethod
     def cumulative_fuse(cls, opinions: List["SubjectiveOpinion"]) -> "SubjectiveOpinion":
         """
         Jøsang Cumulative Fusion (CCF) of multiple opinions.
@@ -291,8 +335,18 @@ class SubjectiveOpinion(BaseModel):
             d = (w1.disbelief * u2 + w2.disbelief * u1) / kappa
             u = (u1 * u2) / kappa
 
-        # Fused base rate (evidence-weighted average)
-        a = (w1.base_rate + w2.base_rate) / 2.0
+        # Fused base rate, weighted by how much each opinion actually claims to
+        # know. `(a1 + a2) / 2` was an unweighted arithmetic mean carrying the
+        # comment "evidence-weighted average" -- it is neither evidence-weighted
+        # nor Josang's base-rate combination. Because `a` multiplies the whole
+        # uncertainty mass in the projection P = b + a*u, an agent with a
+        # measured base rate was being diluted equally by one still carrying the
+        # default.
+        if (1.0 - u1) + (1.0 - u2) > 1e-12:
+            wa1, wa2 = (1.0 - u1), (1.0 - u2)
+            a = (w1.base_rate * wa1 + w2.base_rate * wa2) / (wa1 + wa2)
+        else:
+            a = (w1.base_rate + w2.base_rate) / 2.0
 
         # Normalize to ensure b + d + u = 1.0
         total = b + d + u
@@ -594,9 +648,19 @@ class ConsensusEngine(SentinelAgent):
                 )
                 contradictions.append(contradiction)
 
-            # Subjective Logic fusion
+            # Subjective Logic fusion, averaging rather than cumulative.
+            #
+            # These agents are not independent sources: they subscribe to
+            # overlapping topic sets and reason over the same enriched events,
+            # so several of them agreeing is largely one body of evidence
+            # counted several times. Cumulative fusion treats each as new
+            # evidence and collapses uncertainty accordingly -- eight identical
+            # opinions took u from 0.300 to 0.051 and belief from 0.600 to
+            # 0.814 without a single new observation. Averaging fusion is
+            # Josang's operator for dependent opinions and leaves identical
+            # input unchanged.
             all_opinions = [op for _, op, _ in opinions]
-            fused = SubjectiveOpinion.cumulative_fuse(all_opinions)
+            fused = SubjectiveOpinion.averaging_fuse(all_opinions)
 
             # Decision: ACH report vs consensus signal
             if fused.uncertainty > ACH_UNCERTAINTY_THRESHOLD or fused.conflict_level > 0.3:
@@ -605,7 +669,7 @@ class ConsensusEngine(SentinelAgent):
                     hypothesis=f"Bullish on {ticker}",
                     supporting_agents=bullish_agents,
                     refuting_agents=bearish_agents,
-                    opinion=SubjectiveOpinion.cumulative_fuse(
+                    opinion=SubjectiveOpinion.averaging_fuse(
                         [op for name, op, d in opinions if d in ("up", "bullish", "long")]
                     ) if bullish_agents else None,
                     evidence_summary=f"{len(bullish_agents)} agent(s) bullish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('up','bullish','long')) / max(1, len(bullish_agents)):.0%}"
@@ -614,7 +678,7 @@ class ConsensusEngine(SentinelAgent):
                     hypothesis=f"Bearish on {ticker}",
                     supporting_agents=bearish_agents,
                     refuting_agents=bullish_agents,
-                    opinion=SubjectiveOpinion.cumulative_fuse(
+                    opinion=SubjectiveOpinion.averaging_fuse(
                         [op for name, op, d in opinions if d in ("down", "bearish", "short")]
                     ) if bearish_agents else None,
                     evidence_summary=f"{len(bearish_agents)} agent(s) bearish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('down','bearish','short')) / max(1, len(bearish_agents)):.0%}"

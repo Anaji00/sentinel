@@ -445,6 +445,7 @@ class SoftCorrelator:
             embedding: List[float],
             exclude_domain: str,
             limit: int = 10,
+            for_calibration: bool = False,
     ) -> List[Dict]:
         """
         Find similar events from OTHER domains.
@@ -478,10 +479,24 @@ class SoftCorrelator:
                         ),
                     ]
                 ),
-                score_threshold=self._similarity_calibrator.threshold,
+                # Unfiltered when the caller is building the null distribution:
+                # sampling only pairs that already clear the cutoff censors the
+                # sample from below by the very quantity being estimated.
+                score_threshold=(None if for_calibration else self._similarity_calibrator.threshold),
             )
-            # Map the raw Qdrant results back into a list of our custom 'payload' dictionaries.
-            return [r.payload for r in results[:limit]] # Return only the top 'limit' results after filtering
+            # The score travels with the payload.
+            #
+            # This returned r.payload alone, discarding the cosine similarity
+            # Qdrant puts on every ScoredPoint -- which is why the calibration
+            # caller had no score to observe and passed the calibrator its own
+            # threshold instead, making it a fixed point that never moved off
+            # its 0.65 default while reporting itself calibrated.
+            out = []
+            for r in results[:limit]:
+                payload = dict(r.payload or {})
+                payload["_similarity"] = float(getattr(r, "score", 0.0) or 0.0)
+                out.append(payload)
+            return out
         except Exception as e:
             logger.debug(f"Qdrant search failed: {e}")
             return []

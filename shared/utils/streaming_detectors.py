@@ -85,6 +85,10 @@ class RRCFDetector:
 
         # Shingle buffer: stores the last `shingle_size` raw points
         self._shingle_buffer: deque = deque(maxlen=shingle_size)
+        # How many times a corrupted tree has been replaced. Surfaced rather
+        # than silently absorbed: a forest quietly running below its configured
+        # size produces scores that look ordinary and rank badly.
+        self._tree_resets: int = 0
 
         # Recent magnitudes, on both paths: the positional score needs history
         # whichever detector produced the number.
@@ -147,7 +151,21 @@ class RRCFDetector:
                         valid_trees += 1
             except Exception as e:
                 # If rrcf internal tree structure gets corrupted (e.g. cut not found or leaf attribute error),
-                # reset the corrupted tree instance cleanly
+                # reset the corrupted tree instance cleanly -- and say so.
+                #
+                # `e` was bound and never used: no log line, no counter, in the
+                # detector the radar multiplies by five and the correlation
+                # layer derives confidence from. A replaced tree holds one leaf,
+                # is excluded from valid_trees, and the forest quietly shrinks
+                # while still returning a normal-looking score.
+                self._tree_resets += 1
+                if self._tree_resets in (1, 10, 100) or self._tree_resets % 500 == 0:
+                    logger.warning(
+                        "RRCF tree reset (%s total) in detector '%s': %s. "
+                        "A reset tree contributes nothing until it refills, so "
+                        "the forest is running below its configured size.",
+                        self._tree_resets, getattr(self, "name", "unnamed"), e,
+                    )
                 try:
                     fresh_tree = rrcf.RCTree()
                     fresh_tree.insert_point(point, index=idx)
@@ -158,7 +176,22 @@ class RRCFDetector:
         if valid_trees > 0:
             avg_codisp /= valid_trees
         else:
-            return 0.0
+            # Total failure is not calm.
+            #
+            # This returned 0.0 -- the lowest possible anomaly score -- when
+            # every tree in the forest had thrown, so a detector that had
+            # completely failed reported the same number as one that looked
+            # carefully and found nothing. The fallback path is a real
+            # measurement and is what the class already uses when rrcf is
+            # unavailable; using it here keeps the score honest and the failure
+            # visible in the log above.
+            logger.error(
+                "RRCF forest produced no valid tree for detector '%s' "
+                "(%s trees, %s resets). Falling back to the streaming estimator "
+                "rather than reporting zero anomaly.",
+                getattr(self, "name", "unnamed"), self.num_trees, self._tree_resets,
+            )
+            return self._insert_fallback(point)
 
         # Positioned against this detector's own recent CoDisp values.
         #

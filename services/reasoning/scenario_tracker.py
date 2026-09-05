@@ -281,6 +281,25 @@ class ScenarioTracker:
             elif confidence <= DENY_THRESHOLD:
                 status_change = ScenarioStatus.DENIED
 
+            # Score the published probabilities against what happened.
+            #
+            # Scenarios reach a reader as competing hypotheses with numbers on
+            # them -- H1 45%, H2 30%, H3 25% -- produced by a class called
+            # DynamicBayesianCalibrator in a module called calibration_harness.
+            # Nothing recorded which hypothesis occurred, so there was no Brier
+            # score, no reliability curve and no way to discover the numbers
+            # were wrong. A probability shown to a human is a calibration claim,
+            # and this was the one number in the product that nobody graded.
+            #
+            # The machinery already existed: agent convictions are Brier-scored
+            # in base.py against realised outcomes. This applies the same test
+            # to the scenario layer.
+            if status_change is not None:
+                await self._record_hypothesis_outcome(
+                    scenario_id, hypotheses, watch_hits_by_index, deny_hits_by_index,
+                    confirmed=(status_change == ScenarioStatus.CONFIRMED),
+                )
+
         if (
             confidence != original_confidence
             or status_change
@@ -502,6 +521,63 @@ class ScenarioTracker:
             logger.error(f"fetch_active_scenarios failed: {e}")
             return []
  
+    async def _record_hypothesis_outcome(
+        self, scenario_id, hypotheses, watch_hits_by_index, deny_hits_by_index, confirmed: bool
+    ) -> None:
+        """Brier-score the published hypothesis probabilities against the outcome.
+
+        The realised hypothesis is taken to be the one carrying watch hits and
+        no deny hits -- the only evidence of which explanation actually held
+        that this layer collects. Where that is ambiguous, nothing is scored:
+        an invented outcome would be worse than an unscored one, and would
+        corrupt the reliability record it is meant to build.
+        """
+        try:
+            realised = [
+                i for i in range(len(hypotheses or []))
+                if watch_hits_by_index.get(i) and not deny_hits_by_index.get(i)
+            ]
+            if len(realised) != 1:
+                return
+            winner = realised[0]
+
+            # Brier over the full probability vector: sum (p_i - o_i)^2, where
+            # o_i is 1 for the realised hypothesis and 0 otherwise. Lower is
+            # better; 0 is a perfect call.
+            brier = 0.0
+            for i, h in enumerate(hypotheses):
+                p = float(h.get("probability", 0) or 0) / 100.0
+                o = 1.0 if i == winner else 0.0
+                brier += (p - o) ** 2
+
+            raw = getattr(self.redis, "raw", self.redis)
+            day = datetime.now(timezone.utc).strftime("%Y%m%d")
+            pipe = raw.pipeline()
+            pipe.incrbyfloat(f"sentinel:scenario_calibration:brier_sum:{day}", brier)
+            pipe.incr(f"sentinel:scenario_calibration:count:{day}")
+            # Reliability bucket for the leading hypothesis, so a diagram can be
+            # drawn later: did the things called 70% happen 70% of the time?
+            lead_p = max(
+                (float(h.get("probability", 0) or 0) / 100.0 for h in hypotheses),
+                default=0.0,
+            )
+            bucket = min(9, int(lead_p * 10))
+            pipe.incr(f"sentinel:scenario_calibration:bucket:{bucket}:n")
+            if winner == max(range(len(hypotheses)), key=lambda i: float(hypotheses[i].get("probability", 0) or 0)):
+                pipe.incr(f"sentinel:scenario_calibration:bucket:{bucket}:hit")
+            for k in (f"sentinel:scenario_calibration:brier_sum:{day}",
+                      f"sentinel:scenario_calibration:count:{day}"):
+                pipe.expire(k, 90 * 86400)
+            await pipe.execute()
+
+            logger.info(
+                "Scenario %s resolved: hypothesis %s realised, Brier %.4f "
+                "(leading probability %.0f%%)",
+                str(scenario_id)[:8], winner + 1, brier, lead_p * 100,
+            )
+        except Exception as e:
+            logger.debug("Could not record hypothesis outcome for %s: %s", scenario_id, e)
+
     async def _update_scenario(
         self,
         scenario_id:    str,

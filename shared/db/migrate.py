@@ -645,6 +645,106 @@ MIGRATIONS = [
                 WHERE filing_data IS NOT NULL;
         """,
         "transactional": True
+    },
+    {
+        "version": "0019_tradfi_bars_30m_4h_aggregates",
+        "sql": """
+            -- Two timeframes the platform evaluates but never stored.
+            --
+            -- TIMEFRAMES_MINUTES is [1, 5, 15, 30, 60, 240]: the streaming
+            -- candle evaluator scores 30-minute and 4-hour windows on every
+            -- tick. The durable side had 5m, 15m, 1h, 1d, 1w and 1mth, so
+            -- those two existed only as Redis lists -- capped, volatile, and
+            -- gone on restart. Any consumer wanting 30-minute or 4-hour
+            -- history had nowhere to read it, and the fallback chain in the
+            -- radar agent (1h, then 15m, then 5m) skipped straight past both.
+            --
+            -- 1-minute needs no aggregate: tradfi_bars IS the minute bar, so
+            -- it is the base of every rollup here rather than a gap in them.
+            --
+            -- Offsets follow the convention already established: start_offset
+            -- scaled to the bucket, end_offset one bucket back so a partially
+            -- filled bucket is never materialised, and schedule_interval at
+            -- the bucket width.
+            CREATE MATERIALIZED VIEW IF NOT EXISTS tradfi_bars_30m
+            WITH (timescaledb.continuous) AS
+            SELECT
+                ticker,
+                time_bucket('30 minutes', time) AS bucket_time,
+                FIRST(open, time) AS open,
+                MAX(high) AS high,
+                MIN(low) AS low,
+                LAST(close, time) AS close,
+                SUM(volume) AS volume
+            FROM tradfi_bars
+            GROUP BY ticker, time_bucket('30 minutes', time)
+            WITH NO DATA;
+
+            SELECT add_continuous_aggregate_policy('tradfi_bars_30m',
+                start_offset => INTERVAL '7 days',
+                end_offset => INTERVAL '30 minutes',
+                schedule_interval => INTERVAL '30 minutes',
+                if_not_exists => TRUE);
+
+            CREATE MATERIALIZED VIEW IF NOT EXISTS tradfi_bars_4h
+            WITH (timescaledb.continuous) AS
+            SELECT
+                ticker,
+                time_bucket('4 hours', time) AS bucket_time,
+                FIRST(open, time) AS open,
+                MAX(high) AS high,
+                MIN(low) AS low,
+                LAST(close, time) AS close,
+                SUM(volume) AS volume
+            FROM tradfi_bars
+            GROUP BY ticker, time_bucket('4 hours', time)
+            WITH NO DATA;
+
+            SELECT add_continuous_aggregate_policy('tradfi_bars_4h',
+                start_offset => INTERVAL '30 days',
+                end_offset => INTERVAL '4 hours',
+                schedule_interval => INTERVAL '4 hours',
+                if_not_exists => TRUE);
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0020_retention_and_compression",
+        "sql": """
+            -- Nothing bounded the growth of any hypertable.
+            --
+            -- No add_retention_policy, no compression and no drop_chunks
+            -- appeared anywhere in these migrations, against 121,370 crypto
+            -- transfer events in a single 24 hours, on a host whose entire
+            -- allocation is 26 GiB and whose database is capped at 1.5 GiB of
+            -- memory. The raw tables are also the least valuable thing in the
+            -- system once they have been rolled up: the continuous aggregates
+            -- carry the history the statistics actually read.
+            --
+            -- Compression first, retention well behind it. Chunks older than a
+            -- week compress -- typically an order of magnitude on OHLCV, which
+            -- is highly repetitive per ticker -- and only much older raw data
+            -- is dropped, always long after every aggregate has been
+            -- materialised from it.
+            ALTER TABLE tradfi_bars SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'ticker',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+            SELECT add_compression_policy('tradfi_bars', INTERVAL '7 days', if_not_exists => TRUE);
+            SELECT add_retention_policy('tradfi_bars', INTERVAL '400 days', if_not_exists => TRUE);
+
+            ALTER TABLE events SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'type',
+                timescaledb.compress_orderby = 'occurred_at DESC'
+            );
+            SELECT add_compression_policy('events', INTERVAL '14 days', if_not_exists => TRUE);
+            -- Events are the evidential record correlations cite, so this is
+            -- deliberately generous and far behind the compression window.
+            SELECT add_retention_policy('events', INTERVAL '400 days', if_not_exists => TRUE);
+        """,
+        "transactional": False
     }
 ]
 

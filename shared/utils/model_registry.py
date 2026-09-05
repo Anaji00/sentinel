@@ -83,6 +83,20 @@ def validate_training_data(
 
 # ── 2. CONFORMAL Z-SCORE CALIBRATOR (§1.3) ──────────────────────────────────
 
+def _conformal_index(n: int, target_far: float) -> int:
+    """Order statistic giving finite-sample coverage, not the plug-in quantile.
+
+    Split-conformal coverage comes from the ceil((n+1)(1-alpha))-th order
+    statistic, which is why the guarantee holds at small n. `int(n*(1-alpha))`
+    is the plug-in estimator and sits below it -- anti-conservative in exactly
+    the regime the min_samples floor of 30 puts this in.
+    """
+    if n <= 0:
+        return 0
+    k = math.ceil((n + 1) * (1.0 - float(target_far)))
+    return min(max(0, int(k) - 1), n - 1)
+
+
 class ConformalZScoreCalibrator:
     """
     Conformal calibration layer for dynamic anomaly Z-score thresholds (§1.3).
@@ -117,9 +131,36 @@ class ConformalZScoreCalibrator:
         return self.default_z_threshold
 
     def observe(self, z_score: float, is_confirmed_anomaly: bool = False):
-        """Record an observed background Z-score to build the null distribution."""
-        if not is_confirmed_anomaly and not math.isnan(z_score) and not math.isinf(z_score):
-            self._null_z_scores.append(abs(z_score))
+        """Record a background observation, to build the null distribution.
+
+        Putative anomalies are excluded as well as confirmed ones.
+
+        Every caller passes the default `is_confirmed_anomaly=False`, so the
+        buffer named `_null_z_scores` held the full mixture rather than the
+        background, and its 95th percentile was the 95th percentile of
+        everything the detector saw. That makes the threshold a fixed selection
+        quota: about 5% of events clear it no matter what is happening, and if
+        a genuine crisis makes half the stream anomalous the threshold rises
+        with it and 5% still passes. The platform could not report that today
+        was unusually eventful, because the test was a rate.
+
+        Ground truth is not available here, so the exclusion is the best
+        available proxy: an observation the *current* threshold already calls
+        significant is not evidence about the background. Below the minimum
+        sample count nothing is excluded, because there is no threshold yet to
+        exclude against and the buffer has to fill from somewhere.
+        """
+        if is_confirmed_anomaly or math.isnan(z_score) or math.isinf(z_score):
+            return
+        value = abs(z_score)
+        if (
+            self._calibrated_z_thresh is not None
+            and len(self._null_z_scores) >= self.min_samples
+            and value > self._calibrated_z_thresh
+        ):
+            return
+        if True:
+            self._null_z_scores.append(value)
             if len(self._null_z_scores) > self.buffer_size:
                 self._null_z_scores = self._null_z_scores[-self.buffer_size:]
 
@@ -127,11 +168,9 @@ class ConformalZScoreCalibrator:
                 self._recalibrate()
 
     def _recalibrate(self):
-        """Recompute z-threshold at (1 - target_far) quantile."""
+        """Recompute the threshold at the conformal (1 - target_far) quantile."""
         sorted_scores = sorted(self._null_z_scores)
-        idx = int(len(sorted_scores) * (1.0 - self.target_far))
-        idx = min(max(0, idx), len(sorted_scores) - 1)
-        new_thresh = sorted_scores[idx]
+        new_thresh = sorted_scores[_conformal_index(len(sorted_scores), self.target_far)]
 
         # Clamp to reasonable range [1.0, 3.5]
         new_thresh = max(1.0, min(3.5, new_thresh))
@@ -246,11 +285,9 @@ class ConformalScoreCalibrator(ConformalZScoreCalibrator):
     MAX_SCORE_THRESHOLD = 0.99
 
     def _recalibrate(self):
-        """Recompute the threshold at the (1 - target_far) quantile of scores."""
+        """Recompute the threshold at the conformal (1 - target_far) quantile of scores."""
         sorted_scores = sorted(self._null_z_scores)
-        idx = int(len(sorted_scores) * (1.0 - self.target_far))
-        idx = min(max(0, idx), len(sorted_scores) - 1)
-        new_thresh = sorted_scores[idx]
+        new_thresh = sorted_scores[_conformal_index(len(sorted_scores), self.target_far)]
 
         new_thresh = max(self.MIN_SCORE_THRESHOLD, min(self.MAX_SCORE_THRESHOLD, new_thresh))
 

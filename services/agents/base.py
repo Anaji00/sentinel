@@ -2240,6 +2240,24 @@ class SentinelAgent(ABC):
         except Exception:
             return None
 
+    async def _record_unresolvable(self, pred) -> None:
+        """Track predictions that reached their horizon and could not be scored.
+
+        Exposed beside the scorecard so a reader can tell a 70% hit rate over
+        everything from a 70% hit rate over the two thirds that happened to be
+        checkable.
+        """
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            day = datetime.now(timezone.utc).strftime("%Y%m%d")
+            key = f"sentinel:scorecard:{self.name}:unresolvable:{day}"
+            pipe = raw.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 30 * 86400)
+            await pipe.execute()
+        except Exception as e:
+            self.logger.debug("Could not record an unresolvable prediction: %s", e)
+
     async def resolve_due_predictions(self) -> int:
         """Scores this agent's predictions whose horizon has elapsed.
 
@@ -2296,6 +2314,24 @@ class SentinelAgent(ABC):
                     if not _is_resolvable(pred):
                         await self._retire_prediction(key, pred, "non-positive entry price")
                         continue
+
+                    # Uncounted, and now counted as uncounted.
+                    #
+                    # Skipping these silently is a selection filter if
+                    # verifiability correlates with outcome, and it does:
+                    # _score_directional returns None when a durable price
+                    # cannot be fetched, and prices go missing for illiquid,
+                    # halted and delisted names -- disproportionately where a
+                    # directional call goes wrong. Failures were therefore
+                    # dropped from the denominator more often than successes,
+                    # and the resulting win rate feeds kelly_criterion as
+                    # win_probability. A survivorship-biased hit rate becomes a
+                    # position size.
+                    #
+                    # The prediction still is not scored -- inventing an outcome
+                    # would be worse -- but the rate is now visible beside the
+                    # scorecard, so the bias can be seen instead of inferred.
+                    await self._record_unresolvable(pred)
                     continue        # unverifiable for now, so uncounted
 
                 await self.update_scorecard(

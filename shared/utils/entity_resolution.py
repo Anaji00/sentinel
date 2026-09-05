@@ -92,6 +92,42 @@ _WS = re.compile(r"\s+")
 _TICKERISH = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 
 
+# Words that cannot stand alone as a company's identity.
+#
+# A fold landing on one of these has not identified a company, it has described
+# an industry -- and two different companies described the same way would then
+# share a canonical key and be merged everywhere at once.
+# Shortest leading legal form that may be stripped. Below this the token is
+# more often part of the name than a form attached to it.
+MIN_LEADING_FORM_LEN = 3
+
+_GENERIC_FOLDS = frozenset({
+    "RECYCLING", "ARCHITECTS", "AUTOMOTIVE", "HOLDINGS", "HOLDING", "PARTNERS",
+    "CAPITAL", "VENTURES", "INTERNATIONAL", "GLOBAL", "NATIONAL", "AMERICAN",
+    "GENERAL", "STANDARD", "UNITED", "FIRST", "PACIFIC", "ATLANTIC", "CENTRAL",
+    "MANAGEMENT", "INVESTMENTS", "INVESTMENT", "PROPERTIES", "RESOURCES",
+    "INDUSTRIES", "TECHNOLOGIES", "TECHNOLOGY", "SYSTEMS", "SOLUTIONS",
+    "SERVICES", "ENTERPRISES", "ASSOCIATES", "CONSULTING", "ENERGY", "MEDIA",
+    "FINANCIAL", "BANCORP", "PHARMA", "BIOSCIENCES", "MOTORS", "AIRLINES",
+})
+
+
+def _is_usable_fold(text: str) -> bool:
+    """Whether a folded name still identifies a particular company."""
+    if not text:
+        return False
+    tokens = text.split()
+    if not tokens:
+        return False
+    if len(tokens) == 1:
+        only = tokens[0]
+        # A single token that is a legal form, a generic industry word, or too
+        # short to be a name identifies nothing.
+        if only in _LEGAL_FORMS or only in _GENERIC_FOLDS or len(only) < 2:
+            return False
+    return True
+
+
 def normalize_name(raw: Any) -> str:
     """The structural core of a name, with legal form and punctuation removed.
 
@@ -113,21 +149,51 @@ def normalize_name(raw: Any) -> str:
     text = _WS.sub(" ", text).strip()
 
     # Strip legal forms wherever they sit -- Russian and Chinese filings lead
-    # with them, Anglophone ones trail.
+    # with them, Anglophone ones trail -- but never down to a name that no
+    # longer identifies anybody.
+    #
+    # Stripping leading forms unconditionally destroys companies whose names
+    # begin with those letters, and the residue is generic, which turns a
+    # cosmetic error into a merge. Measured on the previous version:
+    # "SA Recycling" and "AB Recycling" both folded to RECYCLING; "AG Growth
+    # International" and "SA Growth International" both to GROWTH
+    # INTERNATIONAL; "CO Architects" and "AB Architects" both to ARCHITECTS.
+    # AG Growth International is a real listed company whose own name is "AG".
+    # And "Holding AG" folded to AG -- the loop stripped HOLDING from the front
+    # and left the legal form standing as the identifier.
+    #
+    # Two guards. A strip is rejected if it would leave nothing, a single
+    # generic word, or a token that is itself a legal form; and leading strips
+    # additionally require that more than one token survives, since a leading
+    # form is far more often part of the name than a trailing one is.
     changed = True
     while changed:
         changed = False
         for form in _LEGAL_FORMS:
-            for candidate in (f" {form}", f"{form} "):
-                if text.endswith(candidate.rstrip()) and len(text) > len(form) + 1:
-                    text = text[: -len(form)].strip()
-                    changed = True
-                elif text.startswith(candidate.lstrip() + " "):
-                    text = text[len(form):].strip()
-                    changed = True
+            if text.endswith(" " + form) and len(text) > len(form) + 1:
+                candidate = text[: -len(form)].strip()
+                if _is_usable_fold(candidate):
+                    text, changed = candidate, True
+            elif text.startswith(form + " ") and len(form) >= MIN_LEADING_FORM_LEN:
+                # Length is the discriminator, because ambiguity is.
+                #
+                # "PJSC", "GMBH" and "AKTIENGESELLSCHAFT" leading a name are
+                # legal forms and essentially never part of it, so stripping
+                # them is safe and is the case this branch exists for. Two-letter
+                # forms -- AG, SA, AB, CO -- are far more often the company's
+                # own name: AG Growth International, SA Recycling, CO
+                # Architects. Requiring more than one token instead was too
+                # blunt and broke "PJSC Gazprom", which must fold to GAZPROM.
+                candidate = text[len(form):].strip()
+                if _is_usable_fold(candidate):
+                    text, changed = candidate, True
 
     tokens = [t for t in text.split() if t not in _NOISE_TOKENS]
-    return " ".join(tokens).strip()
+    folded = " ".join(tokens).strip()
+    # Never return a fold that identifies nobody. Falling back to the
+    # punctuation-normalised name keeps two distinct companies distinct, which
+    # is the only property this function has to guarantee.
+    return folded if _is_usable_fold(folded) else text
 
 
 def looks_like_ticker(raw: Any) -> bool:

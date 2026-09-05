@@ -27,15 +27,22 @@ Theory:
 """
 
 import asyncio
+import bisect
 import json
 import logging
 import math
 import time
+
+import numpy as np
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("correlation.hawkes")
+
+# Exponential-kernel truncation, in units of 1/beta. exp(-25) = 1.4e-11, so
+# events further back than this contribute nothing measurable to the intensity.
+KERNEL_CUTOFF_LOG = 25.0
 
 # All Sentinel domains
 SENTINEL_DOMAINS = [
@@ -123,94 +130,132 @@ class HawkesMLE:
 
         prev_ll = -float('inf')
 
-        for iteration in range(self.max_iter):
-            # E-step: compute recursive kernel sums R_ij(k) for each event
-            # and log-likelihood
+        # Solved with a bounded quasi-Newton method, not hand-rolled ascent.
+        #
+        # The likelihood and its gradients are correct, and projected gradient
+        # ascent with a fixed learning rate still could not optimise them: the
+        # compensator term runs three orders of magnitude larger than the
+        # log-intensity term at the initial parameters, so a single step drives
+        # every alpha negative and the max(0.0, .) clamp pins it there. The
+        # previous code hid that by omitting the compensator derivative
+        # entirely, which turned the ascent into a one-way ratchet -- alpha rose
+        # every iteration and the stationarity projection clipped it back, so
+        # the "estimate" was always the cap.
+        #
+        # L-BFGS-B handles the scale difference natively and enforces the
+        # non-negativity bounds as constraints rather than as a post-hoc clamp.
+        from scipy.optimize import minimize
+
+        D = self.D
+
+        def _unpack(v):
+            mu = list(v[:D])
+            alpha = [[float(v[D + i * D + j]) for j in range(D)] for i in range(D)]
+            beta = float(v[-1])
+            return mu, alpha, beta
+
+        def _nll_and_grad(v):
+            mu, alpha, beta = _unpack(v)
+            beta = max(1e-8, beta)
+            # How far back the exponential kernel is still worth summing.
+            #
+            # Derived from the current beta rather than fixed, because the
+            # optimiser moves beta by orders of magnitude: a horizon computed
+            # from the initial value would truncate the kernel in the middle of
+            # its mass once beta fell. exp(-25) is 1.4e-11, so nothing material
+            # is dropped.
+            cutoff_window = KERNEL_CUTOFF_LOG / beta
             ll = 0.0
-            grad_mu = [0.0] * self.D
-            grad_alpha = [[0.0] * self.D for _ in range(self.D)]
-            grad_beta = 0.0
+            g_mu = [0.0] * D
+            g_alpha = [[0.0] * D for _ in range(D)]
+            g_beta = 0.0
 
-            import bisect
-            cutoff_window = 5.0 / max(1e-6, self.beta)
-
-            for j in range(self.D):
+            for j in range(D):
                 stream_j = streams[j]
-                n_j = len(stream_j)
-                if n_j == 0:
+                if not stream_j:
                     continue
 
-                # Integral term: -μ_j * T
-                ll -= self.mu[j] * T
-                grad_mu[j] -= T
+                ll -= mu[j] * T
+                g_mu[j] -= T
 
-                for k_idx, t_k in enumerate(stream_j):
-                    # Compute λ_j(t_k) for log-likelihood
-                    lam = self.mu[j]
-                    
-                    # Pre-calculate active historical event slices per domain using binary search
-                    active_slices = {}
-                    for i in range(self.D):
+                for t_k in stream_j:
+                    lam = mu[j]
+                    contribs = []
+                    for i in range(D):
                         stream_i = streams[i]
                         if not stream_i:
                             continue
                         idx_end = bisect.bisect_left(stream_i, t_k)
                         idx_start = bisect.bisect_left(stream_i, t_k - cutoff_window)
-                        if idx_start < idx_end:
-                            active_slices[i] = stream_i[idx_start:idx_end]
-
-                    for i, prev_ts_list in active_slices.items():
-                        alpha_ij = self.alpha[i][j]
-                        if alpha_ij <= 0:
-                            continue
-                        for t_prev in prev_ts_list:
+                        for t_prev in stream_i[idx_start:idx_end]:
                             dt = t_k - t_prev
-                            kernel = math.exp(-self.beta * dt)
-                            lam += alpha_ij * kernel
-
-                    if lam > 1e-10:
-                        ll += math.log(lam)
-                        inv_lam = 1.0 / lam
-
-                        # Gradient of log(λ_j(t_k)) w.r.t. μ_j
-                        grad_mu[j] += inv_lam
-
-                        # Gradient w.r.t. α_ij and β
-                        for i, prev_ts_list in active_slices.items():
-                            alpha_ij = self.alpha[i][j]
-                            for t_prev in prev_ts_list:
-                                dt = t_k - t_prev
-                                kernel = math.exp(-self.beta * dt)
-                                grad_alpha[i][j] += inv_lam * kernel
-                                if alpha_ij > 0:
-                                    grad_beta -= inv_lam * alpha_ij * dt * kernel
-
-                # Integral of excitation terms: -Σ_i α_ij/β * Σ_k (1 - exp(-β(T - t_k^i)))
-                for i in range(self.D):
-                    alpha_ij = self.alpha[i][j]
-                    if alpha_ij <= 0:
+                            kern = math.exp(-beta * dt)
+                            lam += alpha[i][j] * kern
+                            contribs.append((i, dt, kern))
+                    if lam <= 1e-12:
                         continue
+                    ll += math.log(lam)
+                    inv = 1.0 / lam
+                    g_mu[j] += inv
+                    for i, dt, kern in contribs:
+                        g_alpha[i][j] += inv * kern
+                        g_beta -= inv * alpha[i][j] * dt * kern
+
+                # Compensator and its exact derivatives.
+                for i in range(D):
                     integral_sum = 0.0
+                    decay_sum = 0.0
                     for t_prev in streams[i]:
-                        integral_sum += (1.0 - math.exp(-self.beta * (T - t_prev)))
-                    ll -= alpha_ij / max(1e-10, self.beta) * integral_sum
+                        u = T - t_prev
+                        if u <= 0:
+                            continue
+                        e = math.exp(-beta * u)
+                        integral_sum += (1.0 - e)
+                        decay_sum += u * e
+                    ll -= alpha[i][j] / beta * integral_sum
+                    g_alpha[i][j] -= integral_sum / beta
+                    g_beta += (
+                        alpha[i][j] / (beta ** 2) * integral_sum
+                        - alpha[i][j] / beta * decay_sum
+                    )
 
-            # Gradient step
-            for j in range(self.D):
-                self.mu[j] = max(1e-8, self.mu[j] + self.lr * grad_mu[j])
-            for i in range(self.D):
-                for j in range(self.D):
-                    self.alpha[i][j] = max(0.0, self.alpha[i][j] + self.lr * grad_alpha[i][j])
-            self.beta = max(1e-4, self.beta + self.lr * grad_beta)
+            grad = np.concatenate([
+                np.asarray(g_mu, dtype=float),
+                np.asarray(g_alpha, dtype=float).reshape(-1),
+                np.asarray([g_beta], dtype=float),
+            ])
+            # minimise the negative log-likelihood
+            return -ll, -grad
 
-            # Project: enforce spectral radius < cap
-            self._project_stationarity()
+        x0 = np.concatenate([
+            np.asarray(self.mu, dtype=float),
+            np.asarray(self.alpha, dtype=float).reshape(-1),
+            np.asarray([self.beta], dtype=float),
+        ])
+        bounds = [(1e-8, None)] * D + [(0.0, None)] * (D * D) + [(1e-4, None)]
 
-            # Check convergence
-            if abs(ll - prev_ll) < self.tol:
-                logger.info(f"Hawkes MLE converged at iteration {iteration + 1}, LL={ll:.4f}")
-                break
-            prev_ll = ll
+        try:
+            opt = minimize(
+                _nll_and_grad, x0, jac=True, method="L-BFGS-B",
+                bounds=bounds, options={"maxiter": self.max_iter, "ftol": self.tol},
+            )
+            self.mu, self.alpha, self.beta = _unpack(opt.x)
+            self.beta = max(1e-4, self.beta)
+            ll = -float(opt.fun)
+            iteration = int(opt.nit)
+            logger.info(
+                "Hawkes MLE finished in %s iterations (%s), LL=%.4f",
+                iteration, "converged" if opt.success else "iteration limit", ll,
+            )
+        except Exception as e:
+            logger.warning("Hawkes MLE optimisation failed: %s", e)
+            ll = 0.0
+            iteration = 0
+
+        # Stationarity still enforced after the solve: the likelihood does not
+        # know that a branching matrix with spectral radius above 1 describes a
+        # process that explodes.
+        self._project_stationarity()
 
         result = self._current_params_dict()
         result["log_likelihood"] = round(ll, 4)

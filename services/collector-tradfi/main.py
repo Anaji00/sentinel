@@ -1445,6 +1445,72 @@ async def _watchlist_pubsub_listener(redis_client, sync_event: asyncio.Event):
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 
+async def _run_historical_backfill(redis_client) -> None:
+    """Load split- and dividend-adjusted vendor bars for the tracked universe.
+
+    Runs once per process start and records the outcome in Redis, so the result
+    is inspectable rather than only visible in a log line that scrolls away.
+    Every failure path here is logged at warning or above: a backfill that
+    silently does nothing is indistinguishable from one that was not needed,
+    which is the failure mode this codebase has repeatedly produced.
+    """
+    try:
+        from historical_backfill import backfill_bars, DEFAULT_LOOKBACK_DAYS
+    except ImportError:
+        try:
+            from services.collector_tradfi.historical_backfill import (  # type: ignore
+                backfill_bars, DEFAULT_LOOKBACK_DAYS,
+            )
+        except ImportError as e:
+            logger.warning("Historical backfill module unavailable: %s", e)
+            return
+
+    if os.getenv("ENABLE_HISTORICAL_BACKFILL", "true").lower() not in ("1", "true", "yes"):
+        logger.info("Historical backfill disabled by ENABLE_HISTORICAL_BACKFILL.")
+        return
+
+    try:
+        from shared.db import get_timescale
+        db = await get_timescale()
+    except Exception as e:
+        logger.warning("Historical backfill: no database handle (%s); skipped.", e)
+        return
+
+    tickers: list = []
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        members = await raw.zrange("sentinel:watched:equities", 0, -1)
+        tickers = [
+            (m.decode("utf-8") if isinstance(m, bytes) else str(m)).upper()
+            for m in (members or [])
+        ]
+    except Exception as e:
+        logger.warning("Historical backfill: could not read the watchlist (%s).", e)
+
+    if not tickers:
+        # A cold platform has no watchlist yet. Seed from the core symbols this
+        # collector already reserves capacity for, so the first run produces
+        # usable history rather than nothing.
+        #
+        # This previously referenced BASE_CIK_MAP, which lives in the filings
+        # collector and does not exist in this module -- guarded by a
+        # `in globals()` check that made the whole fallback dead code. The
+        # undefined-name check caught it.
+        tickers = list(CORE_EQUITY_SYMBOLS)
+    if not tickers:
+        logger.info("Historical backfill: no tickers to load yet; will run again on next start.")
+        return
+
+    logger.info("Historical backfill starting for %s ticker(s).", len(tickers))
+    report = await backfill_bars(db, tickers, timeframe="1Min", lookback_days=DEFAULT_LOOKBACK_DAYS)
+
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        await raw.set("sentinel:backfill:tradfi:last", json.dumps(report, default=str), ex=86400 * 7)
+    except Exception as e:
+        logger.debug("Could not record backfill report: %s", e)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL TradFi Service (Enterprise Multi-Session Edition)")
@@ -1469,6 +1535,15 @@ async def main():
     # §0.3 — PubSub listener for instant watchlist sync
     pubsub_task = safe_create_task(_watchlist_pubsub_listener(redis_client, watchlist_sync_event))
 
+    # Adjusted vendor history, once, before the live loops start filling bars.
+    #
+    # Detached rather than awaited: a backfill of two years across the tracked
+    # universe takes minutes, and the live feeds must not wait on it. Scoped to
+    # the watchlist rather than the full radar universe -- 11,644 symbols is a
+    # rate-limit problem, and the names the platform reasons about are the ones
+    # whose history it needs.
+    backfill_task = safe_create_task(_run_historical_backfill(redis_client))
+
     try:
         await asyncio.gather(
             run_polling(producer, redis_client),
@@ -1481,6 +1556,7 @@ async def main():
     finally:
         hb_task.cancel()
         pubsub_task.cancel()
+        backfill_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import numpy as np
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -216,7 +217,11 @@ async def test_strategy_backtester_covered_call():
 
     bars = [
         {
-            "timestamp": f"2026-01-01T{i:02d}:00:00Z",
+            # Real timestamps. This was f"2026-01-01T{i:02d}:00:00Z" over 121
+            # bars, which emits "T99:00:00Z" -- an hour that does not exist --
+            # for every bar past the twenty-fourth, so most of the series was
+            # unparseable and any code reading it silently saw nothing.
+            "timestamp": (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=i)).isoformat(),
             "open": c * 0.995,
             "high": c * 1.010,
             "low": c * 0.990,

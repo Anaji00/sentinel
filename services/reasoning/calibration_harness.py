@@ -9,6 +9,7 @@ using precision/recall optimization instead of static heuristics.
 
 import json
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
@@ -249,10 +250,27 @@ class DynamicBayesianCalibrator:
         else:
             posteriors = [num / marginal_likelihood for num in numerators]
 
-        pcts = [round(p * 100) for p in posteriors]
-        diff = 100 - sum(pcts)
-        if pcts:
-            pcts[0] += diff
+        # Largest-remainder apportionment, so the residual is not a thumb on
+        # the scale for whichever hypothesis happens to be listed first.
+        #
+        # `pcts[0] += diff` dumped the whole rounding residual on index 0, which
+        # is by convention the leading hypothesis -- nudging the published
+        # probability of the front-runner up by as much as two points, in the
+        # same direction, in every scenario where rounding did not land exactly.
+        # Three hypotheses near parity round to 33/33/33 and H1 became 34.
+        scaled = [p * 100.0 for p in posteriors]
+        pcts = [int(math.floor(v)) for v in scaled]
+        residual = 100 - sum(pcts)
+        if residual > 0 and pcts:
+            # Hand the spare points to the largest fractional parts, which is
+            # the standard apportionment rule and is order-independent.
+            order = sorted(range(len(scaled)), key=lambda i: scaled[i] - math.floor(scaled[i]), reverse=True)
+            for i in order[:residual]:
+                pcts[i] += 1
+        elif residual < 0 and pcts:
+            order = sorted(range(len(scaled)), key=lambda i: scaled[i] - math.floor(scaled[i]))
+            for i in order[:-residual]:
+                pcts[i] -= 1
 
         updated_hypotheses = []
         for i, h in enumerate(hypotheses):

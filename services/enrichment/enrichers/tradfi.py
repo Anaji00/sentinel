@@ -22,6 +22,7 @@ import re
 
 from shared.utils.materiality import apply_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
+from shared.utils.quiet_failures import swallowed
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -1077,7 +1078,9 @@ class TradFiEnricher:
                     ticker, ts, open_p, high_p, low_p, close_p, volume, session_tag
                 )
         except Exception as bar_err:
-            logger.debug(f"Failed to persist tradfi_bars for {ticker}: {bar_err}")
+            # Counted, not only whispered. This handler is why bar persistence
+            # could fail indefinitely while the enricher reported success.
+            swallowed("enrichment.tradfi_bars_persist", bar_err, logger, detail=ticker)
 
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         if not is_watched:
@@ -2187,7 +2190,7 @@ class TradFiEnricher:
             # The base score is a defensible floor: a 13F is a mandatory
             # disclosure from a large institution and is worth reading whether
             # or not this normalisation succeeded.
-            logger.debug("13F movement scoring fell back to base for %s: %s", filer_id, e)
+            swallowed("enrichment.13f_movement_score", e, logger, detail=str(filer_id))
 
         return NormalizedEvent(
             event_id=raw.event_id,

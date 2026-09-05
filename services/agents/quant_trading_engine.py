@@ -714,9 +714,24 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         # true win probability -- so pooling regimes biases every position size.
         # Falls back to the strategy-wide, then global, card when a partition is
         # too thin to estimate from.
+        # Scoped to the same bet the payoff ratio describes.
+        #
+        # The win rate came from the strategy-wide "trading_advisory" scorecard
+        # while win_loss_ratio is fetched per ticker just below. Kelly assumes
+        # both parameters describe one bet distribution, so mixing a
+        # strategy-wide p with a per-ticker b misprices every position whose
+        # payoff profile differs from the strategy average -- which is the point
+        # of measuring it per ticker in the first place. The per-ticker card is
+        # preferred and the strategy card is the documented fallback when that
+        # partition is too thin, which is the same precedence the payoff ratio
+        # already uses.
         card, card_source = await self.get_conditional_scorecard(
-            strategy="trading_advisory", min_samples=MIN_KELLY_SAMPLES
+            strategy=f"trading_advisory:{ticker.upper()}", min_samples=MIN_KELLY_SAMPLES
         )
+        if card.predictions_made < MIN_KELLY_SAMPLES:
+            card, card_source = await self.get_conditional_scorecard(
+                strategy="trading_advisory", min_samples=MIN_KELLY_SAMPLES
+            )
         if card.predictions_made >= MIN_KELLY_SAMPLES:
             win_prob = min(0.85, max(0.35, card.predictions_correct / max(1, card.predictions_made)))
         else:

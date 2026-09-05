@@ -7,8 +7,9 @@ Exposes mathematical derivations, assumptions, closed-form equations,
 data dependencies, and Z-score calibration gates for all Sentinel signals.
 """
 
+from shared.utils.rbac import require_role, Role
 from typing import Dict, List, Optional, Any
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/v1/methodology", tags=["Mathematical Methodology & Whitepaper"])
@@ -55,7 +56,17 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 symbol=r"\Delta",
                 description="Target delta range for short call strike selection",
                 default_value="[0.20, 0.35]",
-                calibration_method="Empirically calibrated to maximize risk-adjusted Sharpe over 5-year rolling backtests",
+                # Was "Empirically calibrated to maximize risk-adjusted Sharpe
+                # over 5-year rolling backtests". The backtester is invoked with
+                # timeframe="5m" and limit=BACKTEST_REFRESH_BARS=300 -- 1,500
+                # minutes, under four trading days -- and "5-year" appeared
+                # nowhere else in the codebase. It described a process that did
+                # not exist, on an endpoint that required no authentication.
+                calibration_method=(
+                    "Hand-set defaults, validated against a rolling short-horizon "
+                    "backtest over the available bar history; not yet calibrated "
+                    "over a multi-year sample"
+                ),
             ),
             MethodologyParameter(
                 name="Risk-Free Rate",
@@ -198,7 +209,9 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
 
 
 @router.get("", response_model=List[Dict[str, Any]])
-async def get_methodology_catalog():
+async def get_methodology_catalog(
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+):
     """
     Returns high-level catalog of all mathematical methodologies implemented in Sentinel.
     """
@@ -216,7 +229,10 @@ async def get_methodology_catalog():
 
 
 @router.get("/{signal_id}", response_model=SignalMethodology)
-async def get_signal_methodology(signal_id: str):
+async def get_signal_methodology(
+    signal_id: str,
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+):
     """
     Returns exact mathematical equation, assumptions, parameter calibrations,
     and falsifiability conditions for a specific signal type.

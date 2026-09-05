@@ -84,6 +84,60 @@ _CLOSE = dtime(16, 0)
 _POST_CLOSE = dtime(20, 0)
 
 
+# US equity market full closures and early closes.
+#
+# Deliberately a table rather than a rule: the NYSE calendar is not derivable
+# from the date -- Good Friday moves with Easter, observed holidays shift
+# around weekends, and the exchange has closed for national days of mourning
+# with a few days' notice. A table is honest about being maintained, and the
+# helper below says so loudly when it runs past its last known year rather than
+# silently treating an unknown December as an ordinary trading month.
+_MARKET_HOLIDAYS = {
+    # 2025
+    "2025-01-01", "2025-01-09", "2025-01-20", "2025-02-17", "2025-04-18",
+    "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27",
+    "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+# Early closes: the session ends at 13:00 ET.
+_HALF_DAYS = {
+    "2025-07-03", "2025-11-28", "2025-12-24",
+    "2026-11-27", "2026-12-24",
+    "2027-11-26",
+}
+
+_HOLIDAY_TABLE_THROUGH = 2027
+
+# Early-close bell.
+_HALF_DAY_CLOSE = dtime(13, 0)
+
+
+def _is_market_holiday(day) -> bool:
+    """Whether US equity markets are fully closed on this date."""
+    return day.isoformat() in _MARKET_HOLIDAYS
+
+
+def _is_half_day(day) -> bool:
+    """Whether US equity markets close early (13:00 ET) on this date."""
+    return day.isoformat() in _HALF_DAYS
+
+
+def holiday_table_is_current(utc_now=None) -> bool:
+    """Whether the calendar above still covers the current year.
+
+    Exposed so a health check can notice the table has aged out instead of the
+    platform silently treating every holiday as an ordinary session again.
+    """
+    year = eastern_now(utc_now).year
+    return year <= _HOLIDAY_TABLE_THROUGH
+
+
 def current_session(utc_now: Optional[datetime] = None, asset_class: str = "equities") -> Session:
     """Which session an asset class is in right now.
 
@@ -96,6 +150,20 @@ def current_session(utc_now: Optional[datetime] = None, asset_class: str = "equi
     et = eastern_now(utc_now)
     if et.weekday() >= 5:  # Saturday, Sunday
         return Session.CLOSED
+    if _is_market_holiday(et.date()):
+        # A full closure reads as CLOSED, which is what it is.
+        #
+        # This module computed sessions from the clock alone and argued the gap
+        # was harmless because "every caller treats a wrong answer as a pacing
+        # decision". session_liquidity_factor in this same file is documented
+        # "for interpretation rather than pacing" and divides an options score
+        # by its result -- and on a holiday the clock said regular, so the depth
+        # was 1.00 and the guard `if 0 < depth < 1.0` applied no adjustment at
+        # all. The thin-session amplification was switched off on precisely the
+        # thirteen days a year the book is thinnest.
+        return Session.CLOSED
+    if _is_half_day(et.date()) and et.time() >= _HALF_DAY_CLOSE:
+        return Session.AFTER_HOURS
 
     t = et.time()
     if _OPEN <= t < _CLOSE:

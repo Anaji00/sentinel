@@ -36,6 +36,7 @@ import logging
 import re
 from typing import Optional, Tuple
 
+from shared.utils.quiet_failures import swallowed
 logger = logging.getLogger("shared.counterparty")
 
 # Distinct counterparties above which an address is a venue rather than an
@@ -118,7 +119,9 @@ async def note_counterparty(redis_client, address: str, other: str) -> None:
         await redis_client.raw.pfadd(key, str(other).lower())
         await redis_client.raw.expire(key, _DEGREE_TTL_SEC)
     except Exception as e:
-        logger.debug(f"Could not record counterparty for {str(address)[:10]}: {e}")
+        # This swallowed three missing Redis commands for as long as it took to
+        # notice the degree was permanently zero.
+        swallowed("crypto.note_counterparty", e, logger)
 
 
 async def counterparty_degree(redis_client, address: str) -> int:

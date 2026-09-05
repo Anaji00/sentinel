@@ -45,14 +45,62 @@ DEFAULT_WINDOW_SEC = 6 * 3600
 # Token overlap above which two reports are the same claim.
 SAME_CLAIM_THRESHOLD = 0.45
 
-# Overlap above which two reports are not merely the same claim but the same
-# *text* -- syndicated wire copy. Two outlets running the same feed corroborate
-# nothing, and counting them separately is how a single source masquerades as
-# consensus.
-SYNDICATION_THRESHOLD = 0.85
+# Overlap above which two reports are treated as one account rather than two.
+#
+# This is a BACKSTOP, not the primary test, because token overlap provably
+# cannot separate the two cases. Measured on this module's own fixtures:
+#
+#   independent rewording of one story, which MUST corroborate ... 0.600
+#   near-verbatim wire copy, which MUST NOT corroborate .......... 0.636
+#
+# Thirty-six thousandths apart. Any threshold that catches the second destroys
+# the first, which is exactly what happened when this was lowered to 0.55: the
+# syndication test started passing and three corroboration tests began failing,
+# because a genuinely independent second source was being discarded. The
+# original 0.85 had the opposite failure and never fired at all.
+#
+# Two newsrooms reporting one event independently produce the same word overlap
+# as two outlets running one wire story, because they are describing the same
+# facts with the same vocabulary. The signal that distinguishes them is not in
+# the words -- it is who they say they got it from. `cited_source` below is the
+# primary test; this threshold only catches copy so close that attribution is
+# beside the point.
+SYNDICATION_THRESHOLD = 0.80
 
 # Bound on tracked claims, so a busy stream cannot grow this without limit.
 MAX_TRACKED_CLAIMS = 5_000
+
+
+# Attribution phrasings. A report saying where it got the story is telling us
+# it is not an independent account of the event, whatever its wording overlap.
+_ATTRIBUTION_RE = re.compile(
+    r"(?:according to|as reported by|cites?|citing|via|sources?\s+told|"
+    r"first reported by|per)\s+([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,2})",
+    re.IGNORECASE,
+)
+
+# Wire datelines and credit lines: "(Reuters)", "- Bloomberg", "[AP]".
+_DATELINE_RE = re.compile(r"[\(\[\-—]\s*(Reuters|Bloomberg|AP|Associated Press|AFP|Dow Jones|PA Media|Kyodo|Xinhua|TASS)", re.IGNORECASE)
+
+
+def cited_source(text: str) -> Optional[str]:
+    """Which outlet this report says the story came from, if it says.
+
+    Provenance is the signal that actually separates syndication from
+    independent reporting, and it is the one the tracker was missing. Five
+    outlets rewriting one Reuters story are one source; what distinguishes them
+    from five newsrooms working the same event is that the first five say
+    "Reuters" somewhere and the second five do not.
+    """
+    if not text:
+        return None
+    m = _DATELINE_RE.search(text)
+    if m:
+        return m.group(1).strip().lower()
+    m = _ATTRIBUTION_RE.search(text)
+    if m:
+        return m.group(1).strip().lower()
+    return None
 
 
 def tokenize(text: str) -> frozenset:
@@ -82,6 +130,10 @@ class Report:
     tokens: frozenset
     at: float
     reliability: float = 0.5
+    # The original text, kept so provenance can be read from it. Tokenising
+    # discards word order, case and stopwords, which is exactly the information
+    # an attribution phrase like "according to Reuters" is carried in.
+    text: str = ""
 
 
 @dataclass
@@ -105,9 +157,25 @@ class Claim:
             source_key = report.source.strip().lower()
             if source_key in seen_sources:
                 continue
-            if any(similarity(report.tokens, k.tokens) >= SYNDICATION_THRESHOLD for k in kept):
-                # Same words, different masthead: one story, not two.
+
+            # Provenance first: a report that names where it got the story is
+            # not an independent account of the event, however it is worded.
+            # This is the test that actually separates syndication from
+            # independent reporting -- see SYNDICATION_THRESHOLD for why word
+            # overlap cannot.
+            cited = cited_source(report.text) if report.text else None
+            if cited and any(
+                cited == k.source.strip().lower()
+                or cited in k.source.strip().lower()
+                or k.source.strip().lower() in cited
+                for k in kept
+            ):
                 continue
+
+            if any(similarity(report.tokens, k.tokens) >= SYNDICATION_THRESHOLD for k in kept):
+                # Copy so close that attribution is beside the point.
+                continue
+
             seen_sources.add(source_key)
             kept.append(report)
         return kept
@@ -177,7 +245,8 @@ class CorroborationTracker:
                 del self._claims[: len(self._claims) - self.max_claims]
 
         report = Report(source=source or "unknown", tokens=tokens, at=now,
-                        reliability=max(0.0, min(1.0, reliability)))
+                        reliability=max(0.0, min(1.0, reliability)),
+                        text=str(text or ""))
         claim.reports.append(report)
         # The claim's own tokens accumulate, so later phrasings of the same story
         # still match it rather than opening a second claim.

@@ -31,6 +31,11 @@ from shared.utils.logging import setup_sentinel_logging
 
 logger = setup_sentinel_logging("reasoning.orchestrator", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
+# Supporting events a cluster must cite before it can be scheduled for scenario
+# generation. One is enough to make it a claim about something observed; zero
+# means the trigger id refers to nothing in the store.
+MIN_SUPPORTING_EVENTS = 1
+
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.models import CorrelationCluster, AlertTier
 from shared.db import get_timescale, get_redis, get_neo4j
@@ -593,6 +598,18 @@ def _reasoning_priority(item) -> float:
     confidence = max(0.0, min(1.0, confidence))
 
     n_support = len(getattr(cluster, "supporting_event_ids", None) or [])
+
+    # A cluster citing no events is not a weak claim about the world; it is not
+    # a claim about the world.
+    #
+    # breadth is a 0.15-weighted term, so an evidence-free cluster lost at most
+    # 0.15 of priority and still competed for scenario generation -- the
+    # multi-minute inference that is the scarcest resource this platform has.
+    # The quant engine publishes exactly such clusters: supporting_event_ids=[]
+    # with a synthetic trigger id matching no stored event.
+    if n_support < MIN_SUPPORTING_EVENTS:
+        return 0.0
+
     breadth = min(1.0, math.log1p(max(0, n_support - 1)) / math.log1p(49))
 
     metrics = getattr(cluster, "metrics_summary", None) or {}
