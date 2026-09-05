@@ -136,7 +136,7 @@ Sentinel is composed of **30 modular services & containers** orchestrated via Do
 - **Non-Root Container Execution**: All Python containers run as `sentinel` (UID 1001), preventing container-escape privilege escalation.
 - **Hardened Session Cookies**: `sentinel_session` cookie enforces `HttpOnly: true`, `Secure: true`, `SameSite: Strict`, and `Path: /`.
 - **Conditional CORS**: `allow_origin_regex` for localhost is restricted to `SAFE_DEV_ENVS` environments. In production, origins are explicitly enumerated via `CORS_ALLOWED_ORIGINS` with no open regex.
-- **Container Resource Limits**: CPU and memory limits enforced across all 30 services (`deploy.resources.limits`) — from Ollama (4 CPU / 8G) down to collectors (0.5 CPU / 512M) — preventing host starvation.
+- **Container Resource Limits**: CPU and memory limits enforced across all services (`deploy.resources.limits`) — from Ollama (4 CPU / 8G) down to collectors (0.5 CPU / 512M) — preventing host starvation.
 - **Universal Heartbeat Coverage & Data Health Dashboard**: Structured 15s heartbeats across all 15 collectors and background workers aggregated at `GET /api/v1/health/data` for real-time cluster liveness and degradation tracking.
 - **Dynamic Watchlist Governance**: Real-time ticker registration in Redis (`sentinel:watched:equities`) with a hard **Finnhub 50-ticker clamp** and instant WebSocket repointing via Redis Pub/Sub (`sentinel:collector:watchlist_sync`), eliminating static ticker hardcoding.
 - **Role-Based Access Control (RBAC)**: Hierarchical access control (`ADMIN > ANALYST > VIEWER`) enforced across all API routes via the `require_role` FastAPI dependency, with cryptographic JWT session-cookie verification (no spoofable client headers).
@@ -151,21 +151,50 @@ Sentinel is composed of **30 modular services & containers** orchestrated via Do
 
 ---
 
-## 📐 Quantitative & Statistical Mathematics
+## 📐 Quantitative & Statistical Models
 
-Sentinel integrates a specialized quantitative math library in `shared/utils/quant_calc.py`:
+The shared maths library lives in `shared/utils/quant_calc.py`. What it does, plainly:
 
-- **Black-Scholes Greeks & Pricing**: Analytical Call/Put pricing with closed-form Greeks ($\Delta, \Gamma, \Theta, \mathcal{V}, \rho$).
-- **Implied Volatility (IV) Root Finding**: Hybrid Newton-Raphson and Brent-Dekker solver with volatility smile boundary clamping ($0.001 \le \sigma \le 10.0$).
-- **Covered Call Optimization**: Evaluates strike delta selection ($\Delta \approx 0.30$), annualized option yield, downside protection percentage, and max return.
-- **Value at Risk (VaR) & Conditional VaR (CVaR)**: Non-parametric historical loss estimation at 95% and 99% confidence levels per position.
-- **Engle-Granger Cointegration**: Two-step OLS regression testing stationary spread relationships ($y_t - \beta x_t - \alpha$) with Dickey-Fuller t-statistics and half-life estimation.
-- **Granger Causality**: Vector Auto-Regression (VAR) $F$-test evaluating lead-lag causal directionality across time series.
-- **Hawkes Point Process Branching Ratio**: Cross-domain and intra-sector volatility contagion excitation ratio ($\eta = \int \alpha(t) dt$).
-- **30-Day Exponential Edge Recency Decay**: Continuous decay for graph confidence and weights:
-  $$w_{\text{effective}}(t) = w_{\text{base}} \times \exp\left(-\frac{\ln 2}{30 \times 86400} \cdot \Delta t\right)$$
-- **Empirical Half-Kelly Criterion**: Position sizing derived from historical win rates ($W$) and payoff ratios ($R$):
-  $$K_{\text{half}} = 0.5 \times \left( W - \frac{1 - W}{R} \right)$$
+**Options** — Black-Scholes pricing and Greeks, implied volatility solving, and covered-call
+strike selection.
+
+**Risk** — Value at Risk and Conditional VaR from the actual loss history, maximum drawdown,
+and half-Kelly position sizing driven by measured win rates rather than assumed ones.
+
+**Relationships between instruments** — Pearson correlation, Engle-Granger cointegration,
+and Granger causality for lead-lag effects. Because testing many pairs at once produces
+false positives by construction, results are corrected for multiple comparisons before
+anything is reported.
+
+**Market behaviour** — GARCH and EWMA volatility, a Hurst exponent for whether a series
+trends or mean-reverts, and a Hawkes process for how activity in one domain excites another.
+
+**Two notes on how these are used.** Every annualised figure is scaled to the timeframe it
+was measured on, so a number from 5-minute bars is not treated as if it came from daily ones.
+And statistical tests are run on stationary inputs — price levels are differenced first where
+the test requires it — because regressions on raw prices find relationships that are not there.
+
+Each of these is checked against data with a known answer: a random walk should score near
+0.5 on the Hurst measure, and unrelated series should be flagged as causally linked about
+5% of the time and no more.
+
+---
+
+## 📊 Market Data
+
+Price bars are stored as one-minute records and rolled up automatically into
+**5m, 15m, 30m, 1h, 4h, 1d, 1w and 1mth** views.
+
+On startup the platform backfills history for the tickers it is watching, asking the
+vendor for **split- and dividend-adjusted** prices. This matters more than it sounds:
+without adjustment, a 4-for-1 stock split looks like a 75% crash, which is the largest
+price move the system would ever see and carries no information at all. Backfill is
+skipped if no market-data credentials are configured — the platform still runs, it just
+starts with less history.
+
+Two limits worth knowing. Backfilled history covers currently-listed tickers only, so
+backtests across it exclude companies that have since delisted. And adjusted prices are
+adjusted as of today, which is fine for research and not for claiming past returns.
 
 ---
 
@@ -202,7 +231,7 @@ Access the dashboard at **`https://localhost`** (Nginx TLS ingress auto-generate
 
 ### 1. Docker Cluster Management
 ```bash
-# Start all 30 services in background
+# Start all services in background
 docker compose up -d
 
 # Inspect health and container states
@@ -237,27 +266,18 @@ curl -s http://localhost:8000/api/v1/financial/advice -H "X-API-KEY: ${API_KEY}"
 npx wscat -c "ws://localhost:8000/api/v1/events/ws/live-feed?api_key=${API_KEY}"
 ```
 
-### 3. Automated Test Suite (292 Passing Tests)
+### 3. Automated Test Suite (2,628 passing tests)
 ```bash
-# Run entire repository test suite
+# Everything
 python -m pytest tests/
 
-# Run targeted security, domain expansion & integrity modules
-python -m pytest tests/test_rbac_security.py
-python -m pytest tests/test_telegram_formatting.py
-python -m pytest tests/test_integrity_layer.py
-python -m pytest tests/test_domain_expansion.py
-python -m pytest tests/test_domain_coverage_gaps.py
-python -m pytest tests/test_enterprise_features.py
-python -m pytest tests/test_signal_validation_and_governance.py
-python -m pytest tests/test_system_and_security.py
+# One area — the suite is split across 169 files by subject
 python -m pytest tests/test_quant_and_trading.py
 python -m pytest tests/test_correlation_and_graph.py
-python -m pytest tests/test_statistical_discovery.py
-python -m pytest tests/test_macro_calendar.py
-python -m pytest tests/test_drift_scheduler.py
-python -m pytest tests/test_payload_and_graph_promotion.py
-python -m pytest tests/test_tier2_hardening.py
+python -m pytest tests/test_rbac_security.py
+
+# Anything matching a keyword
+python -m pytest tests/ -k "backtest or calibration"
 ```
 
 ---
