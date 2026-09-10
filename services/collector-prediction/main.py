@@ -31,6 +31,7 @@ from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -256,10 +257,42 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
         markets_url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume&ascending=false&limit=100"
         
         while True:
+            dynamic_slugs = []
             try:
                 # 1. Fetch manual slugs from Redis
                 raw_slugs = await redis_client.raw.smembers(redis_key)
-                watched_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else []
+                stored_slugs = [s.decode() if isinstance(s, bytes) else s for s in raw_slugs] if raw_slugs else []
+
+                # The filter is applied to what is stored, not only to what is
+                # swept.
+                #
+                # `_is_relevant_market` reads the slug among its fields, so it
+                # answers for a stored slug exactly as it does for a live
+                # market -- and measured against the live set it rejected 501
+                # of 609, 82%. The collector filtered each sweep, logged that
+                # it kept 11 of 100, and then polled sixty slugs drawn from the
+                # whole unfiltered set: the verdict was computed and discarded.
+                # What it actually tracked was week-old football fixtures,
+                # esports and daily temperature questions, while
+                # `iran-charges-hormuz-fees-by-september-30` sat in the same
+                # set and was polled only by luck.
+                irrelevant = [x for x in stored_slugs if not _is_relevant_market({"slug": x})]
+                watched_slugs = [x for x in stored_slugs if _is_relevant_market({"slug": x})]
+
+                # Pruned, not merely skipped. `sadd` never removes, so the set
+                # grows forever and every read pays for it; leaving them in
+                # place would mean re-filtering the same 501 on every cycle.
+                if irrelevant:
+                    try:
+                        await redis_client.raw.srem(redis_key, *irrelevant)
+                        logger.info(
+                            "Polymarket watch list: pruned %d off-domain slug(s) of %d "
+                            "stored. They were being polled despite this collector's own "
+                            "filter rejecting them.",
+                            len(irrelevant), len(stored_slugs),
+                        )
+                    except Exception as e:
+                        logger.warning("Could not prune the Polymarket watch list: %s", e)
                 
                 # 2. Fetch dynamic active slugs from Polymarket
                 try:
@@ -316,13 +349,30 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 # every question that was briefly popular stayed subscribed
                 # forever, and each one costs a Gamma request per sync cycle.
                 if len(watched_slugs) > MAX_WATCHED_SLUGS:
+                    # "The most recent" was not a property this could have.
+                    #
+                    # `watched_slugs` came from `smembers`, and a Redis set has
+                    # no order -- so `[-60:]` took an arbitrary tail and the log
+                    # line called it recency. The evidence was in the tracked
+                    # list: fixtures dated a week earlier, on a poller claiming
+                    # to sync the newest.
+                    #
+                    # Ordering is now something the data supports. The current
+                    # sweep returned these markets active and volume-ranked
+                    # moments ago, so they lead; the rest follow in a stable
+                    # order rather than an arbitrary one.
+                    fresh = [x for x in dynamic_slugs if x in set(watched_slugs)]
+                    rest = sorted(set(watched_slugs) - set(fresh))
+                    ordered = fresh + rest
                     logger.info(
-                        "Polymarket watch list at %d slugs, above the %d ceiling; "
-                        "syncing the most recent. A set that only grows eventually "
-                        "spends the whole poll interval on resolved questions.",
+                        "Polymarket watch list at %d relevant slugs, above the %d "
+                        "ceiling; keeping the %d the current sweep returned active, "
+                        "then %d more in a stable order.",
                         len(watched_slugs), MAX_WATCHED_SLUGS,
+                        min(len(fresh), MAX_WATCHED_SLUGS),
+                        max(0, MAX_WATCHED_SLUGS - len(fresh)),
                     )
-                    watched_slugs = watched_slugs[-MAX_WATCHED_SLUGS:]
+                    watched_slugs = ordered[:MAX_WATCHED_SLUGS]
 
                 logger.info(f"Heartbeat | Polymarket sync. Tracked slugs ({len(watched_slugs)}): {watched_slugs}")
                 new_assets = []
@@ -548,8 +598,8 @@ async def poll_kalshi(producer: SentinelProducer):
                                     exp_dt = datetime.fromisoformat(exp_ts.replace('Z', '+00:00'))
                                     if exp_dt < datetime.now(timezone.utc):
                                         continue
-                                except Exception:
-                                    pass
+                                except Exception as _exc:
+                                    swallowed("collector_prediction.poll_kalshi", _exc, logger)
                             
                             if market.get("volume", 0) <= 0:
                                 continue

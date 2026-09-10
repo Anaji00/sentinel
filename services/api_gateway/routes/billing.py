@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from services.api_gateway.dependencies import get_db_optional
 from shared.utils import stripe_client
 from shared.utils.accounts import ACTIVE_STATUSES, Tier, account_from_row, normalize_email
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("api-gateway.billing")
 
@@ -189,8 +190,8 @@ async def _resolve_user_id(db, *, client_reference_id: Optional[str],
             row = await db.query_one("SELECT id FROM users WHERE id = $1", int(client_reference_id))
             if row:
                 return int(row["id"])
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as _exc:
+            swallowed("api_gateway.routes.billing._resolve_user_id", _exc, logger)
     if customer_id:
         row = await db.query_one("SELECT id FROM users WHERE stripe_customer_id = $1", customer_id)
         if row:

@@ -27,8 +27,14 @@ Fusion Math:
     Uses Jøsang's Subjective Logic (SL) instead of raw weighted averaging.
     Each agent's bulletin is mapped to an SL opinion (belief, disbelief,
     uncertainty, base_rate) with evidence counts derived from the agent's
-    consensus_weight. SL's Cumulative Fusion explicitly carries conflict
-    and uncertainty forward rather than averaging it away.
+    consensus_weight.
+
+    Averaging fusion, not cumulative -- this paragraph said cumulative long
+    after the code stopped using it. Cumulative fusion treats each opinion as
+    independent evidence, so fusing eight copies of one opinion returns near
+    certainty; these agents read overlapping topics and are not independent,
+    which is the case averaging fusion exists for. `cumulative_fuse` is kept
+    for opinions that genuinely are independent and is not on this path.
 
     When fused uncertainty exceeds a threshold, we emit an Analysis of
     Competing Hypotheses (ACH) report instead of forcing disagreement into
@@ -54,6 +60,7 @@ from pydantic import BaseModel, Field
 
 from .base import SentinelAgent, AgentBulletin, AgentScorecard
 from shared.kafka import Topics
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.consensus")
 
@@ -107,8 +114,8 @@ async def measured_base_rate(db_client, redis_client, direction: str = "any") ->
             cached = await raw_redis.hget(BASE_RATE_CACHE_KEY, cache_field)
             if cached:
                 return float(cached.decode() if isinstance(cached, bytes) else cached)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("agents.consensus_engine.measured_base_rate", _exc, logger)
 
     if not db_client:
         return DEFAULT_BASE_RATE
@@ -153,8 +160,8 @@ async def measured_base_rate(db_client, redis_client, direction: str = "any") ->
                 raw_redis = getattr(redis_client, "raw", redis_client)
                 await raw_redis.hset(BASE_RATE_CACHE_KEY, cache_field, rate)
                 await raw_redis.expire(BASE_RATE_CACHE_KEY, BASE_RATE_CACHE_TTL_SEC)
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.consensus_engine.measured_base_rate", _exc, logger)
 
         logger.info(
             "Base rate for %s claims measured at %.3f over %d resolved predictions.",
@@ -752,7 +759,10 @@ class ConsensusEngine(SentinelAgent):
             try:
                 from shared.kafka import Topics
                 await producer.send(
-                    "agents.consensus.reports",
+                    # The constant, not the string. A literal topic name is how
+                    # this platform previously ended up querying a topic that
+                    # did not exist while the real one accumulated unread.
+                    Topics.CONSENSUS_REPORTS,
                     report.model_dump(mode="json"),
                 )
             except Exception as e:
@@ -791,8 +801,8 @@ class ConsensusEngine(SentinelAgent):
                             try:
                                 raw = val if isinstance(val, str) else val.decode("utf-8")
                                 bulletins.append(AgentBulletin(**json.loads(raw)))
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                swallowed("agents.consensus_engine._read_all_bulletins", _exc, logger)
                 if cursor == 0:
                     break
         except Exception as e:
@@ -815,8 +825,8 @@ class ConsensusEngine(SentinelAgent):
                             try:
                                 raw = val if isinstance(val, str) else val.decode("utf-8")
                                 scorecards.append(AgentScorecard(**json.loads(raw)))
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                swallowed("agents.consensus_engine._read_all_scorecards", _exc, logger)
                 if cursor == 0:
                     break
         except Exception as e:
@@ -907,8 +917,8 @@ class ConsensusEngine(SentinelAgent):
                                 agent_name = key_str.split(":")[-1]
                                 digest = json.loads(val if isinstance(val, str) else val.decode("utf-8"))
                                 digests[agent_name] = digest
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                swallowed("agents.consensus_engine._detect_stale_agents", _exc, logger)
                 if cursor == 0:
                     break
 
@@ -926,8 +936,8 @@ class ConsensusEngine(SentinelAgent):
                         if age_seconds > 300:  # 5 minutes
                             stale.append(agent_name)
                             logger.info(f"🕐 Agent '{agent_name}' digest is {age_seconds:.0f}s stale — downweighting")
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        swallowed("agents.consensus_engine._detect_stale_agents", _exc, logger)
 
             # Cross-check: detect context drift by comparing entity and event ID overlap for agents sharing topics
             all_event_sets = {}

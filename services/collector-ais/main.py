@@ -52,6 +52,7 @@ from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 logger = setup_sentinel_logging("collector.ais", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -257,8 +258,8 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                             counter.note_position(
                                 float(meta.get("latitude")), float(meta.get("longitude"))
                             )
-                        except (TypeError, ValueError):
-                            pass
+                        except (TypeError, ValueError) as _exc:
+                            swallowed("collector_ais.collect", _exc)
                         occurred_at = _parse_aisstream_time(meta.get("time_utc", ""))
                         event = RawEvent(
                             source="aisstream",

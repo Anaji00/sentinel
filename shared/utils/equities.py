@@ -10,6 +10,7 @@ leveraged funds, synthetic option yield ETFs, volatility ETNs, and derivatives.
 
 import re
 from typing import Dict, Set, Tuple, Any, Optional
+from shared.utils.quiet_failures import swallowed
 
 # ── ALLOWED CRYPTO EXCEPTION ──────────────────────────────────────────────────
 ALLOWED_CRYPTO_TOKENS: Set[str] = {"BTC", "BTCUSDT", "BTCUSD"}
@@ -493,8 +494,8 @@ async def is_valid_primary_equity_async(ticker: str, redis_client=None) -> bool:
                     return False
                 if asset_type == "Common Stock":
                     return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.equities.is_valid_primary_equity_async", _exc)
 
     # Fallback: regex + blocklist classification
     if not is_valid_primary_equity(ticker):
@@ -506,8 +507,8 @@ async def is_valid_primary_equity_async(ticker: str, redis_client=None) -> bool:
             if exists:
                 is_valid = await redis_client.raw.sismember("sentinel:equities:valid_set", sym)
                 return bool(is_valid)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.equities.is_valid_primary_equity_async", _exc)
 
     return True
 

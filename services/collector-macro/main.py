@@ -45,6 +45,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 try:
     from economic_calendar import EconomicCalendarCollector
@@ -266,8 +267,8 @@ async def fetch_yfinance_single(ticker: str) -> dict:
                     "is_proxy": False,
                     "provider": f"yfinance ({ticker})"
                 }
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("collector_macro._sync_yf", _exc, logger)
         return {}
 
     try:

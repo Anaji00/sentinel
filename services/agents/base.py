@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import aiohttp
 from pydantic import BaseModel, Field, field_validator
 
+from shared.kafka import Topics
+from shared.utils.regime import current_regime as shared_current_regime
+from shared.utils.quiet_failures import swallowed, heartbeat_line as quiet_heartbeat_line
 from shared.utils.freshness import is_stale
 from shared.utils.live_feed import agent_narrative
 from shared.utils.inference_budget import (
@@ -702,11 +705,20 @@ class SentinelAgent(ABC):
                     if SentinelAgent._global_received_count >= 500:
                         logging.getLogger("agents.swarm").info(f"Swarm processed 500 messages across all agent services.")
                         SentinelAgent._global_received_count = 0
+                    # Each task carries the message it came from.
+                    #
+                    # tasks was a bare list appended to only on valid JSON, then
+                    # zipped against the full msg_list. A single poison pill
+                    # offset the two for the rest of the batch, so every
+                    # subsequent dispatch was accounted for against the wrong
+                    # message -- and _account_for writes that message to the
+                    # dead-letter queue on failure, so the DLQ recorded a
+                    # payload that had nothing to do with the error.
                     tasks = []
                     for msg in msg_list:
                         try:
                             payload = json.loads(msg.value.decode('utf-8'))
-                            tasks.append(safe_create_task(self._dispatch(payload)))
+                            tasks.append((safe_create_task(self._dispatch(payload)), msg))
                         except json.JSONDecodeError as e:
                             self.logger.error(f"POISON PILL dropped: {e}")
                             await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
@@ -725,7 +737,7 @@ class SentinelAgent(ABC):
                     topic_name = tp.topic if hasattr(tp, "topic") else (
                         self.input_topics[0] if self.input_topics else "unknown"
                     )
-                    for task, msg in zip(tasks, msg_list):
+                    for task, msg in tasks:
                         self._inflight.add(task)
                         task.add_done_callback(self._inflight.discard)
                         task.add_done_callback(
@@ -747,7 +759,16 @@ class SentinelAgent(ABC):
                 # and correlated upstream, so a crash mid-inference loses one
                 # opinion, which is what the budget sheds by design anyway.
                 try:
-                    await self._consumer.commit()
+                    # Scoped to the partitions this poll actually accepted, so
+                    # a partition whose dispatch loop raised is not committed
+                    # alongside the ones that succeeded.
+                    offsets = {
+                        tp: msgs[-1].offset + 1
+                        for tp, msgs in batches.items()
+                        if msgs
+                    }
+                    if offsets:
+                        await self._consumer.commit(offsets)
                 except Exception as commit_err:
                     self.logger.warning(f"Consumer commit skipped (partition rebalance/timeout): {commit_err}")
 
@@ -990,7 +1011,7 @@ class SentinelAgent(ABC):
 
     async def _send_dlq(self, raw: Dict, error: str, topic: str):
         try:
-            await self._dlq.send("dead.letter", {"error": error, "topic": topic, "raw": raw, "agent": self.name})
+            await self._dlq.send(Topics.DLQ, {"error": error, "topic": topic, "raw": raw, "agent": self.name})
         except Exception as e:
             self.logger.error(f"DLQ send failed: {e}")
 
@@ -1027,6 +1048,7 @@ class SentinelAgent(ABC):
             self.logger.info(
                 f"♥ {self.name} | processed={self._processed} errors={self._errors} "
                 f"rate={window_rate:.2f}/s (lifetime {lifetime_rate:.2f}/s){stall_note}"
+                f"{quiet_heartbeat_line()}"
             )
 
             last_processed = self._processed
@@ -1061,8 +1083,8 @@ class SentinelAgent(ABC):
                     }),
                     ex=120, 
                 )
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.base._heartbeat_loop", _exc)
 
             # Publish state digest for cross-agent context drift detection (§3.3)
             try:
@@ -1081,8 +1103,8 @@ class SentinelAgent(ABC):
                     json.dumps(digest),
                     ex=300,  # 5-minute TTL: if not refreshed, agent is stale
                 )
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.base._heartbeat_loop", _exc)
 
     def state_key(self, *parts: str) -> str:
         return f"sentinel:agents:{self.name}:{':'.join(parts)}"
@@ -1131,8 +1153,8 @@ class SentinelAgent(ABC):
                     mem = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
                     ts = str(mem.get('ts', ''))[:19]
                     context += f"• [{ts}] {mem.get('agent', 'UnknownAgent')}: {mem.get('text', '')}\n"
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("agents.base.read_agent_memories", _exc)
             return context
         except Exception as e:
             self.logger.warning(f"Failed to read agent memories: {e}")
@@ -1177,8 +1199,8 @@ class SentinelAgent(ABC):
                         agent_name = m.get('agent', 'Agent')
                         if text and agent_name != self.name:
                             mem_strs.append(f"[{agent_name}]: {text}")
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("agents.base.get_cross_agent_context", _exc)
                 if mem_strs:
                     lines.append("Cross-Agent Memories:\n- " + "\n- ".join(mem_strs[:limit]))
         except Exception as e:
@@ -1308,8 +1330,8 @@ class SentinelAgent(ABC):
                             try:
                                 raw = val if isinstance(val, str) else val.decode("utf-8")
                                 bulletins.append(AgentBulletin(**json.loads(raw)))
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                swallowed("agents.base.read_bulletins", _exc)
                 if cursor == 0:
                     break
 
@@ -1496,16 +1518,15 @@ class SentinelAgent(ABC):
         little about the same strategy under inversion, and Kelly sizing treats
         whatever it is handed as the true win probability.
         """
-        try:
-            raw = await self.redis.raw.get("sentinel:macro:rates_regime:latest")
-            if not raw:
-                return "unknown"
-            brief = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-            regime = brief.get("regime") or brief.get("rates_regime") or brief.get("state")
-            return str(regime).lower().strip().replace(" ", "_") if regime else "unknown"
-        except Exception as e:
-            self.logger.debug(f"Regime lookup failed: {e}")
-            return "unknown"
+        # One definition, in shared/utils/regime.py.
+        #
+        # This read `regime`, `rates_regime` or `state` out of the cached brief.
+        # RatesRegimeBrief defines none of the three, so every call returned
+        # "unknown" and the partitioning this docstring describes has never
+        # happened -- a reader and a writer built against different schemas,
+        # the same defect as the telemetry worker reading five keys the
+        # wargamer never sent.
+        return await shared_current_regime(self.redis)
 
     def _scorecard_key(self, strategy: Optional[str] = None, regime: Optional[str] = None) -> str:
         """Redis key for a scorecard partition.
@@ -1815,8 +1836,8 @@ class SentinelAgent(ABC):
                         try:
                             _entry = json.loads(text)
                             text = f"[{_entry.get('agent', '?')}] {_entry.get('text', '')}"
-                        except (ValueError, TypeError):
-                            pass
+                        except (ValueError, TypeError) as _exc:
+                            swallowed("agents.base.fetch_global_context", _exc)
                         context += f"- {text}\n"
             except Exception as mx:
                 self.logger.debug(f"Shared memory miss in global context: {mx}")
@@ -1966,8 +1987,8 @@ class SentinelAgent(ABC):
                         return float(quote[field])
         except _QuoteCacheMiss:
             pass
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("agents.base._latest_price", _exc)
 
         # The cache is not a price history.
         #
@@ -1998,8 +2019,8 @@ class SentinelAgent(ABC):
                 close = json.loads(text).get("close")
                 if close is not None:
                     return float(close)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("agents.base._durable_price", _exc)
 
         # Equities: the most recent bar this platform recorded.
         try:
@@ -2395,7 +2416,7 @@ class SentinelAgent(ABC):
             await self._producer.start()
 
         await self._producer.send(
-            "agents.telemetry", 
+            Topics.TELEMETRY, 
             {
                 "agent": self.name, 
                 "status": "THINKING", 
@@ -2438,7 +2459,7 @@ class SentinelAgent(ABC):
                 )
             except Exception as retry_err:
                 await self._producer.send(
-                    "agents.telemetry",
+                    Topics.TELEMETRY,
                     {
                         "agent": self.name,
                         "status": "FAILED",
@@ -2450,7 +2471,7 @@ class SentinelAgent(ABC):
                 raise
         except Exception as err:
             await self._producer.send(
-                "agents.telemetry",
+                Topics.TELEMETRY,
                 {
                     "agent": self.name,
                     "status": "FAILED",
@@ -2490,7 +2511,7 @@ class SentinelAgent(ABC):
         self.logger.info(f"✅ [{self.name}] Inference completed ({elapsed_ms}ms) | Output: {preview_text}")
 
         await self._producer.send(
-            "agents.telemetry", 
+            Topics.TELEMETRY, 
             {
                 "agent": self.name, 
                 "status": "COMPLETE",
@@ -2566,15 +2587,15 @@ class SentinelAgent(ABC):
         if hasattr(self, "_consumer") and self._consumer:
             try:
                 await self._consumer.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.base.close", _exc)
         if hasattr(self, "_producer") and self._producer:
             try:
                 await self._producer.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.base.close", _exc)
         if hasattr(self, "_dlq") and self._dlq:
             try:
                 await self._dlq.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.base.close", _exc)

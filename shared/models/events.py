@@ -1065,49 +1065,175 @@ POSITION_TELEMETRY_TYPES = frozenset({
 # maritime term and flight_dark is aviation, so a maritime-first keyword pass
 # assigns every dark-aircraft event to the wrong domain. The prefix is
 # unambiguous where it exists.
-_DOMAIN_PREFIX = {
-    "vessel": "maritime", "ais": "maritime", "mmsi": "maritime", "port": "maritime",
-    "flight": "aviation", "aircraft": "aviation", "adsb": "aviation", "icao": "aviation",
-    "crypto": "crypto", "token": "crypto", "wallet": "crypto",
-    "bgp": "cyber", "cyber": "cyber", "breach": "cyber", "ransomware": "cyber",
-    "malware": "cyber", "infra": "cyber", "cve": "cyber", "dns": "cyber",
-    "macro": "macro", "prediction": "prediction", "betting": "prediction",
-    "news": "news", "headline": "news", "social": "news", "narrative": "news",
-    "options": "tradfi", "equity": "tradfi", "dark": "tradfi", "insider": "tradfi",
-    "earnings": "tradfi", "price": "tradfi", "market": "tradfi", "thirteen": "tradfi",
-    "filing": "tradfi", "futures": "tradfi",
-}
 
-_DOMAIN_KEYWORDS = (
-    ("maritime",   ("vessel", "mmsi", "ais", "sts", "port", "strait")),
-    ("aviation",   ("flight", "icao", "adsb", "aircraft", "squawk")),
-    ("cyber",      ("bgp", "cyber", "dns", "ddos", "hijack", "breach", "ransomware",
-                    "malware", "infra", "cve", "exploit")),
-    ("crypto",     ("crypto", "token", "liquidation", "wallet", "chain", "perp")),
-    ("macro",      ("macro", "cpi", "gdp", "fed", "treasury", "yield", "rates")),
-    ("prediction", ("prediction", "polymarket", "kalshi", "betting")),
-    ("news",       ("news", "headline", "narrative", "social", "sentiment")),
-    ("tradfi",     ("equity", "stock", "option", "tradfi", "financial", "market",
-                    "price", "dark_pool", "insider", "earnings", "filing", "thirteen")),
+
+
+class Domain(str, Enum):
+    """The eight domains this platform reasons across, plus one honest escape.
+
+    OTHER is not a ninth domain of the world. It is for event types that are
+    not observations about anything external -- the platform reporting on its
+    own health, or a caller-defined custom type -- and it is deliberately
+    excluded from cross-domain excitation, because feeding "our AIS collector
+    went quiet" into a contagion matrix as though it were a maritime event
+    would have the model learn that the platform's own outages cause markets to
+    move.
+    """
+    MARITIME = "maritime"
+    AVIATION = "aviation"
+    TRADFI = "tradfi"
+    CRYPTO = "crypto"
+    MACRO = "macro"
+    CYBER = "cyber"
+    NEWS = "news"
+    PREDICTION = "prediction"
+    OTHER = "other"
+
+
+# Domains that participate in cross-domain excitation and correlation breadth.
+CROSS_DOMAIN_MEMBERS = tuple(d.value for d in Domain if d is not Domain.OTHER)
+
+
+# One table, checked exhaustively by a test.
+#
+# This replaces four uncoordinated derivations that disagreed with each other:
+# `event.type.value.split("_")[0]` in the correlation engine, an ordered
+# substring scan in the anomaly scorer, `source.split("_")[0]`, and a keyword
+# fallback here. The split-based one produced a pseudo-domain per event-type
+# prefix -- 29 of them against 8 real domains -- so the Hawkes tracker recorded
+# "vessel", "flight", "crypto", "market" and so on as separate domains and five
+# of the eight canonical ones never accumulated any history at all.
+#
+# The substring scan was worse because it was ordered and the tests were not
+# mutually exclusive. Measured against the live enum before this change:
+#
+#   dark_pool     -> maritime   (matched "dark" before any tradfi keyword)
+#   flight_dark   -> maritime   (same, so aviation never saw its own events)
+#   market_candle -> crypto     (matched "candle")
+#   ransomware    -> tradfi     (matched nothing, fell through to the default)
+#   data_breach   -> tradfi     (same)
+#   freight_rate  -> macro      (matched "rate")
+#
+# A lookup cannot drift like that, and the exhaustiveness test means a new
+# EventType fails the build rather than silently landing in the default.
+EVENT_TYPE_TO_DOMAIN: Dict["EventType", Domain] = {}
+
+
+def _build_domain_map() -> None:
+    """Populate EVENT_TYPE_TO_DOMAIN once, by name, at import."""
+    by_name = {
+        # Maritime
+        "VESSEL_POSITION": Domain.MARITIME, "VESSEL_DARK": Domain.MARITIME,
+        "VESSEL_STATIC": Domain.MARITIME, "VESSEL_STS": Domain.MARITIME,
+        "VESSEL_SPOOF": Domain.MARITIME,
+        # Aviation
+        "FLIGHT_POSITION": Domain.AVIATION, "FLIGHT_DARK": Domain.AVIATION,
+        "FLIGHT_ANOMALY": Domain.AVIATION,
+        # Traditional finance
+        "EQUITY_BLOCK": Domain.TRADFI, "DARK_POOL": Domain.TRADFI,
+        "OPTIONS_FLOW": Domain.TRADFI, "MARKET_ANOMALY": Domain.TRADFI,
+        "MARKET_CANDLE": Domain.TRADFI, "PRICE_ANOMALY": Domain.TRADFI,
+        "INSIDER_TRADE": Domain.TRADFI, "INSIDER_CLUSTER": Domain.TRADFI,
+        "EARNINGS_REPORT": Domain.TRADFI, "EARNINGS_SURPRISE": Domain.TRADFI,
+        "FILING": Domain.TRADFI, "THIRTEEN_F": Domain.TRADFI,
+        "FUTURES_COT": Domain.TRADFI, "REGULATORY_EVENT": Domain.TRADFI,
+        # Crypto
+        "CRYPTO_TRADE": Domain.CRYPTO, "CRYPTO_TRANSFER": Domain.CRYPTO,
+        "CRYPTO_LIQUIDATION": Domain.CRYPTO, "CRYPTO_PERP_FUNDING": Domain.CRYPTO,
+        # Macro
+        "MACRO_RELEASE": Domain.MACRO, "SUPPLY_CHAIN_METRIC": Domain.MACRO,
+        "CLIMATE_STRESS": Domain.MACRO,
+        # Cyber
+        "BGP_ANOMALY": Domain.CYBER, "RANSOMWARE": Domain.CYBER,
+        "BREACH_DETECTED": Domain.CYBER, "VULNERABILITY": Domain.CYBER,
+        "INFRA_EXPOSED": Domain.CYBER, "INFRASTRUCTURE": Domain.CYBER,
+        # News
+        "HEADLINE": Domain.NEWS, "NARRATIVE_CLUSTER": Domain.NEWS,
+        "SOCIAL_SIGNAL": Domain.NEWS,
+        # Prediction markets
+        "PREDICTION_MARKET": Domain.PREDICTION,
+        "PREDICTION_MARKET_TRADE": Domain.PREDICTION,
+        "SPORTS_LINE_MOVEMENT": Domain.PREDICTION,
+        # Not observations about the world.
+        "INFRASTRUCTURE_DEGRADED": Domain.OTHER,   # our own collector went quiet
+        "CUSTOM": Domain.OTHER,
+    }
+    for member in EventType:
+        if member.name in by_name:
+            EVENT_TYPE_TO_DOMAIN[member] = by_name[member.name]
+
+
+_build_domain_map()
+
+
+# Event types genuinely produced by more than one domain.
+#
+# Found by asking which enricher emits which type rather than by inspection:
+# MARKET_ANOMALY is the only one, and both the crypto candle path and the
+# equity candle path emit it. A type-level table therefore cannot classify it --
+# mapping it to tradfi files every crypto candle under tradfi, and mapping it to
+# crypto does the reverse. It needs the event, not the type.
+#
+# MARKET_CANDLE is not in this set because nothing emits it: it is declared,
+# named once in a list, and produced by no enricher. Both candle paths emit
+# MARKET_ANOMALY instead.
+AMBIGUOUS_EVENT_TYPES = frozenset({EventType.MARKET_ANOMALY})
+
+
+# Which populated payload implies which domain.
+#
+# Ordered, because an event may legitimately carry more than one -- an equity
+# with a crypto-denominated leg, say -- and the first match is the subject the
+# event is primarily about. Crypto leads for exactly the candle case this
+# exists for: the crypto enricher populates crypto_data and nothing else.
+_PAYLOAD_DOMAIN = (
+    ("crypto_data", Domain.CRYPTO),
+    ("vessel_data", Domain.MARITIME),
+    ("flight_data", Domain.AVIATION),
+    ("cyber_data", Domain.CYBER),
+    ("security_data", Domain.CYBER),
+    ("prediction_market_data", Domain.PREDICTION),
+    ("supply_chain_data", Domain.MACRO),
+    ("filing_data", Domain.TRADFI),
+    ("financial_data", Domain.TRADFI),
 )
 
 
-def event_domain(event_type) -> str:
-    """The domain an event type belongs to, by the platform's own vocabulary.
+def resolve_event_domain(event) -> str:
+    """The domain of a whole event, using its payload where the type is ambiguous.
 
-    Falls back to tradfi, which is where the scorer's equivalent lands too: the
-    financial path is the busiest and the least harmful default.
+    Prefer this over `event_domain()` wherever the event itself is in hand. The
+    type-level table is right for 42 of the 43 event types and cannot be right
+    for the forty-third, because two different domains legitimately emit it.
+
+    Falls back to the type-level answer when the payload says nothing, so an
+    event carrying no domain block behaves exactly as it did before.
     """
-    evt = str(getattr(event_type, "value", event_type) or "").lower()
-    if not evt:
-        return "unknown"
+    if event is None:
+        return Domain.OTHER.value
 
-    # The leading token settles it wherever it is known.
-    head = evt.split("_")[0]
-    if head in _DOMAIN_PREFIX:
-        return _DOMAIN_PREFIX[head]
+    etype = getattr(event, "type", None)
+    if etype in AMBIGUOUS_EVENT_TYPES:
+        for attr, domain in _PAYLOAD_DOMAIN:
+            if getattr(event, attr, None) is not None:
+                return domain.value
+    return event_domain(etype)
 
-    for domain, keywords in _DOMAIN_KEYWORDS:
-        if any(k in evt for k in keywords):
-            return domain
-    return "tradfi"
+
+def event_domain(event_type) -> str:
+    """The canonical domain for an event type.
+
+    A lookup, not a derivation. Unknown or unmapped types return OTHER rather
+    than the busiest domain: defaulting an unrecognised type into tradfi is how
+    ransomware disclosures came to be counted as financial events.
+    """
+    if isinstance(event_type, EventType):
+        return EVENT_TYPE_TO_DOMAIN.get(event_type, Domain.OTHER).value
+
+    raw = str(getattr(event_type, "value", event_type) or "").strip().lower()
+    if not raw:
+        return Domain.OTHER.value
+    try:
+        return EVENT_TYPE_TO_DOMAIN.get(EventType(raw), Domain.OTHER).value
+    except ValueError:
+        return Domain.OTHER.value

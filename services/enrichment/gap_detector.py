@@ -21,6 +21,7 @@ from typing import Optional, List
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
 from shared.utils.heartbeat import is_component_healthy
+from shared.utils.quiet_failures import swallowed
  
 logger = logging.getLogger("enrichment.gap_detector")
  
@@ -166,15 +167,15 @@ class VesselGapDetector:
                     # Ship is active. Remove from seen_gaps if it was previously dark.
                     try:
                         await self.redis.raw.hdel(self._seen_key, dedup_key)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("enrichment.gap_detector._process_batch", _exc, logger)
                     continue
                     
                 try:
                     if await self.redis.raw.hexists(self._seen_key, dedup_key):
                         continue  # Ship is STILL dark; not a new alert.
-                except Exception:
-                    pass  # A store failure must not suppress a real alert.
+                except Exception as _exc:
+                    swallowed("enrichment.gap_detector._process_batch", _exc, logger)
 
                 # Marked where the event is emitted, not here. Marking before
                 # the decision suppresses alerts that were never raised.

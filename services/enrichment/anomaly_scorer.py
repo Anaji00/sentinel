@@ -6,6 +6,7 @@ import time
 import numpy as np
 import logging
 from shared.utils.metrics import MetricsCollector
+from shared.models.events import event_domain as canonical_domain
 from shared.utils import quant_calc
 from shared.utils.streaming_detectors import (
     FALLBACK_MAX_SCORE,
@@ -21,6 +22,7 @@ from shared.utils.model_registry import (
 )
 
 from typing import Optional, List, Dict, Any, Tuple
+from shared.utils.quiet_failures import swallowed
 
 # The maritime gap distribution, mirroring the aviation detector's.
 #
@@ -420,25 +422,19 @@ class DynamicAnomalyScorer:
         return detector
 
     def _get_domain(self, event_type: str) -> str:
-        """Map event type to explicit per-domain model key (§1.1)."""
-        evt = (event_type or "").lower()
-        if any(k in evt for k in ["vessel", "mmsi", "ais", "dark", "sts"]):
-            return "maritime"
-        elif any(k in evt for k in ["flight", "icao", "adsb", "aircraft"]):
-            return "aviation"
-        elif any(k in evt for k in ["equity", "stock", "option", "tradfi", "financial"]):
-            return "tradfi"
-        elif any(k in evt for k in ["crypto", "token", "liquidation", "candle"]):
-            return "crypto"
-        elif any(k in evt for k in ["macro", "cpi", "gdp", "rate", "fed"]):
-            return "macro"
-        elif any(k in evt for k in ["bgp", "cyber", "dns", "ddos", "hijack"]):
-            return "cyber"
-        elif any(k in evt for k in ["news", "headline", "narrative"]):
-            return "news"
-        elif any(k in evt for k in ["prediction", "polymarket", "kalshi"]):
-            return "prediction"
-        return "tradfi"
+        """Canonical domain for an event type.
+
+        This was an ordered substring scan whose tests were not mutually
+        exclusive, so the first matching keyword won regardless of what the
+        event actually was. Measured against the live enum: `dark_pool` and
+        `flight_dark` both matched "dark" and became maritime, `market_candle`
+        matched "candle" and became crypto, and every cyber event fell through
+        to a `return "tradfi"` default. Five of the eight domains were being
+        fed events belonging to other domains, and the per-domain calibrators,
+        detectors and thresholds keyed on this were calibrating on the wrong
+        populations.
+        """
+        return canonical_domain(event_type)
 
 
 
@@ -565,7 +561,14 @@ class DynamicAnomalyScorer:
             # every hour for the life of the deployment, reporting an absence
             # as a finding.
             await self._record_score_sample(scores)
-            return [{"score": round(s, 4), "is_significant": sig, "domain": domain}
+            # Coverage travels with the score. A 0.4 from the detector's
+            # warm-up curve and a 0.4 from its percentile over a full window are
+            # the same number and not the same claim; nothing downstream could
+            # tell them apart, so a cold detector's opinion ranked beside a warm
+            # one's.
+            _cov = detector.coverage()
+            return [{"score": round(s, 4), "is_significant": sig, "domain": domain,
+                     "coverage": _cov}
                     for s, sig in zip(scores, is_significant_list)]
                 
         except Exception as e:
@@ -655,6 +658,14 @@ class DynamicAnomalyScorer:
             final.append({
                 "score": round(score, 4),
                 "is_significant": sig,
+                # What backed this score, alongside it.
+                #
+                # A 0.4 from the detector's warm-up curve and a 0.4 from its
+                # percentile over a full window are the same number and not the
+                # same claim, and until now nothing downstream could tell them
+                # apart -- so a cold detector's opinion ranked beside a warm
+                # one's, and an inference slot could be spent on the weaker.
+                "coverage": detector.coverage(),
                 "domain": "spatial",
                 "residual_distance": residuals["residual_distance"],
                 "residual_speed": residuals["residual_speed"],
@@ -694,8 +705,8 @@ class DynamicAnomalyScorer:
         try:
             cfg = await self._get_thresholds_config("news")
             config.update(cfg)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.anomaly_scorer.score_news_novelty", _exc, logger)
 
         # Primary signal: First Story Detection novelty
         loop = asyncio.get_running_loop()
@@ -1054,8 +1065,8 @@ class DynamicAnomalyScorer:
         try:
             cfg = await self._get_thresholds_config("prediction_trade")
             config.update(cfg)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.anomaly_scorer.score_prediction_anomaly", _exc, logger)
 
         # Multi-dimensional feature vector: [normalized_notional, abs(delta_p)*10, yes_val/1000, no_val/1000, 0]
         feat = [
@@ -1076,8 +1087,8 @@ class DynamicAnomalyScorer:
                 z_vol = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "volume", notional)
             if abs(delta_p) > 0:
                 z_prob = await self._dynamic_normalize(f"prediction:{asset_id.lower()}", "prob_shift", abs(delta_p))
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.anomaly_scorer.score_prediction_anomaly", _exc, logger)
 
         # Purely dynamic combined score based on RRCF and max Z-score significance
         max_z = max(z_vol, z_prob)
@@ -1224,8 +1235,8 @@ class DynamicAnomalyScorer:
         try:
             cfg = await self._get_thresholds_config("news")
             config.update(cfg)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.anomaly_scorer.score_news", _exc, logger)
             
         semantic_boost = 0.0
         semantic_tags = []

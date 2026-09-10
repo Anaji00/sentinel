@@ -24,8 +24,14 @@ from services.agents.base import SentinelAgent, SchemaViolationError, InferenceE
 from shared.utils.equities import split_macro_and_equities
 from shared.kafka import Topics
 from shared.models import NormalizedEvent
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.stock_correlation")
+
+# Keys per SCAN round trip, and the ceiling on how many quote keys one
+# correlation pass will consider.
+SCAN_BATCH = 500
+MAX_QUOTE_KEYS = 2000
 
 
 # The price was arriving inside the identifier.
@@ -193,7 +199,24 @@ class StockCorrelationAgent(SentinelAgent):
 
         # Fetch recent live quotes from Redis for dynamic cross-asset returns calculation
         try:
-            quote_keys = await self.redis.raw.keys("sentinel:quotes:latest:*")
+            # SCAN, not KEYS.
+            #
+            # KEYS walks the entire keyspace in one blocking pass, and Redis is
+            # single threaded -- so on an instance holding ~144,000 keys this
+            # stalled every other client for the duration, during ingestion, on
+            # an agent loop that runs continuously. scan_iter does the same work
+            # in bounded increments the server can interleave.
+            #
+            # Bounded as well as incremental: an unbounded scan feeding an MGET
+            # would fetch every quote on the platform to compute a correlation
+            # over a handful of them.
+            quote_keys = []
+            async for k in self.redis.raw.scan_iter(
+                match="sentinel:quotes:latest:*", count=SCAN_BATCH
+            ):
+                quote_keys.append(k)
+                if len(quote_keys) >= MAX_QUOTE_KEYS:
+                    break
             if not quote_keys or len(quote_keys) < 2:
                 return None
 
@@ -208,8 +231,8 @@ class StockCorrelationAgent(SentinelAgent):
                 if q_val:
                     try:
                         price_map[t_name] = float(q_val)
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        swallowed("agents.stock_correlation_agent.handle_message", _exc, logger)
 
             # Identify macro/commodity assets vs equities.
             #

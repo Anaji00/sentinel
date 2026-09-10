@@ -11,12 +11,34 @@ Delegates statistical Z-score and RRCF anomaly scoring to AnomalyScorer.
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, PredictionMarketData
 
+from shared.utils.quiet_failures import swallowed, dropped
 logger = logging.getLogger("enrichment.prediction")
+
+# Kept deliberately narrow: this decides only whether a slug is worth polling
+# again, never whether an event is worth enriching. An off-domain market that
+# has already arrived is still scored and stored -- it simply stops buying a
+# subscription slot on the next sweep.
+_OFF_DOMAIN_SLUG = re.compile(
+    r"^(?:lol|cs2|mlb|nfl|nba|nhl|epl|uwcl|lec|cfb|val|itf|scoc|crickcl|aut|per\d|el\d|tur\d|"
+    r"jap|egy|qat|por|cze|lal|sec|mgc|big\d)-"
+    r"|rushing-yards|halftime|moneyline|first-half|-nrfi|exact-score"
+    r"|highest-temperature|will-it-rain|where-will-it-rain",
+    re.I,
+)
+
+
+def _slug_is_worth_watching(slug: str) -> bool:
+    """False for the sports, esports and weather questions that flooded the set."""
+    if not slug or not isinstance(slug, str):
+        return False
+    return not _OFF_DOMAIN_SLUG.search(slug)
+
 
 # Exact vocabulary for a two-sided market. "outcome 0"/"outcome 1" are kept only
 # because events collected before the collector read the right field carry those
@@ -47,7 +69,8 @@ class PredictionEnricher:
             return await self._enrich_polymarket(raw, p)
         elif source == "kalshi":
             return await self._enrich_kalshi(raw, p)
-        
+
+        dropped("enrichment.prediction.unrouted_source", f"no branch for source={source!r}", logger)
         return None
 
     async def _enrich_polymarket(self, raw, p) -> Optional[NormalizedEvent]:
@@ -111,8 +134,8 @@ class PredictionEnricher:
                     json.dumps(outcome_prices),
                     ex=7 * 86400,
                 )
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.prediction._enrich_polymarket", _exc, logger)
 
         # Identify YES vs NO side bid/trade value.
         #
@@ -196,10 +219,19 @@ class PredictionEnricher:
             tags.append("odds_update")
             headline = f"🎯 POLYMARKET ODDS: {display_contract}{rank_note} ({choice_name or outcome} @ {(price*100):.1f}%)"
 
-        try:
-            await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
-        except Exception:
-            pass
+        # Only a slug worth polling again goes back into the watch set.
+        #
+        # This added every slug it enriched, unconditionally -- so the
+        # collector's relevance filter was defeated from a different service.
+        # The collector kept 11 of 100 on each sweep and this put the other 89
+        # straight back, which is how a watch list of 609 came to be 82%
+        # off-domain. A filter enforced in one service and not the other is not
+        # enforced.
+        if _slug_is_worth_watching(slug):
+            try:
+                await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
+            except Exception as _exc:
+                swallowed("enrichment.enrichers.prediction._enrich_polymarket", _exc, logger)
 
         entity_name = display_contract if display_contract != "UNKNOWN QUESTION" else slug
         entity = Entity(id=slug, type=EntityType.PREDICTION_MARKET, name=entity_name)
@@ -310,8 +342,8 @@ class PredictionEnricher:
 
         try:
             await self.redis.raw.sadd("sentinel:kalshi:watched_tickers", ticker)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.prediction._enrich_kalshi", _exc, logger)
 
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,

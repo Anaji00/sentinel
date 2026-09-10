@@ -4,6 +4,7 @@ import math
 import os
 from typing import List, Tuple, Dict, Any
 from datetime import datetime, timezone
+from shared.utils.quiet_failures import swallowed
 
 # Closes required before RSI is computed at all.
 #
@@ -301,8 +302,8 @@ async def evaluate_multi_timeframe(
                 is_watched = await scorer.check_watchlist(asset, "equities")
                 if is_watched:
                     anomaly = min(1.0, anomaly + 0.15)
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("utils.candles.evaluate_multi_timeframe", _exc, logger)
             
         domain_tag = get_domain_tag(domain, asset)
 

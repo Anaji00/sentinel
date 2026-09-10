@@ -20,8 +20,12 @@ from shared.utils.logging import setup_sentinel_logging
 
 logger = setup_sentinel_logging("enrichment", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
+from shared.utils.quiet_failures import swallowed, heartbeat_line as quiet_heartbeat_line
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent, CrossDomainSignal
+from shared.models.events import event_domain as canonical_domain
+from shared.models.events import resolve_event_domain
+from shared.utils.metrics import MetricsCollector
 from shared.db import get_redis, get_timescale, get_neo4j
 from shared.db.bootstrap import bootstrap_database
 from shared.utils.heartbeat import start_heartbeat_task
@@ -70,7 +74,14 @@ async def _attach_cross_domain_signals(events: list, redis_client):
                 sig_data = json.dumps({
                     "event_id": str(evt.event_id),
                     "event_type": str(evt.type.value if hasattr(evt.type, "value") else evt.type),
-                    "domain": evt.source.split("_")[0] if "_" in evt.source else evt.source,
+                    # The event's domain, not its collector's name.
+                    #
+                    # This was `evt.source.split("_")[0]`, which yields "alpaca",
+                    # "ripe", "finnhub" -- the ingesting collector, not any
+                    # domain the platform reasons about. The cross-domain check
+                    # below then compared two collector prefixes and called the
+                    # result a domain boundary.
+                    "domain": resolve_event_domain(evt),
                     "entity_id": entity_id or "unknown",
                     "entity_name": evt.primary_entity.name if evt.primary_entity else None,
                     "headline": evt.headline,
@@ -115,15 +126,15 @@ async def _attach_cross_domain_signals(events: list, redis_client):
                 raw_signals = results[res_idx] if res_idx < len(results) else []
                 res_idx += 1
                 if raw_signals:
-                    current_domain = evt.source.split("_")[0] if "_" in evt.source else evt.source
+                    current_domain = resolve_event_domain(evt)
                     cross_signals = []
                     for item in raw_signals:
                         try:
                             s = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
                             if s.get("domain") != current_domain and s.get("event_id") != str(evt.event_id):
                                 cross_signals.append(CrossDomainSignal(**s))
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            swallowed("enrichment._attach_cross_domain_signals", _exc)
                     evt.cross_domain_signals = cross_signals[:3]
     except Exception as e:
         logger.debug(f"Cross-domain signal attachment warning: {e}")
@@ -228,7 +239,7 @@ async def _heartbeat_loop(state: dict):
         logger.info(
             f"⏱ HEARTBEAT | processed={state['processed']} "
             f"errors={state['errors']} rate={rate:.1f}/s "
-            f"uptime={int(elapsed)}s"
+            f"uptime={int(elapsed)}s{quiet_heartbeat_line()}"
         )
 
 # Which index the volatility regime is measured from, in preference order.
@@ -351,6 +362,111 @@ SCORE_DIVERSITY_MIN_RATIO = 0.02
 # the correct answer every time.
 SCORE_DIVERSITY_EXEMPT = {"vessel_static"}
 
+# How many multiples of its own mean interarrival a detector may be silent
+# before it is worth saying so.
+#
+# Learned per detector rather than set globally, for the reason source
+# freshness already learns it per feed: an hourly poller quiet for 55 minutes
+# is normal and a tick feed quiet for the same 55 minutes is dead, and one
+# threshold cannot express both. Measured across this deployment's types, the
+# ordinary spread is 0.4x to 4x; 8x is comfortably outside it.
+DETECTOR_SILENCE_MULTIPLE = float(os.getenv("DETECTOR_SILENCE_MULTIPLE", "8"))
+
+# Below this rate over the baseline window there is no cadence to be late
+# against, and the arithmetic would be noise.
+DETECTOR_SILENCE_MIN_RATE_PER_HOUR = 0.5
+
+# A detector silent for less than this is never reported, whatever the multiple.
+#
+# The multiple alone is wrong at high rates. flight_position runs at 892/hour,
+# so its mean gap is four seconds and an ordinary four-minute pause -- a poll
+# cycle, a batch -- is fifty-nine times its cadence. Reporting that is how a
+# monitor becomes noise. Both conditions have to hold: unusual for this
+# detector, and long enough in absolute terms to be worth a human's attention.
+DETECTOR_SILENCE_MIN_MINUTES = 15.0
+
+# Detectors whose silence is a fact about the world rather than the pipeline.
+# Equities do not trade overnight, and reporting the closing bell as a fault
+# every night is how a monitor teaches its reader to skip it.
+DETECTOR_SILENCE_MARKET_HOURS_TYPES = {
+    "equity_block", "options_flow", "earnings_report", "earnings_surprise",
+    "market_anomaly", "insider_trade", "filing", "thirteen_f",
+}
+
+
+async def _report_silent_detectors(timescale) -> None:
+    """Names detectors silent well beyond their own cadence.
+
+    Deliberately reports rather than diagnoses, for the same reason the
+    diversity check does: the causes share nothing -- an upstream feed, a
+    filter that now rejects everything, a parser raising into a handler, a
+    market that closed -- so a guess would be wrong most of the time and would
+    be read as an answer.
+    """
+    rows = await timescale.query(
+        """
+        SELECT type,
+               COUNT(*)::float / 168.0 AS per_hour,
+               EXTRACT(EPOCH FROM (NOW() - MAX(occurred_at))) / 60.0 AS minutes_silent
+        FROM events
+        WHERE occurred_at > NOW() - INTERVAL '7 days'
+        GROUP BY type
+        """
+    )
+    if not rows:
+        return
+
+    # `current_session`, because `is_market_open` does not exist.
+    #
+    # The first version of this imported that name and let a broad `except`
+    # default to "open" -- so the import would have failed on every call, the
+    # exemption below would never have applied, and every equity detector would
+    # have been reported silent all night. An import error swallowed into a
+    # plausible default is the shape this audit keeps finding; it is only not
+    # in the catalogue because it was caught before it ran.
+    market_open = True
+    try:
+        from shared.utils.market_session import Session, current_session
+
+        market_open = current_session() in (
+            Session.PRE_MARKET, Session.REGULAR, Session.AFTER_HOURS, Session.ALWAYS_OPEN
+        )
+    except Exception as e:
+        # Unknown session: assume open, so a tradfi detector that has genuinely
+        # died is still reported rather than excused by a failed lookup.
+        swallowed("enrichment.detector_silence.session_lookup", e, logger)
+        market_open = True
+
+    late = []
+    for r in rows:
+        etype = str(r.get("type") or "")
+        rate = float(r.get("per_hour") or 0.0)
+        silent_min = float(r.get("minutes_silent") or 0.0)
+        if rate < DETECTOR_SILENCE_MIN_RATE_PER_HOUR:
+            continue
+        if not market_open and etype in DETECTOR_SILENCE_MARKET_HOURS_TYPES:
+            continue
+        if silent_min < DETECTOR_SILENCE_MIN_MINUTES:
+            continue
+        expected_gap_min = 60.0 / rate
+        multiple = silent_min / expected_gap_min
+        if multiple >= DETECTOR_SILENCE_MULTIPLE:
+            late.append((etype, rate, silent_min, multiple))
+
+    for etype, rate, silent_min, multiple in sorted(late, key=lambda x: -x[3]):
+        logger.warning(
+            "Detector %s has been silent %.0f minutes against its own %.2f/hour "
+            "cadence -- %.1fx the gap it usually leaves. A detector that stops "
+            "firing looks exactly like a quiet world; this is the platform "
+            "saying which one it cannot tell apart.",
+            etype, silent_min, rate, multiple,
+        )
+    if not late:
+        logger.info(
+            "Detector cadence: %s type(s) checked, none silent beyond %.0fx its own rate.",
+            len(rows), DETECTOR_SILENCE_MULTIPLE,
+        )
+
 
 async def _score_diversity_loop(timescale) -> None:
     """Reports detectors whose anomaly score has stopped varying."""
@@ -406,6 +522,21 @@ async def _score_diversity_loop(timescale) -> None:
                     "Score diversity: %s detector(s) checked, none flat.",
                     len(rows or []),
                 )
+
+            # A detector that has stopped firing is absent, not flat.
+            #
+            # The query above is `GROUP BY type ... HAVING COUNT(*) >= N` over
+            # the window, so a detector emitting nothing produces no row at all
+            # -- it is not among the "N detectors checked, none flat", it is
+            # simply not there. The component built to notice a detector going
+            # wrong could not notice the one failure mode that produces no
+            # output, which is the cheapest failure mode there is.
+            #
+            # Measured when this was added: `prediction_market_trade` had run
+            # at 1.45/hour for a week and been silent for nine hours -- thirteen
+            # times its own mean interarrival -- and every sweep had reported
+            # all clear.
+            await _report_silent_detectors(timescale)
         except Exception as e:
             logger.error(f"Score diversity check failed: {e}")
         await asyncio.sleep(SCORE_DIVERSITY_INTERVAL_SEC)
@@ -484,8 +615,19 @@ async def main():
     
     # Wait for databases to come online
     producer = SentinelProducer()
-    dlq = SentinelProducer()
+    dlq = SentinelProducer(service_name="enrichment-dlq")
     await producer.start()
+    # Started, like every other producer.
+    #
+    # This was constructed and never started, and SentinelProducer.send raises
+    # RuntimeError("Cannot send: SentinelProducer is not started.") when it is
+    # not -- so every dead-letter write in this service raised. The failures
+    # were collected into pending_dlq_tasks and gathered with
+    # return_exceptions=True, which turned each RuntimeError into a value
+    # nobody inspected: a malformed event was dropped, the DLQ recorded
+    # nothing, and the batch reported success. The shutdown path already called
+    # dlq.close(), which is what made the omission look deliberate.
+    await dlq.start()
     neo4j = await get_neo4j()
     scorer = DynamicAnomalyScorer(redis, neo4j_client=neo4j)
     db = DBWriter(timescale)
@@ -594,24 +736,43 @@ async def main():
                         logger.error(f"POISON PILL / Invalid RawEvent dropped: {e}", exc_info=True)
                         pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": f"Invalid RawEvent: {e}", "topic": msg.topic, "raw": str(msg.value)}))
                 
+                # Each task carries the topic and events it belongs to.
+                #
+                # enrich_tasks was appended to only when an enricher existed and
+                # the results were then zipped against the *unfiltered*
+                # raw_events_by_topic.items(). One topic without a registered
+                # enricher offset everything after it, so a batch failure was
+                # logged against the wrong topic and the wrong raw events were
+                # written to the dead-letter queue.
                 enrich_tasks = []
                 for topic, raw_events in raw_events_by_topic.items():
                     enricher = topic_to_enricher.get(topic)
-                    if enricher:
-                        if hasattr(enricher, "enrich_batch"):
-                            enrich_tasks.append(enricher.enrich_batch(raw_events))
-                        else:
-                            # Fallback if enrich_batch is not implemented
-                            async def _fallback_batch(e_batch, e_inst=enricher):
-                                return await asyncio.gather(*[e_inst.enrich(e) for e in e_batch], return_exceptions=True)
-                            enrich_tasks.append(_fallback_batch(raw_events))
+                    if not enricher:
+                        # Said out loud rather than skipped. A topic arriving
+                        # here with no enricher is a routing gap, and silently
+                        # dropping it is how one goes unnoticed.
+                        logger.warning(
+                            "No enricher registered for topic %s; %s raw event(s) not enriched.",
+                            topic, len(raw_events),
+                        )
+                        MetricsCollector.increment("enrichment_unrouted_topic_total")
+                        continue
+                    if hasattr(enricher, "enrich_batch"):
+                        enrich_tasks.append((topic, raw_events, enricher.enrich_batch(raw_events)))
+                    else:
+                        # Fallback if enrich_batch is not implemented
+                        async def _fallback_batch(e_batch, e_inst=enricher):
+                            return await asyncio.gather(*[e_inst.enrich(e) for e in e_batch], return_exceptions=True)
+                        enrich_tasks.append((topic, raw_events, _fallback_batch(raw_events)))
 
                 # Execute all batches simultaneously 
-                results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+                results = await asyncio.gather(
+                    *(t for _, _, t in enrich_tasks), return_exceptions=True
+                )
                 
                 # ── 2. ASYNC CONCURRENT PRODUCER DISPATCH & ERROR ROUTING ──
                 produce_tasks = []
-                for batch_result, (topic, raw_events) in zip(results, list(raw_events_by_topic.items())):
+                for batch_result, (topic, raw_events, _) in zip(results, enrich_tasks):
                     if isinstance(batch_result, Exception):
                         logger.error(f"Batch enrichment failed for topic {topic}: {batch_result}", exc_info=batch_result)
                         for re in raw_events:
@@ -684,6 +845,7 @@ async def main():
                         try:
                             apply_display_text(e)
                         except Exception as exc:  # cosmetics must not stop the pipeline
+                            MetricsCollector.increment("pipeline_errors_total:cross_domain_signals")
                             logger.warning(
                                 "Display-text formatting failed for event %s: %s",
                                 getattr(e, "event_id", "?"), exc,
@@ -719,13 +881,22 @@ async def main():
                         continue
 
                     entity_key = enriched.primary_entity.id if (enriched.primary_entity and enriched.primary_entity.id) else "unknown"
-                    produce_tasks.append(
+                    # The event travels with its own task.
+                    #
+                    # These were appended to a bare list and later zipped
+                    # against batch_to_write, which this loop skips events from
+                    # -- 6,969 of 17,506 in a measured thirty minutes. After the
+                    # first skip the two lists were offset, so a produce failure
+                    # was reported against whichever event happened to sit at
+                    # that index and the DLQ recorded the wrong payload.
+                    produce_tasks.append((
+                        enriched,
                         producer.send(
                             Topics.ENRICHED_EVENTS,
                             enriched.model_dump(),
                             key=entity_key,
-                        )
-                    )
+                        ),
+                    ))
                     try:
                         live_dict = enriched.model_dump(mode="json")
                         live_dict["event_id"] = str(enriched.event_id)
@@ -739,10 +910,13 @@ async def main():
                         logger.debug(f"Redis live feed publish bypass: {pub_err}")
 
                 if produce_tasks:
-                    produce_results = await asyncio.gather(*produce_tasks, return_exceptions=True)
+                    produced_events = [ev for ev, _ in produce_tasks]
+                    produce_results = await asyncio.gather(
+                        *(t for _, t in produce_tasks), return_exceptions=True
+                    )
                     failed_produce_dlq_tasks = []
                     successful_produces = 0
-                    for enriched, produce_res in zip(batch_to_write, produce_results):
+                    for enriched, produce_res in zip(produced_events, produce_results):
                         if isinstance(produce_res, Exception):
                             logger.error(
                                 f"Kafka produce to {Topics.ENRICHED_EVENTS} failed for event {enriched.event_id}: {produce_res}",
@@ -799,21 +973,23 @@ async def main():
                                 name="source-freshness",
                             )
 
-                            # Broadcast enriched events to Redis PubSub for real-time WebSocket live feed
-                            try:
-                                pub_pipe = redis.raw.pipeline()
-                                for evt in batch_to_write:
-                                    as_dict = evt.model_dump()
-                                    # Same rule as the publisher above. Two
-                                    # sites broadcasting on different rules is
-                                    # how one of them ends up forgotten.
-                                    if not worth_broadcasting(as_dict):
-                                        continue
-                                    payload = json.dumps(as_dict, default=str)
-                                    pub_pipe.publish("sentinel:events:live", payload)
-                                await pub_pipe.execute()
-                            except Exception as pub_err:
-                                logger.debug(f"Redis pubsub publish warning: {pub_err}")
+                            # The live feed is published once, in the produce
+                            # loop above.
+                            #
+                            # There were two publishers on sentinel:events:live
+                            # -- one per event during fan-out and this one over
+                            # the whole batch after the database write -- both
+                            # gated on the same worth_broadcasting rule. Every
+                            # event a subscriber cared about therefore arrived
+                            # twice, and any UI counting them counted double.
+                            # The comment here even noted the risk of two sites
+                            # drifting apart without noticing that they were
+                            # both firing.
+                            #
+                            # The surviving publisher is the earlier one: it
+                            # runs per event with the event in hand, so it does
+                            # not need to re-serialise the batch, and it is the
+                            # one the fan-out floor already filters.
                             break # Success
                         except Exception as write_err:
                             if attempt == 2: 
@@ -838,8 +1014,39 @@ async def main():
                                 await asyncio.sleep(2 ** attempt) 
 
                 # ── 4. COMMIT ────────────────────────────────────────────────
-                if batch_success:
-                    await consumer.commit()
+                #
+                # This partition only.
+                #
+                # A bare consumer.commit() commits every assigned partition,
+                # and it runs inside the `for tp, messages` loop above -- so
+                # succeeding on one partition committed the offsets of every
+                # other partition in the same poll, including ones whose batch
+                # had failed and been routed to the DLQ, and ones not yet
+                # processed at all. Those messages were never redelivered.
+                #
+                # The offset committed is the last message read plus one, which
+                # is the next offset to consume.
+                if batch_success and messages:
+                    try:
+                        await consumer.commit({tp: messages[-1].offset + 1})
+                    except (TypeError, AttributeError) as api_err:
+                        # Not a rebalance. A signature or attribute error here
+                        # is a programming fault and must not be absorbed by a
+                        # handler written for transient broker conditions: the
+                        # previous message said "rebalance or timeout" for a
+                        # TypeError, and the service processed 9,085 events
+                        # while committing none of them at a healthy-looking
+                        # 4.2/s.
+                        logger.error(
+                            "Commit call is wrong for %s: %s. Offsets are NOT advancing.",
+                            tp, api_err, exc_info=True,
+                        )
+                        MetricsCollector.increment("pipeline_errors_total:commit_api")
+                        raise
+                    except Exception as commit_err:
+                        logger.warning(
+                            "Commit skipped for %s (rebalance or timeout): %s", tp, commit_err
+                        )
                 
     except asyncio.CancelledError:
         logger.info("Shutdown signal received. Closing consumer...")

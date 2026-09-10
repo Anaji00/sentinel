@@ -202,16 +202,16 @@ async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = Non
                 parsed = json.loads(cached if isinstance(cached, str) else cached.decode("utf-8"))
                 if isinstance(parsed, list):
                     return parsed
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.fetch_on_the_spot_historical", _exc, logger)
 
     series = await _fetch_on_the_spot_uncached(symbol, limit, redis)
 
     if redis is not None and series:
         try:
             await redis.raw.set(cache_key, json.dumps(series, default=str), ex=ON_THE_SPOT_CACHE_TTL_SEC)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.fetch_on_the_spot_historical", _exc, logger)
     return series
 
 async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None):
@@ -263,8 +263,8 @@ async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None
                                                 "provider": "US Department of the Treasury (Par Yield)",
                                                 "source_type": "LIVE_US_TREASURY_2Y"
                                             })
-                                        except ValueError:
-                                            pass
+                                        except ValueError as _exc:
+                                            swallowed("api_gateway.routes.radar._fetch_on_the_spot_uncached", _exc, logger)
                         if pts:
                             return pts[-limit:]
         except Exception as e:
@@ -538,6 +538,7 @@ async def get_market_series(
     }
 import json
 from fastapi import HTTPException
+from shared.utils.quiet_failures import swallowed
 
 @router.get("/candles/{ticker}")
 async def get_candles(
@@ -601,8 +602,8 @@ async def get_candles(
                     for rc in raw_candles:
                         try:
                             candles.append(normalize_candle(json.loads(rc), ticker))
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            swallowed("api_gateway.routes.radar.get_candles", _exc, logger)
                     if candles:
                         source = "redis"
                         break
@@ -737,8 +738,8 @@ async def get_covered_call_recommendations(
             raw_iv = await redis.raw.get(f"sentinel:options:iv:{ticker}")
             if raw_iv:
                 live_iv = float(raw_iv)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.get_covered_call_recommendations", _exc, logger)
 
     rec = quant_calc.generate_covered_call_recommendation(
         ticker=ticker,

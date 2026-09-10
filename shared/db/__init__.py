@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 import asyncpg
 from neo4j import AsyncGraphDatabase as _Neo4j
 from shared.utils.env_guard import resolve_env_var
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +139,8 @@ class Neo4jClient:
                 if driver is not None:
                     try:
                         await driver.close()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("db.connect", _exc, logger)
 
         # Raised, not swallowed. The caller decides whether the graph is
         # optional; this class must not pretend it connected.

@@ -22,6 +22,7 @@ from services.agents.base import SentinelAgent, SchemaViolationError, InferenceE
 from shared.kafka import Topics
 from shared.utils.tasks import safe_create_task
 from shared.utils.text import clip
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.adversarial_wargamer")
 
@@ -102,8 +103,8 @@ def _is_worth_simulating(message: Dict[str, Any]) -> bool:
     if severity is not None:
         try:
             return float(severity) >= 4
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as _exc:
+            swallowed("agents.adversarial_wargamer._is_worth_simulating", _exc, logger)
 
     # Nothing stated a severity. Rejecting outright was too blunt: a news
     # headline about export controls on a named company carries no tier and is

@@ -27,6 +27,7 @@ from shared.db import get_timescale, get_redis
 from shared.utils.metrics import MetricsCollector
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 try:
     from drift_scheduler import ModelDriftScheduler
@@ -158,8 +159,8 @@ def _prediction_confidence(data: dict) -> float:
     if cascade is not None:
         try:
             return max(0.0, min(1.0, float(cascade) / 100.0))
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as _exc:
+            swallowed("telemetry_worker._prediction_confidence", _exc)
     try:
         return float(data.get("simulation_confidence") or data.get("confidence") or 0.0)
     except (TypeError, ValueError):

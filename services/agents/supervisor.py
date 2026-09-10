@@ -23,6 +23,7 @@ from shared.models.ontology import (
     normalize_predicate,
     is_valid_node_label,
 )
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.supervisor")
 
@@ -538,8 +539,8 @@ async def backfill_node_types(neo4j_client, redis_client) -> None:
             seen = await redis_client.raw.get(BACKFILL_MARKER_KEY)
             if seen and str(seen.decode() if isinstance(seen, bytes) else seen) == BACKFILL_VERSION:
                 return
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("agents.supervisor.backfill_node_types", _exc, logger)
 
     labelled_total = 0
     try:

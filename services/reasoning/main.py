@@ -234,7 +234,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
 async def run_reasoning_loop(context_builder, generator, library, db, redis_client):
     """Main asynchronous Kafka consumption loop."""
     consumer = SentinelConsumer(
-        topics=[Topics.CORRELATIONS, "agents.intel.briefs"],
+        topics=[Topics.CORRELATIONS, Topics.INTEL_BRIEFS],
         group_id="reasoning-service-group",
         auto_offset_reset="latest",
     )
@@ -341,7 +341,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                         try:
                             raw_data = json.loads(message.value.decode('utf-8'))
                             
-                            if tp.topic == "agents.intel.briefs":
+                            if tp.topic == Topics.INTEL_BRIEFS:
                                 brief = raw_data.get("brief", {})
                                 headline = brief.get("headline", "No headline")
                                 logger.debug(f"Received intel brief: {headline} (severity: {brief.get('severity')})")
@@ -656,7 +656,16 @@ async def main():
     generator       = ScenarioGenerator(db, redis_client=redis_client) 
     tracker_producer = SentinelProducer()
     await tracker_producer.start()
-    tracker         = ScenarioTracker(db, tracker_producer)
+    # Redis, which this was never given.
+    #
+    # `ScenarioTracker.__init__` takes (db, producer, redis) and this passed
+    # two, so `self._redis` was None for the life of the service. Everything
+    # that needs it returned early and silently: the calibration outcome write
+    # closed in Phase 4.12, the open-questions offer, and the backfill. Three
+    # mechanisms reported closed in this audit, all inert, none of them saying
+    # so -- 562 resolved scenarios against 0 calibration samples was the visible
+    # end of it.
+    tracker         = ScenarioTracker(db, tracker_producer, redis_client)
     library         = PatternLibrary(db)
  
     tracker_task = safe_create_task(_tracker_loop(tracker), name="scenario-tracker")

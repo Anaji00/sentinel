@@ -6,6 +6,15 @@ Resolves local aliases (`sec = e.security_data; sec.severity`) -- the form the
 real crash took, and the form a naive attribute check misses."""
 import ast, pathlib, sys
 from enum import Enum
+
+# The repo root, so this runs from anywhere.
+#
+# Without it the script raised ModuleNotFoundError on its own first import and
+# had therefore never run -- a guard against a bug class, itself unrunnable,
+# for as long as it had existed. It is not in the test suite either, so nothing
+# ever tried.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 import shared.models.events as ev
 from pydantic import BaseModel
 

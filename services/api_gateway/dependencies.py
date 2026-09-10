@@ -4,6 +4,7 @@ passes database connections from the main app state
 down into isolated routes"""
 
 import hmac
+import ipaddress
 import hashlib
 import base64
 import json
@@ -24,6 +25,10 @@ logger = logging.getLogger("api-gateway.auth")
 # SENTINEL_ENV is in the safe-dev whitelist; production raises). The literal is a
 # non-production placeholder, never a usable admin key in a real deployment.
 API_KEY = resolve_env_var("API_GATEWAY_KEY", "dev-only-key-replace-in-prod", warn_on_fallback=True)
+
+# Shared secret for metric scrapers. Unset means the metrics endpoints require
+# the ordinary API key instead -- never that they are public.
+METRICS_TOKEN = os.getenv("METRICS_TOKEN", "").strip()
 
 # Session signing secret: MUST be its own configured value. No string default and
 # no fallback to API_GATEWAY_KEY (reusing the API key to sign JWTs would let anyone
@@ -139,7 +144,19 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
                 if time.time() > expires_at:
                     return False, None, None
             else:
-                email = payload_str
+                # No expiry segment, so no expiry check ever ran.
+                #
+                # The signature is verified below, so such a token cannot be
+                # forged -- but a legitimately issued one of this shape stays
+                # valid forever, which is what a session expiry exists to
+                # prevent. A token that cannot expire is refused rather than
+                # accepted indefinitely.
+                logger.warning(
+                    "Rejected a session token carrying no expiry. Tokens must "
+                    "encode one; a token that cannot expire cannot be revoked "
+                    "by time."
+                )
+                return False, None, None
 
             expected_sig_hex = hmac.new(secret_bytes, payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
             expected_sig_b64 = base64.urlsafe_b64encode(
@@ -156,38 +173,120 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
     return False, None, None
 
 
-async def check_rate_limit(redis_client, identity_key: str, max_tokens: int = 120, refill_rate_per_sec: float = 10.0) -> bool:
-    """Redis-backed token bucket rate limiter per key/session/IP."""
+# Token bucket, evaluated inside Redis.
+#
+# The Python version read the token count and the refill time, computed the new
+# count, and wrote it back -- three round trips with no lock. Two requests
+# arriving together both read the same count, both decided a token was
+# available, and both wrote the same decremented value, so N concurrent
+# requests consumed one token between them. The limiter held under sequential
+# load and dissolved under exactly the concurrent load it exists for.
+#
+# Lua runs atomically in Redis, so the read-compute-write is one operation.
+_RATE_LIMIT_LUA = """
+local tokens_key = KEYS[1]
+local ts_key     = KEYS[2]
+local max_tokens = tonumber(ARGV[1])
+local refill     = tonumber(ARGV[2])
+local now        = tonumber(ARGV[3])
+local ttl        = tonumber(ARGV[4])
+
+local tokens = tonumber(redis.call('GET', tokens_key))
+local last   = tonumber(redis.call('GET', ts_key))
+if tokens == nil then tokens = max_tokens end
+if last == nil then last = now end
+
+local delta = now - last
+if delta < 0 then delta = 0 end
+tokens = math.min(max_tokens, tokens + delta * refill)
+
+local allowed = 0
+if tokens >= 1.0 then
+    tokens = tokens - 1.0
+    allowed = 1
+end
+
+redis.call('SET', tokens_key, tostring(tokens), 'EX', ttl)
+redis.call('SET', ts_key, tostring(now), 'EX', ttl)
+return allowed
+"""
+
+
+async def check_rate_limit(
+    redis_client,
+    identity_key: str,
+    max_tokens: int = 120,
+    refill_rate_per_sec: float = 10.0,
+    fail_open: bool = True,
+) -> bool:
+    """Redis-backed token bucket rate limiter per key/session/IP.
+
+    `fail_open` decides what happens when Redis cannot answer. The default is
+    open, which is right for ordinary read traffic: a cache outage should not
+    take the product down. Callers guarding anything sensitive pass
+    `fail_open=False`, because an attacker who can degrade Redis should not
+    thereby remove the limiter -- the previous behaviour was to return True
+    unconditionally from a debug-level except, so a Redis drop silently
+    disabled rate limiting everywhere at once.
+    """
     if not redis_client:
-        return True
+        return True if fail_open else False
     try:
         raw_redis = getattr(redis_client, "raw", redis_client)
         now = time.time()
         bucket_key = f"sentinel:ratelimit:{identity_key}"
-
-        pipe = raw_redis.pipeline()
-        pipe.get(f"{bucket_key}:tokens")
-        pipe.get(f"{bucket_key}:last_refill")
-        res = await pipe.execute()
-
-        curr_tokens = float(res[0]) if res[0] is not None else float(max_tokens)
-        last_refill = float(res[1]) if res[1] is not None else now
-
-        delta = max(0.0, now - last_refill)
-        refilled_tokens = min(float(max_tokens), curr_tokens + delta * refill_rate_per_sec)
-
-        if refilled_tokens >= 1.0:
-            new_tokens = refilled_tokens - 1.0
-            p = raw_redis.pipeline()
-            p.set(f"{bucket_key}:tokens", str(new_tokens), ex=3600)
-            p.set(f"{bucket_key}:last_refill", str(now), ex=3600)
-            await p.execute()
-            return True
-        else:
-            return False
+        allowed = await raw_redis.eval(
+            _RATE_LIMIT_LUA,
+            2,
+            f"{bucket_key}:tokens",
+            f"{bucket_key}:last_refill",
+            str(float(max_tokens)),
+            str(float(refill_rate_per_sec)),
+            str(now),
+            "3600",
+        )
+        return bool(int(allowed))
     except Exception as e:
-        logger.debug(f"Rate limit check warning: {e}")
+        if fail_open:
+            logger.warning(
+                "Rate limiting unavailable (%s); allowing the request. "
+                "Sensitive callers should pass fail_open=False.", e,
+            )
+            return True
+        logger.error("Rate limiting unavailable (%s); refusing the request.", e)
+        return False
+
+
+# Networks whose forwarding headers are believed. Empty means believe nobody,
+# which is the safe default for a service exposed directly.
+TRUSTED_PROXY_CIDRS = [
+    c.strip() for c in os.getenv("TRUSTED_PROXY_CIDRS", "").split(",") if c.strip()
+]
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
         return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _peer_is_trusted_proxy(peer: str) -> bool:
+    """Whether the immediate peer is one of our own reverse proxies."""
+    if not TRUSTED_PROXY_CIDRS or not peer or peer == "unknown":
+        return False
+    try:
+        addr = ipaddress.ip_address(peer)
+    except (ValueError, TypeError):
+        return False
+    for cidr in TRUSTED_PROXY_CIDRS:
+        try:
+            if addr in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def client_address(request) -> str:
@@ -196,16 +295,37 @@ def client_address(request) -> str:
     Behind nginx every request appears to originate from the proxy, so
     throttling on the socket address would put all callers in one bucket.
     """
-    headers = getattr(request, "headers", None)
-    if headers is not None:
-        fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        real = headers.get("X-Real-IP") or headers.get("x-real-ip")
-        if real:
-            return real.strip()
     client = getattr(request, "client", None)
-    return getattr(client, "host", None) or "unknown"
+    peer = getattr(client, "host", None) or "unknown"
+
+    # Forwarding headers are only believed from a trusted proxy.
+    #
+    # These were read from every request. They are caller-supplied strings, so
+    # anyone could set X-Forwarded-For to a fresh value per request and get a
+    # fresh rate-limit bucket each time -- the limiter was bypassable by adding
+    # a header. Worse, it is also the identity used in throttling keys and
+    # audit lines, so an attacker could attribute their traffic to somebody
+    # else's address.
+    #
+    # TRUSTED_PROXY_CIDRS lists the networks the ingress actually runs on. When
+    # it is unset the headers are ignored entirely and the socket address is
+    # used, which is correct for a direct-exposure deployment.
+    if _peer_is_trusted_proxy(peer):
+        headers = getattr(request, "headers", None)
+        if headers is not None:
+            fwd = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+            if fwd:
+                # Right-most entry the trusted hop appended is the one it saw;
+                # the left-most is whatever the client claimed. Take the first
+                # from the left only because nginx here rewrites the chain, and
+                # validate it parses as an address before trusting it.
+                candidate = fwd.split(",")[0].strip()
+                if _is_ip_literal(candidate):
+                    return candidate
+            real = headers.get("X-Real-IP") or headers.get("x-real-ip")
+            if real and _is_ip_literal(real.strip()):
+                return real.strip()
+    return peer
 
 
 async def verify_api_key(request: Request = None):
@@ -233,8 +353,36 @@ async def verify_api_key(request: Request = None):
     # Liveness and readiness stay open because an orchestrator has to reach them
     # before it has credentials. Anything that describes the platform's sources
     # or data does not.
-    if path in ("/metrics", "/metrics/json", "/health"):
+    # /health stays open: a liveness probe that needs a credential is a
+    # liveness probe that fails during a credential outage.
+    if path == "/health":
         return None
+
+    # Metrics are not public.
+    #
+    # These were exempted outright. They expose per-service throughput, queue
+    # depths, error counts, model latencies and the platform's own detection
+    # rates -- an operational map of what is running, what is failing and what
+    # is being noticed, served to anyone who asks.
+    #
+    # A scrape token keeps Prometheus working, because a scraper cannot present
+    # a session cookie. When METRICS_TOKEN is unset the endpoints fall through
+    # to the normal API-key check rather than opening up, so an operator who
+    # never configures one is not silently exposed.
+    if path in ("/metrics", "/metrics/json"):
+        if METRICS_TOKEN:
+            supplied = None
+            if hasattr(request, "headers"):
+                supplied = request.headers.get("X-Metrics-Token")
+                if not supplied:
+                    auth = request.headers.get("Authorization") or ""
+                    if auth.lower().startswith("bearer "):
+                        supplied = auth[7:].strip()
+            if supplied and hmac.compare_digest(
+                supplied.encode("utf-8"), METRICS_TOKEN.encode("utf-8")
+            ):
+                return None
+            raise HTTPException(status_code=401, detail="Metrics require a scrape token.")
     if path.startswith("/api/v1/health") and path not in _AUTHENTICATED_HEALTH_PATHS:
         return None
     # Login must be reachable without credentials -- it is where credentials are
@@ -278,9 +426,27 @@ async def verify_api_key(request: Request = None):
         return None
 
     session_cookie = request.cookies.get("sentinel_session") if hasattr(request, "cookies") else None
-    has_qs = hasattr(request, "scope") and isinstance(request.scope, dict) and "query_string" in request.scope
-    api_key_query = request.query_params.get("api_key") if has_qs else None
-    api_key = (request.headers.get("X-API-KEY") if hasattr(request, "headers") else None) or api_key_query
+    # Headers only. An API key in a query string is written to the nginx access
+    # log, kept in browser history, and sent onward in the Referer header of
+    # any link the page loads -- and this key grants Role.ADMIN. A credential
+    # that ends up in three logs by default is not a credential.
+    #
+    # Rejected loudly rather than ignored, so a caller still passing ?api_key=
+    # finds out immediately instead of silently becoming anonymous.
+    api_key = request.headers.get("X-API-KEY") if hasattr(request, "headers") else None
+    if not api_key and hasattr(request, "headers"):
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            api_key = auth_header[7:].strip()
+    if not api_key and hasattr(request, "scope") and isinstance(request.scope, dict)             and "query_string" in request.scope and request.query_params.get("api_key"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API keys must be sent in the X-API-KEY header or as a Bearer "
+                "token. A key in the query string is logged by the proxy and "
+                "retained in browser history."
+            ),
+        )
 
     is_valid = False
     identity = "anonymous"
@@ -427,6 +593,16 @@ async def verify_websocket_api_key(websocket: WebSocket) -> bool:
     query_params_map = getattr(websocket, "query_params", {})
 
     api_key_header = (headers_map.get("X-API-KEY") or headers_map.get("x-api-key")) if hasattr(headers_map, "get") else None
+    # Deliberately still accepted here, unlike on the HTTP path.
+    #
+    # A browser cannot set custom headers on a WebSocket handshake, so the query
+    # string is the only mechanism available to one that is not relying on the
+    # session cookie checked above. The exposure is the same in kind -- the URL
+    # reaches the proxy access log -- which is why the HTTP handler refuses it
+    # outright and this one does not: there, headers are always available and
+    # the query string is a convenience; here it is sometimes the only option.
+    #
+    # Prefer the cookie or a header where the client can send one.
     api_key_query = query_params_map.get("api_key") if hasattr(query_params_map, "get") else None
 
     api_key = api_key_header or api_key_query

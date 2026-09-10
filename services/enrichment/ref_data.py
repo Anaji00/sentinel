@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 from typing import Optional, Dict, Any
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("enrichment.ref_data")
 
@@ -72,8 +73,8 @@ async def fetch_and_cache_reference_data(
         if cached:
             import json
             return json.loads(cached)
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("enrichment.ref_data.fetch_and_cache_reference_data", _exc, logger)
 
     owns_session = session is None
     if owns_session:
@@ -119,8 +120,8 @@ async def fetch_and_cache_reference_data(
             if idx_cached:
                 import json as _json
                 ref_data["index_membership"] = _json.loads(idx_cached)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.ref_data.fetch_and_cache_reference_data", _exc, logger)
 
         import json
         pipe = redis_client.raw.pipeline()
@@ -173,11 +174,11 @@ async def get_reference_data(redis_client, symbol: str) -> Optional[Dict[str, An
                     idx_cached = await redis_client.raw.get(f"{INDEX_MEMBERSHIP_PREFIX}{symbol}")
                     if idx_cached:
                         data["index_membership"] = json.loads(idx_cached)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("enrichment.ref_data.get_reference_data", _exc, logger)
             return data
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("enrichment.ref_data.get_reference_data", _exc, logger)
     return None
 
 

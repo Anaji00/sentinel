@@ -70,6 +70,21 @@ def swallowed(
     becomes impossible to miss without anyone having to predict which it would
     be.
     """
+    count, escalate = _record(site)
+    log = logger or logging.getLogger("sentinel.quiet")
+    suffix = f" ({detail})" if detail else ""
+    if escalate:
+        log.warning(
+            "Suppressed failure at %s has now fired %s time(s): %s: %s%s",
+            site, count, type(exc).__name__, exc, suffix,
+        )
+    else:
+        log.debug("Suppressed failure at %s (%s): %s%s", site, count, exc, suffix)
+    return count
+
+
+def _record(site: str) -> tuple:
+    """Bump the counter for a site and decide whether this firing escalates."""
     now = time.time()
     with _LOCK:
         count = _COUNTS.get(site, 0) + 1
@@ -80,16 +95,40 @@ def swallowed(
         escalate = count in ESCALATION_COUNTS or (now - last_reported) >= ESCALATION_INTERVAL_SEC
         if escalate:
             _LAST_REPORTED[site] = now
+    return count, escalate
 
+
+def dropped(
+    site: str,
+    reason: str,
+    logger: Optional[logging.Logger] = None,
+    detail: str = "",
+) -> int:
+    """Record an input discarded on purpose, where no exception was raised.
+
+    The enricher dispatch chains end in a bare `return None`, and the crypto
+    batch loop has no else branch at all, so an event whose `source` nothing
+    matches is discarded without a log, a metric, or a dead letter. That is how
+    every pre-market and after-hours equity bar was thrown away for as long as
+    only `finnhub_equities` was routed, and how the OKX funding poller's output
+    vanished after being collected correctly -- both found by accident, neither
+    by anything the system said.
+
+    A routing gap is not an error the same way an exception is: one unmatched
+    source is a probe or a new collector still being wired up, and the same
+    source unmatched ten thousand times is a feed being thrown away. The
+    counting and escalation are shared with `swallowed` for exactly that
+    reason.
+    """
+    count, escalate = _record(site)
     log = logger or logging.getLogger("sentinel.quiet")
     suffix = f" ({detail})" if detail else ""
     if escalate:
         log.warning(
-            "Suppressed failure at %s has now fired %s time(s): %s: %s%s",
-            site, count, type(exc).__name__, exc, suffix,
+            "Dropped input at %s, now %s time(s): %s%s", site, count, reason, suffix,
         )
     else:
-        log.debug("Suppressed failure at %s (%s): %s%s", site, count, exc, suffix)
+        log.debug("Dropped input at %s (%s): %s%s", site, count, reason, suffix)
     return count
 
 
@@ -104,6 +143,26 @@ def snapshot() -> Dict[str, Dict[str, float]]:
             }
             for site in sorted(_COUNTS, key=lambda k: -_COUNTS[k])
         }
+
+
+def heartbeat_line(top: int = 3) -> str:
+    """The busiest suppressed sites, short enough to append to a heartbeat.
+
+    `snapshot()` existed from the day this module was written and nothing ever
+    called it, so the counters counted into a dictionary no one read -- which
+    is the failure mode the module was built to end, reproduced by the module
+    itself. A heartbeat already prints once a minute in every service and is
+    the one surface guaranteed to exist in all of them.
+
+    Empty string when nothing has fired, so a healthy heartbeat is unchanged.
+    """
+    snap = snapshot()
+    if not snap:
+        return ""
+    worst = list(snap.items())[:max(1, top)]
+    body = " ".join(f"{site}={int(d['count'])}" for site, d in worst)
+    more = len(snap) - len(worst)
+    return f" | suppressed: {body}" + (f" (+{more} more)" if more > 0 else "")
 
 
 def reset() -> None:

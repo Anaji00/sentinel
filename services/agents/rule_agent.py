@@ -244,7 +244,7 @@ class RuleSynthesizerAgent(SentinelAgent):
                 await self.redis.raw.publish("sentinel:correlation:rule_updates", tombstone)
                 # Emit Telemetry
                 if self._producer:
-                    await self._producer.send("agents.telemetry", {
+                    await self._producer.send(Topics.TELEMETRY, {
                         "agent": "rule_synthesizer",
                         "event": "rule_deprecated",
                         "rule_id": rule_id,
@@ -385,7 +385,7 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
                         await self._producer.send(Topics.RULES_SYNTHESIZED, rule.model_dump(), key=rule.rule_id)
 
                         # 2. Emit Telemetry
-                        await self._producer.send("agents.telemetry", {
+                        await self._producer.send(Topics.TELEMETRY, {
                             "agent": "rule_synthesizer",
                             "event": "rule_created",
                             "rule_id": rule.rule_id,

@@ -22,7 +22,7 @@ import re
 
 from shared.utils.materiality import apply_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import swallowed, dropped, swallowed
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -193,7 +193,13 @@ def _options_premium_score(premium: float) -> float:
     if not math.isfinite(value) or value <= OPTIONS_PREMIUM_FLOOR_USD:
         return 0.0
     if value >= OPTIONS_PREMIUM_REFERENCE_USD:
-        return 1.0
+        # Not 1.0. A premium at or above the reference is the largest sweep
+        # seen so far and is still only that; the next one may be larger, and a
+        # detector reporting certainty leaves nothing to say when it arrives.
+        # `_notional_score` was corrected for exactly this earlier in the audit
+        # and this path was not -- 48 options_flow events sat at exactly 1.000
+        # in 24 hours, the largest ceiling cluster on the platform.
+        return FALLBACK_MAX_SCORE
     span = math.log10(OPTIONS_PREMIUM_REFERENCE_USD) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)
     return round((math.log10(value) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)) / span, 4)
 
@@ -481,7 +487,12 @@ class TradFiEnricher:
             return await self._enrich_13f_filing(raw, p)
         elif source == "macro_freight":
             return await self._enrich_freight_rate(raw, p)
-            
+
+        # Nothing claimed this source. Counted rather than logged per event,
+        # because one unmatched source is a probe and ten thousand is a feed
+        # being thrown away, and the bare `return None` this replaces said
+        # neither.
+        dropped("enrichment.tradfi.unrouted_source", f"no branch for source={source!r}", logger)
         return None
 
     async def _fetch_earnings_calendar(self, tickers) -> dict:
@@ -814,6 +825,7 @@ class TradFiEnricher:
         ofi = 0.0
         ofi_measured = False
         k_lambda = 0.0
+        k_impact_bps = 0.0
         ami = 0.0
         v_wap = price  # fallback
 
@@ -871,6 +883,17 @@ class TradFiEnricher:
                     price_changes = [prices_buf[i] - prices_buf[i + 1] for i in range(len(prices_buf) - 1)]
                     signed_flows = signed_vols_buf[:-1]  # align with price_changes
                     k_lambda = quant_calc.kyle_lambda(price_changes, signed_flows)
+                    # The comparable form, alongside the raw slope.
+                    #
+                    # kyle_lambda is in price per share, so the stop guard's
+                    # `lambda > 1.0` and `> 2.0` thresholds were unreachable for
+                    # any realistically-priced instrument: two names with an
+                    # identical real illiquidity of 50bps per $1M carry raw
+                    # slopes of 0.00125 and 0.0000005. The branch had never
+                    # fired on this term.
+                    k_impact_bps = quant_calc.kyle_impact_bps(
+                        price_changes, signed_flows, reference_price=prices_buf[0]
+                    ) if prices_buf else 0.0
 
                     # Amihud: proper period returns |r_t| = |p_t/p_{t-1} - 1|
                     if len(prices_buf) >= 2 and all(p_val > 0 for p_val in prices_buf):
@@ -884,7 +907,7 @@ class TradFiEnricher:
 
         # Dynamic Microstructure Trailing Stop Guard
         try:
-            stop_mult = quant_calc.microstructure_stop_distance(atr=1.0, ofi=ofi, kyle_lambda=k_lambda)
+            stop_mult = quant_calc.microstructure_stop_distance(atr=1.0, ofi=ofi, impact_bps=k_impact_bps)
             # The write was gated on `stop_mult < 1.0`, which the function can
             # only return for a negative OFI or a large Kyle's lambda. With both
             # inputs pinned at zero the branch was unreachable, so the key was
@@ -904,6 +927,7 @@ class TradFiEnricher:
                     "multiplier": stop_mult,
                     "ofi": ofi,
                     "kyle_lambda": k_lambda,
+                    "kyle_impact_bps": k_impact_bps,
                     "trigger_price": price,
                     "measured": True,
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -1217,8 +1241,8 @@ class TradFiEnricher:
                 raw_corr_ids = await self.redis_client.raw.smembers(f"sentinel:correlation:active_ids:{ticker}")
                 if raw_corr_ids:
                     stat_corr_ids = [c.decode() if isinstance(c, bytes) else str(c) for c in raw_corr_ids]
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("enrichment.enrichers.tradfi._enrich_equity_candle", _exc, logger)
 
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
@@ -1546,7 +1570,7 @@ class TradFiEnricher:
         # sweep cannot exceed the scale.
         _session_depth = session_liquidity_factor(asset_class="equities")
         if 0 < _session_depth < 1.0:
-            base_score = min(1.0, base_score / _session_depth)
+            base_score = min(FALLBACK_MAX_SCORE, base_score / _session_depth)
         lift_spent = 0.0
         anomaly = _lift(base_score, w_boost, lift_spent)
         lift_spent += w_boost
@@ -1655,8 +1679,8 @@ class TradFiEnricher:
         try:
             await self.redis_client.raw.zadd("sentinel:watched:equities", mapping={ticker: _time.time()})
             await self.redis_client.raw.zremrangebyrank("sentinel:watched:equities", 0, -51)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.tradfi._enrich_quant_radar", _exc, logger)
 
         # Watchlist & Frequency boost
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
@@ -1714,6 +1738,27 @@ class TradFiEnricher:
         tags = ["tradfi", "radar_anomaly", ticker.lower()]
         entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
 
+        # The correlations this ticker is already part of, as the other two
+        # tradfi paths do.
+        #
+        # The equity-trade and candle paths both fetch these and this one did
+        # not, so a radar volume spike could not be traced to the statistical
+        # relationships involving its own subject. It is the highest-volume of
+        # the three -- 990 market_anomaly events in 24 hours against 90 equity
+        # blocks -- and it fires on exactly the tickers discovery has run on:
+        # SPY, NVDA and TSM all hold an active_ids set.
+        radar_corr_ids = []
+        try:
+            _raw_ids = await self.redis_client.raw.smembers(
+                f"sentinel:correlation:active_ids:{ticker}"
+            )
+            if _raw_ids:
+                radar_corr_ids = [
+                    c.decode() if isinstance(c, bytes) else str(c) for c in _raw_ids
+                ]
+        except Exception as _exc:
+            swallowed("enrichment.tradfi.radar_correlation_ids", _exc, logger, detail=ticker)
+
         return NormalizedEvent(
             event_id=raw.event_id,
             trace_id=raw.trace_id,
@@ -1722,6 +1767,7 @@ class TradFiEnricher:
             source=raw.source,
             source_reliability=baseline_reliability(raw.source),
             primary_entity=entity,
+            correlation_ids=radar_corr_ids,
             financial_data=FinancialData(
                 ticker=ticker,
                 instrument_type="equity",

@@ -32,6 +32,7 @@ from collections import deque
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("sentinel.streaming_detectors")
 
@@ -170,8 +171,8 @@ class RRCFDetector:
                     fresh_tree = rrcf.RCTree()
                     fresh_tree.insert_point(point, index=idx)
                     self._forest[i] = fresh_tree
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("utils.streaming_detectors._insert_rrcf", _exc, logger)
 
         if valid_trees > 0:
             avg_codisp /= valid_trees
@@ -227,6 +228,26 @@ class RRCFDetector:
         """
         self._z_history.append(float(raw))
 
+        # How much of what this score needed was actually there.
+        #
+        # The two branches below return the same kind of number and are not the
+        # same claim. A 0.4 from the warm-up curve is a guessed sigmoid applied
+        # to a magnitude with almost no history behind it; a 0.4 from the
+        # percentile means "more extreme than 40% of the 256 observations this
+        # detector has seen". Nothing downstream could tell them apart, so a
+        # cold detector's opinion was ranked beside a warm one's -- which is the
+        # general form of a defect this audit has found repeatedly in the
+        # specific: the earnings surprise seeded with its own observation, the
+        # RRCF forest returning 0.0 when every tree had thrown, the conformal
+        # gate reporting `calibrated: True` while reproducing its own default.
+        #
+        # Recorded as state rather than returned, so no caller signature
+        # changes and a reader that does not ask is unaffected.
+        self._last_coverage = min(1.0, len(self._z_history) / float(FALLBACK_MIN_HISTORY))
+        self._last_basis = (
+            "percentile" if len(self._z_history) >= FALLBACK_MIN_HISTORY else "warmup_curve"
+        )
+
         if len(self._z_history) < FALLBACK_MIN_HISTORY:
             score = warmup_curve(raw)
         else:
@@ -237,6 +258,21 @@ class RRCFDetector:
         # that, and a detector reporting certainty leaves nothing to say when
         # something genuinely worse arrives.
         return round(min(FALLBACK_MAX_SCORE, max(0.0, score)), 4)
+
+    def coverage(self) -> dict:
+        """What backed the last score, alongside the score itself.
+
+        `fraction` is how much of the history the percentile wants was
+        available; `basis` says which of the two estimators produced the
+        number. A consumer ranking two detectors, or deciding whether to spend
+        an inference on one, can finally tell a measurement from a warm-up.
+        """
+        return {
+            "fraction": round(float(getattr(self, "_last_coverage", 0.0)), 4),
+            "basis": getattr(self, "_last_basis", "none"),
+            "samples": len(getattr(self, "_z_history", ())),
+            "target_samples": FALLBACK_MIN_HISTORY,
+        }
 
     def _insert_fallback(self, point: np.ndarray) -> float:
         """Z-score fallback when rrcf is not installed."""
@@ -1081,8 +1117,8 @@ class BGPGraphFeatureExtractor:
                 degree = float(res[0]["degree"])
                 # Normalize: a Tier-1 AS has ~500+ peers, normalize by log
                 features["degree"] = min(1.0, math.log(1 + degree) / math.log(500))
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.streaming_detectors._query_graph_features", _exc, logger)
 
         # 2. Path novelty: has this (AS, prefix) pair been seen before?
         try:
@@ -1099,8 +1135,8 @@ class BGPGraphFeatureExtractor:
             else:
                 # Never seen this AS announce this prefix — high novelty (hijack signal)
                 features["path_novelty"] = 1.0
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.streaming_detectors._query_graph_features", _exc, logger)
 
         # 3. Betweenness centrality (if GDS is available)
         if self._has_gds is None:
@@ -1141,8 +1177,8 @@ class BGPGraphFeatureExtractor:
             if res:
                 logger.info(f"Neo4j GDS detected: {res[0].get('version')}")
                 return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.streaming_detectors._check_gds_available", _exc, logger)
         return False
 
     @staticmethod
@@ -1156,8 +1192,8 @@ class BGPGraphFeatureExtractor:
             if "/" in prefix:
                 cidr = int(prefix.split("/")[1])
                 return min(1.0, cidr / 24.0)
-        except (ValueError, IndexError):
-            pass
+        except (ValueError, IndexError) as _exc:
+            swallowed("utils.streaming_detectors._prefix_specificity", _exc, logger)
         return 0.5
 
 

@@ -35,6 +35,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 logger = setup_sentinel_logging("collector.crypto", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
@@ -299,8 +300,8 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
                     funding_stats_cache[symbol] = {"mean": new_mean, "var": new_var}
 
                     is_extreme = abs(z) >= FUNDING_ZSCORE_TRIGGER
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("collector_crypto.on_message", _exc)
 
                 # Only emit Kafka events for extreme funding rates to avoid flooding
                 if is_extreme:

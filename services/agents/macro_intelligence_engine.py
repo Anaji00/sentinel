@@ -22,12 +22,13 @@ import time
 import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from services.agents.base import _as_probability_value, SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_SLOW_SEC, DEDUP_WINDOW_MEDIUM_SEC
 from shared.kafka import Topics
+from shared.utils.regime import stamp as regime_stamp
 from shared.utils import quant_calc
 from shared.utils.tasks import safe_create_task
 from shared.db import get_neo4j
@@ -68,11 +69,25 @@ RATES_RETRY_COOLDOWN_SEC = 300
 
 
 class RatesRegimeBrief(BaseModel):
-    curve_state: str  # "Inverted", "Disinverted", "Normal Steepening", "Flat"
+    # Constrained, so the decoder enforces it instead of the comment asking.
+    #
+    # Both of these were bare strings with their permitted values written in a
+    # comment beside them, and both were filled with something else. Live:
+    # curve_state held "2Y Yield: 4.390% | 10Y Yield: 4.800%" -- a rendered
+    # sentence -- and credit_spread_widening_signal held "crypto". A field
+    # declared as one of four values and holding free text is not a
+    # classification; it is a place a model wrote whatever it liked, and
+    # earlier in this audit a direction signal was derived by searching one of
+    # them for a word.
+    #
+    # Passed to Ollama as `format`, a Literal becomes a decoding grammar rather
+    # than a request -- the same change that took FinancialAdviceBrief from
+    # failing every attempt to succeeding.
+    curve_state: Literal["Inverted", "Disinverted", "Normal Steepening", "Flat"]
     yield_spread_2y10y_bps: float
     breakeven_inflation_bps: float
     tips_yield: float
-    credit_spread_widening_signal: str  # "Stable", "Moderate Widening", "Severe Stress"
+    credit_spread_widening_signal: Literal["Stable", "Moderate Widening", "Severe Stress"]
     regime_summary: str
     macro_risk_level: str  # "LOW", "ELEVATED", "CRITICAL"
     recommended_hedging: List[str] = Field(default_factory=list)
@@ -453,9 +468,20 @@ class MacroIntelligenceEngine(SentinelAgent):
                 },
             }
 
-            # Cache latest rates regime for shared swarm context
-            await self.redis.raw.set("sentinel:macro:rates_regime:latest", json.dumps(res_payload["brief"]), ex=86400)
-            await self.redis.raw.set("sentinel:macro:latest_rates_regime", json.dumps(res_payload["brief"]), ex=86400)
+            # Cache latest rates regime for shared swarm context.
+            #
+            # Stamped with a derived `regime` before it is written. Every reader
+            # of this key looked for `regime`, `rates_regime` or `state`, and
+            # RatesRegimeBrief defines none of them -- so the lookup returned
+            # "unknown" on every call since it was written and the
+            # regime-partitioned scorecards behind it never partitioned
+            # anything. Derived from the measured 2s10s spread rather than
+            # parsed out of `curve_state`, which is declared as four values and
+            # live holds "2Y Yield: 4.390% | 10Y Yield: 4.800%".
+            _cached = regime_stamp(res_payload["brief"])
+            res_payload["brief"] = _cached
+            await self.redis.raw.set("sentinel:macro:rates_regime:latest", json.dumps(_cached), ex=86400)
+            await self.redis.raw.set("sentinel:macro:latest_rates_regime", json.dumps(_cached), ex=86400)
 
             # Publish structured AgentBulletin for Consensus Engine
             # The 2s10s spread is in this same object, computed from measured

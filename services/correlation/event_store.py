@@ -12,9 +12,13 @@ All queries are parameterized. The only f-string interpolation is the safe
 import time
 import json
 import logging
-from typing import List, Dict, Optional, Any
+from datetime import timezone
+from typing import Any, Dict, List, Optional, Sequence
 
 from shared.db import get_timescale
+from shared.utils.metrics import MetricsCollector
+from shared.models.events import event_domain as canonical_domain
+from shared.models.events import resolve_event_domain
 
 logger = logging.getLogger("correlation.store")
 
@@ -81,6 +85,75 @@ def _select_diverse_evidence(ranked: list, limit: int) -> list:
     return selected
 
 
+# How far ahead of now an event may claim to have happened.
+#
+# Clock skew between a collector host and this one is real and small; anything
+# beyond this is a parsing error or a fabricated timestamp.
+FUTURE_TOLERANCE_SEC = 300.0
+
+# How far behind now an event may be and still be worth caching. The correlation
+# window is 48 hours, so anything older cannot participate in a rule anyway.
+MAX_BACKDATE_SEC = 7 * 24 * 3600.0
+
+# Writes between sliding-window prunes. The window moves by seconds and the
+# structure holds hundreds of thousands of members; pruning per write spent a
+# ZREMRANGEBYSCORE on every ingested event to remove almost nothing.
+PRUNE_EVERY_N_WRITES = 250
+
+# Correlations that could not be written to the database, kept so a transient
+# outage does not destroy findings the engine has already moved past.
+FAILED_CORRELATIONS_KEY = "sentinel:correlations:failed"
+FAILED_CORRELATIONS_MAX = 5000
+
+
+def _sane_epoch(occurred_at, event_id=None):
+    """A UTC epoch for an event, or None if the timestamp cannot be trusted.
+
+    Two failures this guards against, both of which poison the sorted set that
+    every correlation window is read from.
+
+    A naive datetime silently takes the host's local offset when `.timestamp()`
+    is called, so the same event ingested on two differently-configured hosts
+    lands hours apart. Naive input is read as UTC here, which is what every
+    collector actually means.
+
+    And a timestamp far in the future is never evicted by a sliding window that
+    prunes from below, so one bad value occupies rank 0 of a descending read
+    permanently and is served as the newest evidence to every rule that queries
+    the window.
+
+    Rejected rather than clamped: clamping invents a time the event did not
+    happen at, and the event is still in the database and the Kafka log -- only
+    the correlation cache declines it.
+    """
+    if occurred_at is None:
+        return None
+    try:
+        dt = occurred_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        epoch = dt.timestamp()
+    except (AttributeError, ValueError, OSError, OverflowError) as e:
+        logger.warning("Unusable occurred_at on event %s: %s", event_id, e)
+        MetricsCollector.increment("event_store_timestamp_unusable_total")
+        return None
+
+    now = time.time()
+    if epoch > now + FUTURE_TOLERANCE_SEC:
+        logger.warning(
+            "Event %s claims to occur %.0fs in the future; not cached. A future "
+            "timestamp is never evicted by a sliding window and would be served "
+            "as the newest evidence indefinitely.",
+            event_id, epoch - now,
+        )
+        MetricsCollector.increment("event_store_timestamp_future_total")
+        return None
+    if epoch < now - MAX_BACKDATE_SEC:
+        MetricsCollector.increment("event_store_timestamp_stale_total")
+        return None
+    return epoch
+
+
 class EventStore:
 
     def __init__(self, redis_client, db_client):
@@ -113,11 +186,22 @@ class EventStore:
             if (event.anomaly_score or 0.0) < RECENT_WINDOW_MIN_ANOMALY:
                 return
 
-            timestamp = event.occurred_at.timestamp()
+            timestamp = _sane_epoch(event.occurred_at, event.event_id)
+            if timestamp is None:
+                return
             payload = json.dumps({
                 "event_id": event.event_id,
                 "type": event.type.value,
-                "domain": event.type.value.split("_")[0],
+                # Canonical, so the Hawkes history loader and the correlation
+                # engine agree about what domain this event was.
+                "domain": resolve_event_domain(event),
+                # Carried so the correlation layer can ask whether its evidence
+                # is independent. Without it, breadth counts events and cannot
+                # tell three reports from one collector apart from three
+                # collectors agreeing -- and measured over 24 hours, 1,601 of
+                # 1,632 clusters drew every supporting event from a single
+                # source.
+                "source": getattr(event, "source", None),
                 "anomaly_score": event.anomaly_score,
                 "tags": event.tags,
                 "region": event.region,
@@ -137,10 +221,35 @@ class EventStore:
             await self._redis.zadd(self.cache_key, {payload: timestamp})
 
             # Sliding Window Maintenance
-            cutoff = time.time() - self.window_seconds
-            await self._redis.raw.zremrangebyscore(self.cache_key, "-inf", cutoff)
+            #
+            # Pruned from both ends, and not on every write.
+            #
+            # The old cleanup was `zremrangebyscore(key, "-inf", cutoff)` on
+            # every add_event. It only removed from below, so an event dated in
+            # the future was never evicted -- and because the window is read
+            # with desc=True, a single bad timestamp sat at rank 0 permanently
+            # and was returned first as the "most recent" evidence for every
+            # rule, forever. The forward sweep is what makes that recoverable
+            # for anything already stored.
+            #
+            # Running both on every write also meant a ZREMRANGEBYSCORE per
+            # ingested event against a structure holding hundreds of thousands
+            # of members. The window moves by seconds; pruning it every
+            # PRUNE_EVERY_N_WRITES is the same window with a fraction of the work.
+            self._writes_since_prune += 1
+            if self._writes_since_prune >= PRUNE_EVERY_N_WRITES:
+                self._writes_since_prune = 0
+                now = time.time()
+                pipe = self._redis.raw.pipeline()
+                pipe.zremrangebyscore(self.cache_key, "-inf", now - self.window_seconds)
+                pipe.zremrangebyscore(self.cache_key, now + FUTURE_TOLERANCE_SEC, "+inf")
+                await pipe.execute()
         except Exception as e:
-            logger.error(f"EventStore.add_event to redis cache failed: {e}")
+            # An event that never reaches the cache cannot be correlated with
+            # anything. Counted so a rising drop rate is visible rather than
+            # inferred from correlations that stopped appearing.
+            logger.error("EventStore.add_event to redis cache failed: %s", e, exc_info=True)
+            MetricsCollector.increment("pipeline_errors_total:event_store_add")
             
 
     async def get_recent(
@@ -153,6 +262,9 @@ class EventStore:
         tags:        List[str] = None,
         limit:       int   = 50,
         entity_id:   Optional[str] = None,
+        exclude_types: Optional[Sequence[str]] = None,
+        after_epoch:   Optional[float] = None,
+        before_epoch:  Optional[float] = None,
     ) -> List[Dict]:
         """Fetch historical events instantly from RAM instead of Postgres."""
 
@@ -229,6 +341,25 @@ class EventStore:
                     # this the rule correlated an AAPL block with whatever else
                     # had traded in 48 hours, and published the result headlined
                     # AAPL over supporting evidence reading MTZ, KKR and DELL.
+                    # Filtered here, not by the caller after truncation.
+                    #
+                    # get_recent sorts by anomaly score and keeps the top 50.
+                    # The caller then stripped position telemetry and applied
+                    # the rule's temporal bound to whatever survived -- so if
+                    # the fifty highest-scoring events in the window were all
+                    # vessel position fixes, the rule saw no evidence at all
+                    # while qualifying events sat below the cut. A rule that
+                    # excludes a noisy type was therefore most likely to find
+                    # nothing precisely when that type was busiest.
+                    if exclude_types and str(e.get("type", "")) in exclude_types:
+                        continue
+                    ts = e.get("occurred_at_epoch")
+                    if ts is not None:
+                        if after_epoch is not None and float(ts) < after_epoch:
+                            continue
+                        if before_epoch is not None and float(ts) > before_epoch:
+                            continue
+
                     if entity_id and str(e.get("entity_id") or "").upper() != entity_id:
                         continue
                     if region and e.get("region") != region:
@@ -308,4 +439,33 @@ class EventStore:
             )
             logger.info(f"💾 Persisted correlation {cluster.correlation_id} to TimescaleDB.")
         except Exception as e:
-            logger.error(f"save_correlation failed ({cluster.correlation_id}): {e}")
+            # Logged with a traceback, counted, and kept.
+            #
+            # The previous handler logged one line and returned. That is not
+            # silence, but it is not recoverable either: a correlation that
+            # fails to persist is gone -- the engine has already moved on, and
+            # nothing retries it -- so a database in trouble loses every finding
+            # it produces while the service reports healthy throughput.
+            #
+            # The cluster is parked in Redis so it can be replayed, and the
+            # counter is what a monitor can alert on. A single failure is
+            # ordinary; a rising count means findings are being dropped.
+            logger.error(
+                "save_correlation failed (%s): %s", cluster.correlation_id, e, exc_info=True
+            )
+            MetricsCollector.increment("pipeline_errors_total:correlation_persist")
+            try:
+                raw = getattr(self._redis, "raw", self._redis)
+                await raw.lpush(
+                    FAILED_CORRELATIONS_KEY,
+                    json.dumps(cluster.model_dump(mode="json") if hasattr(cluster, "model_dump") else str(cluster), default=str),
+                )
+                await raw.ltrim(FAILED_CORRELATIONS_KEY, 0, FAILED_CORRELATIONS_MAX - 1)
+            except Exception as park_err:
+                # Both stores unavailable. Nothing further can be done here, but
+                # it is said plainly rather than swallowed.
+                logger.error(
+                    "Correlation %s could not be persisted or parked: %s",
+                    cluster.correlation_id, park_err,
+                )
+                MetricsCollector.increment("pipeline_errors_total:correlation_lost")

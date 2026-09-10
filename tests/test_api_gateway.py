@@ -25,17 +25,40 @@ from shared.utils.equities import parse_occ_option_symbol
 
 # ── 1. API GATEWAY METRICS & AUTH TEST ───────────────────────────────────────
 
-def test_api_gateway_metrics_endpoints_bypass_auth():
+def test_api_gateway_metrics_endpoints_require_a_credential(monkeypatch):
+    """Metrics are operational intelligence, not a public page.
+
+    This test used to assert the opposite -- that /metrics and /metrics/json
+    returned 200 with no credential -- and so pinned the exposure in place.
+    Those endpoints publish per-service throughput, queue depth, error counts,
+    model latency and the platform's own detection rates: a live map of what is
+    running, what is failing and what is being noticed.
+
+    A scrape token keeps Prometheus working, because a scraper cannot present a
+    session cookie. With no METRICS_TOKEN configured the endpoints fall through
+    to the ordinary API-key check rather than opening up.
+    """
+    import services.api_gateway.dependencies as deps
+
+    monkeypatch.setattr(deps, "METRICS_TOKEN", "scrape-secret")
     client = TestClient(app)
-    res_metrics = client.get("/metrics")
-    assert res_metrics.status_code == 200
 
-    res_json = client.get("/metrics/json")
-    assert res_json.status_code == 200
-    assert isinstance(res_json.json(), dict)
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics/json").status_code == 401
 
-    res_health_metrics = client.get("/api/v1/health/metrics")
-    assert res_health_metrics.status_code == 200
+    ok = client.get("/metrics", headers={"X-Metrics-Token": "scrape-secret"})
+    assert ok.status_code == 200
+
+    ok_json = client.get("/metrics/json", headers={"X-Metrics-Token": "scrape-secret"})
+    assert ok_json.status_code == 200
+    assert isinstance(ok_json.json(), dict)
+
+    # A wrong token is not a missing one.
+    assert client.get("/metrics", headers={"X-Metrics-Token": "wrong"}).status_code == 401
+
+    # Liveness stays open: a probe needing a credential fails during a
+    # credential outage.
+    assert client.get("/api/v1/health/metrics").status_code == 200
 
 def test_api_gateway_protected_endpoint_requires_auth():
     client = TestClient(app)

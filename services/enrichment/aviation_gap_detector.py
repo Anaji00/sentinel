@@ -17,6 +17,7 @@ from typing import Optional, List, Dict
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.utils.heartbeat import is_component_healthy
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("enrichment.aviation_gap_detector")
 
@@ -261,8 +262,8 @@ class AviationGapDetector:
                     # reported as the new event it is.
                     try:
                         await self.redis.raw.hdel(self._seen_key, dedup_key)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("enrichment.aviation_gap_detector._process_batch", _exc, logger)
                     continue
 
                 # Marked seen only once an event is actually emitted, not here.
@@ -275,8 +276,8 @@ class AviationGapDetector:
                 try:
                     if await self.redis.raw.hexists(self._seen_key, dedup_key):
                         continue
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("enrichment.aviation_gap_detector._process_batch", _exc, logger)
                 
                 # How unusual is this silence, for this airspace?
                 samples = region_samples.get(region, [])

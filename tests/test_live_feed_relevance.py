@@ -121,7 +121,19 @@ def test_a_non_dict_result_is_handled():
 def test_both_publishers_apply_the_same_rule():
     """Two sites broadcasting on different rules is how one gets forgotten."""
     source = (ROOT / "services" / "enrichment" / "main.py").read_text(encoding="utf-8")
-    assert source.count("worth_broadcasting(") >= 2
+    # One publisher, applying the rule.
+    #
+    # This asserted the call appeared at least twice, which pinned the presence
+    # of TWO publishers on sentinel:events:live -- one per event during fan-out
+    # and one over the whole batch after the database write. Both were live and
+    # both were gated on this rule, so every event a subscriber cared about was
+    # delivered twice and anything counting them counted double. The duplicate
+    # is gone; what must hold is that the surviving publisher still gates on
+    # the rule rather than broadcasting everything.
+    assert source.count('publish("sentinel:events:live"') == 1, (
+        "exactly one publisher should write to the live feed"
+    )
+    assert source.count("worth_broadcasting(") >= 1
 
 
 def test_agents_decline_rather_than_invent_a_summary():

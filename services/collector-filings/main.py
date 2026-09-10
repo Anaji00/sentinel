@@ -41,6 +41,7 @@ from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 try:
     from thirteen_f import (
@@ -217,8 +218,8 @@ async def get_cik_for_ticker(ticker: str, redis_client) -> Optional[str]:
                 cik = cached_cik.decode("utf-8") if isinstance(cached_cik, bytes) else str(cached_cik)
                 await _remember_cik(redis_client, t_clean, cik)
                 return cik
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("collector_filings.get_cik_for_ticker", _exc)
 
     return None
 
@@ -456,8 +457,8 @@ async def main():
                             sym = t.decode("utf-8") if isinstance(t, bytes) else str(t)
                             if sym not in tickers:
                                 tickers.append(sym)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("collector_filings.main", _exc)
 
                 tasks = []
                 for ticker in tickers:

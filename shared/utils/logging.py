@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from typing import Dict, Optional, Any
+from shared.utils.quiet_failures import swallowed
 
 # ANSI Color Codes
 RESET = "\033[0m"
@@ -50,8 +51,8 @@ class SentinelConsoleFormatter(logging.Formatter):
         if record.args:
             try:
                 msg = msg % record.args
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("utils.logging.format", _exc)
 
         # Highlight key action tokens
         if "DISCARD" in msg or "REJECTED" in msg or "BLOCK" in msg:

@@ -24,12 +24,58 @@ from typing import Any, Dict, Optional, Type, Union
 import aiohttp
 from pydantic import BaseModel, ValidationError
 from shared.utils.metrics import MetricsCollector
+from shared.utils.quiet_failures import swallowed
  
 logger = logging.getLogger("sentinel.ollama")
+
+# Wall-clock budget for one inference request including every fallback hop.
+# Shared across the chain rather than renewed per model.
+INFERENCE_CHAIN_DEADLINE_SEC = float(os.getenv("INFERENCE_CHAIN_DEADLINE_SEC", "900"))
+
+# Default lifetime of a cached model response. Deliberately short: most prompts
+# here describe market or telemetry conditions that move within minutes.
+LLM_CACHE_TTL_SEC = int(os.getenv("LLM_CACHE_TTL_SEC", "300"))
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
-OLLAMA_MODEL   = os.getenv("AGENT_MODEL", "qwen2.5:7b")
+DEFAULT_MODEL_NAME = "qwen2.5:1.5b"
+# Default is what the tiers actually run. "qwen2.5:7b" was a 4.7 GB image
+# against a 4.5 GB container limit -- unloadable, so any caller that reached
+# this default timed out rather than answering.
+OLLAMA_MODEL   = os.getenv("AGENT_MODEL", DEFAULT_MODEL_NAME)
 OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
+
+# Models this deployment is permitted to load, whatever `ollama list` returns.
+#
+# `_get_fallback_model` chose from every pulled tag, ranked "gemma" first, and
+# `_resolve_model` step 3 took `available[0]`. Both could reach llama3:latest
+# and qwen2.5:7b -- 4.7 GB images against the ollama container's 4.5 GB limit,
+# so the request cannot load, produces nothing, and pays the full 600 s client
+# timeout before the ladder moves on. main.py already says the heavy agents did
+# exactly this; the ladder that did it was never narrowed.
+#
+# Six models are pulled on this host and four of them fit. Listing the four is
+# the whole mechanism: an unloadable model is skipped at the point the choice is
+# made rather than discovered by timing out.
+OLLAMA_ALLOWED_MODELS = frozenset(
+    m.strip()
+    for m in os.getenv(
+        "OLLAMA_ALLOWED_MODELS", "qwen2.5:1.5b,qwen2.5:3b,gemma:2b,gemma3:1b"
+    ).split(",")
+    if m.strip()
+)
+
+
+def _permitted(models: list) -> list:
+    """Pulled models the allowlist admits, in the order given.
+
+    An empty allowlist means "no opinion" rather than "nothing allowed", so
+    clearing the env var restores the old behaviour instead of stopping every
+    inference.
+    """
+    if not OLLAMA_ALLOWED_MODELS:
+        return list(models)
+    return [m for m in models if m in OLLAMA_ALLOWED_MODELS]
+
 
 # How long ollama holds a model in RAM after a request. Mirrors the server-side
 # OLLAMA_KEEP_ALIVE so the client does not contradict it. Pinning permanently is
@@ -363,8 +409,8 @@ def _calling_site() -> str:
             if "/shared/utils/ollama.py" in name:
                 continue
             return f"{name.rsplit('/', 1)[-1]}:{frame.name}"
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("utils.ollama._calling_site", _exc, logger)
     return "unknown"
 
 
@@ -607,7 +653,10 @@ class OllamaClient:
                             return m
 
                     # 3. Fall back to an available non-excluded model if primary model tag is missing
-                    available = [m for m in models if m not in exclude and not self.is_circuit_open(m)]
+                    available = [
+                        m for m in _permitted(models)
+                        if m not in exclude and not self.is_circuit_open(m)
+                    ]
                     if available:
                         fallback = available[0]
                         logger.warning(
@@ -645,12 +694,12 @@ class OllamaClient:
                 
                 # Filter out models that failed, are excluded, or have open circuits
                 alternatives = [
-                    m for m in models 
+                    m for m in _permitted(models)
                     if m not in exclude and _base_name(m) not in exclude_bases and not self.is_circuit_open(m)
                 ]
                 if not alternatives:
                     # Fallback recovery: Retry previously visited models if their circuit is half-open / recovered!
-                    recovered = [m for m in models if not self.is_circuit_open(m)]
+                    recovered = [m for m in _permitted(models) if not self.is_circuit_open(m)]
                     if recovered:
                         logger.info(f"🔄 All fallbacks attempted. Retrying recovered previous model: '{recovered[0]}'")
                         return recovered[0]
@@ -679,6 +728,8 @@ class OllamaClient:
         fallback_model: Optional[str] = None,
         num_predict: Optional[int] = None,
         visited_models: Optional[set] = None,
+        deadline: Optional[float] = None,
+        cache_ttl: Optional[int] = None,
     ) -> BaseModel:
         """
         Run inference and validate output against a Pydantic schema.
@@ -687,6 +738,22 @@ class OllamaClient:
         visited = set(visited_models or [])
         active_model = model or self.model
         visited.add(active_model)
+
+        # One wall-clock budget for the whole chain.
+        #
+        # Each fallback hop was handed `max_retries` unchanged, so a three-model
+        # chain at three retries could make nine attempts, each with its own
+        # timeout, with nothing bounding the total. On a host where a single
+        # inference runs into the hundreds of seconds that is not a fallback,
+        # it is an outage held open by retries. Set at the outermost call and
+        # passed down, so the budget is shared rather than renewed.
+        if deadline is None:
+            deadline = time.monotonic() + INFERENCE_CHAIN_DEADLINE_SEC
+        if time.monotonic() >= deadline:
+            raise InferenceError(
+                f"Inference budget exhausted before '{active_model}' was tried "
+                f"({INFERENCE_CHAIN_DEADLINE_SEC:.0f}s across the model chain)."
+            )
 
         if self.is_circuit_open(active_model):
             target_fallback = fallback_model if (fallback_model and fallback_model not in visited) else None
@@ -704,6 +771,8 @@ class OllamaClient:
                     fallback_model=None,
                     num_predict=num_predict,
                     visited_models=visited,
+                    deadline=deadline,
+                    cache_ttl=cache_ttl,
                 )
             raise InferenceError(f"Circuit breaker OPEN for model '{active_model}'")
 
@@ -711,7 +780,24 @@ class OllamaClient:
         cache_key = None
         if self.redis_client is not None:
             try:
-                h = hashlib.sha256(f"{active_model}:{system_prompt}:{user_prompt}".encode("utf-8")).hexdigest()
+                # Everything that changes the answer is in the key.
+                #
+                # The key was model + system + user only, so a call asking for a
+                # different schema, a different temperature or a larger
+                # num_predict was served the earlier answer. Two of those are
+                # silent: a deliberately hotter sample returned the cached cold
+                # one, and a call that raised its token budget because the last
+                # reply was truncated received that same truncated reply back.
+                schema_name = getattr(schema, "__name__", str(schema))
+                schema_fields = ",".join(sorted(getattr(schema, "model_fields", {}) or {}))
+                h = hashlib.sha256(
+                    "|".join([
+                        active_model, system_prompt, user_prompt,
+                        schema_name, schema_fields,
+                        f"{float(temperature):.4f}",
+                        str(num_predict),
+                    ]).encode("utf-8")
+                ).hexdigest()
                 cache_key = f"sentinel:llm_cache:{h}"
                 cached_data = await self.redis_client.raw.get(cache_key)
                 if cached_data:
@@ -840,9 +926,20 @@ class OllamaClient:
 
                 if cache_key and self.redis_client is not None:
                     try:
-                        await self.redis_client.raw.set(cache_key, json.dumps(parsed), ex=3600)
-                    except Exception:
-                        pass
+                        # An hour is a long time in a market.
+                        #
+                        # Every response was cached for 3600s regardless of what
+                        # it was about, so an assessment of live conditions could
+                        # be served an hour after the conditions changed. The
+                        # default is now short; callers reasoning over something
+                        # slow-moving pass a longer cache_ttl explicitly, and
+                        # cache_ttl=0 disables caching for a prompt whose answer
+                        # must be current.
+                        ttl = LLM_CACHE_TTL_SEC if cache_ttl is None else int(cache_ttl)
+                        if ttl > 0:
+                            await self.redis_client.raw.set(cache_key, json.dumps(parsed), ex=ttl)
+                    except Exception as _exc:
+                        swallowed("utils.ollama.infer", _exc, logger)
 
                 return schema(**parsed)
                 
@@ -1176,21 +1273,21 @@ class OllamaClient:
                 return direct[0]
             if isinstance(direct, dict):
                 return direct
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as _exc:
+            swallowed("utils.ollama._extract_json", _exc, logger)
 
         stripped = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         try:
             return json.loads(stripped)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as _exc:
+            swallowed("utils.ollama._extract_json", _exc, logger)
 
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as _exc:
+                swallowed("utils.ollama._extract_json", _exc, logger)
 
         # Only a *top-level* array, anchored at the start of the response.
         #
@@ -1206,8 +1303,8 @@ class OllamaClient:
                     result = json.loads(match.group(0))
                     if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
                         return result[0]
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as _exc:
+                    swallowed("utils.ollama._extract_json", _exc, logger)
 
         return OllamaClient._repair_truncated_json(text)
 
@@ -1368,7 +1465,7 @@ class OllamaClient:
                 if isinstance(val, (str, float)):
                     try:
                         coerced[field_name] = int(float(val))
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        swallowed("utils.ollama._coerce_parsed_json", _exc, logger)
 
         return coerced

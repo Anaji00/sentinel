@@ -358,7 +358,15 @@ class NewsEnricher:
 
         is_threat = any(rx.search(combined_text) for rx in THREAT_REGEXES)
         if is_threat:
-            anomaly = min(1.0, max(0.80, anomaly + 0.35))
+            # The same bound as the sanctions floor three lines above.
+            #
+            # That one was corrected to FALLBACK_MAX_SCORE and this identical
+            # adjacent branch was missed, so any headline matching a threat
+            # regex with an anomaly at or above 0.65 landed on exactly 1.000 --
+            # and it runs after the sanctions floor, overwriting it. Nine
+            # headlines were sitting at certainty, all of them Iran/UN Security
+            # Council wire copy matching both branches.
+            anomaly = min(FALLBACK_MAX_SCORE, max(0.80, anomaly + 0.35))
 
         anomaly = round(anomaly, 3)
 

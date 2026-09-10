@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timezone
 """
 shared/utils/entity_resolution.py
 
@@ -39,11 +41,15 @@ suggest_merges() for a human to confirm, and never applied automatically.
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("shared.entity_resolution")
 
 # Recorded aliases: an arbitrary spelling to the canonical key it resolves to.
 ALIAS_KEY = "sentinel:entities:alias"
+# Who asserted each merge, how sure, and when -- so a wrong link is
+# traceable to the decision that made it.
+ALIAS_PROVENANCE_KEY = "sentinel:entities:alias_provenance"
 
 # The display name last seen for a canonical key, so resolving does not cost the
 # readable form. The graph stores the canonical id; people read the name.
@@ -265,8 +271,8 @@ async def _remember_display(raw_redis: Any, canonical: str, seen_as: str) -> Non
     """Keeps the most recent readable spelling for a canonical key."""
     try:
         await raw_redis.hset(DISPLAY_KEY, canonical, seen_as)
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("utils.entity_resolution._remember_display", _exc, logger)
 
 
 async def display_name(redis_client: Any, canonical: str) -> str:
@@ -278,16 +284,38 @@ async def display_name(redis_client: Any, canonical: str) -> str:
         value = await raw_redis.hget(DISPLAY_KEY, canonical)
         if value:
             return value.decode() if isinstance(value, bytes) else str(value)
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("utils.entity_resolution.display_name", _exc, logger)
     return canonical
 
 
-async def record_alias(redis_client: Any, alias: Any, canonical: Any) -> bool:
+async def record_alias(
+    redis_client: Any,
+    alias: Any,
+    canonical: Any,
+    *,
+    source: str = "unknown",
+    confidence: float = 1.0,
+) -> bool:
     """Records that `alias` names the same subject as `canonical`.
 
     Explicit and permanent: this is the top of the resolution order precisely
     so that being told beats being inferred.
+
+    Provenance travels with the merge. Identity is the backbone of cross-domain
+    correlation -- the platform's central premise is worth exactly as much as
+    its ability to know two mentions are the same subject -- and this layer has
+    been the fragile one throughout: one instrument occupied three graph nodes,
+    an AS registrant became the named subject of a correlation so a law firm
+    appeared as an actor, and entity folds collapsed distinct companies onto
+    shared keys until they were repaired. Every one of those was a merge, and
+    none of them recorded who made it or how sure they were.
+
+    A wrong link should be traceable to the decision that caused it rather than
+    appearing as an inexplicable claim, so `source` says who asserted it and
+    `confidence` how strongly. Neither is consulted at resolution time -- an
+    alias that exists is still authoritative -- they exist so a bad merge can be
+    found and attributed after the fact.
     """
     if not redis_client or alias is None or canonical is None:
         return False
@@ -296,6 +324,10 @@ async def record_alias(redis_client: Any, alias: Any, canonical: Any) -> bool:
     if not alias_s or not canon_s or alias_s == canon_s:
         return False
     try:
+        conf = min(1.0, max(0.0, float(confidence)))
+    except (TypeError, ValueError):
+        conf = 1.0
+    try:
         raw_redis = getattr(redis_client, "raw", redis_client)
         await raw_redis.hset(ALIAS_KEY, alias_s, canon_s)
         # And the fold of the alias, so a differently-punctuated form of the
@@ -303,10 +335,47 @@ async def record_alias(redis_client: Any, alias: Any, canonical: Any) -> bool:
         fold = canonical_key(alias_s)
         if fold and fold != alias_s:
             await raw_redis.hset(ALIAS_KEY, fold, canon_s)
+        await _record_alias_provenance(raw_redis, alias_s, canon_s, str(source), conf)
         return True
     except Exception as e:
         logger.debug("Could not record alias %r -> %r: %s", alias, canonical, e)
         return False
+
+
+async def _record_alias_provenance(
+    raw_redis: Any, alias: str, canonical: str, source: str, confidence: float
+) -> None:
+    """Who asserted this merge, how sure, and when. Best effort."""
+    try:
+        await raw_redis.hset(
+            ALIAS_PROVENANCE_KEY,
+            f"{alias}->{canonical}",
+            json.dumps({
+                "source": source,
+                "confidence": round(confidence, 4),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }),
+        )
+    except Exception as e:
+        swallowed("utils.entity_resolution.alias_provenance_write", e, logger, detail=str(alias))
+
+
+async def alias_provenance(redis_client: Any, alias: Any, canonical: Any) -> Optional[dict]:
+    """How a recorded merge came to be, or None if nothing was recorded."""
+    if not redis_client or alias is None or canonical is None:
+        return None
+    try:
+        raw_redis = getattr(redis_client, "raw", redis_client)
+        blob = await raw_redis.hget(
+            ALIAS_PROVENANCE_KEY,
+            f"{str(alias).strip().upper()}->{canonical_key(canonical)}",
+        )
+        if not blob:
+            return None
+        return json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
+    except Exception as e:
+        swallowed("utils.entity_resolution.alias_provenance_read", e, logger)
+        return None
 
 
 # ── Merge candidates: proposed, never applied ────────────────────────────────

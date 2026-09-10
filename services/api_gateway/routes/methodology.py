@@ -20,6 +20,15 @@ class MethodologyParameter(BaseModel):
     symbol: str
     description: str
     default_value: str
+    # Whether this parameter is learned from live data or fixed in code.
+    #
+    # A published fixed threshold is a specification of what to stay under, for
+    # a platform whose product is noticing behaviour. A learned one moves with
+    # the distribution it is drawn from, so knowing today's value buys much
+    # less. Saying which is which is the honest half of that: a reader can tell
+    # a constant an adversary can plan against from a quantile that will have
+    # moved by the time they act.
+    is_learned: bool = False
     calibration_method: str
 
 
@@ -104,8 +113,14 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 name="Lag Horizon",
                 symbol=r"p",
                 description="Optimal lag order determined by Akaike Information Criterion (AIC)",
-                default_value="3 periods",
-                calibration_method="Minimized AIC over lag grid [1, 10]",
+                default_value="selected per pair",
+                # BIC, not AIC. The lag was chosen by the smallest p-value over
+                # the grid until this audit replaced it -- selection over a
+                # family reported as a single test, measured at 12.5% false
+                # positives on white noise and 22.5% on random walks against a
+                # nominal 5%. The replacement selects by BIC.
+                calibration_method="Minimised BIC over the lag grid, on differenced series where an ADF test finds a unit root",
+                is_learned=True,
             ),
         ],
         data_inputs=["tradfi_bars:continuous_aggregates", "graph_topology:candidate_pairs"],
@@ -135,8 +150,23 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 name="Branching Ratio",
                 symbol=r"\eta",
                 description="Average number of secondary daughter events triggered by an initial parent event",
-                default_value="0.65",
-                calibration_method="Fitted via EM algorithm on historical event logs",
+                # Not 0.65, and not EM.
+                #
+                # Nothing in this codebase fits a Hawkes process by
+                # expectation-maximisation -- the estimator is L-BFGS-B
+                # maximum likelihood with analytic gradients, and the ratio is
+                # estimated per ordered domain pair rather than held as a
+                # constant. Publishing a method the code does not perform is
+                # the same defect as the "5-year rolling backtests" claim
+                # corrected on this endpoint earlier in this audit, and it
+                # survived that pass.
+                default_value="estimated per domain pair; no fixed default",
+                calibration_method=(
+                    "L-BFGS-B maximum likelihood on the multivariate exponential "
+                    "Hawkes log-likelihood, with non-negativity bounds and a "
+                    "stationarity projection on the branching matrix"
+                ),
+                is_learned=True,
             ),
         ],
         data_inputs=["events.enriched:all_domains", "redis:hawkes_tracker"],
@@ -197,7 +227,10 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 name="Hard Position Clamp",
                 symbol=r"K_{\text{max}}",
                 description="Maximum allowable position size as a percentage of total equity",
-                default_value="15.0%",
+                # 10%, which is what MAX_SINGLE_POSITION_PCT holds. This said
+                # 15.0% -- a risk-governance hard rule published at one number
+                # and enforced at another. A test now pins the two together.
+                default_value="10.0%",
                 calibration_method="Platform risk governance hard rule",
             ),
         ],

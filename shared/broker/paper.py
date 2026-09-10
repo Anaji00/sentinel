@@ -20,6 +20,7 @@ from shared.broker.base import (
     OrderType,
     OrderStatus,
 )
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("broker.paper")
 
@@ -94,8 +95,8 @@ class PaperBroker(BrokerInterface):
                 if quote_raw:
                     quote_data = json.loads(quote_raw.decode("utf-8") if isinstance(quote_raw, bytes) else str(quote_raw))
                     base_price = float(quote_data.get("price") or quote_data.get("close") or quote_data.get("last") or 0.0)
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("broker.paper.submit_order", _exc, logger)
 
         if not base_price or base_price <= 0:
             raise ValueError(f"Cannot execute paper order for {sym}: missing limit_price, estimated_market_price, or live quote.")

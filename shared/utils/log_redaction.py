@@ -41,6 +41,7 @@ REDACTED = "***REDACTED***"
 # a parallel fragment list here drifted immediately -- it missed
 # API_GATEWAY_KEY, because that name does not contain the substring "API_KEY".
 from shared.utils.secrets import is_sensitive_key
+from shared.utils.quiet_failures import swallowed
 
 # Additional names that hold a credential without matching the shared patterns.
 EXTRA_SENSITIVE_NAMES = ("DSN", "DATABASE_URL", "REDIS_URL", "NEO4J_URI")
@@ -167,11 +168,11 @@ class RedactingFilter(logging.Filter):
                     except Exception:
                         # Some exception types reject single-string construction.
                         record.exc_info = (record.exc_info[0], RuntimeError(cleaned), record.exc_info[2])
-        except Exception:
+        except Exception as _exc:
             # A failure here must never suppress the log record itself: losing
             # the line is worse than an unredacted one, and re-raising inside a
             # filter can take down the emitting call site.
-            pass
+            swallowed("utils.log_redaction.filter", _exc)
         return True
 
 

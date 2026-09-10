@@ -27,6 +27,7 @@ from services.enrichment.anomaly_scorer import lift_score
 from shared.utils.materiality import apply_materiality, move_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
+from shared.utils.quiet_failures import swallowed, dropped
 logger = logging.getLogger("enrichment.crypto")
 
 
@@ -96,8 +97,8 @@ def _implied_price(notional_usd: float, token_amount: float) -> float:
     try:
         if token_amount and token_amount > 0:
             return round(float(notional_usd) / float(token_amount), 8)
-    except (TypeError, ValueError, ZeroDivisionError):
-        pass
+    except (TypeError, ValueError, ZeroDivisionError) as _exc:
+        swallowed("enrichment.enrichers.crypto._implied_price", _exc, logger)
     return 0.0
 
 
@@ -197,7 +198,23 @@ class CryptoEnricher:
         for raw in events:
             p, source = raw.raw_payload, raw.source
             trade_type = p.get("trade_type", "")
-            if source == "ethereum_rpc":
+            # Any chain, not one chain.
+            #
+            # The collector watches three -- RPC_FALLBACKS holds ethereum,
+            # arbitrum and base -- and stamps `source=f"{chain}_rpc"`. This
+            # matched the literal "ethereum_rpc", so two of the three had every
+            # whale transfer discarded on arrival. Measured live by the
+            # unrouted-source counter: **8,081 dropped in 28 minutes**, against
+            # 8,320 ethereum transfers stored in two hours and zero from the
+            # other two chains, at a $250,000 whale threshold.
+            #
+            # Third instance of this defect in this audit. Equity bars were
+            # thrown away for as long as only `finnhub_equities` was routed, and
+            # the OKX funding poller's output vanished because the branch named
+            # a venue rather than the thing it was matching. Matching the shape
+            # is what stops a fourth chain repeating it: the enricher reads
+            # wallets, asset and notional and is chain-agnostic already.
+            if source.endswith("_rpc"):
                 other_tasks.append(self._enrich_whale_transfer(raw, p))
             elif source == "binance_futures" and trade_type == "LIQUIDATION":
                 other_tasks.append(self._enrich_liquidation(raw, p))
@@ -213,6 +230,14 @@ class CryptoEnricher:
                 spot_trades.append((raw, p))
             elif source == "coinbase_candles":
                 other_tasks.append(self._enrich_candle(raw, p))
+            else:
+                # The loop had no else, so an event matching no branch was
+                # neither enriched nor recorded -- it just left the iteration.
+                dropped(
+                    "enrichment.crypto.unrouted_source",
+                    f"no branch for source={source!r} trade_type={trade_type!r}",
+                    logger,
+                )
             
         results = await asyncio.gather(*other_tasks, return_exceptions=True) if other_tasks else []
         
@@ -504,8 +529,8 @@ class CryptoEnricher:
                 raw_oi = await self.redis.raw.get(f"sentinel:crypto:oi:{asset}")
                 if raw_oi:
                     oi_value = float(raw_oi)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.crypto._enrich_funding_rate", _exc, logger)
 
         direction = "positive" if funding_rate > 0 else "negative"
         annualized_carry = abs(funding_rate) * 3 * 365 * 100  # 8h periods * 365 days * 100%
@@ -625,8 +650,8 @@ class CryptoEnricher:
             if funding_raw:
                 fd = json.loads(funding_raw)
                 latest_price = float(fd.get("mark_price", 0))
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.crypto._enrich_open_interest", _exc, logger)
 
         # A saturating ramp, not a cliff.
         #
@@ -995,8 +1020,8 @@ class CryptoEnricher:
                 if oi_raw:
                     oi_value = float(oi_raw)
                     break
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.crypto._enrich_liquidation", _exc, logger)
 
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 

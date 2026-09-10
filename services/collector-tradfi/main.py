@@ -47,6 +47,7 @@ from shared.utils.logging import setup_sentinel_logging
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 
 # What counts as a block, per instrument rather than per market.
 #
@@ -866,8 +867,8 @@ async def _option_trade_is_new(redis_client, contract: str, fingerprint: str) ->
                     return False
             await redis_client.raw.set(key, fingerprint, ex=_OPTION_FINGERPRINT_TTL_SEC)
             return True
-        except Exception:
-            pass    # fall through to the process-local map
+        except Exception as _exc:
+            swallowed("collector_tradfi._option_trade_is_new", _exc)
 
     if _last_option_trade.get(contract) == fingerprint:
         return False
@@ -1236,8 +1237,8 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                                 logger.debug(f"Earnings watchlist inject: {symbol} (mcap ${mcap_b:.0f}B >= ${mcap_floor_b:.0f}B floor)")
                             elif mcap_b is not None:
                                 logger.debug(f"Earnings watchlist skip: {symbol} (mcap ${mcap_b:.0f}B < ${mcap_floor_b:.0f}B floor)")
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as _exc:
+                        swallowed("collector_tradfi.poll_finnhub_earnings", _exc)
 
                     earnings_context = {
                         "report_date": report_date,

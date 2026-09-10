@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
+from shared.utils.feature_flags import FeatureFlagManager
+from shared.utils.quant_calc import compute_ta_indicators, kelly_criterion
 
 logger = logging.getLogger("api-gateway.explain")
 
@@ -26,6 +28,8 @@ ACTIVE_MODEL_NAME = "RRCF-StreamingAnomaly-v1"
 ACTIVE_MODEL_FAMILY = (
     "Robust Random Cut Forest (online) + Welford streaming variance + Hawkes contagion"
 )
+# Below this many settled predictions a win rate is noise, not an estimate.
+MIN_SETTLED_FOR_WIN_RATE = 20
 FEATURE_SCHEMA_VERSION = "v2.6"
 FEATURES_USED = (
     "price_return_zscore",
@@ -221,14 +225,102 @@ async def explain_event_alert(
     }
 
 
+async def _observed_win_rate(db, ticker: str) -> Optional[float]:
+    """This ticker's settled prediction win rate, or None if nothing has settled.
+
+    None is a real answer here and a placeholder is not: a Kelly fraction built
+    on an invented win rate sizes a position on a number nobody measured.
+    """
+    try:
+        rows = await db.query(
+            "SELECT count(*) FILTER (WHERE outcome_correct)::float AS wins, "
+            "       count(*)::float AS settled "
+            "FROM agent_predictions "
+            "WHERE ticker = $1 AND outcome_correct IS NOT NULL",
+            ticker,
+        )
+    except Exception as e:
+        logger.debug("Win-rate lookup failed for %s: %s", ticker, e)
+        return None
+    if not rows:
+        return None
+    settled = float(rows[0].get("settled") or 0.0)
+    if settled < MIN_SETTLED_FOR_WIN_RATE:
+        return None
+    return float(rows[0].get("wins") or 0.0) / settled
+
+
+async def _graph_precheck(redis, ticker: str) -> Dict[str, Any]:
+    """Reference data for the ticker as the platform actually holds it.
+
+    The literals here named a sector, three index memberships and a two-name
+    supply chain for every signal, whatever the instrument.
+    """
+    empty = {
+        "sector": None,
+        "indices": [],
+        "supply_chain_dependencies": [],
+        "empirical_correlations": [],
+        "note": "No reference data cached for this ticker.",
+    }
+    if redis is None:
+        return empty
+    try:
+        blob = await redis.raw.get(f"sentinel:refdata:{ticker}")
+    except Exception as e:
+        logger.debug("Reference data lookup failed for %s: %s", ticker, e)
+        return empty
+    if not blob:
+        return empty
+    try:
+        ref = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return empty
+    return {
+        "sector": ref.get("sector"),
+        "industry": ref.get("industry"),
+        "indices": ref.get("index_membership") or [],
+        "supply_chain_dependencies": ref.get("suppliers") or [],
+        "empirical_correlations": ref.get("correlations") or [],
+    }
+
+
+async def _feature_flag_status(redis) -> Dict[str, Any]:
+    """The flags as the flag store answers them, not as they were typed here.
+
+    These were three string literals -- "ENABLED", "ENABLED", "NORMAL" -- so a
+    signal produced while a flag was killed still reported the flag enabled, on
+    the endpoint an auditor would consult to find out.
+    """
+    names = ("covered_calls", "granger_causality")
+    if redis is None:
+        return {n: "UNKNOWN" for n in names}
+    try:
+        manager = FeatureFlagManager(redis)
+        return {n: ("ENABLED" if await manager.is_enabled(n) else "DISABLED") for n in names}
+    except Exception as e:
+        logger.debug("Feature flag lookup failed: %s", e)
+        return {n: "UNKNOWN" for n in names}
+
+
 @router.get("/signal/{signal_id}")
 async def explain_trading_signal(
     signal_id: str,
     redis=Depends(get_redis_optional),
+    db=Depends(get_db_optional),
 ):
-    """
-    Explains the exact mathematical parameters, risk bounds, half-Kelly allocation,
-    and technical indicators behind a quantitative trade recommendation.
+    """Explain a trading signal from the bars it was computed on.
+
+    This returned a fixture. Every field was a literal -- price 128.50, ATR
+    3.20, stop 123.70, RSI 58.4, an "empirical_win_rate_W" of 0.62, a sector of
+    Information Technology and a supply chain of TSM and ASML -- returned
+    unchanged for every signal_id, on an endpoint whose whole purpose is to
+    show the arithmetic behind a recommendation. An explainability surface that
+    invents its evidence is worse than none: it survives exactly the audit it
+    exists to support.
+
+    Everything below is now derived from `tradfi_bars` for the ticker, and the
+    endpoint 404s when there is no history rather than filling the gap.
     """
     ticker = "NVDA"
     if "_" in signal_id:
@@ -238,46 +330,105 @@ async def explain_trading_signal(
                 ticker = part.upper()
                 break
 
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Signal explanation needs the bar history; the database is unavailable.",
+        )
+
+    # 250 bars: enough for the 200-period SMA the alignment check needs.
+    try:
+        rows = await db.query(
+            "SELECT time, open, high, low, close, volume FROM tradfi_bars "
+            "WHERE ticker = $1 ORDER BY time DESC LIMIT 250",
+            ticker,
+        )
+    except Exception as e:
+        logger.warning("Bar history lookup failed for %s: %s", ticker, e)
+        raise HTTPException(status_code=503, detail="Bar history is temporarily unavailable.")
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No bar history for {ticker}, so there is nothing to explain. "
+                "This endpoint previously answered with a worked example for a "
+                "different instrument."
+            ),
+        )
+
+    rows = list(reversed(rows))                       # oldest first
+    closes = [float(r["close"]) for r in rows]
+    highs = [float(r["high"]) for r in rows]
+    lows = [float(r["low"]) for r in rows]
+    ta = compute_ta_indicators(closes, highs, lows)
+
+    current_price = closes[-1]
+    atr = float(ta["atr"])
+    stop_distance = 1.5 * atr
+    stop_loss = current_price - stop_distance
+    reward_risk = 2.0
+    target_price = current_price + (stop_distance * reward_risk)
+
+    # Kelly from this agent's own recorded outcomes, or nothing.
+    #
+    # The 0.62 that sat here was labelled "empirical" and had never been
+    # measured. A win rate the platform has not observed is not an input to a
+    # position size.
+    win_rate = await _observed_win_rate(db, ticker)
+    if win_rate is None:
+        kelly = {
+            "empirical_win_rate_W": None,
+            "payoff_ratio_R": reward_risk,
+            "raw_kelly_pct": None,
+            "half_kelly_clamped_pct": None,
+            "note": (
+                "No settled predictions for this ticker yet, so no win rate has "
+                "been observed and no Kelly fraction is defined. Sizing must not "
+                "use a placeholder."
+            ),
+        }
+    else:
+        raw_kelly = kelly_criterion(win_rate, reward_risk)
+        kelly = {
+            "empirical_win_rate_W": round(win_rate, 4),
+            "payoff_ratio_R": reward_risk,
+            "raw_kelly_pct": round(raw_kelly * 100.0, 2),
+            "half_kelly_clamped_pct": round(min(max(raw_kelly / 2.0, 0.0), 0.25) * 100.0, 2),
+        }
+
+    sma_200 = ta.get("sma_200")
     explanation = {
         "signal_id": signal_id,
         "ticker": ticker,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "strategy": "Empirical Half-Kelly ATR Momentum",
+        "bars_used": len(rows),
+        "bar_range": {
+            "from": rows[0]["time"].isoformat() if hasattr(rows[0]["time"], "isoformat") else str(rows[0]["time"]),
+            "to": rows[-1]["time"].isoformat() if hasattr(rows[-1]["time"], "isoformat") else str(rows[-1]["time"]),
+        },
         "deterministic_math_audit": {
-            "current_price": 128.50,
-            "atr_14": 3.20,
-            "stop_distance": 4.80,
+            "current_price": round(current_price, 4),
+            "atr_14": round(atr, 4),
+            "stop_distance": round(stop_distance, 4),
             "stop_formula": "Entry - (1.5 * ATR)",
-            "calculated_stop_loss": 123.70,
-            "target_multiplier": 2.0,
+            "calculated_stop_loss": round(stop_loss, 4),
+            "target_multiplier": reward_risk,
             "target_formula": "Entry + (1.5 * ATR * RiskRewardRatio)",
-            "calculated_target_price": 138.10,
-            "half_kelly_inputs": {
-                "empirical_win_rate_W": 0.62,
-                "payoff_ratio_R": 2.0,
-                "raw_kelly_pct": 43.0,
-                "half_kelly_clamped_pct": 21.5,
-                "macro_stress_discount": "None (Normal Regime)",
-            },
+            "calculated_target_price": round(target_price, 4),
+            "half_kelly_inputs": kelly,
         },
         "technical_indicator_inputs": {
-            "rsi_14": 58.4,
-            "ema_12": 127.20,
-            "ema_26": 124.80,
-            "ma_alignment": "BULLISH_STACK",
-            "dist_sma_200_pct": +14.2,
-            "fib_support_0_618": 122.40,
+            "rsi_14": ta.get("rsi"),
+            "ema_12": ta.get("ema_12"),
+            "ema_26": ta.get("ema_26"),
+            "ma_alignment": ta.get("ma_alignment"),
+            "sma_200": sma_200,
+            "dist_sma_200_pct": ta.get("dist_sma_200_pct"),
+            "fib_support_0_618": (ta.get("fib_levels") or {}).get("0.618"),
         },
-        "graph_topology_precheck": {
-            "sector": "Information Technology",
-            "indices": ["S&P 500", "Nasdaq 100", "SOX Semiconductor"],
-            "supply_chain_dependencies": ["TSM", "ASML"],
-            "empirical_correlations": ["corr:stat:NVDA:TSM (r=0.84)", "granger:NVDA:AMD:lag1 (F=4.82)"],
-        },
-        "feature_flag_status": {
-            "covered_calls": "ENABLED",
-            "granger_causality": "ENABLED",
-            "master_kill_switch": "NORMAL",
-        }
+        "graph_topology_precheck": await _graph_precheck(redis, ticker),
+        "feature_flag_status": await _feature_flag_status(redis),
     }
     return explanation

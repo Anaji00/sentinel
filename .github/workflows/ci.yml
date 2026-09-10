@@ -11,8 +11,18 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Identical to verify.yml.
+      #
+      # These two workflows ran the same suite under different environments:
+      # ci.yml set only SENTINEL_ENV and PYTHONPATH, while verify.yml also
+      # supplied SESSION_SECRET and API_GATEWAY_KEY. The gateway resolves
+      # SESSION_SECRET with required=True at import, so any test touching auth
+      # behaved differently between the two -- and a test that passes in one
+      # workflow and not the other teaches people to trust whichever was green.
       SENTINEL_ENV: test
-      PYTHONPATH: .
+      SESSION_SECRET: ci-only-not-a-real-secret-000000
+      API_GATEWAY_KEY: ci-only-not-a-real-secret-111111
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - uses: actions/checkout@v4

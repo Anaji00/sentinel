@@ -376,22 +376,35 @@ def test_explain_payload_hash_is_deterministic():
 
 
 def test_explain_signal_endpoint():
+    """The endpoint answers from bar history, or says it cannot.
+
+    This asserted `empirical_win_rate_W == 0.62` -- it pinned the fixture. The
+    whole response was constants: price 128.50, ATR 3.20, RSI 58.4, a sector of
+    Information Technology, the same values for every signal_id. The test
+    passed for exactly as long as the endpoint lied consistently, which is what
+    a test pinning a hardcoded response does.
+
+    With no database in this harness the correct answer is 503. The arithmetic
+    itself is covered against real bars in tests/test_explain_signal_is_measured.py.
+    """
     client = TestClient(app)
     cookies = get_auth_cookies()
     res = client.get("/api/v1/explain/signal/signal_NVDA_trade", cookies=cookies)
-    assert res.status_code == 200
+
+    # 503 (no database here) or 404 (no bars for NVDA) are both honest. 200 is
+    # only acceptable if the numbers came from somewhere.
+    assert res.status_code in (200, 404, 503), res.text
+    if res.status_code != 200:
+        return
+
     data = res.json()
-
     assert data["ticker"] == "NVDA"
-    assert "deterministic_math_audit" in data
+    assert data["bars_used"] > 0
     audit = data["deterministic_math_audit"]
-    assert "half_kelly_inputs" in audit
-    assert audit["half_kelly_inputs"]["empirical_win_rate_W"] == 0.62
     assert "stop_formula" in audit
-
-    assert "technical_indicator_inputs" in data
-    assert "graph_topology_precheck" in data
-    assert "empirical_correlations" in data["graph_topology_precheck"]
+    # Never the fixture again.
+    assert audit["current_price"] != 128.50
+    assert audit["half_kelly_inputs"]["empirical_win_rate_W"] != 0.62
 
 
 # ── 4. API GATEWAY FEATURE FLAGS & BACKTEST ROUTES INTEGRATION ────────────────

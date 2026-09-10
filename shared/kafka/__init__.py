@@ -27,6 +27,7 @@ import time
 from shared.utils.logging import suppress_noisy_loggers
 from shared.utils.metrics import MetricsCollector
 import time as _time
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -258,8 +259,8 @@ class SentinelProducer:
         self.batch_logger.flush()
         try:
             await self._p.stop()
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("kafka.close", _exc, logger)
         self._started = False
 
 # ── CONSUMER ────────────────────────────────────────────────────────────────
@@ -320,21 +321,37 @@ class SentinelConsumer:
                 self.batch_logger.log_consumed(tp.topic, len(records))
         return batches
 
-    async def commit(self):
-        """
-        Explicitly advance the partition offset. 
-        Must be called ONLY after the processing pipeline safely completes all writes.
+    async def commit(self, offsets: Optional[Dict[Any, int]] = None):
+        """Advance offsets. Call only after the pipeline has completed its writes.
+
+        `offsets` maps TopicPartition to the next offset to consume. Passing it
+        commits those partitions alone; omitting it commits everything assigned,
+        which is only correct when every assigned partition succeeded.
+
+        The parameter exists because this wrapper did not accept one. A caller
+        that had computed per-partition offsets -- so that succeeding on one
+        partition would not commit another whose batch had failed -- called
+        `commit({tp: offset + 1})` and got
+        `TypeError: commit() takes 1 positional argument but 2 were given`. The
+        caller's except clause logged it as "rebalance or timeout", so the
+        enrichment service processed 9,085 events at 4.2/s while committing
+        none of them: its consumer group held no offsets, did not appear in
+        `list_consumer_groups`, and would have replayed the entire topic on
+        restart. Throughput looked healthy the whole time.
         """
         if not self._started:
             raise RuntimeError("Cannot commit: SentinelConsumer is not started.")
-        await self._c.commit()
+        if offsets:
+            await self._c.commit(offsets)
+        else:
+            await self._c.commit()
         
     async def close(self):
         self.batch_logger.flush()
         try:
             await self._c.stop()
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("kafka.close", _exc, logger)
         self._started = False
 
     

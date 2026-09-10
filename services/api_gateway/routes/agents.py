@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, Query
 from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
 from shared.utils.heartbeat import get_all_heartbeats_status
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("api-gateway.agents")
 
@@ -86,8 +87,8 @@ async def get_agent_processes(redis = Depends(get_redis_client)):
                     if val:
                         try:
                             decisions.append(json.loads(val if isinstance(val, str) else val.decode("utf-8")))
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            swallowed("api_gateway.routes.agents.get_agent_processes", _exc, logger)
         except Exception as e:
             logger.warning(f"Error fetching agent decisions from Redis: {e}")
 
@@ -172,8 +173,8 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
     open_predictions = 0
     try:
         open_predictions = len(await _scan("sentinel:predictions:*", 500))
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("api_gateway.routes.agents.get_swarm_intelligence", _exc, logger)
 
     # The wargamer's predictions, which until now nothing read.
     #
@@ -233,8 +234,8 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
         calibration["resolved"] = int(
             await raw.hlen("sentinel:calibration:market_resolved") or 0
         )
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("api_gateway.routes.agents.get_swarm_intelligence", _exc, logger)
 
     signals = consensus.get("consensus_signals") or []
     return {

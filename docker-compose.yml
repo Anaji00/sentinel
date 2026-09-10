@@ -90,9 +90,23 @@ services:
           cpus: '1.5'
           memory: 1.5G
     healthcheck:
-      test: kafka-broker-api-versions --bootstrap-server localhost:9092
-      interval: 15s
-      timeout: 10s
+      # A TCP connect, not a JVM launch.
+      #
+      # This was `kafka-broker-api-versions`, which starts a JVM on every check.
+      # Measured on this host it takes 8,964ms against a 10,000ms timeout -- a
+      # one-second margin, every 15 seconds, on a six-core box that is also
+      # running CPU inference. Under any load it exceeds the timeout, the
+      # broker is marked unhealthy while it is demonstrably serving group
+      # coordination and controller elections, and every service gated on
+      # `depends_on: condition: service_healthy` refuses to start.
+      #
+      # A connect proves the listener is accepting, which is the right
+      # granularity for a dependency gate: the clients retry metadata on their
+      # own and are built to. It also stops spending a JVM startup of CPU every
+      # fifteen seconds on a host where CPU is the binding constraint.
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/9092' || exit 1"]
+      interval: 30s
+      timeout: 5s
       retries: 15
       start_period: 30s
 
@@ -311,6 +325,15 @@ services:
     container_name: sentinel-correlation
     command: python services/correlation/main.py
     env_file: .env
+    environment:
+      # Matches the server and the other model callers.
+      #
+      # The client sends keep_alive on every request and the last writer wins
+      # on the server, so a service defaulting to the client's "5m" silently
+      # un-pins models the agents pinned with -1. On this host a reload costs
+      # 89-102s, so an unpinned model pays that again after any five-minute
+      # lull -- and this service calls a model on the semantic path.
+      - OLLAMA_KEEP_ALIVE=-1
     volumes:
       - ./services:/app/services
       - ./shared:/app/shared
@@ -355,6 +378,14 @@ services:
     command: python services/reasoning/main.py
     env_file: .env
     environment:
+      # Matches the server and the agent tiers.
+      #
+      # The client sends keep_alive on every request and the last
+      # writer wins on the server, so a service defaulting to the
+      # client's "5m" silently un-pins models the agents pinned with
+      # -1. On this host a reload costs 89-102s, so an unpinned model
+      # pays that again after any five-minute lull.
+      - OLLAMA_KEEP_ALIVE=-1
       - SENTINEL_SERVICE=reasoning
     volumes:
       - ./services:/app/services
@@ -443,6 +474,12 @@ services:
     profiles: ["agents"]
     image: ollama/ollama:latest
     container_name: sentinel-ollama
+    # Every other service says `always`; this one said nothing, and it is the
+    # sole dependency of both agent tiers. It exited 255 and stayed down while
+    # agents-fast and agents-heavy kept restarting, kept logging heartbeats and
+    # ran no inference at all -- nothing in the platform noticed, because an
+    # agent with no backend looks exactly like an idle one.
+    restart: always
     volumes:
       - ollama_data:/root/.ollama
     environment:
@@ -486,6 +523,13 @@ services:
       # described (alternating requests for different models evicting each
       # other). Consolidating the tiers onto one model removes the alternation
       # instead, which is strictly better than paying for both.
+      # The value stayed at 2 under the paragraph that argued for 1, so the
+      # collapse above was permitted the whole time it was documented as fixed.
+      # Nothing here requests a second model deliberately any more, but
+      # OllamaClient's fallback ladder reaches for a different one on any
+      # failure -- so with two slots a single timeout was enough to spawn the
+      # second runner. One slot makes that an eviction and a reload instead,
+      # which is slow and survivable rather than fast and fatal.
       - OLLAMA_MAX_LOADED_MODELS=1
       # f16, not q8_0. A quantised KV cache trades CPU for memory: every
       # attention step dequantises. That is the right trade on a GPU short of
@@ -813,7 +857,11 @@ services:
       - SENTINEL_SERVICE=agents-fast
       - AGENT_TIER_FILTER=fast
       - AGENT_MODEL=qwen2.5:1.5b
-      - OLLAMA_FALLBACK_MODEL=gemma3:1b
+      # Was gemma3:1b: a different model, so falling back to it evicted the
+      # resident one and paid an 89 s reload on the next request that wanted
+      # it back. Both tiers name the same model for the same reason the
+      # ollama service runs one slot.
+      - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
@@ -1048,6 +1096,58 @@ services:
     depends_on:
       - prometheus
 
+
+  # Integration tests, run inside the network the platform actually uses.
+  #
+  # The datastores publish no host ports -- deliberately -- so a pytest run on
+  # the host cannot reach Kafka, Timescale or Ollama, and the smoke tests skip.
+  # This joins the same network and resolves the same service names the
+  # services do, which is the point: the two defects these tests exist to catch
+  # were both configuration, and both would have passed against containers a
+  # test framework started with its own defaults.
+  #
+  # Its own profile, so it never runs as part of the platform:
+  #   docker compose --profile test run --rm integration-tests
+  integration-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    container_name: sentinel-integration-tests
+    env_file: .env
+    environment:
+      # KAFKA_BOOTSTRAP_SERVERS is deliberately NOT set here.
+      #
+      # env_file already supplies kafka:29092, the internal listener. Overriding
+      # it with kafka:9092 pointed the client at the listener the broker
+      # advertises as localhost, so bootstrap succeeded and every subsequent
+      # request was redirected to 127.0.0.1 inside this container. The tests
+      # ran and failed with NodeNotReadyError, which reads like a broken broker
+      # and was a broken test.
+      - OLLAMA_HOST=http://ollama:11434
+      - PYTHONPATH=/app
+    volumes:
+      - ./tests:/app/tests
+      - ./services:/app/services
+      - ./shared:/app/shared
+    working_dir: /app
+    command: >
+      sh -c "pip install --quiet --no-cache-dir pytest anyio &&
+             python -m pytest tests/integration -q --tb=short -p no:cacheprovider"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          # The suite is I/O bound -- it waits on the pipeline rather than
+          # computing -- but it imports the same ML stack the services do, so
+          # the ceiling is set by numpy/sklearn at import, not by the tests.
+          memory: 1G
+
 volumes:
   zookeeper_data:
   zookeeper_log:
@@ -1060,7 +1160,6 @@ volumes:
   qdrant_data:
   prometheus_data:
   grafana_data:
-
 networks:
   default:
     name: sentinel-network

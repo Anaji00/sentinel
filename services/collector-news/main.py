@@ -45,6 +45,7 @@ from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -199,8 +200,8 @@ def _parse_pub_date(entry) -> datetime:
     if entry.get("published_parsed"):
         try:
             return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as _exc:
+            swallowed("collector_news._parse_pub_date", _exc)
     return datetime.now(timezone.utc)
 
 async def poll_feed(

@@ -30,24 +30,6 @@ class RadarBatchDecision(BaseModel):
     """
     decisions: List[RadarCandidateDecision]
 
-class RadarCandidateDecision(BaseModel):
-    """One ticker's verdict inside a batched answer."""
-    ticker: str
-    investigate: bool
-    rationale: str
-
-
-class RadarBatchDecision(BaseModel):
-    """Many verdicts from one inference.
-
-    The unit of scarcity here is the call, not the token: a slot opens every
-    600s and an inference runs three to six minutes, so deciding one ticker per
-    call capped the agent at roughly twenty decisions an hour. Asking about ten
-    at once costs one extra line of prompt each and returns ten verdicts.
-    """
-    decisions: List[RadarCandidateDecision]
-
-
 class WatchlistPruneDecision(BaseModel):
     evict_tickers: List[str]
     rationale: str

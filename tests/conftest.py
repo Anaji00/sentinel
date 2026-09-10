@@ -18,6 +18,17 @@ os.environ.setdefault("SESSION_SECRET", "test-session-secret-not-for-production"
 os.environ.setdefault("API_GATEWAY_KEY", "test-api-key-not-for-production")
 
 
+
+def pytest_configure(config):
+    """Register the marks used outside the unit suite.
+
+    Unregistered marks are a warning, not an error, so a typo in one silently
+    selects nothing -- `-m integraton` would run zero tests and exit green.
+    """
+    config.addinivalue_line(
+        "markers", "integration: needs the compose stack running; skipped otherwise"
+    )
+
 @pytest.fixture
 def anyio_backend():
     return 'asyncio'

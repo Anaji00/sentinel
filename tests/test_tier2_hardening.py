@@ -299,9 +299,17 @@ def test_keep_alive_is_consistent_between_server_and_clients():
     server = re.search(r"OLLAMA_KEEP_ALIVE=(\S+)", _env_of("ollama"))
     assert server, "ollama declares no keep-alive"
 
-    for tier in ("agents-heavy", "agents-fast"):
+    # Every service that calls a model, not just the two agent tiers.
+    #
+    # The client sends keep_alive on every request and the server takes the
+    # last writer, so one service defaulting to the client's "5m" un-pins the
+    # models every other service pinned with -1. `reasoning` and `correlation`
+    # both instantiate an OllamaClient and neither declared one, which is why
+    # `ollama ps` showed a model expiring four minutes out on a host where
+    # reloading it costs 89-102 seconds.
+    for tier in ("agents-heavy", "agents-fast", "reasoning", "correlation"):
         client = re.search(r"OLLAMA_KEEP_ALIVE=(\S+)", _env_of(tier))
-        assert client, f"{tier} does not declare a keep-alive"
+        assert client, f"{tier} calls a model and does not declare a keep-alive"
         assert client.group(1) == server.group(1), (
             f"{tier} asks for keep_alive={client.group(1)} while the server is "
             f"configured for {server.group(1)}"

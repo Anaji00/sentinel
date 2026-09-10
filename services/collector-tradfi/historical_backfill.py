@@ -79,10 +79,14 @@ SYMBOLS_PER_REQUEST = int(os.getenv("ALPACA_BACKFILL_SYMBOLS_PER_REQUEST", "50")
 # Sixty days of 1-minute bars is about 23,400 rows per ticker, which rolls up
 # to roughly 390 hourly and 4,700 five-minute buckets -- enough for Hurst,
 # GARCH, cointegration and Granger, all of which want hundreds of observations
-# and were running on the 42 to 46 bars uptime had produced. Two years of
-# minute bars would be 196,000 rows per ticker on a host with a 26 GiB total
-# allocation and no retention policy, which is a different problem than the one
-# this solves.
+# and were running on the 42 to 46 bars uptime had produced.
+#
+# Two years would be 196,000 rows per ticker, which against 1,132 tickers is
+# 222 million rows on a host with a 26 GiB total allocation. That is still the
+# binding constraint and 60 days is still the right answer -- but the reason
+# given here used to include "and no retention policy", which stopped being
+# true when migration 0020 added compression at 14 days and retention at 90.
+# The number stands on its own merits; half its stated justification did not.
 DEFAULT_LOOKBACK_DAYS = int(os.getenv("ALPACA_BACKFILL_DAYS", "60"))
 
 # tradfi_bars is the ONE-MINUTE base table, and every continuous aggregate --

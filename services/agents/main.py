@@ -34,6 +34,7 @@ from services.agents.stock_correlation_agent import StockCorrelationAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
+from shared.utils.quiet_failures import swallowed
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -98,9 +99,15 @@ async def run_task_queue_worker(redis_client, agents: dict):
 # never load: every call walked the retry-and-fallback ladder before landing on a
 # small model anyway, paying the full timeout each time.
 #
-# AGENT_MODEL already carries the right choice per tier -- the compose file sets
-# qwen2.5:3b for agents-heavy and qwen2.5:1.5b for agents-fast -- so the tier
-# decides, not a literal buried in this file.
+# AGENT_MODEL carries the tier's choice, so the tier decides rather than a
+# literal buried in this file. Both tiers currently name qwen2.5:1.5b: the
+# ollama container runs one model slot, because two resident models meant two
+# llama.cpp runners at six threads each against a six-core quota, and that
+# collapses rather than degrades. docker-compose.yml records the measurements.
+#
+# This comment previously claimed compose set qwen2.5:3b for agents-heavy. It
+# did not, and had not for as long as the comment existed -- the tiering it
+# described was gone and the sentence describing it was not.
 HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
 
 
@@ -218,7 +225,21 @@ async def main():
         input_topics=[
             Topics.RAW_NEWS, Topics.RAW_TRADFI, Topics.ENRICHED_EVENTS, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.MACRO_DECOUPLING,
-            Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT, Topics.RADAR_DECISIONS
+            Topics.QUANT_DISCOVERIES, Topics.MACRO_ASSESSMENT, Topics.RADAR_DECISIONS,
+            # The two the macro engine was already computing and publishing to
+            # nobody. This agent is the natural reader of both and had neither.
+            #
+            # RATES_REGIME is the regime signal every statistic in this platform
+            # is computed without: volatility, correlation and payoff ratios are
+            # all measured over fixed windows with no notion of whether the
+            # window spans a policy break. Kelly sizing here is already
+            # regime-conditioned in principle, and this is the input that makes
+            # that mean something.
+            #
+            # VOL_SURFACE is measured implied volatility. The covered-call
+            # backtest currently derives sigma from realised bar dispersion and
+            # clamps it, which is a proxy for the number this topic carries.
+            Topics.RATES_REGIME, Topics.VOL_SURFACE
         ],
         group_id="agent-quant-trading",
         shared_infra=shared_infra,
@@ -232,12 +253,17 @@ async def main():
         input_topics=[
             Topics.RAW_NEWS, Topics.ENRICHED_EVENTS, Topics.UNKNOWN_ENTITIES,
             Topics.CORRELATIONS, Topics.ONTOLOGY_PROPOSALS, Topics.QUANT_DISCOVERIES,
-            Topics.MACRO_ASSESSMENT, Topics.SCENARIOS_GENERATED
+            Topics.MACRO_ASSESSMENT, Topics.SCENARIOS_GENERATED,
+            # Ontology decisions the supervisor makes, applied by the engine
+            # that owns the graph. The supervisor declared this as its output
+            # topic and nothing subscribed, so every accepted or rejected
+            # ontology change was published into an empty room.
+            Topics.ONTOLOGY_UPDATES
         ],
         group_id="agent-knowledge-graph",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     radar_agent = build_agent(
@@ -250,7 +276,7 @@ async def main():
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     rule_synthesizer_agent = build_agent(
@@ -264,7 +290,7 @@ async def main():
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     supervisor_agent = build_agent(
@@ -286,12 +312,17 @@ async def main():
         input_topics=[
             Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.QUANT_DISCOVERIES, Topics.FINANCIAL_ADVICE,
             Topics.RULES_FEEDBACK, Topics.RULES_SYNTHESIZED,
-            Topics.MACRO_ASSESSMENT, Topics.CORRELATIONS, Topics.INSIDER_CLUSTERS
+            Topics.MACRO_ASSESSMENT, Topics.CORRELATIONS, Topics.INSIDER_CLUSTERS,
+            # Where agents disagree. The consensus engine publishes an ACH
+            # report whenever conviction is split or uncertainty is high, and
+            # nothing read it -- so the one artefact describing disagreement
+            # between agents reached no arbiter at all.
+            Topics.CONSENSUS_REPORTS
         ],
         group_id="agent-consensus-engine",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     adversarial_wargamer = build_agent(
@@ -315,7 +346,7 @@ async def main():
         group_id="agent-edge-validator",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     stock_correlation_agent = build_agent(
@@ -327,7 +358,7 @@ async def main():
         group_id="agent-stock-correlation",
         shared_infra=shared_infra,
         model="qwen2.5:1.5b",
-        fallback_model="gemma3:1b",
+        fallback_model=HEAVY_MODEL,
     )
 
     # Dictionary map with backwards-compatible aliases for task queue dispatch
@@ -464,8 +495,8 @@ async def main():
         for ag in agents_by_name.values():
             try:
                 await ag.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("agents.main", _exc)
         if not main_session.closed:
             await main_session.close()
         logger.info("Agent swarm shut down cleanly")

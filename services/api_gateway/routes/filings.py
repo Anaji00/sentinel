@@ -8,15 +8,20 @@ portfolio holdings for institutional intelligence.
 """
 
 import json
+import logging
 from typing import Dict, List, Optional, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from services.api_gateway.dependencies import get_db_optional
 from shared.db import get_redis
 from shared.utils.rbac import require_role, Role
 
+logger = logging.getLogger("api-gateway.filings")
+
 import importlib.util
 from pathlib import Path
+from shared.utils.quiet_failures import swallowed
 
 ROOT = Path(__file__).resolve().parents[3]
 tf_path = ROOT / "services" / "collector-filings" / "thirteen_f.py"
@@ -43,6 +48,13 @@ class FilingItemSummary(BaseModel):
 
 
 class FilerSummaryItem(BaseModel):
+    # Carried through from ThirteenFPortfolioReport.
+    #
+    # The report has marked seeded portfolios `is_synthetic` since the 13F
+    # audit, and this summary dropped the field -- so the list view presented
+    # curated seed data and a real filing identically, which is the exact
+    # distinction the flag was added to preserve.
+    is_synthetic: bool = False
     filer_id: str
     filer_name: str
     manager_name: str
@@ -70,62 +82,69 @@ class ConsensusHoldersResponse(BaseModel):
 async def get_latest_filings(
     form_type: Optional[str] = Query(None, description="Filter by form type (e.g. 8-K, 10-K, 13F)"),
     ticker: Optional[str] = Query(None, description="Filter by equity ticker"),
+    limit: int = Query(25, ge=1, le=200),
     user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+    db=Depends(get_db_optional),
 ):
-    """
-    Returns recent corporate SEC filings for watchlist equities.
-    """
-    # Sample structured filings list
-    sample_filings = [
-        FilingItemSummary(
-            ticker="NVDA",
-            company_name="NVIDIA Corporation",
-            form_type="8-K",
-            filing_date="2026-08-14",
-            is_material_8k=True,
-            items=["Item 1.01", "Item 8.01"],
-            summary="Entry into strategic multi-gigawatt foundry wafer supply agreement with TSMC.",
-            primary_doc_url="https://www.sec.gov/ix?doc=/Archives/edgar/data/1045810/000104581026000045/nvda-20260814.htm",
-        ),
-        FilingItemSummary(
-            ticker="AAPL",
-            company_name="Apple Inc.",
-            form_type="10-Q",
-            filing_date="2026-08-01",
-            is_material_8k=False,
-            items=[],
-            summary="Quarterly financial report for the period ending June 30, 2026.",
-            primary_doc_url="https://www.sec.gov/ix?doc=/Archives/edgar/data/320193/000032019326000088/aapl-20260630.htm",
-        ),
-        FilingItemSummary(
-            ticker="MSFT",
-            company_name="Microsoft Corporation",
-            form_type="8-K",
-            filing_date="2026-07-28",
-            is_material_8k=True,
-            items=["Item 5.02"],
-            summary="Departure of Executive Vice President, Cloud and AI Division.",
-            primary_doc_url="https://www.sec.gov/ix?doc=/Archives/edgar/data/789019/000078901926000032/msft-20260728.htm",
-        ),
-        FilingItemSummary(
-            ticker="TSLA",
-            company_name="Tesla, Inc.",
-            form_type="8-K",
-            filing_date="2026-07-20",
-            is_material_8k=True,
-            items=["Item 8.01"],
-            summary="Regulatory approval for Full Self-Driving commercial deployment in European markets.",
-            primary_doc_url="https://www.sec.gov/ix?doc=/Archives/edgar/data/1318605/000131860526000062/tsla-20260720.htm",
-        ),
-    ]
+    """Recent SEC filings the platform has actually ingested.
 
-    filtered = sample_filings
+    This returned four hand-written filings with fabricated sec.gov URLs --
+    an NVIDIA foundry agreement, a Microsoft executive departure, a Tesla FSD
+    approval in Europe -- invented corporate events attributed to real
+    companies and served from an intelligence platform's filings endpoint.
+    They were the same four rows for every caller, and the collector had 564
+    real filings in the database at the time.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Filing history is temporarily unavailable.")
+
+    clauses = ["type = 'filing'", "filing_data IS NOT NULL"]
+    args: List[Any] = []
     if form_type:
-        filtered = [f for f in filtered if form_type.upper() in f.form_type.upper()]
+        args.append(form_type.upper())
+        clauses.append(f"upper(filing_data->>'form_type') LIKE '%%' || ${len(args)} || '%%'")
     if ticker:
-        filtered = [f for f in filtered if ticker.upper() == f.ticker.upper()]
+        args.append(ticker.upper())
+        clauses.append(f"upper(coalesce(filing_data->>'ticker', primary_entity_id)) = ${len(args)}")
+    args.append(limit)
 
-    return filtered
+    query = (
+        "SELECT primary_entity_id, primary_entity_name, url, filing_data "
+        "FROM events WHERE " + " AND ".join(clauses) +
+        f" ORDER BY occurred_at DESC LIMIT ${len(args)}"
+    )
+    try:
+        rows = await db.query(query, *args)
+    except Exception as e:
+        logger.warning("Filing lookup failed: %s", e)
+        raise HTTPException(status_code=503, detail="Filing history is temporarily unavailable.")
+
+    out: List[FilingItemSummary] = []
+    for r in rows:
+        fd = r.get("filing_data") or {}
+        if isinstance(fd, str):
+            try:
+                fd = json.loads(fd)
+            except ValueError:
+                continue
+        doc_url = fd.get("primary_doc_url") or r.get("url")
+        if not doc_url:
+            # A filing summary without its source document is an assertion the
+            # reader cannot check, which is what the fixtures were.
+            continue
+        out.append(
+            FilingItemSummary(
+                ticker=str(fd.get("ticker") or r.get("primary_entity_id") or ""),
+                company_name=str(fd.get("company_name") or r.get("primary_entity_name") or ""),
+                form_type=str(fd.get("form_type") or ""),
+                filing_date=str(fd.get("filing_date") or ""),
+                is_material_8k=bool(fd.get("is_material_8k", False)),
+                items=list(fd.get("items") or []),
+                summary=str(fd.get("description") or ""),
+                primary_doc_url=str(doc_url),
+            )
+        )
+    return out
 
 
 @router.get("/13f/prominent", response_model=List[FilerSummaryItem])
@@ -146,8 +165,8 @@ async def get_prominent_13f_filers(
                 cached = await raw_redis.get(f"sentinel:13f:{cik}:latest")
                 if cached:
                     report_data = json.loads(cached.decode("utf-8") if isinstance(cached, bytes) else str(cached))
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("api_gateway.routes.filings.get_prominent_13f_filers", _exc, logger)
 
         if not report_data:
             report_data = generate_curated_seed_13f(cik).model_dump()
@@ -163,6 +182,7 @@ async def get_prominent_13f_filers(
                 holdings_count=report_data.get("total_positions_count", 0),
                 top_10_concentration_pct=report_data.get("top_10_concentration_pct", 0.0),
                 report_period=report_data.get("report_period", "2026-Q2"),
+                is_synthetic=bool(report_data.get("is_synthetic", False)),
             )
         )
 
@@ -195,8 +215,8 @@ async def get_13f_portfolio_details(
             if cached:
                 data = json.loads(cached.decode("utf-8") if isinstance(cached, bytes) else str(cached))
                 return ThirteenFPortfolioReport(**data)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("api_gateway.routes.filings.get_13f_portfolio_details", _exc, logger)
 
     return generate_curated_seed_13f(target_cik)
 
@@ -219,8 +239,8 @@ async def get_13f_consensus_for_ticker(
             raw_buyers = await raw_redis.smembers(f"sentinel:13f:consensus:{t_clean}:buyers")
             for b in raw_buyers:
                 buyers.add(b.decode("utf-8") if isinstance(b, bytes) else str(b))
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("api_gateway.routes.filings.get_13f_consensus_for_ticker", _exc, logger)
 
     # No filings, no consensus. The names are not ours to supply.
     #

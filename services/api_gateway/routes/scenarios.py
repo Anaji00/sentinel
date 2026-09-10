@@ -82,9 +82,21 @@ async def get_correlations(
     # 1. Fetch dynamic StockCorrelationAgent discoveries from Redis
     try:
         if hasattr(redis, "raw"):
-            keys = await redis.raw.keys("sentinel:correlations:stock:*")
+            # SCAN, and stop at the number actually used.
+            #
+            # This called KEYS -- blocking the single-threaded server across the
+            # whole keyspace -- and then used `keys[:20]`. The other n-20 were
+            # fetched from the server and discarded, on an HTTP route any
+            # caller can hit.
+            keys = []
+            async for k in redis.raw.scan_iter(
+                match="sentinel:correlations:stock:*", count=100
+            ):
+                keys.append(k)
+                if len(keys) >= 20:
+                    break
             if keys:
-                raw_vals = await redis.raw.mget(keys[:20])
+                raw_vals = await redis.raw.mget(keys)
                 for rv in raw_vals:
                     if rv:
                         try:

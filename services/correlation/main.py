@@ -34,6 +34,33 @@ from services.correlation.soft_correlator import SoftCorrelator
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import NormalizedEvent, CorrelationCluster, AlertTier
 from shared.models.events import graph_node_id
+from shared.utils.confidence_calibration import calibrate as calibrate_confidence
+
+
+async def _calibrated(redis_client, raw_confidence: float):
+    """Map a heuristic confidence onto the empirical rate, and keep both.
+
+    Three publishers in this file construct a CorrelationCluster and only the
+    rule path called the calibrator. Measured over six hours of live traffic
+    that is the wrong one: SEMANTIC_001 produced 7 of 9 clusters, the cascade
+    path 1 and the rule path 1, so calibration reached about a ninth of what
+    the platform publishes -- and it missed the highest-volume, least
+    discriminating producer entirely. 0 of 379,716 stored correlations carry a
+    `raw_confidence`, which is what that looks like from the database.
+
+    Returns (raw, calibrated, metrics) so the caller can put both in
+    metrics_summary. Keeping the raw score is not bookkeeping: it is the only
+    input the calibrator can honestly be refitted on.
+    """
+    calib = await calibrate_confidence(redis_client, raw_confidence)
+    return raw_confidence, calib["confidence"], {
+        "raw_confidence": round(raw_confidence, 4),
+        "confidence_calibrated": calib["calibrated"],
+        "calibration_samples": calib["calibration_samples"],
+    }
+
+from shared.models.events import resolve_event_domain
+from shared.models.events import event_domain as canonical_domain
 from shared.db import get_redis, get_timescale, get_neo4j
 from services.correlation.event_store import EventStore
 from services.correlation.cascade import GeopoliticalCascadeEngine
@@ -65,6 +92,7 @@ SEMANTIC_INTELLIGENCE_SCORE = float(os.getenv("SEMANTIC_INTELLIGENCE_SCORE", "6.
 PEER_MAX_TICKERS = int(os.getenv("PEER_MAX_TICKERS", "60"))
 PEER_SERIES_BARS = int(os.getenv("PEER_SERIES_BARS", "120"))
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.quiet_failures import swallowed
 
 _dynamic_rules_cache = {}
 
@@ -477,6 +505,18 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                             else corr.get("region")
                         ),
                         entity_id=(entity_id if corr.get("same_entity") else None),
+                        # Pushed down, so the window is filtered before it is
+                        # sorted by anomaly and cut to fifty.
+                        #
+                        # Both of these used to run on whatever survived that
+                        # cut. A rule excluding position telemetry saw nothing
+                        # whenever the fifty highest-scoring events happened to
+                        # be position fixes, and a rule asking for evidence
+                        # *before* its trigger discarded the top fifty and kept
+                        # whichever of them happened to be early -- neither is
+                        # the query the rule asked for.
+                        exclude_types=sorted(POSITION_TELEMETRY_TYPES),
+                        **_window_bounds(corr, trigger_epoch),
                     )
                     if hits:
                         # Routine position telemetry is not corroboration.
@@ -668,6 +708,20 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         * _recur_factor,
                         4,
                     )
+                    # Mapped onto the rate clusters at this score have actually
+                    # confirmed at, where enough of them have resolved to say.
+                    #
+                    # _confidence is a weighted blend of three hand-chosen
+                    # coefficients. It ranks clusters sensibly and it is not a
+                    # probability, and it was being published as one and read as
+                    # one by the tier reconciliation below. Until
+                    # MIN_CALIBRATION_SAMPLES outcomes have resolved this
+                    # returns the raw score unchanged, so an uncalibrated
+                    # deployment behaves exactly as it did.
+                    _raw_confidence, _confidence, _calib_metrics = await _calibrated(
+                        getattr(store, "_redis", None), _confidence
+                    )
+
                     alert_tier = _tier_supported_by(_confidence, alert_tier)
 
                     cluster = CorrelationCluster(
@@ -675,7 +729,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
                         rule_name=rule.get("rule_name", "Dynamic AI Rule"),
                         alert_tier=alert_tier,
-                        primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "general",
+                        primary_domain=resolve_event_domain(event),
                         # Discounted by how often this has already been said.
                         # The repeat is still published; it just stops competing
                         # with novel findings for the same inference slot.
@@ -696,6 +750,19 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                             # Stated, so a reader can tell a discounted repeat
                             # from a genuinely weak first sighting -- the two
                             # arrive at similar confidences by different routes.
+                            # Both, so a reader can see how far the heuristic
+                            # was off -- and so that a calibration doing nothing
+                            # is visible rather than invisible.
+                            **_calib_metrics,
+                            # How much of the supporting evidence is
+                            # independent, so a reader can tell three
+                            # collectors agreeing from one collector repeating.
+                            "distinct_sources": len({
+                                e.get("source") for e in supporting_events if e.get("source")
+                            }),
+                            "independent_support": round(
+                                _independent_support(supporting_events), 2
+                            ),
                             "recurrence_count": _recurrence,
                             "rule_recurrence_count": _rule_recurrence,
                             "recurrence_factor": _recur_factor,
@@ -1053,6 +1120,40 @@ def _apply_join_requirement(hits, corr: dict, rule: dict, event):
     return kept
 
 
+def _window_bounds(corr: dict, trigger_epoch) -> dict:
+    """Temporal bounds for the store query, from the clause's own constraint.
+
+    Returns nothing when the clause declares no ordering, so an unconstrained
+    rule queries exactly the window it did before. `_apply_temporal_constraint`
+    still runs afterwards and is now a confirmation rather than the only place
+    the constraint is applied -- it is cheap, and leaving it means a rule whose
+    bounds cannot be pushed down is still enforced.
+    """
+    if trigger_epoch is None:
+        return {}
+    precedes = bool(corr.get("precedes_trigger"))
+    follows = bool(corr.get("follows_trigger"))
+    within = corr.get("within_minutes")
+    try:
+        window = float(within) * 60.0 if within is not None else None
+    except (TypeError, ValueError):
+        window = None
+
+    bounds: dict = {}
+    if precedes:
+        bounds["before_epoch"] = float(trigger_epoch)
+        if window is not None:
+            bounds["after_epoch"] = float(trigger_epoch) - window
+    elif follows:
+        bounds["after_epoch"] = float(trigger_epoch)
+        if window is not None:
+            bounds["before_epoch"] = float(trigger_epoch) + window
+    elif window is not None:
+        bounds["after_epoch"] = float(trigger_epoch) - window
+        bounds["before_epoch"] = float(trigger_epoch) + window
+    return bounds
+
+
 def _apply_temporal_constraint(hits, corr, trigger_epoch):
     """Filters evidence to the ordering the clause asked for.
 
@@ -1128,10 +1229,25 @@ def _rule_confidence(event, supporting_events, domains_triggered) -> float:
     base = max(0.0, min(1.0, base))
 
     n_support = len(supporting_events or [])
+    # Breadth counts independent evidence, not events.
+    #
+    # Three reports from one collector and three collectors agreeing are the
+    # same number to a count and are not the same evidence. Measured over 24
+    # hours of live clusters: 1,601 of 1,632 drew every supporting event from a
+    # single source, average 3.1 events across 1.02 distinct sources -- so this
+    # term was reporting how chatty one feed is and calling it corroboration.
+    #
+    # Each distinct source counts fully; repeats within a source add
+    # sub-linearly, because a second report from a feed that already reported is
+    # weaker evidence than the first and is not worthless. Sources are unknown
+    # for events stored before this was carried, and an unknown source falls
+    # back to counting events rather than penalising history it cannot judge.
+    effective_support = _independent_support(supporting_events)
+
     # log1p so the curve is steep where the counts live: 1 -> 0.0, 3 -> 0.35,
     # 10 -> 0.69, 50 -> 1.0. A cluster citing fifty events is not fifty times
     # better evidenced than one citing one.
-    breadth = min(1.0, math.log1p(max(0, n_support - 1)) / math.log1p(49))
+    breadth = min(1.0, math.log1p(max(0.0, effective_support - 1.0)) / math.log1p(49))
 
     n_domains = len(domains_triggered or [])
     # Two domains is the whole point; a third adds less than the second did.
@@ -1147,6 +1263,33 @@ def _rule_confidence(event, supporting_events, domains_triggered) -> float:
     # Rounded, because 0.7999999999999999 was published to the wire 1,026 times
     # and a confidence is not meaningful past two decimal places.
     return round(min(RULE_CONF_CEILING, max(0.05, scored)), 4)
+
+
+def _independent_support(supporting_events) -> float:
+    """Effective independent evidence count behind a cluster.
+
+    `k + log1p(n - k)` where k is the number of distinct sources and n the
+    number of supporting events: each source counts once at full weight, and
+    additional reports from a source already counted add less each time.
+
+    Returns the raw count when no event carries a source, so clusters built from
+    events stored before `source` was carried are unchanged rather than
+    silently downgraded.
+    """
+    events = list(supporting_events or [])
+    n = len(events)
+    if n == 0:
+        return 0.0
+    sources = {
+        (e.get("source") if isinstance(e, dict) else getattr(e, "source", None))
+        for e in events
+    }
+    sources.discard(None)
+    sources.discard("")
+    if not sources:
+        return float(n)
+    k = len(sources)
+    return float(k) + math.log1p(max(0, n - k))
 
 
 def _corroboration_weight(event) -> float:
@@ -1367,7 +1510,17 @@ async def main():
                 logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
             
             # 2. Record event in Hawkes process and check for cross-domain excitation
-            event_domain = event.type.value.split("_")[0] if event.type and event.type.value else "unknown"
+            # Canonical domain, not the event type's leading token.
+            #
+            # `.split("_")[0]` minted a pseudo-domain per prefix -- "vessel",
+            # "flight", "crypto", "market", "bgp" and so on, 29 of them against
+            # the 8 real domains -- so the Hawkes tracker accumulated history
+            # under names no other component used and five of the eight
+            # canonical domains never registered any excitation at all.
+            # The event, not just its type: MARKET_ANOMALY is emitted by
+            # both the crypto and the equity candle paths, so the type
+            # alone cannot say which domain excited which.
+            event_domain = resolve_event_domain(event)
             event_ts = event.occurred_at.timestamp() if event.occurred_at else time.time()
             hawkes_state = hawkes_correlator.record_event(event_domain, event_ts)
 
@@ -1382,6 +1535,10 @@ async def main():
                 # Publish excitation forecasts as correlation alerts
                 if top_forecast["excess_multiplier"] >= 2.0:
                     import uuid as _uuid
+                    _fc_raw, _fc_conf, _fc_calib = await _calibrated(
+                        getattr(store, "_redis", None),
+                        min(1.0, 0.5 + 0.1 * top_forecast["excess_multiplier"]),
+                    )
                     forecast_cluster = CorrelationCluster(
                         correlation_id=str(_uuid.uuid4()),
                         trace_id=event.trace_id,
@@ -1389,13 +1546,14 @@ async def main():
                         rule_name="Cross-Domain Hawkes Excitation Forecast",
                         alert_tier=AlertTier.INTELLIGENCE if top_forecast["excess_multiplier"] >= 3.0 else AlertTier.ALERT,
                         primary_domain=top_forecast["source_domain"],
-                        confidence_score=min(1.0, 0.5 + 0.1 * top_forecast["excess_multiplier"]),
+                        confidence_score=_fc_conf,
                         summary_headline=(
                             f"⚡ Hawkes Excitation: {top_forecast['source_domain']} → {top_forecast['target_domain']} "
                             f"({top_forecast['excess_multiplier']:.1f}x above baseline)"
                         ),
                         supporting_headlines=[top_forecast["narrative"]],
                         metrics_summary={
+                            **_fc_calib,
                             "source_domain": top_forecast["source_domain"],
                             "target_domain": top_forecast["target_domain"],
                             "excess_multiplier": top_forecast["excess_multiplier"],
@@ -1506,8 +1664,8 @@ async def main():
                             _sim = sd_event.get("_similarity")
                             if _sim is not None:
                                 soft_correlator._similarity_calibrator.observe_null_score(float(_sim))
-                except Exception:
-                    pass  # Non-critical calibration path
+                except Exception as _exc:
+                    swallowed("correlation._process_correlation_event", _exc)
                 
                 if similar_events:
                     logger.info(f"🧠 Semantic Match Found for event {event.event_id} -> rule: Cross-Domain Semantic Convergence")
@@ -1647,12 +1805,22 @@ async def main():
                         else AlertTier.ALERT
                     )
 
+                    # The busiest publisher in the file, and the one the
+                    # calibration used to skip.
+                    _sem_raw, _sem_conf, _sem_calib = await _calibrated(
+                        getattr(store, "_redis", None),
+                        min(
+                            0.95,
+                            (0.35 + (0.15 * distinct_subjects)) * _corroboration_weight(event),
+                        ),
+                    )
+
                     cluster = None if skip_semantic else CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id="SEMANTIC_001",
                         rule_name="Cross-Domain Semantic Convergence",
                         alert_tier=tier,
-                        primary_domain=event.type.value.split("_")[0] if event.type and event.type.value else "semantic",
+                        primary_domain=resolve_event_domain(event),
                         # Weighted by how well the underlying claim is supported.
                         # A cross-domain convergence resting on a single-sourced
                         # report is a lead; the same convergence corroborated by
@@ -1672,10 +1840,7 @@ async def main():
                         # The cap stays under 1.0 deliberately. This is an
                         # embedding's opinion that two sentences resemble each
                         # other; it should never present as certainty.
-                        confidence_score=min(
-                            0.95,
-                            (0.35 + (0.15 * distinct_subjects)) * _corroboration_weight(event),
-                        ),
+                        confidence_score=_sem_conf,
                         summary_headline=(
                             f"🧠 Semantic Resemblance: {e_name} across "
                             f"{distinct_subjects} subject(s) in "
@@ -1683,6 +1848,7 @@ async def main():
                         ),
                         supporting_headlines=supp_headlines,
                         metrics_summary={
+                            **_sem_calib,
                             "supporting_event_count": len(supporting_ids),
                             "distinct_subjects": distinct_subjects,
                             "candidates_considered": len(similar_events),
@@ -1855,10 +2021,10 @@ async def main():
                         ref = await get_reference_data(redis_client, name)
                         if ref:
                             reference[name] = ref
-                    except Exception:
+                    except Exception as _exc:
                         # Absent reference data is the designed-for case, not an
                         # error: derive_peers works without it.
-                        pass
+                        swallowed("correlation._peer_graph_loop", _exc)
 
                 if len(series) < 2:
                     logger.info(

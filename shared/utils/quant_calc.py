@@ -1160,6 +1160,35 @@ def kyle_lambda(
         return 0.0
 
 
+def kyle_impact_bps(
+    price_changes: List[float],
+    signed_volumes: List[float],
+    reference_price: float,
+    notional: float = 1_000_000.0,
+) -> float:
+    """Price impact in basis points per `notional` of order flow.
+
+    `kyle_lambda` is correctly specified and correctly named, and its units are
+    price per share -- so it is not comparable between two instruments trading
+    at different price levels. A lambda of 2.0 is four tenths of a percent per
+    share in a $500 name and forty percent per share in a $5 one, and any
+    consumer ranking or thresholding on the raw slope is ranking by price level.
+
+    Impact of trading Q shares is lambda*Q dollars; as a fraction of price that
+    is lambda*Q/P, and Q for a fixed notional N is N/P. So the comparable
+    quantity is lambda*N/P^2, which is dimensionless and says the thing a reader
+    wants: how far does this instrument move if you push a million dollars
+    through it.
+    """
+    if reference_price <= 0:
+        return 0.0
+    lam = kyle_lambda(price_changes, signed_volumes)
+    if lam <= 0:
+        return 0.0
+    fractional = lam * notional / (reference_price ** 2)
+    return round(fractional * 10_000.0, 4)
+
+
 def calmar_ratio(
     returns: List[float],
     prices: List[float],
@@ -1392,25 +1421,41 @@ def garch_volatility_cone(
     }
 
 
+# Price impact, in basis points per $1M of flow, at which an instrument is
+# treated as illiquid enough to tighten a stop. Round numbers, and comparable
+# across the universe in a way the raw slope was not: a mega-cap absorbs a
+# million dollars inside a handful of basis points, a thin name does not.
+IMPACT_BPS_ILLIQUID = 100.0
+IMPACT_BPS_THIN = 25.0
+
+
 def microstructure_stop_distance(
     atr: float,
     ofi: float,
-    kyle_lambda: float,
+    impact_bps: float,
     base_multiplier: float = 1.5,
 ) -> float:
-    """
-    Dynamic stop-loss distance multiplier derived from Order Flow Imbalance and Kyle's Lambda.
-    Tightens stop multiplier down to 0.5 * ATR during illiquidity spikes or heavy aggressor selling.
+    """Stop-loss distance multiplier from order flow imbalance and price impact.
+
+    Tightens toward 0.5 * ATR when the book is thin or the aggressor flow is
+    one-sided.
+
+    The impact term used to be the raw Kyle's lambda, thresholded at 1.0 and
+    2.0 -- absolute numbers applied to a quantity in dollars per share. The same
+    threshold therefore meant opposite things across the universe: 2.0 is a
+    trivial impact in a $500 instrument and a catastrophic one in a $5
+    instrument, and this function decides how tight a stop is. It now takes
+    `kyle_impact_bps`, which is comparable.
     """
     mult = base_multiplier
     if ofi < -0.60:
         mult -= 0.50
     elif ofi < -0.30:
         mult -= 0.25
-        
-    if kyle_lambda > 2.0:
+
+    if impact_bps > IMPACT_BPS_ILLIQUID:
         mult -= 0.50
-    elif kyle_lambda > 1.0:
+    elif impact_bps > IMPACT_BPS_THIN:
         mult -= 0.25
 
     return round(max(0.50, min(2.50, mult)), 2)
@@ -1726,3 +1771,74 @@ def generate_covered_call_recommendation(
     }
 
 
+# Moved here from services/agents/quant_trading_engine.py.
+#
+# The API gateway's /explain/signal endpoint needed these and could not import
+# an agent module, so it served constants instead: price 128.50, ATR 3.20,
+# RSI 58.4, win rate 0.62 -- the same numbers for every signal_id, under the
+# key "deterministic_math_audit". Duplicating the formulas into the route would
+# have left two implementations to drift; one shared function serves both.
+
+def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
+    """Helper function computing RSI, EMA, ATR, Fib levels, and 20d/50d/200d SMAs."""
+    curr = closes[-1] if closes else 0.0
+    max_h = max(highs) if highs else curr
+    min_l = min(lows) if lows else curr
+    diff = max_h - min_l if max_h != min_l else curr * 0.05
+
+    fibs = {
+        "0.0": min_l,
+        "0.382": min_l + 0.382 * diff,
+        "0.500": min_l + 0.500 * diff,
+        "0.618": min_l + 0.618 * diff,
+        "1.0": max_h,
+    }
+
+    gains, losses = [], []
+    for i in range(max(1, len(closes) - 14), len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(change if change > 0 else 0)
+        losses.append(-change if change < 0 else 0)
+
+    avg_gain = sum(gains) / max(1, len(gains))
+    avg_loss = sum(losses) / max(1, len(losses))
+
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    def _ema(span: int) -> float:
+        k = 2.0 / (span + 1)
+        res = closes[0] if closes else 0.0
+        for val in closes[1:]:
+            res = (val * k) + (res * (1.0 - k))
+        return res
+
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        tr_list.append(tr)
+    atr = sum(tr_list[-14:]) / max(1, len(tr_list[-14:])) if tr_list else (curr * 0.02)
+
+    ma_res = moving_average_distances(closes)
+
+    return {
+        "rsi": round(rsi, 2),
+        "ema_12": round(_ema(12), 4),
+        "ema_26": round(_ema(26), 4),
+        "atr": round(atr, 4),
+        "sma_20": ma_res.get("sma_20"),
+        "dist_sma_20_pct": ma_res.get("dist_sma_20_pct"),
+        "sma_50": ma_res.get("sma_50"),
+        "dist_sma_50_pct": ma_res.get("dist_sma_50_pct"),
+        "sma_200": ma_res.get("sma_200"),
+        "dist_sma_200_pct": ma_res.get("dist_sma_200_pct"),
+        "ma_alignment": ma_res.get("ma_alignment", "NEUTRAL"),
+        "fib_levels": {k: round(v, 4) for k, v in fibs.items()},
+    }

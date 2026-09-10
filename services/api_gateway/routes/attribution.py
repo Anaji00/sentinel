@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
+from shared.utils.rbac import require_role, Role
 from shared.utils.entity_resolution import (
     canonical_key,
     record_alias,
@@ -112,13 +113,39 @@ async def get_merge_candidates(
 
 
 @router.post("/entities/alias")
-async def post_alias(req: AliasRequest, redis=Depends(get_redis_optional)):
+async def post_alias(
+    req: AliasRequest,
+    redis=Depends(get_redis_optional),
+    user: Dict[str, Any] = Depends(require_role(Role.ANALYST)),
+):
     """Records that two spellings name the same subject.
 
     Explicit and permanent, and the top of the resolution order: being told
     beats being inferred.
+
+    ANALYST, and it had no guard at all.
+    ---------------------------------
+    This route declared no dependency, the router declares none, and
+    `app.include_router(attribution.router)` adds none -- so an unauthenticated
+    caller could permanently merge two identities. A merge sits at the top of
+    the resolution order and is a wrong link in every correlation that follows
+    it; this audit has already catalogued four that went wrong by accident.
+    Comparable writes elsewhere in the gateway require ANALYST, and creating a
+    case is a smaller commitment than merging two subjects forever.
+
+    Found because attributing the merge to its author referenced a `user` this
+    signature did not have, and the undefined-name check refused it.
     """
-    ok = await record_alias(redis, req.alias, req.canonical)
+    # Attributed to the person who asserted it.
+    #
+    # A merge is permanent and sits at the top of the resolution order, so a
+    # wrong one is a wrong link in every correlation that follows. Recording who
+    # made it is what makes that traceable rather than inexplicable.
+    ok = await record_alias(
+        redis, req.alias, req.canonical,
+        source=f"human:{user.get('sub') or user.get('email') or 'unknown'}",
+        confidence=1.0,
+    )
     if not ok:
         raise HTTPException(
             status_code=400,

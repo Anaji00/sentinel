@@ -35,6 +35,8 @@ from typing import List, Optional, Dict
 
 # Import the NormalizedEvent model, which is the standard data format we use across Sentinel.
 from shared.models import NormalizedEvent
+from shared.models.events import event_domain as canonical_domain
+from shared.models.events import resolve_event_domain
 from shared.utils.ollama import OllamaClient
 # Initialize the logger specific to this soft correlation module.
 logger = logging.getLogger("correlation.soft")
@@ -431,7 +433,10 @@ class SoftCorrelator:
                         "occurred_at": event.occurred_at.isoformat(),
                         "region": event.region,
                         # Extract the high-level domain (e.g. "maritime" from "maritime_vessel_dark").
-                        "domain": event.type.value.split("_")[0],  # Extract domain from type (e.g., "Maritime" from "Maritime_Anomaly")
+                        # Canonical. The cross-domain semantic check compares
+                        # this field, so a prefix here meant "vessel" and
+                        # "maritime" read as different domains.
+                        "domain": resolve_event_domain(event),
                         "anomaly": event.anomaly_score,
                     },
                 }],

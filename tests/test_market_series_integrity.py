@@ -160,11 +160,29 @@ def test_the_cache_ttl_is_short_enough_to_stay_current():
 
 
 def test_a_cache_failure_is_not_a_request_failure():
-    """A Redis outage must degrade to the live fetch, not to an error."""
-    code = _code()
-    wrapper = code[code.index("async def fetch_on_the_spot_historical"):]
-    wrapper = wrapper[:wrapper.index("async def _fetch_on_the_spot_uncached")]
-    assert wrapper.count("except Exception:") >= 2
+    """A Redis outage must degrade to the live fetch, not to an error.
+
+    This counted the literal string "except Exception:" and broke when those
+    handlers gained a bound name so their suppression could be counted -- the
+    behaviour it protects was unchanged. It now asks the AST how many handlers
+    the wrapper has, which is the property, not the spelling.
+    """
+    import ast
+
+    tree = ast.parse(_code())
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "fetch_on_the_spot_historical"
+    )
+    handlers = [n for n in ast.walk(fn) if isinstance(n, ast.ExceptHandler)]
+    assert len(handlers) >= 2, (
+        f"only {len(handlers)} exception handler(s) around the cache read and "
+        "write; a Redis outage would surface as a request failure."
+    )
+    # And none of them may re-raise: that is what would turn the outage into
+    # an error rather than a fall-through to the live fetch.
+    assert not [n for h in handlers for n in ast.walk(h) if isinstance(n, ast.Raise)]
 
 
 def test_a_malformed_cache_entry_is_ignored():

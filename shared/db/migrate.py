@@ -740,9 +740,23 @@ MIGRATIONS = [
                 timescaledb.compress_orderby = 'occurred_at DESC'
             );
             SELECT add_compression_policy('events', INTERVAL '14 days', if_not_exists => TRUE);
-            -- Events are the evidential record correlations cite, so this is
-            -- deliberately generous and far behind the compression window.
-            SELECT add_retention_policy('events', INTERVAL '400 days', if_not_exists => TRUE);
+            -- 90 days, matching init.sql, because that is what is running.
+            --
+            -- This asked for 400 and got 90. init.sql already declares a
+            -- 90-day retention on events, and `if_not_exists => TRUE` keeps the
+            -- existing policy rather than replacing it -- so the deployment has
+            -- run 90 days for the life of this migration while the line above
+            -- said 400 and called itself "deliberately generous". Verified
+            -- against timescaledb_information.jobs on the running database:
+            -- {"drop_after": "90 days"}.
+            --
+            -- 90 is also the defensible number on this host. The events
+            -- hypertable is 5,856 MB against a 26 GiB VM; compression at 14
+            -- days is what makes even that fit, and 400 days of raw events is
+            -- not something this allocation can hold. A correlation citing an
+            -- event older than 90 days dangles, and that is a real cost -- it
+            -- is a smaller one than the database filling.
+            SELECT add_retention_policy('events', INTERVAL '90 days', if_not_exists => TRUE);
         """,
         "transactional": False
     }

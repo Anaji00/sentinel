@@ -243,11 +243,22 @@ def test_filings_api_gateway_routes():
     cookies = get_auth_cookies()
 
     # 1. Latest corporate filings
+    #
+    # This asserted a 200 whose first row was one of NVDA, AAPL, MSFT or TSLA
+    # -- which held only because the route returned four hand-written filings
+    # with fabricated sec.gov URLs, the same four for every caller. Like the
+    # 13F consensus test below it, the assertion was pinning the fabrication in
+    # place: it could only pass while the endpoint was inventing.
+    #
+    # With no database in this harness the honest answer is 503. The route's
+    # behaviour against real rows is covered in
+    # tests/test_filings_are_ingested_not_invented.py.
     res_latest = client.get("/api/v1/filings/latest", cookies=cookies)
-    assert res_latest.status_code == 200
-    filings = res_latest.json()
-    assert len(filings) > 0
-    assert filings[0]["ticker"] in ("NVDA", "AAPL", "MSFT", "TSLA")
+    assert res_latest.status_code in (200, 503), res_latest.text
+    if res_latest.status_code == 200:
+        for f in res_latest.json():
+            assert f["primary_doc_url"].startswith("http")
+            assert "multi-gigawatt" not in f["summary"]
 
     # 2. Prominent 13F filers summary
     res_prominent = client.get("/api/v1/filings/13f/prominent", cookies=cookies)

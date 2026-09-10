@@ -215,69 +215,8 @@ class FinancialAdviceBrief(BaseModel):
     general_hedging_strategy: str
 
 
-def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
-    """Helper function computing RSI, EMA, ATR, Fib levels, and 20d/50d/200d SMAs."""
-    curr = closes[-1] if closes else 0.0
-    max_h = max(highs) if highs else curr
-    min_l = min(lows) if lows else curr
-    diff = max_h - min_l if max_h != min_l else curr * 0.05
-
-    fibs = {
-        "0.0": min_l,
-        "0.382": min_l + 0.382 * diff,
-        "0.500": min_l + 0.500 * diff,
-        "0.618": min_l + 0.618 * diff,
-        "1.0": max_h,
-    }
-
-    gains, losses = [], []
-    for i in range(max(1, len(closes) - 14), len(closes)):
-        change = closes[i] - closes[i - 1]
-        gains.append(change if change > 0 else 0)
-        losses.append(-change if change < 0 else 0)
-
-    avg_gain = sum(gains) / max(1, len(gains))
-    avg_loss = sum(losses) / max(1, len(losses))
-
-    if avg_loss == 0:
-        rsi = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-
-    def _ema(span: int) -> float:
-        k = 2.0 / (span + 1)
-        res = closes[0] if closes else 0.0
-        for val in closes[1:]:
-            res = (val * k) + (res * (1.0 - k))
-        return res
-
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        tr_list.append(tr)
-    atr = sum(tr_list[-14:]) / max(1, len(tr_list[-14:])) if tr_list else (curr * 0.02)
-
-    ma_res = quant_calc.moving_average_distances(closes)
-
-    return {
-        "rsi": round(rsi, 2),
-        "ema_12": round(_ema(12), 4),
-        "ema_26": round(_ema(26), 4),
-        "atr": round(atr, 4),
-        "sma_20": ma_res.get("sma_20"),
-        "dist_sma_20_pct": ma_res.get("dist_sma_20_pct"),
-        "sma_50": ma_res.get("sma_50"),
-        "dist_sma_50_pct": ma_res.get("dist_sma_50_pct"),
-        "sma_200": ma_res.get("sma_200"),
-        "dist_sma_200_pct": ma_res.get("dist_sma_200_pct"),
-        "ma_alignment": ma_res.get("ma_alignment", "NEUTRAL"),
-        "fib_levels": {k: round(v, 4) for k, v in fibs.items()},
-    }
+from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
+from shared.utils.quiet_failures import swallowed
 
 
 # ── CONSOLIDATED QUANT TRADING ENGINE ──────────────────────────────────────────
@@ -970,8 +909,8 @@ Return raw JSON matching schema:"""
             if raw_iv:
                 try:
                     live_iv = float(raw_iv)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("agents.quant_trading_engine._process_trading_advisory", _exc, logger)
 
             # sentinel:watched:equities, not :watchlist:.
             #
@@ -1267,8 +1206,8 @@ Return raw JSON matching schema:"""
                     closes.append(float(bar.get("close", 0)))
                     highs.append(float(bar.get("high", bar.get("close", 0))))
                     lows.append(float(bar.get("low", bar.get("close", 0))))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("agents.quant_trading_engine._fetch_prices", _exc, logger)
         except Exception as e:
             self.logger.debug("Candle cache read failed for %s: %s", ticker, e)
 
@@ -1375,8 +1314,8 @@ Return raw JSON matching schema:"""
                         f"📅 EARNINGS UPCOMING: {ticker} | Date: {report_date} ({session_label}) | "
                         f"Est EPS: {eps_est} | Est Revenue: {rev_est}"
                     )
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("agents.quant_trading_engine._fetch_earnings_context", _exc, logger)
         return ""
 
     async def _fetch_funding_context(self, symbol: str) -> str:
@@ -1395,8 +1334,8 @@ Return raw JSON matching schema:"""
                         f"⚡ PERP FUNDING: {candidate} | Rate: {fr:.6f} ({annualized:.1f}% annualized) | "
                         f"Basis: {basis:.2f}bps | Mark: {mark:.2f} | Index: {idx:.2f}"
                     )
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("agents.quant_trading_engine._fetch_funding_context", _exc, logger)
         return ""
 
     # ── 7. STATISTICAL INSIDER CLUSTER ENGINE (§1.4) ──────────────────────────
@@ -1518,8 +1457,8 @@ Return raw JSON matching schema:"""
                 try:
                     val = item.decode("utf-8") if isinstance(item, bytes) else str(item)
                     all_trades.append(json.loads(val))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    swallowed("agents.quant_trading_engine._process_insider_form4", _exc, logger)
 
             # 3. Evaluate cluster conditions
             buy_trades = [t for t in all_trades if t.get("tx_type") == "BUY"]

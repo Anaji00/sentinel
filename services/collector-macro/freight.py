@@ -24,6 +24,7 @@ import aiohttp
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("collector.macro.freight")
 
@@ -82,8 +83,8 @@ async def poll_freight_indices(
                 cached = await raw_redis.get(f"sentinel:freight:{sym}:price")
                 if cached:
                     prev_val = float(cached.decode("utf-8") if isinstance(cached, bytes) else str(cached))
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("collector_macro.freight.poll_freight_indices", _exc, logger)
 
         # Slight market variation or query public data
         import random
@@ -94,8 +95,8 @@ async def poll_freight_indices(
         if raw_redis:
             try:
                 await raw_redis.set(f"sentinel:freight:{sym}:price", str(current_val), ex=86400 * 7)
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("collector_macro.freight.poll_freight_indices", _exc, logger)
 
         is_anomaly = abs(pct_change) >= 2.5
         event = RawEvent(

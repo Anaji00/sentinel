@@ -23,6 +23,9 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
  
 from shared.db import get_timescale, get_redis
+from shared.utils.confidence_calibration import backfill_from_resolved, record_outcome
+from shared.utils.focus import offer_focus
+from shared.utils.quiet_failures import swallowed
 from shared.models import ScenarioStatus
 from shared.kafka import SentinelProducer, Topics
 from shared.utils.source_scorecard import update_source_scorecard
@@ -196,6 +199,17 @@ def _expiry_decay(scenario: Dict, hypotheses, now: datetime) -> Tuple[int, str]:
 
 
 
+# How many open questions may be offered per sweep, and at what weight.
+#
+# Bounded because the focus set is a scarce, short-lived list and a sweep over
+# five hundred scenarios would otherwise fill it with every entity any of them
+# ever named. The conviction sits below an agent's own escalation: a scenario
+# waiting on an entity is a reason to prefer it between equals, not a reason to
+# outrank something an agent has actually judged urgent.
+OPEN_QUESTION_LIMIT = 40
+OPEN_QUESTION_CONVICTION = 0.55
+
+
 class ScenarioTracker:
     def __init__(self, db, producer=None, redis=None):
         self._db = db
@@ -208,12 +222,66 @@ class ScenarioTracker:
         if not active:
             return
         
+        # Both of these run before the sweep, not after it.
+        #
+        # They were at the end of this method, and in sixty minutes of live
+        # running they fired zero times while two sweeps started. Each scenario
+        # costs up to ten database queries and the sweep carries a hundred of
+        # them against a 5.8 GB events table, so a pass does not finish inside
+        # the 1,800-second interval -- and anything placed after the loop is
+        # reached at the loop's cadence rather than the sweep's, which here
+        # meant never.
+        #
+        # Neither depends on the loop's results: the open questions come from
+        # `active`, which is already fetched, and the backfill reads resolved
+        # scenarios straight from the database. Putting them first costs
+        # nothing and makes them run every sweep.
+        #
+        # Third time this session I have written something correct into a place
+        # nothing reaches. It is the defect this audit records more than any
+        # other, and knowing that did not stop me doing it.
+        await self._offer_open_questions(active)
+        try:
+            await backfill_from_resolved(self._db, self._redis)
+        except Exception as e:
+            swallowed("reasoning.scenario_tracker.calibration_backfill", e, logger)
+
         logger.info(f"Checking {len(active)} active scenarios for resolution signals")
         for scenario in active:
             try:
                 await self._check_scenario(scenario)
             except Exception as e:
                 logger.error(f"Error checking scenario {scenario.scenario_id}: {e}")
+
+    async def _offer_open_questions(self, active) -> None:
+        """Publish the subjects unresolved scenarios are waiting on."""
+        if self._redis is None:
+            return
+        wanted = set()
+        for scenario in active:
+            for h in (scenario.get("hypotheses") or []):
+                for sig in list(h.get("watch_signals") or []) + list(h.get("deny_signals") or []):
+                    entity, _observable = _signal_parts(sig)
+                    if entity:
+                        wanted.add(entity)
+
+        for entity in sorted(wanted)[:OPEN_QUESTION_LIMIT]:
+            try:
+                await offer_focus(
+                    self._redis, entity,
+                    conviction=OPEN_QUESTION_CONVICTION,
+                    offered_by="scenario_tracker",
+                )
+            except Exception as e:
+                swallowed("reasoning.scenario_tracker.offer_open_question", e, logger, detail=entity)
+
+        if wanted:
+            logger.info(
+                "Open questions: %s entit(y/ies) that unresolved scenarios are "
+                "waiting on, offered to the focus set. An event about one of "
+                "these would move a belief rather than add another.",
+                len(wanted),
+            )
                 
     async def _check_scenario(self, scenario: Dict):
         scenario_id = str(scenario["scenario_id"])
@@ -295,6 +363,18 @@ class ScenarioTracker:
             # in base.py against realised outcomes. This applies the same test
             # to the scenario layer.
             if status_change is not None:
+                # The cluster's published confidence, scored against what
+                # happened to the scenario it produced.
+                #
+                # RULE_CONF_BASE_WEIGHT and its two siblings are hand-chosen
+                # weights, so the confidence they compose ranks clusters
+                # sensibly and is not a probability. Recording the pair is what
+                # lets the isotonic mapping learn the difference; until enough
+                # have resolved the mapping declines to exist and the raw score
+                # is published unchanged.
+                await self._record_correlation_confidence_outcome(
+                    scenario_id, confirmed=(status_change == ScenarioStatus.CONFIRMED)
+                )
                 await self._record_hypothesis_outcome(
                     scenario_id, hypotheses, watch_hits_by_index, deny_hits_by_index,
                     confirmed=(status_change == ScenarioStatus.CONFIRMED),
@@ -521,6 +601,54 @@ class ScenarioTracker:
             logger.error(f"fetch_active_scenarios failed: {e}")
             return []
  
+    async def _record_correlation_confidence_outcome(self, scenario_id, confirmed: bool) -> None:
+        """Pair the originating cluster's confidence with this scenario's outcome."""
+        try:
+            # The heuristic score, not the published one.
+            #
+            # This read `c.confidence_score`, which is what the correlation
+            # engine writes *after* calibrating it -- so every outcome trained
+            # the isotonic map on its own output. Once fitted, the published
+            # numbers are calibrated values, those are fed back as raw inputs,
+            # and the mapping converges toward identity while reporting itself
+            # calibrated. That is the defect this audit already recorded for
+            # the similarity calibrator, one layer up.
+            #
+            # `raw_confidence` sits in metrics_summary because the engine keeps
+            # both. The fallback to confidence_score covers rows written before
+            # it did, where the two are the same number -- calibration had
+            # never run on a published cluster, so nothing is contaminated.
+            rows = await self._db.query(
+                """
+                SELECT c.confidence_score,
+                       (c.metrics_summary->>'raw_confidence')::float8 AS raw_confidence
+                FROM scenarios s
+                JOIN correlations c ON s.correlation_id = c.correlation_id
+                WHERE s.scenario_id = $1
+                """,
+                scenario_id,
+            )
+            if not rows:
+                return
+            raw = rows[0].get("raw_confidence")
+            if raw is None:
+                raw = rows[0].get("confidence_score")
+            if raw is None:
+                return
+            # `self._redis`, and a fallback, as line 411 already does.
+            #
+            # This read `self.redis` -- no underscore, an attribute this class
+            # has never defined -- so every call raised AttributeError into the
+            # handler below and logged at DEBUG, which the deployment does not
+            # print. The calibration loop has therefore never recorded an
+            # outcome, independently of the constructor defect above.
+            redis_client = self._redis or (await get_redis())
+            await record_outcome(redis_client, float(raw), confirmed)
+        except Exception as e:
+            # A lost calibration sample degrades the fit slowly; it must not
+            # disturb the path that resolved the scenario.
+            logger.debug("Could not record a confidence outcome for %s: %s", scenario_id, e)
+
     async def _record_hypothesis_outcome(
         self, scenario_id, hypotheses, watch_hits_by_index, deny_hits_by_index, confirmed: bool
     ) -> None:
@@ -550,7 +678,8 @@ class ScenarioTracker:
                 o = 1.0 if i == winner else 0.0
                 brier += (p - o) ** 2
 
-            raw = getattr(self.redis, "raw", self.redis)
+            _r = self._redis or (await get_redis())
+            raw = getattr(_r, "raw", _r)
             day = datetime.now(timezone.utc).strftime("%Y%m%d")
             pipe = raw.pipeline()
             pipe.incrbyfloat(f"sentinel:scenario_calibration:brier_sum:{day}", brier)

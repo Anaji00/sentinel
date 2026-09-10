@@ -29,6 +29,7 @@ import os
 import time
 from collections import deque
 from typing import Optional
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("shared.inference_budget")
 
@@ -223,8 +224,8 @@ class InferenceBudget:
             await raw.hset(self._seen_key, self.owner, str(time.time()))
             await raw.expire(self._waiters_key, WAITER_TTL_SEC)
             await raw.expire(self._seen_key, WAITER_TTL_SEC)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.inference_budget._note_interest", _exc, logger)
 
     async def _yields_to_a_waiter(self) -> bool:
         """Whether someone has been waiting longer than this caller.
@@ -260,8 +261,8 @@ class InferenceBudget:
                     if gone:
                         await raw.zrem(self._waiters_key, *gone)
                         await raw.hdel(self._seen_key, *gone)
-            except Exception:
-                pass
+            except Exception as _exc:
+                swallowed("utils.inference_budget._yields_to_a_waiter", _exc, logger)
             head = await raw.zrange(self._waiters_key, 0, 0)
             if not isinstance(head, (list, tuple)) or not head:
                 return False
@@ -351,8 +352,8 @@ class InferenceBudget:
                         # Served: leave the queue so the next caller is head.
                         await raw.zrem(self._waiters_key, self.owner)
                         await raw.hdel(self._seen_key, self.owner)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("utils.inference_budget.try_acquire", _exc, logger)
                 return True
             await self._note_interest()
             self.shed += 1
@@ -463,10 +464,10 @@ class InferenceBudget:
             # EXPIRE 0 deletes the key outright -- turning the gap that keeps
             # the model server off 100% duty into no gap at all.
             await raw.expire(self._key, max(1, math.ceil(MIN_GAP_SEC)))
-        except Exception:
+        except Exception as _exc:
             # The key expires on its own; a failure here costs latency, not
             # correctness.
-            pass
+            swallowed("utils.inference_budget.finish", _exc, logger)
 
     async def release(self) -> None:
         """Frees the slot early when an inference finished faster than the cooldown.
@@ -479,8 +480,8 @@ class InferenceBudget:
         try:
             raw = getattr(self.redis, "raw", self.redis)
             await raw.delete(self._key)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("utils.inference_budget.release", _exc, logger)
 
     @property
     def stats(self) -> dict:

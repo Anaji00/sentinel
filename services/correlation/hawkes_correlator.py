@@ -27,6 +27,7 @@ Theory:
 """
 
 import asyncio
+from shared.models.events import event_domain as canonical_domain
 import bisect
 import json
 import logging
@@ -37,6 +38,7 @@ import numpy as np
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("correlation.hawkes")
 
@@ -649,7 +651,11 @@ class CrossDomainHawkesCorrelator:
                 for raw in raw_results:
                     try:
                         e = json.loads(raw)
-                        domain = e.get("domain", e.get("type", "").split("_")[0])
+                        # Stored domain first, canonical lookup as the
+                        # fallback. Reconstructing it from a prefix here would
+                        # rebuild the pseudo-domains from history even after the
+                        # live recording path was corrected.
+                        domain = e.get("domain") or canonical_domain(e.get("type", ""))
                         if domain in streams:
                             # Extract timestamp from the event
                             ts = e.get("timestamp") or e.get("occurred_at")
@@ -682,15 +688,15 @@ class CrossDomainHawkesCorrelator:
 
                 streams = {d: [] for d in SENTINEL_DOMAINS}
                 for row in rows:
-                    domain = str(row.get("event_type", "")).split("_")[0]
+                    domain = canonical_domain(str(row.get("event_type", "")))
                     if domain in streams:
                         ts = row.get("occurred_at")
                         if isinstance(ts, str):
                             try:
                                 ts_dt = datetime.fromisoformat(ts)
                                 streams[domain].append(ts_dt.timestamp())
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                swallowed("correlation.hawkes_correlator._load_historical_events", _exc, logger)
                         elif hasattr(ts, "timestamp"):
                             streams[domain].append(ts.timestamp())
             except Exception as db_err:

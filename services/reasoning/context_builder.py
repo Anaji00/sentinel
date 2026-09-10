@@ -23,6 +23,7 @@ from typing import Dict, List, Any, Optional
 from shared.db import get_timescale, get_neo4j
 from shared.models import CorrelationCluster
 from shared.models.events import UNRATED_EDGE_CONFIDENCE
+from shared.utils.quiet_failures import swallowed
  
 logger = logging.getLogger("reasoning.context")
 
@@ -71,15 +72,15 @@ def _financial_facts(evt: dict) -> str:
     try:
         if strike is not None and expiry:
             parts.append(f"K{float(strike):g}@{str(expiry)[:10]}")
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as _exc:
+        swallowed("reasoning.context_builder._financial_facts", _exc, logger)
 
     iv = fin.get("implied_volatility")
     if iv:
         try:
             parts.append(f"IV{float(iv) * 100:.0f}%")
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as _exc:
+            swallowed("reasoning.context_builder._financial_facts", _exc, logger)
 
     return f" [{'; '.join(parts)}]" if parts else ""
 

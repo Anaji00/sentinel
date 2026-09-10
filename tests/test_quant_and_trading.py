@@ -222,8 +222,14 @@ def test_garch_volatility_cone():
     assert cone["tp1_sigma_1_0"] > closes[-1]
 
 def test_microstructure_stop_distance():
-    mult_normal = quant_calc.microstructure_stop_distance(atr=2.5, ofi=0.1, kyle_lambda=0.2)
-    mult_tight = quant_calc.microstructure_stop_distance(atr=2.5, ofi=-0.70, kyle_lambda=2.5)
+    # Thresholded on price impact in bps per $1M, not on the raw Kyle's lambda.
+    #
+    # The raw slope is in price per share, so `lambda > 1.0` and `> 2.0` meant
+    # opposite things across the universe and were unreachable for any
+    # realistically-priced instrument: two names with an identical real
+    # illiquidity of 50bps per $1M carry slopes of 0.00125 and 0.0000005.
+    mult_normal = quant_calc.microstructure_stop_distance(atr=2.5, ofi=0.1, impact_bps=5.0)
+    mult_tight = quant_calc.microstructure_stop_distance(atr=2.5, ofi=-0.70, impact_bps=150.0)
     assert mult_normal == 1.5
     assert mult_tight == 0.5
 

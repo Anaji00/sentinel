@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Any
 
 import aiohttp
 from pydantic import BaseModel, Field
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("collector.filings.13f")
 
@@ -143,8 +144,8 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                 _DYNAMIC_CIK_TO_TICKER = data.get("cik_to_ticker", {})
                 if _DYNAMIC_TITLE_TO_TICKER:
                     return _DYNAMIC_TITLE_TO_TICKER
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("collector_filings.thirteen_f.load_sec_company_tickers", _exc, logger)
 
     # Fetch from official SEC EDGAR
     try:
@@ -172,8 +173,8 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                             "cik_to_ticker": _DYNAMIC_CIK_TO_TICKER,
                         })
                         await raw_redis.set("sentinel:sec:company_tickers:map", payload, ex=86400 * 7)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        swallowed("collector_filings.thirteen_f.load_sec_company_tickers", _exc, logger)
     except Exception as e:
         logger.debug(f"Notice fetching SEC company tickers: {e}")
 
@@ -463,8 +464,8 @@ async def _fetch_13f_xml_holdings(
                         if fn.endswith(".xml") and not fn.endswith("primary_doc.xml") and not fn.startswith("edgar"):
                             xml_filename = fn
                             break
-    except Exception:
-        pass
+    except Exception as _exc:
+        swallowed("collector_filings.thirteen_f._fetch_13f_xml_holdings", _exc, logger)
 
     candidates = [xml_filename] if xml_filename else ["infotable.xml", "informationtable.xml", "13f_infotable.xml", f"{acc_num}.xml"]
 
@@ -490,8 +491,8 @@ async def _fetch_13f_xml_holdings(
                     text = await resp.text()
                     if "<informationTable" in text or "<infoTable" in text:
                         return parse_13f_xml_table(text)
-        except Exception:
-            pass
+        except Exception as _exc:
+            swallowed("collector_filings.thirteen_f._fetch_13f_xml_holdings", _exc, logger)
 
     return []
 
