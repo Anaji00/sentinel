@@ -567,6 +567,13 @@ _REASONING_TIER_WEIGHT = {
     "MONITOR": 0.25,
 }
 
+# What a cluster keeps when the score behind it measured nothing at all.
+#
+# A warm-up score is weaker evidence, not absent evidence, so this is a floor
+# rather than a gate: an unmeasured CRITICAL cross-domain cluster still outranks
+# a fully-measured ordinary one, which is the correct ordering.
+REASONING_COVERAGE_FLOOR = 0.6
+
 
 def _reasoning_priority(item) -> float:
     """How much a cluster is worth spending an inference slot on.
@@ -619,10 +626,34 @@ def _reasoning_priority(item) -> float:
         n_domains = 0
     cross_domain = 0.0 if n_domains <= 1 else min(1.0, (n_domains - 1) / 2.0)
 
-    return round(
-        0.40 * tier_w + 0.25 * confidence + 0.15 * breadth + 0.20 * cross_domain,
-        6,
-    )
+    ranked = 0.40 * tier_w + 0.25 * confidence + 0.15 * breadth + 0.20 * cross_domain
+
+    # What backed the trigger's score, where the cluster says.
+    #
+    # The streaming detectors report coverage and the enrichers now carry it
+    # onto the event, but the inference budget still admitted on score alone --
+    # so a 0.4 from a warm-up curve and a 0.4 from a full percentile window
+    # competed for the same slot as equals. That was the half of the coverage
+    # repair that was never done: the reporting half worked, the ranking half
+    # did not exist.
+    #
+    # Absent coverage is not zero coverage. A cluster from a path that does not
+    # report it keeps its priority exactly as before, so this changes the
+    # ordering only where there is something to read.
+    coverage = metrics.get("evidence_coverage") if isinstance(metrics, dict) else None
+    if coverage is not None:
+        try:
+            frac = max(0.0, min(1.0, float(coverage)))
+        except (TypeError, ValueError):
+            frac = None
+        if frac is not None:
+            # A floor, not a gate: a warm-up score is weaker evidence, not no
+            # evidence, and a cold detector on a CRITICAL cross-domain cluster
+            # should still outrank a warm one on an ordinary single-domain
+            # match.
+            ranked *= REASONING_COVERAGE_FLOOR + (1.0 - REASONING_COVERAGE_FLOOR) * frac
+
+    return round(ranked, 6)
 
 
 async def main():

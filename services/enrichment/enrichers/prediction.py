@@ -11,34 +11,16 @@ Delegates statistical Z-score and RRCF anomaly scoring to AnomalyScorer.
 import asyncio
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, PredictionMarketData
 
 from shared.utils.quiet_failures import swallowed, dropped
+# One owner for what belongs on the watch list. This module held a second,
+# looser filter over the same Redis set the collector prunes.
+from shared.utils.prediction_markets import slug_is_relevant
 logger = logging.getLogger("enrichment.prediction")
-
-# Kept deliberately narrow: this decides only whether a slug is worth polling
-# again, never whether an event is worth enriching. An off-domain market that
-# has already arrived is still scored and stored -- it simply stops buying a
-# subscription slot on the next sweep.
-_OFF_DOMAIN_SLUG = re.compile(
-    r"^(?:lol|cs2|mlb|nfl|nba|nhl|epl|uwcl|lec|cfb|val|itf|scoc|crickcl|aut|per\d|el\d|tur\d|"
-    r"jap|egy|qat|por|cze|lal|sec|mgc|big\d)-"
-    r"|rushing-yards|halftime|moneyline|first-half|-nrfi|exact-score"
-    r"|highest-temperature|will-it-rain|where-will-it-rain",
-    re.I,
-)
-
-
-def _slug_is_worth_watching(slug: str) -> bool:
-    """False for the sports, esports and weather questions that flooded the set."""
-    if not slug or not isinstance(slug, str):
-        return False
-    return not _OFF_DOMAIN_SLUG.search(slug)
-
 
 # Exact vocabulary for a two-sided market. "outcome 0"/"outcome 1" are kept only
 # because events collected before the collector read the right field carry those
@@ -227,7 +209,17 @@ class PredictionEnricher:
         # straight back, which is how a watch list of 609 came to be 82%
         # off-domain. A filter enforced in one service and not the other is not
         # enforced.
-        if _slug_is_worth_watching(slug):
+        # The collector's own predicate, not a second one.
+        #
+        # The repair above stopped this adding everything and replaced it with a
+        # reject-known-bad rule, while the collector prunes with a
+        # require-positive-match rule -- so a slug that passes one and fails the
+        # other is added on every enriched event and removed on every sweep,
+        # indefinitely. Measured on both: `will-wti-dip-to-90-in-september-2026`
+        # was kept here and pruned there. The collector prunes with
+        # `is_relevant_market({"slug": x})`, so calling exactly that makes the
+        # two agree by construction rather than by two people agreeing.
+        if slug_is_relevant(slug):
             try:
                 await self.redis.raw.sadd("sentinel:polymarket:watched_slugs", slug)
             except Exception as _exc:

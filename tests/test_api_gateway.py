@@ -56,9 +56,21 @@ def test_api_gateway_metrics_endpoints_require_a_credential(monkeypatch):
     # A wrong token is not a missing one.
     assert client.get("/metrics", headers={"X-Metrics-Token": "wrong"}).status_code == 401
 
+    # The second door to the same data.
+    #
+    # `/api/v1/health/metrics` renders the identical Prometheus text and was
+    # open, because everything under the health prefix was exempt unless
+    # somebody had remembered to name it. This test asserted 200 and called it
+    # liveness -- it is not a probe, it is the operational map. It now takes the
+    # same scrape token as `/metrics`, and liveness proper stays open below.
+    assert client.get("/api/v1/health/metrics").status_code == 401
+    assert client.get(
+        "/api/v1/health/metrics", headers={"X-Metrics-Token": "scrape-secret"}
+    ).status_code == 200
+
     # Liveness stays open: a probe needing a credential fails during a
     # credential outage.
-    assert client.get("/api/v1/health/metrics").status_code == 200
+    assert client.get("/api/v1/health/liveness").status_code == 200
 
 def test_api_gateway_protected_endpoint_requires_auth():
     client = TestClient(app)

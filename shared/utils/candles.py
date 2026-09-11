@@ -268,6 +268,9 @@ async def evaluate_multi_timeframe(
         
         features = [price_change_pct, volatility_pct, notional_volume, rsi_normalized, ema_divergence]
         
+        # What backed the score, carried alongside it for the same reason the
+        # significance verdict is: it is computed here and was discarded here.
+        candle_coverage = None
         if domain == "crypto":
             candle_result = await scorer.score_crypto_candle(asset, features)
             # Tolerates both shapes. These scorers now return the full result so
@@ -276,6 +279,7 @@ async def evaluate_multi_timeframe(
             if isinstance(candle_result, dict):
                 anomaly = float(candle_result.get("score", 0.0) or 0.0)
                 gate_significant = bool(candle_result.get("is_significant", False))
+                candle_coverage = candle_result.get("coverage")
             else:
                 anomaly = float(candle_result or 0.0)
                 gate_significant = False
@@ -287,6 +291,7 @@ async def evaluate_multi_timeframe(
             if isinstance(candle_result, dict):
                 anomaly = float(candle_result.get("score", 0.0) or 0.0)
                 gate_significant = bool(candle_result.get("is_significant", False))
+                candle_coverage = candle_result.get("coverage")
             else:
                 anomaly = float(candle_result or 0.0)
                 gate_significant = False
@@ -362,7 +367,9 @@ async def evaluate_multi_timeframe(
             # re-deriving significance as `anomaly >= 0.65`, a constant that
             # knows nothing about this domain's distribution, while the
             # calibrated answer was computed and discarded one frame up.
-            anomalous_frames.append((tf, block, features, anomaly, gate_significant))
+            anomalous_frames.append(
+                (tf, block, features, anomaly, gate_significant, candle_coverage)
+            )
         elif anomaly >= 0.6:
             logger.debug(
                 "[%s] %s %s-min scored %.3f but moved %.3f%% on $%.2fM -- below the "

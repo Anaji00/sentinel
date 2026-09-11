@@ -37,11 +37,20 @@ METRICS_TOKEN = os.getenv("METRICS_TOKEN", "").strip()
 SESSION_SECRET = get_secret("SESSION_SECRET", required=True)
 
 
-# Health paths that describe the platform rather than merely whether it is up.
-# These require credentials like any other data endpoint.
-_AUTHENTICATED_HEALTH_PATHS = frozenset({
-    "/api/v1/health/sources",
-    "/api/v1/health/data",
+# The health paths an orchestrator may reach without credentials.
+#
+# This was the inverse -- a denylist naming /sources and /data, with everything
+# else under /api/v1/health open -- and a denylist only ever protects the paths
+# somebody remembered. /api/v1/health/secrets was not on it, so the credential
+# audit, including masked previews that reveal a password's prefix and suffix,
+# was served to any unauthenticated caller. The same shape had already been
+# repaired once here, for /sources, by adding one more name to the list.
+#
+# Stated as an allowlist so a health endpoint added tomorrow is closed until
+# someone decides otherwise, rather than open until someone notices.
+_OPEN_HEALTH_PATHS = frozenset({
+    "/api/v1/health/liveness",
+    "/api/v1/health/readiness",
 })
 
 
@@ -369,7 +378,17 @@ async def verify_api_key(request: Request = None):
     # a session cookie. When METRICS_TOKEN is unset the endpoints fall through
     # to the normal API-key check rather than opening up, so an operator who
     # never configures one is not silently exposed.
-    if path in ("/metrics", "/metrics/json"):
+    # `/api/v1/health/metrics` serves the same content and was open, because it
+    # lives under the health prefix and the prefix was exempt by default. That is
+    # the denylist failure in one line: the operational map was closed at one
+    # door and left open at the other, and the test covering it read the second
+    # door as a liveness probe.
+    if path in (
+        "/metrics",
+        "/metrics/json",
+        "/api/v1/health/metrics",
+        "/api/v1/health/metrics/json",
+    ):
         if METRICS_TOKEN:
             supplied = None
             if hasattr(request, "headers"):
@@ -383,7 +402,7 @@ async def verify_api_key(request: Request = None):
             ):
                 return None
             raise HTTPException(status_code=401, detail="Metrics require a scrape token.")
-    if path.startswith("/api/v1/health") and path not in _AUTHENTICATED_HEALTH_PATHS:
+    if path in _OPEN_HEALTH_PATHS:
         return None
     # Login must be reachable without credentials -- it is where credentials are
     # presented. It carries its own per-source throttling rather than relying on

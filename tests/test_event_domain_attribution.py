@@ -91,11 +91,17 @@ def test_the_feed_uses_the_declared_domain():
 
 
 def test_payload_fallbacks_prefer_crypto_over_financial():
-    """Fallback order matters for the same reason the SQL order does."""
-    src = _code(FEED)
-    fn = src[src.index("function domainMetaFor("):]
-    fn = fn[:fn.index("function getDomainMeta(")]
+    """Fallback order matters for the same reason the SQL order does.
+
+    The chain moved into `lib/domain.ts`, because the live-feed tab filter was
+    answering this same question with a substring match on `type` and the two
+    disagreed on every Polymarket row.
+    """
+    src = _code(ROOT / "frontend/src/lib/domain.ts")
+    fn = src[src.index("export function resolveEventDomain("):]
     assert fn.index("e.crypto_data") < fn.index("e.financial_data")
+    # And the badge reads it rather than carrying its own copy.
+    assert "resolveEventDomain(e)" in _code(FEED)
 
 
 @pytest.mark.parametrize("vendor", [

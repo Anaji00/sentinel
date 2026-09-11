@@ -5,6 +5,8 @@ import useSWR from 'swr';
 import { apiClient, fetcher } from '../lib/api';
 import { useLiveEvents } from '../lib/useLiveEvents';
 import { NormalizedEvent, Scenario } from '../lib/types';
+import { resolveEventDomain } from '../lib/domain';
+import { recordInteraction } from '../lib/interactions';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
@@ -42,7 +44,9 @@ interface CorrelationCluster {
  *  by an older gateway.
  */
 export function domainMetaFor(e: NormalizedEvent): { label: string; icon: string; badgeStyle: string } {
-    const declared = (e as { domain?: string }).domain;
+    // One resolver, shared with the live-feed tab filter. These were two
+    // separate answers to the same question -- this one authoritative, the
+    // hook's a substring guess -- and they disagreed on every Polymarket row.
     const exemplar: Record<string, string> = {
         crypto: 'crypto_trade',
         prediction: 'prediction_market_trade',
@@ -52,12 +56,10 @@ export function domainMetaFor(e: NormalizedEvent): { label: string; icon: string
         tradfi: 'equity_block',
         news: 'headline',
     };
-    if (declared && exemplar[declared]) return getDomainMeta(exemplar[declared]);
-    if (e.crypto_data) return getDomainMeta('crypto_trade');
-    if (e.prediction_market_data) return getDomainMeta('prediction_market_trade');
-    if (e.vessel_data) return getDomainMeta('vessel_position');
-    if (e.flight_data) return getDomainMeta('flight_position');
-    if (e.financial_data) return getDomainMeta('equity_block');
+    const resolved = resolveEventDomain(e);
+    if (resolved) return getDomainMeta(exemplar[resolved]);
+    // Nothing declared and no payload: the type is all there is, which is the
+    // case the server change exists to prevent.
     return getDomainMeta(e.type);
 }
 
@@ -190,6 +192,14 @@ const EventRow = React.memo(({ e, onClick }: { e: NormalizedEvent; onClick: (e: 
 
   const fd = e.financial_data || {};
   const cd = e.crypto_data || {};
+
+  // The denominator. "The 0.9 band was opened 40 times" is meaningless until
+  // something records how many times it was shown, and nothing did.
+  // De-duplicated per alert inside recordInteraction, so a re-render or an SWR
+  // revalidation does not turn this into a count of React renders.
+  React.useEffect(() => {
+    recordInteraction('surfaced', e.anomaly_score, { correlationId: e.event_id });
+  }, [e.event_id, e.anomaly_score]);
 
   return (
     <div
@@ -401,6 +411,9 @@ export default function IntelligenceFeed() {
 
   // Handle Event Click to fetch deep detail payload from backend
   const handleEventClick = async (event: NormalizedEvent) => {
+    // Opening an alert is the ordinary signal the calibration loop never had.
+    // `surfaced` is recorded by the row itself; this is the other half.
+    recordInteraction('opened', event.anomaly_score, { correlationId: event.event_id });
     setSelectedEvent(event);
     setFullEventDetail(null);
     setIsLoadingDetail(true);

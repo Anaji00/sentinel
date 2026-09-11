@@ -15,6 +15,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 import inspect
 import time
 
@@ -747,6 +748,9 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         supporting_headlines=supporting_headlines,
                         metrics_summary={
                             "supporting_event_count": len(supporting_events),
+                            # What backed the trigger's own score, read by the
+                            # reasoning budget's ranking.
+                            "evidence_coverage": evidence_coverage(event),
                             # Stated, so a reader can tell a discounted repeat
                             # from a genuinely weak first sighting -- the two
                             # arrive at similar confidences by different routes.
@@ -822,8 +826,21 @@ def _is_stale(event, now=None) -> bool:
 RULE_CONF_BASE_WEIGHT = 0.45      # the trigger's own anomaly
 RULE_CONF_BREADTH_WEIGHT = 0.30   # how much supporting evidence was gathered
 RULE_CONF_DOMAIN_WEIGHT = 0.25    # whether it genuinely spans domains
-# A rule match is a lead, never a verdict.
+# A rule match is a lead, never a verdict. Shared by every publisher in this
+# file, because "nothing states certainty" is a property of the platform and not
+# of one code path.
 RULE_CONF_CEILING = 0.95
+
+# A resemblance is weaker evidence than a rule match. The semantic path's own
+# description says shared wording is not itself a relationship, so it composes
+# its confidence from the same terms and then stands below them.
+SEMANTIC_CONF_FACTOR = 0.85
+
+# The excitation at which a forecast is worth publishing at all, and the one at
+# which it has said everything it can. Below the gate no cluster is emitted.
+HAWKES_EXCITATION_GATE = 2.0
+HAWKES_CONF_SATURATION = 20.0
+HAWKES_CONF_FLOOR = 0.50
 
 # Temporal operators a correlation clause may declare.
 #
@@ -1272,24 +1289,90 @@ def _independent_support(supporting_events) -> float:
     number of supporting events: each source counts once at full weight, and
     additional reports from a source already counted add less each time.
 
-    Returns the raw count when no event carries a source, so clusters built from
-    events stored before `source` was carried are unchanged rather than
-    silently downgraded.
+    An event whose source is unknown counts as its own full unit of evidence.
+    That rule was applied only when NO event carried a source; when some did,
+    every unknown-origin event was folded into the known ones by `n - k`, so a
+    cluster was penalised for history it cannot judge -- the opposite of what
+    this docstring promised. Measured: three events all-unknown gave 3.0, one
+    known plus two unknown gave 2.099, and the mixed case is every cluster
+    spanning the 48 hours after `source` was added to the correlation window.
+
+    Sub-linear discounting is for repeats within a source that is actually
+    known. Two reports from `reuters` are weaker than two sources; two reports
+    of unknown origin might be two sources, and assuming otherwise invents a
+    dependence nobody measured.
     """
     events = list(supporting_events or [])
     n = len(events)
     if n == 0:
         return 0.0
-    sources = {
+    raw_sources = [
         (e.get("source") if isinstance(e, dict) else getattr(e, "source", None))
         for e in events
-    }
-    sources.discard(None)
-    sources.discard("")
-    if not sources:
-        return float(n)
-    k = len(sources)
-    return float(k) + math.log1p(max(0, n - k))
+    ]
+    known = {s for s in raw_sources if s}
+    unknown_n = sum(1 for s in raw_sources if not s)
+    known_n = n - unknown_n
+    k = len(known)
+    return float(k) + math.log1p(max(0, known_n - k)) + float(unknown_n)
+
+
+def evidence_coverage(event) -> Optional[float]:
+    """How much history backed the trigger's own anomaly score, if it says.
+
+    The streaming detectors report coverage, the enrichers now carry it onto the
+    event, and this is the first thing that reads it. Until this existed, the
+    reporting half of that repair was done and the ranking half was not: a 0.4
+    from a warm-up curve and a 0.4 from a full percentile window arrived at the
+    inference budget as the same number.
+
+    Returns None -- not 0.0 -- when the event carries no coverage, so an event
+    from a path that does not report it is not penalised for a field it never
+    had. Absent and zero are different claims.
+    """
+    breakdown = getattr(event, "anomaly_breakdown", None)
+    if breakdown is None:
+        return None
+    fraction = getattr(breakdown, "coverage_fraction", None)
+    if fraction is None and isinstance(breakdown, dict):
+        fraction = breakdown.get("coverage_fraction")
+    if fraction is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(fraction)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _hawkes_confidence(excess_multiplier: float) -> float:
+    """How much a cross-domain excitation forecast is worth.
+
+    This was `min(1.0, 0.5 + 0.1 * excess_multiplier)` on a gate of
+    `excess_multiplier >= 2.0`, so it reached certainty at 5x baseline -- which
+    live forecasts clear routinely. Measured: 19 of 19 Hawkes clusters in 24
+    hours published confidence exactly 1.000, and every one of them is a
+    *forecast*, the least certain claim this platform makes.
+
+    The ceilings already in this codebase all guard `anomaly_score` --
+    FALLBACK_MAX_SCORE at 0.995, RULE_CONF_CEILING at 0.95, and a test named
+    "no detector publishes certainty". Correlation `confidence_score` is a
+    different field on a different model, and no ceiling was ever carried
+    across.
+
+    log1p so ordering survives at the top of the range instead of collapsing:
+    2x -> 0.50, 5x -> 0.71, 10x -> 0.83, 20x -> 0.95. A forecast at 40x is not
+    twice the claim of one at 20x.
+    """
+    try:
+        m = float(excess_multiplier)
+    except (TypeError, ValueError):
+        return HAWKES_CONF_FLOOR
+    excess = max(0.0, m - HAWKES_EXCITATION_GATE)
+    span = math.log1p(HAWKES_CONF_SATURATION - HAWKES_EXCITATION_GATE)
+    fraction = min(1.0, math.log1p(excess) / span) if span > 0 else 0.0
+    return round(
+        HAWKES_CONF_FLOOR + (RULE_CONF_CEILING - HAWKES_CONF_FLOOR) * fraction, 4
+    )
 
 
 def _corroboration_weight(event) -> float:
@@ -1467,7 +1550,27 @@ async def main():
             cascade_cluster = cascade_engine.ingest_event(event)
             if cascade_cluster:
                 if not cascade_cluster.primary_domain:
-                    cascade_cluster.primary_domain = "geopolitical"
+                    # The trigger's own domain, not the literal "geopolitical".
+                    #
+                    # This read `= "geopolitical"`, and cascade.py never set the
+                    # field, so the branch fired on every cluster: wallet
+                    # clusters and BGP clusters alike were filed as geopolitical
+                    # events. The engine now sets it from the domains actually
+                    # present; this stays as a fallback and names the event that
+                    # triggered the window rather than asserting a domain from
+                    # nothing.
+                    cascade_cluster.primary_domain = resolve_event_domain(event)
+                # The cascade path was the one publisher never routed through
+                # calibration -- 43% of the layer's output, mapped by nothing.
+                _cas_raw, _cas_conf, _cas_calib = await _calibrated(
+                    getattr(store, "_redis", None), cascade_cluster.confidence_score
+                )
+                cascade_cluster.confidence_score = _cas_conf
+                if isinstance(cascade_cluster.metrics_summary, dict):
+                    cascade_cluster.metrics_summary.update(_cas_calib)
+                cascade_cluster.alert_tier = _tier_supported_by(
+                    _cas_conf, cascade_cluster.alert_tier
+                )
                 if not cascade_cluster.summary_headline:
                     cascade_cluster.summary_headline = f"🌐 Cascade Alert: {cascade_cluster.rule_name}"
                 await store.save_correlation(cascade_cluster)
@@ -1537,7 +1640,7 @@ async def main():
                     import uuid as _uuid
                     _fc_raw, _fc_conf, _fc_calib = await _calibrated(
                         getattr(store, "_redis", None),
-                        min(1.0, 0.5 + 0.1 * top_forecast["excess_multiplier"]),
+                        _hawkes_confidence(top_forecast["excess_multiplier"]),
                     )
                     forecast_cluster = CorrelationCluster(
                         correlation_id=str(_uuid.uuid4()),
@@ -1805,13 +1908,29 @@ async def main():
                         else AlertTier.ALERT
                     )
 
-                    # The busiest publisher in the file, and the one the
-                    # calibration used to skip.
+                    # The busiest publisher in the file, scored the same way as
+                    # every other one.
+                    #
+                    # This read `(0.35 + 0.15 * distinct_subjects) *
+                    # corroboration`, capped at 0.95 and never rounded. It had
+                    # no breadth term, no independence term and no cross-domain
+                    # term -- and because `kept` is capped at three, almost
+                    # every cluster landed on distinct_subjects=3 and published
+                    # the literal 0.7999999999999999. Measured: 1,201 of 1,243
+                    # semantic clusters in 24 hours carried that one value,
+                    # which is the exact float `_rule_confidence` was written to
+                    # eliminate. The repair landed on the rule path, which fired
+                    # 39 times in 14 days against this path's 72,000.
+                    #
+                    # Calling _rule_confidence means one definition of what a
+                    # correlation's confidence is, discounted because a
+                    # resemblance is not a rule match.
                     _sem_raw, _sem_conf, _sem_calib = await _calibrated(
                         getattr(store, "_redis", None),
-                        min(
-                            0.95,
-                            (0.35 + (0.15 * distinct_subjects)) * _corroboration_weight(event),
+                        round(
+                            _rule_confidence(event, kept, semantic_domains)
+                            * SEMANTIC_CONF_FACTOR,
+                            4,
                         ),
                     )
 
@@ -1850,6 +1969,10 @@ async def main():
                         metrics_summary={
                             **_sem_calib,
                             "supporting_event_count": len(supporting_ids),
+                            # What backed the trigger's own score. Read by the
+                            # reasoning budget's ranking, which until now could
+                            # not tell a measurement from a warm-up.
+                            "evidence_coverage": evidence_coverage(event),
                             "distinct_subjects": distinct_subjects,
                             "candidates_considered": len(similar_events),
                             "centrality_multiplier": round(centrality_mult, 2),

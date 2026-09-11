@@ -212,3 +212,156 @@ async def get_feedback_log(
     except Exception as e:
         logger.debug("Feedback log read failed: %s", e)
         return {"entries": []}
+
+
+# ── ANALYST INTERACTION RECORD ────────────────────────────────────────────────
+#
+# The consequence gap, and the one thing in this audit that could not be closed
+# by repairing code: "which score bands have preceded something a person acted
+# on". Nothing anywhere recorded an analyst action, so the nearest available
+# proxy was whether a scenario confirmed -- which measures the platform agreeing
+# with itself.
+#
+# The explicit-judgement route above is not that record. It captures the alerts
+# an analyst felt strongly enough about to grade, which is a small and
+# self-selected sample. What calibration needs is the ordinary traffic: what was
+# opened, what was scrolled past, what preceded a position.
+#
+# Recorded per score band rather than per alert, because the question is about
+# bands: an alert at 0.9 that nobody opened is evidence about 0.9, and it stays
+# evidence when the alert itself has expired out of every store. Bands are the
+# unit the calibration loop already works in.
+INTERACTION_KEY = "sentinel:feedback:interaction"
+INTERACTION_LOG_KEY = "sentinel:feedback:interaction:log"
+INTERACTION_LOG_MAX = 5000
+INTERACTION_TTL_SEC = 180 * 86400
+
+# Ordered weakest to strongest. `surfaced` is the denominator -- an alert the
+# reader could have acted on -- and without it "opened 40 times" says nothing,
+# because 40 of 50 and 40 of 40,000 are opposite findings.
+INTERACTIONS = ("surfaced", "opened", "dismissed", "acted_on")
+
+# Ten bands. Finer than that and each holds too little to say anything; coarser
+# and the thing being calibrated disappears into the bucket.
+INTERACTION_BANDS = 10
+
+
+def _score_band(score: float) -> str:
+    """The band a score falls in, as a stable string key."""
+    try:
+        s = max(0.0, min(1.0, float(score)))
+    except (TypeError, ValueError):
+        return "unknown"
+    idx = min(INTERACTION_BANDS - 1, int(s * INTERACTION_BANDS))
+    return f"{idx / INTERACTION_BANDS:.1f}-{(idx + 1) / INTERACTION_BANDS:.1f}"
+
+
+class InteractionRequest(BaseModel):
+    """One thing a reader did, or did not do, with one alert."""
+
+    action: str = Field(..., description=f"One of {INTERACTIONS}")
+    score: float = Field(..., ge=0.0, le=1.0, description="The alert's own score")
+    correlation_id: Optional[str] = None
+    rule_id: Optional[str] = None
+
+    @field_validator("action")
+    @classmethod
+    def _known_action(cls, v: str) -> str:
+        value = str(v or "").strip().lower()
+        if value not in INTERACTIONS:
+            raise ValueError(f"action must be one of {INTERACTIONS}")
+        return value
+
+
+@router.post("/interaction", dependencies=[Depends(require_role(Role.VIEWER))])
+async def record_interaction(req: InteractionRequest, redis=Depends(get_redis_optional)):
+    """Records that a reader saw, opened, dismissed or acted on an alert.
+
+    VIEWER rather than ANALYST: this is the ordinary traffic of reading the
+    platform, and restricting it to the role that grades alerts would reproduce
+    the self-selection the explicit-feedback route already has.
+    """
+    if not redis:
+        raise HTTPException(status_code=503, detail="interaction store unavailable")
+
+    band = _score_band(req.score)
+    entry = {
+        "action": req.action,
+        "score": round(float(req.score), 4),
+        "band": band,
+        "correlation_id": req.correlation_id,
+        "rule_id": req.rule_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        raw = getattr(redis, "raw", redis)
+        pipe = raw.pipeline()
+        pipe.hincrby(f"{INTERACTION_KEY}:{band}", req.action, 1)
+        pipe.expire(f"{INTERACTION_KEY}:{band}", INTERACTION_TTL_SEC)
+        pipe.sadd(f"{INTERACTION_KEY}:index", band)
+        pipe.expire(f"{INTERACTION_KEY}:index", INTERACTION_TTL_SEC)
+        pipe.lpush(INTERACTION_LOG_KEY, json.dumps(entry))
+        pipe.ltrim(INTERACTION_LOG_KEY, 0, INTERACTION_LOG_MAX - 1)
+        pipe.expire(INTERACTION_LOG_KEY, INTERACTION_TTL_SEC)
+        await pipe.execute()
+    except Exception as e:
+        logger.error("Could not record interaction: %s", e)
+        raise HTTPException(status_code=503, detail="interaction not recorded")
+
+    return {"recorded": True, **entry}
+
+
+@router.get("/interaction/bands")
+async def get_interaction_bands(redis=Depends(get_redis_optional)):
+    """What readers did with each score band.
+
+    `engagement_rate` is opened over surfaced and `action_rate` is acted_on over
+    surfaced. A platform whose 0.9 band is opened less often than its 0.5 band
+    is miscalibrated in the way that matters -- not against the market, against
+    the person reading it -- and that is a statement no confirm/deny loop can
+    make, because it is not about whether the alert was right.
+
+    Reported with counts as well as rates, so a rate computed from four
+    observations is visibly a rate computed from four observations.
+    """
+    if not redis:
+        return {"bands": [], "total_surfaced": 0}
+    try:
+        raw = getattr(redis, "raw", redis)
+        members = await raw.smembers(f"{INTERACTION_KEY}:index")
+        bands = sorted(m.decode() if isinstance(m, bytes) else str(m) for m in (members or []))
+
+        out: List[Dict[str, Any]] = []
+        total_surfaced = 0
+        for band in bands:
+            counts = await raw.hgetall(f"{INTERACTION_KEY}:{band}")
+            if not counts:
+                continue
+            decoded = {
+                (k.decode() if isinstance(k, bytes) else str(k)):
+                int(v.decode() if isinstance(v, bytes) else v)
+                for k, v in counts.items()
+            }
+            surfaced = decoded.get("surfaced", 0)
+            total_surfaced += surfaced
+            out.append({
+                "band": band,
+                "surfaced": surfaced,
+                "opened": decoded.get("opened", 0),
+                "dismissed": decoded.get("dismissed", 0),
+                "acted_on": decoded.get("acted_on", 0),
+                # None, not 0.0, when nothing was surfaced: a rate with no
+                # denominator is not a rate, and reporting it as zero would say
+                # "nobody opened these" about a band nobody was ever shown.
+                "engagement_rate": (
+                    round(decoded.get("opened", 0) / surfaced, 4) if surfaced else None
+                ),
+                "action_rate": (
+                    round(decoded.get("acted_on", 0) / surfaced, 4) if surfaced else None
+                ),
+            })
+        return {"bands": out, "total_surfaced": total_surfaced}
+    except Exception as e:
+        logger.debug("Interaction band read failed: %s", e)
+        return {"bands": [], "total_surfaced": 0}

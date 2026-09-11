@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { NormalizedEvent } from './types';
 import { useTelemetryStore } from './store';
+import { resolveEventDomain } from './domain';
 
 // Max events kept in memory per hook instance
 const MAX_LIVE_EVENTS = 300;
@@ -162,9 +163,25 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
   return liveEvents.filter((e) => {
     if (!selectedDomain || selectedDomain === 'all') return true;
+
+    // The server's answer, when it has one.
+    //
+    // Everything below this was the whole filter, and it is the substring guess
+    // the gateway's `domain` field was added to replace. `domainMetaFor()` in
+    // IntelligenceFeed already reads that field -- so a Polymarket row, whose
+    // type `prediction_market_trade` contains "market", was badged PREDICTION
+    // by one function and listed under the TRADFI tab by this one, in the same
+    // view. Measured: 24 such rows in twelve hours. The socket sends the payload
+    // columns too, so `resolveEventDomain` can answer for almost every row.
+    const resolved = resolveEventDomain(e);
+    if (resolved) return resolved === selectedDomain;
+
+    // Nothing declared and no payload. The type is all there is, which is what
+    // the rest of this function has always been for; it is now the fallback
+    // rather than the rule.
     const t = (e.type || '').toLowerCase();
     const s = (e.source || '').toLowerCase();
-    
+
     if (selectedDomain === 'tradfi') {
       return t.includes('tradfi') || t.includes('option') || t.includes('dark_pool') || t.includes('equity') || t.includes('price') || t.includes('market') || t.includes('insider') || t.includes('futures') || t.includes('earnings') || s.includes('finnhub') || s.includes('alphavantage');
     }

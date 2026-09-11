@@ -30,6 +30,7 @@ from shared.utils import quant_calc
 from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.tasks import safe_create_task
 from shared.utils.focus import prioritise
+from shared.utils.regime import current_regime
 import numpy as np
 from shared.models.events import entity_cache_key, UNRATED_EDGE_CONFIDENCE
 from shared.models.events import AlertTier, CorrelationCluster
@@ -690,9 +691,21 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             kelly_pct = min(kelly_pct, UNPROVEN_POSITION_PCT)
 
         # Macro risk sizing check & circuit breaker
-        macro_regime_raw = await self.redis.raw.get("sentinel:macro:latest_rates_regime")
-        rates_regime = macro_regime_raw.decode("utf-8") if isinstance(macro_regime_raw, bytes) else (macro_regime_raw if isinstance(macro_regime_raw, str) else "Normal")
-        is_stress = any(s in rates_regime.lower() for s in ("inverted", "bear_flattening", "stress"))
+        # The shared regime, not a substring search of a JSON blob.
+        #
+        # This read the raw cached brief -- a JSON document -- into a variable
+        # named `rates_regime` and asked whether the string "inverted" appeared
+        # anywhere in it. That matches `curve_state`, the field this codebase
+        # records as declared-as-four-values and live holding a rendered
+        # sentence, and it would equally match the word appearing in
+        # `regime_summary` prose. It also interpolated the whole document into
+        # the prompt below as "Macro Regime: {...}".
+        #
+        # `current_regime` derives the label from `yield_spread_2y10y_bps`,
+        # which is a measurement. Four components deriving this separately and
+        # disagreeing is the reason that function exists.
+        rates_regime = await current_regime(self.redis)
+        is_stress = rates_regime in ("inverted", "flat")
 
         if is_stress:
             kelly_pct = min(0.05, kelly_pct * 0.5)

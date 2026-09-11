@@ -635,6 +635,20 @@ class AnomalyBreakdown(BaseModel):
     ewma_volatility: float = 0.0
     is_significant: bool = False
     domain: str = "temporal"
+    # What backed the composite score, carried onto the event.
+    #
+    # The detectors began reporting coverage and nothing read it: a 0.4 from a
+    # warm-up curve and a 0.4 from a full percentile window arrived downstream
+    # as the same number, so the reporting half of that repair was done and the
+    # ranking half was not. It could not be read because it stopped at the
+    # scorer's return value and never reached the event.
+    #
+    # `fraction` is how much of the history the estimator wanted was available;
+    # `basis` names which estimator produced the number -- "percentile",
+    # "warmup_curve", "shingle_warmup", "cold_start". A fraction of 0.0 means
+    # the score measured nothing and should not outrank one that did.
+    coverage_fraction: Optional[float] = None
+    coverage_basis: Optional[str] = None
 
 class MarketMicrostructure(BaseModel):
     """Quantitative market metrics computed at enrichment time."""

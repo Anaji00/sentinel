@@ -11,7 +11,6 @@ Anomaly scoring (Whales/EMA) is handled downstream by the Enrichment service.
 import asyncio
 import aiohttp
 import json
-import re
 import logging
 import os
 import sys
@@ -177,70 +176,15 @@ def _is_binary_market(outcome_names: list) -> bool:
 
 # ── POLYMARKET STREAM ─────────────────────────────────────────────────────────        
 
-# Subjects this platform can actually act on. A prediction market is useful here
-# when its resolution would move an instrument, a currency, a commodity or a
-# border -- that is the only reason the correlation layer has to look at one.
-#
-# Matched on word boundaries against the question and slug, so "fed" does not
-# match "federer" and "war" does not match "warriors" -- both of which are real
-# Polymarket questions that a substring match would have admitted.
-RELEVANT_MARKET_TERMS = frozenset({
-    # Monetary policy and rates
-    "fed", "fomc", "interest", "rate", "rates", "inflation", "cpi", "pce",
-    "recession", "gdp", "unemployment", "jobs", "payrolls", "powell", "ecb",
-    "boj", "treasury", "yield", "yields", "debt", "default", "shutdown",
-    # Instruments and markets
-    "stock", "stocks", "equity", "equities", "nasdaq", "sp500", "dow",
-    "bitcoin", "btc", "ethereum", "eth", "crypto", "etf", "ipo", "earnings",
-    "oil", "opec", "gas", "gold", "commodity", "commodities", "dollar",
-    "yuan", "euro", "yen", "currency",
-    # Geopolitics and conflict
-    "war", "ceasefire", "invasion", "invade", "sanctions", "sanction",
-    "nato", "ukraine", "russia", "china", "taiwan", "iran", "israel",
-    "gaza", "korea", "strait", "blockade", "military", "strike", "missile",
-    "nuclear", "treaty", "tariff", "tariffs", "trade", "embargo",
-    # Government, insofar as it moves the above
-    "election", "president", "presidential", "congress", "senate",
-    "impeach", "cabinet", "resign", "coup", "referendum",
-})
-
-# Subjects that are never actionable here, however liquid. Checked first, so a
-# question that happens to contain "strike" in a sporting sense is still refused.
-EXCLUDED_MARKET_TERMS = frozenset({
-    "nfl", "nba", "mlb", "nhl", "ufc", "soccer", "football", "basketball",
-    "baseball", "hockey", "tennis", "golf", "olympics", "superbowl",
-    "worldcup", "premier", "champions", "playoff", "playoffs", "mvp",
-    "grammy", "oscar", "oscars", "emmy", "billboard", "movie", "album",
-    "netflix", "taylor", "swift", "kardashian", "celebrity", "rotten",
-    "boxoffice", "eurovision", "meme",
-})
+# The vocabulary and the predicate both live in shared/, because this set is
+# written by the enrichment service and pruned here. Two filters over one
+# Redis set is how `will-wti-dip-to-90-in-september-2026` came to be added on
+# every enriched event and removed on every sweep.
+from shared.utils.prediction_markets import is_relevant_market as _is_relevant_market
 
 # How many questions this collector will track at once. Each costs a Gamma
 # request per sync cycle.
 MAX_WATCHED_SLUGS = 60
-
-_MARKET_WORD = re.compile(r"[a-z0-9]+")
-
-
-def _is_relevant_market(market: dict) -> bool:
-    """True when a prediction market's resolution could move something we watch.
-
-    Polymarket is ordered by volume, and its volume leaders are sports. This is
-    the difference between a prediction feed and a scoreboard.
-    """
-    if not isinstance(market, dict):
-        return False
-    text = " ".join(
-        str(market.get(k) or "")
-        for k in ("question", "slug", "title", "description")
-    ).lower()
-    if not text.strip():
-        return False
-
-    words = set(_MARKET_WORD.findall(text))
-    if words & EXCLUDED_MARKET_TERMS:
-        return False
-    return bool(words & RELEVANT_MARKET_TERMS)
 
 
 async def stream_polymarket(producer: SentinelProducer, redis_client):

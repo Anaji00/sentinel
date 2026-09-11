@@ -129,8 +129,21 @@ async def test_an_absent_cache_is_unknown_not_an_error():
 
 
 def test_the_enum_fields_are_constrained_so_the_decoder_enforces_them():
-    """Both held free text live: a rendered sentence, and "crypto"."""
-    import pydantic
+    """Both held free text live: a rendered sentence, and "crypto".
+
+    The constraint stays -- passed to Ollama as `format`, a Literal becomes a
+    decoding grammar rather than a request. What changed is what happens when it
+    does not hold. `ollama.py` sends `format=(schema_dict if attempt == 0 else
+    "json")`, so the grammar covers attempt 0 only, and a retry emitting the old
+    prose raised SchemaViolationError -- which `agents/base.py` dead-letters,
+    discarding the whole brief including `yield_spread_2y10y_bps`, the measured
+    field that is the only one the regime derivation reads.
+
+    So the bad value is coerced to a sentinel rather than raised on, the way
+    `IntelBrief.primary_entity` handles the same problem. One wrong field costs
+    one field.
+    """
+    import typing
 
     from services.agents.macro_intelligence_engine import RatesRegimeBrief
 
@@ -145,12 +158,21 @@ def test_the_enum_fields_are_constrained_so_the_decoder_enforces_them():
     )
     RatesRegimeBrief(**good)
 
+    # Still a closed vocabulary, so the decoder still enforces it on attempt 0.
+    for field in ("curve_state", "credit_spread_widening_signal"):
+        annotation = RatesRegimeBrief.model_fields[field].annotation
+        assert typing.get_origin(annotation) is typing.Literal, field
+        assert "Unclassified" in typing.get_args(annotation), field
+
     for field, bad in (
         ("curve_state", "2Y Yield: 4.390% | 10Y Yield: 4.800%"),
         ("credit_spread_widening_signal", "crypto"),
     ):
-        with pytest.raises(pydantic.ValidationError):
-            RatesRegimeBrief(**{**good, field: bad})
+        brief = RatesRegimeBrief(**{**good, field: bad})
+        assert getattr(brief, field) == "Unclassified"
+        assert brief.yield_spread_2y10y_bps == 41.0, (
+            "the measurement has to survive the model's bad classification"
+        )
 
 
 def test_the_agent_reads_the_one_shared_definition():

@@ -17,8 +17,47 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
 from shared.models import CorrelationCluster, AlertTier, NormalizedEvent
+from shared.models.events import resolve_event_domain
 
 logger = logging.getLogger("correlation.cascade")
+
+# The index this engine computes, expressed as the cluster's confidence.
+#
+# Every cascade published `confidence_score` unset, so all 963 clusters in a
+# measured 24 hours carried the model default of 0.85 -- one distinct value
+# across the engine's entire output, while the flashpoint index it computes
+# ranged 52.3 to 100.0 and was written only into the prose of `description`.
+# Nothing downstream could rank on it and `_tier_supported_by` never saw it.
+CASCADE_CONF_CEILING = 0.95
+
+# A single-domain storm is not a cascade by this engine's own definition --
+# nothing cascaded, one domain fired repeatedly -- so it cannot claim a
+# cascade's confidence. The same reasoning already bars it from CRITICAL.
+CASCADE_SINGLE_DOMAIN_FACTOR = 0.70
+
+
+def _cascade_confidence(flashpoint_index: float, is_multi_domain: bool) -> float:
+    """The flashpoint index, carried as a bounded confidence.
+
+    A lead, never a verdict: bounded below 1.0 for the same reason every other
+    score in this platform is.
+    """
+    conf = max(0.0, min(100.0, float(flashpoint_index or 0.0))) / 100.0
+    if not is_multi_domain:
+        conf *= CASCADE_SINGLE_DOMAIN_FACTOR
+    return round(max(0.05, min(CASCADE_CONF_CEILING, conf)), 4)
+
+
+def _coverage_of(event: NormalizedEvent) -> Optional[float]:
+    """The coverage the enricher recorded for this event's score, if any."""
+    breakdown = getattr(event, "anomaly_breakdown", None)
+    fraction = getattr(breakdown, "coverage_fraction", None) if breakdown else None
+    if fraction is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(fraction)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_event_context(event: NormalizedEvent) -> dict:
@@ -26,14 +65,27 @@ def _extract_event_context(event: NormalizedEvent) -> dict:
     pe = event.primary_entity
     entity_name = (pe.name if pe and pe.name else None) or (pe.id if pe else None) or "Unknown"
     entity_type = (pe.type.value if pe and hasattr(pe.type, "value") else str(pe.type) if pe else "unknown")
-    domain = event.type.value if hasattr(event.type, "value") else str(event.type)
+    event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+    # The canonical domain, not the event type.
+    #
+    # `domain` here held `event.type.value`, so `domains_present` was a set of
+    # event TYPES and every count over it counted types. Two maritime types in
+    # one window -- vessel_position and vessel_dark in the Black Sea -- read as
+    # two domains, cleared the `len(domains_present) >= 2` cross-domain gate,
+    # and were published as a cascade at up to CRITICAL. The flashpoint index's
+    # `len(domains_present) * 25.0` term counted them the same way.
+    #
+    # This is the defect already recorded for the Hawkes tracker, where
+    # `.split("_")[0]` minted 29 pseudo-domains against the 8 real ones. The
+    # repair there was `resolve_event_domain`; it never reached here.
+    domain = resolve_event_domain(event)
 
     # Build a meaningful headline from available fields, never falling back to bare UUID
     headline = getattr(event, "headline", None) or getattr(event, "summary", None)
     if not headline:
-        # Construct a descriptive fallback from entity + domain
-        domain_label = domain.replace("_", " ").title()
-        headline = f"{domain_label}: {entity_name}"
+        # Construct a descriptive fallback from entity + event type
+        type_label = event_type.replace("_", " ").title()
+        headline = f"{type_label}: {entity_name}"
         if event.region:
             headline += f" ({event.region})"
 
@@ -42,9 +94,17 @@ def _extract_event_context(event: NormalizedEvent) -> dict:
         "entity_type": entity_type,
         "entity_id": pe.id if pe else "unknown",
         "domain": domain,
+        # Kept alongside the domain, because the two answer different
+        # questions: the domain decides whether anything cascaded, the type
+        # decides what to call the cluster. Collapsing them into one field is
+        # what let a single-domain window claim to be cross-domain.
+        "event_type": event_type,
         "headline": str(headline)[:200],
         "event_id": str(event.event_id),
         "score": float(getattr(event, "anomaly_score", 0.0) or 0.0),
+        # What backed that score, where the enricher said. None when the path
+        # does not report it -- absent and zero are different claims.
+        "coverage": _coverage_of(event),
         "region": getattr(event, "region", None),
         "summary": str(getattr(event, "summary", "") or "")[:200],
     }
@@ -53,9 +113,12 @@ def _extract_event_context(event: NormalizedEvent) -> dict:
 # Domains where a cluster is a claim about the world: someone did something,
 # somewhere. A co-occurrence that includes one of these is what "geopolitical"
 # was ever meant to describe.
+# Canonical domains, as `resolve_event_domain` returns them. This held event
+# types -- "vessel_position", "bgp_anomaly" -- mixed with three names ("osint",
+# "sanctions", "cyber_incident") that are neither a type nor a domain and could
+# never match anything.
 _WORLD_DOMAINS = frozenset({
-    "news", "osint", "headline", "vessel_position", "flight_position",
-    "bgp_anomaly", "cyber_incident", "vulnerability", "sanctions",
+    "news", "maritime", "aviation", "cyber", "macro",
 })
 
 
@@ -117,7 +180,9 @@ def _looks_like_identifier(key: str) -> bool:
     return " " not in text and any(c.isdigit() or c in "=-_:." for c in text)
 
 
-def _classify_cluster(domains_present: Set[str], is_multi_domain: bool) -> tuple:
+def _classify_cluster(
+    domains_present: Set[str], types_present: Set[str], is_multi_domain: bool
+) -> tuple:
     """What kind of cluster this is, from what actually fired.
 
     This was the string "Geopolitical Cascade", unconditionally, for every
@@ -134,9 +199,14 @@ def _classify_cluster(domains_present: Set[str], is_multi_domain: bool) -> tuple
     word its meaning for the cases that are.
     """
     if not is_multi_domain:
-        # Named after the one domain present, not after the case that happened
-        # to motivate this function.
-        return _single_domain_label(next(iter(domains_present), ""))
+        # Named after what actually fired, not after the case that happened to
+        # motivate this function.
+        #
+        # Keyed on the event TYPE, because that is the vocabulary
+        # _SINGLE_DOMAIN_LABELS matches on -- "crypto_transfer" and
+        # "crypto_trade" are one domain and two very different clusters, and
+        # the domain alone cannot tell a wallet movement from a price move.
+        return _single_domain_label(next(iter(sorted(types_present)), ""))
     if domains_present & _WORLD_DOMAINS:
         return "geopolitical_cascade", "Geopolitical Cascade"
     return "cross_asset_cascade", "Cross-Asset Cascade"
@@ -191,6 +261,9 @@ class GeopoliticalCascadeEngine:
 
         current_entries = self._sliding_window[key]
         domains_present: Set[str] = {e[1]["domain"] for e in current_entries}
+        types_present: Set[str] = {
+            e[1].get("event_type") or e[1]["domain"] for e in current_entries
+        }
 
         # Calculate composite Flashpoint Index (0.0 to 100.0)
         avg_score = sum(e[1]["score"] for e in current_entries) / len(current_entries) if current_entries else 0.0
@@ -223,7 +296,7 @@ class GeopoliticalCascadeEngine:
             self._last_trigger[key] = now
 
             kind_slug, kind_label = _classify_cluster(
-                domains_present, is_multi_domain_cascade
+                domains_present, types_present, is_multi_domain_cascade
             )
 
             # Displayed as written. key.title() was turning a wallet address
@@ -277,6 +350,50 @@ class GeopoliticalCascadeEngine:
                     if (flashpoint_index >= 75.0 and is_multi_domain_cascade)
                     else AlertTier.ELEVATED
                 ),
+                # The index this engine exists to compute, carried where
+                # something can read it.
+                #
+                # This was left unset, so every cascade published the model
+                # default of 0.85 -- 963 clusters in 24 hours, one distinct
+                # value -- while flashpoint_index ranged 52.3 to 100.0 and lived
+                # only inside the prose of `description`. The engine measured
+                # the thing and then threw the measurement away.
+                confidence_score=_cascade_confidence(
+                    flashpoint_index, is_multi_domain_cascade
+                ),
+                # The domain the cluster is actually about.
+                #
+                # main.py fills this with the literal "geopolitical" whenever it
+                # is unset, and it was always unset -- so a cluster of wallet
+                # transfers and a cluster of BGP withdrawals were both filed as
+                # geopolitical, which is the exact error _classify_cluster above
+                # was written to stop. That judgement reached the title and not
+                # the field every downstream filter reads.
+                primary_domain=(
+                    next(iter(sorted(domains_present)), None)
+                    if len(domains_present) == 1
+                    else ("geopolitical" if domains_present & _WORLD_DOMAINS else "cross_asset")
+                ),
+                # Rankable, rather than only readable.
+                metrics_summary={
+                    "flashpoint_index": flashpoint_index,
+                    "domain_count": len(domains_present),
+                    "domains": sorted(domains_present),
+                    "event_types": sorted(types_present),
+                    "window_events": len(current_entries),
+                    "avg_anomaly_score": round(avg_score, 4),
+                    # Mean over the entries that reported it, read by the
+                    # reasoning budget's ranking. None when none of them did.
+                    "evidence_coverage": (
+                        round(sum(_covs) / len(_covs), 4) if (_covs := [
+                            e[1]["coverage"] for e in current_entries
+                            if e[1].get("coverage") is not None
+                        ]) else None
+                    ),
+                    "max_anomaly_score": round(max_score, 4),
+                    "hawkes_boost": round(hawkes_boost, 2),
+                    "is_multi_domain": is_multi_domain_cascade,
+                },
                 trigger_event_id=supporting_ids[0],
                 supporting_event_ids=supporting_ids[1:],
                 primary_entity_id=ctx["entity_id"],

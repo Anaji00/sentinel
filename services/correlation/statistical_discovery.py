@@ -29,6 +29,7 @@ from shared.utils.feature_flags import FeatureFlagManager
 from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS_SECTORS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
 from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistration
+from shared.utils.regime import current_regime
 
 logger = logging.getLogger("correlation.statistical_discovery")
 
@@ -348,6 +349,24 @@ class StatisticalDiscoveryEngine:
             granger_bh["num_rejected"], len(granger_ps), granger_bh["threshold"],
         )
 
+        # The regime these estimates were learned under, resolved once per
+        # batch and stamped on every edge.
+        #
+        # The gap this closes: the shared regime resolves and Kelly partitions
+        # on it, and nothing else does. Volatility, correlation and payoff
+        # statistics are computed over fixed windows with no notion of whether
+        # the window spans a break -- so a correlation learned under an inverted
+        # curve is indistinguishable from one learned under steepening, and
+        # anything that reads the graph applies both as though they were the
+        # same evidence.
+        #
+        # Stamping is deliberately the first step rather than partitioning.
+        # Partitioning needs enough history in each regime to be worth having,
+        # and there is none until the label is recorded. `unknown` is written
+        # rather than omitted, so an edge learned before the macro brief existed
+        # is identifiable as unlabelled rather than silently assumed current.
+        learned_regime = await current_regime(self.redis)
+
         for i, rec in enumerate(pending):
             ticker_a, ticker_b = rec["ticker_a"], rec["ticker_b"]
             r_pearson, p_pearson = rec["r_pearson"], rec["p_pearson"]
@@ -395,6 +414,9 @@ class StatisticalDiscoveryEngine:
                                         "correction": "benjamini_hochberg",
                                         "method": "pearson",
                                         "window": f"{min_len}_bars",
+                                        # Which curve regime this estimate
+                                        # was learned under.
+                                        "regime": learned_regime,
                                     }
                                 }
                             },
@@ -450,6 +472,7 @@ class StatisticalDiscoveryEngine:
                                         "p_value": round(p_val, 4),
                                         "q_value": gc_ab_q,
                                         "correction": "benjamini_hochberg",
+                                        "regime": learned_regime,
                                     }
                                 }
                             },
@@ -497,6 +520,7 @@ class StatisticalDiscoveryEngine:
                                         "p_value": round(p_val, 4),
                                         "q_value": gc_ba_q,
                                         "correction": "benjamini_hochberg",
+                                        "regime": learned_regime,
                                     }
                                 }
                             },

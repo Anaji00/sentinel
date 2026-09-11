@@ -6,44 +6,36 @@ and then polls sixty slugs read from a Redis *set* that nothing filtered. The
 verdict was computed, logged, and discarded.
 
 Measured against the live set with the collector's own filter: **501 of 609
-stored slugs, 82%, were rejected by it** and were being polled anyway. What the
-platform actually tracked was week-old football and esports fixtures and daily
-temperature questions, while `iran-charges-hormuz-fees-by-september-30` -- a
-market about the chokepoint this platform watches by name -- sat in the same set
-and was polled only by luck.
+stored slugs, 82%, were rejected by it** and were being polled anyway.
 
 Two mechanisms produced that. The enricher `sadd`ed every slug it saw with no
 filter at all, so the collector's decision was undone from a different service.
 And the cap took `watched_slugs[-60:]` of a set, which has no order, while
-logging that it was "syncing the most recent" -- a property the data structure
-cannot have.
+logging that it was "syncing the most recent".
+
+**Then the repair introduced a third.** The enricher was given a
+reject-known-bad rule -- a regex of league prefixes -- while the collector kept
+pruning under a require-positive-match rule. A slug that passes one and fails
+the other is added on every enriched event and removed on every sweep, forever.
+Measured on both filters as they stood: `will-wti-dip-to-90-in-september-2026`
+and a French leadership market were kept by the enricher and pruned by the
+collector, so a crude-oil market this platform exists to read oscillated in and
+out of the set and was never reliably polled.
+
+One predicate now owns the set. These tests drive it directly rather than
+slicing it out of two source files, and assert that neither service has grown a
+second one.
 """
 import ast
 import pathlib
-import re
 
 import pytest
+
+from shared.utils.prediction_markets import is_relevant_market, slug_is_relevant
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COLLECTOR = (ROOT / "services" / "collector-prediction" / "main.py").read_text(encoding="utf-8")
 ENRICHER = (ROOT / "services" / "enrichment" / "enrichers" / "prediction.py").read_text(encoding="utf-8")
-
-
-def _relevance():
-    """The collector's own filter, loaded without importing the service."""
-    lines = COLLECTOR.splitlines(keepends=True)
-    blk = "".join(lines[186:])
-    ns = {"re": re}
-    exec(compile(blk[: blk.index("async def stream_polymarket")], "pm", "exec"), ns)
-    return ns["_is_relevant_market"]
-
-
-def _worth_watching():
-    i = ENRICHER.index("_OFF_DOMAIN_SLUG")
-    j = ENRICHER.index("class ", i) if "class " in ENRICHER[i:] else len(ENRICHER)
-    ns = {"re": re}
-    exec(compile(ENRICHER[i:j], "en", "exec"), ns)
-    return ns["_slug_is_worth_watching"]
 
 
 SPORT_SLUGS = [
@@ -54,6 +46,8 @@ SPORT_SLUGS = [
     "christian-mccaffrey-1374pt5-rushing-yards-2026-27",
     "highest-temperature-in-manila-on-september-4-2026-26c",
     "where-will-it-rain-on-september-3-2026-seattle-wa",
+    "lol-gal-tlnpir-2026-09-02-game4",
+    "highest-temperature-in-paris-on-september-4-2026-34corhigher",
 ]
 
 INTEL_SLUGS = [
@@ -64,15 +58,41 @@ INTEL_SLUGS = [
 
 
 @pytest.mark.parametrize("slug", SPORT_SLUGS)
-def test_the_enricher_stops_putting_sports_back(slug):
-    assert not _worth_watching()(slug)
+def test_sports_and_weather_stay_out(slug):
+    assert not slug_is_relevant(slug)
 
 
 @pytest.mark.parametrize("slug", INTEL_SLUGS)
-def test_the_enricher_keeps_what_the_platform_watches(slug):
-    assert _worth_watching()(slug), (
+def test_the_platform_keeps_what_it_exists_to_read(slug):
+    assert slug_is_relevant(slug), (
         f"{slug} is the kind of market this platform exists to read; dropping it "
         "would trade one failure for its opposite"
+    )
+
+
+@pytest.mark.parametrize("slug", INTEL_SLUGS + SPORT_SLUGS)
+def test_the_two_services_cannot_disagree(slug):
+    """The whole defect, as a property.
+
+    The enricher adds with `slug_is_relevant(slug)`; the collector prunes with
+    `is_relevant_market({"slug": x})`. They must be the same verdict for the
+    same slug, or the set oscillates.
+    """
+    assert slug_is_relevant(slug) is is_relevant_market({"slug": slug})
+
+
+def test_neither_service_carries_its_own_vocabulary():
+    """A second filter over this set is the defect, not an implementation detail."""
+    for name, src in (("collector", COLLECTOR), ("enricher", ENRICHER)):
+        assert "RELEVANT_MARKET_TERMS = frozenset" not in src, name
+        assert "_OFF_DOMAIN_SLUG = re.compile" not in src, name
+
+
+def test_the_enricher_gates_its_sadd_on_the_shared_filter():
+    i = ENRICHER.index('sadd("sentinel:polymarket:watched_slugs"')
+    assert "slug_is_relevant(slug)" in ENRICHER[max(0, i - 1200):i], (
+        "the enricher writes the set the collector prunes; it has to write it "
+        "under the collector's rule"
     )
 
 
@@ -94,14 +114,6 @@ def test_the_cap_no_longer_claims_a_recency_a_set_cannot_have():
         "[-60:] took an arbitrary tail and the log called it recency"
     )
     assert "watched_slugs[-MAX_WATCHED_SLUGS:]" not in COLLECTOR
-
-
-def test_the_live_slugs_that_motivated_this_are_still_rejected():
-    """The filter is loaded from source, so a vocabulary edit is caught here."""
-    f = _relevance()
-    assert not f({"slug": "lol-gal-tlnpir-2026-09-02-game4"})
-    assert not f({"slug": "highest-temperature-in-paris-on-september-4-2026-34corhigher"})
-    assert f({"slug": "iran-charges-hormuz-fees-by-september-30"})
 
 
 def test_dynamic_slugs_is_bound_before_the_cap_reads_it():

@@ -119,6 +119,17 @@ class RRCFDetector:
         # Shingling: concatenate recent points into one vector
         self._shingle_buffer.append(point)
         if len(self._shingle_buffer) < self.shingle_size:
+            # Nothing was measured, and the coverage channel has to say so.
+            #
+            # `_positional_score` is the only place `_last_coverage` is set, and
+            # this return never reaches it -- so a detector warm at 101 samples
+            # returned score 0.0 carrying coverage 1.00 and basis "percentile"
+            # from its previous call. A consumer reads the lowest possible
+            # anomaly score backed by full coverage and concludes "confidently
+            # not anomalous" when the shingle buffer simply was not full yet.
+            # That is the RRCF-returning-0.0-when-every-tree-threw shape, in the
+            # mechanism built to prevent it.
+            self._record_unmeasured("shingle_warmup")
             return 0.0  # Not enough history for a full shingle
         shingled = np.concatenate(list(self._shingle_buffer))
 
@@ -259,6 +270,18 @@ class RRCFDetector:
         # something genuinely worse arrives.
         return round(min(FALLBACK_MAX_SCORE, max(0.0, score)), 4)
 
+    def _record_unmeasured(self, basis: str) -> None:
+        """Declare that the score about to be returned measured nothing.
+
+        Every path that returns a score must leave the coverage channel
+        describing *that* score. A path that returns without touching it leaves
+        the previous call's coverage standing, which is worse than no coverage
+        at all: it attaches a confident-looking fraction to a number that was
+        not computed.
+        """
+        self._last_coverage = 0.0
+        self._last_basis = basis
+
     def coverage(self) -> dict:
         """What backed the last score, alongside the score itself.
 
@@ -279,6 +302,8 @@ class RRCFDetector:
         if self._ema_mean is None:
             self._ema_mean = point.copy()
             self._ema_var = np.ones_like(point)
+            # The first point seeds the estimator and is not scored against it.
+            self._record_unmeasured("cold_start")
             return 0.0
 
         alpha = self._ema_alpha

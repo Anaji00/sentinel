@@ -380,6 +380,39 @@ class DynamicAnomalyScorer:
         "options_flow",
     })
 
+    # Scoring keys that are not event types.
+    #
+    # `_get_domain` resolves an EventType to its domain and returns OTHER for
+    # anything it does not recognise. Several callers score against a key that
+    # names a *feature space* rather than an event: a candle's five features are
+    # not the same quantity as a trade's, so they are deliberately scored apart.
+    # None of those keys is an EventType, so every one resolved to OTHER, there
+    # is no OTHER detector, `_detector_for` returned None, and
+    # `score_event_batch` returned its uninitialised 0.5 for every point.
+    #
+    # Measured on the running deployment, four of the seven scoring keys in use:
+    #
+    #   crypto_candle   other  NONE     tradfi_candle  other  NONE
+    #   cyber_anomaly   other  NONE     tradfi_trade   other  NONE
+    #
+    # `evaluate_multi_timeframe` admits a frame only at `anomaly >= 0.6`, so a
+    # constant 0.5 makes the entire multi-timeframe candle detector -- six
+    # timeframes, both domains, RSI, EMA, Parkinson volatility and the
+    # materiality floors -- arithmetically incapable of emitting anything. It
+    # never did. The tradfi side went unnoticed because `market_anomaly` is also
+    # emitted by the quant radar, which works; the crypto side had no second
+    # producer, which is why the detector-silence monitor found it.
+    #
+    # Written out rather than derived by splitting on "_": deriving a domain
+    # from a prefix is the defect this file's own `_get_domain` docstring
+    # records, and the one the Hawkes tracker had.
+    _SCORING_KEY_DOMAIN = {
+        "crypto_candle": "crypto",
+        "tradfi_candle": "tradfi",
+        "tradfi_trade": "tradfi",
+        "cyber_anomaly": "cyber",
+    }
+
     def _detector_key(self, event_type: str) -> str:
         """Which detector history this event type is scored against.
 
@@ -433,7 +466,16 @@ class DynamicAnomalyScorer:
         fed events belonging to other domains, and the per-domain calibrators,
         detectors and thresholds keyed on this were calibrating on the wrong
         populations.
+
+        Internal scoring keys are resolved first. They are not EventTypes and
+        `canonical_domain` correctly returns OTHER for them -- correctly, because
+        it is answering a question about events. `_SCORING_KEY_DOMAIN` answers
+        the question this method is actually asked: which domain's detector,
+        calibrator and threshold does this feature space belong to.
         """
+        mapped = self._SCORING_KEY_DOMAIN.get((event_type or "").lower())
+        if mapped:
+            return mapped
         return canonical_domain(event_type)
 
 

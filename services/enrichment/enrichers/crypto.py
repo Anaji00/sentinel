@@ -715,7 +715,7 @@ class CryptoEnricher:
         )
         
         events = []
-        for tf, block, features, anomaly, gate_significant in anomalous_frames:
+        for tf, block, features, anomaly, gate_significant, frame_coverage in anomalous_frames:
             price_change_pct = features[0]
             volatility_pct = features[1]
             notional = features[2]

@@ -253,6 +253,51 @@ CHARS_PER_TOKEN = int(os.getenv("OLLAMA_CHARS_PER_TOKEN", "4"))
 # Headroom for the chat scaffolding and the correction suffix a retry appends.
 PROMPT_BUDGET_MARGIN_TOKENS = int(os.getenv("OLLAMA_PROMPT_MARGIN_TOKENS", "256"))
 
+# The largest context this deployment will ask a model to hold.
+#
+# The window was `3072 if is_small_model else 4096`, a literal repeated at three
+# sites and chosen by substring-matching the model tag. `ollama show
+# qwen2.5:1.5b` reports a context length of 32768 -- the platform was using 9%
+# of it. The consequence was not a missed optimisation, it was the product:
+# scenario prompts run 8,000 characters against a 4,064-character budget, and
+# `_truncate_middle` keeps the head and the tail, so what was discarded was the
+# compressed event table, the entity graph, the precedents and the headlines --
+# the evidence, in a prompt whose head and tail are instructions and schema.
+#
+# Live, before this: "truncated 8,031 -> 4,064 (49% discarded)", then the model
+# naming "entities the cluster does not contain", then "every hypothesis carries
+# the same watch and deny signals, so no observation could tell them apart", and
+# scenarios_generated=0 across 2,100 seconds and 21 clusters.
+#
+# Capped rather than taken whole, because a context costs KV cache per parallel
+# slot -- roughly 28 KB/token on a 1.5B model, so 8,192 is ~230 MB a slot
+# against measured headroom of 2.7 GiB at OLLAMA_NUM_PARALLEL=2. 8,192 gives a
+# ~24,500-character prompt budget, three times the largest prompt this platform
+# builds. Raise it when the host has the memory; the model's own window is the
+# other bound.
+OLLAMA_MAX_CTX = int(os.getenv("OLLAMA_MAX_CTX", "8192"))
+
+# What each resolved model actually declares, learned from /api/show once and
+# reused. A model's context window is a fact about the model; asking it is
+# strictly better than inferring it from characters in its name -- "2b" is a
+# substring of "qwen2.5:32b".
+_MODEL_CTX_CACHE: Dict[str, int] = {}
+
+
+def _heuristic_ctx(model: str) -> int:
+    """The old guess, kept only as the answer before /api/show has replied."""
+    resolved = str(model or "").lower()
+    is_small = any(tag in resolved for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
+    return 3072 if is_small else 4096
+
+
+def context_window_for(model: str) -> int:
+    """The context this deployment will use for `model`, in tokens."""
+    declared = _MODEL_CTX_CACHE.get(str(model or "").lower())
+    if declared:
+        return max(1024, min(declared, OLLAMA_MAX_CTX))
+    return max(1024, min(_heuristic_ctx(model), OLLAMA_MAX_CTX))
+
 # Fraction of the timeout generation may consume. The remainder covers queueing
 # behind another request, model load and prompt evaluation -- all of which are
 # inside the client's timeout and none of which produce a token.
@@ -380,7 +425,7 @@ def deliverable_prompt_chars(model: Optional[str] = None, num_predict: Optional[
     """
     resolved = str(model or OLLAMA_MODEL or "").lower()
     is_small_model = any(tag in resolved for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
-    context_tokens = 3072 if is_small_model else 4096
+    context_tokens = context_window_for(resolved)
     effective_predict = _bounded_num_predict(num_predict, is_small_model)
     reserved = effective_predict + PROMPT_BUDGET_MARGIN_TOKENS
     return max(1024, (context_tokens - reserved) * CHARS_PER_TOKEN)
@@ -627,6 +672,55 @@ class OllamaClient:
             logger.info(f"⚡ Circuit breaker HALF-OPEN for model '{model_name}'. Allowing recovery trial.")
             return False
         return False
+
+    async def _learn_context_window(self, resolved_model: str) -> None:
+        """Ask the model what its context window is, once, and remember.
+
+        `/api/show` returns a `model_info` map whose context-length key is
+        namespaced by architecture -- "qwen2.architecture" style -- so the key
+        is found by suffix rather than assumed. A failure here is not an error:
+        `context_window_for` falls back to the old heuristic, which is what the
+        platform used for every request before this existed.
+        """
+        key = str(resolved_model or "").lower()
+        if not key or key in _MODEL_CTX_CACHE:
+            return
+        try:
+            req_cm = self._session.post(
+                f"{OLLAMA_URL}/api/show", json={"model": resolved_model}, timeout=10.0
+            )
+            if hasattr(req_cm, "__aenter__"):
+                async with req_cm as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json()
+            else:
+                resp = await req_cm
+                data = await resp.json() if hasattr(resp, "json") else None
+            if not isinstance(data, dict):
+                return
+            info = data.get("model_info")
+            if not isinstance(info, dict):
+                return
+            for name, value in info.items():
+                if str(name).endswith(".context_length"):
+                    declared = int(value)
+                    if declared > 0:
+                        _MODEL_CTX_CACHE[key] = declared
+                        logger.info(
+                            "Context window for %s: %s declared, using %s "
+                            "(OLLAMA_MAX_CTX=%s)",
+                            resolved_model, declared,
+                            context_window_for(key), OLLAMA_MAX_CTX,
+                        )
+                    return
+        except Exception as exc:
+            # Counted rather than only whispered. The fallback is safe -- the
+            # old heuristic, which is what every request used before this
+            # existed -- but a lookup that fails on every call means the whole
+            # deployment is silently back on a 3,072-token window, and a DEBUG
+            # line in a deployment that emits none would never say so.
+            swallowed("utils.ollama._learn_context_window", exc, logger)
 
     async def _resolve_model(self, requested_model: str, exclude_models: Optional[set] = None) -> str:
         """Checks if the requested model exists in Ollama's tags; matches short/family names (e.g. qwen -> qwen2.5:7b) and avoids excluded/open circuit models."""
@@ -1083,7 +1177,10 @@ class OllamaClient:
         # the correction suffix a retry appends.
         model_lower = resolved_model.lower()
         is_small_model = any(tag in model_lower for tag in ["1b", "1.5b", "2b", "gemma", "tiny"])
-        context_tokens = 3072 if is_small_model else 4096
+        # What the model declares it can hold, capped by what this host will
+        # spend on KV cache -- not a literal chosen from characters in its name.
+        await self._learn_context_window(resolved_model)
+        context_tokens = context_window_for(model_lower)
         # The *effective* output budget, not the requested one. num_predict is
         # capped below by _bounded_num_predict -- a scenario asks for 1800 and
         # this host can only deliver 900 -- so reserving the request rather than
@@ -1147,7 +1244,10 @@ class OllamaClient:
                 # Also capped by what the timeout can actually deliver, so a
                 # caller cannot ask for an answer this host has no way to finish.
                 "num_predict": effective_predict,
-                "num_ctx": 3072 if is_small_model else 4096,  # Optimized context window size in tokens
+                # The same number the prompt budget was computed from. These
+                # were two separate literals sixty lines apart, which is how a
+                # budget and the window it is a budget for come to disagree.
+                "num_ctx": context_tokens,
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }

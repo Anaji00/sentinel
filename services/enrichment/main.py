@@ -393,6 +393,13 @@ DETECTOR_SILENCE_MARKET_HOURS_TYPES = {
     "market_anomaly", "insider_trade", "filing", "thirteen_f",
 }
 
+# Domains whose markets do not close, so no session can excuse their silence.
+# The exemption above is keyed on event type, and `market_anomaly` is emitted by
+# both the crypto candle path and the equity candle path -- which is precisely
+# the case `AMBIGUOUS_EVENT_TYPES` exists to record. The type says what was
+# observed; only the domain says whether the market was open.
+DETECTOR_SILENCE_CONTINUOUS_DOMAINS = {"crypto", "prediction"}
+
 
 async def _report_silent_detectors(timescale) -> None:
     """Names detectors silent well beyond their own cadence.
@@ -406,11 +413,29 @@ async def _report_silent_detectors(timescale) -> None:
     rows = await timescale.query(
         """
         SELECT type,
+               -- Grouped by domain as well as type, because the overnight
+               -- exemption below cannot be decided from a type alone.
+               -- MARKET_ANOMALY is emitted by the crypto candle path and the
+               -- equity candle path both, and the platform already records that
+               -- as the one type no type-level table can classify
+               -- (AMBIGUOUS_EVENT_TYPES names it). Grouping by type alone
+               -- collapsed a 24/7 crypto detector and a 09:30-16:00 equity
+               -- detector into one row, and the exemption then excused the
+               -- crypto one for up to eleven hours a night.
+               CASE
+                   WHEN crypto_data IS NOT NULL THEN 'crypto'
+                   WHEN prediction_market_data IS NOT NULL THEN 'prediction'
+                   WHEN vessel_data IS NOT NULL THEN 'maritime'
+                   WHEN flight_data IS NOT NULL THEN 'aviation'
+                   WHEN security_data IS NOT NULL THEN 'cyber'
+                   WHEN financial_data IS NOT NULL THEN 'tradfi'
+                   ELSE 'news'
+               END AS domain,
                COUNT(*)::float / 168.0 AS per_hour,
                EXTRACT(EPOCH FROM (NOW() - MAX(occurred_at))) / 60.0 AS minutes_silent
         FROM events
         WHERE occurred_at > NOW() - INTERVAL '7 days'
-        GROUP BY type
+        GROUP BY type, domain
         """
     )
     if not rows:
@@ -444,7 +469,17 @@ async def _report_silent_detectors(timescale) -> None:
         silent_min = float(r.get("minutes_silent") or 0.0)
         if rate < DETECTOR_SILENCE_MIN_RATE_PER_HOUR:
             continue
-        if not market_open and etype in DETECTOR_SILENCE_MARKET_HOURS_TYPES:
+        edomain = str(r.get("domain") or "")
+        # The closing bell excuses a detector that follows the bell. It does not
+        # excuse one whose market never closes: crypto and prediction markets
+        # trade continuously, and a crypto candle detector dying at 02:00 UTC
+        # stayed invisible until the US open because MARKET_ANOMALY was on the
+        # exempt list and nothing asked which domain emitted it.
+        if (
+            not market_open
+            and etype in DETECTOR_SILENCE_MARKET_HOURS_TYPES
+            and edomain not in DETECTOR_SILENCE_CONTINUOUS_DOMAINS
+        ):
             continue
         if silent_min < DETECTOR_SILENCE_MIN_MINUTES:
             continue

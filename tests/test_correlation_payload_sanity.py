@@ -70,12 +70,27 @@ def test_the_headline_states_which_domains_matched():
 # -- 2. on-chain movement is not a market event -------------------------------
 
 def test_a_wallet_transfer_cluster_is_not_a_market_anomaly():
-    assert _classify_cluster({"crypto_transfer"}, False)[1] == "On-Chain Activity Cluster"
+    # Domains and event types are separate arguments now. They were one field
+    # holding `event.type.value`, so `domains_present` was a set of types and
+    # every count over it counted types -- vessel_position plus vessel_dark read
+    # as two domains and cleared the cross-domain gate.
+    assert _classify_cluster({"crypto"}, {"crypto_transfer"}, False)[1] == "On-Chain Activity Cluster"
 
 
 def test_a_crypto_trade_cluster_still_is_one():
-    """The distinction is movement versus price, not crypto versus not-crypto."""
-    assert _classify_cluster({"crypto_trade"}, False)[1] == "Market Anomaly Cluster"
+    """The distinction is movement versus price, not crypto versus not-crypto.
+
+    Both are the `crypto` domain, which is exactly why the label has to be keyed
+    on the type: the domain alone cannot tell a wallet movement from a price
+    move.
+    """
+    assert _classify_cluster({"crypto"}, {"crypto_trade"}, False)[1] == "Market Anomaly Cluster"
+
+
+def test_two_types_in_one_domain_are_not_a_cross_domain_cascade():
+    """The gate reads domains; it was reading types."""
+    slug, _label = _classify_cluster({"maritime"}, {"vessel_position", "vessel_dark"}, False)
+    assert slug == "maritime_activity_cluster"
 
 
 # -- 3. identifiers are quoted, never restyled --------------------------------

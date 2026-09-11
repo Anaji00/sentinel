@@ -572,6 +572,12 @@ class TradFiEnricher:
             # hardcoded `anomaly >= 0.65`. The gate knows this domain's own
             # distribution; the constant did not.
             gate_significant = bool(score_dict.get("is_significant", False))
+            # Carried onto the event, so what backed the score survives the
+            # scorer's return value. Without this the coverage the detectors
+            # report is read by nothing, which is exactly what was measured.
+            _coverage = score_dict.get("coverage") or {}
+            cov_fraction = _coverage.get("fraction") if isinstance(_coverage, dict) else None
+            cov_basis = _coverage.get("basis") if isinstance(_coverage, dict) else None
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
             base_score = anomaly
@@ -737,6 +743,8 @@ class TradFiEnricher:
                 raw, p, ticker, price, volume, notional, tags, direction_str,
                 anomaly, hawkes_ratio, adjustments, earnings,
                 gate_significant=gate_significant,
+                coverage_fraction=cov_fraction,
+                coverage_basis=cov_basis,
             ))
             
         await set_pipe.execute()
@@ -744,7 +752,7 @@ class TradFiEnricher:
         final_events = await asyncio.gather(*results) if results else []
         return [e for e in final_events if e]
 
-    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None, gate_significant: bool = False):
+    async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None, gate_significant: bool = False, coverage_fraction: Optional[float] = None, coverage_basis: Optional[str] = None):
         if score_adjustments is None:
             score_adjustments = []
             # Shared adjustment allowance, reset per event.
@@ -949,6 +957,8 @@ class TradFiEnricher:
             cross_domain_correlation_score=round(hawkes_ratio, 4),
             domain="tradfi",
             is_significant=gate_significant,
+            coverage_fraction=coverage_fraction,
+            coverage_basis=coverage_basis,
         )
         
         # Only the metrics that were actually computed are stated.
@@ -1120,7 +1130,7 @@ class TradFiEnricher:
         )
         
         events = []
-        for tf, block, features, anomaly, gate_significant in anomalous_frames:
+        for tf, block, features, anomaly, gate_significant, frame_coverage in anomalous_frames:
             price_change_pct = features[0]
             volatility_pct = features[1]
             notional = features[2]
@@ -1231,6 +1241,12 @@ class TradFiEnricher:
                 cross_domain_correlation_score=round(bar_hawkes_ratio, 4),
                 domain="tradfi",
                 is_significant=gate_significant,
+                coverage_fraction=(
+                    frame_coverage.get("fraction") if isinstance(frame_coverage, dict) else None
+                ),
+                coverage_basis=(
+                    frame_coverage.get("basis") if isinstance(frame_coverage, dict) else None
+                ),
             )
             
             bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson:.4f}. Anomaly Score: {anomaly:.2f}."

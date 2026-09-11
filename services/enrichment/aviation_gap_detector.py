@@ -16,6 +16,7 @@ from typing import Optional, List, Dict
 
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
+from shared.models.events import FlightData
 from shared.utils.heartbeat import is_component_healthy
 from shared.utils.quiet_failures import swallowed
 
@@ -314,7 +315,43 @@ class AviationGapDetector:
                         f"— longer than {rank * 100:.0f}% of gaps observed here"
                     ),
                     anomaly_score=score,
-                    region=region
+                    region=region,
+                    # Where it was when it stopped transmitting, and what it was.
+                    #
+                    # Both gap detectors read the same shape of record -- the
+                    # ADS-B enricher writes {lat, lon, alt, callsign, region, ts}
+                    # to aircraft:last_seen -- and the vessel one carries lat,
+                    # lon and a VesselData through onto its event. This one read
+                    # `region` and `callsign` out of that dict and dropped the
+                    # rest, including the coordinates sitting beside them.
+                    #
+                    # Measured over 24 hours before this: vessel_dark 199 of 199
+                    # with payload and position, flight_dark 0 of 530. Because
+                    # /events/aviation filters on `flight_data IS NOT NULL`, the
+                    # aviation panel could not return a single dark aircraft,
+                    # the map had no coordinates to plot, and the gateway's
+                    # domain CASE -- which reads the payload columns -- labelled
+                    # all 530 'news'. The platform's highest-value aviation
+                    # signal was the only one no aviation view could show.
+                    latitude=val.get("lat"),
+                    longitude=val.get("lon"),
+                    flight_data=FlightData(
+                        icao24=icao24,
+                        callsign=callsign or None,
+                        # The last altitude reported before the silence, in
+                        # metres to match the field's declared unit. The
+                        # enricher stores feet under "alt".
+                        baro_altitude_m=(
+                            round(float(val["alt"]) / 3.28084, 1)
+                            if val.get("alt") not in (None, "", 0)
+                            else None
+                        ),
+                    ),
+                    tags=list(filter(None, [
+                        "dark_aircraft",
+                        "adsb_gap",
+                        region.lower().replace(" ", "_") if region else None,
+                    ])),
                 )
                 
                 try:

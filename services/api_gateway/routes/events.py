@@ -38,6 +38,17 @@ DOMAIN_TO_COLUMN = {
     "news": "headline" # News doesn't have a JSONB column, it uses the headline/summary natively
 }
 
+# What "news" means to this endpoint: a row carrying no domain payload at all.
+#
+# It is the ELSE arm of the `domain` CASE below, written as a predicate so the
+# filter and the label cannot drift apart. Every other domain is defined by the
+# presence of its column; this one is defined by the absence of all of them.
+NEWS_PREDICATE = (
+    "crypto_data IS NULL AND prediction_market_data IS NULL "
+    "AND vessel_data IS NULL AND flight_data IS NULL "
+    "AND security_data IS NULL AND financial_data IS NULL"
+)
+
 from datetime import datetime
 
 @router.get("/{domain}")
@@ -83,7 +94,19 @@ async def get_domain_events(
                 detail=f"'{domain}' is not a domain. For a single event use /events/detail/{domain}.",
             )
 
-        if domain == "all" or domain not in DOMAIN_TO_COLUMN or domain == "news":
+        # A domain nobody defined is a routing mistake, not a request for
+        # everything. The UUID guard above already establishes that shape as a
+        # 404; the same reasoning applies to "aviaton" or "predictions".
+        if domain != "all" and domain not in DOMAIN_TO_COLUMN:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"'{domain}' is not a domain. Known domains: "
+                    f"{', '.join(sorted(DOMAIN_TO_COLUMN))}, all."
+                ),
+            )
+
+        if domain == "all":
             # `source` and `domain` are returned because the client cannot derive
             # either. Without them the feed guessed the domain from a substring of
             # `type` -- and "market_anomaly" contains "market", so every Coinbase
@@ -136,10 +159,31 @@ async def get_domain_events(
             # so /events/maritime returned the newest events of ANY type -- news
             # headlines with an empty domain_data -- and the map had no
             # coordinates to plot even though vessel rows existed.
-            domain_sql = (
-                f"{where_sql} AND {target_column} IS NOT NULL "
-                f"AND {target_column}::text NOT IN ('{{}}', 'null')"
-            )
+            if domain == "news":
+                # News is the one domain defined by absence, and it was the one
+                # routed past this filter entirely: the branch condition read
+                # `or domain == "news"`, so /events/news meant "newest N events
+                # of any kind". Measured on the live table, the newest 50 rows
+                # were 26 crypto transfers, 22 vessel positions, 2 vessel_static
+                # and zero headlines -- while ~250 headlines from 30 feeds sat
+                # in the same table, unreachable through the endpoint named for
+                # them.
+                #
+                # Defined here exactly as this endpoint's own `domain` CASE
+                # defines it, so the rows returned by /events/news are precisely
+                # the rows /events/all labels 'news'. Any other definition makes
+                # the two disagree.
+                domain_sql = f"{where_sql} AND {NEWS_PREDICATE}"
+                # There is no payload column to project. `headline` is text, and
+                # aliasing text into domain_data is the defect recorded above:
+                # DataGrid flattens an object and renders nothing for a string.
+                domain_data_sql = "NULL::jsonb"
+            else:
+                domain_sql = (
+                    f"{where_sql} AND {target_column} IS NOT NULL "
+                    f"AND {target_column}::text NOT IN ('{{}}', 'null')"
+                )
+                domain_data_sql = target_column
             # Interleaved by sub-type, not purely by recency.
             #
             # A domain is not one stream. Crypto carries transfers, spot trades,
@@ -191,7 +235,7 @@ async def get_domain_events(
                            COALESCE(longitude, ST_X(coordinates::geometry)) as longitude,
                            headline,
                            summary,
-                           {target_column} as domain_data,
+                           {domain_data_sql} as domain_data,
                            ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as type_rank,
                            ROW_NUMBER() OVER (ORDER BY occurred_at DESC) as overall_rank
                     FROM recent

@@ -30,6 +30,33 @@ function isPublicPath(pathStr: string): boolean {
   return PUBLIC_PATHS.includes(clean);
 }
 
+// Probes an uptime checker reaches before anyone has signed in. Matched
+// exactly, against the whole path.
+//
+// This was `pathname.includes('/health')` -- a substring test standing in for a
+// route test -- and every path containing those seven characters inherited the
+// exemption. Reproduced against the running stack with no cookie:
+// /api/v1/events/crypto returned 401 and /api/v1/events/health returned 500
+// events across every domain, because `health` is not a known domain and fell
+// into the unfiltered branch. /api/v1/health/secrets returned the credential
+// audit with previews. And it was not read-only: POST /api/v1/cases/health/notes
+// returned 422 where /api/v1/cases/abc/notes returned 401 -- FastAPI resolves
+// require_role() before it validates a body, so a 422 means the role gate had
+// already been passed.
+//
+// The escalation came from the block below: with no session, the proxy attaches
+// the operator's master key, which the gateway resolves to Role.ADMIN. So the
+// exemption did not merely skip a check, it upgraded the caller.
+//
+// Only liveness and readiness belong here. The rest of /api/v1/health --
+// /data, /sources, /secrets -- is operational detail about the deployment and
+// requires a session like anything else.
+const PROBE_PATHS = ['health', 'api/v1/health/liveness', 'api/v1/health/readiness'];
+
+function isProbePath(pathStr: string): boolean {
+  return PROBE_PATHS.includes(pathStr.replace(/^\/+|\/+$/g, ''));
+}
+
 async function handleProxy(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   // Check auth session
   const cookie = req.cookies.get('sentinel_session');
@@ -38,15 +65,16 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   const { path } = await context.params;
   const pathStr = (path || []).join('/');
   const publicPath = isPublicPath(pathStr);
+  const probePath = isProbePath(pathStr);
 
-  if (!publicPath) {
+  if (!publicPath && !probePath) {
     if (!cookie || !cookie.value) {
-      if (!isDev && !req.nextUrl.pathname.includes('/health')) {
+      if (!isDev) {
         return NextResponse.json({ error: 'Unauthorized session' }, { status: 401 });
       }
     } else {
       const { valid } = verifySessionToken(cookie.value);
-      if (!valid && !isDev && !req.nextUrl.pathname.includes('/health')) {
+      if (!valid && !isDev) {
         return NextResponse.json({ error: 'Invalid or expired session' }, { status: 401 });
       }
     }
@@ -66,8 +94,12 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   // only where there is no session to forward (health checks and similar).
   // A public path is forwarded with no credential at all: it must be handled as
   // an anonymous caller, never as the operator.
+  // A probe is forwarded with no credential, for the same reason a public path
+  // is: it must be handled as an anonymous caller. Attaching the master key to
+  // an unauthenticated request is what turned the exemption above from a
+  // skipped check into a privilege escalation.
   const hasSession = Boolean(cookie?.value && verifySessionToken(cookie.value).valid);
-  if (hasSession || publicPath) {
+  if (hasSession || publicPath || probePath) {
     headers.delete('X-API-KEY');
     headers.delete('x-api-key');
   } else {

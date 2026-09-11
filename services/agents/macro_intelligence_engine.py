@@ -83,11 +83,47 @@ class RatesRegimeBrief(BaseModel):
     # Passed to Ollama as `format`, a Literal becomes a decoding grammar rather
     # than a request -- the same change that took FinancialAdviceBrief from
     # failing every attempt to succeeding.
-    curve_state: Literal["Inverted", "Disinverted", "Normal Steepening", "Flat"]
+    #
+    # The grammar holds on attempt 0 only. `ollama.py` passes
+    # `format=(schema_dict if attempt == 0 else "json")`, so a retry compels
+    # valid JSON and says nothing about shape -- and a retry emitting the prose
+    # that was live before this change raised SchemaViolationError, which
+    # `agents/base.py` dead-letters. That threw away the whole brief, including
+    # `yield_spread_2y10y_bps`, which is measured by the caller, correct, and
+    # the only field the regime derivation reads. Constraining the field traded
+    # a bad enum for total loss of the numbers beside it.
+    #
+    # Coerced to a sentinel rather than raised on, the way
+    # `IntelBrief.primary_entity` handles the same problem: an unrecognised
+    # classification becomes "Unclassified" and the measurements survive.
+    curve_state: Literal["Inverted", "Disinverted", "Normal Steepening", "Flat", "Unclassified"]
     yield_spread_2y10y_bps: float
     breakeven_inflation_bps: float
     tips_yield: float
-    credit_spread_widening_signal: Literal["Stable", "Moderate Widening", "Severe Stress"]
+    credit_spread_widening_signal: Literal[
+        "Stable", "Moderate Widening", "Severe Stress", "Unclassified"
+    ]
+
+    @field_validator("curve_state", "credit_spread_widening_signal", mode="before")
+    @classmethod
+    def _coerce_unknown_classification(cls, v: Any) -> Any:
+        """An unrecognised classification is one bad field, not a lost brief.
+
+        Case- and whitespace-insensitive, because a retry that is not running
+        under the grammar returns "inverted" as readily as "Inverted", and
+        rejecting a brief over capitalisation is the same failure in miniature.
+        """
+        if not isinstance(v, str):
+            return "Unclassified"
+        cleaned = v.strip()
+        permitted = (
+            "Inverted", "Disinverted", "Normal Steepening", "Flat",
+            "Stable", "Moderate Widening", "Severe Stress", "Unclassified",
+        )
+        for allowed in permitted:
+            if cleaned.lower() == allowed.lower():
+                return allowed
+        return "Unclassified"
     regime_summary: str
     macro_risk_level: str  # "LOW", "ELEVATED", "CRITICAL"
     recommended_hedging: List[str] = Field(default_factory=list)
