@@ -20,6 +20,7 @@ from shared.db import get_redis
 
 logging.basicConfig(level=logging.INFO)
 from shared.utils.sanctions import is_usable_keyword, OFAC_MATCHABLE_TYPES
+from shared.utils.http_client import guarded_request
 
 logger = logging.getLogger("ofac_sync")
 
@@ -42,58 +43,72 @@ async def fetch_ofac_keywords():
 
     strip_chars = ' "\''
 
-    async with aiohttp.ClientSession() as session:
-        # Download primary names
-        async with session.get(OFAC_SDN_URL) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                # OFAC CSV format: uid, last_name, type, programs, title, vessel_call_sign, vessel_type, vessel_tonnage, grt, vessel_flag, vessel_owner, remarks
-                reader = csv.reader(StringIO(text))
-                for row in reader:
-                    if len(row) <= 1 or not row[1]:
-                        continue
-                    # row[2] is the SDN type. Individuals are people, and a
-                    # person's surname matched against a ship's name is not
-                    # evidence about the ship -- that is where "maria", "lily"
-                    # and "star" came from.
-                    sdn_type = row[2].strip(strip_chars).lower() if len(row) > 2 else ""
-                    if sdn_type not in OFAC_MATCHABLE_TYPES:
-                        skipped_individual += 1
-                        continue
-                    name = row[1].strip(strip_chars).lower()
-                    # `len(name) > 3` was the only rule here, and it is what let
-                    # four-character surnames and word fragments into an
-                    # unanchored substring matcher. The length judgement now
-                    # lives with the matcher that has to honour it.
-                    if not is_usable_keyword(name):
-                        skipped_short += 1
-                        continue
-                    keywords.add(name)
-                    if row[0]:
-                        kept_uids.add(row[0].strip())
-            else:
-                logger.error(f"Failed to fetch SDN list: HTTP {resp.status}")
+    # Behind the circuit breaker.
+    #
+    # `shared/utils/http_client.py` wraps outbound HTTP in the breaker, and it
+    # had zero importers anywhere in the tree -- every external dependency the
+    # platform has called out with raw aiohttp, so the live breaker registry
+    # read `{}` and an empty object in a health payload reads as "all circuits
+    # healthy" rather than "there are no circuits". OFAC is a good example of
+    # why it matters: a slow or failing sanctions endpoint retried on every
+    # sweep with nothing between it and the network.
+    text = await guarded_request(
+        "GET", OFAC_SDN_URL,
+        source="ofac", service="enrichment",
+        expect_json=False, timeout=60.0,
+    )
+    if text is not None:
+        # OFAC CSV format: uid, last_name, type, programs, title, vessel_call_sign, vessel_type, vessel_tonnage, grt, vessel_flag, vessel_owner, remarks
+        reader = csv.reader(StringIO(text))
+        for row in reader:
+            if len(row) <= 1 or not row[1]:
+                continue
+            # row[2] is the SDN type. Individuals are people, and a
+            # person's surname matched against a ship's name is not
+            # evidence about the ship -- that is where "maria", "lily"
+            # and "star" came from.
+            sdn_type = row[2].strip(strip_chars).lower() if len(row) > 2 else ""
+            if sdn_type not in OFAC_MATCHABLE_TYPES:
+                skipped_individual += 1
+                continue
+            name = row[1].strip(strip_chars).lower()
+            # `len(name) > 3` was the only rule here, and it is what let
+            # four-character surnames and word fragments into an
+            # unanchored substring matcher. The length judgement now
+            # lives with the matcher that has to honour it.
+            if not is_usable_keyword(name):
+                skipped_short += 1
+                continue
+            keywords.add(name)
+            if row[0]:
+                kept_uids.add(row[0].strip())
+    else:
+        logger.error("Failed to fetch the OFAC SDN list; keeping the previous keyword set.")
 
-        # Download aliases, restricted to the entries kept above
-        async with session.get(OFAC_ALT_URL) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                # OFAC ALT CSV format: uid, ent_num, alt_type, alt_name, alt_remarks
-                reader = csv.reader(StringIO(text))
-                for row in reader:
-                    if len(row) <= 3 or not row[3]:
-                        continue
-                    # ent_num ties the alias back to its SDN entry. An alias of
-                    # an individual is still an individual.
-                    ent_num = row[1].strip() if len(row) > 1 else ""
-                    if ent_num and ent_num not in kept_uids:
-                        skipped_individual += 1
-                        continue
-                    name = row[3].strip(strip_chars).lower()
-                    if not is_usable_keyword(name):
-                        skipped_short += 1
-                        continue
-                    keywords.add(name)
+    # Aliases, restricted to the entries kept above, behind the same breaker.
+    alt_text = await guarded_request(
+        "GET", OFAC_ALT_URL,
+        source="ofac", service="enrichment",
+        expect_json=False, timeout=60.0,
+    )
+    if alt_text is not None:
+        text = alt_text
+        # OFAC ALT CSV format: uid, ent_num, alt_type, alt_name, alt_remarks
+        reader = csv.reader(StringIO(text))
+        for row in reader:
+            if len(row) <= 3 or not row[3]:
+                continue
+            # ent_num ties the alias back to its SDN entry. An alias of
+            # an individual is still an individual.
+            ent_num = row[1].strip() if len(row) > 1 else ""
+            if ent_num and ent_num not in kept_uids:
+                skipped_individual += 1
+                continue
+            name = row[3].strip(strip_chars).lower()
+            if not is_usable_keyword(name):
+                skipped_short += 1
+                continue
+            keywords.add(name)
 
     logger.info(
         "OFAC sync: %d usable keywords; dropped %d individual-typed and %d too short to identify.",

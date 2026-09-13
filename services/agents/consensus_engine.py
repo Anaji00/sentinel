@@ -58,7 +58,10 @@ from shared.utils.entity_resolution import resolve_entity
 
 from pydantic import BaseModel, Field
 
-from .base import SentinelAgent, AgentBulletin, AgentScorecard
+from .base import (
+    SentinelAgent, AgentBulletin, AgentScorecard,
+    AGENT_DIGEST_STALE_AFTER_SEC, canonical_direction,
+)
 from shared.kafka import Topics
 from shared.utils.quiet_failures import swallowed
 
@@ -221,10 +224,15 @@ class SubjectiveOpinion(BaseModel):
         # Higher weight = more evidence = lower uncertainty
         evidence_count = max(0.1, weight * 10.0)
 
-        if direction in ("up", "bullish", "long"):
+        # The shared vocabulary, so this and the prediction recorder cannot
+        # disagree about what a word means. They did: "bearish" was fused here
+        # as a directional opinion and skipped by the recorder, so it moved the
+        # swarm's view while being exempt from ever being scored.
+        canonical = canonical_direction(direction)
+        if canonical == "up":
             r = conviction * evidence_count  # positive evidence
             s = (1.0 - conviction) * evidence_count * 0.3  # weak counter-evidence
-        elif direction in ("down", "bearish", "short"):
+        elif canonical == "down":
             r = (1.0 - conviction) * evidence_count * 0.3
             s = conviction * evidence_count
         else:
@@ -625,10 +633,10 @@ class ConsensusEngine(SentinelAgent):
                 opinion = SubjectiveOpinion.from_bulletin(b, weight, base_rate=prior)
                 opinions.append((b.agent_name, opinion, direction))
 
-                if direction in ("up", "bullish", "long"):
+                if canonical_direction(direction) == "up":
                     bullish_agents.append(b.agent_name)
                     weighted_scores.append(b.conviction * weight)
-                elif direction in ("down", "bearish", "short"):
+                elif canonical_direction(direction) == "down":
                     bearish_agents.append(b.agent_name)
                     weighted_scores.append(-b.conviction * weight)
                 else:
@@ -677,18 +685,18 @@ class ConsensusEngine(SentinelAgent):
                     supporting_agents=bullish_agents,
                     refuting_agents=bearish_agents,
                     opinion=SubjectiveOpinion.averaging_fuse(
-                        [op for name, op, d in opinions if d in ("up", "bullish", "long")]
+                        [op for name, op, d in opinions if canonical_direction(d) == "up"]
                     ) if bullish_agents else None,
-                    evidence_summary=f"{len(bullish_agents)} agent(s) bullish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('up','bullish','long')) / max(1, len(bullish_agents)):.0%}"
+                    evidence_summary=f"{len(bullish_agents)} agent(s) bullish with avg conviction {sum(b.conviction for b in group if canonical_direction(b.expected_direction) == 'up') / max(1, len(bullish_agents)):.0%}"
                 )
                 bearish_hyp = CompetingHypothesis(
                     hypothesis=f"Bearish on {ticker}",
                     supporting_agents=bearish_agents,
                     refuting_agents=bullish_agents,
                     opinion=SubjectiveOpinion.averaging_fuse(
-                        [op for name, op, d in opinions if d in ("down", "bearish", "short")]
+                        [op for name, op, d in opinions if canonical_direction(d) == "down"]
                     ) if bearish_agents else None,
-                    evidence_summary=f"{len(bearish_agents)} agent(s) bearish with avg conviction {sum(b.conviction for b in group if b.expected_direction in ('down','bearish','short')) / max(1, len(bearish_agents)):.0%}"
+                    evidence_summary=f"{len(bearish_agents)} agent(s) bearish with avg conviction {sum(b.conviction for b in group if canonical_direction(b.expected_direction) == 'down') / max(1, len(bearish_agents)):.0%}"
                 )
 
                 ach = ACHReport(
@@ -933,7 +941,7 @@ class ConsensusEngine(SentinelAgent):
                     try:
                         digest_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                         age_seconds = (now - digest_ts).total_seconds()
-                        if age_seconds > 300:  # 5 minutes
+                        if age_seconds > AGENT_DIGEST_STALE_AFTER_SEC:
                             stale.append(agent_name)
                             logger.info(f"🕐 Agent '{agent_name}' digest is {age_seconds:.0f}s stale — downweighting")
                     except (ValueError, TypeError) as _exc:
@@ -977,16 +985,18 @@ class ConsensusEngine(SentinelAgent):
 
     @staticmethod
     def _map_direction(direction: str) -> str:
-        if direction in ("up", "bullish", "long"):
+        canonical = canonical_direction(direction)
+        if canonical == "up":
             return "bullish"
-        elif direction in ("down", "bearish", "short"):
+        elif canonical == "down":
             return "bearish"
         return "mixed"
 
     @staticmethod
     def _direction_to_score(direction: str) -> float:
-        if direction in ("up", "bullish", "long"):
+        canonical = canonical_direction(direction)
+        if canonical == "up":
             return 1.0
-        elif direction in ("down", "bearish", "short"):
+        elif canonical == "down":
             return -1.0
         return 0.0

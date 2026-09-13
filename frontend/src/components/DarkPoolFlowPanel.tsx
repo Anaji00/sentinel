@@ -21,57 +21,46 @@ interface FlowItem {
 export default function DarkPoolFlowPanel() {
   const [filterType, setFilterType] = useState<string>('ALL');
 
-  const { data } = useSWR<{ events: FlowItem[] }>(
+  const { data } = useSWR<FlowItem[]>(
     '/api/v1/events/tradfi?limit=25',
     fetcher,
     { refreshInterval: 3000 }
   );
 
-  const flows = data?.events || [
-    {
-      id: 'flow-1',
-      ticker: 'NVDA',
-      type: 'SWEEP',
-      side: 'BUY',
-      notional_usd: 2450000,
-      price: 128.50,
-      size_shares: 19066,
-      occ_symbol: 'NVDA260918C00130000',
-      occurred_at: new Date().toISOString(),
-    },
-    {
-      id: 'flow-2',
-      ticker: 'AAPL',
-      type: 'DARK_POOL',
-      side: 'SELL',
-      notional_usd: 5800000,
-      price: 224.80,
-      size_shares: 25799,
-      occurred_at: new Date(Date.now() - 45000).toISOString(),
-    },
-    {
-      id: 'flow-3',
-      ticker: 'TSLA',
-      type: 'BLOCK',
-      side: 'BUY',
-      notional_usd: 1750000,
-      price: 210.25,
-      size_shares: 8323,
-      occ_symbol: 'TSLA260918P00200000',
-      occurred_at: new Date(Date.now() - 110000).toISOString(),
-    },
-    {
-      id: 'flow-4',
-      ticker: 'MSFT',
-      type: 'SWEEP',
-      side: 'BUY',
-      notional_usd: 3100000,
-      price: 445.10,
-      size_shares: 6964,
-      occ_symbol: 'MSFT260918C00450000',
-      occurred_at: new Date(Date.now() - 250000).toISOString(),
-    },
-  ];
+  // The endpoint returns a bare JSON array, so `data?.events` was
+  // undefined on every successful fetch and the `||` fired on the
+  // normal path rather than on an outage -- permanently, on a refresh
+  // timer. What it fell back to was not placeholder text but invented
+  // records stamped `occurred_at: new Date()`, which is what turns a
+  // fixture into a claim: a row dated now, with a source attribution
+  // and an anomaly score, is indistinguishable from a live detection.
+  //
+  // An empty list is the honest answer when there is nothing to show.
+  //
+  // The endpoint serves NormalizedEvent rows, not FlowItem rows, so the shape
+  // is mapped explicitly rather than assumed. The event types this panel is
+  // about are the ones the platform actually emits: `options_flow` and
+  // `equity_block`. It previously offered a DARK_POOL filter, and no event of
+  // that type has ever been produced -- the enum declares it, the scorer
+  // handles it, and nothing emits it -- so the filter could only ever have
+  // matched the fabricated rows above it.
+  const flows: FlowItem[] = (Array.isArray(data) ? data : []).map((e: any) => {
+    const fd = e.financial_data || {};
+    const notional = Number(fd.notional_usd ?? fd.premium_usd ?? 0) || 0;
+    const price = Number(fd.close_price ?? fd.price ?? 0) || 0;
+    const volume = Number(fd.volume ?? 0) || 0;
+    return {
+      id: e.event_id,
+      ticker: fd.ticker || e.primary_entity_name || e.primary_entity_id || '—',
+      type: e.type === 'options_flow' ? 'SWEEP' : 'BLOCK',
+      side: String(fd.side || fd.direction || 'NEUTRAL').toUpperCase(),
+      notional_usd: notional,
+      price,
+      size_shares: volume,
+      occ_symbol: fd.occ_symbol || undefined,
+      occurred_at: e.occurred_at,
+    };
+  });
 
   const filteredFlows = flows.filter((f) => {
     if (filterType !== 'ALL' && f.type !== filterType) return false;
@@ -97,7 +86,10 @@ export default function DarkPoolFlowPanel() {
 
         {/* Filter Buttons */}
         <div className="flex items-center gap-1.5 text-[10px]">
-          {['ALL', 'SWEEP', 'DARK_POOL', 'BLOCK'].map((t) => (
+          {/* DARK_POOL is not offered: the platform has never produced an
+              event of that type, so the filter could only ever return
+              nothing. */}
+          {['ALL', 'SWEEP', 'BLOCK'].map((t) => (
             <button
               key={t}
               onClick={() => setFilterType(t)}

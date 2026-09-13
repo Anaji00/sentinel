@@ -45,16 +45,20 @@ from shared.utils.chokepoints import (                      # noqa: E402
 from shared.utils.heartbeat import start_heartbeat_task     # noqa: E402
 
 from shared.utils.tasks import safe_create_task            # noqa: E402
+from shared.utils.logging import setup_sentinel_logging
 from sar_detection import (                                 # noqa: E402
     BLIND_CHOKEPOINTS, OPENEO_URL, VV_TARGET_THRESHOLD_DB, ChokepointReading,
     build_datacube, credentials, observation_window,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("collector.sar")
+# Credential redaction rides on the shared handler.
+#
+# This called logging.basicConfig(), which installs a plain StreamHandler
+# with no RedactingFilter -- so any credential appearing in an exception
+# message reached stdout in clear. asyncpg and aioredis raise connection
+# errors whose text embeds the full DSN, password included, and this
+# service connects to both.
+logger = setup_sentinel_logging("collector.sar", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 # One pass a day. The constellation revisits every six days, so polling faster
 # spends credits re-reading the same acquisition.

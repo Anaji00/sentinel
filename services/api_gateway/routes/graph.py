@@ -221,15 +221,26 @@ async def get_entity_graph(
 
 @router.get("/shortest-path")
 async def get_shortest_path(
-    source_id: str, 
-    target_id: str, 
+    source_id: str,
+    target_id: str,
     graph = Depends(get_graph),
-    db = Depends(get_db)
 ):
     """Advanced Graph AI: Find how two geopolitical entities are connected using native Cypher shortestPath."""
     try:
+        # Unlabelled endpoints, because this graph does not label them `Entity`.
+        #
+        # `graph_writer` MERGEs typed nodes -- Vessel, Aircraft, Company, Index,
+        # Sector, MacroFactor, Flag, Region -- and a Neo4j node carries the one
+        # label it was created with. `Entity` is only the default for the
+        # generic path, so anchoring both ends on `:Entity` excluded almost
+        # every node in the graph: a vessel and a company could never be
+        # connected by this query however many relationships joined them.
+        #
+        # The WHERE already anchors both ends on id/name, and does so through
+        # toLower(), which no index can serve -- so the label was not buying a
+        # lookup either.
         query = """
-        MATCH p = shortestPath((start:Entity)-[*..6]-(end:Entity))
+        MATCH p = shortestPath((start)-[*..6]-(end))
         WHERE (toLower(start.id) = toLower($source_id) OR toLower(start.name) = toLower($source_id))
           AND (toLower(end.id) = toLower($target_id) OR toLower(end.name) = toLower($target_id))
         RETURN nodes(p) AS entities, relationships(p) AS relations
@@ -240,7 +251,7 @@ async def get_shortest_path(
         if not results:
             try:
                 apoc_query = """
-                MATCH (start:Entity), (end:Entity)
+                MATCH (start), (end)
                 WHERE (toLower(start.id) = toLower($source_id) OR toLower(start.name) = toLower($source_id))
                   AND (toLower(end.id) = toLower($target_id) OR toLower(end.name) = toLower($target_id))
                 CALL apoc.algo.dijkstra(start, end, '', 'weight') YIELD path, weight
@@ -251,24 +262,23 @@ async def get_shortest_path(
                 logger.debug(f"APOC shortest path query bypass: {apoc_err}")
 
         if not results:
-            # Dynamic fallback: query TimescaleDB co-occurrence events
-            db_query = """
-            SELECT DISTINCT primary_entity_id, primary_entity_name, type as relationship
-            FROM events
-            WHERE (LOWER(primary_entity_id) LIKE $1 OR LOWER(primary_entity_name) LIKE $1)
-               OR (LOWER(primary_entity_id) LIKE $2 OR LOWER(primary_entity_name) LIKE $2)
-            ORDER BY occurred_at DESC
-            LIMIT 10
-            """
-            db_rows = await db.query(db_query, f"%{source_id.lower()}%", f"%{target_id.lower()}%")
-            if db_rows:
-                path_nodes = [{"id": source_id, "name": source_id, "type": "ENTITY"}]
-                for r in db_rows:
-                    e_name = r.get("primary_entity_name") or r.get("primary_entity_id")
-                    if e_name and e_name.upper() not in (source_id.upper(), target_id.upper()):
-                        path_nodes.append({"id": e_name, "name": e_name, "type": "ENTITY"})
-                path_nodes.append({"id": target_id, "name": target_id, "type": "ENTITY"})
-                return {"path": [{"entities": path_nodes}]}
+            # No third branch. There used to be one, and it invented the answer.
+            #
+            # It queried events matching *either* endpoint by substring --
+            # LIKE %source% OR LIKE %target% -- took the ten most recent rows,
+            # and returned [source, ...those ten entities..., target] as
+            # `{"path": [{"entities": [...]}]}`: the shape a real Cypher path
+            # comes back in, minus the `relations` key that was the only thing
+            # distinguishing the two. Nothing in that chain was connected to
+            # anything else in it. Because the OR admits rows matching only one
+            # endpoint, the "path" was routinely ten entities related to the
+            # source strung to a target they had never co-occurred with.
+            #
+            # On an endpoint whose entire output *is* the claim -- this is how
+            # these two are connected -- a fabricated answer is not a
+            # degradation, it is the wrong answer stated confidently. Saying
+            # nothing was found is the honest result, and it is what the caller
+            # can act on.
             return {"message": "No path found", "path": []}
         return {"path": results}
     except Exception as e:

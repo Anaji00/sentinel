@@ -4,7 +4,9 @@ import os
 from fastapi import APIRouter, Depends, Query
 from services.api_gateway.dependencies import get_db, get_db_optional, get_redis_client, get_redis_optional
 from shared.utils.serialization import score_dto, to_dto
+from shared.models.provenance import ProvenanceSourceType
 
+from shared.utils.quote_cache import quote_key
 from shared.utils.candles import (
     CANDLE_KEY_PREFIX,
     candle_cache_key,
@@ -179,6 +181,22 @@ def _first_price(financial: dict, crypto: dict):
     return None
 
 
+# The canonical provenance envelope, as a plain dict so it can sit inside a
+# series point without a per-point model construction.
+#
+# `source_type` on these points was an ad-hoc vocabulary --
+# LIVE_US_TREASURY_2Y, SECONDARY_MARKET_YIELD, CACHED_QUOTE,
+# PARAMETRIC_FALLBACK -- that no consumer understood and that shares neither
+# spelling nor semantics with `ProvenanceSourceType`, the enum the frontend's
+# ProvenanceBadge switches on. Two provenance vocabularies, and the reader saw
+# neither. The specific label stays, because it says which of three feeds
+# answered; the envelope is what the badge can actually render.
+_PROV_LIVE_MEASUREMENT = {
+    "source_type": ProvenanceSourceType.LIVE_MEASUREMENT.value,
+    "methodology": "Direct read from the publishing venue or its cached quote",
+}
+
+
 async def fetch_on_the_spot_historical(symbol: str, limit: int = 60, redis = None):
     """Cached wrapper around the live fetch.
 
@@ -258,10 +276,17 @@ async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None
                                             pts.append({
                                                 "timestamp": d_elem.text,
                                                 "price": round(val, 3),
-                                                "volume": 1000.0,
+                                                # A par yield is a published rate,
+                                                # not a traded instrument. It has no
+                                                # volume, and 1000.0 drew a real bar
+                                                # on the chart for a quantity that
+                                                # does not exist -- the same invention
+                                                # already removed from the tier below.
+                                                "volume": None,
                                                 "anomaly_score": 0.0,
                                                 "provider": "US Department of the Treasury (Par Yield)",
-                                                "source_type": "LIVE_US_TREASURY_2Y"
+                                                "source_type": "LIVE_US_TREASURY_2Y",
+                                                "provenance": _PROV_LIVE_MEASUREMENT
                                             })
                                         except ValueError as _exc:
                                             swallowed("api_gateway.routes.radar._fetch_on_the_spot_uncached", _exc, logger)
@@ -298,7 +323,8 @@ async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None
                                         "volume": _as_float(v),
                                         "anomaly_score": 0.0,
                                         "provider": "CBOE 2-Year Treasury Note Yield (2YY=F)",
-                                        "source_type": "SECONDARY_MARKET_YIELD"
+                                        "source_type": "SECONDARY_MARKET_YIELD",
+                                        "provenance": _PROV_LIVE_MEASUREMENT
                                     })
                         if pts:
                             return pts[-limit:]
@@ -309,31 +335,31 @@ async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None
         if redis:
             try:
                 for rk in (symbol_upper, "US02Y", "US2Y", "2YR", "2Y"):
-                    cached_p = await redis.raw.get(f"sentinel:quotes:latest:{rk}")
+                    cached_p = await redis.raw.get(quote_key(rk))
                     if cached_p:
                         val = float(cached_p)
                         now_str = datetime.now(timezone.utc).isoformat()
                         return [{
                             "timestamp": now_str,
                             "price": val,
-                            "volume": 1000.0,
+                            "volume": None,
                             "anomaly_score": 0.0,
                             "provider": "Sentinel Redis Cache",
-                            "source_type": "CACHED_QUOTE"
+                            "source_type": "CACHED_QUOTE",
+                            "provenance": _PROV_LIVE_MEASUREMENT
                         }]
             except Exception as e:
                 logger.debug(f"Redis latest quote fetch failed for {symbol}: {e}")
 
-        # Tier 4: Explicitly Labeled Parametric Fallback (never unlabeled fabrication)
-        now_str = datetime.now(timezone.utc).isoformat()
-        return [{
-            "timestamp": now_str,
-            "price": 4.15,
-            "volume": 1000.0,
-            "anomaly_score": 0.0,
-            "provider": "Parametric Baseline Yield",
-            "source_type": "PARAMETRIC_FALLBACK"
-        }]
+        # There is no Tier 4.
+        #
+        # This returned a hardcoded 4.15 under the label "Parametric Baseline
+        # Yield". The label was honest and reached nobody: the chart component
+        # plots `price`, and a constant invented by the gateway rendered
+        # indistinguishably from a Treasury print. Three live sources failing
+        # means the yield is unknown, and every other symbol on this endpoint
+        # already says so by returning nothing.
+        return []
     
     # 2. Check Crypto symbols via Coinbase Public Exchange Candles API (US-compliant, zero auth)
     if any(c in symbol_upper for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK")) or symbol_upper.endswith("USDT") or symbol_upper.endswith("USD"):
@@ -401,15 +427,18 @@ async def _fetch_on_the_spot_uncached(symbol: str, limit: int = 60, redis = None
     # 4. Check Live Redis Collector Cache for authentic price
     if redis:
         try:
-            cached_p = await redis.raw.get(f"sentinel:quotes:latest:{symbol_upper}")
+            cached_p = await redis.raw.get(quote_key(symbol_upper))
             if cached_p:
                 val = float(cached_p)
                 now_str = datetime.now(timezone.utc).isoformat()
                 return [{
                     "timestamp": now_str,
                     "price": val,
-                    "volume": 1000.0,
-                    "anomaly_score": 0.0
+                    "volume": None,
+                    "anomaly_score": 0.0,
+                    "provider": "Sentinel Redis Cache",
+                    "source_type": "CACHED_QUOTE",
+                    "provenance": _PROV_LIVE_MEASUREMENT
                 }]
         except Exception as e:
             logger.debug(f"Redis latest quote fetch failed for {symbol}: {e}")
@@ -711,14 +740,33 @@ async def get_covered_call_recommendations(
             except Exception as e:
                 logger.debug(f"Failed to query Z-score view for {ticker}: {e}")
         if z_score is None:
-            z_score = 2.8  # Fallback default when database is uninitialized or in cold start
+            # Not 2.8. `generate_covered_call_recommendation` returns None
+            # below +2.5, so that literal was the one value that guaranteed
+            # every ticker cleared the significance gate this endpoint exists
+            # to apply -- on a cold or unavailable database, which is exactly
+            # when nothing has been measured.
+            #
+            # The asymmetry was the tell: twenty lines down, a missing price
+            # raises a 400 rather than being invented. The z-score decides
+            # whether there is a trade at all, and it was the one being
+            # supplied. The agent that calls the same function starts from 0.0
+            # and computes from returns when the view is empty -- it fails
+            # closed, and so does this now.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No 5m Z-score available for '{ticker}' -- the "
+                    f"tradfi_bars_5m_zscore aggregate has no row for it. Pass "
+                    f"'z_score' explicitly, or wait for the aggregate to fill."
+                ),
+            )
 
     # If current_price is omitted or non-positive, look up real cached price from Redis
     if current_price is None or current_price <= 0:
         if redis:
             try:
                 for cand in (ticker.upper(), ticker):
-                    raw_p = await redis.raw.get(f"sentinel:quotes:latest:{cand}")
+                    raw_p = await redis.raw.get(quote_key(cand))
                     if raw_p:
                         current_price = float(raw_p)
                         break

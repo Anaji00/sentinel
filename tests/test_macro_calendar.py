@@ -141,7 +141,17 @@ async def test_economic_calendar_collector_poll_and_publish():
     events = await collector.poll_and_publish()
 
     assert len(events) == 2
-    assert len(producer.sent) == 4  # RAW_EVENTS and ENRICHED_EVENTS for both
+    # Once each, to ENRICHED_EVENTS only.
+    #
+    # This asserted four sends, because each release went to RAW_TRADFI as well.
+    # `build_macro_release_event` returns a NormalizedEvent and the raw-topic
+    # consumer parses raw topics as RawEvent, so the duplicate arrived with an
+    # empty `raw_payload`, matched no source branch, and incremented
+    # `enrichment.tradfi.unrouted_source` -- the counter that exists to find
+    # feeds being thrown away, being fed by a deliberate duplicate.
+    assert len(producer.sent) == 2
+    from shared.kafka import Topics
+    assert {topic for topic, *_ in producer.sent} == {Topics.ENRICHED_EVENTS}
 
     cpi_event = events[0]
     assert cpi_event.macro_data.indicator == "CPI"

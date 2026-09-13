@@ -9,6 +9,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from shared.utils.rbac import require_role, Role
 from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
@@ -25,7 +26,12 @@ class RunBacktestRequest(BaseModel):
     initial_capital: float = Field(default=100_000.0, ge=1000.0, le=10_000_000.0)
 
 
-@router.post("/run")
+@router.post(
+    "/run",
+    # Launches a backtest. Unguarded, any authenticated caller could start
+    # arbitrary compute on the shared pool.
+    dependencies=[Depends(require_role(Role.ANALYST))],
+)
 async def run_strategy_backtest(
     req: RunBacktestRequest,
     db=Depends(get_db_optional),

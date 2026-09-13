@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional, List
 from pydantic import BaseModel
 from services.agents.base import InferenceBatcher, SentinelAgent
 from shared.kafka import Topics
+from shared.utils.focus import prioritise
+from shared.utils.quiet_failures import swallowed
 from shared.utils.equities import BROAD_MARKET_ETFS, is_valid_primary_equity
 
 class RadarDecision(BaseModel):
@@ -43,6 +45,13 @@ MIN_EARNINGS_SURPRISE_PCT = 10.0
 # to outlast the slowest dispatch or the stampede reopens as soon as it expires.
 INFLIGHT_CLAIM_SECONDS = 900
 
+# Anomaly scores are percentiles in [0, 1]; z-scores count standard deviations.
+# Converting between them is a modelling choice, so it is made once and named,
+# rather than being a bare `* 5.0` in one branch and absent in another. Five
+# puts a maximal anomaly at the top of the range the radar's own thresholds and
+# conviction arithmetic were written for.
+ANOMALY_TO_Z = 5.0
+
 
 
 def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
@@ -74,6 +83,8 @@ RADAR_BATCH_WAIT_SEC = float(os.getenv("RADAR_BATCH_WAIT_SEC", "20"))
 
 
 class RadarAgent(SentinelAgent):
+    FOCUS_DOMAIN = "tradfi"
+    FOCUS_DOMAINS = ("tradfi", "market", "equity")
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.cooldown_seconds = 86400
@@ -97,6 +108,28 @@ class RadarAgent(SentinelAgent):
         """
         if not items:
             return {}
+
+        # Subjects another agent is already looking at go to the front.
+        #
+        # `publish_bulletin` offers every subject to `sentinel:focus:entities`
+        # and nine agents feed it -- but only `quant_trading_engine` ever read
+        # it back, so nothing directed a second agent to what a first had found.
+        # Measured over 24 hours, the consensus engine's own drift check
+        # reported 277 agent pairs at Jaccard 0.00 and every remaining pair
+        # below its 0.1 threshold, two bulletins existed in Redis from a single
+        # agent, and the latest consensus report read contributing_agents: 1.
+        # A fusion engine with one opinion per entity is an average of one.
+        #
+        # Additive, not restrictive: `prioritise` keeps every candidate and its
+        # relative order, and only lifts the focused ones. This batch is
+        # inference-bounded, so which candidates sit at the front is exactly
+        # what decides whether a second opinion is ever formed.
+        try:
+            focused_order = await prioritise(self.redis, [c["ticker"] for _, c in items], domains=self.FOCUS_DOMAINS)
+            rank = {t: i for i, t in enumerate(focused_order)}
+            items = sorted(items, key=lambda it: rank.get(it[1]["ticker"], len(rank)))
+        except Exception as _exc:
+            swallowed("agents.radar_agent._decide_batch.focus", _exc, self.logger)
 
         lines = []
         for _, c in items:
@@ -230,25 +263,47 @@ class RadarAgent(SentinelAgent):
             )
             return volume * price
 
+        # One quantity, one scale.
+        #
+        # These three branches all returned a value called `z_score` on three
+        # different scales: a real unbounded z-score from raw_payload, an
+        # anomaly score multiplied by 5 from financial_data, and a raw 0-1
+        # anomaly score from trigger. The consumer computes
+        # `conviction = z_score / 10`, and FOCUS_MIN_CONVICTION is 0.35 -- so a
+        # message arriving through the trigger branch could never clear it,
+        # because its "z-score" has a ceiling of 1.0. The one agent that
+        # reliably wins an inference slot contributed to the focus set only when
+        # its input happened to arrive in one particular shape.
+        #
+        # An anomaly score is a percentile in [0,1] and a z-score is a standard
+        # deviation count. `ANOMALY_TO_Z` states the conversion once, and the
+        # basis travels with the value so a reader can tell which it was.
+        z_basis = "unknown"
         if "raw_payload" in message and isinstance(message["raw_payload"], dict):
             p = message["raw_payload"]
             ticker = p.get("ticker")
             z_score = _safe_float(p.get("z_score"))
+            z_basis = "measured_z"
             notional_usd = _notional_from(p)
         elif "financial_data" in message and isinstance(message["financial_data"], dict):
             fd = message["financial_data"]
             ticker = fd.get("ticker")
-            z_score = _safe_float(message.get("anomaly_score")) * 5.0
+            z_score = _safe_float(message.get("anomaly_score")) * ANOMALY_TO_Z
+            z_basis = "derived_from_anomaly"
             notional_usd = _notional_from(fd)
         elif "trigger" in message and isinstance(message["trigger"], dict):
             trig = message["trigger"]
             ticker = trig.get("ticker")
-            z_score = _safe_float(trig.get("anomaly_score"))
+            # Was the raw anomaly score, unscaled -- a 0-1 value standing in for
+            # a z-score everywhere downstream.
+            z_score = _safe_float(trig.get("anomaly_score")) * ANOMALY_TO_Z
+            z_basis = "derived_from_anomaly"
             notional_usd = _notional_from(trig)
 
         if ticker:
             ticker = str(ticker).upper().strip()
 
+        self._last_z_basis = z_basis
         return ticker, z_score, notional_usd
 
     async def prune_watchlist_if_needed(self):
@@ -568,6 +623,10 @@ class RadarAgent(SentinelAgent):
                     expected_direction="neutral",
                     payload={
                         "z_score": round(z_score, 2),
+                        # Which scale that number is on: measured from price
+                        # history, or converted from an anomaly percentile.
+                        # Both are legitimate; conflating them silently was not.
+                        "z_score_basis": getattr(self, "_last_z_basis", "unknown"),
                         "notional_usd": round(notional_usd, 2),
                         "regime": regime_str,
                         "rationale": decision.rationale,

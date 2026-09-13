@@ -6,8 +6,41 @@ import { resolveEventDomain } from './domain';
 // Max events kept in memory per hook instance
 const MAX_LIVE_EVENTS = 300;
 // Reconnect backoff limits (ms)
-const RECONNECT_INITIAL_MS = 1000;
-const RECONNECT_MAX_MS = 30000;
+export const RECONNECT_INITIAL_MS = 1000;
+export const RECONNECT_MAX_MS = 30000;
+
+/** One position report per entity, plus every non-position event, order kept.
+ *
+ * Exported so a test can exercise it rather than restate it. The previous test
+ * copied this loop into its own body and asserted on the copy, which cannot
+ * fail when the hook changes.
+ */
+export function dedupePositionBatch(batch: NormalizedEvent[]): NormalizedEvent[] {
+  const positionMap = new Map<string, NormalizedEvent>();
+  const nonPositionEvents: NormalizedEvent[] = [];
+
+  for (const item of batch) {
+    const t = (item.type || '').toLowerCase();
+    const isHighFreqPos =
+      t.includes('vessel_position') || t.includes('adsb_position') ||
+      t.includes('ais') || t.includes('adsb');
+    // An unattributed position report is still an event: collapsing those
+    // together on a missing key would drop all but one of them.
+    if (isHighFreqPos && item.primary_entity?.id) {
+      if (!positionMap.has(item.primary_entity.id)) {
+        positionMap.set(item.primary_entity.id, item);
+      }
+    } else {
+      nonPositionEvents.push(item);
+    }
+  }
+  return [...Array.from(positionMap.values()), ...nonPositionEvents];
+}
+
+/** The next reconnect delay, doubling up to the ceiling. */
+export function reconnectDelay(current: number): number {
+  return Math.min(current * 2, RECONNECT_MAX_MS);
+}
 
 export function useLiveEvents(selectedDomain: string = 'all') {
   const [liveEvents, setLiveEvents] = useState<NormalizedEvent[]>([]);
@@ -51,23 +84,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
         const flushBatch = () => {
           if (pendingBatch.length > 0) {
-            // Deduplicate high-frequency position reports (AIS vessels & ADS-B flights) by primary entity id
-            const positionMap = new Map<string, NormalizedEvent>();
-            const nonPositionEvents: NormalizedEvent[] = [];
-
-            for (const item of pendingBatch) {
-              const t = (item.type || '').toLowerCase();
-              const isHighFreqPos = t.includes('vessel_position') || t.includes('adsb_position') || t.includes('ais') || t.includes('adsb');
-              if (isHighFreqPos && item.primary_entity?.id) {
-                if (!positionMap.has(item.primary_entity.id)) {
-                  positionMap.set(item.primary_entity.id, item);
-                }
-              } else {
-                nonPositionEvents.push(item);
-              }
-            }
-
-            const batchToAdd = [...Array.from(positionMap.values()), ...nonPositionEvents];
+            const batchToAdd = dedupePositionBatch(pendingBatch);
             pendingBatch = [];
 
             setLiveEvents((prev) => {
@@ -133,7 +150,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
             }
             if (!isMounted) return;
             reconnectTimer = setTimeout(connect, backoffRef.current);
-            backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
+            backoffRef.current = reconnectDelay(backoffRef.current);
           })();
         };
       } catch (err) {
@@ -141,7 +158,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
         useTelemetryStore.getState().setConnected(false);
         if (isMounted) {
           reconnectTimer = setTimeout(connect, backoffRef.current);
-          backoffRef.current = Math.min(backoffRef.current * 2, RECONNECT_MAX_MS);
+          backoffRef.current = reconnectDelay(backoffRef.current);
         }
       }
     }

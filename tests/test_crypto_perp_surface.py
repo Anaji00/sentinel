@@ -123,16 +123,46 @@ def test_the_browser_no_longer_fabricates_microstructure():
     assert "amihud_illiquidity" not in code
 
 
-def test_browser_fetched_rows_are_labelled():
-    """The user has to be able to tell platform analysis from a raw feed."""
-    api = (ROOT / "frontend/src/lib/api.ts").read_text(encoding="utf-8")
-    assert api.count("data_provenance:") >= 3
+def test_the_browser_does_not_fetch_third_party_data_at_all():
+    """Labelling was the half-measure; not fetching is the answer.
 
-    types = (ROOT / "frontend/src/lib/types.ts").read_text(encoding="utf-8")
-    assert "data_provenance?: string;" in types
+    The SWR fetcher used to substitute Coinbase, Polymarket, CISA and Yahoo
+    (the last through api.allorigins.win and corsproxy.io, two unaffiliated
+    CORS proxies) whenever the backend returned nothing, and render the result
+    in the same components with anomaly_score 0.0. This test asserted those
+    rows carried a `data_provenance` badge -- which is the right instinct and
+    the wrong remedy: a row that never passed through enrichment, scoring,
+    correlation or the audit ledger does not belong in a panel beside rows that
+    did, and a backend outage rendering as a working dashboard removes the
+    operator's only signal that the pipeline has stopped.
 
-    panel = (ROOT / "frontend/src/components/CryptoAnalytics.tsx").read_text(encoding="utf-8")
-    assert "e.data_provenance &&" in panel, "the badge is typed but never rendered"
+    The substitution is gone, so there is nothing left to label.
+    """
+    api_src = (ROOT / "frontend/src/lib/api.ts").read_text(encoding="utf-8")
+    # Comments may name the hosts they explain; code must not reach them.
+    api = chr(10).join(
+        line for line in api_src.splitlines()
+        if not line.lstrip().startswith(("//", "*", "/*"))
+    )
+
+    for host in (
+        "api.exchange.coinbase.com",
+        "query1.finance.yahoo.com",
+        "api.allorigins.win",
+        "corsproxy.io",
+        "gamma-api.polymarket.com",
+        "cisa.gov",
+    ):
+        assert host not in api, f"the browser still fetches {host} directly"
+
+    assert "fetchDirect" not in api, "a direct third-party fetch helper survives"
+
+    # And the policy that permitted it is gone too.
+    csp = (ROOT / "frontend/next.config.ts").read_text(encoding="utf-8")
+    assert "script-src 'self' 'unsafe-inline' 'unsafe-eval' http: https:" not in csp, (
+        "`http:`/`https:` as scheme sources match every host -- that is not a "
+        "weak CSP, it is the absence of one expressed as a header"
+    )
 
 
 # ── ranking and open interest ────────────────────────────────────────────────

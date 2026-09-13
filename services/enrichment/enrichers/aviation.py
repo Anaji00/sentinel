@@ -24,6 +24,17 @@ from shared.utils.source_scorecard import baseline_reliability
 
 from services.enrichment.anomaly_scorer import lift_score
 
+
+def _kinematic_score(kin, default: float = 0.10) -> float:
+    """The kinematic detector's score, preserving a measured zero."""
+    if not isinstance(kin, dict):
+        return default
+    value = kin.get("score")
+    if not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
 logger = logging.getLogger("enrichment.aviation")
 
 # How hard a sanctions match lifts an aircraft's measured behaviour.
@@ -132,7 +143,10 @@ class AviationEnricher:
             scoring_tasks.append(self._score_flight(
                 icao24=icao24, callsign=callsign, squawk=squawk, is_emerg=is_emerg,
                 is_sanctioned=is_sanctioned,
-                kinematic=float((kin or {}).get("score", 0.10) or 0.10),
+                # Same shape as the tradfi and prediction paths: `or 0.10` fired on a
+                # measured 0.0, which is the detector saying the track is
+                # entirely ordinary.
+                kinematic=_kinematic_score(kin),
             ))
 
         scoring_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)

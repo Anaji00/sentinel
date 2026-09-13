@@ -28,7 +28,54 @@ from shared.utils.quiet_failures import swallowed
 logger = logging.getLogger("agent.supervisor")
 
 
-def _as_unit_interval(value, default: float = 1.0) -> float:
+# A statistic that was not measured is absent, not zero.
+#
+# These were written as `float(props.get("p_value", 0.0))` and the like at four
+# sites, so an edge nobody measured was stored claiming a p-value of zero --
+# perfect significance -- a zero coefficient, a zero f-statistic and a
+# confidence of 1.0. Measured: 392,810 edges of 399,070, 98.4% of the graph,
+# carrying p_value = 0.0 with no method recorded.
+#
+# What that reaches is the model. `stock_correlation_agent` renders exactly the
+# properties below, and its own repair -- made on the read side, where it
+# stopped coalescing a missing coefficient onto 1.0 -- cannot help, because
+# `0.0 is not None`. Live, before this: "JPM [Relationship: SYMPATHY_MOVER,
+# Coef: 0.000, p-val: 0.0000, lag: 0]". A zero coefficient at perfect
+# significance, invented by the writer.
+#
+# None is what Neo4j stores as a missing property, and the read side already
+# handles it: `Coef: unmeasured`, and the p-value and lag omitted entirely.
+_MEASURED_EDGE_STATS = ("coefficient", "p_value", "f_stat", "branching_ratio", "half_life", "lag")
+
+
+def _measured(props: dict, key: str, cast=float):
+    """The statistic if it was actually measured, otherwise None."""
+    value = (props or {}).get(key)
+    if value is None or value == "":
+        return None
+    try:
+        out = cast(value)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(out, float) and out != out:  # NaN
+        return None
+    return out
+
+
+def _edge_stats(props: dict) -> dict:
+    """Every edge statistic, present only where it was measured."""
+    props = props or {}
+    return {
+        "coefficient": _measured(props, "coefficient"),
+        "p_value": _measured(props, "p_value"),
+        "f_stat": _measured(props, "f_stat"),
+        "branching_ratio": _measured(props, "branching_ratio"),
+        "half_life": _measured(props, "half_life"),
+        "lag": _measured(props, "lag", int),
+    }
+
+
+def _as_unit_interval(value, default=1.0):
     """A confidence or weight on 0-1, whatever scale the producer used.
 
     SYMPATHY_MOVER edges in the live graph range from -0.1 to 95.0 on both
@@ -42,6 +89,12 @@ def _as_unit_interval(value, default: float = 1.0) -> float:
     every writer reaching this supervisor has the same freedom to be wrong.
     Percentages are rescaled; anything else is clamped.
     """
+    # Absence travels. `default=None` means "this producer did not state one",
+    # and the readers already coalesce a missing property onto
+    # UNRATED_EDGE_CONFIDENCE -- a branch that was unreachable while every write
+    # supplied 1.0.
+    if value is None and default is None:
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -285,17 +338,15 @@ class GraphSupervisor(SentinelAgent):
                             "id": graph_node_id(entity_id, source_label),
                             "target_id": graph_node_id(target_id, target_label),
                             "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
-                            "confidence": _as_unit_interval(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                            "confidence": _as_unit_interval(
+                        data.get("confidence", props.get("conviction", data.get("conviction"))),
+                        default=None,
+                    ),
                             "relationship": data.get("relationship", props.get("relationship", "")),
                             "direction": data.get("direction", props.get("direction", UNDIRECTED)),
                             "method": props.get("method", ""),
                             "window": props.get("window", ""),
-                            "coefficient": float(props.get("coefficient", 0.0)),
-                            "p_value": float(props.get("p_value", 0.0)),
-                            "lag": int(props.get("lag", 0)),
-                            "f_stat": float(props.get("f_stat", 0.0)),
-                            "branching_ratio": float(props.get("branching_ratio", 0.0)),
-                            "half_life": float(props.get("half_life", 0.0)),
+                            **_edge_stats(props),
                         })
 
             # Every node carries its own type.
@@ -451,17 +502,15 @@ class GraphSupervisor(SentinelAgent):
                     "id": graph_node_id(entity_id, source_label),
                     "target_id": graph_node_id(target_id, target_label),
                     "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
-                    "confidence": _as_unit_interval(data.get("confidence", props.get("conviction", data.get("conviction", 1.0)))),
+                    "confidence": _as_unit_interval(
+                        data.get("confidence", props.get("conviction", data.get("conviction"))),
+                        default=None,
+                    ),
                     "relationship": str(data.get("relationship", props.get("relationship", ""))),
                     "direction": str(data.get("direction", props.get("direction", UNDIRECTED))),
                     "method": str(props.get("method", "")),
                     "window": str(props.get("window", "")),
-                    "coefficient": float(props.get("coefficient", 0.0)),
-                    "p_value": float(props.get("p_value", 0.0)),
-                    "lag": int(props.get("lag", 0)),
-                    "f_stat": float(props.get("f_stat", 0.0)),
-                    "branching_ratio": float(props.get("branching_ratio", 0.0)),
-                    "half_life": float(props.get("half_life", 0.0)),
+                    **_edge_stats(props),
                 })
                 logger.debug(f"✅ Created/Updated Edge: {entity_id} -[{relation}]-> {target_id}")
 

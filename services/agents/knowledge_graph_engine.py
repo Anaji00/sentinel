@@ -209,6 +209,8 @@ class KnowledgeGraphEngine(SentinelAgent):
     Combines news intelligence synthesis, entity classification, relationship triple extraction,
     and single-transaction Neo4j MERGE updates in a single pass.
     """
+    FOCUS_DOMAIN = "geopolitical"
+    FOCUS_DOMAINS = ("geopolitical", "news", "maritime", "aviation", "cyber")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

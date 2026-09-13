@@ -52,6 +52,39 @@ _ROLE_PERMISSIONS = {
 }
 
 
+def permissions_for(role: Role) -> Set[str]:
+    """Every permission a role holds, including those inherited from below it.
+
+    The hierarchy is a total order, so a role holds its own grants plus every
+    grant of every weaker role. Computing it rather than restating it keeps the
+    table above the single statement of the model.
+    """
+    weight = _ROLE_HIERARCHY.get(role, 0)
+    granted: Set[str] = set()
+    for candidate, perms in _ROLE_PERMISSIONS.items():
+        if _ROLE_HIERARCHY.get(candidate, 0) <= weight:
+            granted |= perms
+    return granted
+
+
+def has_permission(user_role: Role, permission: str) -> bool:
+    """Whether *user_role* may perform *permission*.
+
+    `_ROLE_PERMISSIONS` above was, until now, referenced nowhere but its own
+    definition -- there was no function that read it and no caller that could
+    have. Authorisation was the three-level hierarchy comparison alone, so the
+    distinction the table draws (an ANALYST may write cases and watchlists but
+    not flags or brokers) existed only as documentation that reads like
+    enforcement, and drift between the two was invisible.
+
+    Unknown permissions are refused. A typo in a route decorator should fail
+    closed rather than grant everything.
+    """
+    if not permission:
+        return False
+    return permission in permissions_for(user_role)
+
+
 def has_role_permission(user_role: Role, required_role: Role) -> bool:
     """Checks if user_role satisfies required_role in the hierarchy."""
     user_weight = _ROLE_HIERARCHY.get(user_role, 0)
@@ -101,6 +134,29 @@ def get_current_user_role(request: Request) -> Role:
         return Role.ADMIN
 
     return Role.VIEWER
+
+
+def require_permission(permission: str) -> Callable:
+    """FastAPI dependency enforcing a named permission from `_ROLE_PERMISSIONS`.
+
+    Preferred over `require_role` for anything that mutates state: it says what
+    the route does rather than which tier happens to be allowed to do it, so the
+    table and the routes cannot drift apart the way they had.
+    """
+    async def permission_checker(request: Request):
+        user_role = get_current_user_role(request)
+        if not has_permission(user_role, permission):
+            logger.warning(
+                "RBAC Access Denied: role '%s' lacks permission '%s' (%s)",
+                user_role.value, permission, request.url.path,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"Forbidden: this action requires '{permission}'.",
+            )
+        return user_role
+
+    return permission_checker
 
 
 def require_role(required_role: Role) -> Callable:

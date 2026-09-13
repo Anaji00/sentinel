@@ -10,7 +10,11 @@ from typing import Optional
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from services.reporting.report_generator import ReportGenerator
+from services.reporting.report_generator import (
+    DEFAULT_TEMPLATE_ID,
+    REPORT_TEMPLATES,
+    ReportGenerator,
+)
 from shared.utils.rbac import require_role, Role
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
 
@@ -20,8 +24,14 @@ router = APIRouter(prefix="/api/v1/reports", tags=["Executive Intelligence Repor
 
 
 class GenerateReportRequest(BaseModel):
-    timeframe_hours: int = Field(default=24, ge=1, le=168)
+    # Optional, so a caller that names a template gets that template's window
+    # rather than the default 24 hours.
+    timeframe_hours: Optional[int] = Field(default=None, ge=1, le=168)
     title: Optional[str] = None
+    # The choice /reports/templates has always offered and this endpoint had
+    # no field to receive. Three ids were advertised with prose describing
+    # different content; picking one could not change anything.
+    template_id: Optional[str] = None
 
 
 @router.post("/generate", dependencies=[Depends(require_role(Role.ANALYST))])
@@ -31,38 +41,53 @@ async def generate_intelligence_report(
     db = Depends(get_db_optional),
     redis = Depends(get_redis_optional),
 ):
-    """Generates an executive intelligence brief summarizing recent cross-domain surveillance data."""
+    """Generates an executive intelligence brief over a window.
+
+    `template_id` selects the sections; an unknown one is refused rather than
+    silently treated as the default, because a caller asking for an incident
+    flash report and receiving a daily brief has no way to tell.
+    """
     actor = getattr(request.state, "identity", "Sentinel Analyst")
+
+    template_id = (req.template_id or DEFAULT_TEMPLATE_ID).upper()
+    template = REPORT_TEMPLATES.get(template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"'{req.template_id}' is not a report template. Known templates: "
+                f"{', '.join(sorted(REPORT_TEMPLATES))}."
+            ),
+        )
+
     generator = ReportGenerator(db_client=db, redis_client=redis)
     return await generator.generate_brief(
-        timeframe_hours=req.timeframe_hours,
+        timeframe_hours=req.timeframe_hours or int(template["default_timeframe_hours"]),
         title=req.title,
         author=actor,
+        template_id=template_id,
     )
 
 
 @router.get("/templates", dependencies=[Depends(require_role(Role.VIEWER))])
 async def list_report_templates():
-    """List available pre-configured report templates."""
+    """The templates /reports/generate will actually honour.
+
+    This used to be a separate hand-written list, and the generator had no
+    notion of a template -- so the catalogue described three reports the
+    platform could not produce differently, one of them promising parametric
+    VaR and CVaR tail risk that this generator has never computed. It is now
+    the generator's own catalogue, so the two cannot describe different things.
+    """
     return {
         "templates": [
             {
-                "id": "DAILY_EXECUTIVE_BRIEF",
-                "name": "Daily Executive Threat & Market Brief",
-                "default_timeframe_hours": 24,
-                "description": "Comprehensive cross-domain synthesis of high-confidence anomalies and macro market shifts.",
-            },
-            {
-                "id": "WEEKLY_PORTFOLIO_RISK",
-                "name": "Weekly Quantitative Portfolio Risk Audit",
-                "default_timeframe_hours": 168,
-                "description": "Analysis of parametric VaR, CVaR tail risk, and sector concentration under geopolitical stress.",
-            },
-            {
-                "id": "INCIDENT_FLASH_REPORT",
-                "name": "Rapid Incident Flash Report",
-                "default_timeframe_hours": 4,
-                "description": "Focused summary of recent critical-tier anomalies and active AI-generated scenarios.",
-            },
+                "id": t["id"],
+                "name": t["name"],
+                "default_timeframe_hours": t["default_timeframe_hours"],
+                "sections": t["sections"],
+                "description": t["description"],
+            }
+            for t in REPORT_TEMPLATES.values()
         ]
     }

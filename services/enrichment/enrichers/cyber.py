@@ -14,6 +14,7 @@ from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, SecurityData
 from shared.models.events import RawEvent
 from shared.utils.sanctions import check_sanctions
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("enrichment.cyber")
 
@@ -27,6 +28,17 @@ HIGH_VALUE_ORGS = {
 # has ranked it. A critical-infrastructure CVE cannot fall to the bottom of the
 # distribution because the week happened to be busy.
 CVE_FLOOR_SHARE = 0.8
+
+# How far below its categorical band the detector may place a ransomware
+# incident. The same 0.8 the CVE path uses: enough room to separate incidents
+# within a band, not enough to demote a critical-infrastructure victim out of it.
+RANSOMWARE_FLOOR_SHARE = 0.8
+
+# Saturation points for the two repetition-rate features. A group posting ten
+# victims in a minute is running a campaign; a sector taking twenty hits in a
+# minute is a sector-wide event. Both are log-scaled up to these counts.
+RANSOMWARE_GROUP_BURST = 10
+RANSOMWARE_SECTOR_BURST = 20
 
 ICS_VENDORS = {
     "siemens", "schneider", "rockwell", "honeywell",
@@ -97,6 +109,30 @@ class CyberThreatScorer:
             anomaly = min(1.0, anomaly * c.get("critical_multiplier", 1.5))
         return round(anomaly, 3)
 
+def _as_number(raw) -> tuple:
+    """The originating AS number, plus any others announced alongside it.
+
+    A prefix announced from several ASes at once (MOAS) is one event with one
+    subject: whichever AS this record is about. The rest are recorded as
+    context rather than concatenated into the identifier.
+    """
+    if raw is None:
+        return "", []
+    if isinstance(raw, (list, tuple, set)):
+        values = [str(v).strip().lstrip("Aa").lstrip("Ss") for v in raw if str(v).strip()]
+        values = [v for v in values if v]
+        if not values:
+            return "", []
+        return values[0], values[1:]
+    text = str(raw).strip()
+    if not text:
+        return "", []
+    # "AS1299" and "1299" are the same AS.
+    if text[:2].upper() == "AS" and text[2:].isdigit():
+        return text[2:], []
+    return text, []
+
+
 class CyberEnricher:
     """
     Translates raw cyber security alerts into standardized NormalizedEvents.
@@ -160,7 +196,18 @@ class CyberEnricher:
             cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             event_dt = raw.occurred_at if raw.occurred_at.tzinfo else raw.occurred_at.replace(tzinfo=timezone.utc)
             if event_dt < cutoff:
-                logger.debug(f"Dropping stale cyber event from {raw.source}: {event_dt.isoformat()}")
+                # Counted, not only logged at DEBUG.
+                #
+                # The deployment runs at INFO, so this line has never been seen
+                # in production. A KEV entry can reference a CVE published
+                # months ago, and a feed that starts backfilling would have
+                # every event of it discarded here with no observable trace --
+                # the platform would simply look quieter.
+                dropped(
+                    "enrichment.cyber.stale_event",
+                    f"{raw.source} event from {event_dt.isoformat()} is older than 30 days",
+                    logger,
+                )
                 return None
 
         src = raw.source
@@ -175,18 +222,37 @@ class CyberEnricher:
             return await self._process_ransomware(raw)
         elif src == "breach_monitor": 
             return await self._process_breach(raw)
-            
+
+        # Nothing claimed this source.
+        #
+        # A bare `return None` here says the same thing as a successful filter,
+        # and this is the enricher for the domain with the most feed aliases --
+        # five branches covering nine spellings. One unmatched source is a
+        # probe; ten thousand is a feed being thrown away, and the counter is
+        # the only thing that can tell them apart.
+        dropped(
+            "enrichment.cyber.unrouted_source", f"no branch for source={src!r}", logger,
+        )
         return None
 
     async def _process_bgp(self, raw: RawEvent) -> Optional[NormalizedEvent]:
         p = raw.raw_payload
         prefix = p.get("prefix", "")
-        origin = p.get("origin_as", "")
+        # One AS, whatever shape the feed sent.
+        #
+        # `origin_as` arrives as a list for a multi-origin announcement, and
+        # `f"AS{origin}"` turned that straight into an entity id: 229 events in
+        # the live table are named `AS[1299, 3257, ...]`. That string is not an
+        # AS, so it matches no other event, resolves to no graph node and joins
+        # to nothing -- each one is its own singleton entity.
+        origin, co_origins = _as_number(p.get("origin_as"))
         hijack = p.get("is_hijack", False)
         origin_change = p.get("is_origin_change", False)
-        previous_origin = p.get("previous_origin_as", "")
+        previous_origin, _ = _as_number(p.get("previous_origin_as"))
         country = (p.get("country_code") or "")[:2].upper()
-        as_name = p.get("as_name", f"AS{origin}")
+        # `.get(key, default)` returns None when the key is present and null,
+        # and `as_name.lower()` two lines down is not optional.
+        as_name = p.get("as_name") or f"AS{origin}"
         as_path = p.get("as_path", [])
         
         if not prefix: return None
@@ -235,6 +301,11 @@ class CyberEnricher:
             tags.append("bgp_origin_change")
         if bgp_result.get("path_novelty", 0) > 0.9:
             tags.append("novel_as_path")
+        if co_origins:
+            # A prefix announced from more than one AS at once is itself a
+            # finding, and used to be lost inside the mangled entity id.
+            tags.append("multi_origin_as")
+            tags.extend(f"co_origin:AS{a}" for a in co_origins[:5])
         
         # The autonomous system is the subject; its registrant is an attribute.
         #
@@ -276,7 +347,21 @@ class CyberEnricher:
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=" ".join(headline_parts),
-            security_data=SecurityData(breach_type=("bgp_hijack" if hijack else ("bgp_origin_change" if origin_change else "bgp_anomaly")), affected_org=as_name, ip_address=prefix),
+            security_data=SecurityData(
+                breach_type=("bgp_hijack" if hijack else ("bgp_origin_change" if origin_change else "bgp_anomaly")),
+                affected_org=as_name,
+                # A route prefix is not an IP address, and it was being passed
+                # as one: the panel's "IP / ASN" row reads `ip_address || asn`,
+                # so every BGP event showed a CIDR block under a label naming
+                # neither of the two things it could be -- while the AS number,
+                # which is the event's actual subject, had no field at all and
+                # appeared only inside the prose headline.
+                #
+                # Both now go where they belong. `route_leak_prefix` is a field
+                # the frontend has always declared and the server never sent.
+                route_leak_prefix=prefix,
+                asn=f"AS{origin}" if origin else None,
+            ),
             tags=tags, country_code=country or None, anomaly_score=anomaly
         )
 
@@ -380,7 +465,13 @@ class CyberEnricher:
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"KEV Added: {cve_id} — {vendor} {product} (ransomware:{ransomware_use})",
-            security_data=SecurityData(breach_type="known_exploited_vulnerability", affected_org=vendor, cve_id=cve_id, data_types=[cve_id, vuln_name]),
+            security_data=SecurityData(
+                breach_type="known_exploited_vulnerability", affected_org=vendor,
+                cve_id=cve_id, data_types=[cve_id, vuln_name],
+                # This handler exists because the entry is in CISA's catalogue.
+                # Saying so is what makes the panel's KEV count a count.
+                cisa_kev=True,
+            ),
             tags=tags, anomaly_score=anomaly
         )
 
@@ -394,8 +485,49 @@ class CyberEnricher:
         
         is_critical = any(kw in victim or kw in sector for kw in HIGH_VALUE_ORGS)
         is_apt = any(apt in group.lower() for apt in APT_GROUPS)
-        
-        anomaly = self.cyber_scorer.score_ransomware(is_critical, is_apt)
+
+        # Same treatment the KEV path above already has, for the same reason.
+        #
+        # `score_ransomware` is a three-branch lookup, so every ransomware event
+        # the platform has ever produced carries 0.95, 0.75 or 0.45 and nothing
+        # else. Two of those three describe the victim; none of them describe the
+        # incident. Every percentile, threshold and "most anomalous" ranking
+        # downstream was then computed over a three-valued constant.
+        #
+        # The categorical band stays as the floor -- "APT-attributed group hit
+        # critical infrastructure" is domain knowledge the detector cannot
+        # infer -- and the detector places the event within its band using
+        # quantities that actually vary between incidents: how active this group
+        # is right now, how often this victim's sector is being hit, and how
+        # much of the victim's identity the feed actually gave us.
+        categorical = self.cyber_scorer.score_ransomware(is_critical, is_apt)
+        anomaly = categorical
+        try:
+            group_velocity = await self._calculate_velocity(
+                "ransomware_group", group.lower(), threshold=RANSOMWARE_GROUP_BURST
+            )
+            sector_velocity = await self._calculate_velocity(
+                "ransomware_sector", sector or "unknown", threshold=RANSOMWARE_SECTOR_BURST
+            )
+            ranked = await self.scorer.score_event(
+                "ransomware", victim,
+                [
+                    categorical,
+                    group_velocity,
+                    sector_velocity,
+                    1.0 if is_apt else 0.0,
+                    1.0 if is_critical else 0.0,
+                ],
+            )
+            score = ranked.get("score") if isinstance(ranked, dict) else None
+            if score is not None and not ranked.get("scoring_degraded"):
+                anomaly = max(
+                    categorical * RANSOMWARE_FLOOR_SHARE,
+                    min(1.0, float(score)),
+                )
+        except Exception as _exc:
+            swallowed("enrichment.cyber._process_ransomware.rank", _exc, logger)
+        anomaly = round(anomaly, 4)
         
         tags = ["ransomware", group.lower().replace(" ", "_")]
         if is_critical: tags.append("critical_infrastructure")
@@ -413,7 +545,15 @@ class CyberEnricher:
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
             headline=f"{group} ransomware: {victim} ({sector})",
-            security_data=SecurityData(breach_type="ransomware", affected_org=victim, data_types=p.get("data_types", [])),
+            security_data=SecurityData(
+                breach_type="ransomware", affected_org=victim,
+                data_types=p.get("data_types", []),
+                # Which group claimed it. Read from the feed at the top of this
+                # handler, used in the headline, and with no structured field
+                # to sit in -- so nothing downstream could group by actor, and
+                # the frontend type declared it while the server never sent it.
+                ransomware_group=str(group) if group and group != "Unknown" else None,
+            ),
             tags=tags, country_code=country or None, anomaly_score=anomaly
         )
 

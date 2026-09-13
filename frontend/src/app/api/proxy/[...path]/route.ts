@@ -8,7 +8,9 @@ import { verifySessionToken } from '../../auth/login/route';
 // request would fail against this container -- an authentication success
 // followed by an empty product, which is the hardest shape to diagnose.
 const BACKEND_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
-const API_GATEWAY_KEY = process.env.API_GATEWAY_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
+// The master key is deliberately not read here any more. Every proxied
+// request is forwarded with the caller's own session or with no credential
+// at all -- see the header handling below.
 
 // Endpoints a person reaches before they have a session: creating an account,
 // confirming an address, recovering a password, registering interest in the paid
@@ -99,11 +101,26 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   // an unauthenticated request is what turned the exemption above from a
   // skipped check into a privilege escalation.
   const hasSession = Boolean(cookie?.value && verifySessionToken(cookie.value).valid);
-  if (hasSession || publicPath || probePath) {
-    headers.delete('X-API-KEY');
-    headers.delete('x-api-key');
-  } else {
-    headers.set('X-API-KEY', API_GATEWAY_KEY);
+  // The master key is never attached to a request that arrived without a
+  // session.
+  //
+  // The session gate above only returns 401 when NODE_ENV is production, so in
+  // development an unauthenticated request fell through to this `else` and was
+  // forwarded with X-API-KEY -- which the gateway resolves to Role.ADMIN. That
+  // is the escalation the comment above describes as removed, still reachable
+  // in exactly the configuration a developer runs locally against a real
+  // gateway. And since probes and public paths now take the branch above, the
+  // `else` had no legitimate caller left at all.
+  //
+  // Forwarding with no credential is the honest outcome: the gateway decides,
+  // and an anonymous caller is treated as one.
+  headers.delete('X-API-KEY');
+  headers.delete('x-api-key');
+  if (!hasSession && !publicPath && !probePath && isDev) {
+    console.warn(
+      `[proxy] ${pathStr} forwarded without a session (development). ` +
+      'The gateway will treat this as an anonymous caller.'
+    );
   }
 
   try {

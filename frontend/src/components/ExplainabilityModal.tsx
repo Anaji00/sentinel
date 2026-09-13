@@ -7,12 +7,20 @@ import { fetcher } from '../lib/api';
 import { X, ShieldAlert, Cpu, Activity, Database, CheckCircle, AlertTriangle, Layers, Clock, Hash } from 'lucide-react';
 import { Badge } from './ui/Badge';
 
+/** One dimension the scorer measured, and its share of what it measured.
+ *
+ *  `model_weight` is gone because there was no model to weight: the server
+ *  published a fixed 0.40 / 0.30 / 0.20 / 0.10 against a streaming RRCF scorer
+ *  that has no such linear composite, and substituted plausible constants --
+ *  2.4, 0.35, 0.5, 35.0 -- for whichever inputs the event did not carry.
+ *
+ *  `contribution_pct` is null when every measured dimension came back zero: a
+ *  share of nothing is undefined, not 0%. */
 interface FactorAttribution {
   factor_key: string;
   label: string;
   raw_subscore: number;
-  model_weight: number;
-  contribution_pct: number;
+  contribution_pct: number | null;
 }
 
 interface ScoreAdjustment {
@@ -71,6 +79,12 @@ interface ExplainResponse {
   provenance: ProvenanceData;
   model_card: ModelCard;
   market_microstructure: Record<string, any>;
+  /** Which estimator produced the score, and how much of the history it
+   *  wanted was available. A 0.4 from a warm-up curve and a 0.4 from a full
+   *  percentile window are different claims. Null on events whose scorer
+   *  records no breakdown. */
+  score_basis?: string | null;
+  score_coverage_fraction?: number | null;
 }
 
 interface ExplainabilityModalProps {
@@ -116,6 +130,24 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
           <div className="py-12 flex flex-col items-center justify-center gap-3 text-slate-400">
             <Activity className="w-6 h-6 animate-spin text-cyan-400" />
             <span>Hydrating mathematical factor attribution & model card...</span>
+          </div>
+        ) : !data ? (
+          /* No explanation is a state of its own, and it had none.
+           *
+           * `error` is declared and can never be set: the shared fetcher
+           * catches every failure and returns null, so a 404, a 503 and a
+           * working response with nothing in it all arrived here identically.
+           * The panel then rendered its full frame -- score, waterfall,
+           * timeline, model card -- against `data?.` optional chaining, which
+           * reads as an event that was examined and found unremarkable rather
+           * than as one that was never read. On this panel above all others,
+           * those two must not look the same. */
+          <div className="py-12 flex flex-col items-center justify-center gap-2 text-slate-400">
+            <span className="text-slate-300 font-bold">NO EXPLANATION AVAILABLE</span>
+            <span className="text-[11px] text-center max-w-sm">
+              The server returned no derivation for this {eventId ? 'event' : 'signal'}.
+              Nothing below would be a description of it.
+            </span>
           </div>
         ) : (
           <div className="space-y-5">
@@ -185,12 +217,12 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
                   <div key={idx} className="space-y-1">
                     <div className="flex justify-between text-[11px]">
                       <span className="text-slate-300">{f.label}</span>
-                      <span className="text-cyan-400 font-bold">{f.contribution_pct}%</span>
+                      <span className="text-cyan-400 font-bold">{f.contribution_pct === null ? '--' : `${f.contribution_pct}%`}</span>
                     </div>
                     <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800">
                       <div
                         className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-500"
-                        style={{ width: `${Math.min(100, f.contribution_pct)}%` }}
+                        style={{ width: `${Math.min(100, f.contribution_pct ?? 0)}%` }}
                       />
                     </div>
                   </div>
@@ -205,7 +237,9 @@ export default function ExplainabilityModal({ eventId, signalId, onClose }: Expl
                   <Clock className="w-4 h-4 text-amber-400" />
                   Score Derivation Timeline
                 </span>
-                <Badge variant="neutral">4 STEPS</Badge>
+                {/* However many steps there were. The server used to emit a
+                    fixed four, and this badge was written to match. */}
+                <Badge variant="neutral">{(data?.score_adjustments || []).length} STEPS</Badge>
               </div>
 
               <div className="space-y-2">

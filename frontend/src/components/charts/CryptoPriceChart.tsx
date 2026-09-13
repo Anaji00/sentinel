@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
+import { describeApiError } from '../../lib/api';
 import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
@@ -12,7 +13,15 @@ import { formatPercent } from '../../lib/format';
 interface SeriesPoint {
   timestamp: string;
   price: number;
-  volume: number;
+  // Nullable, as the gateway has always been able to send it.
+  //
+  // /market/series answers a 2Y par yield and a cached quote with no volume at
+  // all -- BondYieldsChart's own `SeriesPoint` has said `number | null` since
+  // that was found -- and these two copies of the interface still declared it
+  // required. Which is how a live tick with no volume ended up carrying the
+  // literal 1000 instead: with the type insisting on a number, the `|| 1000`
+  // that produced one looked correct.
+  volume: number | null;
   anomaly_score: number;
 }
 
@@ -27,7 +36,7 @@ export default function CryptoPriceChart() {
   // Real-time WebSocket stream ticks
   const liveCryptoEvents = useLiveEvents('crypto');
 
-  const { data } = useSWR<MarketSeriesResponse>(
+  const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=BTCUSD&limit=60',
     fetcher,
     { refreshInterval: 3000 }
@@ -41,12 +50,19 @@ export default function CryptoPriceChart() {
     liveCryptoEvents.forEach(e => {
       const sym = (e.crypto_data?.pair || e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym.includes('BTC')) {
-        const price = e.crypto_data?.price || e.crypto_data?.mark_price || e.financial_data?.current_price;
+        const price = e.crypto_data?.price || e.crypto_data?.mark_price || e.crypto_data?.close_price;
         if (price && price > 10000) {
           list.push({
             timestamp: e.occurred_at,
             price: price,
-            volume: e.crypto_data?.volume || 1000,
+            // Absent, not 1000.
+            //
+            // `crypto_data.volume` is not a field the server has ever sent --
+            // the payload carries `size_tokens` and `notional_usd` -- so this
+            // fell through to the literal on every point, and the chart
+            // reported a volume of exactly 1000 for every live BTC tick it
+            // drew. An invented measurement is worse than a gap: a gap shows.
+            volume: e.crypto_data?.size_tokens ?? null,
             anomaly_score: e.anomaly_score
           });
         }
@@ -89,7 +105,7 @@ export default function CryptoPriceChart() {
         hasData ? (
           <Badge variant="live" pulse>LIVE WS SYNC</Badge>
         ) : (
-          <Badge variant="warning" pulse>AWAITING LIVE DATA STREAM...</Badge>
+          <Badge variant="warning" pulse>{describeApiError(error) ?? 'AWAITING LIVE DATA STREAM...'}</Badge>
         )
       }
       noPadding
@@ -133,7 +149,7 @@ export default function CryptoPriceChart() {
               <span className="text-amber-300 font-bold">BTC / USD LIVE CANDLE & STREAM TRAJECTORY</span>
               <span>
                 {activeHoverPoint
-                  ? `HOVER: $${activeHoverPoint.price.toLocaleString()} | VOL: ${activeHoverPoint.volume.toLocaleString()}`
+                  ? `HOVER: $${activeHoverPoint.price.toLocaleString()} | VOL: ${activeHoverPoint.volume?.toLocaleString() ?? '--'}`
                   : 'REAL-TIME 1-SEC TELEMETRY BARS'}
               </span>
             </div>

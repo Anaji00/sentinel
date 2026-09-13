@@ -36,6 +36,14 @@ logger = setup_sentinel_logging("reasoning.orchestrator", level=getattr(logging,
 # means the trigger id refers to nothing in the store.
 MIN_SUPPORTING_EVENTS = 1
 
+# The most supporting events any publisher attaches to a cluster.
+#
+# `services.correlation.main` truncates at ten on the rule path and at three on
+# the semantic path; nothing writes more. It is the top of the breadth scale
+# below, and it lives here as a name so the next change to either cap is a
+# change to one number rather than a silent narrowing of the ranking.
+MAX_CITED_EVENTS = 10
+
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.models import CorrelationCluster, AlertTier
 from shared.db import get_timescale, get_redis, get_neo4j
@@ -135,8 +143,9 @@ async def _save_scenario(db, scenario):
                 headline, significance, hypotheses,
                 recommended_monitoring, confidence_overall,
                 confidence_rationale, supporting_event_ids,
-                trace_id, narrative_summary
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::uuid[],$11::uuid,$12)
+                trace_id, narrative_summary,
+                primary_entity_id, primary_entity_name
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::uuid[],$11::uuid,$12,$13,$14)
         """, 
             scenario.scenario_id,
             scenario.correlation_id,
@@ -163,6 +172,14 @@ async def _save_scenario(db, scenario):
             # string fails the cast and takes the whole insert with it.
             (str(getattr(scenario, "trace_id", "") or "").strip() or None),
             _narrative_summary(scenario),
+            # The subject. `Scenario` resolves both of these from `entity_ids`
+            # and `entity_names` in a validator on every scenario it builds,
+            # and the table had no column to put them in -- so the feed's
+            # scenario card and its detail modal, which both read
+            # `primary_entity_name`, showed "Multi-Entity" for every scenario
+            # the platform has ever produced, including the single-entity ones.
+            (scenario.primary_entity_id or None),
+            (scenario.primary_entity_name or None),
         )
         logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
     except Exception as e:
@@ -617,7 +634,20 @@ def _reasoning_priority(item) -> float:
     if n_support < MIN_SUPPORTING_EVENTS:
         return 0.0
 
-    breadth = min(1.0, math.log1p(max(0, n_support - 1)) / math.log1p(49))
+    # Normalised against what a cluster can actually cite.
+    #
+    # This divided by log1p(49), as though fifty supporting events were the
+    # top of the scale. No publisher can produce fifty: the rule path caps
+    # `supporting_event_ids` at ten, the semantic path at three, and the quant
+    # path emits none. So the term reached at most 0.589 of its range and a
+    # maximally-evidenced cluster was scored as though it were two thirds
+    # evidenced -- the same unreachable-denominator mistake as the correlation
+    # engine's own breadth term, in the ranker that decides which clusters are
+    # worth an inference at all.
+    breadth = min(
+        1.0,
+        math.log1p(max(0, n_support - 1)) / math.log1p(MAX_CITED_EVENTS - 1),
+    )
 
     metrics = getattr(cluster, "metrics_summary", None) or {}
     try:

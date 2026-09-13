@@ -26,6 +26,24 @@ interface FlagsResponse {
   signals: Record<string, FlagConfig>;
 }
 
+/** Turns a failed control write into something the operator can act on.
+ *
+ * The three handlers below govern feature flags and the emergency kill switch,
+ * and every one of them checked `res.ok` with no else branch -- so a 403, a 404
+ * or a 500 looked exactly like success.
+ */
+async function describeFailure(res: Response, action: string): Promise<string> {
+  let detail = `HTTP ${res.status}`;
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === 'string') detail = body.detail;
+    else if (body && typeof body.error === 'string') detail = body.error;
+  } catch {
+    /* a non-JSON error page: the status is all there is */
+  }
+  return `⛔ Could not ${action} — ${detail}. Nothing was changed.`;
+}
+
 export default function FeatureFlagManager() {
   const { data, error, isLoading } = useSWR<FlagsResponse>('/flags', fetcher, { refreshInterval: 5000 });
   const [processingFlag, setProcessingFlag] = useState<string | null>(null);
@@ -34,7 +52,7 @@ export default function FeatureFlagManager() {
   const handleToggle = async (flagName: string, currentEnabled: boolean, rollout: number) => {
     setProcessingFlag(flagName);
     try {
-      const res = await fetch('/api/v1/flags/toggle', {
+      const res = await fetch('/api/proxy/api/v1/flags/toggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -47,9 +65,16 @@ export default function FeatureFlagManager() {
       if (res.ok) {
         setActionMessage(`Flag '${flagName}' toggled to ${!currentEnabled ? 'ENABLED' : 'DISABLED'}`);
         mutate('/flags');
+      } else {
+        // A control that silently does nothing is worse than one that is
+        // plainly broken. These handlers had no else at all, so a failed write
+        // cleared the spinner, showed no message, and refreshed the list to its
+        // unchanged state -- indistinguishable from success.
+        setActionMessage(await describeFailure(res, `toggle '${flagName}'`));
       }
     } catch (e) {
       console.error(e);
+      setActionMessage(`⛔ Could not reach the gateway to toggle '${flagName}'.`);
     } finally {
       setProcessingFlag(null);
       setTimeout(() => setActionMessage(null), 4000);
@@ -59,7 +84,7 @@ export default function FeatureFlagManager() {
   const handleTripKillSwitch = async (flagName: string) => {
     setProcessingFlag(flagName);
     try {
-      const res = await fetch('/api/v1/flags/kill-switch', {
+      const res = await fetch('/api/proxy/api/v1/flags/kill-switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -70,9 +95,12 @@ export default function FeatureFlagManager() {
       if (res.ok) {
         setActionMessage(`🚨 Kill switch TRIPPED for ${flagName}`);
         mutate('/flags');
+      } else {
+        setActionMessage(await describeFailure(res, `trip the kill switch for '${flagName}'`));
       }
     } catch (e) {
       console.error(e);
+      setActionMessage(`⛔ Could not reach the gateway to trip '${flagName}'. The switch is NOT tripped.`);
     } finally {
       setProcessingFlag(null);
       setTimeout(() => setActionMessage(null), 4000);
@@ -82,7 +110,7 @@ export default function FeatureFlagManager() {
   const handleResetKillSwitch = async (flagName: string) => {
     setProcessingFlag(flagName);
     try {
-      const res = await fetch('/api/v1/flags/reset', {
+      const res = await fetch('/api/proxy/api/v1/flags/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ flag_name: flagName }),
@@ -90,9 +118,12 @@ export default function FeatureFlagManager() {
       if (res.ok) {
         setActionMessage(`✅ Kill switch RESET for ${flagName}`);
         mutate('/flags');
+      } else {
+        setActionMessage(await describeFailure(res, `reset '${flagName}'`));
       }
     } catch (e) {
       console.error(e);
+      setActionMessage(`⛔ Could not reach the gateway to reset '${flagName}'.`);
     } finally {
       setProcessingFlag(null);
       setTimeout(() => setActionMessage(null), 4000);

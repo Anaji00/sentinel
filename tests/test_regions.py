@@ -33,7 +33,15 @@ from shared.utils.regions import (
     (12.6, 43.3, "Mandeb"),
     (30.0, 32.5, "Suez"),
     (24.0, 119.5, "Taiwan"),
-    (43.5, 34.2, "Black Sea"),
+    # 43.5/34.2 sits inside Ukraine's claimed waters south of Crimea, and
+    # classify_region now returns the smallest containing polygon rather than
+    # whichever the spatial index yielded first -- so it answers "Ukrainian
+    # Waters", which is strictly more informative and carries a higher
+    # sensitivity multiplier (1.4) than the sea around it (1.3).
+    (43.5, 34.2, "Ukrainian Waters"),
+    # And a point in the open Black Sea, outside any territorial polygon, to
+    # keep the parent region covered by this table as well.
+    (42.5, 33.0, "Black Sea"),
     (0.0, 0.0, "Gulf of Guinea"),
     (85.0, 0.0, None),
 ])
@@ -134,3 +142,41 @@ def test_cwd_path_independence(tmp_path):
         assert reg is not None
     finally:
         os.chdir(orig_cwd)
+
+
+def test_classify_region_returns_the_smallest_containing_polygon():
+    """The chokepoint, not whichever polygon the spatial index yielded first.
+
+    95.3% of live vessel positions fall inside more than one named region, so
+    "first containing" was effectively arbitrary: the Bab-el-Mandeb answered
+    'Gulf of Aden', the Panama Canal answered 'Colombian Territorial', and the
+    Taiwan Strait answered 'Taiwan Territorial'. That is not only a wrong
+    label -- is_sensitive_region and get_region_sensitivity_multiplier key off
+    it, so 7,073 Taiwan Strait transits in three days lost the sensitivity flag.
+    """
+    assert classify_region(12.58, 43.33) == "Bab-el-Mandeb"
+    assert classify_region(9.08, -79.68) == "Panama Canal"
+    assert classify_region(24.50, 119.50) == "Taiwan Strait"
+    assert classify_region(26.57, 56.25) == "Strait of Hormuz"
+
+
+def test_resolving_more_specifically_never_lowers_sensitivity():
+    """The specificity rule must be monotone in sensitivity.
+
+    If a chokepoint is sensitive and the territorial water inside it is not,
+    answering more precisely *loses* the flag and the fix becomes a regression
+    for exactly the waters it improves. Every small polygon that sits inside a
+    sensitive parent is therefore in HIGH_SENSITIVITY too.
+    """
+    pairs = [
+        ("Taiwan Strait", "Taiwan Territorial"),
+        ("Black Sea", "Crimean Waters"),
+        ("Black Sea", "Ukrainian Waters"),
+        ("Strait of Malacca", "Singapore Approach"),
+        ("Taiwan ADIZ", "Taiwan Territorial"),
+    ]
+    for parent, child in pairs:
+        if is_sensitive_region(parent):
+            assert is_sensitive_region(child), (
+                f"{child} sits inside sensitive {parent} and would lose the flag"
+            )

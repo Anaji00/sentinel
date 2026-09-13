@@ -25,13 +25,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("alert-manager")
-
 from shared.kafka import SentinelConsumer, Topics
 from shared.models import CorrelationCluster, AlertTier, Scenario
 from shared.db import get_timescale, get_redis
@@ -40,6 +33,16 @@ from shared.utils.heartbeat import start_heartbeat_task
 from services.alert_manager.formatters.telegram import format_correlation, format_scenario, format_intel_brief
 from services.alert_manager.formatters.webhook import format_generic
 from shared.utils.tasks import safe_create_task
+from shared.utils.logging import setup_sentinel_logging
+
+# Credential redaction rides on the shared handler.
+#
+# This called logging.basicConfig(), which installs a plain StreamHandler
+# with no RedactingFilter -- so any credential appearing in an exception
+# message reached stdout in clear. asyncpg and aioredis raise connection
+# errors whose text embeds the full DSN, password included, and this
+# service connects to both.
+logger = setup_sentinel_logging("alert-manager", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")

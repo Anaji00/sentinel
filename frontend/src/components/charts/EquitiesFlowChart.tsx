@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
+import { describeApiError } from '../../lib/api';
 import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
@@ -13,7 +14,10 @@ import { formatPercent } from '../../lib/format';
 interface SeriesPoint {
   timestamp: string;
   price: number;
-  volume: number;
+  // Nullable, because the backend stopped inventing one. A Treasury par
+  // yield and a cached quote report no volume, and the gateway now says so
+  // instead of sending 1000.
+  volume: number | null;
   anomaly_score: number;
 }
 
@@ -29,7 +33,7 @@ export default function EquitiesFlowChart() {
   // Real-time WebSocket stream ticks
   const liveTradfiEvents = useLiveEvents('tradfi');
 
-  const { data } = useSWR<MarketSeriesResponse>(
+  const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=SPY,QQQ&limit=60',
     fetcher,
     { refreshInterval: 3000 }
@@ -43,8 +47,8 @@ export default function EquitiesFlowChart() {
     liveTradfiEvents.forEach(e => {
       const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym === 'SPY') {
-        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+        const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
       }
     });
     return list.slice(-60);
@@ -55,8 +59,8 @@ export default function EquitiesFlowChart() {
     liveTradfiEvents.forEach(e => {
       const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym === 'QQQ') {
-        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+        const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
       }
     });
     return list.slice(-60);
@@ -129,7 +133,7 @@ export default function EquitiesFlowChart() {
         hasData ? (
           <Badge variant="live" pulse>ALPACA / SIP TELEMETRY</Badge>
         ) : (
-          <Badge variant="warning" pulse>AWAITING LIVE DATA STREAM...</Badge>
+          <Badge variant="warning" pulse>{describeApiError(error) ?? 'AWAITING LIVE DATA STREAM...'}</Badge>
         )
       }
       noPadding
@@ -247,7 +251,9 @@ export default function EquitiesFlowChart() {
           <div className="h-44 w-full bg-[#07090e] rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2 font-mono">
             <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
             <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
-              AWAITING LIVE DATA STREAM FOR SPY / QQQ EQUITIES
+              {error
+                ? `SPY / QQQ FEED: ${describeApiError(error)}`
+                : 'AWAITING LIVE DATA STREAM FOR SPY / QQQ EQUITIES'}
             </span>
             <p className="text-[10px] text-slate-500 max-w-sm">
               Finnhub & Alpaca WebSocket stream connections active. Ticks will render automatically upon database ingestion.

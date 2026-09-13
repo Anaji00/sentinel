@@ -95,14 +95,29 @@ class RRCFDetector:
         # whichever detector produced the number.
         self._z_history: deque = deque(maxlen=FALLBACK_HISTORY_SIZE)
 
+        # The fallback estimator's state, on both paths.
+        #
+        # These lived inside the `else` below -- initialised only when rrcf is
+        # *unavailable*, which is the one case the fallback is not the fallback
+        # for. `_insert_rrcf` calls `_insert_fallback` when every tree throws,
+        # which is precisely what it was added for ("this returned 0.0 when
+        # every tree had thrown"), and on this deployment HAS_RRCF is True, so
+        # `_ema_mean` did not exist and the fallback raised AttributeError.
+        #
+        # The exception propagates out of insert_batch and takes the whole
+        # enrichment batch with it. Measured, permanently dead-lettered by day:
+        # 586, then 1,620, then 41 -- 2,008 maritime and 13 cyber events in
+        # thirty-six hours, every one marked perm=True. A repair that exists and
+        # cannot run is the shape this catalogue records most often; this is one
+        # applied to that same shape.
+        self._ema_mean = None
+        self._ema_var = None
+        self._ema_alpha = 0.05
+
         if HAS_RRCF:
             self._forest = [rrcf.RCTree() for _ in range(num_trees)]
         else:
             self._forest = None
-            # Fallback: EMA-based z-score detector
-            self._ema_mean = None
-            self._ema_var = None
-            self._ema_alpha = 0.05
 
     def insert(self, point: np.ndarray) -> float:
         """

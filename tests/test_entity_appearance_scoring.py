@@ -199,7 +199,11 @@ def _resolver(pred, scorer_result):
         called.append("categorical")
         return None
 
-    async def _scorecard(prediction_correct, conviction):
+    async def _scorecard(prediction_correct, conviction, strategy=None):
+        # `strategy` mirrors the production signature. The resolver now passes
+        # the prediction's partition so the strategy and strategy/regime cards
+        # are actually written -- a stub that does not accept it turns that into
+        # a swallowed TypeError and the outcome silently stops being scored.
         called.append(f"scored:{prediction_correct}")
 
     agent._score_entity_appearance = _entity

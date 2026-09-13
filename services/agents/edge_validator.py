@@ -32,7 +32,31 @@ from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("agent.edge_validator")
 
-EXPOSURE_PREDICATES = ["SUPPLIES", "COMMODITY_EXPOSURE", "POSITIVE_EXPOSURE_TO", "INVERSE_EXPOSURE_TO"]
+# Which relationships this validator is willing to grade.
+#
+# It listed four, and live those matched three edges in the whole graph -- two
+# COMMODITY_EXPOSURE and one POSITIVE_EXPOSURE_TO, none of which had ever been
+# validated, while SUPPLIES and INVERSE_EXPOSURE_TO did not exist at all. The
+# predicates that actually carry weight in the prompts had no path to being
+# checked: 124 SYMPATHY_MOVER, 53 PEER_OF, 31 GRANGER_CAUSES, 13
+# STATISTICALLY_CORRELATED_WITH, 10 MACRO_CORRELATED.
+#
+# These are the asserted, directional, instrument-to-instrument claims -- the
+# ones whose confidence is meant to be earned rather than declared. Deliberately
+# not RELATED_TO or LOCATED_IN: a co-occurrence edge and a geographical fact are
+# not predictions, and grading them against a price reaction would be scoring
+# the wrong thing.
+EXPOSURE_PREDICATES = [
+    "SUPPLIES",
+    "COMMODITY_EXPOSURE",
+    "POSITIVE_EXPOSURE_TO",
+    "INVERSE_EXPOSURE_TO",
+    "SYMPATHY_MOVER",
+    "PEER_OF",
+    "GRANGER_CAUSES",
+    "STATISTICALLY_CORRELATED_WITH",
+    "MACRO_CORRELATED",
+]
 REACTION_WINDOW_HOURS = 24          # how long after the source-entity event to look for a reaction
 MIN_SAMPLES_BEFORE_TRUST = 5        # don't promote/decay off one data point
 CONFIDENCE_STEP = 0.05              # EWMA learning rate for confidence updates
@@ -82,14 +106,38 @@ async def _base_rate(timescale_client: Any, ticker: str) -> Optional[float]:
     what a 24-hour window actually integrates. Returns None when there is no
     history to fit, which is not the same as a rate of zero.
     """
+    # The window is the denominator, not the time since the first hit.
+    #
+    # This fitted lambda as n / (NOW() - min(occurred_at)) over rows already
+    # filtered to anomaly_score >= threshold, so the denominator was the time
+    # since the ticker's *first qualifying event*. Conditioning it on the first
+    # arrival is length-biased sampling: it inflates lambda by T/(T - t_first),
+    # and for a ticker whose single reaction was an hour ago it drives p0 to
+    # 1.0. That then meets MAX_TESTABLE_BASE_RATE, whose purpose is to exclude
+    # tickers that react so often no window can discriminate -- so the sparsest
+    # names were being excluded for being too busy. Measured over 30 days of
+    # live events: 2,108 tickers ruled untestable as fitted, against 904 using
+    # the lookback window.
+    #
+    # `observed_sec` is how long this ticker has been observable at all, which
+    # is the honest denominator for a name the platform only started seeing
+    # recently, capped at the lookback.
     query = """
         SELECT count(*)::float AS n,
-               EXTRACT(EPOCH FROM (NOW() - min(occurred_at))) AS span_sec
+               LEAST(
+                   EXTRACT(EPOCH FROM (NOW() - COALESCE(
+                       (SELECT min(occurred_at) FROM events
+                         WHERE (primary_entity_id = $1 OR headline ~* $2)
+                           AND occurred_at > NOW() - INTERVAL '%s days'),
+                       NOW() - INTERVAL '%s days'
+                   ))),
+                   %s * 86400.0
+               ) AS span_sec
         FROM events
         WHERE occurred_at > NOW() - INTERVAL '%s days'
           AND (primary_entity_id = $1 OR headline ~* $2)
           AND anomaly_score >= $3
-    """ % LOOKBACK_DAYS
+    """ % (LOOKBACK_DAYS, LOOKBACK_DAYS, LOOKBACK_DAYS, LOOKBACK_DAYS)
     try:
         rows = await timescale_client.query(
             query, ticker, _word_pattern(ticker), REACTION_THRESHOLD

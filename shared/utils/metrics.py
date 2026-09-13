@@ -216,13 +216,33 @@ async def collect_all(redis_client: Any = None) -> Dict[str, Dict[str, float]]:
                     num = float(v)
                 except ValueError:
                     continue
+                # Callers bake the service into the metric name -- the live
+                # fields read `collector_ingested_total:collector-ais` -- so the
+                # name is already per-service by the time it arrives here.
+                #
+                # That broke both halves of the intent below. The "sum across
+                # services" never summed anything, because no two services share
+                # a metric name; and emitting the same value again under a
+                # `{service=...}` label published every counter twice. Measured
+                # live: 177 counters, 84 plain and 93 labelled, all 84 plain
+                # keys also present labelled, and the total over all of them was
+                # exactly double the total over the plain ones. Any dashboard
+                # aggregating by name regex reported twice the truth.
+                #
+                # Stripping the suffix gives a base name that genuinely is
+                # shared, so the sum is a sum, and the per-service view is the
+                # label -- which is also the shape Prometheus expects, instead
+                # of a metric name that grows with the number of services.
+                base = metric
+                if name and metric.endswith(f":{name}"):
+                    base = metric[: -(len(name) + 1)]
                 if kind == "c":
                     # Counters sum across services, and are also exposed
                     # per-service so a single stalled producer is visible.
-                    counters[metric] += num
-                    counters[f"{metric}{{service=\"{name}\"}}"] = num
+                    counters[base] += num
+                    counters[f"{base}{{service=\"{name}\"}}"] = num
                 elif kind == "g":
-                    gauges[f"{metric}{{service=\"{name}\"}}"] = num
+                    gauges[f"{base}{{service=\"{name}\"}}"] = num
 
         # Include this process's own values, which may be newer than its last publish.
         for k, v in _COUNTER_METRICS.items():

@@ -112,7 +112,11 @@ _HALF_DAYS = {
     "2027-11-26",
 }
 
-_HOLIDAY_TABLE_THROUGH = 2027
+# Public, so a health surface can report the horizon alongside the verdict.
+# A reader who learns the table has aged out immediately wants to know when it
+# was last good for.
+HOLIDAY_TABLE_THROUGH = 2027
+_HOLIDAY_TABLE_THROUGH = HOLIDAY_TABLE_THROUGH
 
 # Early-close bell.
 _HALF_DAY_CLOSE = dtime(13, 0)

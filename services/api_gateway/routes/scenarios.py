@@ -60,7 +60,14 @@ async def get_active_scenarios(
         
         if status and status.lower() != "all":
             params.append(status.strip())
-            query += f" WHERE toLower(status) = toLower(${len(params)})"
+            # `lower()`, not `toLower()`. The latter is Cypher: this query runs
+            # against PostgreSQL, which has no such function, so every request
+            # naming a status raised `function tolower(text) does not exist`,
+            # was caught by the handler below and returned as a 500. The feed's
+            # HYPOTHESIS / CONFIRMED / UNDER_REVISE / DENIED tabs therefore
+            # rendered "NO ACTIVE SCENARIOS FOUND" every time, whatever the
+            # table held; only the unfiltered "all" tab ever worked.
+            query += f" WHERE lower(status) = lower(${len(params)})"
         params.append(limit)
         query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
         

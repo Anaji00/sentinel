@@ -158,7 +158,12 @@ class RejectRequest(BaseModel):
     pair_id: str = Field(..., min_length=1, description="pair_id from merge-candidates")
 
 
-@router.post("/entities/reject-merge")
+@router.post(
+    "/entities/reject-merge",
+    # A write that permanently records an identity decision, and it carried no
+    # role guard while POST /entities/alias beside it required ANALYST.
+    dependencies=[Depends(require_role(Role.ANALYST))],
+)
 async def post_reject_merge(req: RejectRequest, redis=Depends(get_redis_optional)):
     """Records that a person looked at a candidate pair and said no.
 

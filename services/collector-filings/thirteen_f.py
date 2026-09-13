@@ -17,7 +17,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -120,6 +120,18 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
 # Dynamic in-memory SEC Company Registry cache
 _DYNAMIC_TITLE_TO_TICKER: Dict[str, str] = {}
 _DYNAMIC_CIK_TO_TICKER: Dict[str, str] = {}
+# Registry titles with the corporate suffixes removed. Built once with the
+# registry so the resolver does not strip 12,000 titles on every holding.
+_STRIPPED_TITLE_TO_TICKER: Dict[str, str] = {}
+
+
+def _rebuild_stripped_index() -> None:
+    """Derive the suffix-stripped index from whatever is in the title map."""
+    _STRIPPED_TITLE_TO_TICKER.clear()
+    for title, ticker in _DYNAMIC_TITLE_TO_TICKER.items():
+        t_base, t_class = _normalize_issuer(title)
+        if t_base:
+            _STRIPPED_TITLE_TO_TICKER.setdefault(f"{t_base}|{t_class}", ticker)
 
 
 async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client: Any = None) -> Dict[str, str]:
@@ -143,6 +155,7 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                 _DYNAMIC_TITLE_TO_TICKER = data.get("title_to_ticker", {})
                 _DYNAMIC_CIK_TO_TICKER = data.get("cik_to_ticker", {})
                 if _DYNAMIC_TITLE_TO_TICKER:
+                    _rebuild_stripped_index()
                     return _DYNAMIC_TITLE_TO_TICKER
         except Exception as _exc:
             swallowed("collector_filings.thirteen_f.load_sec_company_tickers", _exc, logger)
@@ -161,6 +174,12 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                         clean_title = re.sub(r"[^A-Z0-9 ]", "", title).strip()
                         _DYNAMIC_TITLE_TO_TICKER[clean_title] = ticker
                         _DYNAMIC_TITLE_TO_TICKER[title] = ticker
+                        t_base, t_class = _normalize_issuer(clean_title)
+                        # First writer wins: the registry lists share classes in
+                        # order, so "ALPHABET" resolves to GOOGL rather than to
+                        # whichever class was enumerated last.
+                        if t_base:
+                            _STRIPPED_TITLE_TO_TICKER.setdefault(f"{t_base}|{t_class}", ticker)
                     if ticker and cik:
                         _DYNAMIC_CIK_TO_TICKER[cik] = ticker
                         _DYNAMIC_CIK_TO_TICKER[cik.zfill(10)] = ticker
@@ -197,24 +216,92 @@ def resolve_ticker_dynamically(issuer_name: Optional[str], cusip: Optional[str] 
     if alphanumeric_name in _DYNAMIC_TITLE_TO_TICKER:
         return _DYNAMIC_TITLE_TO_TICKER[alphanumeric_name]
 
-    # Partial prefix match across official registry
-    for title, ticker in _DYNAMIC_TITLE_TO_TICKER.items():
-        if title and (title in alphanumeric_name or alphanumeric_name in title):
-            return ticker
+    # Same name with the corporate suffixes dropped. "ALPHABET INC" and
+    # "ALPHABET INC." and "ALPHABET INCORPORATED" are one company.
+    base, share_class = _normalize_issuer(alphanumeric_name)
+    if base:
+        exact = _STRIPPED_TITLE_TO_TICKER.get(f"{base}|{share_class}")
+        if exact:
+            return exact
+        # A class the registry does not list separately resolves to the
+        # primary listing rather than to some other company's class.
+        primary = _STRIPPED_TITLE_TO_TICKER.get(f"{base}|")
+        if primary:
+            return primary
 
-    # Common corporate abbreviations normalization
-    tokens = alphanumeric_name.split()
-    if tokens:
-        first_word = tokens[0]
-        if first_word in ("APPLE", "MICROSOFT", "NVIDIA", "AMAZON", "ALPHABET", "GOOGLE", "META", "TESLA", "BERKSHIRE", "CHEVRON", "CHIPOTLE", "HILTON"):
-            name_map = {
-                "APPLE": "AAPL", "MICROSOFT": "MSFT", "NVIDIA": "NVDA", "AMAZON": "AMZN",
-                "ALPHABET": "GOOGL", "GOOGLE": "GOOGL", "META": "META", "TESLA": "TSLA",
-                "BERKSHIRE": "BRK.B", "CHEVRON": "CVX", "CHIPOTLE": "CMG", "HILTON": "HLT",
-            }
-            return name_map.get(first_word)
+    # Longest anchored match, not the first substring hit.
+    #
+    # This was an unanchored `title in name or name in title` over ~12,000
+    # registry titles, returning whichever matched first in dict insertion
+    # order. Two things went wrong with it. A registry title that happens to be
+    # a substring of an unrelated issuer wins on position rather than on fit --
+    # that is where GOOGN came from, a title sharing a prefix with the Alphabet
+    # entries and reached first. And `name in title` fires when the issuer name
+    # is merely a fragment of a much longer, different company's title.
+    #
+    # A match now has to begin at a word boundary and cover most of the name,
+    # and among the candidates the longest -- most specific -- one wins.
+    best_ticker: Optional[str] = None
+    best_len = 0
+    for title, ticker in _DYNAMIC_TITLE_TO_TICKER.items():
+        if len(title) < _MIN_ANCHORED_TITLE_LEN or len(title) <= best_len:
+            continue
+        if alphanumeric_name == title or alphanumeric_name.startswith(title + " "):
+            best_ticker, best_len = ticker, len(title)
+    if best_ticker:
+        return best_ticker
 
     return None
+
+
+# A registry title shorter than this cannot identify a company by containment;
+# it is an abbreviation that collides with ordinary words.
+_MIN_ANCHORED_TITLE_LEN = 4
+
+# Suffixes that carry no identity. Order matters only in that they are stripped
+# repeatedly from the end until none match.
+_CORPORATE_SUFFIXES = (
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "LTD",
+    "LIMITED", "PLC", "LLC", "LP", "LLP", "SA", "NV", "AG", "SE", "AB", "ASA",
+    "HOLDING", "HOLDINGS", "GROUP", "COM", "NEW", "THE", "TRUST",
+    "ADR", "SPONSORED", "SHS", "ORD",
+)
+
+# The share-class marker, which is identity and must not be stripped away with
+# the rest: "ALPHABET INC CL A" is GOOGL and "ALPHABET INC CL C" is GOOG. Both
+# reduce to "ALPHABET" once the class is separated out, and the class then
+# selects between them.
+_CLASS_MARKERS = ("CL", "CLASS", "SER", "SERIES")
+
+
+def _normalize_issuer(name: str) -> Tuple[str, str]:
+    """Split an issuer name into (base name, share class).
+
+    Share class is "" when the name names no class, which is the registry's
+    primary listing.
+    """
+    tokens = name.split()
+    share_class = ""
+    while tokens and tokens[-1] in _CORPORATE_SUFFIXES:
+        tokens.pop()
+    if (
+        len(tokens) >= 2
+        and len(tokens[-1]) == 1
+        and tokens[-1].isalpha()
+        and tokens[-2] in _CLASS_MARKERS
+    ):
+        share_class = tokens.pop()
+        tokens.pop()
+    elif tokens and tokens[-1] in _CLASS_MARKERS:
+        tokens.pop()
+    while tokens and tokens[-1] in _CORPORATE_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens), share_class
+
+
+def _strip_corporate_suffixes(name: str) -> str:
+    """Backwards-compatible base-name view of :func:`_normalize_issuer`."""
+    return _normalize_issuer(name)[0]
 
 
 class ThirteenFPositionRecord(BaseModel):
@@ -281,9 +368,10 @@ def parse_13f_xml_table(xml_content: str) -> List[Dict[str, Any]]:
                         cusip = text
                     elif c_tag == "value":
                         try:
-                            v = float(text.replace(",", ""))
-                            # SEC 13F value entries are reported in thousands USD ($1,000s)
-                            value = v * 1000.0 if v < 1e11 else v
+                            # Raw, in whatever unit this filing reports. The unit
+                            # is decided once for the whole table below -- it is a
+                            # property of the filing, not of the number.
+                            value = float(text.replace(",", ""))
                         except ValueError:
                             value = 0.0
                     elif c_tag in ("shrsorprnamt", "shrsprnamt"):
@@ -307,7 +395,93 @@ def parse_13f_xml_table(xml_content: str) -> List[Dict[str, Any]]:
                     })
     except Exception as e:
         logger.debug(f"Error parsing 13F XML table: {e}")
-    return holdings
+
+    scale = _value_scale_for_table(holdings)
+    if scale != 1.0:
+        for h in holdings:
+            h["market_value_usd"] = h["market_value_usd"] * scale
+    return _aggregate_by_security(holdings)
+
+
+# The SEC amended Form 13F effective 2023-01-03: <value> changed from thousands
+# of dollars to whole dollars. Both conventions are in the archive, and nothing
+# in the information table says which one a given filing used.
+#
+# The previous rule was `v * 1000.0 if v < 1e11 else v` -- a guess from the
+# magnitude of a single holding, with a cut three orders of magnitude above any
+# real position, so it multiplied by 1000 essentially always. Every
+# post-2023 filing was inflated 1000x, which is every filing this collector
+# fetches, and portfolio totals read in the hundreds of trillions.
+#
+# The filing answers the question itself. Each row carries shares alongside
+# value, so value/shares is an implied price per share, and a share price is a
+# quantity with a known range. Decide once per table, on the median, so one odd
+# lot or one warrant line cannot flip the unit for the whole portfolio.
+_MIN_PLAUSIBLE_SHARE_PRICE = 1.0
+
+
+def _value_scale_for_table(rows: List[Dict[str, Any]]) -> float:
+    """1.0 if the table reports whole dollars, 1000.0 if it reports thousands."""
+    implied = [
+        r["market_value_usd"] / r["shares"]
+        for r in rows
+        if r.get("shares") and r["shares"] > 0 and r.get("market_value_usd", 0.0) > 0
+    ]
+    if not implied:
+        # Nothing measurable. Leave the numbers as filed rather than inventing a
+        # factor of a thousand in either direction.
+        return 1.0
+    implied.sort()
+    median = implied[len(implied) // 2]
+    if median < _MIN_PLAUSIBLE_SHARE_PRICE:
+        logger.info(
+            "13F table reports values in thousands (median implied price $%.4f/share "
+            "across %d holdings); scaling to whole dollars.", median, len(implied),
+        )
+        return 1000.0
+    return 1.0
+
+
+def _aggregate_by_security(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse the information table to one row per security.
+
+    A 13F information table has one row per *position*, not per security: the
+    same CUSIP appears once for each other manager and each investment
+    discretion category the filer splits it across. Berkshire's AAPL is four
+    rows. Everything downstream treated each row as a separate holding, so
+    position counts were inflated, weight_pct was computed against a fragment
+    of the real position, and the quarter-over-quarter diff compared one
+    arbitrary fragment against another and reported the difference as a trade.
+
+    CUSIP is the security identifier and is what the filing is keyed on; issuer
+    name is only a fallback for the rare row that omits it.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for r in rows:
+        cusip = (r.get("cusip") or "").strip().upper()
+        # CUSIP 9 identifies the exact security including class; 8 is the same
+        # thing without its check digit, which some filers omit.
+        key = cusip[:8] if len(cusip) >= 8 else (
+            (r.get("ticker") or r.get("issuer_name") or "").strip().upper()
+        )
+        if not key:
+            continue
+        if key not in merged:
+            merged[key] = dict(r)
+            order.append(key)
+            continue
+        acc = merged[key]
+        acc["shares"] = acc.get("shares", 0.0) + r.get("shares", 0.0)
+        acc["market_value_usd"] = acc.get("market_value_usd", 0.0) + r.get("market_value_usd", 0.0)
+        # Keep whichever fragment carried the identifiers.
+        if not acc.get("ticker") and r.get("ticker"):
+            acc["ticker"] = r["ticker"]
+        if not acc.get("cusip") and r.get("cusip"):
+            acc["cusip"] = r["cusip"]
+        if not acc.get("issuer_name") and r.get("issuer_name"):
+            acc["issuer_name"] = r["issuer_name"]
+    return [merged[k] for k in order]
 
 
 def compute_portfolio_differential(

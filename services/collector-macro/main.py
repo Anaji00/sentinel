@@ -46,6 +46,7 @@ from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
+from shared.utils.logging import setup_sentinel_logging
 
 try:
     from economic_calendar import EconomicCalendarCollector
@@ -59,8 +60,15 @@ except ImportError:
         spec.loader.exec_module(mod)
         EconomicCalendarCollector = mod.EconomicCalendarCollector
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("feed.macro")
+# Credential redaction rides on the shared handler.
+#
+# This called logging.basicConfig(), which installs a plain StreamHandler
+# with no RedactingFilter -- so any credential appearing in an exception
+# message reached stdout in clear. asyncpg and aioredis raise connection
+# errors whose text embeds the full DSN, password included, and this
+# service connects to both. Fourteen of nineteen services already went
+# through setup_sentinel_logging; these five did not.
+logger = setup_sentinel_logging("feed.macro", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # Macro tickers to track
@@ -482,7 +490,7 @@ async def fetch_treasury_yields(session: aiohttp.ClientSession, redis_client) ->
             # Two days, so a long weekend or a federal holiday does not empty
             # the cache while the curve is simply unchanged.
             await redis_client.raw.set(
-                f"sentinel:quotes:latest:{key}", str(value), ex=2 * 86400,
+                quote_key(key), str(value), ex=QUOTE_CACHE_TTL_SEC,
             )
             written[key] = value
 

@@ -1,7 +1,8 @@
 'use client';
 
+import { ABSENT } from '../lib/format';
 import React, { useEffect, useMemo, useState } from "react";
-import { ComposableMap, Geographies, Geography, Marker, Line } from "react-simple-maps";
+import { ComposableMap, Geographies, Geography, Marker } from "react-simple-maps";
 import useSWR from "swr";
 import { fetcher } from "../lib/api";
 import { NormalizedEvent } from "../lib/types";
@@ -155,7 +156,6 @@ export default function GlobalMap() {
     // Multi-Domain REST telemetry fetches
     const { data: maritimeEvents } = useSWR<NormalizedEvent[]>("/events/maritime?limit=250", fetcher, { refreshInterval: 6000 });
     const { data: aviationEvents } = useSWR<NormalizedEvent[]>("/events/aviation?limit=80", fetcher, { refreshInterval: 8000 });
-    const { data: cyberEvents } = useSWR<NormalizedEvent[]>("/events/cyber?limit=30", fetcher, { refreshInterval: 10000 });
     const { data: tradfiEvents } = useSWR<NormalizedEvent[]>("/events/tradfi?limit=40", fetcher, { refreshInterval: 6000 });
 
     // Layer Toggles State
@@ -163,12 +163,11 @@ export default function GlobalMap() {
     const [tankersOnly, setTankersOnly] = useState(false);
     const [showFlights, setShowFlights] = useState(true);
     const [showExchanges, setShowExchanges] = useState(true);
-    const [showCyber, setShowCyber] = useState(true);
     const [showChokepoints, setShowChokepoints] = useState(true);
     const [showRadar, setShowRadar] = useState(true);
 
     const [selectedObject, setSelectedObject] = useState<{
-        type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'cyber';
+        type: 'vessel' | 'flight' | 'exchange' | 'chokepoint';
         data: any;
     } | null>(null);
 
@@ -302,11 +301,23 @@ export default function GlobalMap() {
                 callsign,
                 lat,
                 lon,
-                altitude_ft: d.baro_altitude_m ? Math.round(d.baro_altitude_m * 3.28084) : e.altitude_ft || 32000,
-                speed_kts: d.velocity_ms ? Math.round(d.velocity_ms * 1.94384) : 450,
-                squawk: squawk || '1200',
+                // Absent, not invented.
+                //
+                // These four fields defaulted to 32,000 ft, 450 kts, squawk
+                // 1200 and origin US, and the detail panel rendered them as
+                // measurements. Over two days of live flight events: 36,178 of
+                // 90,108 (40.1%) carry no squawk, so two fifths of the aircraft
+                // on this map asserted 1200 -- which is not a placeholder but
+                // the assigned code for VFR flight outside controlled airspace,
+                // a specific operational claim. And `baro_altitude_m` of 0 is
+                // falsy, so an aircraft on the ground was drawn at 32,000 feet.
+                altitude_ft: d.baro_altitude_m != null
+                    ? Math.round(d.baro_altitude_m * 3.28084)
+                    : (e.altitude_ft ?? null),
+                speed_kts: d.velocity_ms != null ? Math.round(d.velocity_ms * 1.94384) : null,
+                squawk: squawk || null,
                 isEmergency,
-                origin_country: d.origin_country || e.country_code || 'US',
+                origin_country: d.origin_country || e.country_code || null,
                 anomaly: e.anomaly_score ?? 0.0,
                 headline: e.headline,
             });
@@ -338,19 +349,22 @@ export default function GlobalMap() {
         return map;
     }, [tradfiEvents]);
 
-    // 4. BGP CYBER LINKS
-    const bgpLinks = useMemo(() => (cyberEvents || []).map((e) => {
-        const d = e.domain_data || {};
-        if (d.from_coords && d.to_coords) {
-            return {
-                from: d.from_coords as [number, number],
-                to: d.to_coords as [number, number],
-                id: e.event_id,
-                anomaly: e.anomaly_score
-            };
-        }
-        return null;
-    }).filter(Boolean) as Array<{ from: [number, number]; to: [number, number]; id: string; anomaly: number }>, [cyberEvents]);
+    // 4. BGP CYBER LINKS -- removed, because they could never be drawn.
+    //
+    // The layer plotted an arc from `domain_data.from_coords` to
+    // `domain_data.to_coords`. Neither name appears anywhere in the platform:
+    // not in `SecurityData`, not in the cyber enricher, not in any collector.
+    // The toggle beside it has therefore always read "CYBER (0)" and the layer
+    // has never drawn a line.
+    //
+    // Nor is the arc derivable. A BGP event knows one endpoint -- the origin
+    // AS and the country it is registered in -- and the other end of a hijack
+    // is the announced prefix, which this deployment has no way to place on a
+    // map. Restoring the layer means an ASN-to-location dataset the platform
+    // does not have; drawing it from what is here would mean inventing the
+    // half that is missing, which is the class of defect this audit exists to
+    // remove. The cyber domain is served by CyberIntelligencePanel, which
+    // renders what is actually known about these events.
 
     return (
         <div className="w-full h-full bg-[#06080d] relative overflow-hidden font-mono text-white rounded-xl border border-cyan-500/20 shadow-[0_0_25px_rgba(0,0,0,0.6)]">
@@ -398,14 +412,6 @@ export default function GlobalMap() {
                         📈 EXCHANGES ({FINANCIAL_EXCHANGES.length})
                     </button>
                     <button
-                        onClick={() => setShowCyber(!showCyber)}
-                        className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
-                            showCyber ? 'bg-rose-500/20 text-rose-400 border-rose-500/50' : 'bg-slate-900 text-slate-500 border-slate-800'
-                        }`}
-                    >
-                        ⚡ CYBER ({bgpLinks.length})
-                    </button>
-                    <button
                         onClick={() => setShowChokepoints(!showChokepoints)}
                         className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
                             showChokepoints ? 'bg-amber-500/20 text-amber-300 border-amber-500/50' : 'bg-slate-900 text-slate-500 border-slate-800'
@@ -433,7 +439,6 @@ export default function GlobalMap() {
                             {selectedObject.type === 'flight' && '✈️ AIRSPACE FLIGHT INSPECTOR'}
                             {selectedObject.type === 'exchange' && '📈 FINANCIAL EXCHANGE HUB'}
                             {selectedObject.type === 'chokepoint' && '⚓ MARITIME CHOKEPOINT'}
-                            {selectedObject.type === 'cyber' && '⚡ CYBER BGP ATTACK VECTOR'}
                         </span>
                         <button onClick={() => setSelectedObject(null)} className="text-slate-400 hover:text-white font-bold text-xs bg-slate-800 px-2 py-0.5 rounded cursor-pointer">
                             ✕
@@ -456,10 +461,10 @@ export default function GlobalMap() {
                         <div className="space-y-1 text-[11px] text-slate-300">
                             <div>CALLSIGN: <span className="text-cyan-300 font-bold">{selectedObject.data.callsign}</span></div>
                             <div>ICAO24: <span className="text-slate-400 font-mono">{selectedObject.data.icao24}</span></div>
-                            <div>ALTITUDE: <span className="text-emerald-400 font-bold">{selectedObject.data.altitude_ft.toLocaleString()} ft</span></div>
-                            <div>SPEED: <span className="text-emerald-400 font-bold">{selectedObject.data.speed_kts} knots</span></div>
-                            <div>SQUAWK CODE: <span className={selectedObject.data.isEmergency ? "text-rose-400 font-bold animate-pulse" : "text-slate-300"}>{selectedObject.data.squawk}</span></div>
-                            <div>ORIGIN COUNTRY: <span className="text-amber-300">{selectedObject.data.origin_country}</span></div>
+                            <div>ALTITUDE: <span className="text-emerald-400 font-bold">{selectedObject.data.altitude_ft != null ? `${selectedObject.data.altitude_ft.toLocaleString()} ft` : ABSENT}</span></div>
+                            <div>SPEED: <span className="text-emerald-400 font-bold">{selectedObject.data.speed_kts ?? ABSENT} knots</span></div>
+                            <div>SQUAWK CODE: <span className={selectedObject.data.isEmergency ? "text-rose-400 font-bold animate-pulse" : "text-slate-300"}>{selectedObject.data.squawk ?? ABSENT}</span></div>
+                            <div>ORIGIN COUNTRY: <span className="text-amber-300">{selectedObject.data.origin_country ?? ABSENT}</span></div>
                             <div>ANOMALY SCORE: <span className="text-rose-400 font-bold">{(selectedObject.data.anomaly || 0).toFixed(2)}</span></div>
                         </div>
                     )}
@@ -487,13 +492,6 @@ export default function GlobalMap() {
                             <div>LOCATION: <span className="text-white font-bold">{selectedObject.data.name}</span></div>
                             <div>RISK TIER: <span className="text-amber-400 font-bold">{selectedObject.data.risk}</span></div>
                             <div>COORDINATES: <span className="text-slate-400">{selectedObject.data.lat}, {selectedObject.data.lon}</span></div>
-                        </div>
-                    )}
-
-                    {selectedObject.type === 'cyber' && (
-                        <div className="space-y-1 text-[11px] text-slate-300">
-                            <div>ATTACK PATH: <span className="text-rose-400 font-bold">{selectedObject.data.from.join(', ')} → {selectedObject.data.to.join(', ')}</span></div>
-                            <div>BGP ANOMALY SCORE: <span className="text-rose-400 font-bold">{(selectedObject.data.anomaly || 0).toFixed(2)}</span></div>
                         </div>
                     )}
                 </div>
@@ -620,20 +618,6 @@ export default function GlobalMap() {
                             </>
                         )}
                     </Marker>
-                ))}
-
-                {/* 5. BGP Cyber Attack Vectors Layer */}
-                {showCyber && bgpLinks.map((link, idx) => (
-                    <Line
-                        key={idx}
-                        from={link.from}
-                        to={link.to}
-                        stroke="#ef4444"
-                        strokeWidth={1.5}
-                        strokeDasharray="4 4"
-                        onClick={() => setSelectedObject({ type: 'cyber', data: link })}
-                        style={{ cursor: 'pointer' }}
-                    />
                 ))}
             </ComposableMap>
         </div>

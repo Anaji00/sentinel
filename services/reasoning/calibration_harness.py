@@ -54,7 +54,14 @@ class ThresholdCalibrationHarness:
                     SELECT s.scenario_id,
                            s.status,
                            s.confidence_overall,
-                           e.anomaly_score
+                           e.anomaly_score,
+                           -- Recorded when the scenario was generated, from the
+                           -- correlation's own evidence, and never touched by
+                           -- the tracker that later confirms or denies it. That
+                           -- independence is the whole point: grading the
+                           -- confidence against a label derived from the
+                           -- confidence measures nothing.
+                           c.confidence_score AS similarity
                     FROM scenarios s
                     LEFT JOIN correlations c ON s.correlation_id = c.correlation_id
                     LEFT JOIN events e ON e.event_id = c.trigger_event_id
@@ -65,10 +72,16 @@ class ThresholdCalibrationHarness:
                 rows = await self.db.query(query)
                 for r in rows:
                     anomaly = r.get("anomaly_score")
+                    similarity = r.get("similarity")
                     outcomes.append({
                         "scenario_id": str(r["scenario_id"]),
                         "status": r["status"],
                         "confidence": float(r.get("confidence_overall") or 50),
+                        # None when the correlation carried no confidence score.
+                        # Left as None rather than defaulted: a scenario that
+                        # cannot inform the grid should be skipped, not counted
+                        # against a stand-in value.
+                        "similarity": float(similarity) if similarity is not None else None,
                         "payload": {"anomaly_score": float(anomaly) if anomaly is not None else 0.5},
                     })
             except Exception as e:
@@ -91,11 +104,34 @@ class ThresholdCalibrationHarness:
         tp, fp, fn = 0, 0, 0
         for item in outcomes:
             status = item.get("status")
-            conf = item.get("confidence", 50.0) / 100.0
             anomaly = item.get("payload", {}).get("anomaly_score", 0.5)
+            similarity = item.get("similarity")
 
-            # Signal triggered if anomaly >= z_score_thresh / 3.0 and conf >= sim_thresh
-            triggered = (anomaly >= (z_score_thresh / 3.0)) and (conf >= sim_thresh)
+            # The trigger must not be the label wearing a different name.
+            #
+            # This read `conf = confidence_overall / 100` and tested
+            # `conf >= sim_thresh` against a label of `status == 'CONFIRMED'` --
+            # and the tracker sets status='confirmed' precisely when
+            # confidence_overall >= CONFIRM_THRESHOLD, which is 65, which is the
+            # lowest value in sim_grid. So the signal was a subset of the label,
+            # cut from the same variable at the same point.
+            #
+            # Computing the full 5x5 matrix over the 500 scenarios the harness
+            # fetches gave false positives = 0 in all 25 cells: precision 1.0
+            # everywhere by construction, F1 maximised by recall alone, and the
+            # search therefore returned the loosest cell every time on any data.
+            # The value live in Redis was z=1.0, sim=0.65, best_f1 0.9724 -- the
+            # first cell of the grid -- and it had loosened
+            # min_correlation_coef from 0.65 to 0.59 in the discovery engine.
+            #
+            # Similarity is the independent quantity the threshold is actually
+            # about: how alike the matched pattern was, recorded at generation
+            # time and not derived from the confidence the tracker later scores.
+            # Where it is absent the scenario cannot inform this grid and is
+            # skipped rather than counted with a stand-in.
+            if similarity is None:
+                continue
+            triggered = (anomaly >= (z_score_thresh / 3.0)) and (float(similarity) >= sim_thresh)
             # Case-insensitive: the column stores "confirmed", not "CONFIRMED",
             # so this comparison was false for every confirmed outcome and the
             # harness would have scored precision at zero even with data.
@@ -147,14 +183,41 @@ class ThresholdCalibrationHarness:
         best_f1 = -1.0
         best_z = 1.5
         best_sim = 0.72
+        scored_cells = 0
 
         for z in z_grid:
             for sim in sim_grid:
                 p, r, f1 = self.evaluate_threshold_combination(outcomes, z, sim)
+                if f1 > 0.0:
+                    scored_cells += 1
                 if f1 > best_f1:
                     best_f1 = f1
                     best_z = z
                     best_sim = sim
+
+        # A grid where nothing scored is not a calibration.
+        #
+        # With best_f1 starting at -1.0, the first cell evaluated wins whenever
+        # every cell returns 0.0 -- so an unscoreable corpus produced a
+        # confident-looking recommendation that was really just the top-left of
+        # the grid. Falling back to the defaults says what happened instead.
+        if scored_cells == 0:
+            logger.info(
+                "Threshold calibration found no separating cell across %d outcomes; "
+                "keeping defaults rather than returning the first grid point.",
+                len(outcomes),
+            )
+            default_config["sample_count"] = len(outcomes)
+            default_config["calibration_status"] = "no_separating_threshold"
+            if self.redis:
+                try:
+                    await self.redis.raw.set(
+                        "sentinel:calibration:correlation_thresholds",
+                        json.dumps(default_config), ex=86400 * 7,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to persist default thresholds to Redis: %s", e)
+            return default_config
 
         calibrated = {
             "z_score_threshold": round(best_z, 2),
@@ -167,6 +230,8 @@ class ThresholdCalibrationHarness:
             "min_cointegration_p_value": 0.05,
             "best_f1_score": round(best_f1, 4),
             "sample_count": len(outcomes),
+            "scored_cells": scored_cells,
+            "calibration_status": "measured",
             "calibrated_at": datetime.now(timezone.utc).isoformat(),
         }
 

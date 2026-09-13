@@ -272,8 +272,38 @@ async def get_domain_events(
                 ORDER BY occurred_at DESC
             """
 
-        return await db.query(query, *params)
-    
+        rows = await db.query(query, *params)
+
+        # The payload under the name the client's own contract gives it.
+        #
+        # Both branches project the domain payload as `domain_data` -- a single
+        # generic key, so one component can flatten any row. Every typed reader
+        # asks for the specific name instead, because that is what
+        # `NormalizedEvent` declares and what the websocket feed sends:
+        # `security_data`, `crypto_data`, `vessel_data` and the rest.
+        #
+        # Nothing bridged the two. `CyberIntelligencePanel` fetches
+        # /events/cyber and counts `e.security_data?.cisa_kev`, so that headline
+        # was zero no matter what the cyber feed carried; its CVE/CVSS detail
+        # block is gated on `selectedEvent.security_data` and never opened at
+        # all; and `domain.ts` decides a row is cyber by `if (e.security_data)`,
+        # which was false for every row this endpoint has ever returned. The
+        # merged feed hid it: rows arriving over the websocket do carry the
+        # named key, so the same list held some events that worked and some
+        # that did not.
+        #
+        # Aliased, not copied twice over the wire -- both keys reference the
+        # same decoded payload object.
+        named = []
+        for row in rows:
+            item = dict(row)
+            column = DOMAIN_TO_COLUMN.get(item.get("domain") or "")
+            # "news" maps to `headline`, which is not a payload column.
+            if column and column.endswith("_data") and item.get("domain_data") is not None:
+                item[column] = item["domain_data"]
+            named.append(item)
+        return named
+
     except HTTPException:
         # A deliberate 4xx is an answer, not a fault. Re-raised untouched: the
         # blanket handler below turned the "that is an event id, not a domain"

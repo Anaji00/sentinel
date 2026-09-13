@@ -211,16 +211,60 @@ Copy and customize the `.env` configuration file:
 cp .env.example .env
 ```
 
-### 2. Pull Local LLM Models (Ollama)
+### 2. Start Sentinel Platform
+
+The stack is split across Compose **profiles**, and a bare `docker compose up`
+starts only the 14 services that have no profile -- the databases, Kafka, the
+gateway, enrichment, correlation and the frontend. No collectors, no agents, no
+observability. That is why a plain `up` looks like "not all the containers
+started": the rest were never selected.
+
+Use the Makefile, which knows the combinations:
+
+```bash
+make up
+```
+
+`make up` runs preflight checks and starts the **collectors** profile alongside
+the core: ingestion plus the dashboard. This is the default mode.
+
+```bash
+make reasoning
+```
+
+`make reasoning` stops the collectors and starts the **agents** profile -- the
+LLM swarm and Ollama. The two modes are deliberately exclusive: on a single
+host, twelve collectors and a local inference tier do not fit in memory
+together, and running both is how the OOM killer gets involved.
+
+```bash
+make obs
+```
+
+`make obs` adds Prometheus, Grafana and Kafka UI to whichever mode is running.
+
+To drive Compose directly, name the profiles explicitly:
+
+```bash
+docker compose --profile collectors up -d --build
+```
+
+| Profile | Services | When |
+| :--- | :--- | :--- |
+| *(none)* | ingress, zookeeper, kafka, timescaledb, neo4j, redis, qdrant, migrator, enrichment, correlation, api-gateway, frontend, dlq-worker, telemetry-worker | Always started |
+| `collectors` | 12 domain collectors | Ingestion — `make up` |
+| `agents` | reasoning, ollama, agents-fast, agents-heavy, alert-manager | Inference — `make reasoning` |
+| `obs` | prometheus, grafana, kafka-ui | Monitoring — `make obs` |
+| `test` | integration-tests | CI only |
+
+### 3. Pull Local LLM Models (Ollama)
+
+Only needed for `make reasoning`; Ollama does not run in the default mode.
+
 ```bash
 docker exec -it sentinel-ollama ollama pull qwen2.5:7b
 docker exec -it sentinel-ollama ollama pull qwen2.5:1.5b
 docker exec -it sentinel-ollama ollama pull gemma3:1b
-```
-
-### 3. Start Sentinel Platform
-```bash
-docker compose up --build -d
 ```
 
 Access the dashboard at **`https://localhost`** (Nginx TLS ingress auto-generates a self-signed certificate on first boot; mount production certs at `deploy/nginx/ssl/sentinel.crt` and `sentinel.key` for trusted HTTPS).
@@ -231,18 +275,22 @@ Access the dashboard at **`https://localhost`** (Nginx TLS ingress auto-generate
 
 ### 1. Docker Cluster Management
 ```bash
-# Start all services in background
-docker compose up -d
+# Start the default mode (core + collectors) in the background
+make up
 
-# Inspect health and container states
-docker compose ps
+# Inspect health and container states, with memory headroom
+make ps
 
 # Follow service logs
 docker compose logs -f enrichment correlation api-gateway agents-heavy telemetry-worker
 
-# Stop all services
-docker compose down
+# Stop every profile's containers, keeping volumes
+make stop
 ```
+
+`docker compose down` without `--profile` leaves the collector and agent
+containers running, because Compose only acts on the services the selected
+profiles name. `make down` passes all three.
 
 ### 2. API Gateway & Subgraph Queries
 ```bash

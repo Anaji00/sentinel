@@ -22,7 +22,8 @@ import re
 
 from shared.utils.materiality import apply_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
-from shared.utils.quiet_failures import swallowed, dropped, swallowed
+from shared.utils.quiet_failures import swallowed, dropped
+from shared.utils.feature_flags import FeatureFlagManager
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -47,6 +48,9 @@ FREIGHT_SPIKE_LIFT = 0.20
 THIRTEEN_F_DEDUP_TTL_SEC = 100 * 86400
 
 THIRTEEN_F_BASE_SCORE = 0.60
+
+# How long a measured stop multiplier stays usable. See the write site below.
+STOP_MULTIPLIER_TTL_SEC = 86400
 
 # What a filing's form says about how much it is worth reading.
 #
@@ -82,14 +86,79 @@ _FILING_FORM_SCORES = (
 _FILING_FORM_DEFAULT = 0.45
 
 
-def _filing_form_score(form_type: str, is_8k: bool) -> float:
-    """Base anomaly for a filing, from its form.
+# What an 8-K is actually about.
+#
+# The form type alone gave every 8-K the same 0.85, so a bankruptcy petition and
+# a Regulation FD slide deck arrived at the ranking tier indistinguishable. The
+# discriminator was already in the payload and already parsed -- the collector
+# splits the item codes out of the EDGAR index and ships them as
+# `items`, and the enricher used them for tags and for nothing else.
+#
+# Item numbers are the SEC's own taxonomy of what happened, and they are ordered
+# by how much they change the view of a company. Ordering below follows that:
+# insolvency and change of control at the top, scheduled disclosure at the
+# bottom, with the auditor change high because a registrant dismissing its
+# accountant is one of the strongest distress signals on the form.
+_EIGHT_K_ITEM_SCORES = {
+    "1.03": 0.97,  # Bankruptcy or Receivership
+    "5.01": 0.94,  # Changes in Control of Registrant
+    "2.01": 0.92,  # Completion of Acquisition or Disposition of Assets
+    "3.01": 0.92,  # Notice of Delisting
+    "4.01": 0.90,  # Change of Certifying Accountant
+    "1.02": 0.88,  # Termination of a Material Definitive Agreement
+    "5.02": 0.86,  # Departure of Directors or Principal Officers
+    "1.01": 0.84,  # Entry into a Material Definitive Agreement
+    "2.02": 0.82,  # Results of Operations (scheduled, and usually pre-announced)
+    "3.02": 0.80,  # Unregistered Sales of Equity Securities (dilution)
+    "2.03": 0.78,  # Creation of a Direct Financial Obligation
+    "5.03": 0.62,  # Amendments to Articles or Bylaws
+    "7.01": 0.60,  # Regulation FD Disclosure
+    "8.01": 0.55,  # Other Events
+}
+
+# An item code this table does not name is unclassified, not routine: the middle
+# of the 8-K band, the same principle as _FILING_FORM_DEFAULT.
+_EIGHT_K_ITEM_DEFAULT = 0.70
+
+# An 8-K filed with no parseable items carries no discriminator at all, so it
+# keeps the flat form-level score rather than being scored down for the absence.
+_EIGHT_K_NO_ITEMS = 0.85
+
+# Several material items on one form is a bigger event than any one of them.
+# Small and capped: a list of items is weak evidence next to which items they are.
+_EIGHT_K_MULTI_ITEM_STEP = 0.02
+_EIGHT_K_MULTI_ITEM_CAP = 0.06
+_EIGHT_K_MATERIAL_CUT = 0.80
+
+
+def _eight_k_item_score(items) -> float:
+    """Anomaly for an 8-K from the item codes it reports."""
+    codes = []
+    for raw_item in items or []:
+        text = str(raw_item).strip()
+        if not text:
+            continue
+        # The collector sends bare codes; a label ("5.02: Departure of ...")
+        # is accepted too so the score does not depend on which side formatted it.
+        codes.append(text.split(":", 1)[0].strip())
+    if not codes:
+        return _EIGHT_K_NO_ITEMS
+    scores = [_EIGHT_K_ITEM_SCORES.get(c, _EIGHT_K_ITEM_DEFAULT) for c in codes]
+    base = max(scores)
+    extra_material = sum(1 for v in scores if v >= _EIGHT_K_MATERIAL_CUT) - 1
+    if extra_material > 0:
+        base += min(_EIGHT_K_MULTI_ITEM_CAP, extra_material * _EIGHT_K_MULTI_ITEM_STEP)
+    return round(min(0.99, base), 4)
+
+
+def _filing_form_score(form_type: str, is_8k: bool, items=None) -> float:
+    """Base anomaly for a filing, from its form and, for an 8-K, its items.
 
     is_8k is honoured first: the collector sets it from a material-event check
     that can be true for forms whose prefix this table would score lower.
     """
     if is_8k:
-        return 0.85
+        return _eight_k_item_score(items)
     form = str(form_type or "").upper().strip()
     for prefix, score in _FILING_FORM_SCORES:
         if form.startswith(prefix):
@@ -413,6 +482,8 @@ class TradFiEnricher:
         self.redis_client = redis_client
         self.graph = graph_writer
         self.db = db
+        # Flags consulted by the macro-release path below.
+        self.flags = FeatureFlagManager(redis_client)
 
     async def enrich_batch(self, events: list) -> list:
         if not events: return []
@@ -567,7 +638,22 @@ class TradFiEnricher:
         set_pipe = self.redis_client.raw.pipeline()
         for i, (raw, p, ticker, price, volume, notional) in enumerate(parsed_events):
             score_dict = score_results[i] if i < len(score_results) else {}
-            anomaly = float(score_dict.get("score", 0.5) or 0.5)
+            # `or 0.5` fired on 0.0, which is a real answer from the detector and
+            # its most common one: an event entirely unremarkable for its
+            # instrument. It became 0.5 -- mid-range, and above three downstream
+            # thresholds including edge_validator's REACTION_THRESHOLD, which is
+            # tested with `>=`.
+            raw_score = score_dict.get("score")
+            anomaly = float(raw_score) if isinstance(raw_score, (int, float)) else 0.5
+            # Whether that number was measured at all.
+            #
+            # score_event_batch returns {"score": 0.5, "scoring_degraded": True}
+            # on three failure branches, and `scoring_degraded` was written at
+            # three sites and read at zero across the whole tree. Live, 101 of
+            # 152 equity blocks sat at exactly 0.5000 with no coverage basis --
+            # every one of them unscored, and indistinguishable from an event
+            # the detector had actually looked at.
+            scoring_degraded = bool(score_dict.get("scoring_degraded", False))
             # The calibrated per-domain gate's answer, in place of a
             # hardcoded `anomaly >= 0.65`. The gate knows this domain's own
             # distribution; the constant did not.
@@ -578,6 +664,11 @@ class TradFiEnricher:
             _coverage = score_dict.get("coverage") or {}
             cov_fraction = _coverage.get("fraction") if isinstance(_coverage, dict) else None
             cov_basis = _coverage.get("basis") if isinstance(_coverage, dict) else None
+            # A degraded score has no coverage to report, so say which it was
+            # rather than leaving the field simply absent.
+            if scoring_degraded and not cov_basis:
+                cov_basis = "not_scored"
+                cov_fraction = 0.0
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
             base_score = anomaly
@@ -833,7 +924,10 @@ class TradFiEnricher:
         ofi = 0.0
         ofi_measured = False
         k_lambda = 0.0
-        k_impact_bps = 0.0
+        # None until measured. 0.0 here read as 'no price impact', which is
+        # the deepest book a stop guard can see, for an instrument nothing
+        # had regressed yet.
+        k_impact_bps = None
         ami = 0.0
         v_wap = price  # fallback
 
@@ -901,7 +995,7 @@ class TradFiEnricher:
                     # fired on this term.
                     k_impact_bps = quant_calc.kyle_impact_bps(
                         price_changes, signed_flows, reference_price=prices_buf[0]
-                    ) if prices_buf else 0.0
+                    ) if prices_buf else None
 
                     # Amihud: proper period returns |r_t| = |p_t/p_{t-1} - 1|
                     if len(prices_buf) >= 2 and all(p_val > 0 for p_val in prices_buf):
@@ -940,7 +1034,24 @@ class TradFiEnricher:
                     "measured": True,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
-                await self.redis_client.raw.set(f"sentinel:stop_loss:{ticker}", json.dumps(stop_data), ex=3600)
+                # Sized for how often the input actually arrives.
+                #
+                # A one-hour TTL was written when block trades came in at
+                # ~20,000 a day. The materiality filter that replaced the flat
+                # $50k floor cut that to about sixty a day across fifty symbols
+                # -- roughly twice an hour -- so the key was almost always
+                # absent and `_measured_stop_multiplier` fell back to the flat
+                # 1.5 this measurement exists to replace. Live, the keyspace
+                # held zero of them.
+                #
+                # Order-flow imbalance and Kyle's lambda describe a book's
+                # depth, which does not change materially within a session, so
+                # a day is the honest shelf life.
+                await self.redis_client.raw.set(
+                    f"sentinel:stop_loss:{ticker}",
+                    json.dumps(stop_data),
+                    ex=STOP_MULTIPLIER_TTL_SEC,
+                )
         except Exception as stop_err:
             logger.debug(f"Trailing stop calculation bypass for {ticker}: {stop_err}")
 
@@ -1120,7 +1231,7 @@ class TradFiEnricher:
         if not is_watched:
             return []
             
-        from shared.utils.candles import evaluate_multi_timeframe
+        from shared.utils.candles import evaluate_multi_timeframe, candle_observation_ts
         
         ts = raw.occurred_at or datetime.now(timezone.utc)
         
@@ -1263,7 +1374,12 @@ class TradFiEnricher:
             events.append(NormalizedEvent(
                 event_id=raw.event_id, trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
-                occurred_at=datetime.fromisoformat(block["start_ts"]),
+                # The same rule the crypto candle path uses. This carried the
+                # bucket's start, which is stale by up to the timeframe; the
+                # helper takes the close where the bar has actually closed and
+                # the observation time where it has not, so neither path can
+                # stamp an event in the future.
+                occurred_at=candle_observation_ts(block, tf),
                 source=raw.source,
                 source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
@@ -1688,7 +1804,13 @@ class TradFiEnricher:
 
         z_score = float(p.get("z_score", 0.0))
         volume = float(p.get("volume", 0.0))
-        price = float(p.get("price", 0.0))
+        # `close_price`, which is the key the collector sends.
+        #
+        # This read "price", and collector-radar's raw_payload carries
+        # `close_price` -- so `underlying_price` was 0.0 on all 676 radar events
+        # in 24 hours. Both spellings are accepted so a producer that changes
+        # its mind does not silently zero the field again.
+        price = float(p.get("close_price") or p.get("price") or 0.0)
         notional = float(p.get("notional_usd", 0.0))
 
         import time as _time
@@ -1789,8 +1911,12 @@ class TradFiEnricher:
                 instrument_type="equity",
                 trade_type="RADAR_ANOMALY",
                 premium_usd=notional,
+                notional_usd=notional,
                 underlying_price=price,
                 volume=volume,
+                # The statistic the anomaly was judged on, stored rather than
+                # only logged, so downstream can rank two radar hits.
+                z_score=round(z_score, 4),
             ),
             headline=f"⚡ QUANT RADAR VOLUME SPIKE | {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional/1e6:.2f}M",
             tags=tags,
@@ -2018,7 +2144,7 @@ class TradFiEnricher:
         if is_8k:
             tags.extend(["material_event", "ground_truth"])
 
-        anomaly = _filing_form_score(form_type, is_8k)
+        anomaly = _filing_form_score(form_type, is_8k, items)
         headline = p.get("title") or f"📄 SEC FILING: {company_name} ({ticker}) filed Form {form_type}"
         summary = p.get("summary") or f"SEC filing {form_type} for {company_name} ({ticker}) on {f_date}."
 
@@ -2053,6 +2179,11 @@ class TradFiEnricher:
         )
 
     async def _enrich_freight_rate(self, raw, p) -> Optional[NormalizedEvent]:
+        # The `macro_releases` switch names this path -- "Scheduled economic
+        # calendar release ingestion and surprise signals" -- and had no
+        # reader anywhere, so tripping it stopped nothing.
+        if not await self.flags.is_enabled("macro_releases"):
+            return None
         """Enriches a freight-rate index update into a supply-chain event.
 
         The collector has been running and publishing FREIGHT_RATE_UPDATE to

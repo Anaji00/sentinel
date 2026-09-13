@@ -116,12 +116,30 @@ async def create_case(
     )
 
     case_dict = new_case.model_dump(mode="json")
-    if redis:
-        raw_redis = getattr(redis, "raw", redis)
-        pipe = raw_redis.pipeline()
-        pipe.set(f"{REDIS_CASES_PREFIX}{new_case.case_id}", json.dumps(case_dict))
-        pipe.zadd(REDIS_CASES_INDEX, {new_case.case_id: datetime.now(timezone.utc).timestamp()})
-        await pipe.execute()
+
+    # A case that was not stored was not created.
+    #
+    # This was `if redis:` -- so with no store the endpoint returned a 200, a
+    # case id and a full case body, wrote a CREATE_INVESTIGATION_CASE entry to
+    # the audit ledger for it, and the id resolved to nothing on the very next
+    # request. The ledger recorded the creation of a case that does not exist,
+    # which is worse than losing the case.
+    #
+    # The ledger takes this exact stance one layer down: it refuses to record
+    # rather than create the false impression that an audit trail exists.
+    if not redis:
+        raise HTTPException(
+            status_code=503,
+            detail="The case store is unavailable; the case was not created.",
+        )
+
+    raw_redis = getattr(redis, "raw", redis)
+    pipe = raw_redis.pipeline()
+    # No TTL, deliberately. Redis runs volatile-lru here, which evicts only
+    # keys that carry one, so an investigation is never silently dropped.
+    pipe.set(f"{REDIS_CASES_PREFIX}{new_case.case_id}", json.dumps(case_dict))
+    pipe.zadd(REDIS_CASES_INDEX, {new_case.case_id: datetime.now(timezone.utc).timestamp()})
+    await pipe.execute()
 
     # Record in audit ledger
     ledger = AuditLedger(redis_client=redis, db_client=db)

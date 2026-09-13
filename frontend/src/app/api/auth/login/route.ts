@@ -37,8 +37,13 @@ export function verifySessionToken(token: string): { valid: boolean; email?: str
     if (segments.length >= 3) {
       [email, role, expiresAtStr] = segments;
     } else {
+      // VIEWER, not ANALYST -- the same rule the gateway applies.
+      //
+      // ANALYST carries write access to cases, watchlists and reports. A cookie
+      // minted before roles were encoded says nothing about what its holder may
+      // do, and the least privilege is the only safe reading of silence.
       [email, expiresAtStr] = segments;
-      role = 'ANALYST';
+      role = 'VIEWER';
     }
     const expiresAt = parseInt(expiresAtStr, 10);
 

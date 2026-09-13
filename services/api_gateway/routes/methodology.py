@@ -178,11 +178,23 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         name="Parametric Value at Risk (VaR) & Expected Shortfall (CVaR)",
         category="Risk & Governance",
         epistemic_tier="Deterministic Closed-Form",
-        description="Computes 1-Day 95% Parametric VaR and 99% Conditional VaR using an empirical covariance matrix and Herfindahl concentration index.",
+        description=(
+            "Computes 1-Day 95% Parametric VaR and 99% Gaussian Expected Shortfall "
+            "from the L2 norm of position weights and a measured daily volatility. "
+            "It said \"using an empirical covariance matrix\"; there is no covariance "
+            "matrix in this platform, and the implementation assumes zero correlation "
+            "between positions -- which is what sqrt(sum(w^2)) encodes, and which "
+            "understates risk for a long equity book."
+        ),
         formula_latex=r"\text{VaR}_{\alpha} = Z_{\alpha} \cdot \sigma_P \cdot V_P, \quad \text{CVaR}_{\alpha} = \frac{\phi(Z_{\alpha})}{1 - \alpha} \cdot \sigma_P \cdot V_P",
         assumptions=[
             "Multivariate normal distribution of asset log returns over 1-day horizon",
             "Linear portfolio valuation with constant position weights over the holding period",
+            "Zero correlation between positions, and one volatility shared by all of "
+            "them: sigma_P is approximated as sigma_daily * sqrt(sum(w^2))",
+            "sigma_daily is the platform's market-wide realised volatility "
+            "(QQQ/SPY 1m bars, annualised, over sqrt(252)); when no measurement is "
+            "available the response is marked DISCLOSED_PLACEHOLDER rather than computed",
         ],
         parameters=[
             MethodologyParameter(
@@ -200,8 +212,18 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 calibration_method="FRTB (Fundamental Review of the Trading Book) standard",
             ),
         ],
-        data_inputs=["broker:positions", "broker:account", "tradfi:historical_covariance"],
-        validation_gate="Kupiec proportion-of-failures (POF) test: exceptions must match theoretical 5% frequency within binomial confidence bands.",
+        data_inputs=["broker:positions", "broker:account", "redis:sentinel:macro:realised_vol"],
+        # `tradfi:historical_covariance` was listed as an input and does not
+        # exist, and the gate named a Kupiec proportion-of-failures test that
+        # nothing in this platform runs. A validation gate nobody executes is a
+        # claim, and this field sits on the endpoint whose whole purpose is to
+        # let a reader check the claims.
+        validation_gate=(
+            "None. A Kupiec proportion-of-failures backtest would require a "
+            "recorded history of daily portfolio P&L against the VaR published "
+            "on each prior day, which this platform does not retain. The figure "
+            "is unvalidated and reported as such."
+        ),
         falsifiability_condition="Realized daily portfolio losses breach 95% VaR threshold more than 4 times in a 60-day window.",
     ),
     "half_kelly_position_sizing": SignalMethodology(

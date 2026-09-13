@@ -146,7 +146,7 @@ export default function FinancialAdvisorAdvice() {
     }
 
     try {
-      const res = await fetch('/api/v1/trading/orders/execute', {
+      const res = await fetch('/api/proxy/api/v1/trading/orders/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

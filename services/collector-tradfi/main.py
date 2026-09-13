@@ -67,6 +67,69 @@ BLOCK_MULTIPLE_OF_TYPICAL = float(os.getenv("BLOCK_MULTIPLE_OF_TYPICAL", "8.0"))
 _TYPICAL_NOTIONAL: dict = {}
 _TYPICAL_ALPHA = 0.02  # slow EWMA: a block must not raise the bar it is judged against
 
+# Where that average is kept between restarts.
+#
+# It was a module-level dict and nothing else. The collector restarts often --
+# deploys, crashes, a host suspending -- and on the first trade after one,
+# `prev = notional` seeds the baseline to whatever that trade happened to be,
+# so a large first print sets the bar to eight times itself and silences the
+# ticker. With alpha at 0.02 convergence needs on the order of a hundred
+# observations, and the filtered feed now delivers about sixty block events a
+# day across fifty symbols: roughly one per ticker per day, discarded before it
+# converges. Every restart returned every ticker to the flat $200,000 floor the
+# comment above explains is wrong for a mega-cap.
+#
+# The same collector already persists subscriptions, last prices and bar
+# aggregates. This number, which decides what is emitted at all, was the one
+# held only in memory.
+_TYPICAL_NOTIONAL_KEY = "sentinel:tradfi:typical_notional"
+_TYPICAL_NOTIONAL_TTL_SEC = 30 * 86400
+_typical_dirty: set = set()
+
+
+async def load_typical_notional(redis_client) -> int:
+    """Restores the per-instrument baseline from Redis at startup."""
+    if not redis_client:
+        return 0
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        stored = await raw.hgetall(_TYPICAL_NOTIONAL_KEY)
+        for k, v in (stored or {}).items():
+            key = k.decode() if isinstance(k, bytes) else str(k)
+            try:
+                _TYPICAL_NOTIONAL[key] = float(v.decode() if isinstance(v, bytes) else v)
+            except (TypeError, ValueError):
+                continue
+        if _TYPICAL_NOTIONAL:
+            logger.info(
+                "Restored typical-notional baselines for %s instrument(s); "
+                "block materiality is judged against measured history rather "
+                "than the cold-start floor.",
+                len(_TYPICAL_NOTIONAL),
+            )
+        return len(_TYPICAL_NOTIONAL)
+    except Exception as e:
+        logger.warning("Could not restore typical-notional baselines: %s", e)
+        return 0
+
+
+async def persist_typical_notional(redis_client) -> None:
+    """Writes back the baselines that have moved since the last flush."""
+    if not redis_client or not _typical_dirty:
+        return
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        payload = {t: str(_TYPICAL_NOTIONAL[t]) for t in list(_typical_dirty) if t in _TYPICAL_NOTIONAL}
+        _typical_dirty.clear()
+        if payload:
+            await raw.hset(_TYPICAL_NOTIONAL_KEY, mapping=payload)
+            await raw.expire(_TYPICAL_NOTIONAL_KEY, _TYPICAL_NOTIONAL_TTL_SEC)
+    except Exception as e:
+        # Counted: losing these means every instrument reverts to the flat
+        # cold-start floor on the next restart, which is the defect this
+        # persistence was added for.
+        swallowed("collector.tradfi.persist_typical_notional", e, logger)
+
 
 def _is_block_trade(ticker: str, notional: float) -> bool:
     """Is this trade large for this instrument?
@@ -85,6 +148,7 @@ def _is_block_trade(ticker: str, notional: float) -> bool:
 
     prev = typical if typical is not None else notional
     _TYPICAL_NOTIONAL[ticker] = prev + _TYPICAL_ALPHA * (notional - prev)
+    _typical_dirty.add(ticker)
     return is_block
 
 
@@ -1295,6 +1359,119 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
 
 # ── INSTITUTIONAL FIX 4.4 CLIENT ──────────
 
+# The fields that make a market-data message a book rather than a price.
+#
+# FIX carries MDEntries as a repeating group: each entry opens with 269
+# (MDEntryType) and is followed by its own price, size, side and -- on an
+# incremental refresh -- what happened to it.
+#
+#   269  MDEntryType      0 bid, 1 offer, 2 trade, 4 open, 7 high, 8 low
+#   270  MDEntryPx        the price of this entry
+#   271  MDEntrySize      the size resting at it
+#   279  MDUpdateAction   0 New, 1 Change, 2 Delete
+#   1023 MDPriceLevel     where in the book it sits
+#   278  MDEntryID        the venue's handle for this order
+MD_ENTRY_TYPE, MD_ENTRY_PX, MD_ENTRY_SIZE = 269, 270, 271
+MD_UPDATE_ACTION, MD_ENTRY_ID, MD_PRICE_LEVEL = 279, 278, 1023
+# 55 is the message's symbol in a snapshot and the *entry's* symbol in an
+# incremental refresh, which may carry several instruments in one message.
+MD_SYMBOL = 55
+
+_MD_ENTRY_FIELDS = {
+    MD_ENTRY_PX: "price",
+    MD_ENTRY_SIZE: "size",
+    MD_ENTRY_ID: "entry_id",
+    MD_PRICE_LEVEL: "price_level",
+    MD_SYMBOL: "symbol",
+}
+
+# Either of these can be the first field of an entry, and which one it is
+# depends on the message.
+#
+# In a snapshot (35=W) the group opens with 269 MDEntryType. In an incremental
+# refresh (35=X) it opens with 279 MDUpdateAction and 269 follows it. Starting
+# a new entry only on 269 therefore drops the update action of every entry in
+# every incremental message -- which is to say every cancellation, which is the
+# only field the order-based typologies are defined by.
+#
+# Found by a test, after writing the parser the other way. It is the same
+# defect as the one this function exists to fix, one layer further in.
+_MD_ENTRY_OPENERS = {MD_ENTRY_TYPE: "entry_type", MD_UPDATE_ACTION: "update_action"}
+
+MD_ENTRY_TYPE_NAMES = {"0": "bid", "1": "offer", "2": "trade"}
+MD_UPDATE_ACTION_NAMES = {"0": "new", "1": "change", "2": "delete"}
+
+
+def _fix_str(value) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+
+
+def _set_md_field(entry: dict, name: str, raw: str) -> None:
+    """One field onto an entry, dropping only what cannot be read.
+
+    A malformed price costs that price and not the cancellation beside it: an
+    entry that says a resting bid was deleted is still worth carrying when its
+    price field is junk.
+    """
+    if name in ("price", "size"):
+        try:
+            entry[name] = float(raw)
+        except ValueError:
+            return
+    elif name == "entry_type":
+        entry[name] = MD_ENTRY_TYPE_NAMES.get(raw, raw)
+    elif name == "update_action":
+        entry[name] = MD_UPDATE_ACTION_NAMES.get(raw, raw)
+    else:
+        entry[name] = raw
+
+
+def market_data_entries(pairs) -> list:
+    """MDEntries from a FIX message's tag/value pairs, in order.
+
+    Pure, and separated from the socket on purpose: it is the part that can be
+    wrong, and it is the part a test can reach.
+
+    The client requested `264=0` -- Full Book -- and parsed the reply with
+    `fix_msg.get(270) or fix_msg.get(44)`, which takes the first price in the
+    message and discards everything else. A bid resting at level five being
+    *cancelled* and a trade printing at the touch both arrived downstream as
+    `{"ticker": ..., "price": ...}` and were indistinguishable.
+
+    What that threw away is specifically the book. 269 says whether an entry is
+    a bid, an offer or a trade; 271 says how much is resting there; and **279
+    says whether the entry was added, changed or deleted**. Order-based
+    manipulation is defined by cancellations, so a venue was being asked for the
+    one field those patterns are made of, and it was dropped in the parser.
+
+    A repeating group has no delimiter, so an entry ends where the next one
+    begins: at whichever of 269 or 279 comes round again.
+    """
+    entries, current = [], None
+    for tag, value in pairs or []:
+        try:
+            tag = int(tag)
+        except (TypeError, ValueError):
+            continue
+
+        if tag in _MD_ENTRY_OPENERS:
+            name = _MD_ENTRY_OPENERS[tag]
+            # Seeing an opener the current entry already carries means the
+            # group has come round to the next one.
+            if current is not None and name in current:
+                entries.append(current)
+                current = None
+            if current is None:
+                current = {}
+            _set_md_field(current, name, _fix_str(value))
+        elif current is not None and tag in _MD_ENTRY_FIELDS:
+            _set_md_field(current, _MD_ENTRY_FIELDS[tag], _fix_str(value))
+
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
 class InstitutionalFIXClient:
     """
     State Street / Tier-1 Institutional FIX 4.4 & FIXT 1.1 Market Data Client.
@@ -1396,16 +1573,21 @@ async def run_institutional_fix(producer: SentinelProducer, redis_client):
                     price_tag = fix_msg.get(270) or fix_msg.get(44)
                     if sym_tag and price_tag:
                         try:
-                            sym = sym_tag.decode() if isinstance(sym_tag, bytes) else str(sym_tag)
+                            sym = _fix_str(sym_tag)
                             p_val = float(price_tag)
+                            # The book, not just the first price in it. A
+                            # collector that discards what a venue sent has
+                            # made a decision no downstream consumer can undo.
+                            entries = market_data_entries(getattr(fix_msg, "pairs", None))
                             event = RawEvent(
                                 source="institutional_fix",
                                 occurred_at=datetime.now(timezone.utc),
                                 raw_payload={
                                     "ticker": sym,
                                     "price": p_val,
-                                    "msg_type": msg_type.decode() if isinstance(msg_type, bytes) else str(msg_type),
+                                    "msg_type": _fix_str(msg_type),
                                     "source_protocol": "FIX.4.4",
+                                    "md_entries": entries,
                                 }
                             )
                             await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=sym)
@@ -1512,6 +1694,20 @@ async def _run_historical_backfill(redis_client) -> None:
         logger.debug("Could not record backfill report: %s", e)
 
 
+async def _persist_baselines_loop(redis_client, interval_sec: int = 300) -> None:
+    """Writes the typical-notional baselines back every few minutes."""
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            await persist_typical_notional(redis_client)
+        except asyncio.CancelledError:
+            # Last write on the way out, so a clean shutdown keeps what it learnt.
+            await persist_typical_notional(redis_client)
+            raise
+        except Exception as e:
+            swallowed("collector.tradfi.baseline_flush", e, logger)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL TradFi Service (Enterprise Multi-Session Edition)")
@@ -1522,6 +1718,13 @@ async def main():
     logger.info("Starting TradFi Collector (Finnhub WS, SEC EDGAR, Alpaca Extended Hours & Options, Finnhub Earnings, FIX 4.4 Engine)")
 
     aggregator = OHLCVAggregator(producer, redis_client)
+
+    # What counts as a block, restored rather than relearned.
+    #
+    # Without this every restart returns every instrument to the flat cold-start
+    # floor and the per-instrument baseline begins converging again from the
+    # first trade it happens to see.
+    await load_typical_notional(redis_client)
 
     # §0.3 — Shared event for instant watchlist repointing
     watchlist_sync_event = asyncio.Event()
@@ -1544,6 +1747,10 @@ async def main():
     # rate-limit problem, and the names the platform reasons about are the ones
     # whose history it needs.
     backfill_task = safe_create_task(_run_historical_backfill(redis_client))
+
+    # Flush the baselines periodically, so a crash loses minutes of learning
+    # rather than all of it.
+    baseline_task = safe_create_task(_persist_baselines_loop(redis_client))
 
     try:
         await asyncio.gather(

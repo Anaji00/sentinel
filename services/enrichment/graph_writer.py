@@ -322,7 +322,19 @@ class GraphWriter:
                 "target_label": target_label if is_valid_node_label(target_label) else "Entity",
                 "relation_type": normalized_rel,
                 "weight": float(properties.get("weight", 1.0)),
-                "confidence": float(properties.get("confidence", 1.0)),
+                # An unrated relationship is left unrated, not asserted at 1.0.
+                #
+                # Three Cypher reads coalesce a missing confidence onto
+                # UNRATED_EDGE_CONFIDENCE, and that branch was unreachable while
+                # every write supplied a default: 272,040 RELATED_TO edges, 68%
+                # of the graph, were stored claiming certainty about a
+                # co-occurrence nobody scored. Node proposals elsewhere in this
+                # file keep their 1.0 deliberately -- "this vessel exists" is a
+                # thing the AIS feed does assert.
+                "confidence": (
+                    float(properties["confidence"])
+                    if properties.get("confidence") is not None else None
+                ),
                 "properties": properties,
             }
             proposal = {

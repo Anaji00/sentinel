@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 from shared.kafka import Topics
 from shared.utils.regime import current_regime as shared_current_regime
 from shared.utils.quiet_failures import swallowed, heartbeat_line as quiet_heartbeat_line
+from shared.utils.metrics import MetricsCollector
 from shared.utils.freshness import is_stale
 from shared.utils.live_feed import agent_narrative
 from shared.utils.inference_budget import (
@@ -75,11 +76,13 @@ def _message_domain(message: Dict[str, Any]) -> str:
 
 from shared.utils.tasks import safe_create_task
 from shared.utils.focus import offer_focus, prioritise
+from shared.utils.quote_cache import quote_key
 # The same set the correlation layer refuses to treat as corroboration. One
 # definition of "this is a position report, not a claim", used by both.
 from shared.models.events import POSITION_TELEMETRY_TYPES as ROUTINE_TELEMETRY_TYPES
 from shared.utils.heartbeat import touch_heartbeat
 from shared.utils.text import clip
+from shared.utils.untrusted_text import quote_untrusted_block, sanitize_untrusted
 from shared.utils.ollama import (
     DEFAULT_MODEL,
     OllamaClient, SchemaViolationError, InferenceError,
@@ -114,7 +117,64 @@ TASK_QUEUE_LOW    = "sentinel:tasks:low"
 # Heartbeat interval in seconds for agent health reporting
 HEARTBEAT_INTERVAL = 60
 
+# How long an agent's state digest outlives its last refresh.
+#
+# Must exceed AGENT_DIGEST_STALE_AFTER_SEC, or a digest expires before it can be
+# seen to be stale. Both live here so the pair cannot drift apart again.
+AGENT_DIGEST_STALE_AFTER_SEC = 300
+AGENT_DIGEST_TTL_SEC = AGENT_DIGEST_STALE_AFTER_SEC * 3
+
 # ── STRUCTURED AGENT COMMUNICATION PROTOCOL ──────────────────────────────────
+
+# One direction vocabulary, for the three readers that each had their own.
+#
+# `expected_direction` was gated on ("up", "down") by the prediction recorder,
+# understood as up/bullish/long and down/bearish/short by the Subjective Logic
+# mapper, and as sixteen words by the resolver. The macro engine publishes
+# "bearish": consensus fused it as a directional opinion and moved the swarm's
+# view on it, the recorder did not match it, so it was never stored, never
+# scored, and never fed the base rate or the scorecard that decides how heavily
+# its own author counts. It influenced the fusion and was exempt from being
+# graded by it. The quant engine publishes "uncertain", which no reader knew
+# and which the field's own comment does not declare.
+#
+# Normalising once, here, is what stops the three drifting again.
+DIRECTION_UP = frozenset({"up", "bullish", "long", "buy", "positive"})
+DIRECTION_DOWN = frozenset({"down", "bearish", "short", "sell", "negative"})
+DIRECTION_FLAT = frozenset({"flat", "neutral", "unchanged", "hold", "sideways"})
+
+
+def canonical_direction(value) -> Optional[str]:
+    """"up", "down", "flat", or None when the word says nothing directional.
+
+    None is a real answer: "uncertain" is not a direction, and turning it into
+    one would invent a claim in order to score it.
+    """
+    token = str(value or "").strip().lower()
+    if token in DIRECTION_UP:
+        return "up"
+    if token in DIRECTION_DOWN:
+        return "down"
+    if token in DIRECTION_FLAT:
+        return "flat"
+    return None
+
+
+def is_scoreable_direction(value) -> bool:
+    """Whether a bulletin's stated direction is a claim worth recording.
+
+    Deliberately up/down only, not flat. Every publisher in this codebase uses
+    "neutral" to mean *no directional claim* rather than a prediction that the
+    price will not move -- the radar says so in as many words, because its
+    decision is {investigate, rationale} and recording a direction there would
+    invent a claim and then score a track record against it.
+
+    `canonical_direction` still maps flat words to "flat", because the resolver
+    must grade a prediction that was deliberately recorded as flat: the quant
+    engine records one for a HOLD play, and that is a real claim.
+    """
+    return canonical_direction(value) in ("up", "down")
+
 
 # Confidence assigned to an agent result that states none.
 #
@@ -240,6 +300,15 @@ class AgentPrediction(BaseModel):
     # Defaulted to "price" so every prediction already in Redis keeps the exact
     # behaviour it had.
     prediction_kind: str = "price"
+    # Which performance partition this claim belongs to.
+    #
+    # `update_scorecard(strategy=...)` writes the strategy and strategy/regime
+    # cards that `get_conditional_scorecard` reads, and nothing in the tree ever
+    # passed one -- so those partitions never existed, every lookup fell through
+    # to the global card, and the quant engine's Kelly sizing used the 0.55
+    # prior for every position it has ever sized. The prediction has to carry
+    # the partition for the resolver to be able to write it.
+    strategy: Optional[str] = None
     outcome_space: List[str] = Field(default_factory=list)
     predicted_outcome: Optional[str] = None
     market_key: Optional[str] = None
@@ -252,6 +321,13 @@ class AgentPrediction(BaseModel):
 # A prediction record with nothing in it. 0.5 is the Brier score of a forecaster
 # who says "even chance" every time -- uninformative rather than wrong.
 UNPROVEN_BRIER = 0.5
+
+# How long a directional bulletin's claim is given before it is resolved.
+#
+# A day: long enough that intraday noise is not what decides the Brier score,
+# short enough that an agent accumulates a record within a week of running.
+BULLETIN_PREDICTION_HORIZON_HOURS = int(os.getenv("AGENT_BULLETIN_HORIZON_HOURS", "24"))
+
 
 # The floor keeps a consistently wrong agent contributing something rather than
 # being silenced outright; being reliably wrong is information.
@@ -327,6 +403,24 @@ PREDICTION_RESOLUTION_BUFFER_SEC = int(
 )
 
 
+def _default_max_stall_sec() -> float:
+    """How long a batched caller must be prepared to wait.
+
+    The model client tries the primary model and then the fallback, each under
+    OLLAMA_TIMEOUT, so the worst case a flush can occupy is two full timeouts.
+    A caller that gives up sooner releases its dispatch slot and leaves the
+    flush holding `_inflight`, which blocks every subsequent batch for the
+    remainder -- the wedge this class exists to prevent.
+    """
+    try:
+        model_timeout = float(os.getenv("OLLAMA_TIMEOUT", "600"))
+    except (TypeError, ValueError):
+        model_timeout = 600.0
+    model_timeout = max(60.0, model_timeout)
+    # Two attempts, plus the batch window, plus a margin for the queue.
+    return (model_timeout * 2.0) + 60.0
+
+
 class InferenceBatcher:
     """Collects like questions so that one inference answers all of them.
 
@@ -373,11 +467,27 @@ class InferenceBatcher:
             max_items = max(1, int(max_waiters))
         self.max_items = max(1, int(max_items))
         self.max_wait_sec = max(0.5, float(max_wait_sec))
-        # Ceiling on how long any one caller waits: the batch window plus room
-        # for a real inference on this host, which measured 1-6 minutes.
+        # Ceiling on how long any one caller waits.
+        #
+        # This defaulted to 420 seconds, and the work it waits on can run far
+        # longer: docker-compose sets OLLAMA_TIMEOUT=600, and on a timeout the
+        # client offloads to the fallback model, which gets its own 600-second
+        # ceiling. So a failing batch occupied the flush for up to 1,200 seconds
+        # while every caller in it had given up at 420 -- and `_flush()` returns
+        # early for that whole window because `self._inflight` is still true, so
+        # nothing else could start either.
+        #
+        # Live, that reproduced the exact condition `submit()` was written to
+        # end: 188 stall lines in two hours, radar_agent at rate=0.00/s with
+        # STALLED climbing, and every committed Kafka offset frozen while the
+        # end offsets advanced -- lag 20,765 -> 21,764 in 45 seconds.
+        #
+        # A caller must outlast the work, not undercut it. Derived from the
+        # model timeout rather than set beside it, so the two cannot drift:
+        # both attempts plus the batch window plus headroom.
         self.max_stall_sec = float(
             max_stall_sec if max_stall_sec is not None
-            else os.getenv("BATCH_MAX_STALL_SEC", "420")
+            else os.getenv("BATCH_MAX_STALL_SEC", str(_default_max_stall_sec()))
         )
         self.logger = logger or logging.getLogger(f"agents.batcher.{name}")
         self._pending: List[tuple] = []
@@ -499,12 +609,32 @@ class InferenceBatcher:
 
         keys = [k for k, _, _ in batch]
         try:
-            answers = await self._flush_fn([(k, item) for k, item, _ in batch])
+            # Bounded, so `_inflight` cannot be held forever.
+            #
+            # The caller-side wait is now sized above the model's worst case,
+            # which stops callers giving up on work that is still running. This
+            # is the other half: if the flush itself never returns -- a hung
+            # socket, a model server that accepts and never answers -- nothing
+            # would clear `_inflight`, and `_flush()` returns early while it is
+            # set, so every later batch is blocked behind a call that will never
+            # finish. That is the wedge, and a ceiling here is what makes it
+            # impossible rather than merely unlikely.
+            answers = await asyncio.wait_for(
+                self._flush_fn([(k, item) for k, item, _ in batch]),
+                timeout=self.max_stall_sec,
+            )
             answers = answers or {}
             self.logger.info(
                 "%s: one inference answered %s candidate(s) -- %s",
                 self.name, len(batch), ", ".join(keys[:8]) + ("..." if len(keys) > 8 else ""),
             )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "%s: batch of %s exceeded %.0fs and was abandoned so the next "
+                "batch can start. Every caller is answered 'no decision'.",
+                self.name, len(batch), self.max_stall_sec,
+            )
+            answers = {}
         except Exception as e:
             # One failure resolves the whole batch to "no decision" rather than
             # leaving callers awaiting a future that will never complete. A
@@ -1020,6 +1150,9 @@ class SentinelAgent(ABC):
         last_processed = self._processed
         last_sample_at = datetime.now(timezone.utc)
         stalled_since = None
+        # Previous sample's lag, so "growing" is a comparison rather than
+        # another absent attribute.
+        previous_lag: Optional[int] = None
 
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -1059,6 +1192,33 @@ class SentinelAgent(ABC):
             # consumer 68,000 messages behind report HEALTHY.
             try:
                 error_rate = (self._errors / self._processed) if self._processed else 0.0
+                # Measured, not read off an attribute nothing assigns.
+                #
+                # `consumer_lag` came from getattr(self, "_consumer_lag", None)
+                # against a name that appears nowhere else in the tree, so every
+                # heartbeat ever published carried null and the health surface
+                # graded a consumer 68,000 messages behind on liveness alone.
+                #
+                # `lag_growing` now compares against the previous sample instead
+                # of another absent attribute, and `retention_headroom` is the
+                # measurement that was missing entirely: Kafka deletes by
+                # retention rather than by consumption, so a consumer that falls
+                # far enough behind sees its own backlog deleted and its lag
+                # *drop*, which reads as recovery.
+                lag_report = await self._consumer.lag_report()
+                current_lag = lag_report.get("lag")
+                lag_growing = None
+                if isinstance(current_lag, int) and isinstance(previous_lag, int):
+                    lag_growing = current_lag > previous_lag
+                previous_lag = current_lag if isinstance(current_lag, int) else previous_lag
+
+                if lag_report.get("at_retention_edge"):
+                    self.logger.error(
+                        f"⚠ {self.name} is at the Kafka retention edge: unread messages "
+                        f"are being deleted before this consumer reaches them "
+                        f"(lag={current_lag})."
+                    )
+
                 await touch_heartbeat(
                     self.redis, self.name,
                     metadata={
@@ -1066,8 +1226,10 @@ class SentinelAgent(ABC):
                         "window_rate": round(window_rate, 4),
                         "stalled_seconds": round(stalled_seconds, 1),
                         "error_rate": round(error_rate, 4),
-                        "consumer_lag": getattr(self, "_consumer_lag", None),
-                        "lag_growing": getattr(self, "_lag_growing", None),
+                        "consumer_lag": current_lag,
+                        "lag_growing": lag_growing,
+                        "retention_headroom": lag_report.get("retention_headroom"),
+                        "at_retention_edge": bool(lag_report.get("at_retention_edge")),
                     },
                 )
             except Exception as hb_err:
@@ -1098,10 +1260,23 @@ class SentinelAgent(ABC):
                     "current_regime": self._current_regime,
                     "model": self.model,
                 }
+                # The TTL has to outlive the staleness threshold it is judged by.
+                #
+                # This was ex=300 against a consensus-engine test of
+                # `age_seconds > 300`, so a digest was evicted from Redis at the
+                # exact moment it would first qualify as stale -- there was no
+                # window in which the condition could be observed. The reader
+                # then treats "no digests at all" as "nothing to penalise", so
+                # `stale_agents` was always empty and the 0.3x downweight for a
+                # drifted agent had never once applied.
+                #
+                # Three times the threshold: a dead agent's last digest stays
+                # readable, and visibly old, for ten minutes after it stops
+                # being refreshed.
                 await self.redis.raw.set(
                     f"sentinel:agent:digest:{self.name}",
                     json.dumps(digest),
-                    ex=300,  # 5-minute TTL: if not refreshed, agent is stale
+                    ex=AGENT_DIGEST_TTL_SEC,
                 )
             except Exception as _exc:
                 swallowed("agents.base._heartbeat_loop", _exc)
@@ -1210,6 +1385,36 @@ class SentinelAgent(ABC):
 
     # ── STRUCTURED BULLETIN SYSTEM ──────────────────────────────────────────
 
+
+    async def _record_bulletin_prediction(
+        self, ticker: str, direction: str, conviction: float
+    ) -> None:
+        """Record a directional bulletin as a scoreable prediction.
+
+        The entry price is fetched rather than taken from the caller: a bulletin
+        does not carry one, and a prediction without a usable entry cannot be
+        resolved -- which is exactly how the only six predictions ever stored
+        came to be retired unscored.
+        """
+        try:
+            entry = await self._latest_price(ticker)
+        except Exception as _exc:
+            swallowed(f"agents.{self.name}._record_bulletin_prediction", _exc, self.logger)
+            return
+        if not isinstance(entry, (int, float)) or entry <= 0:
+            # No quote, so no resolvable claim. Counted, because a swarm whose
+            # subjects are never quotable would otherwise look identical to one
+            # that is simply quiet.
+            MetricsCollector.increment("agent_prediction_unpriced_total")
+            return
+        await self.record_prediction(
+            ticker=ticker,
+            direction=direction,
+            conviction=conviction,
+            entry_price=float(entry),
+            time_horizon_hours=BULLETIN_PREDICTION_HORIZON_HOURS,
+        )
+
     async def publish_bulletin(
         self,
         bulletin_type: str,
@@ -1235,7 +1440,13 @@ class SentinelAgent(ABC):
         # compelling anything: the other agents consult the focus set when
         # choosing and are free to ignore it.
         safe_create_task(
-            offer_focus(self.redis, ticker, conviction, offered_by=self.name),
+            offer_focus(
+                self.redis, ticker, conviction, offered_by=self.name,
+                # Every agent declares the domain it reasons about, so a
+                # bulletin's subject is filed where the agents that could act on
+                # it will look.
+                domain=getattr(self, "FOCUS_DOMAIN", None),
+            ),
             name=f"{self.name}-offer-focus",
         )
         try:
@@ -1253,10 +1464,58 @@ class SentinelAgent(ABC):
                 summary=summary,
                 ttl_seconds=ttl_seconds,
             )
+            # The key carries a subject, always.
+            #
+            # This appended the ticker only when one was supplied, so every
+            # bulletin an agent published without one landed on the same key and
+            # overwrote the last. The macro engine's decoupling alert is exactly
+            # that shape: all of them collapsed into a single
+            # `sentinel:bulletins:macro_intelligence_engine:alert`, so the
+            # consensus engine could never see more than one and the rest were
+            # gone before anything read them.
+            subject = (ticker or ent_id or ent_name or "").strip().upper()
             key = f"sentinel:bulletins:{self.name}:{bulletin_type}"
-            if ticker:
-                key += f":{ticker.upper()}"
+            if subject:
+                key += f":{subject}"
+            else:
+                # Genuinely unattributed. Keyed by a digest of its own summary
+                # so two different findings cannot silently become one, and
+                # still bounded by the TTL below.
+                import hashlib as _hashlib
+                digest = _hashlib.sha256((summary or "").encode("utf-8")).hexdigest()[:12]
+                key += f":unattributed:{digest}"
             await self.redis.raw.set(key, bulletin.model_dump_json(), ex=ttl_seconds)
+
+            # A directional bulletin is a prediction, so it is recorded as one.
+            #
+            # The scorecard machinery is complete -- `_resolve_predictions_loop`
+            # runs, `_score_directional` fetches a realised price,
+            # `update_scorecard` folds the outcome into a Brier score, and the
+            # consensus engine weights every agent by it. It had one producer,
+            # the quant engine, whose advisory path is gated behind an LLM call
+            # and a price lookup. Measured: `sentinel:agents:scorecard*` held
+            # ZERO keys, the only predictions ever stored were six retired for a
+            # non-positive entry price, and every agent in the swarm therefore
+            # carried the identical unproven weight -- so the Subjective Logic
+            # fusion was uniform by construction and Kelly sized every position
+            # as unproven, permanently.
+            #
+            # Hooked here for the same reason the episodic memory write is: an
+            # agent that publishes a directional conclusion has, by
+            # construction, made a claim that can be scored. Detached and
+            # best-effort -- a bulletin must not fail because its prediction
+            # could not be recorded -- and `record_prediction` itself declines
+            # anything without a usable entry price, so a subject with no quote
+            # is skipped rather than stored unresolvable.
+            if ticker and is_scoreable_direction(expected_direction):
+                safe_create_task(
+                    self._record_bulletin_prediction(
+                        ticker=ticker,
+                        direction=canonical_direction(expected_direction),
+                        conviction=conviction,
+                    ),
+                    name=f"{self.name}-bulletin-prediction",
+                )
 
             # A bulletin is the agent's conclusion, so it is also the memory
             # worth sharing.
@@ -1383,6 +1642,10 @@ class SentinelAgent(ABC):
         target_price: float = 0.0,
         time_horizon_hours: int = 24,
         prediction_kind: str = "price",
+        strategy: Optional[str] = None,
+        outcome_space: Optional[List[str]] = None,
+        predicted_outcome: Optional[str] = None,
+        market_key: Optional[str] = None,
     ) -> str:
         """
         Records a prediction for later verification.
@@ -1427,6 +1690,17 @@ class SentinelAgent(ABC):
                 target_price=target_price,
                 time_horizon_hours=time_horizon_hours,
                 prediction_kind=prediction_kind,
+                strategy=strategy,
+                # A categorical claim -- which of several outcomes wins -- is
+                # the only shape this platform can compare against a prediction
+                # market, and the recorder had no parameter for it. So
+                # outcome_space was always empty, `_record_paired_forecast`
+                # returned at its first guard, `_score_categorical` was
+                # unreachable, and MarketCalibrationTracker never recorded or
+                # resolved anything, against thirteen live market-odds keys.
+                outcome_space=list(outcome_space or []),
+                predicted_outcome=predicted_outcome,
+                market_key=market_key,
             )
             key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
             # Horizon plus a generous window to be resolved in.
@@ -1740,7 +2014,7 @@ class SentinelAgent(ABC):
             context = f"\n### RECENT ML ANOMALIES & NEWS FOR {entity_name.upper()} ###\n"
             for r in rows:
                 score = f"(Anomaly Score: {r['anomaly_score']:.2f})" if r.get('anomaly_score') else ""
-                context += f"- [{r['type']}] {r['headline']} {score}\n"
+                context += f"- [{r['type']}] {sanitize_untrusted(r['headline'])} {score}\n"
             return context + "\n"
         except Exception as e:
             self.logger.error(f"Failed to fetch entity context for {entity_name}: {e}")
@@ -1775,11 +2049,11 @@ class SentinelAgent(ABC):
             context = "\n### GLOBAL SENTINEL SWARM WORLD STATE (LAST 24 HOURS) ###\n"
             context += "TOP ML ANOMALIES:\n"
             for r in anomalies:
-                context += f"- [{r['type']}] {r['headline']} (Score: {r['anomaly_score']:.2f})\n"
+                context += f"- [{r['type']}] {sanitize_untrusted(r['headline'])} (Score: {r['anomaly_score']:.2f})\n"
                 
             context += "\nLATEST GLOBAL NEWS:\n"
             for r in news:
-                context += f"- {r['headline']}\n"
+                context += f"- {sanitize_untrusted(r['headline'])}\n"
 
             # Ingest live rate regime & macro state from Redis cache
             try:
@@ -1813,10 +2087,10 @@ class SentinelAgent(ABC):
                     headline = brief_body.get("headline") or brief_body.get("strategic_summary")
                     if headline:
                         context += "\nLATEST STRATEGIC MACRO BRIEF (MacroIntelligenceEngine):\n"
-                        context += f"- {clip(headline, 200)}\n"
+                        context += f"- {sanitize_untrusted(headline, max_chars=200)}\n"
                         summary = brief_body.get("summary") or brief_body.get("strategic_summary")
                         if summary and summary != headline:
-                            context += f"- {clip(summary, 240)}\n"
+                            context += f"- {sanitize_untrusted(summary, max_chars=240)}\n"
                         context += f"- Severity: {payload.get('computed_severity', 'N/A')} | As of: {payload.get('created_at', 'unknown')}\n"
             except Exception as bx:
                 self.logger.debug(f"Macro brief cache miss in global context: {bx}")
@@ -1956,7 +2230,10 @@ class SentinelAgent(ABC):
         not have would manufacture a track record out of nothing.
         """
         try:
-            raw = await self.redis.raw.get(f"sentinel:quotes:latest:{ticker.upper()}")
+            # The shared helper, which also strips. Building the key by hand here
+            # dropped the .strip() the writer applies, so a ticker arriving
+            # with whitespace looked up a key that is present and missed it.
+            raw = await self.redis.raw.get(quote_key(ticker))
             if not raw:
                 # A cache miss is the ordinary case, not the end of the search:
                 # this key expires after an hour and predictions are resolved a
@@ -2095,18 +2372,18 @@ class SentinelAgent(ABC):
             )
             return None
 
-        direction = (pred.direction or "").strip().lower()
+        direction = canonical_direction(pred.direction)
         # Relative, so the threshold means the same thing for a $3 stock and a
         # $3,000 one.
         move = (current - pred.entry_price) / abs(pred.entry_price)
 
-        if direction in ("flat", "neutral", "unchanged", "hold"):
+        if direction == "flat":
             return abs(move) <= self.FLAT_BAND
         if abs(move) <= self.FLAT_BAND:
             return None             # no move to judge a directional call against
-        if direction in ("up", "long", "bullish", "buy"):
+        if direction == "up":
             return move > 0
-        if direction in ("down", "short", "bearish", "sell"):
+        if direction == "down":
             return move < 0
         # An unrecognised direction used to be silently scored as "down", which
         # credited the agent for a word the resolver did not understand.
@@ -2358,10 +2635,24 @@ class SentinelAgent(ABC):
                 await self.update_scorecard(
                     prediction_correct=correct,
                     conviction=pred.conviction,
+                    # The partition the claim was made under, so the
+                    # strategy and strategy/regime cards actually get written.
+                    strategy=pred.strategy,
                 )
 
                 pred.verified = True
                 pred.outcome_correct = correct
+                # Durable, not only in Redis.
+                #
+                # update_scorecard writes to Redis; three readers query
+                # `agent_predictions` in Postgres for resolved_at, direction,
+                # ticker and outcome_correct, and nothing ever wrote them.
+                # measured_base_rate returned the non-informative 0.5 prior for
+                # every Subjective Logic projection the platform has ever made,
+                # _observed_win_rate returned None for every Kelly fraction, and
+                # the swarm route saw nothing. The outcome exists here; this is
+                # where it becomes durable.
+                await self._persist_resolved_prediction(pred, correct)
                 # Kept briefly after resolution so a scorecard dispute can be
                 # traced back to the predictions behind it.
                 await self.redis.raw.set(key, pred.model_dump_json(), ex=86400)
@@ -2374,6 +2665,45 @@ class SentinelAgent(ABC):
                 "Resolved %s prediction(s) for %s against realised prices", resolved, self.name
             )
         return resolved
+
+    async def _persist_resolved_prediction(self, pred: "AgentPrediction", correct: bool) -> None:
+        """Writes a resolved prediction to the durable record its readers query.
+
+        Best-effort: a scorecard that has already been updated must not be lost
+        because the archive write failed, and the Redis copy remains the
+        authority for the resolver itself.
+        """
+        if not self.db:
+            return
+        try:
+            brier = (float(pred.conviction) - (1.0 if correct else 0.0)) ** 2
+            await self.db.execute(
+                """
+                INSERT INTO agent_predictions (
+                    prediction_id, predicted_target, confidence, occurred_at,
+                    agent_name, ticker, direction, entry_price, horizon_hours,
+                    resolved_at, outcome_correct, brier_score
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
+                """,
+                str(pred.prediction_id),
+                str(pred.ticker),
+                float(pred.conviction),
+                datetime.fromisoformat(pred.created_at)
+                if isinstance(pred.created_at, str) else pred.created_at,
+                str(self.name),
+                str(pred.ticker),
+                canonical_direction(pred.direction) or str(pred.direction or ""),
+                float(pred.entry_price or 0.0),
+                int(pred.time_horizon_hours or 0),
+                bool(correct),
+                round(brier, 6),
+            )
+        except Exception as e:
+            # Counted, not whispered. This is the durable record three separate
+            # readers depend on -- the measured base rate, the per-ticker win
+            # rate behind Kelly, and the swarm view -- so losing a write here
+            # silently is how they came to be empty in the first place.
+            swallowed(f"agents.{self.name}._persist_resolved_prediction", e, self.logger)
 
     async def _execute_with_telemetry(
         self,

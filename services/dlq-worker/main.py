@@ -120,6 +120,132 @@ async def _republish_after_backoff(producer, topic: str, raw_data, attempt: int)
         logger.error(f"Failed to re-publish to {topic}: {e}")
 
 
+# Where the gateway leaves replay requests. A list rather than a pub/sub
+# channel: a replay an operator asked for must survive this worker being down,
+# and a channel drops what nobody is listening to.
+REPLAY_QUEUE_KEY = "sentinel:dlq:replay_queue"
+
+# How long one drain may hold before going back to the loop.
+REPLAY_POLL_TIMEOUT_SEC = 5
+
+# A row that has been put back this many times and keeps coming back is not
+# going to succeed on the next attempt either.
+MAX_REPLAYS_PER_ROW = 3
+
+
+async def _replay_loop(db, producer, redis_client) -> None:
+    """Puts dead letters back on their original topic when an operator asks.
+
+    `failed_events.resolved` existed, was indexed and had no writer: 11,539 rows
+    permanently FALSE, because nothing in the platform could act on a dead
+    letter at all. The payload was being kept for a replay that had no
+    implementation.
+
+    Operator-driven rather than automatic, deliberately. Most of what lands here
+    is a poison pill -- the worker classifies it as such before it ever writes
+    the row -- and a sweeper that replayed those on a timer would reproduce the
+    unbounded retry this table exists to terminate.
+    """
+    while True:
+        try:
+            item = await redis_client.raw.blpop(REPLAY_QUEUE_KEY, timeout=REPLAY_POLL_TIMEOUT_SEC)
+            if not item:
+                continue
+            _key, raw_value = item
+            try:
+                request = json.loads(
+                    raw_value.decode("utf-8") if isinstance(raw_value, bytes) else raw_value
+                )
+                row_id = int(request.get("id"))
+                requested_by = str(request.get("requested_by") or "unknown")[:120]
+            except Exception as parse_err:
+                logger.warning(f"Discarding unparseable DLQ replay request: {parse_err}")
+                continue
+
+            rows = await db.query(
+                """
+                SELECT id, original_topic, raw_payload, replay_count
+                FROM failed_events
+                WHERE id = $1 AND resolved = FALSE
+                """,
+                row_id,
+            )
+            if not rows:
+                # Already resolved, or never existed. Either way there is
+                # nothing to put back, and saying so is not an error.
+                logger.info(f"DLQ replay {row_id}: nothing outstanding under that id.")
+                continue
+
+            row = rows[0]
+            topic = row["original_topic"]
+            attempts = int(row.get("replay_count") or 0)
+            if topic in (None, "", "unknown"):
+                await _record_replay_failure(db, row_id, "original topic unknown")
+                continue
+            if attempts >= MAX_REPLAYS_PER_ROW:
+                await _record_replay_failure(
+                    db, row_id, f"replay ceiling reached ({attempts}/{MAX_REPLAYS_PER_ROW})"
+                )
+                continue
+
+            payload = row["raw_payload"]
+            if isinstance(payload, (str, bytes)):
+                try:
+                    payload = json.loads(payload)
+                except Exception as decode_err:
+                    await _record_replay_failure(db, row_id, f"payload is not JSON: {decode_err}")
+                    continue
+
+            try:
+                await producer.send(topic, payload)
+            except Exception as send_err:
+                await _record_replay_failure(db, row_id, f"publish failed: {send_err}")
+                continue
+
+            # Resolved means "put back on the topic it failed on", not "succeeded
+            # downstream" -- if it fails again it arrives here as a new row, with
+            # its own error, which is the honest record of what happened.
+            await db.execute(
+                """
+                UPDATE failed_events
+                SET resolved = TRUE,
+                    resolved_at = NOW(),
+                    resolved_by = $2,
+                    replay_count = COALESCE(replay_count, 0) + 1,
+                    last_replay_error = NULL
+                WHERE id = $1
+                """,
+                row_id, requested_by,
+            )
+            logger.info(f"DLQ replay {row_id}: republished to {topic} (requested by {requested_by}).")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"DLQ replay loop error: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+
+async def _record_replay_failure(db, row_id: int, reason: str) -> None:
+    """A replay that could not happen is recorded on the row, not just logged.
+
+    The operator who asked for it is looking at the table, not at this worker's
+    stdout.
+    """
+    logger.warning(f"DLQ replay {row_id} refused: {reason}")
+    try:
+        await db.execute(
+            """
+            UPDATE failed_events
+            SET replay_count = COALESCE(replay_count, 0) + 1,
+                last_replay_error = $2
+            WHERE id = $1
+            """,
+            row_id, reason[:500],
+        )
+    except Exception as e:
+        logger.error(f"Could not record replay failure for {row_id}: {e}")
+
+
 async def _consume_loop(consumer, db, session, producer, redis_client):
     """Blocking loop that reads from Kafka and writes to Postgres with retry logic."""
     last_alert_time = 0
@@ -247,6 +373,12 @@ async def main():
 
     # §1.1 Universal heartbeat — silent DLQ death is catastrophic
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "dlq-worker"))
+
+    # The replay drain runs alongside the consume loop: it holds on a blocking
+    # pop, so it costs nothing while the queue is empty.
+    replay_task = safe_create_task(
+        _replay_loop(db, producer, redis_client), name="dlq-replay"
+    )
     
     connector = aiohttp.TCPConnector(limit=5)
     
@@ -255,6 +387,7 @@ async def main():
             await _consume_loop(consumer, db, session, producer, redis_client)
     finally:
         hb_task.cancel()
+        replay_task.cancel()
         await producer.close()
         await consumer.close()
 

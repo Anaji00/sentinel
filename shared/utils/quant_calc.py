@@ -1118,7 +1118,7 @@ def cusum_change_detection(
 def kyle_lambda(
     price_changes: List[float],
     signed_volumes: List[float],
-) -> float:
+) -> Optional[float]:
     """
     Kyle's Lambda: price impact coefficient.
     Measures how much price moves per unit of signed order flow.
@@ -1133,19 +1133,31 @@ def kyle_lambda(
     Returns:
         Kyle's Lambda (regression slope)
     """
+    # None, not 0.0, when the slope cannot be measured.
+    #
+    # This returned 0.0 for five distinct conditions: a length mismatch, too few
+    # points, too few non-zero volumes, a singular matrix, and a genuinely
+    # non-positive slope. Only the last is a measurement. The docstring above
+    # says "Higher lambda -> less liquid", so 0.0 reads as *the most liquid
+    # instrument possible* -- and it feeds `microstructure_stop_distance`, which
+    # tightens a stop when impact is low. Four failure modes were being read as
+    # a frictionless book.
+    #
+    # The distinction is available at the point it is lost, and every consumer
+    # already handles absence: MarketMicrostructure.kyle_lambda is Optional.
     if len(price_changes) != len(signed_volumes) or len(price_changes) < 10:
-        return 0.0
-    
+        return None
+
     dp = np.array(price_changes, dtype=np.float64)
     sv = np.array(signed_volumes, dtype=np.float64)
-    
+
     # Filter zeros
     mask = np.abs(sv) > 1e-10
     if mask.sum() < 5:
-        return 0.0
-    
+        return None
+
     dp, sv = dp[mask], sv[mask]
-    
+
     X = np.column_stack([np.ones(len(sv)), sv])
     try:
         beta = np.linalg.lstsq(X, dp, rcond=None)[0]
@@ -1154,10 +1166,11 @@ def kyle_lambda(
         # price down. A negative slope is noise, a sign convention error or a
         # mislabelled aggressor, and returning it lets a consumer reading
         # "higher lambda means less liquid" rank it as maximally liquid. Zero
-        # is the honest reading -- no measurable impact in this window.
+        # is the honest reading here -- this one IS a measurement, of a window
+        # in which no impact was detectable.
         return round(max(0.0, lam), 8)
     except np.linalg.LinAlgError:
-        return 0.0
+        return None
 
 
 def kyle_impact_bps(
@@ -1165,7 +1178,7 @@ def kyle_impact_bps(
     signed_volumes: List[float],
     reference_price: float,
     notional: float = 1_000_000.0,
-) -> float:
+) -> Optional[float]:
     """Price impact in basis points per `notional` of order flow.
 
     `kyle_lambda` is correctly specified and correctly named, and its units are
@@ -1180,9 +1193,14 @@ def kyle_impact_bps(
     wants: how far does this instrument move if you push a million dollars
     through it.
     """
+    # Absence propagates rather than collapsing to zero: an unmeasurable
+    # lambda gives an unmeasurable impact, and the stop guard below reads a
+    # low impact as a deep book.
     if reference_price <= 0:
-        return 0.0
+        return None
     lam = kyle_lambda(price_changes, signed_volumes)
+    if lam is None:
+        return None
     if lam <= 0:
         return 0.0
     fractional = lam * notional / (reference_price ** 2)
@@ -1432,7 +1450,7 @@ IMPACT_BPS_THIN = 25.0
 def microstructure_stop_distance(
     atr: float,
     ofi: float,
-    impact_bps: float,
+    impact_bps: Optional[float],
     base_multiplier: float = 1.5,
 ) -> float:
     """Stop-loss distance multiplier from order flow imbalance and price impact.
@@ -1453,10 +1471,15 @@ def microstructure_stop_distance(
     elif ofi < -0.30:
         mult -= 0.25
 
-    if impact_bps > IMPACT_BPS_ILLIQUID:
-        mult -= 0.50
-    elif impact_bps > IMPACT_BPS_THIN:
-        mult -= 0.25
+    # An unmeasured impact tightens nothing. `impact_bps` is None when the
+    # regression could not be run at all, and tightening a stop on the strength
+    # of a number nobody computed is the failure this whole path was built to
+    # avoid.
+    if impact_bps is not None:
+        if impact_bps > IMPACT_BPS_ILLIQUID:
+            mult -= 0.50
+        elif impact_bps > IMPACT_BPS_THIN:
+            mult -= 0.25
 
     return round(max(0.50, min(2.50, mult)), 2)
 

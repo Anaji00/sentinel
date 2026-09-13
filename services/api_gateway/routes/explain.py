@@ -112,76 +112,138 @@ async def explain_event_alert(
     _t0 = time.perf_counter()
 
     event = None
+    looked = False
     if db:
         try:
             rows = await db.query("SELECT * FROM events WHERE event_id = $1 LIMIT 1", event_id)
+            looked = True
             if rows:
                 event = dict(rows[0])
         except Exception as e:
-            logger.debug(f"DB event lookup fallback: {e}")
+            logger.debug("DB event lookup failed for %s: %s", event_id, e)
 
-    # Fallback to in-memory/simulated payload if event was synthetic or offline
+    # No invented event.
+    #
+    # This branch used to build one: an NVDA "high-frequency volume and
+    # volatility anomaly" at 0.88, priced at 128.50 against a 127.80 VWAP, with
+    # a realized volatility, an order-flow imbalance, a Kyle lambda and an
+    # Amihud illiquidity -- and then explained it, in full, under whatever event
+    # id had been asked about. On the one endpoint whose entire purpose is to
+    # show how a number was arrived at, a wrong id returned a confident
+    # explanation of an event that never happened.
+    #
+    # "Not found" and "could not look" are different answers, and only one of
+    # them is about the event: a 404 for a database that never answered would
+    # tell the caller the event does not exist, which nobody here knows.
     if not event:
-        event = {
-            "event_id": event_id,
-            "type": "price_anomaly",
-            "source": "collector-tradfi",
-            "occurred_at": datetime.now(timezone.utc).isoformat(),
-            "primary_entity_id": "NVDA",
-            "primary_entity_name": "NVIDIA Corporation",
-            "anomaly_score": 0.88,
-            "summary": "High-frequency volume and volatility anomaly detected on NVDA",
-            "financial_data": {
-                "ticker": "NVDA",
-                "price": 128.50,
-                "volume": 8500000,
-                "vwap": 127.80,
-                "realized_volatility": 0.42,
-                "order_flow_imbalance": 0.65,
-                "kyle_lambda": 0.0034,
-                "amihud_illiquidity": 0.00012,
-            },
-            "tags": ["EQUITY", "VOLATILITY_SPIKE", "OPTIONS_SWEEP"],
-        }
+        if not looked:
+            raise HTTPException(
+                status_code=503,
+                detail="The events store is unavailable; nothing could be read.",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=f"No event {event_id}. Nothing to explain.",
+        )
 
-    anomaly_score = float(event.get("anomaly_score", 0.5))
+    anomaly_score = float(event.get("anomaly_score", 0.0) or 0.0)
     raw_fin = event.get("financial_data") or {}
     fin_data = json.loads(raw_fin) if isinstance(raw_fin, str) else raw_fin
+    if not isinstance(fin_data, dict):
+        fin_data = {}
 
-    # Factor attribution calculations
-    vol_z = float(fin_data.get("volatility_z_score", 2.4) if isinstance(fin_data, dict) else 2.4)
-    vol_pct = min(100.0, max(10.0, vol_z * 25.0))
-    micro_score = min(100.0, max(10.0, float(fin_data.get("realized_volatility", 0.35) if isinstance(fin_data, dict) else 0.35) * 150.0))
-    flow_score = min(100.0, max(10.0, abs(float(fin_data.get("order_flow_imbalance", 0.5) if isinstance(fin_data, dict) else 0.5)) * 100.0))
-    spatial_score = 15.0  # Baseline non-spatial domain weight
+    raw_breakdown = event.get("anomaly_breakdown") or {}
+    breakdown = json.loads(raw_breakdown) if isinstance(raw_breakdown, str) else raw_breakdown
+    if not isinstance(breakdown, dict):
+        breakdown = {}
 
-    raw_factors = {
-        "volatility_z_score": {"score": round(vol_pct, 1), "weight": 0.40, "label": "Volatility Z-Score Shock"},
-        "market_microstructure": {"score": round(micro_score, 1), "weight": 0.30, "label": "Microstructure & Illiquidity"},
-        "order_flow_imbalance": {"score": round(flow_score, 1), "weight": 0.20, "label": "Order Flow Imbalance (OFI)"},
-        "cross_domain_hawkes": {"score": 35.0, "weight": 0.10, "label": "Cross-Domain Hawkes Excitation"},
-    }
-
-    # Normalize factor contributions
-    total_weighted = sum(f["score"] * f["weight"] for f in raw_factors.values())
-    factor_attribution = []
-    for k, v in raw_factors.items():
-        contrib_pct = round(((v["score"] * v["weight"]) / max(1.0, total_weighted)) * 100.0, 1)
-        factor_attribution.append({
-            "factor_key": k,
-            "label": v["label"],
-            "raw_subscore": v["score"],
-            "model_weight": v["weight"],
-            "contribution_pct": contrib_pct,
-        })
-
-    # Step-by-step score derivation adjustments
-    score_adjustments = [
-        {"step": 1, "action": "Base IsolationForest Anomaly Score", "score_before": 0.0, "delta": round(anomaly_score * 0.65, 2), "score_after": round(anomaly_score * 0.65, 2), "reason": "Unsupervised high-dimensional outlier score"},
-        {"step": 2, "action": "Watchlist Prior Alignment Boost", "score_before": round(anomaly_score * 0.65, 2), "delta": +0.10, "score_after": round(anomaly_score * 0.75, 2), "reason": "Entity is active member of top tier watchlist"},
-        {"step": 3, "action": "High-Frequency Clustering Multiplier", "score_before": round(anomaly_score * 0.75, 2), "delta": +0.08, "score_after": round(anomaly_score * 0.83, 2), "reason": "3+ correlated prints within rolling 60-second window"},
-        {"step": 4, "action": "Final Clamped Anomaly Score", "score_before": round(anomaly_score * 0.83, 2), "delta": round(anomaly_score - (anomaly_score * 0.83), 2), "score_after": round(anomaly_score, 2), "reason": "Sigmoid normalization and threshold bounds"},
+    # The dimensions the scorer actually measured, and their share of what it
+    # measured. Not a weighted model: this platform has no linear composite
+    # with published coefficients, and the 0.40 / 0.30 / 0.20 / 0.10 weights
+    # printed here previously did not come from one. Neither did the inputs --
+    # a missing volatility z-score defaulted to 2.4, a missing realized
+    # volatility to 0.35, a missing order-flow imbalance to 0.5, and the
+    # cross-domain Hawkes factor was the literal 35.0 on every event ever
+    # explained, while an actual Hawkes correlator runs in this deployment.
+    #
+    # An empty waterfall is the correct output for an event whose score carries
+    # no breakdown, and most do not: `anomaly_breakdown` is populated by the
+    # tradfi path today. Showing nothing says so. Showing four bars does not.
+    _DIMENSIONS = (
+        ("volatility_z_score", "Volatility Z-Score"),
+        ("volume_z_score", "Volume Z-Score"),
+        ("spatial_score", "Spatial Dispersion"),
+        ("temporal_score", "Temporal Clustering"),
+        ("cross_domain_correlation_score", "Cross-Domain Correlation"),
+    )
+    measured = []
+    for key, label in _DIMENSIONS:
+        value = breakdown.get(key)
+        if value is None:
+            continue
+        measured.append((key, label, abs(float(value))))
+    total_measured = sum(v for _, _, v in measured)
+    factor_attribution = [
+        {
+            "factor_key": key,
+            "label": label,
+            "raw_subscore": round(value, 4),
+            # Share of the measured dimensions, stated as that and nothing
+            # more. Null when every dimension measured zero, because a share
+            # of nothing is not zero percent, it is undefined.
+            "contribution_pct": (
+                round((value / total_measured) * 100.0, 1) if total_measured > 0 else None
+            ),
+        }
+        for key, label, value in measured
     ]
+
+    # How the score actually moved, from the steps the scorer recorded.
+    #
+    # `NormalizedEvent.score_adjustments` is a real ordered list of
+    # (reason, delta) and reaches the table as of migration 0024. What stood
+    # here instead was four fixed steps -- "Base IsolationForest Anomaly
+    # Score", "Watchlist Prior Alignment Boost +0.10", "3+ correlated prints
+    # within rolling 60-second window", "Sigmoid normalization" -- with their
+    # deltas computed as fractions of the final score, so the arithmetic always
+    # reconciled and the reasons were asserted of every event regardless of
+    # whether the entity was watched, whether anything clustered, or whether an
+    # IsolationForest had run at all. It had not: the scorer is streaming RRCF,
+    # as this handler's own model card says twenty lines below.
+    raw_steps = event.get("score_adjustments") or []
+    if isinstance(raw_steps, str):
+        try:
+            raw_steps = json.loads(raw_steps)
+        except (ValueError, TypeError):
+            raw_steps = []
+    score_adjustments = []
+    if isinstance(raw_steps, list) and raw_steps:
+        # The recorded deltas are the tail of the derivation; the base is
+        # whatever the score was before the first of them.
+        total_delta = sum(float(st.get("delta") or 0.0) for st in raw_steps if isinstance(st, dict))
+        running = round(anomaly_score - total_delta, 6)
+        score_adjustments.append({
+            "step": 1,
+            "action": "Base score",
+            "score_before": 0.0,
+            "delta": running,
+            "score_after": running,
+            "reason": f"{ACTIVE_MODEL_NAME} ({ACTIVE_MODEL_FAMILY}) before recorded adjustments",
+        })
+        for idx, st in enumerate(raw_steps, start=2):
+            if not isinstance(st, dict):
+                continue
+            delta = float(st.get("delta") or 0.0)
+            before = running
+            running = round(before + delta, 6)
+            score_adjustments.append({
+                "step": idx,
+                "action": st.get("reason") or "adjustment",
+                "score_before": before,
+                "delta": round(delta, 6),
+                "score_after": running,
+                "reason": st.get("reason") or "",
+            })
 
     # Data source provenance. Values that are not measured are reported as null
     # rather than as a plausible constant -- an audit trail that invents its own
@@ -219,6 +281,11 @@ async def explain_event_alert(
         "is_significant": anomaly_score >= 0.70,
         "factor_attribution": factor_attribution,
         "score_adjustments": score_adjustments,
+        # What backed the number. A 0.4 from a warm-up curve and a 0.4 from a
+        # full percentile window are not the same claim, and an explainability
+        # surface that cannot say which is not explaining anything.
+        "score_basis": breakdown.get("coverage_basis"),
+        "score_coverage_fraction": breakdown.get("coverage_fraction"),
         "provenance": provenance,
         "model_card": model_card,
         "market_microstructure": fin_data if isinstance(fin_data, dict) else {},

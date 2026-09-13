@@ -86,6 +86,13 @@ def test_a_rule_with_no_version_is_treated_as_older():
     assert rule_id in redis.raw.written
 
 
+# These three assert that reconciliation leaves a particular rule alone. They
+# used to say "nothing was written at all", which held only because a shipped
+# rule missing from the store was skipped rather than installed -- the defect
+# that meant a rule added in a later build reached no running deployment, and a
+# pruned one never came back. Reconciliation now installs what is absent, so
+# each test asserts about the rule it is actually about.
+
 def test_a_current_rule_is_left_alone():
     m = _mod()
     rule_id = "rule_financial_block_volume_spike"
@@ -95,7 +102,7 @@ def test_a_current_rule_is_left_alone():
     }
     redis = _Redis()
     asyncio.run(m._reconcile_shipped_rules(redis))
-    assert redis.raw.written == {}
+    assert rule_id not in redis.raw.written
 
 
 def test_an_operator_edit_at_a_higher_version_survives():
@@ -108,7 +115,8 @@ def test_an_operator_edit_at_a_higher_version_survives():
     }
     redis = _Redis()
     asyncio.run(m._reconcile_shipped_rules(redis))
-    assert redis.raw.written == {}
+    assert rule_id not in redis.raw.written
+    assert m._dynamic_rules_cache[rule_id]["definition_version"] == m.RULE_DEFINITION_VERSION + 5
 
 
 def test_a_runtime_synthesised_rule_is_never_touched():
@@ -118,7 +126,10 @@ def test_a_runtime_synthesised_rule_is_never_touched():
     m._dynamic_rules_cache["rule_invented_by_the_agent"] = {"rule_id": "rule_invented_by_the_agent"}
     redis = _Redis()
     asyncio.run(m._reconcile_shipped_rules(redis))
-    assert redis.raw.written == {}
+    assert "rule_invented_by_the_agent" not in redis.raw.written
+    assert m._dynamic_rules_cache["rule_invented_by_the_agent"] == {
+        "rule_id": "rule_invented_by_the_agent"
+    }
 
 
 def test_a_redis_failure_does_not_stop_the_other_rules():
@@ -143,3 +154,46 @@ def test_reconciliation_runs_when_rules_already_exist():
     """The branch that previously did nothing but load."""
     source = (ROOT / "services/correlation/main.py").read_text(encoding="utf-8")
     assert "await _reconcile_shipped_rules(redis_client)" in source
+
+
+def test_a_shipped_rule_missing_from_the_store_is_installed():
+    """The case that was `continue`, and the reason it mattered.
+
+    The full shipped set is written wholesale only when the rule hash is
+    completely empty -- true exactly once in a deployment's life. The
+    synthesiser writes rules continuously, so from its first rule onward the
+    hash is never empty again, and a shipped rule added in a later build had no
+    path into a running platform at all.
+    """
+    m = _mod()
+    m._dynamic_rules_cache.clear()
+    # An existing deployment: the hash holds a synthesised rule and nothing the
+    # build shipped.
+    m._dynamic_rules_cache["syn_from_last_tuesday"] = {"rule_id": "syn_from_last_tuesday"}
+    redis = _Redis()
+    asyncio.run(m._reconcile_shipped_rules(redis))
+
+    for rule in m.SHIPPED_RULES:
+        assert rule["rule_id"] in redis.raw.written, (
+            f"{rule['rule_id']} ships with the build and never reached the store"
+        )
+    assert "syn_from_last_tuesday" not in redis.raw.written
+
+
+def test_a_pruned_shipped_rule_comes_back():
+    """The recovery path, which needed the same branch.
+
+    Reconciliation skipped a missing rule precisely because it was missing,
+    which is the one case it existed to handle.
+    """
+    m = _mod()
+    m._dynamic_rules_cache.clear()
+    for rule in m.SHIPPED_RULES:
+        m._dynamic_rules_cache[rule["rule_id"]] = dict(rule)
+    pruned = "rule_maritime_chokepoint_evasion"
+    del m._dynamic_rules_cache[pruned]
+
+    redis = _Redis()
+    asyncio.run(m._reconcile_shipped_rules(redis))
+    assert pruned in redis.raw.written
+    assert len(redis.raw.written) == 1, "reconciliation rewrote rules it did not need to"

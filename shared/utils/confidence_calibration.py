@@ -54,6 +54,13 @@ MAX_OUTCOMES = int(os.getenv("CALIBRATION_MAX_OUTCOMES", "5000"))
 # still means every bucket rests on more than a couple of observations.
 MIN_CALIBRATION_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "200"))
 
+# Below this no mapping is fitted at all. MIN_CALIBRATION_SAMPLES above now
+# governs how far the fitted correction is trusted, not whether it is computed:
+# an all-or-nothing gate at 200 meant the platform published its raw heuristic
+# for months -- 17 outcomes were stored -- and would then have moved every score
+# at once.
+MIN_FITTABLE_SAMPLES = int(os.getenv("CALIBRATION_MIN_FITTABLE", "30"))
+
 # How long a fitted mapping is reused before it is refitted from the store.
 REFIT_INTERVAL_SEC = float(os.getenv("CALIBRATION_REFIT_SEC", "900"))
 
@@ -196,7 +203,15 @@ def fit(pairs: Sequence[Tuple[float, int]]):
     treats as "publish the raw score and say it is uncalibrated" rather than as
     an error.
     """
-    if len(pairs) < MIN_CALIBRATION_SAMPLES:
+    # The floor below which a fit is not attempted at all.
+    #
+    # Separate from MIN_CALIBRATION_SAMPLES, which now sets how much a fit is
+    # *trusted* rather than whether one exists -- see `_shrinkage`. A mapping
+    # needs enough points to have a shape; below that it is interpolating noise,
+    # and shrinking a noisy curve toward the raw score still carries some of the
+    # noise. Thirty is where isotonic regression stops fitting individual
+    # observations.
+    if len(pairs) < MIN_FITTABLE_SAMPLES:
         return None
 
     outcomes = {int(o) for _, o in pairs}
@@ -261,6 +276,28 @@ def apply(model, raw_confidence: float) -> float:
         return score
 
 
+def _shrinkage(n: int) -> float:
+    """How much of the fitted correction to apply, given how much it rests on.
+
+    An all-or-nothing gate spends a long time doing nothing and then switches
+    the whole correction on at once. Measured on this deployment, the store held
+    17 resolved outcomes against a floor of 200, so every confidence the
+    platform published was its raw heuristic -- and would have been for as long
+    as it took 183 more clusters to resolve, at which point every score would
+    move at the same instant.
+
+    `n / (n + MIN_CALIBRATION_SAMPLES)` is the standard shrinkage weight: at 17
+    samples the correction is applied at 8%, at 200 it is half, and it
+    approaches full application as the evidence accumulates. The ranking is
+    untouched either way -- a convex blend of two monotone functions of the same
+    score is monotone -- so this changes how much the correction is trusted, not
+    what it says.
+    """
+    if n <= 0:
+        return 0.0
+    return float(n) / float(n + MIN_CALIBRATION_SAMPLES)
+
+
 async def calibrate(redis_client, raw_confidence: float) -> Dict[str, Any]:
     """The published confidence, with the raw score kept beside it.
 
@@ -269,10 +306,21 @@ async def calibrate(redis_client, raw_confidence: float) -> Dict[str, Any]:
     no way to notice the correction is doing nothing.
     """
     model = await get_model(redis_client)
-    calibrated = apply(model, raw_confidence)
+    raw = float(raw_confidence)
+    fitted = apply(model, raw)
+
+    # Blended toward the raw score in proportion to the evidence behind the fit,
+    # rather than withheld entirely below a threshold and then applied whole.
+    weight = _shrinkage(_cached_n) if model is not None else 0.0
+    calibrated = round(weight * float(fitted) + (1.0 - weight) * raw, 4)
+
     return {
         "confidence": calibrated,
-        "raw_confidence": float(raw_confidence),
+        "raw_confidence": raw,
         "calibrated": model is not None,
         "calibration_samples": _cached_n,
+        # How much of the fitted correction was actually applied. Without this a
+        # reader cannot tell a correction that agreed with the heuristic from one
+        # that was barely trusted.
+        "calibration_weight": round(weight, 4),
     }

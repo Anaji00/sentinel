@@ -1,8 +1,18 @@
 """
 shared/broker/paper.py
 
-Simulated paper trading broker with realistic slippage, commission modeling,
-position persistence, and order fill simulation.
+Simulated paper trading broker with realistic slippage and order fill
+simulation, marked to the platform's own live quote cache.
+
+The book is process-local and does not survive a restart. It previously said
+"position persistence" here and "In-memory and Redis-backed" on the class, and
+three module constants -- REDIS_PAPER_POSITIONS, REDIS_PAPER_ACCOUNT,
+REDIS_PAPER_ORDERS -- named the keys that would have held it. None of the three
+was ever read or written. They are gone rather than wired up, and not because
+Redis is evictable -- it is not, for a key with no TTL, under this
+deployment's volatile-lru policy -- but because a trading book wants what the
+audit ledger wants from Postgres: a schema, constraints, and a history that can
+be queried rather than a blob that can be overwritten.
 """
 
 import asyncio
@@ -21,17 +31,14 @@ from shared.broker.base import (
     OrderStatus,
 )
 from shared.utils.quiet_failures import swallowed
+from shared.utils.quote_cache import quote_key
 
 logger = logging.getLogger("broker.paper")
-
-REDIS_PAPER_POSITIONS = "sentinel:paper:positions"
-REDIS_PAPER_ACCOUNT = "sentinel:paper:account"
-REDIS_PAPER_ORDERS = "sentinel:paper:orders"
 
 
 class PaperBroker(BrokerInterface):
     """
-    In-memory and Redis-backed simulation broker.
+    In-memory simulation broker, marked to the live quote cache.
     Simulates instantaneous fills for market orders and realistic execution.
     """
 
@@ -48,7 +55,59 @@ class PaperBroker(BrokerInterface):
         self._positions: Dict[str, Position] = {}
         self._orders: Dict[str, Order] = {}
 
+    async def _live_price(self, symbol: str) -> Optional[float]:
+        """The platform's current quote for a symbol, or None.
+
+        The same cache `submit_order` prices fills from, read through one
+        helper so marking and filling cannot drift apart.
+        """
+        if not self.redis:
+            return None
+        try:
+            raw_redis = getattr(self.redis, "raw", self.redis)
+            quote_raw = await raw_redis.get(quote_key(symbol.upper()))
+            if not quote_raw:
+                return None
+            quote = json.loads(
+                quote_raw.decode("utf-8") if isinstance(quote_raw, bytes) else str(quote_raw)
+            )
+            price = float(quote.get("price") or quote.get("close") or quote.get("last") or 0.0)
+            return price if price > 0 else None
+        except Exception as _exc:
+            swallowed("broker.paper._live_price", _exc, logger)
+            return None
+
+    async def _mark_to_market(self) -> None:
+        """Revalue open positions at the current quote.
+
+        Nothing did this. `current_price` was written once, at fill, and never
+        again -- so `market_value` was the cost of the position, `unrealized_pl`
+        was structurally zero, and a paper book could not show a gain or a loss
+        however the market moved. Those values are what
+        /portfolio/positions renders, what /portfolio/risk weights positions by,
+        and what `get_account().portfolio_value` sums.
+
+        It also fed back into execution: the fill price fell through to
+        `existing_pos.current_price` before consulting the quote cache, so every
+        later order in a symbol already held filled at the first fill's price.
+
+        A symbol with no quote keeps its last mark rather than being zeroed; an
+        absent quote is not a price of zero.
+        """
+        for symbol, pos in self._positions.items():
+            price = await self._live_price(symbol)
+            if price is None:
+                continue
+            pos.current_price = round(price, 2)
+            pos.market_value = round(pos.qty * pos.current_price, 2)
+            cost_basis = pos.qty * pos.avg_entry_price
+            pos.unrealized_pl = round(pos.market_value - cost_basis, 2)
+            pos.unrealized_pl_pct = (
+                round((pos.unrealized_pl / cost_basis) * 100.0, 2) if cost_basis else 0.0
+            )
+
     async def get_account(self) -> AccountSummary:
+        await self._mark_to_market()
         portfolio_val = self.cash
         for pos in self._positions.values():
             portfolio_val += pos.market_value
@@ -66,9 +125,11 @@ class PaperBroker(BrokerInterface):
         )
 
     async def get_positions(self) -> List[Position]:
+        await self._mark_to_market()
         return list(self._positions.values())
 
     async def get_position(self, symbol: str) -> Optional[Position]:
+        await self._mark_to_market()
         return self._positions.get(symbol.upper())
 
     async def submit_order(
@@ -84,19 +145,26 @@ class PaperBroker(BrokerInterface):
         take_profit_price: Optional[float] = None,
     ) -> Order:
         sym = symbol.upper()
-        # Simulated execution price: use limit price, estimated price, existing position mark, or live Redis quote
         existing_pos = self._positions.get(sym)
-        base_price = limit_price or estimated_market_price or (existing_pos.current_price if existing_pos else None)
 
-        if not base_price and self.redis:
-            try:
-                raw_redis = getattr(self.redis, "raw", self.redis)
-                quote_raw = await raw_redis.get(f"sentinel:quotes:latest:{sym}")
-                if quote_raw:
-                    quote_data = json.loads(quote_raw.decode("utf-8") if isinstance(quote_raw, bytes) else str(quote_raw))
-                    base_price = float(quote_data.get("price") or quote_data.get("close") or quote_data.get("last") or 0.0)
-            except Exception as _exc:
-                swallowed("broker.paper.submit_order", _exc, logger)
+        # The market before the position's own mark.
+        #
+        # This read `limit_price or estimated_market_price or
+        # existing_pos.current_price` and consulted the quote cache only when
+        # all three were absent -- so for a symbol already held, the third term
+        # always answered and the cache was never reached. Combined with a
+        # `current_price` that was only ever written at fill time, every order
+        # after the first in a given symbol executed at the first fill's price,
+        # for the life of the process.
+        #
+        # The position's mark is still the last resort, because filling at a
+        # stale price beats refusing to simulate at all -- but it is now the
+        # fallback rather than the answer.
+        base_price = limit_price or estimated_market_price
+        if not base_price:
+            base_price = await self._live_price(sym)
+        if not base_price and existing_pos:
+            base_price = existing_pos.current_price
 
         if not base_price or base_price <= 0:
             raise ValueError(f"Cannot execute paper order for {sym}: missing limit_price, estimated_market_price, or live quote.")

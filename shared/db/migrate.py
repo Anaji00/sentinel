@@ -759,6 +759,191 @@ MIGRATIONS = [
             SELECT add_retention_policy('events', INTERVAL '90 days', if_not_exists => TRUE);
         """,
         "transactional": False
+    },
+    {
+        "version": "0021_failed_events_resolution",
+        "sql": """
+            -- `failed_events.resolved` had no writer.
+            --
+            -- The column is declared in init.sql, is half of
+            -- idx_failed_events_topic, and no statement anywhere in the tree
+            -- ever set it. 11,539 rows sat at FALSE, which is the same thing as
+            -- the column not existing -- except that an index was being
+            -- maintained on it and an operator reading the table would take
+            -- "0 resolved" as a finding rather than as an absence.
+            --
+            -- There was also no way to act on a dead letter. A dead-letter table
+            -- with no replay path is a log file with a schema: the whole point
+            -- of keeping the payload is being able to put it back.
+            --
+            -- These columns are what a replay writes when it succeeds.
+            ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolved_at  TIMESTAMPTZ;
+            ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolved_by  TEXT;
+            ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS replay_count INT DEFAULT 0;
+            ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS last_replay_error TEXT;
+
+            -- The question the replay path asks is "what is still outstanding
+            -- on this topic, oldest first", and the existing
+            -- (original_topic, resolved) index cannot order it.
+            CREATE INDEX IF NOT EXISTS failed_events_unresolved_idx
+                ON failed_events (original_topic, failed_at DESC)
+                WHERE resolved = FALSE;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0022_correlations_index_and_retention",
+        "sql": """
+            -- The only query this table serves could not use either of its
+            -- indexes.
+            --
+            -- services/api_gateway/routes/scenarios.py runs
+            --   WHERE alert_tier >= $1 ORDER BY detected_at DESC LIMIT $2
+            -- against corr_tier_time_idx (alert_tier, detected_at DESC). A
+            -- range predicate on the leading column leaves the second column
+            -- unordered across the matched range, so the planner cannot walk
+            -- the index to satisfy the ORDER BY -- it reads every qualifying
+            -- row and sorts. Measured at 385,000 rows on the live table, for a
+            -- request that wants twenty.
+            --
+            -- An index on the sort column alone is what a top-N-by-time query
+            -- wants: walk it backwards, drop rows failing the tier filter, stop
+            -- at LIMIT. The composite index stays, because a query pinned to a
+            -- single tier still uses it.
+            CREATE INDEX IF NOT EXISTS corr_detected_at_idx
+                ON correlations (detected_at DESC);
+
+            -- And nothing bounded the table.
+            --
+            -- `events` is dropped at 90 days by migration 0020. A correlation
+            -- older than that cites trigger and supporting event ids that no
+            -- longer resolve, so it is not merely stale, it is unreadable --
+            -- while still being scanned, indexed and backed up. Matching the
+            -- events window keeps the two consistent.
+            --
+            -- `correlations` is a plain table, not a hypertable, so
+            -- add_retention_policy does not apply; TimescaleDB's job scheduler
+            -- runs the delete instead. Rows an analyst has opened an
+            -- investigation on are exempt: scenarios holds a hard foreign key
+            -- to correlation_id, and a human workspace outliving the raw
+            -- detection is the whole point of that table.
+            CREATE OR REPLACE PROCEDURE sentinel_prune_correlations(
+                job_id INT, config JSONB
+            )
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                keep_days INT := COALESCE((config->>'keep_days')::INT, 90);
+            BEGIN
+                DELETE FROM correlations c
+                WHERE c.detected_at < NOW() - (keep_days || ' days')::INTERVAL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scenarios s WHERE s.correlation_id = c.correlation_id
+                  );
+            END;
+            $$;
+
+            -- Dead letters too. The table had 11,539 rows, no retention and,
+            -- until migration 0021, nothing that could ever mark one done.
+            -- Only resolved rows are dropped: an outstanding failure is still
+            -- work to do however old it is.
+            CREATE OR REPLACE PROCEDURE sentinel_prune_failed_events(
+                job_id INT, config JSONB
+            )
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                keep_days INT := COALESCE((config->>'keep_days')::INT, 30);
+            BEGIN
+                DELETE FROM failed_events
+                WHERE resolved = TRUE
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at < NOW() - (keep_days || ' days')::INTERVAL;
+            END;
+            $$;
+
+            -- Registered once. add_job has no if_not_exists, so re-running this
+            -- migration body outside the schema_migrations guard would schedule
+            -- duplicates; the guard is what prevents that, and the lookup below
+            -- makes it safe anyway.
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM timescaledb_information.jobs
+                    WHERE proc_name = 'sentinel_prune_correlations'
+                ) THEN
+                    PERFORM add_job(
+                        'sentinel_prune_correlations', INTERVAL '1 day',
+                        config => '{"keep_days": 90}'::jsonb
+                    );
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM timescaledb_information.jobs
+                    WHERE proc_name = 'sentinel_prune_failed_events'
+                ) THEN
+                    PERFORM add_job(
+                        'sentinel_prune_failed_events', INTERVAL '1 day',
+                        config => '{"keep_days": 30}'::jsonb
+                    );
+                END IF;
+            END
+            $$;
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0023_scenarios_primary_entity",
+        "sql": """
+            -- The subject of a scenario, carried on the model since it was
+            -- written and never persisted.
+            --
+            -- `Scenario` resolves `primary_entity_id` and
+            -- `primary_entity_name` from `entity_ids`/`entity_names` in a
+            -- validator that runs on every scenario built, and the table had
+            -- no column for either -- so `_save_scenario` could not have
+            -- inserted them if it had tried. The feed's scenario card and its
+            -- detail modal both read `primary_entity_name`, so every scenario
+            -- in the product was labelled "Multi-Entity", including the ones
+            -- about a single vessel or a single ticker.
+            --
+            -- TEXT rather than UUID: an entity id here is an MMSI, an ICAO24,
+            -- a ticker or an AS number, never a generated key.
+            ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS primary_entity_id TEXT;
+            ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS primary_entity_name TEXT;
+
+            -- "What has this platform said about NVDA" is the question the
+            -- column exists to answer, so the index is on subject and time.
+            CREATE INDEX IF NOT EXISTS scenarios_entity_time_idx
+                ON scenarios(primary_entity_id, created_at DESC)
+                WHERE primary_entity_id IS NOT NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0024_events_score_provenance",
+        "sql": """
+            -- How a score was arrived at, discarded at the database boundary.
+            --
+            -- `NormalizedEvent` carries `anomaly_breakdown` -- the spatial,
+            -- temporal, volume and volatility sub-scores, the coverage fraction
+            -- and which estimator produced the number -- and
+            -- `score_adjustments`, the ordered (reason, delta) steps the scorer
+            -- records as it builds the composite. Both are populated on scored
+            -- events. Neither had a column, so the writer dropped them and the
+            -- only thing reaching the table was the single float at the end.
+            --
+            -- The cost landed on /explain/event/{id}, the endpoint whose whole
+            -- purpose is to show that derivation: with no real steps to read,
+            -- it printed an invented four-step waterfall instead.
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS anomaly_breakdown JSONB;
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS score_adjustments JSONB;
+
+            -- Which estimator backed a score, over time. A 0.4 from a warm-up
+            -- curve and a 0.4 from a full percentile window are not the same
+            -- claim, and this is the column that can tell them apart.
+            CREATE INDEX IF NOT EXISTS events_score_basis_idx
+                ON events((anomaly_breakdown->>'coverage_basis'), occurred_at DESC)
+                WHERE anomaly_breakdown IS NOT NULL;
+        """,
+        "transactional": True
     }
 ]
 

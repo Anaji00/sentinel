@@ -2,11 +2,24 @@
 
 import React, { useState } from 'react';
 import useSWR from 'swr';
+import { ABSENT } from '../lib/format';
 import { fetcher } from '../lib/api';
 import { Activity, Database, Server, Shield, Cpu, X } from 'lucide-react';
 import { DataGrid } from './ui/DataGrid';
 
+/** The shape /api/v1/health/data actually returns.
+ *
+ * This interface previously declared five fields the endpoint published none
+ * of -- it serves `system_status`, this read `status` -- and because
+ * useSWR<T> asserts over parsed JSON rather than checking it, the mismatch
+ * compiled cleanly and rendered three red DISCONNECTED tiles against three
+ * healthy datastores, with a header stuck on "CONNECTING...". The endpoint now
+ * publishes the connection states and the running configuration; `system_status`
+ * is read here under its real name, with `status` kept as the alias the
+ * endpoint also sets.
+ */
 interface SystemHealthResponse {
+  system_status?: string;
   status: string;
   redis_connected: boolean;
   timescale_connected: boolean;
@@ -36,7 +49,8 @@ export default function SystemHealthHUD() {
     { refreshInterval: 5000 }
   );
 
-  const isHealthy = healthData?.status === 'online';
+  const systemStatus = healthData?.system_status ?? healthData?.status;
+  const isHealthy = typeof systemStatus === 'string' && ['online', 'healthy', 'operational'].includes(systemStatus.toLowerCase());
 
   return (
     <>
@@ -51,7 +65,7 @@ export default function SystemHealthHUD() {
       >
         <span className={`h-2 w-2 rounded-full ${isHealthy ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
         <span className="font-bold uppercase tracking-wider">
-          {healthData?.status ? `SYS: ${healthData.status.toUpperCase()}` : 'CONNECTING...'}
+          {systemStatus ? `SYS: ${String(systemStatus).toUpperCase()}` : 'CONNECTING...'}
         </span>
       </button>
 
@@ -102,11 +116,11 @@ export default function SystemHealthHUD() {
               <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">ACTIVE RUNTIME CONFIGURATION</span>
               <div className="flex justify-between items-center text-[11px]">
                 <span className="text-slate-400">Maritime Dark Threshold:</span>
-                <span className="text-cyan-400 font-bold">{healthData?.active_configuration?.maritime_dark_thresholds || 4} Hours</span>
+                <span className="text-cyan-400 font-bold">{healthData?.active_configuration?.maritime_dark_thresholds ?? ABSENT}{healthData?.active_configuration?.maritime_dark_thresholds != null ? ' Hours' : ''}</span>
               </div>
               <div className="flex justify-between items-center text-[11px]">
                 <span className="text-slate-400">Tracked Geopolitical Instruments:</span>
-                <span className="text-amber-400 font-bold">{healthData?.active_configuration?.tracked_financial_instruments || 14} Assets</span>
+                <span className="text-amber-400 font-bold">{healthData?.active_configuration?.tracked_financial_instruments ?? ABSENT}{healthData?.active_configuration?.tracked_financial_instruments != null ? ' Assets' : ''}</span>
               </div>
             </div>
 

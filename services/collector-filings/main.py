@@ -42,6 +42,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
+from shared.utils.entity_resolution import seed_aliases
 
 try:
     from thirteen_f import (
@@ -60,6 +61,22 @@ except (ImportError, ModuleNotFoundError):
     fetch_live_13f_from_edgar = thirteen_f_mod.fetch_live_13f_from_edgar
     generate_curated_seed_13f = thirteen_f_mod.generate_curated_seed_13f
     ThirteenFPortfolioReport = thirteen_f_mod.ThirteenFPortfolioReport
+
+try:
+    from thirteen_f import resolve_ticker_dynamically, load_sec_company_tickers
+except (ImportError, ModuleNotFoundError):
+    resolve_ticker_dynamically = thirteen_f_mod.resolve_ticker_dynamically
+    load_sec_company_tickers = thirteen_f_mod.load_sec_company_tickers
+
+try:
+    from edgar_firehose import poll_edgar_firehose
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    _fh_path = Path(__file__).resolve().parent / "edgar_firehose.py"
+    _fh_spec = _ilu.spec_from_file_location("edgar_firehose", _fh_path)
+    _fh_mod = _ilu.module_from_spec(_fh_spec)
+    _fh_spec.loader.exec_module(_fh_mod)
+    poll_edgar_firehose = _fh_mod.poll_edgar_firehose
 
 # SEC fair-access requires a User-Agent that identifies the requester with a
 # contact address they actually read. research@sentinel.local is not
@@ -439,6 +456,35 @@ async def main():
     connector = aiohttp.TCPConnector(limit=10)
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
+            # The firehose resolves every filer through this registry, so it is
+            # loaded explicitly rather than left to whichever 13F fetch happens
+            # to run first -- a dependency that holds by accident is one that
+            # breaks when the accident changes.
+            registry = await load_sec_company_tickers(session, redis_client)
+
+            # And the same registry seeds entity identity for the whole platform.
+            #
+            # `sentinel:entities:alias` had one writer -- an admin route where a
+            # human types one merge at a time -- so it was empty, and
+            # `resolve_entity` fell through to the structural fold for every
+            # subject in the system. Under that fold "AAPL" and "Apple Inc." are
+            # two different entities, which is why agents watching the same
+            # company could not corroborate each other and why one company's
+            # centrality was split across its spellings.
+            #
+            # title -> ticker for every SEC registrant is exactly that mapping,
+            # already downloaded, previously used only to label 13F rows.
+            try:
+                seeded = await seed_aliases(
+                    redis_client,
+                    ((title, ticker) for title, ticker in registry.items()),
+                    source="sec_company_tickers",
+                    confidence=0.98,
+                )
+                logger.info(f"Entity alias seed from SEC registry: {seeded} new aliases.")
+            except Exception as _exc:
+                swallowed("collector_filings.main.seed_aliases", _exc)
+
             # Fetch live 13F filings from SEC EDGAR on startup
             await seed_prominent_13f_reports(session, producer, redis_client)
 
@@ -466,10 +512,27 @@ async def main():
                     if cik:
                         tasks.append(poll_company_filings(session, producer, dedup, ticker, cik))
 
+                # Breadth, alongside the per-ticker depth above: every 8-K,
+                # S-1 and 424B filed anywhere, not only by the twenty names in
+                # BASE_CIK_MAP. Both paths share `dedup`, so a filing from a
+                # watched company is published exactly once whichever sees it.
+                tasks.append(
+                    poll_edgar_firehose(
+                        session, producer, dedup, SEC_HEADERS,
+                        ITEM_DESCRIPTIONS, resolve_ticker_dynamically,
+                    )
+                )
+
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, BaseException):
+                        logger.warning(f"EDGAR poll task failed: {type(r).__name__}: {r}")
                 new_filings = sum(r for r in results if isinstance(r, int))
                 elapsed = time.time() - t0
-                logger.info(f"EDGAR Poll Cycle #{cycle}: Ingested {new_filings} filings across {len(tasks)} companies in {elapsed:.1f}s")
+                logger.info(
+                    f"EDGAR Poll Cycle #{cycle}: Ingested {new_filings} filings across "
+                    f"{len(tasks) - 1} watched companies + the current-filings feed in {elapsed:.1f}s"
+                )
 
                 await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:

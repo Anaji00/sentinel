@@ -20,7 +20,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from shared.utils.confidence_calibration import (  # noqa: E402
+from shared.utils.confidence_calibration import (
+    MIN_FITTABLE_SAMPLES,
+    _shrinkage,  # noqa: E402
     MIN_CALIBRATION_SAMPLES,
     apply,
     fit,
@@ -47,9 +49,30 @@ def test_it_recovers_the_true_rate_from_an_overconfident_score():
 
 
 def test_it_refuses_to_fit_below_the_sample_floor():
-    """A mapping from nine outcomes is worse than none: it looks like evidence."""
-    assert fit(_overconfident(n=MIN_CALIBRATION_SAMPLES - 1)) is None
+    """A mapping from nine outcomes is worse than none: it looks like evidence.
+
+    The floor that decides whether a curve is fitted at all is now separate from
+    the one that decides how far it is trusted. An all-or-nothing gate at 200
+    meant this platform published its raw heuristic for months -- the store held
+    17 resolved outcomes -- and would then have moved every score it publishes at
+    the same instant. `_shrinkage` replaces that with a weight; MIN_FITTABLE
+    keeps the original argument, which is about a curve having a shape at all.
+    """
+    assert fit(_overconfident(n=MIN_FITTABLE_SAMPLES - 1)) is None
     assert fit([]) is None
+    # And a curve that can be fitted still is, below the trust threshold.
+    assert fit(_overconfident(n=MIN_CALIBRATION_SAMPLES - 1)) is not None
+
+
+def test_the_correction_is_trusted_in_proportion_to_its_evidence():
+    """17 of 200 should apply some of the correction, not none of it."""
+    assert _shrinkage(0) == 0.0
+    assert 0.0 < _shrinkage(17) < 0.1
+    assert abs(_shrinkage(MIN_CALIBRATION_SAMPLES) - 0.5) < 1e-9
+    # Monotone, and never fully trusted -- there is always more evidence to come.
+    weights = [_shrinkage(n) for n in (17, 30, 100, 200, 600, 2000)]
+    assert weights == sorted(weights)
+    assert weights[-1] < 1.0
 
 
 def test_it_refuses_to_fit_when_every_outcome_agrees():

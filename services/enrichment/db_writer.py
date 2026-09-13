@@ -33,6 +33,12 @@ class DBWriter:
             # Most payloads are pydantic models; corroboration is a plain dict
             # already in its final shape. Assuming model_dump() exists raised on
             # the first plain-dict field added to this table.
+            #
+            # And `score_adjustments` is a list of them, which is neither: the
+            # list has no model_dump, so it would reach asyncpg as a list of
+            # ScoreAdjustment objects and fail the whole batch on encode.
+            if isinstance(val, list):
+                return [v.model_dump() if hasattr(v, "model_dump") else v for v in val]
             return val.model_dump() if hasattr(val, "model_dump") else val
         
         pe = e.primary_entity
@@ -107,6 +113,18 @@ class DBWriter:
             # a judgement about a claim, not a fixed record, and it is read
             # whole or not at all.
             _dump('corroboration'),
+            # How the score was arrived at, which stopped here.
+            #
+            # The scorer fills `anomaly_breakdown` -- spatial, temporal, volume
+            # and volatility sub-scores, the coverage fraction and which
+            # estimator produced the number -- and appends a `ScoreAdjustment`
+            # for every step that moved the composite. Both were built on every
+            # scored event and neither had a column, so the only thing that
+            # survived to the table was the single float at the end, and the
+            # endpoint that exists to show the derivation had nothing real to
+            # read. See migration 0024.
+            _dump('anomaly_breakdown'),
+            _dump('score_adjustments'),
         )
 
     async def write_events_batch(self, events: list[NormalizedEvent]):
@@ -125,7 +143,7 @@ class DBWriter:
                 prediction_market_data, crypto_data, cyber_data, supply_chain_data,
                 filing_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids,
-                coordinates, corroboration
+                coordinates, corroboration, anomaly_breakdown, score_adjustments
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17,
@@ -139,7 +157,7 @@ class DBWriter:
                     ELSE NULL 
                 END
             ,
-                $32
+                $32, $33, $34
             )
             ON CONFLICT (event_id, occurred_at) DO UPDATE SET
                 latitude = COALESCE(EXCLUDED.latitude, events.latitude),

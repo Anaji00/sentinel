@@ -169,6 +169,9 @@ def test_api_gateway_sovereignty_manifest():
     assert res.status_code == 200
     manifest = res.json()
 
+    # Still 100, and now because every declared boundary item exposes no user
+    # data rather than because the number is a literal. A score that cannot
+    # fall is not a score.
     assert manifest["sovereignty_score_pct"] == 100.0
     assert len(manifest["local_subsystems"]) >= 5
     assert len(manifest["external_ingest_feeds"]) >= 4
@@ -184,4 +187,72 @@ def test_api_gateway_sovereignty_manifest():
 
     # Verify cryptographic guarantees
     assert manifest["cryptographic_guarantees"]["genesis_hash"] == GENESIS_HASH
-    assert manifest["cryptographic_guarantees"]["tamper_evident"] is True
+
+    # `tamper_evident` was the literal `True`, on an endpoint that exists to
+    # attest and never asked the ledger it was attesting about. Live, it
+    # reported true while the ledger held zero rows.
+    #
+    # This test app has no durable store, so the honest answer is that nothing
+    # was verified -- and the status says which of the several ways that can
+    # happen applies.
+    guarantees = manifest["cryptographic_guarantees"]
+    assert guarantees["tamper_evident"] is False
+    assert guarantees["audit_chain_status"] in (
+        "NO_STORAGE", "EMPTY_LEDGER", "VERIFICATION_ERROR",
+    )
+    assert guarantees["audit_entries_verified"] == 0
+
+
+def test_the_manifest_reports_tamper_evidence_when_the_chain_verifies():
+    """And says true when, and only when, a chain was actually walked.
+
+    `verify_chain` returns `valid: True` for an empty ledger and for no
+    storage at all; neither is tamper-evidence. Only VERIFIED_VALID is.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from services.api_gateway.routes.sovereignty import get_data_sovereignty_manifest
+
+    class _Chain:
+        def __init__(self, *a, **k):
+            pass
+
+        async def verify_chain(self):
+            return {
+                "valid": True,
+                "verified": True,
+                "entries_checked": 7,
+                "status": "VERIFIED_VALID",
+            }
+
+    with patch("services.api_gateway.routes.sovereignty.AuditLedger", _Chain):
+        manifest = asyncio.run(get_data_sovereignty_manifest(db=None, redis=None))
+
+    assert manifest.cryptographic_guarantees["tamper_evident"] is True
+    assert manifest.cryptographic_guarantees["audit_entries_verified"] == 7
+
+
+def test_an_empty_ledger_is_not_tamper_evidence():
+    import asyncio
+    from unittest.mock import patch
+
+    from services.api_gateway.routes.sovereignty import get_data_sovereignty_manifest
+
+    class _Empty:
+        def __init__(self, *a, **k):
+            pass
+
+        async def verify_chain(self):
+            return {
+                "valid": True,
+                "verified": False,
+                "entries_checked": 0,
+                "status": "EMPTY_LEDGER",
+            }
+
+    with patch("services.api_gateway.routes.sovereignty.AuditLedger", _Empty):
+        manifest = asyncio.run(get_data_sovereignty_manifest(db=None, redis=None))
+
+    assert manifest.cryptographic_guarantees["tamper_evident"] is False
+    assert manifest.cryptographic_guarantees["audit_chain_status"] == "EMPTY_LEDGER"

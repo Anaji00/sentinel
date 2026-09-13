@@ -70,6 +70,77 @@ EVENT_COLLECTION = "sentinel_events_v2"
 # rule without importing this service. Re-exported here because callers across
 # the correlation package import it from this module by name.
 from shared.models.events import POSITION_TELEMETRY_TYPES
+from shared.models.events import Domain
+
+# The canonical domain names, and the mapping that repairs a stored pseudo-one.
+#
+# A payload written before `store_event` was corrected holds a `.split("_")[0]`
+# prefix rather than a domain: `flight` for aviation, `vessel` for maritime,
+# `market`/`equity`/`options`/`filing`/`earnings` for tradfi, `bgp`/`ransomware`
+# for cyber, `headline` for news. Those are not domains and never were, and the
+# points carrying them cannot be rewritten because store_event only upserts on
+# ingest.
+_CANONICAL_DOMAINS = frozenset(d.value for d in Domain)
+
+# Written out, not derived. Deriving a domain from a prefix is the defect being
+# repaired here; a table of the prefixes actually observed in the live store is
+# the honest inverse of it.
+_LEGACY_DOMAIN_ALIASES = {
+    "flight": Domain.AVIATION.value,
+    "aircraft": Domain.AVIATION.value,
+    "adsb": Domain.AVIATION.value,
+    "vessel": Domain.MARITIME.value,
+    "ais": Domain.MARITIME.value,
+    # "market" is deliberately absent.
+    #
+    # It is the prefix of `market_anomaly`, which the crypto candle path and the
+    # equity candle path both emit -- the one type this platform already records
+    # as unresolvable from a type alone (AMBIGUOUS_EVENT_TYPES names it, and
+    # resolve_event_domain exists because of it). A stale payload carrying
+    # "market" does not say which domain produced it, so mapping it to either
+    # would invent the answer. Unresolved means it is not counted as a domain at
+    # all, which is the honest treatment and is what the consumer's `if d`
+    # filter already does.
+    "equity": Domain.TRADFI.value,
+    "options": Domain.TRADFI.value,
+    "filing": Domain.TRADFI.value,
+    "earnings": Domain.TRADFI.value,
+    "insider": Domain.TRADFI.value,
+    "dark": Domain.TRADFI.value,
+    "bgp": Domain.CYBER.value,
+    "ransomware": Domain.CYBER.value,
+    "vulnerability": Domain.CYBER.value,
+    "breach": Domain.CYBER.value,
+    "headline": Domain.NEWS.value,
+    "social": Domain.NEWS.value,
+    "osint": Domain.NEWS.value,
+    "macro": Domain.MACRO.value,
+    "supply": Domain.MACRO.value,
+    "prediction": Domain.PREDICTION.value,
+    "crypto": Domain.CRYPTO.value,
+}
+
+
+def _canonical_domain_name(stored) -> Optional[str]:
+    """A stored payload domain, as a canonical domain name.
+
+    Returns the value unchanged when it already is one, maps the known legacy
+    prefixes when it is not, and falls back to the event-type table for anything
+    else. `None` stays `None`: an absent domain is not evidence of a domain, and
+    the consumer filters those out rather than counting them.
+    """
+    if not stored:
+        return None
+    value = str(stored).strip().lower()
+    if value in _CANONICAL_DOMAINS:
+        return value
+    mapped = _LEGACY_DOMAIN_ALIASES.get(value)
+    if mapped:
+        return mapped
+    # Some legacy payloads stored a whole event type rather than a prefix.
+    resolved = canonical_domain(value)
+    return resolved if resolved != Domain.OTHER.value else None
+
 
 SIMILARITY_THRESHOLD_DEFAULT = 0.65
 
@@ -438,6 +509,39 @@ class SoftCorrelator:
                         # "maritime" read as different domains.
                         "domain": resolve_event_domain(event),
                         "anomaly": event.anomaly_score,
+                        # The five fields the semantic correlation path reads
+                        # back and this payload has never written.
+                        #
+                        # `find_similar` returns these points, and the consumer
+                        # asks each for headline, summary, entity_name,
+                        # entity_id and source. None of the five was here, so
+                        # every one fell back silently:
+                        #
+                        #   supp_headlines -> f"{type}: Unknown", so every
+                        #     cluster's evidence read "flight_dark: Unknown"
+                        #     three times -- which is what the scenario
+                        #     generator was handed as the thing to reason about.
+                        #   distinct_subjects -> {entity_name or entity_id or
+                        #     idx}, which falls to enumerate's index and is
+                        #     therefore ALWAYS len(kept), capped at 3. That is
+                        #     why 1,201 of 1,243 semantic clusters carried the
+                        #     identical confidence 0.7999999999999999: it is
+                        #     0.35 + 0.15x3 and the 3 was never a measurement.
+                        #   _independent_support -> reads `source`, absent, so
+                        #     every cluster took the all-unknown branch.
+                        #
+                        # Truncated at write for the same reason the correlation
+                        # window truncates: the consumer cuts them anyway, and
+                        # storing them in full multiplies a large structure.
+                        "headline": (event.headline or "")[:160] or None,
+                        "summary": (getattr(event, "summary", None) or "")[:200] or None,
+                        "entity_name": (
+                            event.primary_entity.name
+                            if event.primary_entity and event.primary_entity.name
+                            else (event.primary_entity.id if event.primary_entity else None)
+                        ),
+                        "entity_id": event.primary_entity.id if event.primary_entity else None,
+                        "source": getattr(event, "source", None),
                     },
                 }],
             )
@@ -499,6 +603,32 @@ class SoftCorrelator:
             out = []
             for r in results[:limit]:
                 payload = dict(r.payload or {})
+                # The stored domain, normalised on the way out.
+                #
+                # `store_event` writes a canonical domain and says why: "the
+                # cross-domain semantic check compares this field, so a prefix
+                # here meant 'vessel' and 'maritime' read as different domains".
+                # The writer was fixed and the points already in the collection
+                # were never migrated -- and store_event only upserts on ingest,
+                # so a third of them keep the old `.split("_")[0]` pseudo-domain
+                # for good. Measured: 3,900 of 12,000 sampled points, 32.5%,
+                # carrying `market`, `flight`, `vessel`, `bgp`, `headline`,
+                # `earnings`, `equity`, `options`, `ransomware`.
+                #
+                # The consumer unions this with the trigger's canonical domain,
+                # so a cluster of aircraft events resolved to
+                # {"aviation", "flight"} and counted two. Over 24 hours, 812 of
+                # 812 semantic clusters claimed to be cross-domain and every one
+                # was a single domain under two names -- and that count gates the
+                # tier competing for inference slots, feeds _rule_confidence's
+                # cross-domain term, and reaches the model as fact, which is why
+                # it wrote up dark aircraft as "Suspicion of Maritime Security
+                # Breaches".
+                #
+                # Normalised here rather than by a migration because this is the
+                # one place every reader passes through, and it corrects history
+                # as well as anything written from now on.
+                payload["domain"] = _canonical_domain_name(payload.get("domain"))
                 payload["_similarity"] = float(getattr(r, "score", 0.0) or 0.0)
                 out.append(payload)
             return out

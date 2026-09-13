@@ -252,16 +252,32 @@ class ContextBuilder:
         
         try:
             neo4j_client = await get_neo4j()
+            # Direct relationships, described by the edge that actually
+            # connects the two nodes.
+            #
+            # This was `MATCH (v)-[r*1..3]-(n)` returning `type(r[0])`,
+            # `r[0].weight` and `r[0].confidence` -- a variable-length path, so
+            # r[0] is the *first* hop while n is up to three hops away. Every
+            # row paired a distant node with a relationship type and a
+            # confidence belonging to a different edge. Measured against a real
+            # high-degree entity, of the 100 rows the LIMIT kept, 1 was direct,
+            # 6 were two-hop and 93 were three-hop -- so 93% of the graph
+            # context handed to the reasoning layer asserted a relationship that
+            # does not exist, and `decayed_weight` then ranked them.
+            #
+            # A single hop is the claim this query can actually support. The
+            # path length also made it enumerate paths across 544,022
+            # RELATED_TO edges before the limit applied.
             rel_task = neo4j_client.query("""
                 MATCH (v) WHERE v.name IN $ids OR v.mmsi IN $ids OR v.id IN $ids
-                MATCH (v)-[r*1..3]-(n)
+                MATCH (v)-[r]-(n)
                 RETURN coalesce(v.name, v.mmsi, v.id) as entity_id,
-                       type(r[0]) as rel,
+                       type(r) as rel,
                        coalesce(n.name, n.mmsi, n.id) as connected,
                        labels(n) as labels,
-                       coalesce(r[0].weight, 1.0) as weight,
-                       coalesce(r[0].confidence, $unrated) as confidence,
-                       coalesce(r[0].last_updated, r[0].updated_at, 0) as last_updated
+                       coalesce(r.weight, 1.0) as weight,
+                       coalesce(r.confidence, $unrated) as confidence,
+                       coalesce(r.last_updated, r.updated_at, 0) as last_updated
                 LIMIT 100
             """, {"ids": targets, "unrated": UNRATED_EDGE_CONFIDENCE})
             

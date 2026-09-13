@@ -33,7 +33,9 @@ subject nobody else will ever look at.
 
 import logging
 import time
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
+
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("shared.focus")
 
@@ -53,6 +55,25 @@ FOCUS_TTL_SEC = 2700
 # handful of things worth converging on.
 FOCUS_MAX = 12
 
+# And how many of those any one domain may hold.
+#
+# The set was a single global FIFO evicted oldest-first, and the correlation
+# engine feeds it from every ELEVATED+ cluster regardless of domain -- so
+# whichever domain was loud in a 45-minute window took every slot. Measured
+# live, all seven entries were maritime, aviation and one commodity, while the
+# three agents that read the set (quant, radar, stock-correlation) all draw
+# their candidates from equity and crypto universes. A vessel name can never
+# match a ticker candidate, so `prioritise` was a no-op on every call for every
+# consumer.
+#
+# A per-domain cap means a burst in one domain evicts its own oldest entry
+# rather than everyone else's, so the set stays usable by all of its readers.
+FOCUS_MAX_PER_DOMAIN = 4
+
+# Where each subject's domain is remembered, so the cap can be applied and a
+# consumer can ask for the subjects it could actually act on.
+FOCUS_DOMAIN_KEY = "sentinel:focus:domains"
+
 # Below this conviction an agent's interest is not worth redirecting others.
 # A radar escalation at 0.015 conviction, which the live system produced, should
 # not pull four agents onto a ticker.
@@ -64,6 +85,7 @@ async def offer_focus(
     entity: str,
     conviction: float = 1.0,
     offered_by: str = "",
+    domain: Optional[str] = None,
 ) -> bool:
     """Propose a subject as worth a second opinion.
 
@@ -85,14 +107,35 @@ async def offer_focus(
     try:
         raw = getattr(redis_client, "raw", redis_client)
         now = time.time()
-        pipe = raw.pipeline()
-        pipe.zadd(FOCUS_KEY, {subject: now})
-        # Drop anything older than the window, then anything beyond the cap,
-        # oldest first.
-        pipe.zremrangebyscore(FOCUS_KEY, "-inf", now - FOCUS_TTL_SEC)
-        pipe.zremrangebyrank(FOCUS_KEY, 0, -(FOCUS_MAX + 1))
-        pipe.expire(FOCUS_KEY, FOCUS_TTL_SEC)
-        await pipe.execute()
+        dom = (str(domain).strip().lower() if domain else "unknown")
+
+        await raw.zadd(FOCUS_KEY, {subject: now})
+        await raw.hset(FOCUS_DOMAIN_KEY, subject, dom)
+        await raw.zremrangebyscore(FOCUS_KEY, "-inf", now - FOCUS_TTL_SEC)
+
+        # Evict within the domain first, so a burst in one cannot crowd out the
+        # others. Only once every domain is inside its own cap does the global
+        # cap apply, oldest-first as before.
+        members = await raw.zrange(FOCUS_KEY, 0, -1)
+        members = [m.decode() if isinstance(m, bytes) else str(m) for m in (members or [])]
+        if members:
+            domains = await raw.hmget(FOCUS_DOMAIN_KEY, members)
+            by_domain: dict = {}
+            for name, d in zip(members, domains or []):
+                d = (d.decode() if isinstance(d, bytes) else d) or "unknown"
+                by_domain.setdefault(d, []).append(name)
+            surplus = []
+            for d, names in by_domain.items():
+                if len(names) > FOCUS_MAX_PER_DOMAIN:
+                    # `members` is oldest-first, so the head of each list is.
+                    surplus.extend(names[: len(names) - FOCUS_MAX_PER_DOMAIN])
+            if surplus:
+                await raw.zrem(FOCUS_KEY, *surplus)
+                await raw.hdel(FOCUS_DOMAIN_KEY, *surplus)
+
+        await raw.zremrangebyrank(FOCUS_KEY, 0, -(FOCUS_MAX + 1))
+        await raw.expire(FOCUS_KEY, FOCUS_TTL_SEC)
+        await raw.expire(FOCUS_DOMAIN_KEY, FOCUS_TTL_SEC)
         if offered_by:
             logger.debug("%s offered %s for a second opinion.", offered_by, subject)
         return True
@@ -101,8 +144,18 @@ async def offer_focus(
         return False
 
 
-async def current_focus(redis_client: Any, limit: int = FOCUS_MAX) -> List[str]:
-    """Subjects another agent has found interesting recently, newest first."""
+async def current_focus(
+    redis_client: Any,
+    limit: int = FOCUS_MAX,
+    domains: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Subjects another agent has found interesting recently, newest first.
+
+    `domains` narrows the answer to subjects a caller could actually act on. An
+    equity agent asking for maritime subjects gets a list it can do nothing
+    with, which is what made this mechanism a no-op for all three of its
+    readers.
+    """
     if not redis_client:
         return []
     try:
@@ -112,7 +165,27 @@ async def current_focus(redis_client: Any, limit: int = FOCUS_MAX) -> List[str]:
             FOCUS_KEY, now - FOCUS_TTL_SEC, "+inf",
         )
         out = [m.decode() if isinstance(m, bytes) else str(m) for m in (members or [])]
-        return list(reversed(out))[:limit]
+        out = list(reversed(out))
+
+        if domains:
+            wanted = {str(d).strip().lower() for d in domains if d}
+            try:
+                tags = await raw.hmget(FOCUS_DOMAIN_KEY, out) if out else []
+                kept = []
+                for name, d in zip(out, tags or []):
+                    d = (d.decode() if isinstance(d, bytes) else d) or "unknown"
+                    # "unknown" is kept: a subject offered before domains were
+                    # recorded should not vanish from every caller's view.
+                    if d in wanted or d == "unknown":
+                        kept.append(name)
+                out = kept
+            except Exception as _exc:
+                # Counted rather than whispered: if the domain tags go missing
+                # the filter silently widens to everything, which is the
+                # behaviour this change exists to remove.
+                swallowed("utils.focus.current_focus.domain_filter", _exc, logger)
+
+        return out[:limit]
     except Exception as e:
         logger.debug("Could not read the focus set: %s", e)
         return []
@@ -122,6 +195,7 @@ async def prioritise(
     redis_client: Any,
     candidates: List[str],
     limit: Optional[int] = None,
+    domains: Optional[Iterable[str]] = None,
 ) -> List[str]:
     """Reorder an agent's own candidates to put focused subjects first.
 
@@ -132,7 +206,7 @@ async def prioritise(
     """
     if not candidates:
         return []
-    focused = set(await current_focus(redis_client))
+    focused = set(await current_focus(redis_client, domains=domains))
     if not focused:
         return candidates[:limit] if limit else candidates
 

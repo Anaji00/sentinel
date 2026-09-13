@@ -23,6 +23,25 @@ from pydantic import BaseModel, Field, field_validator
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
 from shared.utils.equities import split_macro_and_equities
 from shared.kafka import Topics
+from shared.utils.focus import prioritise
+
+
+def _as_unit_conviction(value) -> float:
+    """A model-supplied conviction, normalised to [0, 1], preserving zero.
+
+    `x or 1.0` reads 0.0 -- the model's least confident answer -- as its most
+    confident one. A percentage is divided down, matching what
+    `_as_probability_value` does for AgentBulletin and AgentPrediction, so one
+    model habit does not mean two different things depending on which field it
+    lands in.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if 1.0 < number <= 100.0:
+        number /= 100.0
+    return min(1.0, max(0.0, number))
 from shared.models import NormalizedEvent
 from shared.utils.quiet_failures import swallowed
 
@@ -113,6 +132,8 @@ class StockCorrelationAgent(SentinelAgent):
     to dynamically discover cross-asset equity correlations and project sympathy nodes
     into the Neo4j Knowledge Graph.
     """
+    FOCUS_DOMAIN = "tradfi"
+    FOCUS_DOMAINS = ("tradfi", "market", "equity", "macro")
 
     def __init__(
         self,
@@ -247,7 +268,28 @@ class StockCorrelationAgent(SentinelAgent):
             if not macro_assets or not equities:
                 return None
 
-            # Pick target macro asset and target equity
+            # Pick target macro asset and target equity, preferring whatever
+            # the rest of the swarm is already looking at.
+            #
+            # `publish_bulletin` offers every subject to
+            # `sentinel:focus:entities` and nine agents feed it; for months only
+            # the quant engine read it back, so nothing ever directed a second
+            # agent to what a first had found. Measured over 24 hours, the
+            # consensus engine's own drift check reported 277 agent pairs at
+            # Jaccard 0.00 and two bulletins existed in Redis, from one agent --
+            # so a fusion engine that combines opinions by entity had one
+            # opinion per entity, always.
+            #
+            # `prioritise` is additive: every candidate stays, in its original
+            # relative order, and a focused one rises. This agent takes the
+            # first of each list, so the ordering is exactly what decides
+            # whether a second opinion is ever formed.
+            try:
+                equities = await prioritise(self.redis, equities, domains=self.FOCUS_DOMAINS)
+                macro_assets = await prioritise(self.redis, macro_assets, domains=self.FOCUS_DOMAINS)
+            except Exception as _exc:
+                swallowed("agents.stock_correlation_agent.focus", _exc, logger)
+
             target_macro = macro_assets[0]
             target_equity = ticker if ticker in equities else equities[0]
 
@@ -397,8 +439,27 @@ class StockCorrelationAgent(SentinelAgent):
                                     "source_label": "Company",
                                     "target_label": "Company",
                                     "relation_type": "SYMPATHY_MOVER",
-                                    "weight": float(sm.conviction or 1.0),
-                                    "confidence": float(sm.conviction or 1.0),
+                                    # Normalised, and 0.0 preserved.
+                                    #
+                                    # `float(sm.conviction or 1.0)` turned a
+                                    # model saying "no confidence" into
+                                    # certainty, and nothing clamped the value
+                                    # at all -- so the percentage problem the
+                                    # AgentBulletin and AgentPrediction
+                                    # validators exist to stop was still open on
+                                    # this path. Live: 17 RELATED_TO and 5
+                                    # SYMPATHY_MOVER edges carry a weight above
+                                    # 1.0, the largest 95.0, and
+                                    # `coalesce(r.coefficient, r.weight)` hands
+                                    # that to a model as a correlation
+                                    # coefficient of 95.
+                                    "weight": _as_unit_conviction(sm.conviction),
+                                    "confidence": _as_unit_conviction(sm.conviction),
+                                    # This number came from a language model,
+                                    # not a measurement. The edge validator can
+                                    # now grade SYMPATHY_MOVER, and a grader
+                                    # needs to know which edges were asserted.
+                                    "confidence_basis": "model_asserted",
                                     "relationship": sm.relationship,
                                     "direction": sm.direction,
                                     "properties": {

@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { apiClient, fetcher } from '../lib/api';
+import { apiClient, describeApiError, fetcher } from '../lib/api';
 import { useLiveEvents } from '../lib/useLiveEvents';
 import { NormalizedEvent, Scenario } from '../lib/types';
 import { resolveEventDomain } from '../lib/domain';
@@ -327,14 +327,14 @@ export default function IntelligenceFeed() {
     ? '/scenarios?limit=20' 
     : `/scenarios?limit=20&status=${encodeURIComponent(scenarioStatus)}`;
 
-  const { data: scenarios } = useSWR<Scenario[]>(
+  const { data: scenarios, error: scenariosError } = useSWR<Scenario[]>(
     scenarioUrl,
     fetcher,
     { refreshInterval: 6000 }
   );
 
   // Fetch Raw Correlation Clusters
-  const { data: correlations } = useSWR<CorrelationCluster[]>(
+  const { data: correlations, error: correlationsError } = useSWR<CorrelationCluster[]>(
     '/correlations?limit=30&min_tier=1',
     fetcher,
     { refreshInterval: 6000 }
@@ -408,6 +408,21 @@ export default function IntelligenceFeed() {
   ];
 
   const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
+
+  // The evidence trail belongs to the correlation, not to the scenario.
+  //
+  // The modal read `selectedScenario.evidence_trail`, and /scenarios returns
+  // rows of the `scenarios` table, which has no such column and never has --
+  // so "EVIDENCE TRAIL (SWARM FUSION)" has never appeared for any scenario.
+  // The trail it wanted is real and already on this page: /correlations builds
+  // it per cluster, and a scenario names the cluster it was written from.
+  const selectedScenarioTrail = useMemo<EvidenceContributor[]>(() => {
+    if (!selectedScenario) return [];
+    return (
+      correlations?.find(c => c.correlation_id === selectedScenario.correlation_id)
+        ?.evidence_trail || []
+    );
+  }, [selectedScenario, correlations]);
 
   // Handle Event Click to fetch deep detail payload from backend
   const handleEventClick = async (event: NormalizedEvent) => {
@@ -544,7 +559,12 @@ export default function IntelligenceFeed() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {(!scenarios || scenarios.length === 0) ? (
             <div className="col-span-full p-8 text-center bg-slate-950/60 rounded-xl border border-slate-800/80 font-mono text-slate-400 text-xs">
-              NO ACTIVE SCENARIOS FOUND.
+              {/* Not the same statement as "the request failed", and this line
+                  was making it for both. The status filter returned a 500 on
+                  every request for as long as it existed -- the SQL called
+                  Cypher's toLower() -- and each of the four status tabs
+                  reported that the platform had nothing to say. */}
+              {describeApiError(scenariosError) ?? 'NO ACTIVE SCENARIOS FOUND.'}
             </div>
           ) : (
             scenarios.map((s) => (
@@ -565,7 +585,7 @@ export default function IntelligenceFeed() {
                   {s.headline}
                 </h3>
                 <p className="text-[11px] text-slate-400 font-sans line-clamp-2 leading-tight">
-                  {s.narrative || s.description}
+                  {s.narrative_summary}
                 </p>
                 <div className="pt-2 flex items-center justify-between text-[10px] text-slate-400 border-t border-purple-500/10">
                   <span>Entity: <span className="text-amber-300 font-bold">{s.primary_entity_name || 'Multi-Entity'}</span></span>
@@ -582,7 +602,7 @@ export default function IntelligenceFeed() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {(!correlations || correlations.length === 0) ? (
             <div className="col-span-full p-8 text-center bg-slate-950/60 rounded-xl border border-slate-800/80 font-mono text-slate-400 text-xs">
-              NO CORRELATION CLUSTERS DETECTED YET.
+              {describeApiError(correlationsError) ?? 'NO CORRELATION CLUSTERS DETECTED YET.'}
             </div>
           ) : (
             correlations.map((c) => (
@@ -719,11 +739,11 @@ export default function IntelligenceFeed() {
                 </div>
               )}
 
-              {selectedScenario.evidence_trail && selectedScenario.evidence_trail.length > 0 && (
+              {selectedScenarioTrail.length > 0 && (
                 <div>
                   <span className="text-cyan-400 font-bold block mb-1">EVIDENCE TRAIL (SWARM FUSION):</span>
                   <div className="p-2.5 bg-slate-950 rounded border border-cyan-500/20 space-y-1 text-[10px]">
-                    {selectedScenario.evidence_trail.map((item, idx) => (
+                    {selectedScenarioTrail.map((item, idx) => (
                       <div key={idx} className="flex items-center justify-between border-b border-slate-800 pb-1">
                         <span className="text-slate-200 font-bold">{item.agent_name}</span>
                         <span className="text-slate-400">

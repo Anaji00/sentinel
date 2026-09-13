@@ -3,7 +3,7 @@ import logging
 import math
 import os
 from typing import List, Tuple, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from shared.utils.quiet_failures import swallowed
 
 # Closes required before RSI is computed at all.
@@ -109,6 +109,44 @@ def get_domain_tag(domain: str, asset: str) -> str:
     elif domain_clean in ("tradfi", "equity", "equities", "stocks"):
         return "EQUITY"
     return domain_clean.upper() if domain_clean else "UNKNOWN"
+
+def candle_observation_ts(block: dict, timeframe_minutes) -> datetime:
+    """When this bar's content became knowable -- never later than now.
+
+    The projected close, clamped to the present.
+
+    This returned `start + timeframe` outright, on the reasoning that a bar is
+    knowable when it closes. But `evaluate_multi_timeframe` scores the bucket
+    *while it is still open*, on every incoming candle, so a 240-minute frame
+    evaluated one minute in was stamped 239 minutes in the future. The signature
+    was unmistakable -- minutes ahead of collection ran 240, 239, 238, 237, 236,
+    235 and down, a clean decay from the timeframe length -- and 366 of 895
+    market_anomaly events in twelve hours were dated after they were collected,
+    by up to 14,398 seconds.
+
+    A stale timestamp is a worse estimate. A future one is a different kind of
+    error and breaks four things staleness does not: the correlation window is a
+    sorted set on this field, so a future event pins rank 0 and is returned as
+    the newest evidence for every rule; `precedes_trigger` and `follows_trigger`
+    invert; the Hawkes tracker reads it for intensity; and `_is_stale` can never
+    be true of an event in the future, so it is always admitted.
+
+    So the close is used where the bar has actually closed -- a completed bucket
+    replayed from cache -- and the observation time is used where it has not.
+    Falls back to the start timestamp if the timeframe cannot be read.
+    """
+    start = datetime.fromisoformat(block["start_ts"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    try:
+        minutes = float(timeframe_minutes)
+    except (TypeError, ValueError):
+        return min(start, now)
+    if minutes <= 0:
+        return min(start, now)
+    return min(start + timedelta(minutes=minutes), now)
+
 
 async def evaluate_multi_timeframe(
     redis_client,

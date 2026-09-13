@@ -1,35 +1,42 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { useTelemetryStore } from '../lib/store';
 
-describe('Frontend Telemetry Store Unit Tests (store.ts)', () => {
-  it('should track WebSocket connectivity state and event counters', () => {
-    interface TelemetryState {
-      connected: boolean;
-      totalEventsReceived: number;
-      lastUpdated: number;
-    }
+/**
+ * This test imports `store.ts`.
+ *
+ * The previous version declared its own `TelemetryState` interface and a pair
+ * of reducers inside the test body and asserted on those. It was a
+ * transcription of the store rather than the store, so it could only fail if
+ * the transcription was wrong -- never if the store changed, and never if the
+ * store were deleted. It also named fields (`connected`,
+ * `totalEventsReceived`) that the real store does not have.
+ */
+describe('Telemetry store (store.ts)', () => {
+  beforeEach(() => {
+    useTelemetryStore.setState({ isConnected: false, authRequired: false, lastUpdate: null });
+  });
 
-    const initialState: TelemetryState = {
-      connected: false,
-      totalEventsReceived: 0,
-      lastUpdated: 0,
-    };
+  it('tracks websocket connectivity', () => {
+    expect(useTelemetryStore.getState().isConnected).toBe(false);
+    useTelemetryStore.getState().setConnected(true);
+    expect(useTelemetryStore.getState().isConnected).toBe(true);
+  });
 
-    const setConnected = (state: TelemetryState, isConn: boolean): TelemetryState => ({
-      ...state,
-      connected: isConn,
-      lastUpdated: Date.now(),
-    });
+  it('distinguishes "refused for want of a session" from "still connecting"', () => {
+    // The gateway rejects the WebSocket during the handshake, so the browser
+    // only sees an abnormal close. Without this flag the dashboard sits on
+    // CONNECTING... forever while the real problem is a missing session.
+    expect(useTelemetryStore.getState().authRequired).toBe(false);
+    useTelemetryStore.getState().setAuthRequired(true);
+    expect(useTelemetryStore.getState().authRequired).toBe(true);
+    expect(useTelemetryStore.getState().isConnected).toBe(false);
+  });
 
-    const incrementEvents = (state: TelemetryState, count: number): TelemetryState => ({
-      ...state,
-      totalEventsReceived: state.totalEventsReceived + count,
-      lastUpdated: Date.now(),
-    });
-
-    let state = setConnected(initialState, true);
-    expect(state.connected).toBe(true);
-
-    state = incrementEvents(state, 50);
-    expect(state.totalEventsReceived).toBe(50);
+  it('stamps lastUpdate only once telemetry has actually arrived', () => {
+    // null, not 0: "no update yet" and "updated at the epoch" are different
+    // statements, and a dashboard rendering an age from 0 shows 56 years.
+    expect(useTelemetryStore.getState().lastUpdate).toBeNull();
+    useTelemetryStore.getState().updateTelemetry();
+    expect(useTelemetryStore.getState().lastUpdate).toBeGreaterThan(0);
   });
 });

@@ -6,12 +6,18 @@ export interface ScenarioHypothesis {
     probability?: number;
 }
 
+/** One agent's contribution to a consensus evidence trail.
+ *
+ *  `reasoning` was declared here and produced by nothing: neither
+ *  `EvidenceContributor` nor the route that builds these dicts has ever
+ *  carried it, and no component rendered it. `weight` is the field the
+ *  producers do carry beyond these four. */
 export interface EvidenceItem {
     agent_name: string;
     direction?: string;
     conviction?: number;
     score?: number;
-    reasoning?: string;
+    weight?: number;
 }
 
 export interface Corroboration {
@@ -29,20 +35,25 @@ export interface Scenario {
     correlation_id: string;
     status: string;
     headline: string;
-    title?: string;
-    description?: string;
-    narrative?: string;
-    summary?: string;
+    /** The synthesis body, under the name the `scenarios` table gives it.
+     *
+     *  The card rendered `s.narrative || s.description` and neither name has
+     *  ever existed on either side of the wire: the reasoning service computes
+     *  the prose, writes it to `narrative_summary`, and `/scenarios` returns
+     *  the row as it stands. Every scenario card in the feed showed a headline
+     *  above an empty paragraph. */
+    narrative_summary?: string;
     significance: string;
     confidence_overall: number;
     confidence_rationale?: string;
     hypotheses?: ScenarioHypothesis[];
     recommended_monitoring?: string[];
-    probability?: number;
     created_at: string;
     updated_at?: string;
+    trace_id?: string;
+    supporting_event_ids?: string[];
+    primary_entity_id?: string;
     primary_entity_name?: string;
-    evidence_trail?: EvidenceItem[];
 }
 
 export interface Entity {
@@ -58,7 +69,10 @@ export interface MarketMicrostructure {
     kyle_lambda?: number;
     amihud_illiquidity?: number;
     vwap?: number;
-    timestamp?: string;
+    twap?: number;
+    bid_ask_spread?: number;
+    realized_volatility?: number;
+    ewma_volatility?: number;
 }
 
 export interface FinancialData {
@@ -73,10 +87,7 @@ export interface FinancialData {
     open_interest?: number;
     implied_volatility?: number;
     strike?: number;
-    strike_price?: number;
     expiry?: string;
-    expiration_date?: string;
-    current_price?: number;
     open_price?: number;
     close_price?: number;
     high_price?: number;
@@ -106,75 +117,110 @@ export interface ScoreAdjustment {
 
 export interface CryptoData {
     pair?: string;
-    symbol?: string;
     trade_type?: string;
     side?: string;
     price?: number;
     size_tokens?: number;
-    volume?: number;
-    market_cap?: number;
-    change_24h?: number;
+    notional_usd?: number;
     leverage?: number;
     funding_rate?: number;
     mark_price?: number;
     index_price?: number;
     basis_bps?: number;
     open_interest?: number;
+    open_price?: number;
+    high_price?: number;
+    low_price?: number;
+    close_price?: number;
     market_microstructure?: MarketMicrostructure;
 }
 
+/**
+ * The AIS payload as `VesselData` defines it, field for field.
+ *
+ * Eight of the sixteen names here were the client's own. `flag`, `course` and
+ * `ship_type` are `flag_state`, `course_over_ground` and `vessel_type` on the
+ * wire, so a vessel's flag state -- resolved from its MMSI on every position
+ * report -- could not be read through this contract at all. `name` was
+ * declared *required* and never sent: the ship's name travels as
+ * `primary_entity.name`. `is_tanker`, `is_dark` and `is_sanctioned` were
+ * likewise never sent, and each is already expressed: a tanker is
+ * `vessel_type`, dark is the `vessel_dark` event type, and a sanctions hit is
+ * a flag on the entity.
+ *
+ * `latitude` and `longitude` are optional because a `vessel_static` report
+ * carries identity without a position.
+ */
 export interface VesselData {
     mmsi: string;
-    name: string;
-    flag?: string;
-    speed?: number;
+    imo?: string;
+    flag_state?: string;
     speed_knots?: number;
-    course?: number;
+    course_over_ground?: number;
     heading?: number;
-    latitude: number;
-    longitude: number;
-    ship_type?: string;
+    latitude?: number;
+    longitude?: number;
+    vessel_type?: string;
+    cargo_type?: string;
+    nav_status?: string;
     draught?: number;
+    length_meters?: number;
     destination?: string;
     eta?: string;
-    is_tanker?: boolean;
-    is_dark?: boolean;
-    is_sanctioned?: boolean;
+    gap_hours?: number;
+    last_seen_region?: string;
 }
 
+/**
+ * OpenSky state vectors, in the units OpenSky reports them.
+ *
+ * The previous shape declared `altitude_feet` and `velocity_knots` against a
+ * server that sends metres and metres per second -- a reader trusting the
+ * names would have been wrong by 3.28x and 1.94x. It also declared required
+ * `latitude`/`longitude`, which `FlightData` has never carried: an aircraft's
+ * position is on the event, not in its payload. `GlobalMap` reads
+ * `baro_altitude_m` and `velocity_ms` off an `any` and converts them, which is
+ * why nothing broke and why nothing caught it either.
+ *
+ * `is_military` has no producer anywhere in the platform. `is_emergency` is
+ * decided from the squawk and carried as the `aviation_emergency` tag.
+ */
 export interface FlightData {
     icao24: string;
     callsign?: string;
     origin_country?: string;
-    latitude: number;
-    longitude: number;
-    altitude_feet?: number;
-    velocity_knots?: number;
-    heading?: number;
+    baro_altitude_m?: number;
+    geo_altitude_m?: number;
+    velocity_ms?: number;
+    true_track?: number;
     vertical_rate?: number;
+    on_ground?: boolean;
     squawk?: string;
-    is_military?: boolean;
-    is_emergency?: boolean;
+    aircraft_type?: string;
+    operator?: string;
+    registration?: string;
 }
 
 export interface SecurityData {
-    breach_type: string;
+    breach_type?: string;
     affected_org?: string;
-    severity?: string;
     ip_address?: string;
     cve_id?: string;
     cvss_score?: number;
     cisa_kev?: boolean;
     asn?: string;
     ransomware_group?: string;
-    target_sector?: string;
     route_leak_prefix?: string;
+    exposure_type?: string;
+    port?: number;
+    record_count?: number;
+    data_types?: string[];
+    source_url?: string;
 }
 
 export interface PredictionMarketData {
     ticker: string;
     market_id?: string;
-    title?: string;
     question?: string;
     outcome?: string;
     category?: string;
@@ -182,12 +228,12 @@ export interface PredictionMarketData {
     shares_traded?: number;
     notional_usd?: number;
     price_usd?: number;
-    volume_24h?: number;
+    liquidity_pool_size?: number;
     yes_bid?: number;
     no_bid?: number;
     yes_probability?: number;
     no_probability?: number;
-    price_change_24h?: number;
+    probability_delta_24h?: number;
     resolution_date?: string;
 }
 

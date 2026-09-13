@@ -42,8 +42,8 @@ def validate_training_data(
     Raises InsufficientTrainingDataError if:
     - data is empty/None
     - sample count < min_samples
-    - data variance is zero (collapsed synthetic placeholder)
-    - allow_synthetic is False (default)
+    - data variance is zero (collapsed synthetic placeholder), unless
+      allow_synthetic is True
 
     Returns:
         Number of valid samples
@@ -69,7 +69,12 @@ def validate_training_data(
         )
 
     # Check for collapsed/synthetic data (all identical values or zero variance across columns)
-    if arr.ndim >= 2 and arr.size > 0:
+    #
+    # `allow_synthetic` was a declared parameter the body never read, while the
+    # docstring said it decided whether this raised. This is the check it names:
+    # zero variance across every column is the signature of a placeholder
+    # dataset, and a caller that knowingly fits on a constant opts out here.
+    if not allow_synthetic and arr.ndim >= 2 and arr.size > 0:
         variances = np.var(arr, axis=0)
         if np.all(variances < 1e-12):
             raise InsufficientTrainingDataError(

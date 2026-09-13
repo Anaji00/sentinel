@@ -346,6 +346,82 @@ class SentinelConsumer:
         else:
             await self._c.commit()
         
+    async def lag_report(self) -> Dict[str, Any]:
+        """How far behind this consumer is, and how much of its safety margin is left.
+
+        Two different questions, and only the first was ever asked -- badly:
+        `consumer_lag` reached the heartbeat through
+        `getattr(self, "_consumer_lag", None)` against an attribute nothing in
+        the tree ever assigned, so every heartbeat this platform has published
+        carried `consumer_lag: null`, and `scripts/healthcheck.py` read that
+        null as "no lag information" forever.
+
+        `lag` is end_offset - position: messages produced and not yet read.
+
+        `retention_headroom` is position - beginning_offset: messages still
+        available *behind* this consumer. It is the one that matters and the one
+        nothing measured. Kafka deletes by retention, not by consumption, so a
+        consumer that falls far enough behind has its unread messages deleted
+        under it -- and the visible symptom is lag *falling*, which reads as
+        recovery. Headroom going to zero is the only signal that distinguishes
+        "caught up" from "the backlog was deleted".
+
+        Returns per-partition detail plus totals. Never raises: this is called
+        from a heartbeat loop, and a metrics failure must not stop a heartbeat.
+        """
+        empty: Dict[str, Any] = {
+            "lag": None, "retention_headroom": None, "partitions": [],
+            "at_retention_edge": False,
+        }
+        if not self._started:
+            return empty
+        try:
+            assignment = self._c.assignment()
+            if not assignment:
+                # Subscribed but not yet assigned: no partitions, no answer.
+                return empty
+
+            partitions = list(assignment)
+            end_offsets = await self._c.end_offsets(partitions)
+            begin_offsets = await self._c.beginning_offsets(partitions)
+
+            detail = []
+            total_lag = 0
+            total_headroom = 0
+            at_edge = False
+            for tp in partitions:
+                position = await self._c.position(tp)
+                end = end_offsets.get(tp)
+                begin = begin_offsets.get(tp)
+                if position is None or end is None or begin is None:
+                    continue
+                lag = max(0, int(end) - int(position))
+                headroom = max(0, int(position) - int(begin))
+                total_lag += lag
+                total_headroom += headroom
+                # The consumer's next read is the oldest message the broker
+                # still holds: anything older has already been deleted unread.
+                edge = int(position) <= int(begin) and lag > 0
+                at_edge = at_edge or edge
+                detail.append({
+                    "topic": tp.topic, "partition": tp.partition,
+                    "position": int(position), "begin": int(begin), "end": int(end),
+                    "lag": lag, "retention_headroom": headroom,
+                    "at_retention_edge": edge,
+                })
+
+            if not detail:
+                return empty
+            return {
+                "lag": total_lag,
+                "retention_headroom": total_headroom,
+                "partitions": detail,
+                "at_retention_edge": at_edge,
+            }
+        except Exception as e:
+            swallowed("kafka.lag_report", e, logger)
+            return empty
+
     async def close(self):
         self.batch_logger.flush()
         try:

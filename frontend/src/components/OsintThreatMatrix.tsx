@@ -24,66 +24,22 @@ export default function OsintThreatMatrix() {
   const [selectedTheater, setSelectedTheater] = useState<string>('ALL');
   const [onlySanctions, setOnlySanctions] = useState<boolean>(false);
 
-  const { data } = useSWR<{ events: OsintItem[] }>(
+  const { data } = useSWR<OsintItem[]>(
     '/api/v1/events/news?limit=30',
     fetcher,
     { refreshInterval: 5000 }
   );
 
-  const events = data?.events || [
-    {
-      id: 'osint-1',
-      headline: 'OFAC Sanctions Update: Special Designated Nationals Fleet Alert in Strait of Hormuz',
-      source: 'OFAC / Reuters OSINT',
-      occurred_at: new Date().toISOString(),
-      anomaly_score: 0.92,
-      sentiment: -0.65,
-      reliability: 0.95,
-      is_threat: true,
-      is_ofac_hit: true,
-      region: 'MIDDLE_EAST',
-      tags: ['SANCTIONS', 'MARITIME', 'OFAC', 'HORMUZ'],
-    },
-    {
-      id: 'osint-2',
-      headline: 'Unusual Naval Auxiliary Vessel Movement Detected Near Bab-el-Mandeb Bottleneck',
-      source: 'AISStream OSINT',
-      occurred_at: new Date(Date.now() - 120000).toISOString(),
-      anomaly_score: 0.84,
-      sentiment: -0.40,
-      reliability: 0.88,
-      is_threat: true,
-      is_ofac_hit: false,
-      region: 'RED_SEA',
-      tags: ['NAVAL', 'RED_SEA', 'AIS_GAP'],
-    },
-    {
-      id: 'osint-3',
-      headline: 'BGP Routing Hijack Anomalies Detected Impacting Financial Exchange Data Center',
-      source: 'BGP Telemetry Stream',
-      occurred_at: new Date(Date.now() - 360000).toISOString(),
-      anomaly_score: 0.78,
-      sentiment: -0.30,
-      reliability: 0.90,
-      is_threat: true,
-      is_ofac_hit: false,
-      region: 'GLOBAL',
-      tags: ['CYBER', 'BGP', 'NETWORK'],
-    },
-    {
-      id: 'osint-4',
-      headline: 'Emergency Squawk 7700 Declared by Transport Aircraft in Eastern European Airspace',
-      source: 'ADSB Network Feed',
-      occurred_at: new Date(Date.now() - 720000).toISOString(),
-      anomaly_score: 0.81,
-      sentiment: -0.50,
-      reliability: 0.92,
-      is_threat: true,
-      is_ofac_hit: false,
-      region: 'EUROPE',
-      tags: ['AVIATION', 'EMERGENCY', 'SQUAWK_7700'],
-    },
-  ];
+  // The endpoint returns a bare JSON array, so `data?.events` was
+  // undefined on every successful fetch and the `||` fired on the
+  // normal path rather than on an outage -- permanently, on a refresh
+  // timer. What it fell back to was not placeholder text but invented
+  // records stamped `occurred_at: new Date()`, which is what turns a
+  // fixture into a claim: a row dated now, with a source attribution
+  // and an anomaly score, is indistinguishable from a live detection.
+  //
+  // An empty list is the honest answer when there is nothing to show.
+  const events = Array.isArray(data) ? data : [];
 
   const filteredEvents = events.filter((e) => {
     if (onlySanctions && !e.is_ofac_hit) return false;

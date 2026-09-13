@@ -28,6 +28,10 @@ from shared.utils.materiality import apply_materiality, move_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
 from shared.utils.quiet_failures import swallowed, dropped
+# One definition, shared with the tradfi candle path: the two were
+# stamping the same kind of event by different rules.
+from shared.utils.candles import candle_observation_ts
+from shared.utils.feature_flags import FeatureFlagManager
 logger = logging.getLogger("enrichment.crypto")
 
 
@@ -132,22 +136,6 @@ def _notional_score(notional: float) -> float:
     return round((math.log10(value) - math.log10(_NOTIONAL_FLOOR_USD)) / span, 4)
 
 
-def _candle_close_ts(block: dict, timeframe_minutes) -> datetime:
-    """When a bar closed, which is when its content became knowable.
-
-    Falls back to the start timestamp if the timeframe cannot be read -- an
-    approximately-right timestamp beats an exception on the enrichment path.
-    """
-    start = datetime.fromisoformat(block["start_ts"])
-    try:
-        minutes = float(timeframe_minutes)
-    except (TypeError, ValueError):
-        return start
-    if minutes <= 0:
-        return start
-    return start + timedelta(minutes=minutes)
-
-
 def _money(usd: float) -> str:
     """Formats an amount at a unit that shows it.
 
@@ -183,6 +171,11 @@ class CryptoEnricher:
         self.scorer = scorer
         self.redis = redis_client
         self.graph = graph_writer
+        # The `crypto_liquidations` kill switch is offered on the operator's
+        # flag panel with a description -- "High-frequency perpetual contract
+        # liquidation cascade detection" -- and nothing in the tree ever asked
+        # whether it was enabled. Tripping it changed nothing.
+        self.flags = FeatureFlagManager(redis_client)
 
 
     async def enrich(self, raw) -> Optional[NormalizedEvent]:
@@ -226,6 +219,16 @@ class CryptoEnricher:
                 other_tasks.append(self._enrich_funding_rate(raw, p))
             elif trade_type == "OPEN_INTEREST":
                 other_tasks.append(self._enrich_open_interest(raw, p))
+            # Cross-venue divergence, which nothing claimed.
+            #
+            # The collector polls Binance and Bybit funding and mark prices,
+            # computes the funding spread in basis points and the price basis,
+            # thresholds them, attaches its own `divergence_score` and logs
+            # "Cross-Venue Divergence Detected" at INFO. A complete detector,
+            # whose every output reached the unrouted counter and stopped --
+            # so the log said it was working and the platform never saw one.
+            elif trade_type == "CROSS_EXCHANGE_FUNDING_DIVERGENCE":
+                other_tasks.append(self._enrich_funding_divergence(raw, p))
             elif source == "coinbase_spot":
                 spot_trades.append((raw, p))
             elif source == "coinbase_candles":
@@ -446,7 +449,9 @@ class CryptoEnricher:
                 except (json.JSONDecodeError, KeyError, ValueError):
                     signed_volumes_computed.append(0.0)
 
-            k_lambda = quant_calc.kyle_lambda(price_changes, signed_volumes_computed) if len(price_changes) >= 10 else 0.0
+            # None, not 0.0: kyle_lambda itself now distinguishes 'could not measure'
+            # from 'measured no impact', and this guard must not undo it.
+            k_lambda = quant_calc.kyle_lambda(price_changes, signed_volumes_computed) if len(price_changes) >= 10 else None
             # Amihud pairs |return| with the notional traded over the same step,
             # so the two lists are built together: dividing by prices[i + 1] was
             # unguarded, and the collectors write 0.0 for a trade that arrived
@@ -581,6 +586,70 @@ class CryptoEnricher:
         )
 
     # ── Phase 2: Open Interest Enrichment ─────────────────────────────────────
+
+    # Funding spread at which the venues genuinely disagree, in basis points.
+    #
+    # The collector already thresholds at 3 bps before publishing, so anything
+    # arriving here is a divergence by its own definition. This is the second
+    # question -- how far past that line it is. 25 bps is a dislocation large
+    # enough that the basis trade is the story.
+    DIVERGENCE_FLOOR_BPS = 3.0
+    DIVERGENCE_CEILING_BPS = 25.0
+
+    async def _enrich_funding_divergence(self, raw, p):
+        """Two venues disagreeing about the cost of the same perpetual.
+
+        Funding is the price of holding a perp, and it converges across venues
+        because arbitrage makes it. A persistent spread means the arbitrage is
+        not happening, which is a statement about the venues -- inventory,
+        withdrawal friction, someone unable to move collateral -- rather than
+        about the asset. It leads venue stress and it leads liquidation
+        cascades, and it is the one crypto signal that needs two exchanges to
+        see at all.
+
+        Scored from the spread rather than from the collector's own
+        `divergence_score`, which is `0.40 + bps/20` -- a formula that starts at
+        0.40 for a reading exactly on the publishing threshold and reaches 1.0
+        at 12 bps. Carried through as a field so the two can be compared, but
+        not used as the score: a detector grading its own output is the shape
+        this audit has spent the most time removing.
+        """
+        asset = str(p.get("asset") or "").upper()
+        if not asset:
+            return None
+
+        try:
+            spread_bps = float(p.get("funding_spread_bps") or 0.0)
+        except (TypeError, ValueError):
+            return None
+
+        span = self.DIVERGENCE_CEILING_BPS - self.DIVERGENCE_FLOOR_BPS
+        anomaly = max(0.0, min(1.0, (spread_bps - self.DIVERGENCE_FLOOR_BPS) / span))
+
+        basis_pct = p.get("price_spread_pct")
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.CRYPTO_PERP_FUNDING,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
+            primary_entity=Entity(id=asset, type=EntityType.INSTRUMENT, name=asset),
+            headline=(
+                f"{asset} perp funding diverged {spread_bps:.1f} bps across venues "
+                f"(Binance {float(p.get('binance_funding_rate') or 0) * 100:.4f}% vs "
+                f"Bybit {float(p.get('bybit_funding_rate') or 0) * 100:.4f}%)"
+            ),
+            summary=(
+                f"Cross-venue funding divergence on {asset}. Spread "
+                f"{spread_bps:.2f} bps; mark-price basis {basis_pct}%. Funding "
+                f"converges across venues when arbitrage is working, so a "
+                f"persistent spread describes the venues rather than the asset."
+            ),
+            anomaly_score=anomaly,
+            tags=["crypto", "funding_rate", "cross_venue_divergence", asset.lower()],
+            named_entities=[asset],
+        )
 
     async def _enrich_open_interest(self, raw, p) -> Optional[NormalizedEvent]:
         """
@@ -773,7 +842,7 @@ class CryptoEnricher:
                 # observation became available, not when the window it describes
                 # began. The window itself is still recoverable: the timeframe
                 # is on the event and in its tags.
-                occurred_at=_candle_close_ts(block, tf),
+                occurred_at=candle_observation_ts(block, tf),
                 source=raw.source,
                 source_reliability=baseline_reliability(raw.source),
                 primary_entity=entity,
@@ -969,6 +1038,9 @@ class CryptoEnricher:
         )
 
     async def _enrich_liquidation(self, raw, p) -> Optional[NormalizedEvent]:
+        # Honour the switch that claims to govern this path.
+        if not await self.flags.is_enabled("crypto_liquidations"):
+            return None
         """Processes forced closures of leveraged positions on centralized exchanges."""
         asset = p.get("asset", "UNKNOWN")
         side = p.get("side", "UNKNOWN")

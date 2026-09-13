@@ -95,12 +95,29 @@ def test_an_empty_document_yields_nothing_rather_than_raising():
 
 
 def test_the_keys_written_are_the_ones_the_macro_engine_reads():
-    """The whole point of the exercise, and easy to get subtly wrong."""
+    """The whole point of the exercise, and easy to get subtly wrong.
+
+    This asserted the literal f-string on both sides, which pinned one spelling
+    of the key rather than the agreement. Both now build it with
+    `quote_cache.quote_key`, so the agreement is structural: there is one
+    function, and it also applies the `.strip()` that four hand-built readers
+    were dropping.
+    """
+    from shared.utils.quote_cache import quote_key
+
     engine = (ROOT / "services/agents/macro_intelligence_engine.py").read_text(encoding="utf-8")
-    for key in ("US2Y", "US10Y"):
-        assert f'"sentinel:quotes:latest:{key}"' in engine
     collector = (ROOT / "services/collector-macro/main.py").read_text(encoding="utf-8")
-    assert 'f"sentinel:quotes:latest:{key}"' in collector
+
+    # Both sides derive the key rather than spelling it.
+    assert "quote_key(" in engine, "the macro engine builds the quote key by hand again"
+    assert "quote_key(" in collector, "the macro collector builds the quote key by hand again"
+
+    # And the key that function produces is the one both were spelling before.
+    for key in ("US2Y", "US10Y"):
+        assert quote_key(key) == f"sentinel:quotes:latest:{key}"
+    # Whitespace, which the hand-built readers did not handle.
+    assert quote_key(" us2y ") == quote_key("US2Y")
+
     assert '"US2Y":  "2 Yr"' in collector and '"US10Y": "10 Yr"' in collector
 
 

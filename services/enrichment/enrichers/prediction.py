@@ -20,6 +20,22 @@ from shared.utils.quiet_failures import swallowed, dropped
 # One owner for what belongs on the watch list. This module held a second,
 # looser filter over the same Redis set the collector prunes.
 from shared.utils.prediction_markets import slug_is_relevant
+
+
+def _probability_or_default(value, default: float = 0.5) -> float:
+    """A market probability, preserving a genuine 0.0.
+
+    `float(x or 0.5)` cannot tell "the market says no" from "the field was
+    absent", and the first is the interesting one.
+    """
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(1.0, max(0.0, number))
+
 logger = logging.getLogger("enrichment.prediction")
 
 # Exact vocabulary for a two-sided market. "outcome 0"/"outcome 1" are kept only
@@ -266,8 +282,16 @@ class PredictionEnricher:
 
         yes_bid = float(p.get("yes_bid") or 0.0)
         no_bid = float(p.get("no_bid") or 0.0)
-        yes_prob = float(p.get("yes_probability") or 0.5)
-        no_prob = float(p.get("no_probability") or 0.5)
+        # 0.0 is the most informative thing a market can say.
+        #
+        # `or 0.5` fired on it, converting "this will not happen" into maximum
+        # uncertainty -- and `delta_p = yes_prob - last_prob` feeds the
+        # probability-shift z-score, so a genuine collapse to zero registered as
+        # a move toward the middle. Both legs defaulted independently, so when
+        # the whole field was absent the pair read 0.5/0.5, summed to 1.0, and
+        # was internally consistent: nothing downstream could have checked it.
+        yes_prob = _probability_or_default(p.get("yes_probability"))
+        no_prob = _probability_or_default(p.get("no_probability"))
 
         # Stateful volume & probability delta calculation using Redis
         delta_vol = 0.0

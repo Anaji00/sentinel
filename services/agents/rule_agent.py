@@ -2,13 +2,23 @@ import asyncio
 import json
 import re
 import logging
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from services.agents.base import SentinelAgent
 from shared.kafka import Topics
 from shared.utils.text import clip
+from shared.utils.quiet_failures import swallowed
+from shared.utils.entity_resolution import is_plausible_entity_name
+from shared.utils.rule_feedback import firing_counts, rule_performance
+from shared.models.correlation_rules import (
+    CLAUSE_KEYS,
+    is_seed_rule,
+    clause_event_types,
+    declares_a_join,
+    trigger_event_types,
+)
 
 logger = logging.getLogger("agent.rule_synthesizer")
 
@@ -111,16 +121,80 @@ def _unknown_event_types(rule) -> set:
 
 
 class CorrelationDef(BaseModel):
+    """One clause of a rule, in the DSL the correlation engine actually reads.
+
+    Every field below is a key `evaluate_dynamic_rules` looks up. That
+    equivalence is the point, and it did not hold: this model declared five
+    fields while the evaluator read ten, and Pydantic's default is to *drop*
+    what it was not told about.
+
+    The consequence was specific and total. The synthesiser's prompt tells the
+    model, in as many words, to set `"same_entity": true` for a rule about one
+    company, and its worked example includes it -- and every rule the agent has
+    ever produced arrived at the evaluator without it, because validation threw
+    it away before storage. A join the prompt asked for, the model supplied and
+    the engine supports was silently removed in between, so every synthetic
+    rule correlated a block trade in one name with activity in another. That is
+    the same defect the shipped rules were repaired for, reintroduced on the
+    path that writes most of the rules.
+
+    `extra="forbid"` so the next key added to the engine fails loudly here
+    rather than being quietly discarded, and the accompanying test asserts the
+    two vocabularies are identical.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     event_types: List[str]
     hours: int
     min_anomaly: float
     tags: Optional[List[str]] = None
-    region: Optional[str] = None
+    # The joins. `region` takes a place name, or `true` meaning "wherever the
+    # trigger is"; the others are flags.
+    region: Optional[Union[str, bool]] = None
+    same_entity: Optional[bool] = None
+    shared_tags: Optional[bool] = None
+    proximity_km: Optional[float] = None
+    # Ordering. A rule that says its evidence came *before* the trigger is
+    # making a different and stronger claim than one that says both happened
+    # this week, and the engine has supported it since the informed-trading
+    # sequence was written.
+    precedes_trigger: Optional[bool] = None
+    follows_trigger: Optional[bool] = None
+    within_minutes: Optional[int] = None
+
+
+# Checked at import, not only in a test.
+#
+# This model is the gate every synthesised rule passes through, and the way it
+# failed was by declaring fewer fields than the evaluator reads -- silently, for
+# the life of the deployment. A test catches that on the next run; this catches
+# it before the service starts, which is where a contract between two services
+# should be enforced.
+_declared = set(CorrelationDef.model_fields)
+if _declared != set(CLAUSE_KEYS):
+    raise RuntimeError(
+        "CorrelationDef has drifted from the correlation rule DSL. "
+        f"only here: {sorted(_declared - set(CLAUSE_KEYS))}; "
+        f"only in the DSL: {sorted(set(CLAUSE_KEYS) - _declared)}. "
+        "A key the evaluator reads and this model does not declare is deleted "
+        "in validation without a word."
+    )
+del _declared
+
 
 class DynamicRule(BaseModel):
+    # Deliberately not `forbid` here, unlike the clause above. A stray
+    # top-level key -- a "rationale" the model volunteered -- is harmless and
+    # costs nothing to drop; discarding the whole rule for it would be a worse
+    # trade. Every key that changes what a rule *means* lives on the clause.
+
     rule_id: str
     rule_name: str
-    trigger_event_type: str
+    # A list, as the shipped rules use. Declared as a bare string, a synthetic
+    # rule could not express "any of these three types triggers this", which is
+    # how every cyber and every sequence rule in the shipped set is written.
+    trigger_event_type: Union[str, List[str]]
     conditions: Dict[str, Any] = Field(default_factory=dict)
     correlations: List[CorrelationDef]
     alert_tier: str
@@ -212,7 +286,52 @@ def _is_reusable_rule(rule):
             " but no clause filters on it; it would match everywhere"
         )
 
+    # A cross-domain clause that declares no join.
+    #
+    # The engine falls back to matching on a shared subject when a rule spans
+    # domains and says nothing about what connects its sides, and counts every
+    # time it has to. That fallback is a safety net, not a design: a rule
+    # stored without a join is one whose author never decided what it means,
+    # and it will sit in the rule set asserting co-occurrence under a name that
+    # promises a relationship. This is the shape that produced 69% of the
+    # correlation layer's output on nothing but a shared 48 hours.
+    #
+    # Rejected here rather than repaired, because the join a rule needs depends
+    # on what the rule is claiming, and that is the model's decision to make --
+    # the prompt now lists all six and gives the case for each.
+    trigger_domains = _trigger_domains(rule)
+    for clause in (getattr(rule, "correlations", None) or []):
+        types = clause_event_types(clause)
+        if _domains_of(types) - trigger_domains and not declares_a_join(clause):
+            return (
+                "clause " + repr(sorted(types)) + " spans domains and declares no "
+                "join; it would correlate on a shared time window alone"
+            )
+
     return None
+
+
+def _domains_of(types) -> set:
+    """The domains a list of event types belongs to, skipping what it cannot name."""
+    from shared.models.events import event_domain
+    out = set()
+    for t in types:
+        try:
+            out.add(event_domain(t))
+        except Exception:
+            continue
+    return out - {""}
+
+
+def _trigger_domains(rule) -> set:
+    """Every domain the rule can be triggered from.
+
+    All of them, not the first. A rule triggering on ["ransomware",
+    "price_anomaly"] already spans cyber and tradfi, so judging its clauses
+    against whichever trigger happened to be written first would demand a join
+    from a clause that is in the same domain as one of them.
+    """
+    return _domains_of(trigger_event_types(rule))
 
 
 class RuleList(BaseModel):
@@ -305,20 +424,37 @@ convergence that the listed event types can actually express.
 - hours is the lookback for a clause. Prefer the shortest window that could
   still capture the relationship; 48 hours of options flow will always find
   something.
-- Set "same_entity": true when the rule is about one company, ticker, vessel or
-  wallet. "Block trade and options activity converge" means in the SAME name;
-  without this the rule correlates a trade in one company with activity in
-  another and reads as a finding.
+- EVERY clause must say what connects its evidence to the trigger. A clause
+  that declares no join asserts that falling in the same time window is itself
+  the relationship, which for a rule spanning domains is not a finding. Use
+  exactly one of:
+    "same_entity": true   one company, ticker, vessel or wallet. "Block trade
+                          and options activity converge" means in the SAME name.
+    "region": true        wherever the trigger is -- for chokepoints, theatres,
+                          and anything geographic. A literal place name also works.
+    "shared_tags": true   the two sides name the same subject, when they cannot
+                          share an identifier: a headline about a company and
+                          that company's stock, a CPI print and what repriced.
+    "proximity_km": 50    within this distance, for events carrying coordinates.
+    "follows_trigger": true, "within_minutes": 240
+                          the evidence came AFTER the trigger, inside the window
+                          -- contagion and spillover, where the two sides are
+                          genuinely different subjects.
+    "precedes_trigger": true, "within_minutes": 4320
+                          the evidence came BEFORE it. Positioning ahead of a
+                          catalyst; the order is the whole signal.
+  These are the only join keys. A clause naming anything else is rejected.
 - Alert tiers: WATCH | ALERT | ELEVATED | INTELLIGENCE | CRITICAL. Reserve
   CRITICAL for convergences that would change a decision today.
 
 Return raw JSON matching the RuleList schema. One complete rule, for shape:
 {{"rules": [{{"rule_id": "syn_1",
   "rule_name": "Insider Sale Into Options Accumulation",
-  "trigger_event_type": "insider_trade",
+  "trigger_event_type": ["price_anomaly", "equity_block"],
   "conditions": {{"min_anomaly": 0.4}},
   "correlations": [{{"event_types": ["options_flow", "equity_block"],
-                    "hours": 24, "min_anomaly": 0.5, "same_entity": true}}],
+                    "hours": 24, "min_anomaly": 0.5, "same_entity": true,
+                    "precedes_trigger": true, "within_minutes": 2880}}],
   "alert_tier": "ELEVATED", "tags": ["equity", "insider"]}}]}}"""
         
         try:
@@ -394,7 +530,24 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
                         })
 
                         # 3. Route discovered entity correlations through governed ONTOLOGY_PROPOSALS (§3.7)
-                        rule_tags = [t.upper() for t in (rule.tags or []) if len(t) <= 10]
+                        # A tag is not an entity.
+                        #
+                        # This chained a synthesised rule's tags pairwise into
+                        # MACRO_CORRELATED edges, both endpoints labelled
+                        # `Company`, with no check that either string names a
+                        # company. That is how "0.80" -- a confidence score the
+                        # model printed into its own tag list -- became a node in
+                        # the live graph with ten correlation edges to real
+                        # issuers, and how "GLOBAL CONTEXT", a prompt heading,
+                        # became another. Both then carried degree, and
+                        # centrality is degree.
+                        #
+                        # The length ceiling was the only filter and it is the
+                        # wrong axis: "0.80" is four characters.
+                        rule_tags = [
+                            t.upper() for t in (rule.tags or [])
+                            if len(t) <= 10 and is_plausible_entity_name(t)
+                        ]
                         if len(rule_tags) >= 2:
                             for i in range(len(rule_tags) - 1):
                                 prop = {
@@ -447,18 +600,33 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
         """
         try:
             active = await self.redis.raw.hgetall("sentinel:correlation:dynamic_rules")
-            if not active or len(active) <= MAX_ACTIVE_SYNTHETIC_RULES:
+            if not active:
                 return
 
+            # Seed rules share this hash and are not the agent's to retire.
+            #
+            # The budget below is named for synthetic rules and was counting
+            # both, so every rule added to the build quietly took one slot from
+            # the synthesiser: seventeen shipped rules turned a budget of forty
+            # into a budget of twenty-three, and nothing said so. Counting only
+            # what this agent wrote is what keeps the platform's floor and its
+            # capacity to discover independent of each other.
             aged = []
             for rid, rjson in active.items():
                 rid_s = rid.decode() if isinstance(rid, bytes) else str(rid)
                 try:
                     obj = json.loads(rjson.decode() if isinstance(rjson, bytes) else rjson)
-                    aged.append((int(obj.get("expires_at") or 0), rid_s))
                 except Exception:
-                    # A rule that cannot be parsed cannot be evaluated either.
+                    # A rule that cannot be parsed cannot be evaluated either,
+                    # and cannot claim to be a seed rule.
                     aged.append((0, rid_s))
+                    continue
+                if is_seed_rule(obj):
+                    continue
+                aged.append((int(obj.get("expires_at") or 0), rid_s))
+
+            if len(aged) <= MAX_ACTIVE_SYNTHETIC_RULES:
+                return
 
             aged.sort()
             surplus = len(aged) - MAX_ACTIVE_SYNTHETIC_RULES
@@ -488,11 +656,33 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
             active = await self.redis.raw.hgetall("sentinel:correlation:dynamic_rules")
             if not active:
                 return
-            decoded = {
-                (k if isinstance(k, str) else k.decode("utf-8")):
-                (v if isinstance(v, str) else v.decode("utf-8"))
-                for k, v in active.items()
-            }
+            decoded = {}
+            for k, v in active.items():
+                rid = k if isinstance(k, str) else k.decode("utf-8")
+                rjson = v if isinstance(v, str) else v.decode("utf-8")
+                # A seed rule is never a prune candidate.
+                #
+                # This handed the whole hash to a model asked to "identify any
+                # rules that are obsolete, contradictory, or duplicate" and
+                # deleted whatever ids it named. Nothing distinguished a rule
+                # the build ships from one the agent invented last Tuesday, so
+                # one prune pass could remove the only rule that lets this
+                # platform see a tanker go dark in a chokepoint -- and nothing
+                # would restore it until the correlation service next restarted
+                # and reconciled the shipped set.
+                try:
+                    if is_seed_rule(json.loads(rjson)):
+                        continue
+                except (ValueError, TypeError) as _exc:
+                    # Unparseable, so it cannot claim to be a seed rule -- and
+                    # a rule the evaluator cannot read is a good prune
+                    # candidate rather than a reason to stop. Counted, because
+                    # a rising number here means something is writing junk into
+                    # the rule hash.
+                    swallowed("agents.rule_agent.unparseable_stored_rule", _exc, self.logger)
+                decoded[rid] = rjson
+            if not decoded:
+                return
             await self.mark_processed("rule_prune_pass", window_seconds=self.PRUNE_COOLDOWN_SEC)
             self.logger.info("Evaluating %s active rules for pruning.", len(decoded))
             await self._evaluate_and_prune_rules(decoded, current_context)
@@ -502,24 +692,45 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
     async def _evaluate_and_prune_rules(self, active_rules: Dict[str, str], current_context: str) -> None:
         """
         LLM Reasoning Engine for Rule Pruning:
-        Evaluates existing active correlation rules in Redis against current market context
-        and hit rates, using LLM reasoning to determine which rules are obsolete, duplicate, or stale.
+        Evaluates active correlation rules against current market context, how
+        often each has fired, and what analysts said about it when it did.
+
+        The last two are new here, and the docstring claimed one of them
+        already: it said "current market context and hit rates" while the
+        summaries carried a rule name, a trigger type and an expiry. The model
+        was being asked which rules are obsolete from their names.
+
+        Both inputs existed. `correlation_rule_fired:{rule_id}` is incremented
+        on every firing and published to the metrics hash. `/feedback` records
+        an analyst's verdict per rule and flags `needs_review` -- and that flag
+        was read by nothing at all: no component fetched the endpoint, no
+        service read the key, and the counters expired on a TTL. An analyst
+        could mark the same rule wrong every day for a week and the curator
+        deciding its fate would never hear about it.
         """
         if not active_rules:
             return
+
+        fired = await firing_counts(self.redis)
 
         rule_summaries = []
         for r_id, r_json in active_rules.items():
             try:
                 r_obj = json.loads(r_json)
-                rule_summaries.append({
-                    "rule_id": r_id,
-                    "rule_name": r_obj.get("rule_name"),
-                    "trigger_event": r_obj.get("trigger_event_type"),
-                    "expires_at": r_obj.get("expires_at")
-                })
-            except Exception:
+            except Exception as _exc:
+                swallowed("agents.rule_agent.prune_summary_parse", _exc, self.logger)
                 continue
+            record = await rule_performance(self.redis, r_id, fired)
+            rule_summaries.append({
+                "rule_id": r_id,
+                "rule_name": r_obj.get("rule_name"),
+                "trigger_event": r_obj.get("trigger_event_type"),
+                "expires_at": r_obj.get("expires_at"),
+                "times_fired": record["times_fired"],
+                "analyst_verdicts": record["total"],
+                "analyst_negative": record["negative"],
+                "flagged_by_analysts": record["needs_review"],
+            })
 
         if not rule_summaries:
             return
@@ -531,6 +742,19 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
 
         ACTIVE DYNAMIC CORRELATION RULES:
         {json.dumps(rule_summaries, separators=(',', ':'))}
+
+        Each rule carries its record:
+          - times_fired: how often the correlation engine has matched it.
+          - analyst_verdicts / analyst_negative: how many times an analyst
+            judged a finding from this rule, and how many of those were
+            negative.
+          - flagged_by_analysts: true when there is enough feedback to judge
+            and the negative share is above the review threshold.
+
+        Weigh that record above the rule's name. A rule analysts have
+        repeatedly marked wrong is a prune candidate whatever it is called; a
+        rule that has never fired is untested rather than useless, and firing
+        often with no negative verdicts is the opposite of obsolete.
 
         Analyze each rule's relevance to current market conditions. Identify any rules that are obsolete, contradictory, or duplicate.
         Return a JSON list of rule_ids that should be PRUNED and REMOVED from active correlation evaluation.

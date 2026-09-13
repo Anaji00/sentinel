@@ -204,6 +204,16 @@ def test_13f_portfolio_differential_and_consensus():
         </infoTable>
     </informationTable>"""
 
+    # The resolver reads the SEC's own company registry, which the collector
+    # loads at startup. It used to fall back to a hand-written map of twelve
+    # mega-caps when the registry was absent; that map is gone, so the registry
+    # is seeded here exactly as `load_sec_company_tickers` would leave it.
+    thirteen_f_mod._DYNAMIC_TITLE_TO_TICKER.update({
+        "APPLE INC": "AAPL",
+        "MICROSOFT CORP": "MSFT",
+    })
+    thirteen_f_mod._rebuild_stripped_index()
+
     holdings = parse_13f_xml_table(sec_xml_sample)
     assert len(holdings) == 2
     assert holdings[0]["ticker"] == "AAPL"

@@ -228,6 +228,11 @@ class QuantTradingEngine(SentinelAgent):
     Combines peer discovery, SEC Form 4 insider flow tracking, quantitative risk modeling
     (VaR/CVaR, Half-Kelly), and technical trading signal generation in a single pass.
     """
+    # Which focus-set domains this agent can act on. Its candidates are
+    # equity and crypto tickers, so a maritime subject is a slot it can do
+    # nothing with.
+    FOCUS_DOMAIN = "tradfi"
+    FOCUS_DOMAINS = ("tradfi", "crypto", "market", "equity")
 
     def __init__(
         self,
@@ -775,9 +780,9 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 
                 # 2. Exposure & statistical correlations
                 graph_query = """
-                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES*1..2]-(inst:Entity)
+                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES]-(inst:Entity)
                 WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
-                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r[0]) AS predicate, coalesce(r[0].confidence, $unrated) AS confidence
+                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r) AS predicate, coalesce(r.confidence, $unrated) AS confidence
                 LIMIT 5
                 """
                 rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper(), "unrated": UNRATED_EDGE_CONFIDENCE})
@@ -823,6 +828,28 @@ HARD RISK CONSTRAINTS (MANDATORY):
 - Specify action (BUY/SELL/HOLD), trade_type, entry_level, target_price, and stop_loss targets.
 Return raw JSON matching schema:"""
 
+        # An advisory without a price is not an advisory, and this is decided
+        # before the inference rather than after it.
+        #
+        # `entry_level` was assigned unconditionally from `current_price` with
+        # no guard testing it, so a missing price published
+        # "BUY EQIX @ $0.00 -> $0.00 (Kelly 2.0%)" and recorded a prediction the
+        # resolver rejects as unscoreable. That was fixed -- but the check sat
+        # *after* `_execute_with_telemetry`, which is the model call. Measured
+        # live: a 202.6-second inference for SNDK completed and was then
+        # discarded for a condition known before it began, and that was one of
+        # only four inferences the agent tier completed in roughly fifty
+        # minutes of runtime. On a host that affords this few, spending one to
+        # learn something already in a local variable is the expensive mistake.
+        if not isinstance(current_price, (int, float)) or not math.isfinite(current_price) or current_price <= 0:
+            logger.warning(
+                "Advisory for %s abandoned before inference: no usable current "
+                "price (%r). A play priced at zero cannot be executed or "
+                "resolved, and the model call is the scarcest thing here.",
+                ticker, current_price,
+            )
+            return None
+
         try:
             brief: FinancialAdviceBrief = await self._execute_with_telemetry(
                 message=message,
@@ -847,23 +874,6 @@ Return raw JSON matching schema:"""
             # to 1.5 keeps the previous behaviour whenever no measurement
             # exists for the ticker.
             stop_multiplier = await self._measured_stop_multiplier(ticker)
-
-            # An advisory without a price is not an advisory.
-            #
-            # `entry_level` was assigned unconditionally from `current_price`,
-            # with no guard anywhere in this function testing it. Where the
-            # price lookup returned nothing the engine published
-            # "BUY EQIX @ $0.00 -> $0.00 (Kelly 2.0%)" -- an instruction that
-            # cannot be followed -- and recorded a prediction whose entry price
-            # of 0.0 the resolver rejects as falsy, so it could never be scored.
-            # Refusing here is what keeps both halves honest.
-            if not isinstance(current_price, (int, float)) or not math.isfinite(current_price) or current_price <= 0:
-                logger.warning(
-                    "Advisory for %s abandoned: no usable current price (%r). "
-                    "A play priced at zero cannot be executed or resolved.",
-                    ticker, current_price,
-                )
-                return None
 
             for play in brief.highest_conviction_plays:
                 play.entry_level = round(current_price, 2)
@@ -1017,6 +1027,12 @@ Return raw JSON matching schema:"""
                         entry_price=play.entry_level,
                         target_price=play.target_price,
                         time_horizon_hours=24,
+                        # The partition this claim is made under, and the one
+                        # `get_conditional_scorecard` asks for when sizing the
+                        # next position in the same name. Without it the
+                        # per-ticker and strategy cards stayed empty forever and
+                        # every Kelly fraction used the 0.55 prior.
+                        strategy=f"trading_advisory:{play.ticker.upper()}",
                     ),
                     name=f"record-prediction-{play.ticker}"
                 )
@@ -1069,7 +1085,7 @@ Return raw JSON matching schema:"""
             # swarm's opinions never overlapped. Additive: every ticker the
             # engine chose is still here, in its original order behind any that
             # are already under examination elsewhere.
-            tickers = await prioritise(self.redis, tickers)
+            tickers = await prioritise(self.redis, tickers, domains=self.FOCUS_DOMAINS)
 
             results = []
             for ticker in tickers[:5]:  # Sweep top 5 watched tickers

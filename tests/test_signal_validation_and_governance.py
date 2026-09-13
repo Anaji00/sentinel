@@ -304,26 +304,69 @@ def get_auth_cookies():
     return {"sentinel_session": token}
 
 
-def test_explain_event_endpoint():
+class _OneEventDB:
+    """An events table holding one scored row, so the card can be checked."""
+
+    async def query(self, sql, *params):
+        return [{
+            "event_id": "evt_test_12345",
+            "type": "price_anomaly",
+            "source": "collector-tradfi",
+            "occurred_at": "2026-09-13T00:00:00+00:00",
+            "primary_entity_name": "PLTR",
+            "anomaly_score": 0.71,
+            "financial_data": {"ticker": "PLTR"},
+            "anomaly_breakdown": {"volatility_z_score": 2.0, "volume_z_score": 2.0},
+            "score_adjustments": [{"reason": "volume_capitulation_x1.4", "delta": 0.06}],
+        }]
+
+
+def test_explain_event_endpoint_reports_nothing_when_it_knows_nothing():
+    """This used to assert 200, and passed because the endpoint invented one.
+
+    With no database wired in the test app, `/explain/event/evt_test_12345`
+    returned a complete explanation -- of an NVDA volatility anomaly at 0.88,
+    under the id that had been asked for. The assertions below it pinned that
+    fabrication in place: `len(score_adjustments) == 4` was four hardcoded
+    steps, and `"model_weight" in factor` was a published coefficient for a
+    linear composite this platform does not have.
+
+    The irony was in the same function: it checked carefully that the model
+    card names RRCF rather than the retired IsolationForest, because "naming it
+    would misdescribe the model to anyone auditing a signal" -- while asserting
+    a waterfall whose first step read "Base IsolationForest Anomaly Score".
+    """
     client = TestClient(app)
     cookies = get_auth_cookies()
     res = client.get("/api/v1/explain/event/evt_test_12345", cookies=cookies)
+    assert res.status_code == 503, "an unreadable store is not an explanation"
+
+
+def test_explain_event_endpoint():
+    from services.api_gateway.dependencies import get_db_optional
+
+    client = TestClient(app)
+    cookies = get_auth_cookies()
+    app.dependency_overrides[get_db_optional] = lambda: _OneEventDB()
+    try:
+        res = client.get("/api/v1/explain/event/evt_test_12345", cookies=cookies)
+    finally:
+        app.dependency_overrides.pop(get_db_optional, None)
     assert res.status_code == 200
     data = res.json()
 
     assert data["event_id"] == "evt_test_12345"
-    assert "factor_attribution" in data
-    assert len(data["factor_attribution"]) > 0
+    # The dimensions the scorer recorded, and only those.
+    factors = {f["factor_key"]: f for f in data["factor_attribution"]}
+    assert set(factors) == {"volatility_z_score", "volume_z_score"}
+    assert factors["volatility_z_score"]["contribution_pct"] == 50.0
+    # No model_weight: there is no linear composite to publish coefficients for.
+    assert "model_weight" not in factors["volatility_z_score"]
 
-    # Verify factor attribution structure
-    factor = data["factor_attribution"][0]
-    assert "label" in factor
-    assert "contribution_pct" in factor
-    assert "model_weight" in factor
-
-    # Verify score adjustments derivation timeline
-    assert "score_adjustments" in data
-    assert len(data["score_adjustments"]) == 4
+    # The derivation is the base plus the steps the scorer actually recorded.
+    assert len(data["score_adjustments"]) == 2
+    assert data["score_adjustments"][1]["action"] == "volume_capitulation_x1.4"
+    assert data["score_adjustments"][-1]["score_after"] == pytest.approx(0.71)
 
     # Verify model card metadata. The card must name the scorer that actually
     # runs -- anomaly scoring is streaming RRCF; the batch IsolationForest ONNX

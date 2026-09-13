@@ -167,6 +167,10 @@ CREATE TABLE IF NOT EXISTS scenarios (
     supporting_event_ids   UUID[]
 );
  
+-- Additive columns live in shared/db/migrate.py, not here: init.sql runs only
+-- on a database's first container start, so a column added to it never reaches
+-- a deployment that already exists. See 0023_scenarios_primary_entity.
+
 CREATE INDEX IF NOT EXISTS scenario_status_idx ON scenarios(status, created_at DESC);
 
 

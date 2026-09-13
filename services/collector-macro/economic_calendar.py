@@ -263,7 +263,21 @@ class EconomicCalendarCollector:
             )
 
             if self.producer:
-                await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=event.primary_entity.id)
+                # Enriched only.
+                #
+                # `build_macro_release_event` returns a NormalizedEvent -- it
+                # computes the surprise, the bias and the score itself, because
+                # a scheduled release is a thing the collector understands
+                # better than a generic scorer does. Sending the same object to
+                # RAW_TRADFI as well did not enrich it twice: the consumer
+                # parses raw topics as RawEvent, a NormalizedEvent has no
+                # `raw_payload`, so it arrived with an empty one, matched no
+                # branch, and incremented `enrichment.tradfi.unrouted_source`.
+                #
+                # That counter exists to find feeds being thrown away. Every
+                # macro release was adding to it, which is how a signal becomes
+                # unreadable -- the one instrument for this class of defect,
+                # reporting a deliberate duplicate as a lost feed.
                 await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=event.primary_entity.id)
                 logger.info(f"📊 Emitted Macro Release Event: {event.headline}")
 

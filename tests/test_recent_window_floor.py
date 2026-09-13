@@ -97,5 +97,16 @@ def test_long_text_is_truncated_at_write():
 
 def test_the_window_itself_is_unchanged():
     """Rules genuinely look back forty-eight hours. This changes what goes in,
-    not how long it stays."""
-    assert "48 * 3600" in SOURCE
+    not how long it stays.
+
+    Asserted against the store rather than against the text `48 * 3600`, which
+    is where the number used to be written twice -- once as the prune horizon
+    and once as the point where `get_recent` stops trusting the cache. Reading
+    the value means the two staying equal is what is being tested, rather than
+    a particular way of spelling it.
+    """
+    from services.correlation.event_store import CACHED_WINDOW_HOURS, EventStore
+
+    assert CACHED_WINDOW_HOURS == 48
+    store = EventStore(redis_client=None, db_client=None)
+    assert store.window_seconds == CACHED_WINDOW_HOURS * 3600

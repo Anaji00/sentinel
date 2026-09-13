@@ -159,10 +159,21 @@ def test_hurst_exponent_bounds():
 # ── 5. MICROSTRUCTURE & LIQUIDITY METRICS ────────────────────────────────────
 
 def test_kyle_lambda():
-    price_changes = [0.5, -0.2, 0.8, -0.4, 0.3]
-    order_flows = [100.0, -50.0, 150.0, -80.0, 60.0]
+    """A measurable window returns a slope; an unmeasurable one returns None.
+
+    The five-point series below used to be the whole test, and kyle_lambda
+    requires ten -- so it was asserting `>= 0.0` against the value the function
+    returns when it gives up. That is the distinction the function now makes,
+    so the test makes it too.
+    """
+    too_short = quant_calc.kyle_lambda([0.5, -0.2, 0.8, -0.4, 0.3],
+                                       [100.0, -50.0, 150.0, -80.0, 60.0])
+    assert too_short is None
+
+    price_changes = [0.5, -0.2, 0.8, -0.4, 0.3] * 3
+    order_flows = [100.0, -50.0, 150.0, -80.0, 60.0] * 3
     kl = quant_calc.kyle_lambda(price_changes, order_flows)
-    assert kl >= 0.0
+    assert kl is not None and kl >= 0.0
 
 def test_amihud_illiquidity():
     returns = [0.02, -0.01, 0.03, -0.02]

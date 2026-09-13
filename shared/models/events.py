@@ -230,7 +230,11 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # Deliberately narrow. It matches "($59.06)", "(12.5%)" and "(-3)", and leaves
 # "(finorion)" and "(Class A)" alone, because those distinguish one entity from
 # another rather than describing its state at a moment.
-_DECORATIVE_VALUE_RE = re.compile(r"\s*\(\s*[-+]?[$€£¥]?\s*[\d][\d.,]*\s*%?\s*\)\s*$")
+# Square brackets too. The parenthetical form was the one observed in the live
+# graph and the one this was written for; a producer that reaches for the other
+# bracket mints the same fragmented identities, and the reason to strip it is
+# identical.
+_DECORATIVE_VALUE_RE = re.compile(r"\s*[\(\[]\s*[-+]?[$€£¥]?\s*[\d][\d.,]*\s*%?\s*[\)\]]\s*$")
 
 
 def canonical_entity_id(raw: Any, entity_type: "EntityType" = None) -> str:
@@ -501,6 +505,15 @@ class FinancialData(BaseModel):
     low_price: Optional[float] = None
     exchange: Optional[str] = None
     volume_oi_ratio: Optional[float] = None
+    # The statistic a volume anomaly was actually judged on.
+    #
+    # The quant radar computes a z-score, announces it to the console
+    # ("RADAR ANOMALY DETECTED: SGOV | Volume: ... | Z-Score: ..."), and had
+    # nowhere to store it -- so across 676 events in 24 hours the number that
+    # decided each one existed only in a log line, and nothing downstream could
+    # tell a z of 2.1 from a z of 9.0. Same shape as the cascade's flashpoint
+    # index: measured, then written into prose.
+    z_score: Optional[float] = None
     otm_percentage: Optional[float] = None
     option_type: Optional[str] = None
     # Earnings calendar fields (Phase 4)
@@ -616,6 +629,32 @@ class SecurityData(BaseModel):
     cve_id: Optional[str] = None
     cvss_score: Optional[float] = None
     exposure_type: Optional[str] = None
+
+    # Three fields the frontend has always read and the server has never sent.
+    #
+    # `CyberIntelligencePanel` counts KEV events with
+    # `filter(e => e.security_data?.cisa_kev).length` -- a headline number that
+    # was structurally always zero on a platform that ingests the CISA
+    # known-exploited-vulnerability catalogue. Always zero reads as "nothing
+    # being actively exploited right now", which is the most reassuring
+    # possible wrong answer.
+    #
+    # The same panel renders `sd.asn` as a badge and in its "IP / ASN" detail
+    # row. A BGP event's whole subject is an AS number and the enricher has it
+    # in hand, with no field to put it in. The row was not blank, which is
+    # worse: `_process_bgp` passed the announced prefix as `ip_address`, so
+    # "IP / ASN" showed a CIDR block under a label naming neither, while the
+    # AS number sat in the headline beside it.
+    #
+    # `route_leak_prefix` is where a prefix belongs -- the frontend has always
+    # declared the field -- and the panel's own tab is called "BGP ROUTE LEAKS".
+    #
+    # None of these is new information. Each was known at enrichment and had
+    # nowhere to go.
+    cisa_kev: Optional[bool] = None
+    asn: Optional[str] = None
+    ransomware_group: Optional[str] = None
+    route_leak_prefix: Optional[str] = None
     ip_address: Optional[str] = None
     port: Optional[int] = None
 

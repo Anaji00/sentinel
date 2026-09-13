@@ -30,6 +30,7 @@ from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
 from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistration
 from shared.utils.regime import current_regime
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("correlation.statistical_discovery")
 
@@ -173,7 +174,81 @@ class StatisticalDiscoveryEngine:
             pair = (src, tgt) if src < tgt else (tgt, src)
             pairs.add(pair)
 
+        # 3. The rest of the universe this platform actually holds bars for.
+        #
+        # The list above is thirty hand-written pairs, and the job reported
+        # "evaluated 17 candidate pairs" against a store holding 2,335,815 rows
+        # across 1,181 tickers. Eight of the twenty core equity/commodity pairs
+        # were unevaluable, and they were exactly the cross-asset ones: TNX,
+        # DXY, BTC-USD, ETH-USD, EURUSD and XLI have zero rows, under any
+        # spelling. So equities-vs-rates, vs-the-dollar, vs-FX and vs-crypto
+        # could not be tested at all and every surviving pair was
+        # equity-against-equity -- on a platform whose stated purpose is
+        # cross-asset correlation.
+        #
+        # Widened from the data rather than from a longer hand-list: the tickers
+        # with enough recent history to support an estimate are paired against
+        # the core names, which keeps the candidate count bounded and the pairs
+        # meaningful while making the engine's reach a function of what is
+        # collected instead of what somebody remembered to type.
+        liquid = await self._tickers_with_history()
+        if liquid:
+            anchors = [t for t in ("SPY", "QQQ", "CL=F", "GC=F", "TLT") if t in liquid]
+            for anchor in anchors:
+                for other in liquid:
+                    if other == anchor:
+                        continue
+                    pair = (anchor, other) if anchor < other else (other, anchor)
+                    pairs.add(pair)
+
+        # 4. Say what cannot be tested, rather than dropping it silently.
+        #
+        # A pair whose series is missing is skipped downstream with no record,
+        # which is how six symbols came to be named in the candidate list for
+        # months while none of them existed. Naming them is the difference
+        # between a gap that is visible and one that has to be measured to find.
+        if liquid:
+            named = {t for pair in pairs for t in pair if not str(t).startswith("MACRO:")}
+            absent = sorted(named - set(liquid))
+            if absent:
+                logger.warning(
+                    "Candidate pairs name %s symbol(s) with no usable price history, "
+                    "so every pair involving them is unevaluable: %s",
+                    len(absent), ", ".join(absent[:20]),
+                )
+
         return list(pairs)
+
+    async def _tickers_with_history(self, min_bars: int = 200, limit: int = 60) -> list:
+        """Tickers with enough recent bars for a correlation to mean anything.
+
+        `min_bars` sits well above the twenty `pearson_on_returns` requires, so a
+        symbol that only just qualifies does not enter the candidate set and then
+        fail the FDR correction on noise.
+        """
+        if self.db is None:
+            return []
+        try:
+            rows = await self.db.query(
+                """
+                SELECT ticker, COUNT(*) AS n
+                  FROM tradfi_bars
+                 WHERE time > NOW() - INTERVAL '30 days'
+                 GROUP BY ticker
+                HAVING COUNT(*) >= $1
+                 ORDER BY n DESC
+                 LIMIT $2
+                """,
+                min_bars, limit,
+            )
+            return [r["ticker"] for r in (rows or []) if r.get("ticker")]
+        except Exception as e:
+            # Counted, not whispered. A universe query that silently fails takes
+            # the engine back to the seventeen hand-listed pairs it was widened
+            # from, and a DEBUG line in a deployment that emits none would never
+            # say so.
+            swallowed("correlation.statistical_discovery._tickers_with_history", e, logger)
+            return []
 
     # ── 2. PRICE & SURPRISE SERIES RETRIEVAL FROM TIMESCALEDB (§4.1, §4.2, §5.2) ──
 

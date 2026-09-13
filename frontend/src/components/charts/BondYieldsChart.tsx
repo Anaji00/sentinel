@@ -2,17 +2,35 @@
 
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { fetcher } from '../../lib/api';
+import { describeApiError, fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Activity, Radio } from 'lucide-react';
 import { formatBps, formatPercent } from '../../lib/format';
+import ProvenanceBadge, { ProvenanceType } from '../ProvenanceBadge';
+
+interface SeriesProvenance {
+  source_type: ProvenanceType;
+  methodology?: string;
+}
 
 interface SeriesPoint {
   timestamp: string;
   price: number;
-  volume: number;
+  // Which feed answered, and what kind of number this is. The gateway resolves
+  // the 2Y through three sources in order -- the Treasury's own par-yield
+  // publication, the CBOE futures yield, then its own Redis cache -- and used
+  // to fall through to a hardcoded 4.15 labelled "Parametric Baseline Yield".
+  // The label never reached this component, which plots `price`, so an invented
+  // constant rendered identically to a Treasury print. The constant is gone and
+  // the label now arrives with the data.
+  provider?: string;
+  provenance?: SeriesProvenance;
+  // Nullable, because the backend stopped inventing one. A Treasury par
+  // yield and a cached quote report no volume, and the gateway now says so
+  // instead of sending 1000.
+  volume: number | null;
   anomaly_score: number;
 }
 
@@ -27,7 +45,7 @@ export default function BondYieldsChart() {
   // Real-time WebSocket stream ticks
   const liveTradfiEvents = useLiveEvents('tradfi');
 
-  const { data } = useSWR<MarketSeriesResponse>(
+  const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=US30Y,US10Y,US02Y,TLT,IEF&limit=50',
     fetcher,
     { refreshInterval: 3000 }
@@ -43,8 +61,8 @@ export default function BondYieldsChart() {
     liveTradfiEvents.forEach(e => {
       const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym.includes('30') || sym.includes('TYX')) {
-        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+        const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
       }
     });
     return list.slice(-50);
@@ -55,8 +73,8 @@ export default function BondYieldsChart() {
     liveTradfiEvents.forEach(e => {
       const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym.includes('10') || sym.includes('TNX')) {
-        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+        const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
       }
     });
     return list.slice(-50);
@@ -67,8 +85,8 @@ export default function BondYieldsChart() {
     liveTradfiEvents.forEach(e => {
       const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
       if (sym.includes('2') || sym.includes('2YY') || sym.includes('IRX')) {
-        const p = e.financial_data?.current_price || e.financial_data?.underlying_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: 1000, anomaly_score: e.anomaly_score });
+        const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
+        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
       }
     });
     return list.slice(-50);
@@ -85,6 +103,18 @@ export default function BondYieldsChart() {
   const isInverted = spread2Y10Y !== null ? spread2Y10Y < 0 : false;
 
   const pointsCount = Math.max(us30ySeries.length, us10ySeries.length, us02ySeries.length);
+
+  // The provenance of whichever point is actually on screen. A live WebSocket
+  // tick carries none, so the badge falls back to the last point that did.
+  const latest2YProvenance = useMemo(() => {
+    for (let i = us02ySeries.length - 1; i >= 0; i--) {
+      const point = us02ySeries[i];
+      if (point?.provenance) {
+        return { provenance: point.provenance, provider: point.provider };
+      }
+    }
+    return null;
+  }, [us02ySeries]);
 
   // Normalize SVG Path Coordinates for Real Ticks Only
   const { path30Y, path10Y, path2Y, pointsData } = useMemo(() => {
@@ -154,8 +184,10 @@ export default function BondYieldsChart() {
             {isInverted ? 'YIELD CURVE INVERTED' : 'NORMAL CURVE'}
           </Badge>
         ) : (
+          /* An outage and a quiet market are opposite facts, and this badge
+             used to state the second one for both. */
           <Badge variant="warning" pulse>
-            AWAITING LIVE DATA STREAM...
+            {describeApiError(error) ?? 'AWAITING LIVE DATA STREAM...'}
           </Badge>
         )
       }
@@ -185,10 +217,17 @@ export default function BondYieldsChart() {
 
           <div>
             <span className="text-slate-400 block text-[10px] uppercase font-bold">2Y TREASURY YIELD (US02Y)</span>
-            <div className="flex items-center gap-1.5 mt-0.5">
+            <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
               <span className="text-purple-400 font-extrabold text-base">
                 {latest2Y !== null ? formatPercent(latest2Y, { decimals: 2 }) : 'AWAITING FEED...'}
               </span>
+              {latest2Y !== null && latest2YProvenance && (
+                <ProvenanceBadge
+                  sourceType={latest2YProvenance.provenance.source_type}
+                  methodology={latest2YProvenance.provenance.methodology}
+                  dataInputs={latest2YProvenance.provider ? [latest2YProvenance.provider] : []}
+                />
+              )}
             </div>
           </div>
 
@@ -232,10 +271,16 @@ export default function BondYieldsChart() {
           <div className="h-48 w-full bg-[#05070c] rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
             <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
             <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
-              AWAITING LIVE DATA STREAM FOR TREASURY YIELDS (30Y, 10Y, 2Y)
+              {error
+                ? `TREASURY YIELD FEED: ${describeApiError(error)}`
+                : 'AWAITING LIVE DATA STREAM FOR TREASURY YIELDS (30Y, 10Y, 2Y)'}
             </span>
+            {/* The reassurance below is a claim about the backend, and it was
+                printed while the request to that backend was failing. */}
             <p className="text-[10px] text-slate-500 max-w-sm">
-              Backend live WebSocket and REST pollers are active. Ticks will render automatically upon database ingestion.
+              {error
+                ? 'The series request did not succeed. Nothing is being plotted, and this is not a quiet market.'
+                : 'Backend live WebSocket and REST pollers are active. Ticks will render automatically upon database ingestion.'}
             </p>
           </div>
         )}

@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo } from 'react';
 import useSWR from 'swr';
+import { describeApiError } from '@/lib/api';
 import { fetcher } from '@/lib/api';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -12,7 +13,15 @@ import BondYieldsChart from '@/components/charts/BondYieldsChart';
 interface SeriesPoint {
   timestamp: string;
   price: number;
-  volume: number;
+  // Nullable, as the gateway has always been able to send it.
+  //
+  // /market/series answers a 2Y par yield and a cached quote with no volume at
+  // all -- BondYieldsChart's own `SeriesPoint` has said `number | null` since
+  // that was found -- and these two copies of the interface still declared it
+  // required. Which is how a live tick with no volume ended up carrying the
+  // literal 1000 instead: with the type insisting on a number, the `|| 1000`
+  // that produced one looked correct.
+  volume: number | null;
   anomaly_score: number;
 }
 
@@ -57,10 +66,16 @@ const ASSET_REGISTRY: AssetConfig[] = [
 function AssetSparklineCard({
   config,
   data,
+  feedError,
   onExpand,
 }: {
   config: AssetConfig;
   data: SeriesPoint[];
+  /** Why there is no series, when the reason is that the request failed.
+   *  An empty grid during an outage used to read "AWAITING BACKEND
+   *  TELEMETRY / POLLING WEBSOCKET / REST FEED (3S)" -- a description of a
+   *  healthy system, printed thirteen times over. */
+  feedError?: unknown;
   onExpand: (config: AssetConfig) => void;
 }) {
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
@@ -182,8 +197,10 @@ function AssetSparklineCard({
         ) : (
           <div className="flex flex-col items-center justify-center gap-1.5 text-center p-2">
             <Radio className="w-5 h-5 text-amber-400/80 animate-pulse" />
-            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">AWAITING BACKEND TELEMETRY</span>
-            <span className="text-[9px] text-slate-600">POLLING WEBSOCKET / REST FEED (3S)</span>
+            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">{describeApiError(feedError) ?? 'AWAITING BACKEND TELEMETRY'}</span>
+            <span className="text-[9px] text-slate-600">
+              {feedError ? 'THE SERIES REQUEST DID NOT SUCCEED' : 'POLLING WEBSOCKET / REST FEED (3S)'}
+            </span>
           </div>
         )}
       </div>
@@ -221,7 +238,7 @@ export default function ChartsPage() {
   const liveEvents = useLiveEvents('all');
 
   // Live polling every 3 seconds from backend market-series route
-  const { data: marketData } = useSWR<MarketSeriesResponse>(
+  const { data: marketData, error: marketError } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=SPY,QQQ,DJI,VIX,WTI,BRENT,BTCUSD,ETHUSD,TLT,US30Y,US10Y,US02Y,GLD&limit=60',
     fetcher,
     { refreshInterval: 3000 }
@@ -241,7 +258,7 @@ export default function ChartsPage() {
     // 2. Real-time WebSocket ticks
     liveEvents.forEach(e => {
       const rawSym = (e.crypto_data?.pair || e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase().replace('-', '');
-      const price = e.crypto_data?.price || e.financial_data?.current_price || e.financial_data?.underlying_price;
+      const price = e.crypto_data?.price || e.financial_data?.underlying_price || e.financial_data?.close_price;
 
       if (rawSym && price && price > 0) {
         const canonicalKeys = [rawSym];
@@ -257,7 +274,11 @@ export default function ChartsPage() {
             map[k] = [...map[k], {
               timestamp: e.occurred_at,
               price: price,
-              volume: e.crypto_data?.volume || e.financial_data?.volume || 1000,
+              // `crypto_data.volume` has never existed; the payload carries
+              // `size_tokens`. With the first term permanently undefined and
+              // `financial_data` absent on a crypto tick, every live point on
+              // this chart reported a volume of exactly 1000.
+              volume: e.crypto_data?.size_tokens ?? e.financial_data?.volume ?? null,
               anomaly_score: e.anomaly_score ?? 0
             }].slice(-60);
           }
@@ -356,10 +377,11 @@ export default function ChartsPage() {
     else if (latestPrice > latest20 && latestPrice > latest50) alignment = 'BULLISH_CROSS';
     else if (latestPrice < latest20 && latestPrice < latest50) alignment = 'BEARISH_CROSS';
 
-    const maxVol = Math.max(...expandedSeries.map((s) => s.volume)) || 1;
+    const maxVol = Math.max(...expandedSeries.map((s) => s.volume ?? 0)) || 1;
     const bars = pts.map((pt) => ({
       x: pt.x,
-      h: (pt.vol / maxVol) * 60,
+      // No volume draws no bar, rather than borrowing the scale's own zero.
+      h: ((pt.vol ?? 0) / maxVol) * 60,
     }));
 
     return {
@@ -422,6 +444,7 @@ export default function ChartsPage() {
             key={asset.symbol}
             config={asset}
             data={seriesMap[asset.symbol] || []}
+            feedError={marketError}
             onExpand={(config) => setExpandedAsset(config)}
           />
         ))}

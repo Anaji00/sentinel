@@ -59,6 +59,29 @@ MIN_SILENCE_SEC = 900
 # not move the baseline much.
 _INTERVAL_ALPHA = 0.2
 
+# The reference cadence a source is compared against, and how slowly it moves.
+#
+# `_INTERVAL_KEY` is an EMA over observed gaps at alpha 0.2, which means the
+# baseline follows the failure: when a feed's rate collapses its gaps lengthen,
+# the EMA absorbs them within five to ten observations, and the source is once
+# again arriving "on schedule". Measured live, finnhub_equities went from
+# 20,827 events a day to 5 and its expected interval had drifted to 11,970
+# seconds -- reported `stale: false` throughout.
+#
+# So freshness alone cannot answer "is this feed still seeing what it used to".
+# A far slower reference interval can: at alpha 0.01 it takes hundreds of
+# observations to move, so a sustained collapse shows up as a ratio between the
+# two rather than being absorbed by both.
+_REFERENCE_INTERVAL_KEY = "sentinel:sources:reference_interval"
+_REFERENCE_ALPHA = 0.01
+
+# How far the recent cadence may fall behind the reference before the source is
+# reported as degraded. Four times slower than it used to run is not noise.
+RATE_COLLAPSE_MULTIPLE = 4.0
+
+# Observations needed before the reference is worth comparing against.
+MIN_OBSERVATIONS_FOR_REFERENCE = 30
+
 
 async def mark_source_filtered(redis_client: Any, source: str) -> None:
     """Records that a source produced something the platform deliberately dropped.
@@ -103,6 +126,7 @@ async def mark_sources_seen(redis_client: Any, sources: Iterable[str]) -> None:
 
         previous = await raw.hmget(_LAST_SEEN_KEY, list(distinct))
         intervals = await raw.hgetall(_INTERVAL_KEY)
+        reference_intervals = await raw.hgetall(_REFERENCE_INTERVAL_KEY)
 
         pipe = raw.pipeline()
         for source, prev in zip(distinct, previous or []):
@@ -124,9 +148,20 @@ async def mark_sources_seen(redis_client: Any, sources: Iterable[str]) -> None:
                     pipe.hset(_INTERVAL_KEY, source, updated)
                     pipe.hincrby(f"{_INTERVAL_KEY}:n", source, 1)
 
+                    # The slow reference, updated from the same observation.
+                    # Two EMAs over one series at different speeds: the fast one
+                    # says what the cadence is now, the slow one remembers what
+                    # it was, and the ratio is the thing neither can say alone.
+                    stored_ref = _decode(reference_intervals, source)
+                    updated_ref = gap if stored_ref is None else (
+                        _REFERENCE_ALPHA * gap + (1 - _REFERENCE_ALPHA) * stored_ref
+                    )
+                    pipe.hset(_REFERENCE_INTERVAL_KEY, source, updated_ref)
+
         pipe.expire(_LAST_SEEN_KEY, _FRESHNESS_TTL_SEC)
         pipe.expire(_INTERVAL_KEY, _FRESHNESS_TTL_SEC)
         pipe.expire(f"{_INTERVAL_KEY}:n", _FRESHNESS_TTL_SEC)
+        pipe.expire(_REFERENCE_INTERVAL_KEY, _FRESHNESS_TTL_SEC)
         await pipe.execute()
     except Exception as e:
         logger.debug("Source freshness write skipped: %s", e)
@@ -161,6 +196,7 @@ async def source_freshness(redis_client: Any) -> List[Dict[str, Any]]:
         raw = getattr(redis_client, "raw", redis_client)
         last_seen = await raw.hgetall(_LAST_SEEN_KEY)
         intervals = await raw.hgetall(_INTERVAL_KEY)
+        reference_intervals = await raw.hgetall(_REFERENCE_INTERVAL_KEY)
         counts = await raw.hgetall(f"{_INTERVAL_KEY}:n")
         filtered = await raw.hgetall(_FILTERED_KEY)
     except Exception as e:
@@ -190,6 +226,21 @@ async def source_freshness(redis_client: Any) -> List[Dict[str, Any]]:
             budget = MAX_SILENCE_SEC
             basis = f"absolute ceiling ({MAX_SILENCE_SEC // 3600}h) -- too few observations to know its cadence"
 
+        # Has this source's cadence collapsed relative to what it used to be?
+        #
+        # Freshness answers "has it gone quiet". This answers "is it still
+        # producing at the rate it used to", which is the question a feed that
+        # degrades rather than stops never triggers.
+        reference = _decode(reference_intervals, source)
+        rate_ratio = None
+        rate_collapsed = False
+        if (
+            interval and reference and reference > 0
+            and observations >= MIN_OBSERVATIONS_FOR_REFERENCE
+        ):
+            rate_ratio = round(interval / reference, 2)
+            rate_collapsed = rate_ratio >= RATE_COLLAPSE_MULTIPLE
+
         # A source heard from recently but filtered to nothing is quiet, not dead.
         filtered_at = _decode(filtered, source)
         recently_filtered = bool(filtered_at and (now - filtered_at) < budget)
@@ -205,6 +256,12 @@ async def source_freshness(redis_client: Any) -> List[Dict[str, Any]]:
             # is producing, and the platform is choosing not to publish.
             "stale": silence > budget and not recently_filtered,
             "basis": basis,
+            # How much slower this source is running than it historically has.
+            # None until there is enough history for the comparison to mean
+            # anything; >= RATE_COLLAPSE_MULTIPLE is a feed that is alive and
+            # no longer doing its job.
+            "rate_ratio_vs_reference": rate_ratio,
+            "rate_collapsed": rate_collapsed,
         })
 
     out.sort(key=lambda r: (not r["stale"], -r["silent_seconds"]))
@@ -214,3 +271,17 @@ async def source_freshness(redis_client: Any) -> List[Dict[str, Any]]:
 async def stale_sources(redis_client: Any) -> List[Dict[str, Any]]:
     """Just the ones that are quiet for longer than they should be."""
     return [r for r in await source_freshness(redis_client) if r["stale"]]
+
+
+async def degraded_sources(redis_client: Any) -> List[Dict[str, Any]]:
+    """Sources still producing, at a small fraction of the rate they used to.
+
+    Distinct from `stale_sources`, and the gap between the two is the point: a
+    feed that stops is caught by silence, and a feed that decays is not --
+    because the interval it is judged against decays with it. This is the
+    condition an exhausted API quota or a narrowed filter actually produces.
+    """
+    return [
+        r for r in await source_freshness(redis_client)
+        if r.get("rate_collapsed") and not r.get("filtered_not_silent")
+    ]

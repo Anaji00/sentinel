@@ -204,6 +204,14 @@ export default function CyberIntelligencePanel() {
                     <div><span className="text-slate-400 block">CVSS Score:</span> <span className="text-white font-bold">{selectedEvent.security_data.cvss_score ? selectedEvent.security_data.cvss_score.toFixed(1) : 'N/A'}</span></div>
                     <div><span className="text-slate-400 block">Affected Org:</span> <span className="text-cyan-300 font-bold">{selectedEvent.security_data.affected_org || 'N/A'}</span></div>
                     <div><span className="text-slate-400 block">IP / ASN:</span> <span className="text-purple-300 font-bold">{selectedEvent.security_data.ip_address || selectedEvent.security_data.asn || 'N/A'}</span></div>
+                    {/* The announced prefix, which used to arrive as `ip_address`
+                        and rendered above under a label naming neither. */}
+                    {selectedEvent.security_data.route_leak_prefix && (
+                      <div><span className="text-slate-400 block">Announced Prefix:</span> <span className="text-amber-300 font-bold">{selectedEvent.security_data.route_leak_prefix}</span></div>
+                    )}
+                    {selectedEvent.security_data.ransomware_group && (
+                      <div><span className="text-slate-400 block">Claiming Group:</span> <span className="text-rose-300 font-bold">{selectedEvent.security_data.ransomware_group}</span></div>
+                    )}
                   </div>
                 </div>
               )}

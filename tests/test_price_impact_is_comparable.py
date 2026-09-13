@@ -82,6 +82,14 @@ def test_impact_is_never_negative():
 
 
 def test_a_missing_price_is_not_an_infinite_impact():
+    """A price that cannot anchor the impact gives no impact, not a zero one.
+
+    This asserted `== 0.0`, which satisfies the function's name and nothing
+    else: the docstring says higher impact means less liquid, so zero is the
+    deepest book a consumer can read, and `microstructure_stop_distance`
+    tightens a stop on exactly that reading. None is the answer that cannot be
+    mistaken for a measurement.
+    """
     dp, sv = _series(100.0, 0.005)
-    assert kyle_impact_bps(dp, sv, reference_price=0.0) == 0.0
-    assert kyle_impact_bps(dp, sv, reference_price=-1.0) == 0.0
+    assert kyle_impact_bps(dp, sv, reference_price=0.0) is None
+    assert kyle_impact_bps(dp, sv, reference_price=-1.0) is None

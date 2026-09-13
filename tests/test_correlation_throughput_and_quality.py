@@ -165,9 +165,25 @@ def test_candidates_and_kept_evidence_are_reported_separately():
 
 
 def test_subjects_are_counted_not_headlines():
-    """Three headlines about one vessel are one observation seen three times."""
+    """Three headlines about one vessel are one observation seen three times.
+
+    And an event that names no subject is not a fourth. The set comprehension
+    this used to assert on ended `or idx`, so an unnamed event fell back to
+    `enumerate`'s index and counted as distinct -- which, because the Qdrant
+    payload carried no entity_name or entity_id at all, made distinct_subjects
+    ALWAYS len(kept). That is why 1,201 of 1,243 clusters in 24 hours published
+    the identical confidence 0.7999999999999999: 0.35 + 0.15x3, where the 3 was
+    never a measurement.
+    """
     source = _source()
-    assert "distinct_subjects = len({" in source
+    assert "_named_subjects = {" in source
+    assert "distinct_subjects = len(_named_subjects)" in source
+    assert "or e.get(\"entity_id\") or idx" not in source, (
+        "an unnamed event is an event whose subject is unknown, not a distinct one"
+    )
+    # And the count of what could not be named travels with it, so a reader can
+    # tell a narrow cluster from one assembled out of unlabelled points.
+    assert '"unnamed_subjects": _unnamed' in source
 
 
 # -- confidence ---------------------------------------------------------------

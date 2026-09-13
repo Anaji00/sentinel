@@ -8,6 +8,9 @@ Scores sentiment and anomaly.
 
 import asyncio
 import logging
+import os
+from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import swallowed
 from datetime import datetime, timezone
 from typing import Optional, List
 import re
@@ -126,6 +129,20 @@ INFLATION_COST_BURDEN_KEYWORDS = [
 ]
 INFLATION_COST_REGEXES = [re.compile(p, re.IGNORECASE) for p in INFLATION_COST_BURDEN_KEYWORDS]
 
+# Cue count at which the polarity is trusted at half its face value.
+#
+# Two is deliberate: the lexicons below are broad enough that one match is
+# routinely incidental ("records", "gains", "secure" appear in headlines with no
+# directional content) while two co-occurring cues are usually about the same
+# claim.
+SENTIMENT_EVIDENCE_HALFWAY = float(os.getenv("NEWS_SENTIMENT_EVIDENCE_HALFWAY", "2"))
+
+# How fast an entity's running sentiment follows the latest headline, and how
+# long it is remembered. A single story should move the mean, not replace it.
+ENTITY_SENTIMENT_ALPHA = float(os.getenv("NEWS_ENTITY_SENTIMENT_ALPHA", "0.3"))
+ENTITY_SENTIMENT_TTL_SEC = int(os.getenv("NEWS_ENTITY_SENTIMENT_TTL_SEC", str(14 * 86400)))
+
+
 def _sentiment(text: str) -> float:
     t = text.lower()
     is_cost_burden_topic = any(rx.search(t) for rx in INFLATION_COST_REGEXES)
@@ -164,7 +181,26 @@ def _sentiment(text: str) -> float:
     total = neg + pos
     if total == 0:
         return 0.0
-    return round((pos - neg) / total, 3)
+    # The polarity, shrunk toward neutral by how little evidence there was.
+    #
+    # This returned `(pos - neg) / total` outright, so a headline containing
+    # exactly ONE matched word scored +/-1.000 -- the top of the scale -- and one
+    # containing none scored 0.0. The live distribution was the function's own
+    # signature rather than anything about the news: of 1,605 headlines in 48
+    # hours, 995 sat at 0.00, 351 at -1.00 and 222 at +1.00, with the remainder
+    # on small fractions. 573 carried maximal sentiment on the strength of a
+    # single keyword.
+    #
+    # A ratio is the right shape and a ratio of one observation is not a
+    # measurement. Weighting by total/(total + k) is the standard shrinkage: one
+    # cue reaches a third of the scale, two a half, four two thirds, and the
+    # ceiling is approached but never touched -- the same argument as every
+    # other bounded score in this platform. Ordering between headlines is
+    # preserved; what changes is that a one-word match can no longer outrank a
+    # story with five.
+    polarity = (pos - neg) / total
+    weight = total / (total + SENTIMENT_EVIDENCE_HALFWAY)
+    return round(polarity * weight, 3)
 
 FINANCIAL_KEYWORDS = {
     # ── MACRO & MONETARY POLICY ──
@@ -325,6 +361,49 @@ class NewsEnricher:
             except Exception as e:
                 logger.debug(f"spaCy NER extraction failed: {e}")
         
+        # Subjects the collector already resolved, ahead of anything spaCy can
+        # infer from a title.
+        #
+        # `collector-macro/regulatory.py` reads the Federal Register and
+        # resolves `affected_tickers` for each rule it finds -- the one field
+        # that makes a regulatory action tradeable. Nothing read it. An export
+        # control naming semiconductor equipment arrived with AMAT, LRCX and
+        # KLAC already attached, and the enricher discarded them and extracted
+        # "Bureau of Industry and Security" from the headline instead.
+        #
+        # First, because the subject join compares identity tokens and a
+        # resolved ticker is the strongest identity a news event can carry.
+        resolved = [
+            str(t).strip().upper()
+            for t in (p.get("affected_tickers") or [])
+            if t and str(t).strip()
+        ]
+        if resolved:
+            named_entities = resolved + named_entities
+            tags.append("resolved_tickers")
+
+        # Where it was posted, and by whom.
+        #
+        # The social collector emits `subreddit` or `channel` and `author` on
+        # every primary_social item, and the enricher read neither. That is the
+        # difference between one subreddit shouting and three independently
+        # discussing the same name -- which is the whole content of a
+        # coordinated-push signal, and the only thing that makes the social
+        # half of this feed worth more than its loudest thread.
+        #
+        # Carried as tags rather than folded into `source`: a venue is not a
+        # collector, and `source` is what the scorecards, the freshness monitor
+        # and the unrouted-source counter all key on. Whether independent
+        # corroboration should count venues as well as feeds is a scoring
+        # decision, and it is recorded in tests/test_social_venue_is_carried.py
+        # rather than made here as one change among eight.
+        venue = p.get("subreddit") or p.get("channel")
+        if venue:
+            tags.append(f"venue:{str(venue).strip().lower()}")
+        author = p.get("author")
+        if author:
+            tags.append(f"author:{str(author).strip().lower()}")
+
         unique_entities = list(dict.fromkeys(named_entities))
         tags.extend(unique_entities)
             
@@ -414,7 +493,25 @@ class NewsEnricher:
         tags.append(f"source_type:{source_type}")
 
         event_type = EventType.SOCIAL_SIGNAL if source_type == "primary_social" else EventType.HEADLINE
-    
+
+        # The rolling per-entity sentiment the scorer has always read.
+        #
+        # `anomaly_scorer` looks up `sentinel:semantic_sentiment:{entity}` for
+        # every named entity, at two sites, and contributes `abs(val) * 0.1` to
+        # the score. Nothing in the tree had ever written that key -- zero of
+        # them existed -- so the term was structurally always zero and the
+        # "semantic" half of the news score did nothing.
+        #
+        # Written here because this is the only place that holds both a
+        # sentiment and the entities it is about. An EMA rather than the latest
+        # value: one alarming headline about a company is not that company's
+        # standing sentiment, and the scorer's own `abs(val)` reading treats the
+        # magnitude as conviction.
+        safe_create_task(
+            self._record_entity_sentiment(unique_entities, sentiment),
+            name="news-entity-sentiment",
+        )
+
         return NormalizedEvent(
             event_id=raw.event_id, trace_id=raw.trace_id,
             type=event_type,
@@ -437,5 +534,52 @@ class NewsEnricher:
                 f"{title} {summary}".strip(),
                 source=str(raw.source or "unknown"),
                 reliability=reliability,
+                # When the story was filed, not when the poller reached it.
+                # Headlines arrive a mean of 2h50m after publication and up to
+                # 11.5 hours, so an arrival-keyed window measured this
+                # platform's cadence rather than the world's.
+                published_at=(
+                    raw.occurred_at.timestamp()
+                    if getattr(raw, "occurred_at", None) else None
+                ),
             ).to_dict(),
         )
+
+    async def _record_entity_sentiment(self, entities: list, sentiment: float) -> None:
+        """Fold this headline's sentiment into each named entity's running mean.
+
+        Bounded to [-1, 1] like its input, expiring so a company is judged on
+        recent coverage rather than on everything ever written about it.
+        """
+        if not entities or not self.redis or getattr(self.redis, "raw", None) is None:
+            return
+        try:
+            value = float(sentiment)
+        except (TypeError, ValueError):
+            return
+        if value != value:                                  # NaN
+            return
+        raw_redis = self.redis.raw
+        try:
+            pipe = raw_redis.pipeline()
+            keys = [f"sentinel:semantic_sentiment:{str(e).lower()}" for e in entities[:12]]
+            for k in keys:
+                pipe.get(k)
+            prior = await pipe.execute()
+
+            pipe = raw_redis.pipeline()
+            for k, was in zip(keys, prior):
+                try:
+                    previous = float(was) if was is not None else None
+                except (TypeError, ValueError):
+                    previous = None
+                blended = (
+                    value if previous is None
+                    else (ENTITY_SENTIMENT_ALPHA * value
+                          + (1.0 - ENTITY_SENTIMENT_ALPHA) * previous)
+                )
+                blended = max(-1.0, min(1.0, blended))
+                pipe.set(k, f"{blended:.4f}", ex=ENTITY_SENTIMENT_TTL_SEC)
+            await pipe.execute()
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.news._record_entity_sentiment", _exc, logger)

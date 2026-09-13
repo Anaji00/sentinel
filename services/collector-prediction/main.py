@@ -31,12 +31,16 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
+from shared.utils.logging import setup_sentinel_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s"
-)
-logger = logging.getLogger("collector.prediction")
+# Credential redaction rides on the shared handler.
+#
+# This called logging.basicConfig(), which installs a plain StreamHandler
+# with no RedactingFilter -- so any credential appearing in an exception
+# message reached stdout in clear. asyncpg and aioredis raise connection
+# errors whose text embeds the full DSN, password included, and this
+# service connects to both.
+logger = setup_sentinel_logging("collector.prediction", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
@@ -536,6 +540,16 @@ async def poll_kalshi(producer: SentinelProducer):
                             if market.get("status") != "open":
                                 continue
                                 
+                            # Read once to reject expired markets, and then
+                            # thrown away -- while `PredictionMarketData`
+                            # declares `resolution_date` and the enricher reads
+                            # it by that name, so the field was null on every
+                            # prediction event the platform has ever produced.
+                            #
+                            # A contract at 67% resolving in three weeks is a
+                            # tradeable claim; the same 67% resolving in 2028 is
+                            # noise, and nothing downstream could tell them
+                            # apart. The frontend declares the field too.
                             exp_ts = market.get("expiration_ts")
                             if exp_ts:
                                 try:
@@ -596,7 +610,12 @@ async def poll_kalshi(producer: SentinelProducer):
                                     "yes_bid": yes_bid_dollars if yes_bid_dollars is not None else yes_bid,
                                     "no_bid": no_bid_dollars if no_bid_dollars is not None else no_bid,
                                     "yes_probability": yes_prob,
-                                    "no_probability": no_prob
+                                    "no_probability": no_prob,
+                                    # The expiry this poller already read, in
+                                    # the name the enricher and the frontend
+                                    # both ask for. It was fetched, used to
+                                    # reject expired markets, and dropped.
+                                    "resolution_date": market.get("expiration_ts"),
                                 }
                             )
                             await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)

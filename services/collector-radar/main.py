@@ -36,9 +36,17 @@ from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 from shared.utils.market_session import poll_interval
-logger = logging.getLogger("collector.radar")
+from shared.utils.logging import setup_sentinel_logging
+# Credential redaction rides on the shared handler.
+#
+# This called logging.basicConfig(), which installs a plain StreamHandler
+# with no RedactingFilter -- so any credential appearing in an exception
+# message reached stdout in clear. asyncpg and aioredis raise connection
+# errors whose text embeds the full DSN, password included, and this
+# service connects to both. Fourteen of nineteen services already went
+# through setup_sentinel_logging; these five did not.
+logger = setup_sentinel_logging("collector.radar", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 # What the radar wants when the market is busy. Everything slower than this is
 # derived from the session rather than configured separately.

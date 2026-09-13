@@ -30,14 +30,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from services.api_gateway.dependencies import get_redis_optional
+from shared.utils.quiet_failures import swallowed
 from shared.utils.rbac import require_role, Role
+from shared.utils.rule_feedback import (
+    MIN_FEEDBACK_FOR_REVIEW,
+    NEGATIVE_SHARE_FOR_REVIEW,
+    RULE_FEEDBACK_KEY,
+    needs_review,
+)
 
 logger = logging.getLogger("api-gateway.feedback")
 router = APIRouter(prefix="/api/v1/feedback", tags=["Analyst Feedback"])
 
 # Where feedback accumulates. Per-rule counters drive the review list; the log
 # keeps the reasons, which are the part worth reading.
-RULE_FEEDBACK_KEY = "sentinel:feedback:rule"
+# Imported, not restated. The rule agent's prune pass reads these same
+# counters now, and a key convention spelled out in two places is how
+# `sentinel:watched:equities` came to be read under a name nobody wrote.
 FEEDBACK_LOG_KEY = "sentinel:feedback:log"
 FEEDBACK_LOG_MAX = 1000
 FEEDBACK_TTL_SEC = 90 * 86400
@@ -45,8 +54,6 @@ FEEDBACK_TTL_SEC = 90 * 86400
 # How much negative feedback, and how consistently, before a rule is surfaced
 # for review. Both bars exist: three complaints out of four firings is a signal,
 # three out of three hundred is an opinion.
-MIN_FEEDBACK_FOR_REVIEW = 5
-NEGATIVE_SHARE_FOR_REVIEW = 0.6
 
 VERDICTS = ("useful", "not_useful", "wrong", "duplicate")
 
@@ -175,16 +182,28 @@ async def get_rule_feedback(
                 "negative_share": round(share, 4),
                 "verdicts": {k: v for k, v in decoded.items()
                              if k not in ("total", "negative")},
-                "needs_review": bool(
-                    total >= MIN_FEEDBACK_FOR_REVIEW and share >= NEGATIVE_SHARE_FOR_REVIEW
-                ),
+                "needs_review": needs_review(total, negative),
             })
 
         out.sort(key=lambda r: (-r["negative_share"], -r["total"]))
-        return {"rules": out[:limit]}
-    except Exception as e:
-        logger.debug("Rule feedback read failed: %s", e)
-        return {"rules": []}
+        # The thresholds travel with the answer, so a reader does not have to
+        # infer what `needs_review` meant from the numbers beside it.
+        return {
+            "rules": out[:limit],
+            "review_threshold": {
+                "min_verdicts": MIN_FEEDBACK_FOR_REVIEW,
+                "negative_share": NEGATIVE_SHARE_FOR_REVIEW,
+            },
+        }
+    except Exception as _exc:
+        # An empty list said "no analyst has judged any rule", which is a
+        # statement about the platform, not about the read. 503 says what
+        # happened.
+        swallowed("api_gateway.routes.feedback.get_rule_feedback", _exc, logger)
+        raise HTTPException(
+            status_code=503,
+            detail="Rule feedback store is unavailable; no verdicts could be read.",
+        )
 
 
 @router.get("/log")

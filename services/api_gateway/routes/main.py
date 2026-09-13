@@ -53,6 +53,7 @@ from services.api_gateway.routes import (
     sovereignty,
     attribution,
     feedback,
+    dlq,
 )
 
 @asynccontextmanager
@@ -179,6 +180,7 @@ app.include_router(feedback.router)
 app.include_router(health.router)
 app.include_router(watchlists.router)
 app.include_router(audit.router)
+app.include_router(dlq.router)
 app.include_router(cases.router)
 app.include_router(portfolio.router)
 app.include_router(reports.router)

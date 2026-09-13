@@ -58,8 +58,27 @@ def test_only_liveness_and_readiness_are_exempt():
 
 
 def test_a_probe_is_forwarded_without_the_operator_key():
-    """The escalation was the key, not the skipped check."""
-    assert "hasSession || publicPath || probePath" in PROXY
+    """The escalation was the key, not the skipped check.
+
+    This used to pin the literal source expression that decided when the master
+    key was attached. That expression is gone, because the answer became
+    "never": the key is now deleted from every forwarded request, which is a
+    stronger guarantee than the condition it replaced and would have failed a
+    test that matched on the old spelling.
+    """
+    code = _code_only(PROXY)
+    # The master key is stripped, in both spellings a caller could send.
+    assert "headers.delete('X-API-KEY')" in code
+    assert "headers.delete('x-api-key')" in code
+    # And it is never put back. Nothing may set the header on a forwarded
+    # request, whatever the path or session state.
+    assert "headers.set('X-API-KEY'" not in code
+    assert "headers.set('x-api-key'" not in code
+    assert "API_GATEWAY_KEY" not in code, (
+        "the operator key is read in the proxy again; it has no legitimate "
+        "caller here, and attaching it to an unauthenticated request is what "
+        "turned a skipped check into a privilege escalation"
+    )
 
 
 def test_the_gateway_allowlists_rather_than_denylists_health():

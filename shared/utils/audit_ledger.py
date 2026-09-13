@@ -38,9 +38,36 @@ def _is_unique_violation(exc: Exception) -> bool:
     return "23505" in str(exc) or "duplicate key value" in str(exc).lower()
 
 
-def compute_entry_hash(prev_hash: str, timestamp: str, actor: str, action: str, details_json: str) -> str:
-    """Computes the SHA-256 digest of an audit entry chaining from the previous hash."""
-    message = f"{prev_hash}|{timestamp}|{actor}|{action}|{details_json}".encode("utf-8")
+def compute_entry_hash(
+    prev_hash: str,
+    timestamp: str,
+    actor: str,
+    action: str,
+    details_json: str,
+    resource_type: str = "",
+    resource_id: str = "",
+    ip_address: str = "",
+) -> str:
+    """Computes the SHA-256 digest of an audit entry chaining from the previous hash.
+
+    `resource_type`, `resource_id` and `ip_address` are covered.
+
+    They were stored, returned by the API, and outside the digest -- so all
+    three could be altered in the database and `verify_chain()` would still
+    return VERIFIED_VALID. `resource_id` is the field that says *which* order
+    was placed, which watchlist entry changed, which entity was merged, and
+    `ip_address` the only record of where an action came from. The module
+    docstring claims tamper detection for trading and governance mutations;
+    who did what and when was covered, what it was done to was not.
+
+    Defaulted to empty strings so the signature stays compatible with any
+    caller that has not been updated, and so an entry written before these were
+    covered still hashes the way it did.
+    """
+    message = (
+        f"{prev_hash}|{timestamp}|{actor}|{action}|{details_json}"
+        f"|{resource_type or ''}|{resource_id or ''}|{ip_address or ''}"
+    ).encode("utf-8")
     return hashlib.sha256(message).hexdigest()
 
 
@@ -65,10 +92,22 @@ class AuditLedger:
         details_json = json.dumps(details_obj, sort_keys=True)
 
         if not self.db:
-            # The ledger is the system of record for trade execution and governance
-            # changes. Redis alone cannot back it — it runs allkeys-lru and is
-            # evictable — so refuse to record rather than create the false
-            # impression that an audit trail exists.
+            # The ledger is the system of record for trade execution and
+            # governance changes, so refuse to record rather than create the
+            # false impression that an audit trail exists.
+            #
+            # This used to say Redis "runs allkeys-lru and is evictable". That
+            # was true when it was written and is not true now: the policy was
+            # changed to volatile-lru during this audit, after allkeys-lru
+            # evicted 83,289 keys including every recorded prediction. Under
+            # volatile-lru a key with no TTL is never evicted, and appendonly
+            # is on.
+            #
+            # The refusal stands on better ground anyway. A hash chain needs
+            # an append-only guarantee, a uniqueness constraint that serialises
+            # concurrent appends, and a store that cannot be rewritten in
+            # place. audit_ledger has all three as table constraints and a
+            # trigger; a Redis list has none of them.
             raise AuditLedgerUnavailable(
                 "Audit ledger requires a durable database connection; refusing to "
                 f"record '{action}' by '{actor}' with no durable store."
@@ -81,7 +120,11 @@ class AuditLedger:
         for attempt in range(MAX_APPEND_RETRIES):
             prev_hash = await self._get_chain_head()
             now = datetime.now(timezone.utc).isoformat()
-            entry_hash = compute_entry_hash(prev_hash, now, actor, action, details_json)
+            entry_hash = compute_entry_hash(
+                prev_hash, now, actor, action, details_json,
+                resource_type=resource_type, resource_id=resource_id,
+                ip_address=ip_address or "",
+            )
 
             try:
                 await self.db.execute(
@@ -258,7 +301,23 @@ class AuditLedger:
             entries_in_order = await self._load_chain_ascending()
 
             if not entries_in_order:
-                return {"valid": True, "entries_checked": 0, "status": "EMPTY_LEDGER"}
+                # Distinct from a verified chain, and said so plainly.
+                #
+                # `valid: True` on an empty ledger is correct and useless: an
+                # intact trail and no trail at all returned the same verdict, so
+                # the endpoint built to detect tampering could not tell them
+                # apart. Live, the ledger held zero rows while the sovereignty
+                # endpoint reported `tamper_evident: true` at 100%.
+                return {
+                    "valid": True,
+                    "verified": False,
+                    "entries_checked": 0,
+                    "status": "EMPTY_LEDGER",
+                    "detail": (
+                        "The ledger contains no entries, so there is nothing to "
+                        "verify. This is not the same as a verified chain."
+                    ),
+                }
 
             raw_items = entries_in_order
             expected_prev_hash = GENESIS_HASH
@@ -282,6 +341,9 @@ class AuditLedger:
                     entry["actor"],
                     entry["action"],
                     details_json,
+                    resource_type=entry.get("resource_type") or "",
+                    resource_id=entry.get("resource_id") or "",
+                    ip_address=entry.get("ip_address") or "",
                 )
 
                 if recomputed != entry.get("hash"):
@@ -297,6 +359,7 @@ class AuditLedger:
 
             return {
                 "valid": True,
+                "verified": True,
                 "entries_checked": len(raw_items),
                 "latest_hash": expected_prev_hash,
                 "status": "VERIFIED_VALID",

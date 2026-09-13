@@ -125,7 +125,9 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
                     return False, None, None
 
             sub = payload_json.get("sub") or payload_json.get("email") or payload_json.get("user") or "authenticated_user"
-            role = payload_json.get("role") or payload_json.get("roles") or "ANALYST"
+            # Same rule as the two-part branch below: a token that does not
+            # state a role gets the least privilege, not a middling one.
+            role = payload_json.get("role") or payload_json.get("roles") or "VIEWER"
             if isinstance(role, list) and role:
                 role = role[0]
             return True, str(sub), str(role)
@@ -140,7 +142,29 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
             padded = encoded_payload + ("=" * (4 - rem) if rem else "")
             payload_str = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
 
-            role = "ANALYST"
+            # VIEWER, not ANALYST.
+            #
+            # ANALYST carries write:cases, write:watchlists and write:reports.
+            # A cookie minted before roles were encoded says nothing about what
+            # its holder may do, and `parse_role` in the RBAC engine defaults to
+            # VIEWER for exactly that reason: an unknown role is the smallest
+            # one. Granting write access on the strength of a token not saying
+            # anything is the wrong direction to fail.
+            # Signature first, then read the payload.
+            #
+            # The expiry used to be parsed and compared before this, so
+            # `float(expires_str)` ran on unauthenticated input. It failed
+            # closed inside the try, so nothing was exploitable -- but the JWT
+            # branch above verifies before it decodes, and one function should
+            # not disagree with itself about when a token becomes trustworthy.
+            expected_sig_hex = hmac.new(secret_bytes, payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
+            expected_sig_b64 = base64.urlsafe_b64encode(
+                hmac.new(secret_bytes, payload_str.encode("utf-8"), hashlib.sha256).digest()
+            ).rstrip(b"=").decode("utf-8")
+            if not (hmac.compare_digest(signature, expected_sig_hex) or hmac.compare_digest(signature, expected_sig_b64)):
+                return False, None, None
+
+            role = "VIEWER"
             if ":" in payload_str:
                 colon_parts = payload_str.split(":")
                 if len(colon_parts) >= 3:
@@ -165,14 +189,6 @@ def verify_session_token(token: str, secret: Optional[str] = None) -> Tuple[bool
                     "encode one; a token that cannot expire cannot be revoked "
                     "by time."
                 )
-                return False, None, None
-
-            expected_sig_hex = hmac.new(secret_bytes, payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
-            expected_sig_b64 = base64.urlsafe_b64encode(
-                hmac.new(secret_bytes, payload_str.encode("utf-8"), hashlib.sha256).digest()
-            ).rstrip(b"=").decode("utf-8")
-
-            if not (hmac.compare_digest(signature, expected_sig_hex) or hmac.compare_digest(signature, expected_sig_b64)):
                 return False, None, None
 
             return True, email or "session_user", role

@@ -7,12 +7,22 @@ Exposes explicit, verifiable architectural disclosures of Sentinel's
 local-first deployment posture, zero-telemetry boundary, and audit trail.
 """
 
+import logging
 from typing import Dict, List, Any
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from shared.models.ontology import PROHIBITED_DATA_CATEGORIES
-from shared.utils.audit_ledger import GENESIS_HASH
+from shared.utils.audit_ledger import AuditLedger, GENESIS_HASH
+from shared.utils.quiet_failures import swallowed
+from services.api_gateway.dependencies import get_db_optional, get_redis_optional
+
+logger = logging.getLogger("api-gateway.sovereignty")
+
+# The chain was actually walked and every link recomputed. Any other verdict --
+# an empty ledger, no durable store, a broken link, an error -- is not
+# tamper-evidence, and this endpoint used to report all of them as `true`.
+VERIFIED_STATUS = "VERIFIED_VALID"
 
 router = APIRouter(prefix="/api/v1/system/sovereignty", tags=["Data Sovereignty & Privacy Posture"])
 
@@ -36,9 +46,21 @@ class SovereigntyManifest(BaseModel):
 
 
 @router.get("", response_model=SovereigntyManifest)
-async def get_data_sovereignty_manifest():
+async def get_data_sovereignty_manifest(
+    db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
+):
     """
-    Returns platform-wide data sovereignty manifest proving zero user data leakage.
+    Returns the platform's data sovereignty manifest: the declared service
+    boundary, plus the audit ledger's verdict on its own chain.
+
+    It used to say it was "proving zero user data leakage". A list of
+    hand-written strings proves nothing, and two of the numbers it returned
+    were literals: `sovereignty_score_pct` was the constant 100.0, and
+    `tamper_evident` was the constant `True` -- on a platform that ships a
+    `verify_chain()` able to answer that question and was never asked. Live,
+    this endpoint reported `tamper_evident: true` while the ledger held zero
+    rows.
     """
     local_subsystems = [
         ServiceBoundaryItem(
@@ -116,16 +138,39 @@ async def get_data_sovereignty_manifest():
         ),
     ]
 
+    # Asked, not asserted.
+    verdict: Dict[str, Any] = {"status": "NOT_EVALUATED"}
+    try:
+        verdict = await AuditLedger(redis_client=redis, db_client=db).verify_chain()
+    except Exception as _exc:
+        swallowed("api_gateway.routes.sovereignty.verify_chain", _exc, logger)
+        verdict = {"status": "VERIFICATION_ERROR"}
+
+    tamper_evident = verdict.get("status") == VERIFIED_STATUS
+
+    # The share of the declared boundary that exposes no user data. Still 100
+    # today, and now for a reason: adding a boundary item with
+    # `user_data_exposed=True` moves it, which a constant could not do. A score
+    # that cannot fall is not a score.
+    boundary = local_subsystems + external_ingest
+    private = sum(1 for item in boundary if not item.user_data_exposed)
+    score = round((private / len(boundary)) * 100.0, 2) if boundary else 0.0
+
     return SovereigntyManifest(
         architecture_model="Self-Hosted Air-Gappable Local-First Intelligence Platform",
-        sovereignty_score_pct=100.0,
+        sovereignty_score_pct=score,
         prohibited_categories=sorted(list(PROHIBITED_DATA_CATEGORIES)),
         local_subsystems=local_subsystems,
         external_ingest_feeds=external_ingest,
         cryptographic_guarantees={
             "audit_trail": "SHA-256 Hash-Chained Merkle-like Ledger",
             "genesis_hash": GENESIS_HASH,
-            "tamper_evident": True,
+            # The ledger's own verdict, and what it was reached from. An empty
+            # ledger and an unreachable store are not tamper-evidence, and the
+            # status says which of them applies.
+            "tamper_evident": tamper_evident,
+            "audit_chain_status": verdict.get("status"),
+            "audit_entries_verified": verdict.get("entries_checked", 0),
             "session_security": "HMAC-SHA256 Signed Sessions & Constant-Time Verification",
             "analytics_telemetry_trackers": "0 (Zero Google Analytics, Zero Mixpanel, Zero Segment)",
         },

@@ -4,6 +4,29 @@ services:
       context: ./deploy/nginx
       dockerfile: Dockerfile
     container_name: sentinel-ingress
+    healthcheck:
+      # nginx:alpine, so there is no `python` on PATH and no /app.
+      #
+      # This probe was applied to every service at once and is right for the
+      # twenty built from the root Python image; on this one and on `frontend`
+      # it could only ever produce
+      #   OCI runtime exec failed: exec: "python": executable file not found
+      # which Docker records as a failing check, so the container reported
+      # unhealthy for the life of the deployment while nginx was serving fine.
+      #
+      # busybox wget is in the base image. Port 80 answers with the 301 to
+      # HTTPS, which is a served response and exactly what this needs to know.
+      #
+      # Verified against the image rather than reasoned about: `--spider`
+      # returns 0 for the 301 and 1 for "can't connect to remote host". An
+      # earlier spelling piped wget through `grep -qv`, which returned 0 for
+      # the connection-refused message too -- a probe that could only ever say
+      # healthy.
+      test: ["CMD-SHELL", "wget -q -O /dev/null --spider http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     ports:
       # Loopback by default: without an explicit address Docker publishes on
@@ -38,6 +61,14 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: sentinel-zookeeper
+    # The only container in the deployment that had no restart policy, and the
+    # one Kafka cannot run without. If it exits -- OOM, a bad upgrade, a host
+    # hiccup -- Docker left it down, Kafka lost its coordinator, consumer group
+    # membership could not be maintained, and every tier stopped moving as
+    # healthy-but-idle rather than crashed, so nothing else restarted either.
+    # It already had a healthcheck: the deployment could tell it was unwell and
+    # had no instruction to act.
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -63,6 +94,11 @@ services:
     image: confluentinc/cp-kafka:7.5.0
     container_name: sentinel-kafka
     restart: unless-stopped
+    # A controlled shutdown flushes the log segments and hands leadership over
+    # cleanly. Docker's ten-second default cut that short with SIGKILL, and an
+    # unclean Kafka shutdown means log recovery on every subsequent start --
+    # minutes of it, during which every `depends_on: service_healthy` waits.
+    stop_grace_period: 90s
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -134,6 +170,10 @@ services:
       dockerfile: Dockerfile.timescale
     container_name: sentinel-timescaledb
     restart: unless-stopped
+    # Postgres SIGKILLed mid-checkpoint comes back needing crash recovery, and
+    # on a 5.8 GB events hypertable that is not quick. Ten seconds is not enough
+    # to write a shutdown checkpoint.
+    stop_grace_period: 120s
     environment:
       # Interpolated from host .env variables.
       POSTGRES_USER: ${POSTGRES_USER}
@@ -175,6 +215,29 @@ services:
     image: neo4j:5.13
     container_name: sentinel-neo4j
     restart: unless-stopped
+    # Clear the pid file before handing over to the image's own entrypoint.
+    #
+    # Neo4j writes /var/lib/neo4j/run/neo4j.pid, which lives in the container's
+    # writable layer and therefore survives `docker restart`. When the process
+    # is killed rather than shut down -- a compose stop that outruns the grace
+    # period below, or an OOM -- the file is left behind, and on the next start
+    # the launcher finds a *different* process occupying that pid in the fresh
+    # namespace and refuses:
+    #
+    #     Neo4j is already running (pid:8).
+    #     Run with '--verbose' for a more detailed error message.
+    #
+    # It then exits non-zero, `restart: unless-stopped` brings it back, and it
+    # says the same thing. The live deployment logged exactly that three times
+    # in a row before the whole stack was torn down around it.
+    #
+    # The pid file is only meaningful to a process that outlives the container,
+    # and nothing here does: the container *is* the process.
+    entrypoint: ["/bin/bash", "-c", "rm -f /var/lib/neo4j/run/*.pid; exec /startup/docker-entrypoint.sh neo4j"]
+    # Neo4j takes well over ten seconds to flush and close its store files, and
+    # ten seconds is Docker's default before SIGKILL -- which is what leaves the
+    # pid file above and, worse, can leave the store needing recovery.
+    stop_grace_period: 120s
     environment:
       # Parameterized auth from .env.
       NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
@@ -288,6 +351,14 @@ services:
     build:
       context: .
       dockerfile: ml.Dockerfile
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     # No fixed container_name: enrichment is the pipeline's throughput ceiling and
     # must be scalable with `docker compose up -d --scale enrichment=N`, which
     # Docker refuses for a service with a fixed name. Nothing references it by
@@ -323,6 +394,14 @@ services:
       context: .
       dockerfile: ml.Dockerfile
     container_name: sentinel-correlation
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/correlation/main.py
     env_file: .env
     environment:
@@ -375,6 +454,14 @@ services:
       context: .
       dockerfile: ml.Dockerfile
     container_name: sentinel-reasoning
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/reasoning/main.py
     env_file: .env
     environment:
@@ -411,6 +498,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-tradfi
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-tradfi/main.py
     env_file: .env
     volumes:
@@ -432,6 +527,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-crypto
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-crypto/main.py
     env_file: .env
     volumes:
@@ -453,6 +556,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-prediction
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-prediction/main.py
     env_file: .env
     volumes:
@@ -611,6 +722,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-cyber
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-cyber/main.py
     env_file: .env
     volumes:
@@ -633,6 +752,14 @@ services:
     build: .
     command: "python services/collector-radar/main.py"
     container_name: sentinel-radar
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     env_file: .env
     volumes:
       - ./services:/app/services
@@ -653,6 +780,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-filings
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-filings/main.py
     env_file: .env
     volumes:
@@ -672,6 +807,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-sar
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-sar/main.py
     env_file: .env
     volumes:
@@ -691,6 +834,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-ais
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-ais/main.py
     env_file: .env
     volumes:
@@ -712,6 +863,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-adsb
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-adsb/main.py
     env_file: .env
     volumes:
@@ -733,6 +892,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-news
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-news/main.py
     env_file: .env
     volumes:
@@ -761,6 +928,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-social
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-social/main.py
     env_file: .env
     volumes:
@@ -782,6 +957,14 @@ services:
     profiles: ["collectors"]
     build: .
     container_name: sentinel-macro
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/collector-macro/main.py
     env_file: .env
     volumes:
@@ -847,6 +1030,14 @@ services:
       context: .
       dockerfile: ml.Dockerfile
     container_name: sentinel-agents-fast
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/agents/main.py
     env_file: .env
     environment:
@@ -893,6 +1084,14 @@ services:
       context: .
       dockerfile: ml.Dockerfile
     container_name: sentinel-agents-heavy
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/agents/main.py
     env_file: .env
     environment:
@@ -955,6 +1154,14 @@ services:
     profiles: ["agents"]
     build: .
     container_name: sentinel-alert-manager
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/alert_manager/main.py
     env_file: .env
     volumes:
@@ -979,6 +1186,19 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: sentinel-frontend
+    healthcheck:
+      # node:20-alpine. Same mistake as `ingress`: the shared Python probe was
+      # applied here too, `python` is not on PATH, and the container reported
+      # unhealthy continuously while Next.js served every request.
+      #
+      # Node is the one interpreter this image definitely has. Any status below
+      # 500 counts: the root path redirects to the login route when there is no
+      # session, and a redirect is a served response.
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     environment:
       - API_GATEWAY_URL=http://api-gateway:8000
       # NEXT_PUBLIC_API_URL intentionally unset: the browser reaches REST via the
@@ -1020,6 +1240,14 @@ services:
   dlq-worker:
     build: .
     container_name: sentinel-dlq-worker
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/dlq-worker/main.py
     env_file: .env
     volumes:
@@ -1042,6 +1270,14 @@ services:
       context: .
       dockerfile: ml.Dockerfile
     container_name: sentinel-telemetry-worker
+    healthcheck:
+      # Asks whether the service is working, not merely running. Reads the
+      # heartbeat it already publishes every 60s; see scripts/healthcheck.py.
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
     command: python services/telemetry-worker/main.py
     env_file: .env
     volumes:

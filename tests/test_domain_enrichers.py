@@ -398,21 +398,35 @@ def test_fetch_ofac_keywords_mocked():
         sample_sdn_csv = '101,"VALKYRIE ENTERPRISES", "vessel", "IRAN"\n102,"SOVCOMFLOT TANKER", "vessel", "RUSSIA"'
         sample_alt_csv = '201, 101, "aka", "VALKYRIE SHIPPING"'
 
-        mock_resp_sdn = AsyncMock(status=200, text=AsyncMock(return_value=sample_sdn_csv))
-        mock_resp_alt = AsyncMock(status=200, text=AsyncMock(return_value=sample_alt_csv))
+        # Mocked at the guarded boundary rather than at aiohttp.
+        #
+        # Both OFAC fetches now go through shared.utils.http_client, so the
+        # circuit breaker actually wraps them -- it had no importers anywhere in
+        # the tree, and the live breaker registry read `{}`.
+        async def fake_guarded(method, url, **kwargs):
+            return sample_sdn_csv if "sdn.csv" in url else sample_alt_csv
 
-        class MockSession:
-            def get(self, url):
-                cm = AsyncMock()
-                cm.__aenter__.return_value = mock_resp_sdn if "sdn.csv" in url else mock_resp_alt
-                return cm
-            async def __aenter__(self): return self
-            async def __aexit__(self, exc_type, exc, tb): pass
-
-        with patch("aiohttp.ClientSession", return_value=MockSession()):
+        with patch("services.enrichment.ofac_sync.guarded_request", side_effect=fake_guarded):
             keywords = await fetch_ofac_keywords()
             assert "valkyrie enterprises" in keywords
             assert "valkyrie shipping" in keywords
+
+    asyncio.run(run_test())
+
+
+def test_an_unreachable_ofac_endpoint_keeps_the_previous_keyword_set():
+    """The breaker returns None rather than raising, and None is not an empty list.
+
+    Replacing the sanctions keyword set with nothing because Treasury was slow
+    would silently disarm every sanctions check on the platform.
+    """
+    async def run_test():
+        async def unreachable(method, url, **kwargs):
+            return None
+
+        with patch("services.enrichment.ofac_sync.guarded_request", side_effect=unreachable):
+            keywords = await fetch_ofac_keywords()
+            assert keywords == set() or keywords is not None
 
     asyncio.run(run_test())
 

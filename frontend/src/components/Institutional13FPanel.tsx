@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
-import { ProvenanceBadge } from "./ProvenanceBadge";
+import { ProvenanceBadge, type ProvenanceType } from "./ProvenanceBadge";
 import { ProvenanceValue } from "./ProvenanceValue";
 import { formatPercent } from '../lib/format';
 
@@ -43,155 +43,82 @@ interface PortfolioReport extends FilerSummary {
   source_type?: string;
 }
 
-const DEFAULT_FILERS: FilerSummary[] = [
-  {
-    filer_id: "berkshire_hathaway",
-    filer_name: "Berkshire Hathaway Inc",
-    manager_name: "Warren Buffett",
-    cik: "0001067983",
-    style: "Deep Value / Long Horizon",
-    total_value_usd: 247100000000,
-    holdings_count: 41,
-    top_10_concentration_pct: 88.4,
-    report_period: "2026-Q2",
-  },
-  {
-    filer_id: "scion",
-    filer_name: "Scion Asset Management, LLC",
-    manager_name: "Michael Burry",
-    cik: "0001649339",
-    style: "Contrarian / Asymmetric",
-    total_value_usd: 50750000,
-    holdings_count: 5,
-    top_10_concentration_pct: 100.0,
-    report_period: "2026-Q2",
-  },
-  {
-    filer_id: "pershing_square",
-    filer_name: "Pershing Square Capital",
-    manager_name: "Bill Ackman",
-    cik: "0001336528",
-    style: "Concentrated Activist",
-    total_value_usd: 7550000000,
-    holdings_count: 7,
-    top_10_concentration_pct: 100.0,
-    report_period: "2026-Q2",
-  },
-  {
-    filer_id: "citadel",
-    filer_name: "Citadel Advisors LLC",
-    manager_name: "Ken Griffin",
-    cik: "0001423053",
-    style: "Multi-Strategy Quant",
-    total_value_usd: 6200000000,
-    holdings_count: 1420,
-    top_10_concentration_pct: 18.5,
-    report_period: "2026-Q2",
-  },
-  {
-    filer_id: "bridgewater",
-    filer_name: "Bridgewater Associates",
-    manager_name: "Ray Dalio",
-    cik: "0001350694",
-    style: "Global Macro / Risk Parity",
-    total_value_usd: 17800000000,
-    holdings_count: 650,
-    top_10_concentration_pct: 34.2,
-    report_period: "2026-Q2",
-  },
-  {
-    filer_id: "ark_invest",
-    filer_name: "ARK Investment Management",
-    manager_name: "Cathie Wood",
-    cik: "0001697748",
-    style: "Disruptive Innovation",
-    total_value_usd: 11400000000,
-    holdings_count: 180,
-    top_10_concentration_pct: 54.0,
-    report_period: "2026-Q2",
-  },
-];
+// No hardcoded roster.
+//
+// This held eight funds with invented aggregates -- Berkshire at
+// $247,100,000,000 across 41 positions, 88.4% concentration -- and offered
+// Scion Asset Management, which the gateway's prominent-filer list does not
+// contain, so the dropdown named a fund the platform cannot serve. The roster
+// now comes from /13f/prominent, which returns ten real filers with real CIKs.
+const NO_FILERS: FilerSummary[] = [];
+
+/** The provenance label for a report, defaulting to the weakest.
+ *
+ * Each badge previously read
+ *   source_type || (is_synthetic ? "disclosed_placeholder" : "live_measurement")
+ * and both fields are optional. On the fallback path -- which ran on every
+ * render, because the fetch went to a URL with no route -- neither was set, so
+ * the chain evaluated to "live_measurement" and certified invented holdings as
+ * a live measurement, five times on one panel. A `||` chain that treats absent
+ * provenance as proven provenance is the exact inversion of what a provenance
+ * badge is for.
+ */
+function provenanceOf(report: PortfolioReport | null): ProvenanceType {
+  if (!report) return "disclosed_placeholder";
+  if (report.source_type) return report.source_type as any;
+  if (report.is_synthetic === false) return "live_measurement";
+  // Unknown provenance is not proven provenance.
+  return "disclosed_placeholder";
+}
 
 export const Institutional13FPanel: React.FC = () => {
-  const [filers, setFilers] = useState<FilerSummary[]>(DEFAULT_FILERS);
-  const [selectedFilerId, setSelectedFilerId] = useState<string>("berkshire_hathaway");
+  const [filers, setFilers] = useState<FilerSummary[]>(NO_FILERS);
+  const [selectedFilerId, setSelectedFilerId] = useState<string>("");
   const [report, setReport] = useState<PortfolioReport | null>(null);
   const [activeTab, setActiveTab] = useState<"top" | "new" | "increased" | "decreased" | "exited">("top");
   const [loading, setLoading] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // The roster the gateway actually serves.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/proxy/api/v1/filings/13f/prominent");
+        if (!res.ok) return;
+        const rows = await res.json();
+        if (cancelled || !Array.isArray(rows) || rows.length === 0) return;
+        setFilers(rows);
+        setSelectedFilerId((current) => current || rows[0].filer_id);
+      } catch {
+        /* leave the roster empty rather than inventing one */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     async function fetchFilerData() {
+      if (!selectedFilerId) { setLoading(false); return; }
       setLoading(true);
+      setLoadError(null);
       try {
-        const res = await fetch(`/api/v1/filings/13f/${selectedFilerId}`);
+        const res = await fetch(`/api/proxy/api/v1/filings/13f/${selectedFilerId}`);
         if (res.ok) {
           const data = await res.json();
           setReport(data);
         } else {
-          // Fallback to local computed view
-          const currentFiler = filers.find((f) => f.filer_id === selectedFilerId);
-          if (currentFiler) {
-            setReport({
-              ...currentFiler,
-              new_positions: [],
-              exited_positions: [],
-              increased_positions: [],
-              decreased_positions: [],
-              top_holdings: [
-                {
-                  ticker: "AAPL",
-                  issuer_name: "Apple Inc",
-                  class_title: "COM",
-                  market_value_usd: 69000000000,
-                  shares: 300000000,
-                  weight_pct: 27.9,
-                  change_type: "DECREASED",
-                  change_pct: -25.0,
-                },
-                {
-                  ticker: "AXP",
-                  issuer_name: "American Express Co",
-                  class_title: "COM",
-                  market_value_usd: 37800000000,
-                  shares: 151610700,
-                  weight_pct: 15.3,
-                  change_type: "MAINTAINED",
-                  change_pct: 0.0,
-                },
-                {
-                  ticker: "BAC",
-                  issuer_name: "Bank of America Corp",
-                  class_title: "COM",
-                  market_value_usd: 30600000000,
-                  shares: 766000000,
-                  weight_pct: 12.4,
-                  change_type: "DECREASED",
-                  change_pct: -4.2,
-                },
-                {
-                  ticker: "KO",
-                  issuer_name: "Coca-Cola Co",
-                  class_title: "COM",
-                  market_value_usd: 27200000000,
-                  shares: 400000000,
-                  weight_pct: 11.0,
-                  change_type: "MAINTAINED",
-                  change_pct: 0.0,
-                },
-                {
-                  ticker: "CVX",
-                  issuer_name: "Chevron Corp",
-                  class_title: "COM",
-                  market_value_usd: 17800000000,
-                  shares: 118600000,
-                  weight_pct: 7.2,
-                  change_type: "MAINTAINED",
-                  change_pct: 0.0,
-                },
-              ],
-              filing_url: `https://www.sec.gov/edgar/browse/?CIK=${currentFiler.cik}`,
-            });
-          }
+          // No invented holdings.
+          //
+          // This rendered DEFAULT_FILERS plus a hardcoded top-ten -- AAPL at
+          // 300,000,000 shares, "DECREASED -25.0%" -- attributed to Warren
+          // Buffett under a subtitle reading "Quarterly SEC Form 13F-HR". It
+          // ran on every render, because the fetch went to /api/v1/... on the
+          // Next.js origin where no route exists, so the 404 was the normal
+          // path. The request now goes through the proxy; a genuine failure
+          // shows nothing rather than something made up.
+          setReport(null);
+          setLoadError(`Could not load 13F data (HTTP ${res.status}).`);
         }
       } catch (err) {
         console.error("Error fetching 13F:", err);
@@ -239,12 +166,15 @@ export const Institutional13FPanel: React.FC = () => {
             <span className="text-xl">🏛️</span>
             <h2 className="text-lg font-bold tracking-wide text-white">13F Institutional Intelligence & Ownership Flow</h2>
             <ProvenanceBadge
-              sourceType={report?.source_type as any || (report?.is_synthetic ? "disclosed_placeholder" : "live_measurement")}
+              sourceType={provenanceOf(report)}
             />
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
             Quarterly SEC Form 13F-HR portfolio holdings & QoQ changes from premier asset managers
           </p>
+          {loadError && (
+            <p className="text-xs text-amber-400 mt-1">{loadError} Nothing is shown rather than a placeholder.</p>
+          )}
         </div>
         {report?.filing_url && (
           <a
@@ -286,7 +216,7 @@ export const Institutional13FPanel: React.FC = () => {
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-400 font-medium">Total Portfolio Value</span>
-              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "disclosed_placeholder" : "live_measurement")} />
+              <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-emerald-400 mt-0.5">
               ${(report.total_value_usd / 1e9).toFixed(2)}B
@@ -295,21 +225,21 @@ export const Institutional13FPanel: React.FC = () => {
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-400 font-medium">Report Period</span>
-              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "disclosed_placeholder" : "live_measurement")} />
+              <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-sky-400 mt-0.5">{report.report_period}</div>
           </div>
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-400 font-medium">Holdings Count</span>
-              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "disclosed_placeholder" : "live_measurement")} />
+              <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-slate-200 mt-0.5">{report.holdings_count} positions</div>
           </div>
           <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-400 font-medium">Top 10 Concentration</span>
-              <ProvenanceBadge sourceType={report.source_type as any || (report.is_synthetic ? "disclosed_placeholder" : "live_measurement")} />
+              <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-purple-400 mt-0.5">{formatPercent(report.top_10_concentration_pct, { decimals: 1 })}</div>
           </div>

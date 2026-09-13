@@ -32,6 +32,8 @@ from shared.utils.regime import stamp as regime_stamp
 from shared.utils import quant_calc
 from shared.utils.tasks import safe_create_task
 from shared.db import get_neo4j
+from shared.utils.quiet_failures import swallowed
+from shared.utils.quote_cache import quote_key
 
 logger = logging.getLogger("agent.macro_intelligence")
 
@@ -281,6 +283,8 @@ class MacroIntelligenceEngine(SentinelAgent):
     Evaluates fixed income rates, options surface skew, commodity-equity cointegration,
     and systemic sector trends in a single-pass pipelined architecture.
     """
+    FOCUS_DOMAIN = "macro"
+    FOCUS_DOMAINS = ("macro", "tradfi", "market")
 
     @property
     def output_topic(self) -> str:
@@ -646,6 +650,30 @@ class MacroIntelligenceEngine(SentinelAgent):
 
     # ── SUB-ENGINE 2: OPTIONS VOLATILITY SURFACE ─────────────────────────────
 
+    @staticmethod
+    def _measured_volume(cached, arriving):
+        """Contracts actually observed on one leg, or None.
+
+        `cached` is this leg's 24-hour counter; `arriving` is the size of the
+        event being processed when it belongs to this leg. Either is a
+        measurement. Neither present means the leg was not observed, which is
+        not the same as it being small.
+        """
+        if cached is not None:
+            try:
+                return int(cached)
+            except (TypeError, ValueError) as _exc:
+                # A counter that will not parse is not a zero volume. Fall
+                # through to the arriving leg, but count it: a malformed
+                # counter that keeps recurring is a Redis problem, not noise.
+                swallowed("agents.macro._measured_volume", _exc, logger)
+        if arriving is not None:
+            try:
+                return int(arriving)
+            except (TypeError, ValueError):
+                return None
+        return None
+
     async def _process_volatility_surface(self, message: Dict[str, Any], ticker: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Admission is checked before the context is built, not after.
         #
@@ -676,9 +704,28 @@ class MacroIntelligenceEngine(SentinelAgent):
             f"sentinel:options:iv:{ticker}:CALL",
             f"sentinel:options:iv:{ticker}:PUT",
         ])
-        calls_vol = int(vals[0] or (size if option_type == "CALL" else 100))
-        puts_vol = int(vals[1] or (size if option_type == "PUT" else 100))
-        pc_ratio = round(puts_vol / max(1, calls_vol), 3)
+        # A ratio needs both legs measured.
+        #
+        # The counter for the *arriving* leg is incremented just above, so it is
+        # always present; the opposite leg is the one that can be missing, and
+        # `or 100` invented it. A put sweep of 500 contracts on a ticker with no
+        # call flow in 24 hours produced pc_ratio 5.0 against a denominator
+        # nobody observed -- and `pc_ratio > 1.5` sets a directional bulletin,
+        # which `_record_bulletin_prediction` then stores as a scoreable claim.
+        # One-sided flow is exactly the case this path is interesting for, and
+        # exactly the case the fallback fired in.
+        #
+        # This is the same correction the IV skew two blocks down already
+        # received: one measured leg and one assumed leg measures the
+        # assumption. None renders as "not measured" and publishes no direction.
+        calls_vol = self._measured_volume(vals[0], size if option_type == "CALL" else None)
+        puts_vol = self._measured_volume(vals[1], size if option_type == "PUT" else None)
+        pc_ratio = (
+            round(puts_vol / calls_vol, 3)
+            if (calls_vol is not None and puts_vol is not None and calls_vol > 0)
+            else None
+        )
+        pc_ratio_str = f"{pc_ratio:.3f}" if pc_ratio is not None else "not measured"
 
         # measured_iv is frequently absent, and this read path did not allow for
         # it while the write path four lines above already did.
@@ -727,8 +774,8 @@ class MacroIntelligenceEngine(SentinelAgent):
         await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC)
 
         logger.info(
-            "⚡ Options Vol Surface | %s | P/C Ratio: %.2f | IV Skew: %s",
-            ticker, pc_ratio, skew_str,
+            "⚡ Options Vol Surface | %s | P/C Ratio: %s | IV Skew: %s",
+            ticker, pc_ratio_str, skew_str,
         )
 
         global_context, cross_context = await asyncio.gather(
@@ -740,7 +787,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         user_prompt = f"""
         Evaluate options surface metrics:
         - Symbol: {ticker}
-        - P/C Ratio: {pc_ratio:.3f}
+        - P/C Ratio: {pc_ratio_str}
         - 25D IV Skew: {skew_str}
         - Call IV: {call_iv_str} | Put IV: {put_iv_str}
 
@@ -771,6 +818,7 @@ class MacroIntelligenceEngine(SentinelAgent):
                 "metrics": {
                     "ticker": ticker,
                     "put_call_volume_ratio": pc_ratio,
+                    "put_call_measured": pc_ratio is not None,
                     "iv_skew_25d_bps": iv_skew_bps,
                 },
             }
@@ -784,10 +832,13 @@ class MacroIntelligenceEngine(SentinelAgent):
             # Publish structured AgentBulletin
             safe_create_task(self.publish_bulletin(
                 bulletin_type="alert",
-                summary=f"Vol Surface {ticker}: P/C {pc_ratio:.2f}, Skew {skew_str} ({brief.volatility_regime})",
+                summary=f"Vol Surface {ticker}: P/C {pc_ratio_str}, Skew {skew_str} ({brief.volatility_regime})",
                 ticker=ticker,
                 conviction=brief.tail_risk_conviction,
-                expected_direction="down" if pc_ratio > 1.5 else "neutral",
+                # No measured ratio, no directional claim.
+                expected_direction=(
+                    "down" if (pc_ratio is not None and pc_ratio > 1.5) else "neutral"
+                ),
                 payload=res_payload["metrics"],
                 ttl_seconds=3600,
             ))
@@ -813,7 +864,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         if not exposed_equities:
             return
 
-        keys = [f"sentinel:quotes:latest:{t}" for t in exposed_equities]
+        keys = [quote_key(t) for t in exposed_equities]
         raw_micros = await self.redis.raw.mget(keys)
 
         for micro_ticker, raw_micro in zip(exposed_equities, raw_micros):
@@ -900,6 +951,18 @@ class MacroIntelligenceEngine(SentinelAgent):
                     safe_create_task(self.publish_bulletin(
                         bulletin_type="alert",
                         summary=f"Oil/Equity Decoupling ({macro_asset} vs {micro_ticker}): Pearson Corr {pearson_corr:.2f}",
+                        # Attributed to the equity it is about.
+                        #
+                        # This published with ticker and primary_entity_id both
+                        # unset, and the consensus engine groups bulletins *by
+                        # entity* -- so the finding reached the swarm and then
+                        # sat outside every comparison the swarm exists to make.
+                        # The knowledge-graph engine carries a nine-line comment
+                        # about this exact defect being fixed there; this site
+                        # was missed.
+                        ticker=micro_ticker,
+                        primary_entity_id=micro_ticker,
+                        primary_entity_name=micro_ticker,
                         conviction=abs(pearson_corr),
                         expected_direction="bearish",
                         payload={"macro_asset": macro_asset, "equity": micro_ticker, "correlation": pearson_corr, "reasoning": reasoning},

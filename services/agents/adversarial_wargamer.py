@@ -120,6 +120,8 @@ class AdversarialWargamerAgent(SentinelAgent):
     other, synthesizes cascade failure probabilities, and emits predictive
     wargame reports.
     """
+    FOCUS_DOMAIN = "geopolitical"
+    FOCUS_DOMAINS = ("geopolitical", "maritime", "aviation", "cyber")
 
     @property
     def output_topic(self) -> str:

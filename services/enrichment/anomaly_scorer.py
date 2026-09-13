@@ -18,7 +18,7 @@ from shared.utils.streaming_detectors import (
     sts_zone_risk_multiplier,
 )
 from shared.utils.model_registry import (
-    ModelRegistry, ConformalZScoreCalibrator, ConformalScoreCalibrator,
+    ModelRegistry, ConformalScoreCalibrator, validate_training_data,
 )
 
 from typing import Optional, List, Dict, Any, Tuple
@@ -219,6 +219,15 @@ def lift_score(anomaly: float, weight: float, spent: float = 0.0) -> float:
 # uncalibrated domain behaves exactly as it did.
 SIGNIFICANCE_FALLBACK_CUT = 0.60
 
+# Above this observed false-alarm rate a detector is flagged as drifting in the
+# model registry. The significance gate targets 1 - SIGNIFICANCE_PERCENTILE by
+# construction, so sustained firing well above it means the distribution the
+# percentile was fitted to has moved.
+DRIFT_FAR_CEILING = 0.25
+
+# Below the ceiling but above the target: worth recording, not worth acting on.
+DRIFT_FAR_WARN = 0.12
+
 
 class DynamicAnomalyScorer:
     def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
@@ -288,6 +297,37 @@ class DynamicAnomalyScorer:
         self._bgp_extractor = BGPGraphFeatureExtractor(neo4j_client=neo4j_client)
 
         logger.info("⚡ Per-domain streaming anomaly detectors & ModelRegistry initialized (8 domain RRCFs + Conformal Z + Kalman + Hawkes + FSD + BGP)")
+
+    def model_inventory(self) -> Dict[str, Any]:
+        """What each domain's detector is, and how it is behaving.
+
+        `ModelRegistry.get_model_metadata` had no caller, so eight models were
+        registered at startup into a dictionary nothing read. This is the read
+        side: version, training window and the observed false-alarm rate, per
+        domain, for a health surface or an operator to look at.
+        """
+        out: Dict[str, Any] = {}
+        for domain in list(getattr(self.registry, "_registry", {})):
+            meta = self.registry.get_model_metadata(domain)
+            if meta is None:
+                continue
+            # The field names are ModelMetadata's own: version/created_at, not
+            # model_version/trained_at. Read through getattr against the wrong
+            # names and every entry publishes None while looking populated.
+            out[domain] = {
+                "model_id": meta.model_id,
+                "model_type": meta.model_type,
+                "version": meta.version,
+                "drift_status": meta.drift_status,
+                "false_alarm_rate": meta.false_alarm_rate,
+                "created_at": meta.created_at,
+                "last_evaluated_at": meta.last_evaluated_at,
+                "calibration": (
+                    self._conformal_z_calibrators[domain].get_status()
+                    if domain in self._conformal_z_calibrators else None
+                ),
+            }
+        return out
 
     async def load_thresholds(self):
         """Loads dynamic ML thresholds from Redis cache."""
@@ -378,6 +418,11 @@ class DynamicAnomalyScorer:
         "crypto_candle",
         "crypto_liquidation",
         "options_flow",
+        # Shares the cyber domain with KEV, whose vector is a CVSS severity in
+        # one slot and four zeros. A ransomware incident's five features are a
+        # different quantity; pooling them would compare a victim-sector flag
+        # against a padding zero.
+        "ransomware",
     })
 
     # Scoring keys that are not event types.
@@ -503,6 +548,41 @@ class DynamicAnomalyScorer:
         res = await self._check_ema_gatekeeper_batch(event_type, [raw_score])
         return res[0]
         
+    def _calibrated_cut(self, domain: str, calibrator: ConformalScoreCalibrator) -> float:
+        """The conformal cut, but only once its window is fit to carry one.
+
+        `validate_training_data` -- the registry's own guard against fitting on
+        a collapsed or undersized sample -- had no caller anywhere in the tree,
+        so the one place in the platform that derives a threshold from data
+        derived it from whatever was in the buffer.
+
+        That matters here because of how a cold detector behaves. RRCF returns
+        a warm-up constant until its window fills, so the calibrator's first
+        few hundred observations in a quiet domain can be the *same number*
+        repeated. The conformal quantile of a constant is that constant, and
+        the clamp then lifts it to MIN_SCORE_THRESHOLD -- a cut fitted to no
+        variation at all, applied as if it were measured.
+
+        Validation failure is not an error here, it is "not calibrated yet":
+        fall back to the fixed cut, which is what an uncalibrated domain used
+        before any of this existed.
+        """
+        window = getattr(calibrator, "_null_z_scores", None)
+        if not window:
+            return SIGNIFICANCE_FALLBACK_CUT
+        try:
+            # Shaped (n, 1) so the zero-variance check applies -- it is written
+            # for a feature matrix and skips 1-D input.
+            validate_training_data(
+                np.asarray(window, dtype=np.float64).reshape(-1, 1),
+                domain,
+                min_samples=calibrator.min_samples,
+            )
+        except Exception as _exc:
+            swallowed("enrichment.anomaly_scorer.calibration_window", _exc, logger)
+            return SIGNIFICANCE_FALLBACK_CUT
+        return calibrator.z_threshold
+
     async def _check_ema_gatekeeper_batch(self, event_type: str, raw_scores: list) -> list:
         if not raw_scores:
             return []
@@ -510,7 +590,10 @@ class DynamicAnomalyScorer:
         # The per-domain conformal cut for this event type.
         domain = self._get_domain(event_type)
         calibrator = self._conformal_z_calibrators.get(domain)
-        score_thresh = calibrator.z_threshold if calibrator else SIGNIFICANCE_FALLBACK_CUT
+        score_thresh = (
+            self._calibrated_cut(domain, calibrator) if calibrator
+            else SIGNIFICANCE_FALLBACK_CUT
+        )
 
         # Observe scores to dynamically calibrate the conformal threshold.
         if calibrator:
@@ -603,6 +686,24 @@ class DynamicAnomalyScorer:
             # every hour for the life of the deployment, reporting an absence
             # as a finding.
             await self._record_score_sample(scores)
+            # And tell the registry what the detector is doing.
+            #
+            # `register_model` was called once per domain at startup and the
+            # three methods that would *use* the registry --
+            # get_model_metadata, update_drift_status, validate_training_data --
+            # had no callers anywhere in the tree. So eight models were recorded
+            # into a dictionary that was never read, and `drift_status` never
+            # moved from whatever it was registered with.
+            try:
+                observed_far = sum(1 for sig in is_significant_list if sig) / max(1, len(is_significant_list))
+                self.registry.update_drift_status(
+                    domain,
+                    "DRIFTED" if observed_far > DRIFT_FAR_CEILING
+                    else ("WARNING" if observed_far > DRIFT_FAR_WARN else "NORMAL"),
+                    far=round(observed_far, 4),
+                )
+            except Exception as _exc:
+                swallowed("enrichment.anomaly_scorer.update_drift_status", _exc, logger)
             # Coverage travels with the score. A 0.4 from the detector's
             # warm-up curve and a 0.4 from its percentile over a full window are
             # the same number and not the same claim; nothing downstream could
@@ -670,7 +771,22 @@ class DynamicAnomalyScorer:
 
         results = []
         points = []
-        for i, entity_id in enumerate(entities):
+        # Which items carry a usable kinematic reading.
+        #
+        # AIS transmits "not available" in band -- 511 for heading, 1023 tenths
+        # for speed over ground -- and the maritime enricher now decodes both to
+        # None rather than passing the sentinel through as a bearing of 511
+        # degrees or a speed of 102.3 knots. So these lists can contain None,
+        # and a missing dimension is not a zero one: feeding 0 into the Kalman
+        # filter asserts a stationary vessel pointing due north.
+        scoreable = [
+            i for i in range(len(entities))
+            if speeds[i] is not None and headings[i] is not None
+            and lats[i] is not None and lons[i] is not None
+        ]
+
+        for i in scoreable:
+            entity_id = entities[i]
             kf = self._get_or_create_kalman(entity_id)
             residuals = kf.predict_and_update(
                 lats[i], lons[i], speeds[i], headings[i], timestamps[i]
@@ -692,11 +808,28 @@ class DynamicAnomalyScorer:
             results.append(residuals)
 
         loop = asyncio.get_running_loop()
-        scores = await loop.run_in_executor(None, detector.insert_batch, points)
-        is_significant_list = await self._check_ema_gatekeeper_batch("kinematic", scores)
+        scores = await loop.run_in_executor(None, detector.insert_batch, points) if points else []
+        is_significant_list = await self._check_ema_gatekeeper_batch("kinematic", scores) if points else []
+
+        scored_by_index = {}
+        for pos, (score, sig, residuals) in enumerate(zip(scores, is_significant_list, results)):
+            scored_by_index[scoreable[pos]] = (score, sig, residuals)
 
         final = []
-        for i, (score, sig, residuals) in enumerate(zip(scores, is_significant_list, results)):
+        for i in range(len(entities)):
+            if i not in scored_by_index:
+                # No reading, so no opinion. Marked rather than scored, so a
+                # vessel that did not report its heading is not ranked beside
+                # one that did.
+                final.append({
+                    "score": 0.0,
+                    "is_significant": False,
+                    "domain": domain,
+                    "scoring_degraded": True,
+                    "degraded_reason": "kinematics_not_reported",
+                })
+                continue
+            score, sig, residuals = scored_by_index[i]
             final.append({
                 "score": round(score, 4),
                 "is_significant": sig,

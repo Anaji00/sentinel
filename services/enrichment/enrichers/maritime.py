@@ -10,6 +10,9 @@ structured events that the rest of the system can understand.
 import json
 import logging
 import asyncio
+import time
+from shared.utils.tasks import safe_create_task
+from shared.utils.quiet_failures import dropped, swallowed
 from datetime import datetime, timezone
 from typing import Optional, List
  
@@ -19,7 +22,15 @@ from shared.utils.regions import (
     classify_region, decode_nav_status, decode_vessel_type, is_restricted_nav_status,
 )
 from shared.utils.sanctions import check_sanctions, mmsi_to_country
-from shared.utils.regions import routine_band_score
+
+# The vessel watchlist the news scorer reads and nothing wrote.
+#
+# `check_watchlist(entity, "vessels")` and two zscore lookups in anomaly_scorer
+# all point at this key; it did not exist. Flagged hulls are written here so a
+# vessel named in a headline is recognised the way a watched ticker is.
+WATCHED_VESSELS_KEY = "sentinel:watched:vessels"
+WATCHED_VESSELS_TTL_SEC = 30 * 86400
+from shared.utils.regions import classify_region, routine_band_score
 from services.enrichment.anomaly_scorer import lift_score
  
 logger = logging.getLogger("enrichment.maritime")
@@ -35,6 +46,26 @@ logger = logging.getLogger("enrichment.maritime")
 # rather than a number no compass can show.
 AIS_HEADING_UNAVAILABLE = 511
 AIS_COG_UNAVAILABLE = 360.0
+
+
+# Speed over ground is transmitted in tenths of a knot, and 1023 -- 102.3
+# after scaling -- is the not-available code. 342 live events carry it. No
+# helper existed for it at all; the detector happens to be robust to the value,
+# which is why it was never noticed.
+AIS_SOG_UNAVAILABLE = 102.3
+
+
+def _ais_sog(value):
+    """Speed over ground in knots, or None where AIS said it does not know."""
+    if value is None:
+        return None
+    try:
+        sog = float(value)
+    except (TypeError, ValueError):
+        return None
+    if sog >= AIS_SOG_UNAVAILABLE or sog < 0:
+        return None
+    return sog
 
 
 def _ais_heading(value):
@@ -91,6 +122,7 @@ class MaritimeEnricher:
         
         positions = []
         statics = []
+        chokepoints = []
         for raw in events:
             payload = raw.raw_payload
             msg_type = payload.get("MessageType", "")
@@ -98,8 +130,36 @@ class MaritimeEnricher:
                 positions.append(raw)
             elif msg_type == "ShipStaticData":
                 statics.append(raw)
-                
+            elif payload.get("instrument") == "sentinel-1-sar":
+                # Radar, not AIS.
+                #
+                # The SAR collector publishes to this topic and its payload has
+                # no MessageType, so it matched neither branch above and left
+                # the loop -- with no counter, no log and no dead letter, which
+                # is the one failure mode this platform is least able to see.
+                # Every chokepoint reading Sentinel-1 has ever produced was
+                # discarded on arrival, including the traffic assessments the
+                # collector logs at WARNING when they are notable.
+                chokepoints.append(raw)
+            else:
+                # Counted, for the same reason the crypto and tradfi enrichers
+                # count theirs: one unmatched message is a probe and ten
+                # thousand is a feed being thrown away, and a bare `continue`
+                # says neither.
+                dropped(
+                    "enrichment.maritime.unrouted_message",
+                    f"no branch for source={raw.source!r} MessageType={msg_type!r}",
+                    logger,
+                )
+
         results = []
+        if chokepoints:
+            c_res = await asyncio.gather(
+                *[self._chokepoint_reading(e, e.raw_payload) for e in chokepoints],
+                return_exceptions=True,
+            )
+            results.extend([r for r in c_res if isinstance(r, NormalizedEvent)])
+
         if statics:
             tasks = [self._static(e, e.raw_payload, e.raw_payload.get("MetaData", {}), str(e.raw_payload.get("MetaData", {}).get("MMSI", "")).strip()) for e in statics]
             s_res = await asyncio.gather(*tasks, return_exceptions=True)
@@ -111,6 +171,111 @@ class MaritimeEnricher:
             
         return results
     
+    # ── Chokepoint radar ──────────────────────────────────────────────────────
+
+    # Sigma at which a chokepoint reading is worth reporting as a finding.
+    #
+    # `shared.utils.chokepoints` already calls two sigma "notable" and says so
+    # in the assessment's own `direction`. This scales that judgement onto the
+    # platform's score rather than re-deciding it: two sigma reaches the floor
+    # every rule can see, four saturates.
+    CHOKEPOINT_SIGMA_FLOOR = 2.0
+    CHOKEPOINT_SIGMA_CEILING = 4.0
+
+    async def _chokepoint_reading(self, raw, payload) -> Optional[NormalizedEvent]:
+        """A Sentinel-1 look at a chokepoint, as a supply-chain measurement.
+
+        The first producer of SUPPLY_CHAIN_METRIC. The type was declared, named
+        by `rule_physical_disruption_repricing` as its evidence, and constructed
+        nowhere -- so a rule about a strait emptying and freight repricing had
+        no way to learn that a strait had emptied.
+
+        Radar is the measurement AIS cannot be: a vessel that has switched off
+        its transponder still returns like metal. The collector is careful to
+        say the reading is a target density and not a vessel count
+        (`is_vessel_count: False`), and that distinction is carried through
+        here rather than quietly upgraded.
+        """
+        name = payload.get("chokepoint")
+        if not name:
+            return None
+
+        assessment = payload.get("traffic_assessment")
+        tags = ["maritime", "chokepoint", "sar", str(name).lower()]
+
+        if not assessment:
+            # No baseline yet. A chokepoint that has not been measured has not
+            # been quiet, and scoring it as calm would be the more damaging of
+            # the two errors.
+            anomaly = 0.0
+            tags.append("no_baseline")
+            direction = "unmeasured"
+            z_score = None
+        else:
+            z_score = float(assessment.get("z_score") or 0.0)
+            direction = str(assessment.get("direction") or "normal")
+            span = self.CHOKEPOINT_SIGMA_CEILING - self.CHOKEPOINT_SIGMA_FLOOR
+            anomaly = max(0.0, min(1.0, (abs(z_score) - self.CHOKEPOINT_SIGMA_FLOOR) / span))
+            tags.append(direction)
+
+        # The region AIS would give the same water, not the collector's label
+        # for it.
+        #
+        # The SAR collector images four chokepoints under its own names, and the
+        # region a vessel gets comes from `classify_region` on its position.
+        # Three of the four agree by luck; "Gulf of Guinea" resolves to
+        # "Nigerian Territorial", so a radar reading labelled with the
+        # collector's name could never join the vessels inside it -- and the
+        # region join is the whole basis of the chokepoint rules.
+        #
+        # Running the centroid through the same function the AIS path uses
+        # makes the two agree by construction rather than by coincidence, for
+        # the chokepoints that exist now and any added later.
+        bbox = payload.get("bbox") or {}
+        lat = lon = None
+        try:
+            lat = (float(bbox["south"]) + float(bbox["north"])) / 2.0
+            lon = (float(bbox["west"]) + float(bbox["east"])) / 2.0
+        except (KeyError, TypeError, ValueError):
+            lat = lon = None
+        region = classify_region(lat, lon) if lat is not None else None
+
+        observed = payload.get("observed_on")
+        headline = (
+            f"{name}: radar target density {payload.get('target_density')} "
+            + (f"({direction}, z={z_score:+.2f})" if z_score is not None
+               else "(no baseline yet)")
+        )
+
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.SUPPLY_CHAIN_METRIC,
+            occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+            source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
+            primary_entity=Entity(
+                id=str(name), type=EntityType.INFRASTRUCTURE, name=str(name),
+            ),
+            # Resolved above, so it matches what a vessel in the same water
+            # carries. Falls back to the collector's own name only when the
+            # reading has no usable bounding box, which is the honest answer
+            # when there is nothing to classify.
+            region=region or str(name),
+            latitude=lat,
+            longitude=lon,
+            headline=headline,
+            summary=(
+                f"Sentinel-1 SAR over {name} on {observed}: "
+                f"{payload.get('target_pixels')} target pixels of "
+                f"{payload.get('water_pixels')} water pixels. "
+                f"{payload.get('method')}. This is a target density, not a vessel count."
+            ),
+            anomaly_score=anomaly,
+            tags=tags,
+            named_entities=[str(name)],
+        )
+
     # ── Position ──────────────────────────────────────────────────────────────
 
     async def _position_batch(self, events: list) -> list:
@@ -130,8 +295,22 @@ class MaritimeEnricher:
             lon = pos.get("Longitude")
             if lat is None or lon is None: continue
             
-            speed = float(pos.get("Sog") or 0)
-            heading = int(pos.get("TrueHeading") or 0)
+            # The in-band "not available" codes, decoded here rather than only
+            # on the display path.
+            #
+            # `_ais_heading` and `_ais_cog` were written for exactly this and
+            # were called at two sites, both of which render the payload. The
+            # parse path forty lines earlier kept `int(pos.get("TrueHeading") or
+            # 0)`, so the raw 511 -- ITU-R M.1371's heading-not-available code --
+            # went straight into the kinematic batch scorer. Measured over three
+            # days: 228 vessel events carry heading 511 and average 0.600
+            # anomaly against a 0.126 baseline, 4.8x, and above the 0.5 that
+            # counts as a reaction in edge validation.
+            #
+            # `or 0` was the second half of it: a genuine heading of due north
+            # and a missing one were the same value.
+            speed = _ais_sog(pos.get("Sog"))
+            heading = _ais_heading(pos.get("TrueHeading"))
             nav_code = pos.get("NavigationalStatus") or 0
             nav_status = decode_nav_status(nav_code)
             region = classify_region(lat, lon)
@@ -206,6 +385,25 @@ class MaritimeEnricher:
             # By code, not by prose in the label -- see the note at the
             # nav_anomaly assignment above.
             is_emergency_nav = is_restricted_nav_status(nav_code)
+
+            # A flagged vessel joins the vessel watchlist.
+            #
+            # `anomaly_scorer` reads `sentinel:watched:vessels` at two sites --
+            # it is how a vessel named in a headline earns the same boost a
+            # watched ticker does -- and nothing in the tree had ever written
+            # that key. It did not exist at all, so the lookup returned None on
+            # every call and the maritime half of that check was dead, on a
+            # platform whose maritime domain is its largest.
+            #
+            # Populated from what the platform already determined rather than
+            # from a list somebody has to maintain: a sanctioned or flagged hull
+            # is exactly the vessel whose mention in the news should carry
+            # weight. The same key and the same zset `check_watchlist` reads.
+            if is_sanctioned and getattr(self, "redis", None) is not None:
+                safe_create_task(
+                    self._watch_vessel(mmsi, vname),
+                    name="watch-flagged-vessel",
+                )
 
             # ROUTINE TELEMETRY GUARD:
             # Routine pings are held below the alerting band -- but *ordered*
@@ -396,3 +594,24 @@ class MaritimeEnricher:
         if any("sanctioned" in f for f in flags):
             tags.append("sanctions_risk")
         return tags
+
+    async def _watch_vessel(self, mmsi, name) -> None:
+        """Record a flagged hull on the vessel watchlist, by MMSI and by name.
+
+        Both, because the reader looks up whatever token a headline produced --
+        a news story names a ship, an AIS feed names an MMSI, and they have to
+        meet somewhere.
+        """
+        raw_redis = getattr(getattr(self, "redis", None), "raw", None)
+        if raw_redis is None:
+            return
+        members = {str(m).upper(): time.time() for m in (mmsi, name) if m}
+        if not members:
+            return
+        try:
+            pipe = raw_redis.pipeline()
+            pipe.zadd(WATCHED_VESSELS_KEY, mapping=members)
+            pipe.expire(WATCHED_VESSELS_KEY, WATCHED_VESSELS_TTL_SEC)
+            await pipe.execute()
+        except Exception as _exc:
+            swallowed("enrichment.enrichers.maritime._watch_vessel", _exc, logger)

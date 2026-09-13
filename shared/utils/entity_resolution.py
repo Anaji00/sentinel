@@ -209,6 +209,62 @@ def looks_like_ticker(raw: Any) -> bool:
     return bool(_TICKERISH.match(str(raw).strip().upper()))
 
 
+# Names that cannot be a subject, whatever the extractor said.
+#
+# Two junk nodes reached the live graph and acquired ten MACRO_CORRELATED edges
+# to real companies: one named "GLOBAL CONTEXT" -- a section heading from a
+# prompt -- and one named "0.80" -- a confidence score printed inside the text
+# being read. Nothing asked whether a proposed entity name could name an entity
+# at all, so both became nodes, both gained degree, and centrality counted a
+# decimal number as a hub.
+#
+# Structural, not a blocklist of observed junk: the first rule rejects anything
+# made only of digits and separators, which no company name is.
+_NON_ENTITY_SHAPE = re.compile(r"^[\s\d.,:;%+\-/()\[\]]*$")
+
+# Prompt scaffolding the reasoning tier prints into its own context and then
+# reads back out. Real English phrases, so matched exactly -- a shape rule wide
+# enough to catch these would catch real names too.
+_PROMPT_SCAFFOLD = frozenset({
+    "GLOBAL CONTEXT", "MARKET CONTEXT", "EXECUTIVE SUMMARY", "KEY FINDINGS",
+    "ANALYSIS", "SUMMARY", "CONTEXT", "BACKGROUND", "RECOMMENDATION",
+    "RECOMMENDATIONS", "CONCLUSION", "ASSESSMENT", "OVERVIEW",
+    "UNKNOWN", "N/A", "NONE", "NULL", "TBD", "ETC",
+})
+
+# Below this a name is a fragment, not an identification -- unless it is shaped
+# like a ticker, which is short by construction.
+#
+# Two, not three: "3M" is a company and is not ticker-shaped (the ticker is
+# MMM), so a floor of three rejected it. The rule that does the work here is the
+# requirement below that a name contain at least one letter.
+MIN_ENTITY_NAME_LEN = 2
+
+
+def is_plausible_entity_name(raw: Any) -> bool:
+    """Whether a string could name a real-world subject.
+
+    Deliberately permissive: it rejects what cannot be an entity rather than
+    accepting only what is known to be one. A wrong rejection loses a real
+    subject, and the platform's whole premise is joining mentions of the same
+    subject across domains.
+    """
+    if raw is None:
+        return False
+    text = str(raw).strip()
+    if not text or _NON_ENTITY_SHAPE.match(text):
+        return False
+    upper = text.upper()
+    if upper in _PROMPT_SCAFFOLD:
+        return False
+    if looks_like_ticker(text):
+        return True
+    if len(text) < MIN_ENTITY_NAME_LEN:
+        return False
+    # A name with no letter in it at all is an identifier fragment, not a name.
+    return any(ch.isalpha() for ch in text)
+
+
 def canonical_key(raw: Any) -> str:
     """The key a subject folds to before any store is consulted.
 
@@ -340,6 +396,101 @@ async def record_alias(
     except Exception as e:
         logger.debug("Could not record alias %r -> %r: %s", alias, canonical, e)
         return False
+
+
+# How many aliases one pipeline round trip carries. The SEC registry is about
+# twelve thousand companies; at this size the seed is a few dozen round trips
+# rather than twenty-four thousand.
+_ALIAS_SEED_BATCH = 500
+
+
+async def seed_aliases(
+    redis_client: Any,
+    pairs,
+    *,
+    source: str,
+    confidence: float = 0.95,
+) -> int:
+    """Bulk-record aliases from an authoritative registry. Returns how many were new.
+
+    `record_alias` existed, was correct, and had exactly one caller: an admin
+    route where a human types one merge at a time. So the alias hash was empty
+    on the running deployment, and every consumer of `resolve_entity` -- the
+    consensus engine fusing bulletins by subject, the centrality the correlation
+    tier reads, the pattern library's retrieval by entity -- operated on the
+    structural fold alone. Under that fold "AAPL" is AAPL and "Apple Inc." is
+    APPLE: two subjects, one company, no corroboration possible between them.
+
+    The mapping was already in the platform. The filings collector downloads the
+    SEC's own company_tickers.json -- title to ticker for every registrant -- and
+    used it only to label 13F holdings.
+
+    HSETNX rather than HSET, per field: a merge a human recorded through the
+    attribution route is a deliberate decision and outranks a bulk seed, so an
+    existing entry is never overwritten. Provenance is written only for the
+    entries that were actually new, so it describes what happened.
+    """
+    if not redis_client:
+        return 0
+    try:
+        raw_redis = getattr(redis_client, "raw", redis_client)
+    except Exception:
+        return 0
+
+    try:
+        conf = min(1.0, max(0.0, float(confidence)))
+    except (TypeError, ValueError):
+        conf = 0.95
+
+    # Deduplicate before touching Redis: a registry lists several share classes
+    # under near-identical titles and the fold collapses them onto one key.
+    candidates: Dict[str, str] = {}
+    for alias, canonical in pairs:
+        alias_s = str(alias or "").strip().upper()
+        canon_s = canonical_key(canonical)
+        if not alias_s or not canon_s or alias_s == canon_s:
+            continue
+        candidates.setdefault(alias_s, canon_s)
+        fold = canonical_key(alias_s)
+        if fold and fold != alias_s:
+            candidates.setdefault(fold, canon_s)
+
+    if not candidates:
+        return 0
+
+    recorded = 0
+    items = list(candidates.items())
+    now = datetime.now(timezone.utc).isoformat()
+    for start in range(0, len(items), _ALIAS_SEED_BATCH):
+        chunk = items[start:start + _ALIAS_SEED_BATCH]
+        try:
+            pipe = raw_redis.pipeline()
+            for alias_s, canon_s in chunk:
+                pipe.hsetnx(ALIAS_KEY, alias_s, canon_s)
+            results = await pipe.execute()
+        except Exception as e:
+            logger.warning("Alias seed batch failed (%s): %s", source, e)
+            continue
+
+        provenance = {
+            f"{alias_s}->{canon_s}": json.dumps({
+                "source": source,
+                "confidence": round(conf, 4),
+                "recorded_at": now,
+            })
+            for (alias_s, canon_s), was_new in zip(chunk, results or [])
+            if was_new
+        }
+        recorded += len(provenance)
+        if provenance:
+            try:
+                await raw_redis.hset(ALIAS_PROVENANCE_KEY, mapping=provenance)
+            except Exception as _exc:
+                swallowed("utils.entity_resolution.seed_aliases_provenance", _exc, logger)
+
+    if recorded:
+        logger.info("Recorded %d new aliases from %s.", recorded, source)
+    return recorded
 
 
 async def _record_alias_provenance(
