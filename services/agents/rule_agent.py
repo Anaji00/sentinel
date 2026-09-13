@@ -12,6 +12,7 @@ from shared.utils.text import clip
 from shared.utils.quiet_failures import swallowed
 from shared.utils.entity_resolution import is_plausible_entity_name
 from shared.utils.rule_feedback import firing_counts, rule_performance
+from shared.utils.quiet_failures import dropped
 from shared.models.correlation_rules import (
     CLAUSE_KEYS,
     is_seed_rule,
@@ -374,7 +375,40 @@ class RuleSynthesizerAgent(SentinelAgent):
         summary = ""
         entities = []
         prompt_context = ""
-        
+
+        # An analyst's verdict on a rule, which used to fall off the end.
+        #
+        # /feedback publishes to RULES_FEEDBACK and this agent subscribes to it,
+        # so the topic-contract check reports the pairing as healthy -- a
+        # producer and a consumer, correctly wired. What the check cannot see is
+        # that the message reached the `else` below, found no
+        # `brief.headline_summary`, and returned. Every analyst verdict the
+        # platform has ever collected arrived here and was dropped on the line
+        # after it arrived.
+        #
+        # A consumer that discards every message of a type still counts as a
+        # consumer, which is why the wiring check passed for as long as this
+        # did. The verdict is not a synthesis trigger -- it says an existing
+        # rule is wrong, not that a new one is needed -- so it goes to the
+        # curator that decides which rules survive.
+        if message.get("source") == "analyst" and message.get("rule_id"):
+            rule_id = str(message["rule_id"])
+            record = await rule_performance(self.redis, rule_id)
+            self.logger.info(
+                "Analyst verdict on %s: %s (%s negative of %s, review=%s)",
+                rule_id, message.get("verdict"), record["negative"],
+                record["total"], record["needs_review"],
+            )
+            if record["needs_review"]:
+                # Enough negative judgement to be worth the inference. The
+                # cooldown inside still applies, so a run of complaints cannot
+                # turn every verdict into a prune pass.
+                await self._maybe_prune_rules(
+                    f"An analyst marked rule {rule_id} as {message.get('verdict')}. "
+                    f"{record['negative']} of {record['total']} verdicts on it are negative."
+                )
+            return
+
         # Branch based on message structure
         if "scenario_id" in message:
             summary = message.get("headline", "")
@@ -392,6 +426,18 @@ class RuleSynthesizerAgent(SentinelAgent):
             summary = brief.get("headline_summary", "")
             entities = brief.get("entities", [])
             if not summary:
+                # The end of the dispatch chain, and it was a bare return.
+                #
+                # Counted rather than dropped, the way the enrichment tier ends
+                # its own chains: one unmatched shape is a new producer being
+                # wired up, the same shape unmatched ten thousand times is a
+                # feed being thrown away, and only the count tells them apart.
+                dropped(
+                    "agents.rule_synthesizer.unrouted_message",
+                    "no branch matched this message shape",
+                    self.logger,
+                    detail=f"keys={sorted(message)[:8]}",
+                )
                 return
             self.logger.debug(f"Synthesizing rules based on macro shift: {summary}")
             prompt_context = f"A new macro intelligence brief has been issued:\nSUMMARY: {summary}\nENTITIES: {entities}"
