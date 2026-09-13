@@ -1146,6 +1146,20 @@ class Domain(str, Enum):
 # Domains that participate in cross-domain excitation and correlation breadth.
 CROSS_DOMAIN_MEMBERS = tuple(d.value for d in Domain if d is not Domain.OTHER)
 
+# Domains the platform no longer originates findings from.
+#
+# Still members above, deliberately: the events table keeps 90 days of cyber
+# rows, /events/cyber still serves them, and a historical finding whose
+# primary_domain is "cyber" is a real record that must still route. What has
+# ended is the claim that this platform can *produce* a cross-domain finding
+# from the domain -- its collector is out of the default profile and both of
+# its rules are withdrawn.
+#
+# The distinction matters because the scenario coverage check reads "every
+# domain the platform claims must trigger at least one scenario", and a
+# retired domain would otherwise have to keep a scenario it cannot satisfy.
+RETIRED_DOMAINS = frozenset({Domain.CYBER.value})
+
 
 # One table, checked exhaustively by a test.
 #

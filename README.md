@@ -8,7 +8,8 @@
 
 ```
                                   [ DOMAIN TELEMETRY SOURCES ]
-  (Maritime AIS | TradFi Equities & Options | Macro Calendar & SOFR | Crypto Swaps | Cyber BGP | Prediction Markets | Aviation ADSB | OSINT)
+  (Maritime AIS | TradFi Equities & Options | Macro Calendar & SOFR | Crypto Swaps | Prediction Markets | Aviation ADSB* | OSINT)
+                     * emergency squawks and five watch zones.  Cyber BGP is retired: `make cyber`.
                                                 │
                                                 ▼
                                     [ KAFKA EVENT BACKBONE ]

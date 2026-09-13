@@ -103,7 +103,7 @@ const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
     category: "Cross-Domain Epistemic",
     epistemic_tier: "Stochastic Process",
     description:
-      "Quantifies self- and mutually-exciting jump clustering across maritime chokepoint events, geopolitical news, cyber disclosures, and market volatility.",
+      "Quantifies self- and mutually-exciting jump clustering across maritime chokepoint events, geopolitical news, and market volatility.",
     formula_latex:
       "λ_i(t) = μ_i + Σ_j Σ_{t_k < t} α_{ij} · e^(-β_{ij} · (t - t_k))",
     assumptions: [

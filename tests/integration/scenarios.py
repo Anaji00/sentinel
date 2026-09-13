@@ -309,9 +309,14 @@ PORT_RANSOMWARE = Scenario(
              headline="STS transfer outside designated anchorage",
              source="aisstream"),
     ],
-    expect_rule="rule_cyber_aviation_chokepoint",
-    expect_evidence_types=("vessel_dark",),
-    expect_min_domains=2,
+    # Retired with the cyber domain, and kept as the price of retiring it.
+    #
+    # This is a real situation the platform could answer and now cannot. The
+    # scenario stays written down, asserting silence rather than a finding, so
+    # the cost is visible and the acceptance criteria survive: if the cyber
+    # feeds come back, changing this one line back is how you check the
+    # capability came back with them.
+    expect_rule="",  # the cyber domain is withdrawn; nothing should fire
 )
 
 GPS_INTERFERENCE = Scenario(
@@ -346,9 +351,14 @@ GPS_INTERFERENCE = Scenario(
              source="opensky",
              headline="Transponder off mid-route"),
     ],
-    expect_rule="rule_cyber_aviation_chokepoint",
-    expect_evidence_types=("flight_anomaly", "flight_dark"),
-    expect_min_domains=2,
+    # Retired with the cyber domain, and kept as the price of retiring it.
+    #
+    # This is a real situation the platform could answer and now cannot. The
+    # scenario stays written down, asserting silence rather than a finding, so
+    # the cost is visible and the acceptance criteria survive: if the cyber
+    # feeds come back, changing this one line back is how you check the
+    # capability came back with them.
+    expect_rule="",  # the cyber domain is withdrawn; nothing should fire
 )
 
 CYBER_MARKET_IMPACT = Scenario(
@@ -378,9 +388,14 @@ CYBER_MARKET_IMPACT = Scenario(
              headline="UNH -4.1% intraday",
              tags=["tradfi", "unh"]),
     ],
-    expect_rule="rule_cyber_market_impact",
-    expect_evidence_types=("options_flow", "price_anomaly"),
-    expect_min_domains=2,
+    # Retired with the cyber domain, and kept as the price of retiring it.
+    #
+    # This is a real situation the platform could answer and now cannot. The
+    # scenario stays written down, asserting silence rather than a finding, so
+    # the cost is visible and the acceptance criteria survive: if the cyber
+    # feeds come back, changing this one line back is how you check the
+    # capability came back with them.
+    expect_rule="",  # the cyber domain is withdrawn; nothing should fire
 )
 
 
@@ -875,9 +890,14 @@ KEV_EXPLOITATION = Scenario(
              headline="EDGE block, seller",
              tags=["tradfi", "equity_block", "edge"]),
     ],
-    expect_rule="rule_cyber_market_impact",
-    expect_evidence_types=("options_flow", "equity_block"),
-    expect_min_domains=2,
+    # Retired with the cyber domain, and kept as the price of retiring it.
+    #
+    # This is a real situation the platform could answer and now cannot. The
+    # scenario stays written down, asserting silence rather than a finding, so
+    # the cost is visible and the acceptance criteria survive: if the cyber
+    # feeds come back, changing this one line back is how you check the
+    # capability came back with them.
+    expect_rule="",  # the cyber domain is withdrawn; nothing should fire
 )
 
 CYBER_WRONG_REGION = Scenario(
@@ -1134,4 +1154,14 @@ ALL_SCENARIOS = [
 
 # Every domain the platform claims to reason across must be the *trigger* of at
 # least one scenario. Being evidence for someone else's rule is not coverage.
-COVERED_DOMAINS = {s.domain for s in ALL_SCENARIOS}
+#
+# Nor is asserting silence. When the four cyber scenarios were converted to
+# expect nothing, cyber went on counting as covered by scenarios that cannot
+# produce a finding -- the check passed while its own failure message said "one
+# with no scenario is one nobody has checked can produce a finding". A scenario
+# has to expect a rule before it is evidence that the domain works.
+COVERED_DOMAINS = {s.domain for s in ALL_SCENARIOS if s.expect_rule}
+
+# Every domain that appears at all, including the ones only asserting silence.
+# Used to check that a retired domain has kept its situations written down.
+DOMAINS_WITH_SCENARIOS = {s.domain for s in ALL_SCENARIOS}

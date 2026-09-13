@@ -43,11 +43,14 @@ reasoning: preflight ## Start the LLM swarm (stops collectors — they do not co
 obs: ## Add Prometheus + Grafana + Kafka UI to the running mode
 	$(COMPOSE) --profile obs up -d
 
+cyber: ## Start the retired cyber collector (see docker-compose.yml for why)
+	$(COMPOSE) --profile cyber up -d
+
 stop: ## Stop containers, keep volumes
-	$(COMPOSE) --profile collectors --profile agents --profile obs stop
+	$(COMPOSE) --profile collectors --profile agents --profile obs --profile cyber stop
 
 down: ## Remove containers, KEEP volumes (data survives)
-	$(COMPOSE) --profile collectors --profile agents --profile obs down
+	$(COMPOSE) --profile collectors --profile agents --profile obs --profile cyber down
 
 # ── Observation ──────────────────────────────────────────────────────────────
 ps: ## Running services with memory headroom

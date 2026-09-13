@@ -253,11 +253,27 @@ async def test_every_domain_the_platform_claims_is_covered_by_a_scenario():
     scenario triggering from it is a domain nobody has asked the question
     about.
     """
-    from shared.models.events import CROSS_DOMAIN_MEMBERS
+    from shared.models.events import CROSS_DOMAIN_MEMBERS, RETIRED_DOMAINS
 
-    missing = sorted(set(CROSS_DOMAIN_MEMBERS) - S.COVERED_DOMAINS)
+    claimed = set(CROSS_DOMAIN_MEMBERS) - RETIRED_DOMAINS
+    missing = sorted(claimed - S.COVERED_DOMAINS)
     assert not missing, (
         f"No use case triggers from: {missing}. Every domain in the enum is "
         f"collected, scored and stored; one with no scenario is one nobody has "
         f"checked can produce a finding."
     )
+
+    # And the retirement has to be real in both directions. A retired domain
+    # keeps its situations -- that is how the cost of retiring it stays
+    # visible -- but none of them may expect a finding, or the domain is not
+    # retired, it is merely unmonitored.
+    for domain in sorted(RETIRED_DOMAINS):
+        assert domain in S.DOMAINS_WITH_SCENARIOS, (
+            f"{domain} was retired and its situations deleted with it. Keep "
+            f"them asserting silence, so what was given up is still written "
+            f"down and the acceptance criteria survive if it returns."
+        )
+        assert domain not in S.COVERED_DOMAINS, (
+            f"{domain} is listed as retired and still has a scenario expecting "
+            f"a rule to fire. One of the two is wrong."
+        )

@@ -117,7 +117,7 @@ _dynamic_rules_cache = {}
 # Reconciliation is version-gated rather than unconditional, because these
 # rules are meant to be edited at runtime and overwriting an operator's change
 # on every restart would be worse than the problem it fixes.
-RULE_DEFINITION_VERSION = 4
+RULE_DEFINITION_VERSION = 5
 
 # What each tier is allowed to claim, per hour, before it stops being that tier.
 #
@@ -185,40 +185,6 @@ async def _tier_after_frequency(redis_client, rule_id: str, declared: AlertTier)
 # share one source. They were declared inside the seed branch, which is why
 # nothing could compare against them once seeding had happened.
 SHIPPED_RULES = [
-    {
-        "rule_id": "rule_cyber_aviation_chokepoint",
-        "rule_name": "Cyber Disruption at a Transport Chokepoint",
-        "trigger_event_type": ["breach_detected", "infra_exposed", "ransomware", "bgp_anomaly"],
-        "conditions": {"min_anomaly": 0.25},
-        # Joined by geography, which is what the rule's name has always claimed.
-        #
-        # Declaring no join meant this correlated a ransomware disclosure about
-        # one company with the positions of unrelated aircraft anywhere on
-        # earth, on nothing but both falling inside 48 hours -- 27 of 39 live
-        # correlations, 69% of the layer's entire output. The join requirement
-        # added alongside this would otherwise have silenced the rule rather
-        # than corrected it, which is a worse outcome: a rule that fires wrongly
-        # is visible and a rule that stopped firing is not.
-        #
-        # A cyber event and an aircraft in the same chokepoint is a claim worth
-        # making. The same two on opposite sides of the world is not.
-        #
-        # The two position types this clause used to list are stripped from
-        # every result set before a rule sees them, so the only types it could
-        # ever match were flight_dark and flight_anomaly -- and its one
-        # maritime type was vessel_position, the one that is always excluded.
-        # A ransomware attack on a terminal operator could therefore never
-        # correlate with a single ship, which is the case the rule is named
-        # for: Maersk in 2017 and the Port of Nagoya in 2023 both showed up in
-        # AIS behaviour at the berth within hours.
-        #
-        # Now it lists the five types that are *findings about* a vessel or an
-        # aircraft, and none that are routine telemetry.
-        "correlations": [{"event_types": ["flight_dark", "flight_anomaly", "vessel_dark", "vessel_sts", "vessel_spoof"], "hours": 48, "min_anomaly": 0.25, "region": True}],
-        "alert_tier": "CRITICAL",
-        "expires_at": int(time.time()) + 315360000,
-        "definition_version": RULE_DEFINITION_VERSION
-    },
     {
         # The first rule that asks about order rather than co-occurrence.
         #
@@ -509,26 +475,27 @@ SHIPPED_RULES = [
         "alert_tier": "ELEVATED",
         "expires_at": int(time.time()) + 315360000,
         "definition_version": RULE_DEFINITION_VERSION
-    },
-    {
-        "rule_id": "rule_cyber_market_impact",
-        "rule_name": "Cyber Incident & Market Reaction",
-        "trigger_event_type": ["ransomware", "breach_detected", "vulnerability"],
-        "conditions": {"min_anomaly": 0.25},
-        # Change Healthcare in 2024, MGM in 2023, SolarWinds in 2020: a
-        # disclosed incident at a listed company reprices it, and the options
-        # market usually moves first. The cyber feeds name the victim and the
-        # market feeds name the ticker, so the join is on the subject rather
-        # than on an identifier the two sides never share.
-        "correlations": [{
-            "event_types": ["market_anomaly", "price_anomaly", "options_flow", "equity_block", "dark_pool"],
-            "hours": 48, "min_anomaly": 0.25, "shared_tags": True,
-        }],
-        "alert_tier": "ELEVATED",
-        "expires_at": int(time.time()) + 315360000,
-        "definition_version": RULE_DEFINITION_VERSION
     }
 ]
+
+# Rules this build has withdrawn, and the reason.
+#
+# Reconciliation installs a missing shipped rule and updates a superseded one.
+# It has never removed anything, because nothing had ever been withdrawn -- so
+# a rule deleted from SHIPPED_RULES would go on evaluating forever on every
+# deployment that already had it, against a feed that no longer exists. A
+# retired rule needs a list of its own or the retirement does not reach the
+# platform, which is the same shape as the defect that kept six *added* rules
+# from reaching it.
+#
+# The cyber domain was withdrawn because it does not join to the others, which
+# is what this platform is for: an AS number resolves to no ticker, no vessel
+# and no region, and the attempt to bridge it through the RIR registrant put
+# law firms and a university at the head of live cross-domain correlations.
+RETIRED_RULE_IDS = {
+    "rule_cyber_aviation_chokepoint": "cyber domain withdrawn; trigger and aviation evidence both gone",
+    "rule_cyber_market_impact": "cyber domain withdrawn; no trigger remains",
+}
 
 # Marked in one place rather than seventeen.
 #
@@ -571,6 +538,24 @@ async def _reconcile_shipped_rules(redis_client) -> None:
     protecting: an edited rule is present, so it takes the version comparison
     below rather than this branch.
     """
+    # Withdrawn first, so a rule cannot be retired and reinstalled in one pass.
+    for rule_id, reason in RETIRED_RULE_IDS.items():
+        if rule_id not in _dynamic_rules_cache:
+            continue
+        try:
+            await redis_client.raw.hdel("sentinel:correlation:dynamic_rules", rule_id)
+            # The cache delete reaches this process; the tombstone reaches the
+            # others. The listener's deprecated branch clears the cache but does
+            # not touch the hash, which is why the hdel above is separate.
+            await redis_client.raw.publish(
+                "sentinel:correlation:rule_updates",
+                json.dumps({"rule_id": rule_id, "deprecated": True}),
+            )
+            _dynamic_rules_cache.pop(rule_id, None)
+            logger.info("Withdrew retired rule %s: %s", rule_id, reason)
+        except Exception as e:
+            logger.error("Failed to withdraw retired rule %s: %s", rule_id, e)
+
     updated, installed = [], []
     for rule_id, shipped in _shipped_rules_cache.items():
         stored = _dynamic_rules_cache.get(rule_id)
@@ -616,7 +601,7 @@ async def _listen_for_rule_updates(redis_client):
                     _dynamic_rules_cache[rule["rule_id"]] = rule
             await _reconcile_shipped_rules(redis_client)
         else:
-            default_rules = SHIPPED_RULES
+            default_rules = [r for r in SHIPPED_RULES if r["rule_id"] not in RETIRED_RULE_IDS]
             for d_rule in default_rules:
                 await redis_client.raw.hset("sentinel:correlation:dynamic_rules", d_rule["rule_id"], json.dumps(d_rule))
                 _dynamic_rules_cache[d_rule["rule_id"]] = d_rule

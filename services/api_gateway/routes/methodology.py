@@ -132,7 +132,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         name="Mutually Exciting Hawkes Cross-Domain Contagion",
         category="Cross-Domain Epistemic",
         epistemic_tier="Stochastic Process",
-        description="Quantifies self- and mutually-exciting jump clustering across maritime chokepoint events, geopolitical news, cyber disclosures, and market volatility.",
+        description="Quantifies self- and mutually-exciting jump clustering across maritime chokepoint events, geopolitical news, and market volatility.",
         formula_latex=r"\lambda_i(t) = \mu_i + \sum_{j=1}^M \sum_{t_k < t} \alpha_{ij} \cdot e^{-\beta_{ij}(t - t_k)}",
         assumptions=[
             "Temporal point process with exponential memory decay kernels",

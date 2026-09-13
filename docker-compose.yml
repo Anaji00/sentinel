@@ -718,8 +718,22 @@ services:
     healthcheck:
       disable: true
 
+  # Retired from the default ingestion set, not deleted.
+  #
+  # The cyber domain does not join to the others, which is what this platform
+  # is for. An AS number resolves to no ticker, no vessel and no region, and
+  # the one attempt to bridge it -- using the RIR registrant as the entity
+  # name -- put law firms, a German university and an Italian optician at the
+  # head of live cross-domain correlations. Its scoring was degenerate as well:
+  # all 219 BGP events in a 45-minute window scored exactly 0.850, because
+  # betweenness_centrality is permanently 0 in this deployment (no Neo4j GDS
+  # plugin) and path_novelty is 1.0 for a hijack almost by definition.
+  #
+  # `make cyber` still starts it, and `shared/utils/cyber_mapper.py` still
+  # holds the vendor-to-ticker map that is the one cyber signal worth
+  # rebuilding: a known-exploited vulnerability in a listed company's product.
   collector-cyber:
-    profiles: ["collectors"]
+    profiles: ["cyber"]
     build: .
     container_name: sentinel-cyber
     healthcheck:

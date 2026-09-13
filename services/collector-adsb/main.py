@@ -60,6 +60,8 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
+from shared.utils.source_freshness import mark_source_filtered
+from shared.utils.quiet_failures import swallowed
 from shared.utils.tasks import safe_create_task
 
 OPENSKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
@@ -69,21 +71,59 @@ OPENSKY_API_BASE = "https://opensky-network.org/api"
 
 EMERGENCY_SQUAWKS = {"7500", "7600", "7700"}
 
-# Detailed sub-zone definitions for precise event tagging
+# The zones a position has to be inside to be published at all.
+#
+# These twelve boxes were declared "for precise event tagging" and used for
+# exactly one thing: printing their own count in a startup log line. Nothing
+# was tagged with them, and every state vector in the three macro regions was
+# published regardless of where it was.
+#
+# Measured over two days, that was 90,108 flight events, 36,178 of them with no
+# squawk at all, which the gap detector turned into 10,370 `flight_dark` events
+# in 48 hours -- enough for this audit to record a live scenario headlined
+# "flight_dark: Unknown ~~ flight_dark: Unknown ~~ flight_dark: Unknown". A
+# stream whose subjects cannot be resolved is not intelligence, and it was
+# crowding every correlation window it entered.
+#
+# So the list now does the job it was declared for. Narrowed to the chokepoints
+# and the active conflict airspace -- the places whose aircraft can correlate
+# with something this platform also watches by sea -- which is roughly a
+# seventh of the macro-region area the sweep still covers for emergencies.
 WATCH_ZONES = [
     ("Strait of Hormuz",   24.0, 27.0,  56.0,  60.0),
-    ("Strait of Malacca",   1.0,  6.0, 103.0, 105.0),
     ("Bab-el-Mandeb",      11.5, 13.5,  43.0,  45.5),
     ("Taiwan Strait",      22.0, 26.0, 119.0, 122.5),
     ("Black Sea",          40.5, 46.5,  27.5,  41.5),
-    ("South China Sea",     5.0, 22.0, 109.0, 121.0),
     ("Ukrainian Airspace", 44.0, 52.5,  22.0,  40.5),
+]
+
+# Kept rather than deleted: national airspaces are tracking rather than anomaly
+# detection, and Iranian and Saudi between them are most of the Middle East
+# macro box -- publishing inside them would have left the volume roughly where
+# it was. The coordinates are here so restoring one is a one-line edit.
+RETIRED_ZONES = [
+    ("Strait of Malacca",   1.0,  6.0, 103.0, 105.0),
+    ("South China Sea",     5.0, 22.0, 109.0, 121.0),
     ("Red Sea",            29.8, 31.5,  32.2,  44.0),
     ("Caspian Sea",         36.0, 47.0,  46.0,  54.0),
-    ("Iranian Airspace",     24.0, 40.0,  44.0,  63.0),
-    ("Israeli Airspace",      29.0, 33.0,  34.0,  36.0),
-    ("Saudi Airspace",        16.0, 32.0,  34.0,  56.0),
+    ("Iranian Airspace",   24.0, 40.0,  44.0,  63.0),
+    ("Israeli Airspace",   29.0, 33.0,  34.0,  36.0),
+    ("Saudi Airspace",     16.0, 32.0,  34.0,  56.0),
 ]
+
+
+def zone_for(latitude, longitude):
+    """The watch zone containing this position, or None.
+
+    None means the aircraft is inside a macro sweep box but outside everywhere
+    this platform is actually watching, and its position is not published.
+    """
+    if latitude is None or longitude is None:
+        return None
+    for name, lamin, lamax, lomin, lomax in WATCH_ZONES:
+        if lamin <= latitude <= lamax and lomin <= longitude <= lomax:
+            return name
+    return None
 
 # Consolidated Macro-Regions to minimize API call count & credit consumption
 MACRO_REGIONS = [
@@ -189,6 +229,7 @@ async def poll_zone(
         lamax: float,
         lomin: float,
         lomax: float,
+        redis_client=None,
     ):
     global OPENSKY_RATE_LIMITED_UNTIL
     if time.time() < OPENSKY_RATE_LIMITED_UNTIL:
@@ -218,6 +259,7 @@ async def poll_zone(
                 
                 logger.debug(f"{zone_name}: {len(states)} aircraft, credits left: {remaining}")
 
+                published = 0
                 for state_array in states:
                     parsed = parse_state_vector(state_array)
                     if not parsed or parsed["latitude"] is None:
@@ -225,13 +267,34 @@ async def poll_zone(
 
                     squawk = str(parsed.get("squawk") or "").strip()
                     is_emergency = squawk in EMERGENCY_SQUAWKS
+                    precise_zone = zone_for(parsed["latitude"], parsed["longitude"])
+
+                    # Published, or not published at all.
+                    #
+                    # Every state vector in the macro sweep used to be sent;
+                    # `is_emergency` changed only a log line. The comment above
+                    # POLL_INTERVAL already named what this platform acts on --
+                    # emergency squawks, sanctioned operators and dark-flight
+                    # gaps -- and the collector published the other 99% as well,
+                    # at a cost paid by enrichment, scoring, storage and every
+                    # correlation window downstream.
+                    #
+                    # OpenSky serves a bounding box and cannot filter by squawk,
+                    # so the fetch is unchanged. Everything after it is not.
+                    if not (is_emergency or precise_zone):
+                        continue
 
                     event = RawEvent(
                         source = "OpenSky",
                         occurred_at = datetime.fromtimestamp(parsed["time_position"] or server_time, tz=timezone.utc),
                         raw_payload = {
                             **parsed,
-                            "zone_name": zone_name,
+                            # The precise zone where there is one, so the tag
+                            # names where the aircraft is rather than which
+                            # sweep found it. An emergency outside every watch
+                            # zone keeps the macro region, which is still true.
+                            "zone_name": precise_zone or zone_name,
+                            "macro_region": zone_name,
                             "is_emergency": is_emergency,
                             "emergency_type": {
                                 "7500": "Hijacking",
@@ -245,6 +308,7 @@ async def poll_zone(
                         data = event.model_dump(),
                         key = parsed["icao24"] or "unknown",
                     )
+                    published += 1
 
                     if is_emergency:
                         logger.warning(
@@ -253,6 +317,24 @@ async def poll_zone(
                             f"({parsed['icao24']}) "
                             f"@ {parsed['latitude']:.3f},{parsed['longitude']:.3f}"
                         ) 
+
+                # Alive, fetching, and choosing not to publish.
+                #
+                # Now that the publish gate exists, a quiet sweep is the normal
+                # case: outside the watch zones with no emergency squawk, this
+                # collector can go hours without sending anything. The freshness
+                # monitor calls a source stale after six hours of silence
+                # whatever its measured cadence, so without this the aviation
+                # feed would report itself dead every night -- and a monitor
+                # that cries wolf is how a real outage gets ignored.
+                #
+                # `mark_source_filtered` is the mechanism this codebase already
+                # built for exactly that distinction.
+                if states and published == 0 and redis_client is not None:
+                    try:
+                        await mark_source_filtered(redis_client, "opensky")
+                    except Exception as _exc:
+                        swallowed("collector_adsb.mark_filtered", _exc, logger)
 
             elif resp.status == 429:
                 OPENSKY_RATE_LIMITED_UNTIL = time.time() + 180.0
@@ -272,7 +354,7 @@ async def poll_zone(
 
 # ── MAIN COLLECTION LOOP ──────────────────────────────────────────────────────
 
-async def collect(producer: SentinelProducer):
+async def collect(producer: SentinelProducer, redis_client=None):
     auth = OpenSkyAuth()
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)  # Limit concurrent connections
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -280,7 +362,8 @@ async def collect(producer: SentinelProducer):
             for zone_name, lamin, lamax, lomin, lomax in MACRO_REGIONS:
                 await poll_zone(
                     session, auth, producer,
-                    zone_name, lamin, lamax, lomin, lomax
+                    zone_name, lamin, lamax, lomin, lomax,
+                    redis_client=redis_client,
                 )
                 await asyncio.sleep(5)  # Space out zone polls to respect rate limits
 
@@ -290,7 +373,11 @@ async def collect(producer: SentinelProducer):
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL  ADS-B Collector")
-    logger.info(f"Zones: {len(WATCH_ZONES)}  |  Poll interval: {POLL_INTERVAL}s")
+    logger.info(
+        "Publishing: emergency squawks anywhere in %s macro sweeps, plus all "
+        "traffic in %s watch zones (%s retired)  |  Poll interval: %ss",
+        len(MACRO_REGIONS), len(WATCH_ZONES), len(RETIRED_ZONES), POLL_INTERVAL,
+    )
     logger.info(f"Auth: {'OAuth2' if OPENSKY_CLIENT_ID else 'Anonymous (400 credits/day)'}")
     logger.info("=" * 60)
  
@@ -304,7 +391,7 @@ async def main():
         metrics = CollectorMetrics("collector-adsb")
         await metrics.start(redis)
         hb_task = safe_create_task(start_heartbeat_task(redis, "collector-adsb"))
-        await collect(producer)
+        await collect(producer, redis_client=redis)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:

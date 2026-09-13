@@ -2,7 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { fetcher } from '../lib/api';
+import { describeApiError, fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
@@ -14,11 +14,29 @@ export default function CyberIntelligencePanel() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedEvent, setSelectedEvent] = useState<NormalizedEvent | null>(null);
 
-  const { data: cyberEvents } = useSWR<NormalizedEvent[]>(
+  // An archive, polled at an archive's pace.
+  //
+  // The cyber collector is no longer in the default ingestion profile, so
+  // nothing new arrives here. The events table keeps 90 days, so what is
+  // already there stays readable and this panel goes on serving it -- but a
+  // five-second refresh against a feed that has stopped is work with no
+  // possible result.
+  const { data: cyberEvents, error: cyberError } = useSWR<NormalizedEvent[]>(
     '/events/cyber?limit=100',
     fetcher,
-    { refreshInterval: 5000 }
+    { refreshInterval: 60000 }
   );
+
+  // The age of the newest row, which is what tells a reader whether they are
+  // looking at intelligence or at history.
+  const newestAgeHours = useMemo(() => {
+    const newest = (cyberEvents || [])
+      .map(e => new Date(e.occurred_at).getTime())
+      .filter(t => Number.isFinite(t))
+      .sort((a, b) => b - a)[0];
+    if (!newest) return null;
+    return (Date.now() - newest) / 3_600_000;
+  }, [cyberEvents]);
 
   const filterTabs = [
     { id: 'all', label: 'ALL THREATS' },
@@ -56,7 +74,22 @@ export default function CyberIntelligencePanel() {
   return (
     <Card
       title="CYBER INTELLIGENCE & INFRASTRUCTURE HUD"
-      badge={<Badge variant="live" pulse>CISA & BGP REAL-TIME</Badge>}
+      /* Not live, and it must not say so.
+       *
+       * This read `variant="live" pulse` with the text "CISA & BGP REAL-TIME".
+       * The moment the collector left the default profile that became a false
+       * claim about the platform, rendered in the one place a viewer looks to
+       * decide whether a threat is current -- which is the failure this whole
+       * audit exists to remove, committed by a retirement rather than by a
+       * defect. */
+      badge={
+        <Badge variant={describeApiError(cyberError) ? 'warning' : 'neutral'}>
+          {describeApiError(cyberError)
+            ?? (newestAgeHours === null
+              ? 'RETIRED FEED — NO ARCHIVE'
+              : `RETIRED FEED — ARCHIVE, NEWEST ${Math.floor(newestAgeHours)}H OLD`)}
+        </Badge>
+      }
       headerAction={
         <Tabs
           tabs={filterTabs}
