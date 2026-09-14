@@ -217,6 +217,7 @@ class FinancialAdviceBrief(BaseModel):
 
 
 from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import swallowed
 
 
@@ -445,7 +446,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             # Inject top verified primary equity peers into watched equities ZSET
             for p in discovery.peer_tickers[:4]:
                 if p.discovery_confidence >= 0.65 and await is_valid_primary_equity_async(p.ticker):
-                    await self.redis.raw.zadd("sentinel:watched:equities", mapping={p.ticker: time.time()})
+                    await self.redis.raw.zadd(WATCHED_EQUITIES_KEY, mapping={p.ticker: time.time()})
 
             closes, _, _ = await self._fetch_prices(ticker)
             if len(closes) >= MIN_BARS_FOR_QUALITY_METRICS:
@@ -944,7 +945,7 @@ Return raw JSON matching schema:"""
             # entirely when that argument is None -- so the overlay was
             # evaluated for every ticker rather than the 44 on the watchlist.
             # It failed open, which is why nothing ever looked wrong.
-            raw_watchlist = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
+            raw_watchlist = await self.redis.raw.zrange(WATCHED_EQUITIES_KEY, 0, -1)
             watched_set = {s.decode() if isinstance(s, bytes) else str(s) for s in raw_watchlist} if raw_watchlist else None
 
             # Evaluate closed-form Covered Call recommendation if flag enabled and CAGG Z-score >= +2.5 (§2.3, §2.6, §B.3)
@@ -1062,7 +1063,7 @@ Return raw JSON matching schema:"""
         Brings scheduled execution path to 100% parity with live trigger path.
         """
         try:
-            raw_watched = await self.redis.raw.zrange("sentinel:watched:equities", 0, -1)
+            raw_watched = await self.redis.raw.zrange(WATCHED_EQUITIES_KEY, 0, -1)
             tickers = [t.decode("utf-8") if isinstance(t, bytes) else str(t) for t in raw_watched]
             if not tickers:
                 tickers = ["AAPL", "MSFT", "NVDA", "BTC-USD", "ETH-USD"]

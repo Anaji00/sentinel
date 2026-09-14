@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from services.agents.base import InferenceBatcher, SentinelAgent
 from shared.kafka import Topics
 from shared.utils.focus import prioritise
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import swallowed
 from shared.utils.equities import BROAD_MARKET_ETFS, is_valid_primary_equity
 
@@ -314,7 +315,7 @@ class RadarAgent(SentinelAgent):
         which lower conviction/stale tickers to remove from surveillance.
         """
         try:
-            equities_key = "sentinel:watched:equities"
+            equities_key = WATCHED_EQUITIES_KEY
             total_count = await self.redis.raw.zcard(equities_key)
             if total_count < 45:
                 return
@@ -595,8 +596,8 @@ class RadarAgent(SentinelAgent):
                 await self.prune_watchlist_if_needed()
 
                 async with self.redis.raw.pipeline(transaction=True) as pipe:
-                    pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
-                    pipe.zremrangebyrank("sentinel:watched:equities", 0, -46)
+                    pipe.zadd(WATCHED_EQUITIES_KEY, mapping={ticker: time.time()})
+                    pipe.zremrangebyrank(WATCHED_EQUITIES_KEY, 0, -46)
                     await pipe.execute()
                 
                 # Publish the thesis, so the escalation reaches the swarm.
@@ -656,8 +657,8 @@ class RadarAgent(SentinelAgent):
                 await self.prune_watchlist_if_needed()
 
                 async with self.redis.raw.pipeline(transaction=True) as pipe:
-                    pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
-                    pipe.zremrangebyrank("sentinel:watched:equities", 0, -46)
+                    pipe.zadd(WATCHED_EQUITIES_KEY, mapping={ticker: time.time()})
+                    pipe.zremrangebyrank(WATCHED_EQUITIES_KEY, 0, -46)
                     await pipe.execute()
                 await self.mark_processed(ticker, self.cooldown_seconds)
                 return {

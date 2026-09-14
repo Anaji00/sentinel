@@ -5,6 +5,15 @@ from services.api_gateway.dependencies import get_db, get_redis_client, require_
 from shared.utils.heartbeat import get_all_heartbeats_status
 from shared.utils.quiet_failures import swallowed
 
+# The calibration hashes, named where they are written.
+#
+# Both were typed out here as literals while market_calibration.py defines
+# them as FORECAST_KEY and RESOLVED_KEY. This panel counts forecasts and
+# resolutions; a rename on the writing side would have left it reporting
+# zero of each, which is indistinguishable from a calibration loop that has
+# not started.
+from services.reasoning.market_calibration import FORECAST_KEY, RESOLVED_KEY
+
 logger = logging.getLogger("api-gateway.agents")
 
 # Heartbeat components the LLM swarm publishes under, one per compose tier.
@@ -229,10 +238,10 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
     calibration = {"paired_forecasts": 0, "resolved": 0}
     try:
         calibration["paired_forecasts"] = int(
-            await raw.hlen("sentinel:calibration:market_forecasts") or 0
+            await raw.hlen(FORECAST_KEY) or 0
         )
         calibration["resolved"] = int(
-            await raw.hlen("sentinel:calibration:market_resolved") or 0
+            await raw.hlen(RESOLVED_KEY) or 0
         )
     except Exception as _exc:
         swallowed("api_gateway.routes.agents.get_swarm_intelligence", _exc, logger)

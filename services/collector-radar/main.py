@@ -25,7 +25,17 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+from shared.utils.quiet_failures import swallowed
 from shared.kafka import SentinelProducer, Topics
+from shared.utils.radar_keys import (
+    MOVERS_DAY_ZSET,
+    MOVERS_TTL_SEC,
+    RADAR_SWEEP_STATE_KEY,
+    movers_snapshot_key,
+    radar_baseline_key,
+    radar_observations_key,
+    radar_variance_key,
+)
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
@@ -101,9 +111,9 @@ class QuantRadar:
         self.redis = redis_client
     
     async def _get_baseline(self, ticker: str) -> Tuple[float, float, int]:
-        mean_key = f"sentinel:radar:1m_mean:{ticker}"
-        var_key = f"sentinel:radar:1m_var:{ticker}"
-        n_key = f"sentinel:radar:1m_n:{ticker}"
+        mean_key = radar_baseline_key(ticker)
+        var_key = radar_variance_key(ticker)
+        n_key = radar_observations_key(ticker)
 
         mean = float(await self.redis.raw.get(mean_key) or 0.0)
         var = float(await self.redis.raw.get(var_key) or 0.0)
@@ -133,13 +143,13 @@ class QuantRadar:
         # worth holding, and an active ticker rewrites its own key on every
         # scan, so the expiry never bites on anything in use.
         pipe = self.redis.raw.pipeline()
-        pipe.set(f"sentinel:radar:1m_mean:{ticker}", new_mean, ex=BASELINE_TTL_SEC)
-        pipe.set(f"sentinel:radar:1m_var:{ticker}", new_var, ex=BASELINE_TTL_SEC)
+        pipe.set(radar_baseline_key(ticker), new_mean, ex=BASELINE_TTL_SEC)
+        pipe.set(radar_variance_key(ticker), new_var, ex=BASELINE_TTL_SEC)
         # Counted with the same expiry as the moments it describes, so a
         # baseline and its observation count can never disagree about how much
         # history there is.
-        pipe.incr(f"sentinel:radar:1m_n:{ticker}")
-        pipe.expire(f"sentinel:radar:1m_n:{ticker}", BASELINE_TTL_SEC)
+        pipe.incr(radar_observations_key(ticker))
+        pipe.expire(radar_observations_key(ticker), BASELINE_TTL_SEC)
         await pipe.execute()
 
     async def evaluate_volume(self, ticker:str, current_vol: float, current_price: float, alpha: float, z_threshold: float) -> Tuple[bool, float]:
@@ -264,6 +274,71 @@ async def heartbeat_loop(state: dict):
             f"| polls={state.get('polls', 0)}"
         )
 
+def _as_float(value) -> float:
+    """A number, or 0.0. A missing bar is not a price of zero anywhere below."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if out == out and out not in (float("inf"), float("-inf")) else 0.0
+
+
+def _percent_moves(prev_close: float, day_open: float, day_close: float):
+    """gap, intraday and day moves as percentages, or None if unknowable.
+
+    None rather than zero: a symbol with no previous close has not been flat,
+    it has not been measured, and a zero here would rank it in the middle of
+    the movers list rather than leaving it out.
+    """
+    if prev_close <= 0 or day_close <= 0:
+        return None
+    day_pct = (day_close / prev_close - 1.0) * 100.0
+    out = {"day_pct": round(day_pct, 4), "prev_close": prev_close, "last_price": day_close}
+    if day_open > 0:
+        out["gap_pct"] = round((day_open / prev_close - 1.0) * 100.0, 4)
+        out["intraday_pct"] = round((day_close / day_open - 1.0) * 100.0, 4)
+        out["day_open"] = day_open
+    return out
+
+
+async def _publish_movers(redis_client, movers: Dict[str, Dict[str, float]], evaluated: int) -> None:
+    """One sorted set scored by the day's move, plus the components per ticker.
+
+    ZREVRANGE gives the gainers and ZRANGE gives the losers off the same
+    structure, so neither needs its own list to fall out of date.
+
+    The zset is replaced rather than updated: a ticker that has stopped
+    reporting should leave the board, not sit at yesterday's number. The
+    per-ticker hashes carry a TTL for the same reason.
+    """
+    if not redis_client or not movers:
+        return
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        staging = f"{MOVERS_DAY_ZSET}:staging"
+        pipe = raw.pipeline()
+        pipe.delete(staging)
+        pipe.zadd(staging, {t: m["day_pct"] for t, m in movers.items()})
+        for ticker, move in movers.items():
+            key = movers_snapshot_key(ticker)
+            pipe.hset(key, mapping={k: str(v) for k, v in move.items()})
+            pipe.expire(key, MOVERS_TTL_SEC)
+        # Swapped in one step, so a reader never sees a half-built board.
+        pipe.rename(staging, MOVERS_DAY_ZSET)
+        pipe.expire(MOVERS_DAY_ZSET, MOVERS_TTL_SEC)
+        # What this sweep actually covered, so the endpoint reporting it does
+        # not have to hold a literal.
+        pipe.hset(RADAR_SWEEP_STATE_KEY, mapping={
+            "evaluated": str(evaluated),
+            "priced": str(len(movers)),
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        pipe.expire(RADAR_SWEEP_STATE_KEY, MOVERS_TTL_SEC)
+        await pipe.execute()
+    except Exception as _exc:
+        swallowed("collector_radar.publish_movers", _exc, logger)
+
+
 async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict):
     state["polls"] += 1
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
@@ -297,6 +372,8 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
     top_vol = 0.0
     top_price = 0.0
 
+    movers: Dict[str, Dict[str, float]] = {}
+
     for snapshots in snapshot_results:
         if not isinstance(snapshots, dict):
             continue
@@ -311,6 +388,28 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             # Use minuteBar for interval volume to evaluate 1-minute spikes
             volume = minute_bar.get("v", 0)
             close_price = minute_bar.get("c", 0) or daily_bar.get("c", 0) or prev_daily_bar.get("c", 0)
+
+            # The day's move, from bars already in hand.
+            #
+            # Both of these were bound above and used only as the second and
+            # third terms of that price fallback. Alpaca returns today's bar and
+            # yesterday's bar for every symbol in the sweep, so percent-on-the-
+            # day was one division away and was never performed -- for the whole
+            # tradable universe, on every poll, for as long as this collector
+            # has run. The platform could say what traded unusually much and had
+            # no way at all to say what went up.
+            #
+            # Three numbers rather than one, because they answer different
+            # questions: `gap_pct` is what happened overnight, `intraday_pct` is
+            # what the session has done since the open, and `day_pct` is the
+            # two together. A name up 6% that gapped 7% and has been sold all
+            # day is not the same event as one that ground higher from the bell.
+            prev_close = _as_float(prev_daily_bar.get("c"))
+            day_open = _as_float(daily_bar.get("o"))
+            day_close = _as_float(daily_bar.get("c")) or _as_float(minute_bar.get("c"))
+            move = _percent_moves(prev_close, day_open, day_close)
+            if move:
+                movers[ticker] = move
 
             if volume == 0 or close_price == 0:
                 continue
@@ -349,6 +448,10 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
                         # a missing key as 0.0, so every anomaly this collector
                         # raised was discarded one hop later.
                         "notional_usd": float(volume) * float(close_price),
+                        # A volume spike on a name up 14% is a different event
+                        # from the same spike on a name that is flat, and until
+                        # now nothing downstream could tell them apart.
+                        **(movers.get(ticker) or {}),
                     },
                     occurred_at=datetime.now(timezone.utc)
                 )
@@ -358,6 +461,8 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
 
     state["total_evaluated"] += total_evaluated
     state["total_anomalies"] += anomalies_detected
+
+    await _publish_movers(radar.redis, movers, total_evaluated)
 
     if total_evaluated > 0:
         top_str = f" | Top Dynamic Mover: {top_ticker} (Z={max_z:.2f}, ${top_price*top_vol/1e6:.2f}M)" if top_ticker else ""

@@ -55,7 +55,15 @@ class _Redis:
 
 
 def _quotes(**prices):
-    return {quote_key(sym): json.dumps({"price": px}) for sym, px in prices.items()}
+    """The format the writers actually use: a bare number.
+
+    This fixture wrote `json.dumps({"price": px})`, an object no writer in the
+    tree produces -- every one of the six stores `str(price)` or the float
+    itself. So these tests passed against a cache shape that does not exist,
+    and the mark-to-market they covered could not have worked in production.
+    Inventing a fixture is the same failure as trusting a docstring.
+    """
+    return {quote_key(sym): str(px) for sym, px in prices.items()}
 
 
 @pytest.fixture(autouse=True)
@@ -285,3 +293,41 @@ def test_the_per_entity_volatility_store_still_has_no_writer():
     assert scorer.count("_compute_ewma_volatility") == 1, (
         "the per-entity volatility now has a caller; /portfolio/risk should use it"
     )
+
+
+def test_the_fixture_above_matches_what_the_writers_store():
+    """Pinned, because it was wrong and nothing said so.
+
+    If a writer ever starts storing an object, this fails and the fixture is
+    updated deliberately rather than the two drifting apart again.
+    """
+    import re
+
+    writers = []
+    for path in (ROOT / "services").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r"set\(\s*quote_key\([^)]*\),\s*([^,)]+)", text):
+            writers.append((path.name, match.group(1).strip()))
+
+    assert writers, "no quote-cache writer found; this test has gone stale"
+    for name, written in writers:
+        assert "json.dumps" not in written, (
+            f"{name} now writes an object to the quote cache: {written}. "
+            f"parse_quote handles both, but the fixtures above assume a number."
+        )
+
+
+def test_the_parser_reads_what_the_writers_write():
+    from shared.utils.quote_cache import parse_quote
+
+    assert parse_quote("93.23") == 93.23
+    assert parse_quote(b"93.23") == 93.23
+    assert parse_quote(str(41.0)) == 41.0
+    # An object still works, in case a writer ever produces one.
+    assert parse_quote('{"price": 12.5}') == 12.5
+    # And absence stays absence rather than becoming zero.
+    assert parse_quote(None) is None
+    assert parse_quote("0") is None
+    assert parse_quote("not a price") is None

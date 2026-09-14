@@ -39,6 +39,13 @@ _VESSEL_SCORE_FLOOR = 0.35
 _VESSEL_SCORE_CEILING = 0.92
 
 
+# Imported rather than retyped, and from `shared` rather than from the
+# maritime enricher: that enricher imports `lift_score` from this module,
+# so the two cannot import each other. A key convention shared by two
+# modules belongs in neither of them.
+from shared.utils.watchlists import WATCHED_VESSELS_KEY
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
 DYNAMIC_NORMALIZE_LUA = """
@@ -899,8 +906,8 @@ class DynamicAnomalyScorer:
             pipe = self.redis.raw.pipeline()
             for tag in named_entities:
                 pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
-                pipe.zscore("sentinel:watched:equities", tag)
-                pipe.zscore("sentinel:watched:vessels", tag)
+                pipe.zscore(WATCHED_EQUITIES_KEY, tag)
+                pipe.zscore(WATCHED_VESSELS_KEY, tag)
                 
             results = await pipe.execute()
             vals = []
@@ -1423,8 +1430,8 @@ class DynamicAnomalyScorer:
             for tag in named_entities:
                 pipe.get(f"sentinel:semantic_sentiment:{tag.lower()}")
                 # Query ZSET scores directly (returns score if member, None if not)
-                pipe.zscore("sentinel:watched:equities", tag)
-                pipe.zscore("sentinel:watched:vessels", tag)
+                pipe.zscore(WATCHED_EQUITIES_KEY, tag)
+                pipe.zscore(WATCHED_VESSELS_KEY, tag)
                 
             results = await pipe.execute()
             vals = []

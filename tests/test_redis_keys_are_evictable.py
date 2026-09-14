@@ -85,10 +85,19 @@ def test_the_radar_baselines_expire():
     again after the candle lists were fixed."""
     radar = (ROOT / "services" / "collector-radar" / "main.py").read_text(encoding="utf-8")
     assert "ex=BASELINE_TTL_SEC" in radar
-    # Writes only. A read site naming the same key is not a missing expiry.
+    # Writes only, found by the key builders rather than by the literal prefix.
+    #
+    # This matched lines containing `sentinel:radar:`, which stopped working the
+    # moment those keys moved behind `radar_baseline_key()` in shared -- a test
+    # that pins a spelling fails when the spelling is centralised, which is the
+    # opposite of what it wants. The property is that a baseline write carries a
+    # TTL, whatever the key is called.
+    builders = ("radar_baseline_key(", "radar_variance_key(", "radar_observations_key(")
     writes = [
         ln for ln in radar.splitlines()
-        if ".set(" in ln and "sentinel:radar:" in ln and not ln.lstrip().startswith("#")
+        if ".set(" in ln
+        and any(b in ln for b in builders)
+        and not ln.lstrip().startswith("#")
     ]
     assert writes, "the radar baseline writes disappeared"
     missing = [ln for ln in writes if "ex=" not in ln]

@@ -28,8 +28,7 @@ from shared.utils.sanctions import check_sanctions, mmsi_to_country
 # `check_watchlist(entity, "vessels")` and two zscore lookups in anomaly_scorer
 # all point at this key; it did not exist. Flagged hulls are written here so a
 # vessel named in a headline is recognised the way a watched ticker is.
-WATCHED_VESSELS_KEY = "sentinel:watched:vessels"
-WATCHED_VESSELS_TTL_SEC = 30 * 86400
+from shared.utils.watchlists import WATCHED_VESSELS_KEY, WATCHED_VESSELS_TTL_SEC
 from shared.utils.regions import classify_region, routine_band_score
 from services.enrichment.anomaly_scorer import lift_score
  

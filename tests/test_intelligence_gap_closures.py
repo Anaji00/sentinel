@@ -311,10 +311,27 @@ def test_the_entity_sentiment_the_scorer_reads_now_has_a_writer():
 
 
 def test_the_vessel_watchlist_the_scorer_reads_now_has_a_writer():
+    """Reader and writer, checked by the key they share rather than its spelling.
+
+    This asserted the literal `sentinel:watched:vessels` in both files, which
+    is the thing that was wrong: two files spelling a key out is how
+    `sentinel:watched:equities` came to be read under a name nobody wrote. Both
+    now import it from `shared.utils.watchlists`, so the property to check is
+    that they resolve to the same constant -- not that they contain the same
+    string.
+    """
+    from shared.utils.watchlists import WATCHED_VESSELS_KEY
+
     maritime = (ROOT / "services" / "enrichment" / "enrichers" / "maritime.py").read_text(encoding="utf-8")
     scorer = (ROOT / "services" / "enrichment" / "anomaly_scorer.py").read_text(encoding="utf-8")
-    assert "sentinel:watched:vessels" in scorer, "the reader"
-    assert 'WATCHED_VESSELS_KEY = "sentinel:watched:vessels"' in maritime, "and now the writer"
+
+    assert WATCHED_VESSELS_KEY == "sentinel:watched:vessels"
+    assert "WATCHED_VESSELS_KEY" in scorer, "the reader"
+    assert "WATCHED_VESSELS_KEY" in maritime, "and the writer"
+    for source in (maritime, scorer):
+        assert f'"{WATCHED_VESSELS_KEY}"' not in source, (
+            "the key is spelled out again rather than imported"
+        )
     assert "_watch_vessel" in maritime
 
 

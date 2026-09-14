@@ -22,11 +22,14 @@ from shared.utils.rbac import require_role, Role, get_current_user_role
 from shared.utils.audit_ledger import AuditLedger
 from shared.utils.equities import is_valid_primary_equity
 
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 logger = logging.getLogger("api-gateway.watchlists")
 
 router = APIRouter(prefix="/api/v1/watchlists", tags=["Watchlist Governance"])
 
-REDIS_EQUITIES_KEY = "sentinel:watched:equities"
+# One definition, in shared. This module had the only named constant for
+# this key while five other modules typed it out by hand.
+REDIS_EQUITIES_KEY = WATCHED_EQUITIES_KEY
 WATCHLIST_SYNC_CHANNEL = "sentinel:collector:watchlist_sync"
 MAX_WATCHLIST_LIMIT = 50
 

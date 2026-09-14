@@ -13,6 +13,7 @@ import logging
 import os
 from typing import Optional, Dict, Any
 from shared.utils.quiet_failures import swallowed
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 
 logger = logging.getLogger("enrichment.ref_data")
 
@@ -274,7 +275,7 @@ async def refresh_watchlist_reference_data(redis_client, session=None, graph_wri
 
     try:
         # Get all watched equities
-        watched = await redis_client.raw.zrevrange("sentinel:watched:equities", 0, -1)
+        watched = await redis_client.raw.zrevrange(WATCHED_EQUITIES_KEY, 0, -1)
         if not watched:
             logger.info("No watched equities to refresh reference data for")
             return

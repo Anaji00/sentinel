@@ -156,11 +156,24 @@ LIB = (ROOT / "services/reasoning/pattern_library.py").read_text(encoding="utf-8
 
 def test_the_covered_call_scoping_reads_the_key_that_exists():
     """sentinel:watched:equities is a 44-member zset the same file writes.
+
     One read site said :watchlist: instead, always came back empty, and the
     scoping check is skipped entirely when the set is None -- so the overlay
-    ran for every ticker instead of the watchlist. It failed open."""
+    ran for every ticker instead of the watchlist. It failed open.
+
+    This used to count occurrences of the literal, requiring at least three.
+    That pinned the very thing that caused the defect: the key was typed out
+    sixteen times across seven files, and a mistyped seventeenth is exactly
+    what happened. It is one constant now, and the property worth asserting is
+    that nobody spells it out.
+    """
+    from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+
     assert "sentinel:watchlist:equities" not in QUANT
-    assert QUANT.count('"sentinel:watched:equities"') >= 3
+    assert "WATCHED_EQUITIES_KEY" in QUANT, "the scoping read"
+    assert f'"{WATCHED_EQUITIES_KEY}"' not in QUANT, (
+        "the key is spelled out here again rather than imported"
+    )
 
 
 def test_the_watchlist_key_is_consistent_across_the_tree():

@@ -31,7 +31,7 @@ from shared.broker.base import (
     OrderStatus,
 )
 from shared.utils.quiet_failures import swallowed
-from shared.utils.quote_cache import quote_key
+from shared.utils.quote_cache import parse_quote, quote_key
 
 logger = logging.getLogger("broker.paper")
 
@@ -65,14 +65,12 @@ class PaperBroker(BrokerInterface):
             return None
         try:
             raw_redis = getattr(self.redis, "raw", self.redis)
-            quote_raw = await raw_redis.get(quote_key(symbol.upper()))
-            if not quote_raw:
-                return None
-            quote = json.loads(
-                quote_raw.decode("utf-8") if isinstance(quote_raw, bytes) else str(quote_raw)
-            )
-            price = float(quote.get("price") or quote.get("close") or quote.get("last") or 0.0)
-            return price if price > 0 else None
+            # Parsed by the module that owns the key. This read
+            # `json.loads(...).get("price")`, which raises AttributeError on the
+            # bare number every writer actually stores -- so the mark-to-market
+            # this helper exists for never ran against a real cache, and the
+            # test that covered it invented the object format in its fixture.
+            return parse_quote(await raw_redis.get(quote_key(symbol.upper())))
         except Exception as _exc:
             swallowed("broker.paper._live_price", _exc, logger)
             return None

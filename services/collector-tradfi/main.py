@@ -48,6 +48,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 
 # What counts as a block, per instrument rather than per market.
 #
@@ -156,7 +157,9 @@ def _is_block_trade(ticker: str, notional: float) -> bool:
 logger = setup_sentinel_logging("collector.tradfi", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-REDIS_EQUITIES_KEY = "sentinel:watched:equities"
+# One definition. This file had it, on this line, and then typed the key
+# out four more times below it.
+REDIS_EQUITIES_KEY = WATCHED_EQUITIES_KEY
 
 # Finnhub allows 50 concurrent symbol subscriptions, and that budget was spent
 # entirely on recency: zrevrange takes the 50 most recently *added* watchlist
@@ -997,7 +1000,7 @@ async def poll_options(producer: SentinelProducer, redis_client):
         while True:
             total_sweeps = 0
             try:
-                raw_symbols = await redis_client.raw.zrange("sentinel:watched:equities", 0, -1)
+                raw_symbols = await redis_client.raw.zrange(REDIS_EQUITIES_KEY, 0, -1)
                 raw_symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
                 symbols = [
                     s.upper().strip() for s in raw_symbols
@@ -1293,10 +1296,10 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
 
                             if mcap_b is not None and mcap_b >= mcap_floor_b:
                                 await redis_client.raw.zadd(
-                                    "sentinel:watched:equities",
+                                    REDIS_EQUITIES_KEY,
                                     mapping={symbol: _time.time()},
                                 )
-                                await redis_client.raw.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                                await redis_client.raw.zremrangebyrank(REDIS_EQUITIES_KEY, 0, -51)
                                 watchlist_count += 1
                                 logger.debug(f"Earnings watchlist inject: {symbol} (mcap ${mcap_b:.0f}B >= ${mcap_floor_b:.0f}B floor)")
                             elif mcap_b is not None:
@@ -1662,7 +1665,7 @@ async def _run_historical_backfill(redis_client) -> None:
     tickers: list = []
     try:
         raw = getattr(redis_client, "raw", redis_client)
-        members = await raw.zrange("sentinel:watched:equities", 0, -1)
+        members = await raw.zrange(REDIS_EQUITIES_KEY, 0, -1)
         tickers = [
             (m.decode("utf-8") if isinstance(m, bytes) else str(m)).upper()
             for m in (members or [])

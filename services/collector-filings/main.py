@@ -43,6 +43,7 @@ from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 from shared.utils.entity_resolution import seed_aliases
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 
 try:
     from thirteen_f import (
@@ -498,7 +499,7 @@ async def main():
                 if redis_client:
                     try:
                         raw_redis = getattr(redis_client, "raw", redis_client)
-                        dynamic_tickers = await raw_redis.zrange("sentinel:watched:equities", 0, 50)
+                        dynamic_tickers = await raw_redis.zrange(WATCHED_EQUITIES_KEY, 0, 50)
                         for t in dynamic_tickers:
                             sym = t.decode("utf-8") if isinstance(t, bytes) else str(t)
                             if sym not in tickers:

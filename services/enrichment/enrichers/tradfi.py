@@ -24,6 +24,7 @@ from shared.utils.materiality import apply_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 from shared.utils.quiet_failures import swallowed, dropped
 from shared.utils.feature_flags import FeatureFlagManager
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -1420,8 +1421,8 @@ class TradFiEnricher:
                     tags.append("geo_linked_asset")
                     tags.extend(concepts)
                     async with self.redis_client.raw.pipeline(transaction=True) as pipe:
-                        pipe.zadd("sentinel:watched:equities", mapping={ticker: time.time()})
-                        pipe.zremrangebyrank("sentinel:watched:equities", 0, -51)
+                        pipe.zadd(WATCHED_EQUITIES_KEY, mapping={ticker: time.time()})
+                        pipe.zremrangebyrank(WATCHED_EQUITIES_KEY, 0, -51)
                         await pipe.execute()
         except Exception as e:
             logger.error(f"Failed to update geo watchlist for {ticker}: {e}", exc_info=True)
@@ -1815,8 +1816,8 @@ class TradFiEnricher:
 
         import time as _time
         try:
-            await self.redis_client.raw.zadd("sentinel:watched:equities", mapping={ticker: _time.time()})
-            await self.redis_client.raw.zremrangebyrank("sentinel:watched:equities", 0, -51)
+            await self.redis_client.raw.zadd(WATCHED_EQUITIES_KEY, mapping={ticker: _time.time()})
+            await self.redis_client.raw.zremrangebyrank(WATCHED_EQUITIES_KEY, 0, -51)
         except Exception as _exc:
             swallowed("enrichment.enrichers.tradfi._enrich_quant_radar", _exc, logger)
 

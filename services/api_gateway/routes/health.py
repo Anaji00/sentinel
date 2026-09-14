@@ -24,6 +24,7 @@ from services.api_gateway.dependencies import get_db_optional, get_redis_optiona
 # than a literal it carried when the field was absent.
 MARITIME_DARK_GAP_HOURS = 4
 
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 logger = logging.getLogger("api-gateway.health")
 
 router = APIRouter(prefix="/api/v1/health", tags=["Data Health & Telemetry"])
@@ -177,7 +178,7 @@ async def _watched_equity_count(redis) -> int:
         if redis is None:
             return 0
         raw_redis = getattr(redis, "raw", redis)
-        return int(await raw_redis.zcard("sentinel:watched:equities") or 0)
+        return int(await raw_redis.zcard(WATCHED_EQUITIES_KEY) or 0)
     except Exception as _exc:
         swallowed("api_gateway.routes.health.watched_count", _exc, logger)
         return 0

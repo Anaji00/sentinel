@@ -15,6 +15,13 @@ from shared.utils.candles import (
     timeframe_aliases,
 )
 
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+from shared.utils.radar_keys import (
+    MOVERS_DAY_ZSET,
+    RADAR_BASELINE_PREFIX,
+    RADAR_SWEEP_STATE_KEY,
+    movers_snapshot_key,
+)
 logger = logging.getLogger("api-gateway.radar")
 
 # Anomaly scores are unit-normalized [0,1]; this maps them onto a z-like scale
@@ -70,11 +77,27 @@ async def get_radar_anomalies(
     watchlist = []
     if redis:
         try:
-            raw_items = await redis.raw.zrange("sentinel:watched:equities", 0, -1, withscores=True)
+            raw_items = await redis.raw.zrange(WATCHED_EQUITIES_KEY, 0, -1, withscores=True)
             for item in raw_items:
                 t = item[0].decode('utf-8') if isinstance(item[0], bytes) else str(item[0])
                 score = float(item[1])
-                watchlist.append({"ticker": t, "added_timestamp": score})
+                # A watched ticker used to arrive with nothing but the moment it
+                # was promoted. The zset score stays the promotion time, because
+                # that is the radar's eviction order and should not be
+                # overloaded; the move joins from the movers store instead.
+                row = {"ticker": t, "added_timestamp": score, "day_pct": None}
+                try:
+                    detail = await redis.raw.hgetall(movers_snapshot_key(t))
+                    for k, v in (detail or {}).items():
+                        key = k.decode() if isinstance(k, bytes) else k
+                        value = v.decode() if isinstance(v, bytes) else v
+                        try:
+                            row[key] = float(value)
+                        except (TypeError, ValueError):
+                            row[key] = value
+                except Exception as _exc:
+                    swallowed("api_gateway.routes.radar.watchlist_move", _exc, logger)
+                watchlist.append(row)
         except Exception as e:
             logger.warning(f"Error reading sentinel:watched:equities from Redis: {e}")
 
@@ -91,32 +114,119 @@ from datetime import datetime, timezone
 import math
 import time
 
+@router.get("/movers")
+async def get_movers(
+    direction: str = Query("gainers", pattern="^(gainers|losers)$"),
+    limit: int = Query(20, ge=1, le=200),
+    redis = Depends(get_redis_client),
+):
+    """The day's biggest moves, from bars the radar was already downloading.
+
+    Alpaca's snapshot carries today's bar and yesterday's bar for every symbol
+    in the sweep. The collector bound both and used them only as a price
+    fallback, so the platform could say what traded unusually much and had no
+    way to say what went up -- there was no gainers-or-losers concept anywhere
+    in the tree.
+
+    One sorted set scored by the day's move answers both directions, so neither
+    can fall out of date relative to the other.
+    """
+    if not redis:
+        raise HTTPException(status_code=503, detail="Movers store is unavailable.")
+
+    raw = redis.raw
+    try:
+        if direction == "gainers":
+            rows = await raw.zrevrange(MOVERS_DAY_ZSET, 0, limit - 1, withscores=True)
+        else:
+            rows = await raw.zrange(MOVERS_DAY_ZSET, 0, limit - 1, withscores=True)
+    except Exception as _exc:
+        swallowed("api_gateway.routes.radar.movers", _exc, logger)
+        raise HTTPException(status_code=503, detail="Movers store could not be read.")
+
+    if not rows:
+        # Empty is a real answer -- before the market opens there are no moves
+        # -- and it is not the same as the store being unreachable, which is a
+        # 503 above.
+        return {"direction": direction, "count": 0, "movers": [], "as_of": None}
+
+    movers = []
+    as_of = None
+    for member, score in rows:
+        ticker = member.decode() if isinstance(member, bytes) else str(member)
+        entry = {"ticker": ticker, "day_pct": round(float(score), 4)}
+        try:
+            detail = await raw.hgetall(movers_snapshot_key(ticker))
+            for k, v in (detail or {}).items():
+                key = k.decode() if isinstance(k, bytes) else k
+                value = v.decode() if isinstance(v, bytes) else v
+                if key == "day_pct":
+                    continue
+                try:
+                    entry[key] = float(value)
+                except (TypeError, ValueError):
+                    entry[key] = value
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.mover_detail", _exc, logger)
+        movers.append(entry)
+
+    try:
+        state = await raw.hget(RADAR_SWEEP_STATE_KEY, "at")
+        as_of = state.decode() if isinstance(state, bytes) else state
+    except Exception as _exc:
+        swallowed("api_gateway.routes.radar.movers_as_of", _exc, logger)
+
+    return {"direction": direction, "count": len(movers), "movers": movers, "as_of": as_of}
+
+
 @router.get("/sweeps")
 async def get_radar_sweeps_status(redis = Depends(get_redis_client)):
-    """Retrieve quantitative radar sweep baseline parameters and active universe metrics."""
-    universe_size = 4500
-    mean_count = 0
+    """What the last sweep actually covered.
+
+    Two numbers here were literals. `total_universe_scanned` was 4500 while the
+    collector's own comments put the figure at 11,631, and `tracked_baselines`
+    was `mean_count or 1840` -- where `mean_count` came from scanning
+    `sentinel:radar:mean:*`, a prefix nothing writes. The collector writes
+    `sentinel:radar:1m_mean:{ticker}`, so the scan matched nothing on every
+    request and the constant was the answer, always.
+    """
+    mean_count = None
+    sweep = {}
     if redis:
         try:
             cursor = 0
             mean_count = 0
             while True:
-                cursor, keys = await redis.raw.scan(cursor=cursor, match="sentinel:radar:mean:*", count=500)
+                cursor, keys = await redis.raw.scan(
+                    cursor=cursor, match=f"{RADAR_BASELINE_PREFIX}*", count=500
+                )
                 mean_count += len(keys)
                 if cursor == 0:
                     break
-        except Exception as e:
-            logger.warning(f"Error scanning Redis radar mean keys: {e}")
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.baseline_scan", _exc, logger)
+        try:
+            raw_state = await redis.raw.hgetall(RADAR_SWEEP_STATE_KEY)
+            sweep = {
+                (k.decode() if isinstance(k, bytes) else k):
+                (v.decode() if isinstance(v, bytes) else v)
+                for k, v in (raw_state or {}).items()
+            }
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.sweep_state", _exc, logger)
 
     return {
         "status": "sweeping",
         "scanner": "Alpaca US Equities Snapshot API",
-        "total_universe_scanned": universe_size,
-        "tracked_baselines": mean_count or 1840,
+        # Null rather than a plausible number: the collector publishes what it
+        # evaluated, and if it has not run there is nothing to report.
+        "total_universe_scanned": int(sweep["evaluated"]) if sweep.get("evaluated") else None,
+        "symbols_priced": int(sweep["priced"]) if sweep.get("priced") else None,
+        "last_sweep_at": sweep.get("at"),
+        "tracked_baselines": mean_count,
         "z_score_threshold": 3.0,
         "ewma_alpha": 0.05,
         "intraday_vwap_normalization": True,
-        "last_sweep_time": "Real-time 1-Bar Continuous"
     }
 
 
