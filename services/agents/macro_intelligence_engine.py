@@ -16,6 +16,14 @@ import asyncio
 import json
 import math
 import logging
+from shared.utils.agent_conclusions import (
+    AGENT_CORRELATION_ANALYSIS_PREFIX,
+    HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_INVERSE_CORRELATION_PREFIX,
+    MACRO_RATES_REGIME_KEY,
+    MACRO_SPREAD_2Y10Y_KEY,
+    TRADFI_BACKFILL_REPORT_KEY,
+)
 import os
 import sys
 import time
@@ -426,8 +434,8 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         # Atomic Redis pipeline write for rolling history
         async with self.redis.raw.pipeline(transaction=True) as pipe:
-            pipe.rpush("sentinel:macro:spread_2y10y", spread_2y10y_bps)
-            pipe.ltrim("sentinel:macro:spread_2y10y", -100, -1)
+            pipe.rpush(MACRO_SPREAD_2Y10Y_KEY, spread_2y10y_bps)
+            pipe.ltrim(MACRO_SPREAD_2Y10Y_KEY, -100, -1)
             await pipe.execute()
 
         dedup_key = f"macro_regime:{int(time.time() // 3600)}"
@@ -521,7 +529,7 @@ class MacroIntelligenceEngine(SentinelAgent):
             _cached = regime_stamp(res_payload["brief"])
             res_payload["brief"] = _cached
             await self.redis.raw.set("sentinel:macro:rates_regime:latest", json.dumps(_cached), ex=86400)
-            await self.redis.raw.set("sentinel:macro:latest_rates_regime", json.dumps(_cached), ex=86400)
+            await self.redis.raw.set(MACRO_RATES_REGIME_KEY, json.dumps(_cached), ex=86400)
 
             # Publish structured AgentBulletin for Consensus Engine
             # The 2s10s spread is in this same object, computed from measured
@@ -935,7 +943,7 @@ class MacroIntelligenceEngine(SentinelAgent):
                     reasoning = f"Strong inverse correlation ({pearson_corr:.2f}) detected: Rising {macro_asset} (${x_vec[-1]:.2f}) is exerting margin pressure on {micro_ticker} (${y_vec[-1]:.2f})."
                     logger.warning(f"🔴 DYNAMIC MACRO SHOCK | {reasoning}")
                     await self.redis.raw.set(
-                        f"sentinel:macro:inverse_correlation:{macro_asset}:{micro_ticker}",
+                        f"{MACRO_INVERSE_CORRELATION_PREFIX}{macro_asset}:{micro_ticker}",
                         json.dumps({
                             "macro_asset": macro_asset,
                             "equity_ticker": micro_ticker,

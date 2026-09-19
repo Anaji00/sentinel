@@ -29,33 +29,27 @@ export default function DashboardError({
   }, [error]);
 
   return (
-    <div
-      role="alert"
-      className="flex h-full w-full items-center justify-center p-6"
-    >
-      <div className="w-full max-w-md rounded-xl border border-rose-500/30 bg-rose-950/20 p-6 font-mono">
+    <div role="alert" className="flex h-full w-full items-center justify-center p-6">
+      <div className="w-full max-w-md rounded-xl border border-rose-500/30 bg-rose-950/20 p-6">
         <div className="flex items-center gap-2.5">
           <AlertTriangle className="h-4 w-4 shrink-0 text-rose-400" />
-          <h2 className="text-sm font-bold uppercase tracking-wider text-rose-300">
-            This view could not be loaded
-          </h2>
+          <h2 className="text-sm font-bold text-rose-300">This view could not be loaded</h2>
         </div>
 
-        <p className="mt-3 text-[11px] leading-relaxed text-slate-400">
-          The panel failed while rendering. Other views are unaffected. Retrying
-          re-runs the request; if it keeps failing, the upstream service is
-          likely unavailable.
+        <p className="mt-3 text-micro leading-relaxed text-ink-dim">
+          The panel failed while rendering. Other views are unaffected. Retrying re-runs the
+          request; if it keeps failing, the upstream service is likely unavailable.
         </p>
 
         {error.digest && (
-          <p className="mt-3 text-[10px] text-slate-500">
-            Reference <code className="text-slate-400">{error.digest}</code>
+          <p className="mt-3 text-micro text-ink-mute">
+            Reference <code className="text-ink-dim">{error.digest}</code>
           </p>
         )}
 
         <button
           onClick={reset}
-          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-[11px] font-bold text-rose-300 transition-colors hover:bg-rose-900/40 focus:outline-none focus:ring-2 focus:ring-rose-400"
+          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-micro font-bold text-rose-300 transition-colors hover:bg-rose-900/40 focus:outline-none focus:ring-2 focus:ring-rose-400"
         >
           <RotateCw className="h-3.5 w-3.5" />
           RETRY

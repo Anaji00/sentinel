@@ -369,3 +369,58 @@ def test_verify_target_runs_the_production_build():
     verify = mk[mk.index("verify:"):]
     verify = verify[:verify.index("\n\n")] if "\n\n" in verify else verify
     assert "npm run build" in verify, "make verify does not run the production build"
+
+
+def test_the_seed_fixture_writes_columns_the_schema_actually_has():
+    """It named `domain_data` and `raw_payload`; the events table has neither.
+
+    There is no single payload column -- the schema carries one jsonb column per
+    domain and every reader asks for the one its domain uses. So this script
+    raised `column "domain_data" does not exist` on its first row and had
+    written nothing for as long as those columns have been typed.
+    """
+    src = _read("scripts/seed_live_pipeline.py")
+    assert "DOMAIN_COLUMN" in src, "no mapping from event type to domain column"
+    for absent in ('INSERT INTO events (event_id, type, source, occurred_at, '
+                   'primary_entity_id, primary_entity_name, region, '
+                   'anomaly_score, summary, domain_data, raw_payload)',):
+        assert absent not in src, "still inserting into columns that do not exist"
+
+
+def test_the_seed_fixture_marks_its_rows_as_fabricated():
+    """The header disclosed it; the rows did not.
+
+    Once inserted these carried `source: "collector.ais"` and nothing else,
+    which makes them indistinguishable from measurements to every consumer
+    downstream. `source_reliability` is the field the platform already uses to
+    weigh a source, and zero is what a fabrication is worth.
+    """
+    src = _read("scripts/seed_live_pipeline.py")
+    assert "source_reliability" in src
+    assert '"fabricated"' in src, "the rows carry no tag saying what they are"
+
+
+def test_an_unmapped_seed_type_is_refused_rather_than_guessed():
+    """A vessel payload in financial_data inserts cleanly and is never read.
+
+    That is the same outcome as writing nothing, with none of the noise -- so
+    the script stops instead.
+    """
+    src = _read("scripts/seed_live_pipeline.py")
+    assert "no domain column mapped for type" in src
+
+
+def test_an_unreplayable_dead_letter_is_marked_permanently_failed():
+    """`unknown` is not a topic and `{}` is not a message.
+
+    The retry branch requires `original_topic != "unknown"`, so an unroutable
+    event skipped it and arrived at the insert with retry_count 0 -- written as
+    retryable. Measured: 2,584 rows with no topic and an empty payload, none of
+    them marked permanently failed, sitting in the backlog as if a replay could
+    do something with them.
+    """
+    src = _read("services/dlq-worker/main.py")
+    assert "unreplayable" in src, "nothing distinguishes a replayable failure"
+    assert 'original_topic == "unknown"' in src
+    # And it has to reach the flag, not just be computed.
+    assert "or unreplayable" in src

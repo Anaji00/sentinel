@@ -252,3 +252,22 @@ def score_dto(obj: Any, **kwargs: Any) -> Any:
     """`to_dto` tuned for probability/score payloads (4 decimal places)."""
     kwargs.setdefault("precision", PRECISION_SCORE)
     return to_dto(obj, **kwargs)
+
+
+def iso_or_none(value: Any) -> Optional[str]:
+    """A timestamp as an ISO string, whatever shape it arrives in.
+
+    Rows from `TimescaleClient` have already had their datetimes converted by
+    `_sanitize_row`, so a route receives a `str` and calling `.isoformat()` on
+    it raises. Rows from somewhere else may still carry a datetime. Both are
+    normal, and the difference is not something a route should have to track --
+    which is why five call sites got it wrong and the rest carried a
+    `hasattr` check that says nothing about intent.
+
+    None stays None: a missing timestamp is not the epoch.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)

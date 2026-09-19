@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { signSessionToken } from '../../login/route';
-import { SSO_STATE_COOKIE } from '../start/route';
+import { SSO_STATE_COOKIE, signSessionToken } from '@/lib/session';
 
 const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 const SESSION_SECRET = process.env.SESSION_SECRET;

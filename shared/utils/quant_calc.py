@@ -912,7 +912,7 @@ def _expected_rs(n: int) -> float:
     return max(1e-9, front * (1.0 / math.sqrt(n * math.pi / 2.0)) * k)
 
 
-def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool = True) -> float:
+def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool = True) -> Optional[float]:
     """Hurst exponent by rescaled-range (R/S) analysis.
 
     H < 0.5 anti-persistent, H = 0.5 random walk, H > 0.5 persistent.
@@ -940,12 +940,12 @@ def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool
     is unstable below about eight observations per chunk.
     """
     if not series or len(series) < 32:
-        return 0.5
+        return None
 
     arr = np.asarray(series, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
     if arr.size < 32:
-        return 0.5
+        return None
 
     if is_level_series:
         # Increments. Log differences where the series is strictly positive,
@@ -956,7 +956,7 @@ def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool
         else:
             arr = np.diff(arr)
         if arr.size < 32:
-            return 0.5
+            return None
 
     n_obs = arr.size
     # At least MIN_RS_CHUNK points per chunk and at least 4 chunks per lag, so
@@ -964,7 +964,7 @@ def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool
     max_usable = max(MIN_RS_CHUNK, n_obs // 4)
     lags = [l for l in range(MIN_RS_CHUNK, min(max_lag, max_usable) + 1)]
     if len(lags) < 3:
-        return 0.5
+        return None
 
     log_rs: List[float] = []
     log_n: List[float] = []
@@ -991,7 +991,7 @@ def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool
             lags_used.append(lag)
 
     if len(log_rs) < 3:
-        return 0.5
+        return None
 
     # Anis-Lloyd correction, or the null does not sit at 0.5.
     #
@@ -1007,6 +1007,45 @@ def hurst_exponent(series: List[float], max_lag: int = 20, is_level_series: bool
     # Clamped, but to a range an R/S estimate can legitimately occupy. The old
     # [0.0, 1.0] clamp hid the pathology that produced it.
     return round(max(0.0, min(1.0, h)), 4)
+
+
+
+# Where a random walk actually lands on this estimator, measured rather than
+# assumed: 40 trials per window size at n = 64, 200 and 500 put the median
+# between 0.40 and 0.43. The theoretical null is 0.5 and the Anis-Lloyd
+# correction moves it most of the way there and not all of it, so a threshold
+# written at 0.5 calls a genuine random walk mean-reverting.
+HURST_RANDOM_WALK_NULL = 0.43
+
+# Half the distance from the null to each extreme. Inside this band the series
+# is not distinguishable from a random walk on the samples available.
+HURST_BAND = 0.12
+
+
+def hurst_regime(h: Optional[float]) -> Optional[str]:
+    """What a Hurst value says, in words that match what it measures.
+
+    Not "Trending". R/S on increments is blind to drift -- it takes deviations
+    from each chunk's own mean, which subtracts a constant trend exactly -- so
+    a persistent series and a drifting one are the same number to it. What it
+    does measure is whether increments *persist*: whether a move up is more
+    often followed by another move up than chance allows.
+
+        PERSISTENT       moves tend to continue
+        RANDOM_WALK      indistinguishable from chance on this sample
+        MEAN_REVERTING   moves tend to reverse
+
+    None in, None out: a series too short to measure has no regime, and saying
+    so is not the same as saying "mean-reverting", which is what a strict
+    `> 0.5` comparison against a 0.5 sentinel used to do.
+    """
+    if h is None:
+        return None
+    if h >= HURST_RANDOM_WALK_NULL + HURST_BAND:
+        return "PERSISTENT"
+    if h <= HURST_RANDOM_WALK_NULL - HURST_BAND:
+        return "MEAN_REVERTING"
+    return "RANDOM_WALK"
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1864,4 +1903,53 @@ def compute_ta_indicators(closes: List[float], highs: List[float], lows: List[fl
         "dist_sma_200_pct": ma_res.get("dist_sma_200_pct"),
         "ma_alignment": ma_res.get("ma_alignment", "NEUTRAL"),
         "fib_levels": {k: round(v, 4) for k, v in fibs.items()},
+    }
+
+
+def best_bid_ask_spread(md_entries: List[dict]) -> Optional[dict]:
+    """Best bid, best offer and the spread from a FIX market-data book.
+
+    The FIX 4.4 collector parses tag 269 (0 bid, 1 offer, 2 trade), tag 270
+    (price) and tag 271 (size) into `md_entries` and publishes the whole book on
+    every institutional message. Nothing in the enrichment service read it --
+    `md_entries` appears nowhere outside the collector that writes it -- while
+    `MarketMicrostructure.bid_ask_spread` sat declared and unfilled on the same
+    payload, the one field of the eleven with no implementation behind it.
+
+    Returned in price terms and in basis points of the mid, because a 5-cent
+    spread means one thing on a $12 name and another on a $1,200 one. None when
+    the book is one-sided or crossed: both are real states of a snapshot and
+    neither is a negative spread.
+    """
+    if not md_entries:
+        return None
+    bids, offers = [], []
+    for entry in md_entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("type") or entry.get("entry_type") or "").lower()
+        try:
+            price = float(entry.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        if kind in ("0", "bid"):
+            bids.append(price)
+        elif kind in ("1", "offer", "ask"):
+            offers.append(price)
+
+    if not bids or not offers:
+        return None
+    best_bid, best_offer = max(bids), min(offers)
+    if best_offer <= best_bid:
+        return None
+    mid = (best_bid + best_offer) / 2.0
+    spread = best_offer - best_bid
+    return {
+        "best_bid": round(best_bid, 6),
+        "best_offer": round(best_offer, 6),
+        "bid_ask_spread": round(spread, 6),
+        "spread_bps": round((spread / mid) * 10_000.0, 2) if mid > 0 else None,
+        "book_depth": len(bids) + len(offers),
     }

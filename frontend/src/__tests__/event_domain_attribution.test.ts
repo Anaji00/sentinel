@@ -13,8 +13,13 @@ import type { NormalizedEvent } from '../lib/types';
  */
 
 const row = (over: Partial<NormalizedEvent>): NormalizedEvent =>
-  ({ event_id: 'e1', type: 'market_anomaly', occurred_at: '2026-08-24T04:28:50Z',
-     anomaly_score: 1, ...over } as NormalizedEvent);
+  ({
+    event_id: 'e1',
+    type: 'market_anomaly',
+    occurred_at: '2026-08-24T04:28:50Z',
+    anomaly_score: 1,
+    ...over,
+  }) as NormalizedEvent;
 
 describe('event domain attribution', () => {
   it('labels a Coinbase candle anomaly as crypto, not tradfi', () => {

@@ -8,7 +8,9 @@ import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Bitcoin, TrendingUp, Zap, Radio } from 'lucide-react';
-import { formatPercent } from '../../lib/format';
+import { formatCompact, formatCurrency, formatPercent } from '../../lib/format';
+import { PALETTE } from '../../lib/palette';
+import { POLL } from '../ui/DataProvider';
 
 interface SeriesPoint {
   timestamp: string;
@@ -39,18 +41,26 @@ export default function CryptoPriceChart() {
   const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=BTCUSD&limit=60',
     fetcher,
-    { refreshInterval: 3000 }
+    { refreshInterval: POLL.live },
   );
 
-  const basePoints = data?.series?.['BTCUSD'] || data?.series?.['BTC'] || data?.series?.['BTCUSDT'] || [];
-  
+  const basePoints =
+    data?.series?.['BTCUSD'] || data?.series?.['BTC'] || data?.series?.['BTCUSDT'] || [];
+
   // Merge live ticks from WebSocket stream if available
   const mergedSeries = useMemo(() => {
     const list = [...basePoints];
-    liveCryptoEvents.forEach(e => {
-      const sym = (e.crypto_data?.pair || e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+    liveCryptoEvents.forEach((e) => {
+      const sym = (
+        e.crypto_data?.pair ||
+        e.financial_data?.ticker ||
+        e.primary_entity?.id ||
+        e.primary_entity?.name ||
+        ''
+      ).toUpperCase();
       if (sym.includes('BTC')) {
-        const price = e.crypto_data?.price || e.crypto_data?.mark_price || e.crypto_data?.close_price;
+        const price =
+          e.crypto_data?.price || e.crypto_data?.mark_price || e.crypto_data?.close_price;
         if (price && price > 10000) {
           list.push({
             timestamp: e.occurred_at,
@@ -63,7 +73,7 @@ export default function CryptoPriceChart() {
             // reported a volume of exactly 1000 for every live BTC tick it
             // drew. An invented measurement is worse than a gap: a gap shows.
             volume: e.crypto_data?.size_tokens ?? null,
-            anomaly_score: e.anomaly_score
+            anomaly_score: e.anomaly_score,
           });
         }
       }
@@ -76,10 +86,11 @@ export default function CryptoPriceChart() {
   const latestPrice = hasData ? mergedSeries[mergedSeries.length - 1].price : null;
   const startPrice = hasData ? mergedSeries[0].price : null;
   const priceChange = latestPrice !== null && startPrice !== null ? latestPrice - startPrice : null;
-  const priceChangePct = startPrice && startPrice > 0 && priceChange !== null ? (priceChange / startPrice) * 100 : null;
+  const priceChangePct =
+    startPrice && startPrice > 0 && priceChange !== null ? (priceChange / startPrice) * 100 : null;
   const isPositive = priceChange !== null ? priceChange >= 0 : true;
 
-  const prices = mergedSeries.map(p => p.price);
+  const prices = mergedSeries.map((p) => p.price);
   const minPrice = hasData ? Math.min(...prices) : 0;
   const maxPrice = hasData ? Math.max(...prices) : 0;
 
@@ -91,65 +102,83 @@ export default function CryptoPriceChart() {
       return { x, y };
     });
 
-    const dPath = pts.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`, '');
+    const dPath = pts.reduce(
+      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
+      '',
+    );
     const dArea = `${dPath} L 600 180 L 0 180 Z`;
     return { pathStr: dPath, areaStr: dArea };
   }, [mergedSeries, minPrice, maxPrice, hasData]);
 
-  const activeHoverPoint = hoverIndex !== null && mergedSeries[hoverIndex] ? mergedSeries[hoverIndex] : null;
+  const activeHoverPoint =
+    hoverIndex !== null && mergedSeries[hoverIndex] ? mergedSeries[hoverIndex] : null;
 
   return (
     <Card
       title="BTC / USD REAL-TIME MARKET TELEMETRY & VOLATILITY"
       badge={
         hasData ? (
-          <Badge variant="live" pulse>LIVE WS SYNC</Badge>
+          <Badge variant="live" pulse>
+            LIVE WS SYNC
+          </Badge>
         ) : (
-          <Badge variant="warning" pulse>{describeApiError(error) ?? 'AWAITING LIVE DATA STREAM...'}</Badge>
+          <Badge variant="warning" pulse>
+            {describeApiError(error) ?? 'Waiting for the stream…'}
+          </Badge>
         )
       }
       noPadding
     >
-      <div className="p-4 space-y-3 font-mono">
+      <div className="p-4 space-y-3">
         {/* Metric Summary Ribbon */}
-        <div className="grid grid-cols-3 gap-3 bg-[#080b12] p-3 rounded-lg border border-amber-500/20 text-xs">
+        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-amber-500/20 text-xs">
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold flex items-center gap-1">
+            <span className="text-ink-dim block text-micro uppercase font-bold flex items-center gap-1">
               <Bitcoin className="w-3.5 h-3.5 text-amber-400" /> BTC / USD PRICE
             </span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className="text-amber-400 font-extrabold text-base">
-                {latestPrice !== null ? `$${latestPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : 'AWAITING FEED...'}
+                {latestPrice !== null
+                  ? formatCurrency(latestPrice, { decimals: 2 })
+                  : 'AWAITING FEED...'}
               </span>
               {hasData && <Zap className="w-3.5 h-3.5 text-amber-400 animate-pulse" />}
             </div>
           </div>
 
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold">24H CHANGE</span>
+            <span className="text-ink-dim block text-micro uppercase font-bold">24H CHANGE</span>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span className={`font-extrabold text-base ${priceChangePct !== null ? (isPositive ? 'text-emerald-400' : 'text-rose-400') : 'text-slate-400'}`}>
-                {priceChangePct !== null ? formatPercent(priceChangePct, { decimals: 2, signed: true }) : 'AWAITING FEED...'}
+              <span
+                className={`font-extrabold text-base ${priceChangePct !== null ? (isPositive ? 'text-emerald-400' : 'text-rose-400') : 'text-ink-dim'}`}
+              >
+                {priceChangePct !== null
+                  ? formatPercent(priceChangePct, { decimals: 2, signed: true })
+                  : 'AWAITING FEED...'}
               </span>
             </div>
           </div>
 
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold">INTRADAY RANGE</span>
-            <div className="text-slate-200 font-bold text-xs mt-1">
-              {hasData ? `$${minPrice.toLocaleString()} - $${maxPrice.toLocaleString()}` : 'AWAITING FEED...'}
+            <span className="text-ink-dim block text-micro uppercase font-bold">
+              INTRADAY RANGE
+            </span>
+            <div className="text-ink font-bold text-xs mt-1">
+              {hasData
+                ? `${formatCurrency(minPrice)} - ${formatCurrency(maxPrice)}`
+                : 'AWAITING FEED...'}
             </div>
           </div>
         </div>
 
         {/* Live Interactive SVG Area Chart or Awaiting Live Stream State */}
         {hasData ? (
-          <div className="relative bg-[#07090e] p-3 rounded-lg border border-slate-800 overflow-hidden">
-            <div className="flex items-center justify-between text-[10px] text-slate-400 mb-2 font-bold uppercase">
-              <span className="text-amber-300 font-bold">BTC / USD LIVE CANDLE & STREAM TRAJECTORY</span>
+          <div className="relative bg-page p-3 rounded-lg border border-line overflow-hidden">
+            <div className="flex items-center justify-between text-micro text-ink-dim mb-2 font-bold uppercase">
+              <span className="text-amber-300 font-bold">BTC / USD</span>
               <span>
                 {activeHoverPoint
-                  ? `HOVER: $${activeHoverPoint.price.toLocaleString()} | VOL: ${activeHoverPoint.volume?.toLocaleString() ?? '--'}`
+                  ? `${formatCurrency(activeHoverPoint.price)} · vol ${formatCompact(activeHoverPoint.volume)}`
                   : 'REAL-TIME 1-SEC TELEMETRY BARS'}
               </span>
             </div>
@@ -157,17 +186,47 @@ export default function CryptoPriceChart() {
             <svg viewBox="0 0 600 180" className="w-full h-44 overflow-visible">
               <defs>
                 <linearGradient id="btcGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.4" />
-                  <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.0" />
+                  <stop offset="0%" stopColor={PALETTE.caution} stopOpacity="0.4" />
+                  <stop offset="100%" stopColor={PALETTE.caution} stopOpacity="0.0" />
                 </linearGradient>
               </defs>
 
-              <line x1="0" y1="45" x2="600" y2="45" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.8" />
-              <line x1="0" y1="90" x2="600" y2="90" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.8" />
-              <line x1="0" y1="135" x2="600" y2="135" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.8" />
+              <line
+                x1="0"
+                y1="45"
+                x2="600"
+                y2="45"
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+                strokeWidth="0.8"
+              />
+              <line
+                x1="0"
+                y1="90"
+                x2="600"
+                y2="90"
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+                strokeWidth="0.8"
+              />
+              <line
+                x1="0"
+                y1="135"
+                x2="600"
+                y2="135"
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+                strokeWidth="0.8"
+              />
 
               <path d={areaStr} fill="url(#btcGradient)" />
-              <path d={pathStr} fill="none" stroke="#f59e0b" strokeWidth="2.2" strokeLinecap="round" />
+              <path
+                d={pathStr}
+                fill="none"
+                stroke={PALETTE.caution}
+                strokeWidth="2.2"
+                strokeLinecap="round"
+              />
 
               {hoverIndex !== null && (
                 <line
@@ -175,7 +234,7 @@ export default function CryptoPriceChart() {
                   y1="0"
                   x2={(hoverIndex / Math.max(1, mergedSeries.length - 1)) * 600}
                   y2="180"
-                  stroke="#00f2fe"
+                  stroke={PALETTE.accent}
                   strokeWidth="1.2"
                   strokeDasharray="2 2"
                 />
@@ -197,13 +256,14 @@ export default function CryptoPriceChart() {
             </svg>
           </div>
         ) : (
-          <div className="h-44 w-full bg-[#07090e] rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
+          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
             <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
             <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
-              AWAITING LIVE DATA STREAM FOR BTC / USD
+              Waiting for the BTC / USD stream
             </span>
-            <p className="text-[10px] text-slate-500 max-w-sm">
-              Binance & Coinbase WebSocket stream connections active. Ticks will render automatically upon database ingestion.
+            <p className="text-micro text-ink-mute max-w-sm">
+              Binance & Coinbase WebSocket stream connections active. Ticks will render
+              automatically upon database ingestion.
             </p>
           </div>
         )}

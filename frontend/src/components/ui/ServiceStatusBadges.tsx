@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import { Database, Zap, Network } from 'lucide-react';
 import { fetcher } from '../../lib/api';
 import { formatAge } from '../../lib/format';
+import { POLL } from '../ui/DataProvider';
 
 /**
  * Live backend status badges.
@@ -32,7 +33,7 @@ const TONE: Record<Health, string> = {
   healthy: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400',
   degraded: 'bg-amber-500/15 border-amber-500/30 text-amber-400',
   down: 'bg-rose-500/15 border-rose-500/30 text-rose-400',
-  unknown: 'bg-slate-700/20 border-slate-600/40 text-slate-400',
+  unknown: 'bg-slate-700/20 border-line-strong/40 text-ink-dim',
 };
 
 const LABEL: Record<Health, string> = {
@@ -85,7 +86,7 @@ export const ServiceStatusBadges: React.FC<{ components?: string[] }> = ({
   components = ['enrichment', 'correlation'],
 }) => {
   const { data, error, isLoading } = useSWR<HealthPayload>('/health/data', fetcher, {
-    refreshInterval: 15_000,
+    refreshInterval: POLL.standard,
     revalidateOnFocus: false,
   });
 
@@ -96,14 +97,14 @@ export const ServiceStatusBadges: React.FC<{ components?: string[] }> = ({
   const overall: Health = error
     ? 'down'
     : isLoading
-    ? 'unknown'
-    : toHealth(
-        components.every((c) => entries[c]?.status === 'HEALTHY')
-          ? 'HEALTHY'
-          : components.some((c) => entries[c]?.status === 'HEALTHY')
-          ? 'DEGRADED'
-          : 'OFFLINE',
-      );
+      ? 'unknown'
+      : toHealth(
+          components.every((c) => entries[c]?.status === 'HEALTHY')
+            ? 'HEALTHY'
+            : components.some((c) => entries[c]?.status === 'HEALTHY')
+              ? 'DEGRADED'
+              : 'OFFLINE',
+        );
 
   const freshest = components
     .map((c) => entries[c]?.age_seconds)
@@ -126,7 +127,13 @@ export const ServiceStatusBadges: React.FC<{ components?: string[] }> = ({
       {components.map((c) => (
         <Badge
           key={c}
-          icon={c === 'correlation' ? <Zap className="w-3.5 h-3.5" /> : <Database className="w-3.5 h-3.5" />}
+          icon={
+            c === 'correlation' ? (
+              <Zap className="w-3.5 h-3.5" />
+            ) : (
+              <Database className="w-3.5 h-3.5" />
+            )
+          }
           name={c.toUpperCase()}
           health={toHealth(entries[c]?.status)}
           detail={entries[c]?.last_seen ?? null}

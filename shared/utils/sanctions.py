@@ -13,6 +13,7 @@ Phase 2: replace keyword matching with full OFAC SDN list sync
 """
 
 import logging
+import math
 import re
 from typing import List
 
@@ -109,6 +110,20 @@ MMSI_COUNTRY: dict = {
 
 _automaton = None
 
+# The keywords actually in force, which is not the same list as the constant.
+#
+# The fuzzy branch and the no-automaton fallback both iterated
+# `SANCTIONED_KEYWORDS` -- the 31 hardcoded terms, 17 of them long enough to be
+# fuzzy-eligible. Meanwhile `fetch_and_sync_ofac_sdn_list` downloads the
+# Treasury SDN list and passes thousands of names to `_init_automaton`, which
+# feeds the *exact* path only. So exact matching covered the synced universe
+# and variant matching covered seventeen names, which is not a threshold
+# problem or a scoring problem -- those names were never offered to it.
+#
+# Set by _init_automaton from the same list the automaton gets, so the two
+# paths cannot describe different sanctions universes.
+_active_keywords: List[str] = list(SANCTIONED_KEYWORDS)
+
 # The curated list is trusted at any length; anything the sync adds must earn
 # its place. Held as a set so the length rule can exempt exactly these.
 _CURATED = {k.lower() for k in SANCTIONED_KEYWORDS}
@@ -133,6 +148,83 @@ def is_usable_keyword(kw: str) -> bool:
     return len(k.split()) >= 2 and len(k) >= 6
 
 
+# ── Fuzzy candidate index ─────────────────────────────────────────────────────
+# Which keywords could possibly score the threshold against a given name.
+#
+# Offering the fuzzy loop the whole synced list is correct and unaffordable:
+# measured in the running enricher against the real SDN download, 13,187
+# fuzzy-eligible keywords cost 1,367 ms for a single check_sanctions call --
+# 615% of one core at the 4.5 events/s this pipeline runs at, on a service
+# limited to four. The loop has to see the whole list and must not touch most
+# of it.
+#
+# Two exhaustive cases, so the filter is a bound rather than a guess.
+# token_set_ratio takes the best of three difflib comparisons built from the
+# two token sets:
+#
+#   no shared token -> the shared part is empty, the first two comparisons are
+#       0, and the score is the plain ratio of the two joined token strings.
+#       difflib's ratio is 2*M/T with M <= the shorter string, so
+#       2*min(la,lb)/(la+lb) is an upper bound that depends only on lengths.
+#   a shared token  -> one side's tokens may be a subset of the other's, which
+#       scores 100 at any length ("sovcomflot" inside "sovcomflot shipping
+#       ltd"), so no length bound holds and the pair must be scored.
+#
+# So: everything sharing a token, plus everything inside the length window.
+# Nothing else can reach the threshold, and the index makes both lookups O(1).
+_fuzzy_terms: List[str] = []          # keyword, by index
+_fuzzy_joined: List[str] = []         # its tokens, sorted and rejoined
+_fuzzy_by_token: dict = {}            # token -> [index, ...]
+_fuzzy_by_len: dict = {}              # len(joined) -> [index, ...]
+
+# Names repeat constantly on this platform -- the same vessel reports a position
+# every few seconds -- so the fuzzy verdict for a name is computed once and
+# reused until the keyword list changes. Bounded, and cleared by a rebuild,
+# because a cache that outlives the list it was computed from would keep
+# answering from a retired sanctions universe.
+_FUZZY_CACHE_MAX = 20_000
+_fuzzy_cache: dict = {}
+
+
+def _build_fuzzy_index(keywords: List[str]) -> None:
+    global _fuzzy_terms, _fuzzy_joined, _fuzzy_by_token, _fuzzy_by_len
+    terms, joined, by_token, by_len = [], [], {}, {}
+    for kw in keywords:
+        k = (kw or "").strip().lower()
+        if len(k) < MIN_SYNCED_KEYWORD_LEN:
+            continue
+        toks = sorted(set(k.split()))
+        if not toks:
+            continue
+        j = " ".join(toks)
+        idx = len(terms)
+        terms.append(kw)
+        joined.append(j)
+        for t in toks:
+            by_token.setdefault(t, []).append(idx)
+        by_len.setdefault(len(j), []).append(idx)
+    _fuzzy_terms, _fuzzy_joined, _fuzzy_by_token, _fuzzy_by_len = terms, joined, by_token, by_len
+    _fuzzy_cache.clear()
+
+
+def _fuzzy_candidates(name_tokens: set, joined_len: int, threshold: float) -> set:
+    """Indices of keywords that could reach `threshold` for this name."""
+    out = set()
+    for t in name_tokens:
+        hits = _fuzzy_by_token.get(t)
+        if hits:
+            out.update(hits)
+    if joined_len > 0 and _fuzzy_by_len:
+        # 2*min(a,b)/(a+b) >= thr, solved for b on each side of a.
+        lo = int(math.ceil(threshold * joined_len / (2.0 - threshold)))
+        hi = int(math.floor(joined_len * (2.0 - threshold) / threshold))
+        for L in range(max(lo, 1), hi + 1):
+            hits = _fuzzy_by_len.get(L)
+            if hits:
+                out.update(hits)
+    return out
+
+
 def _matches_on_boundary(haystack: str, needle: str, end_index: int) -> bool:
     """Verify an automaton hit sits on token boundaries.
 
@@ -150,12 +242,19 @@ def _matches_on_boundary(haystack: str, needle: str, end_index: int) -> bool:
 
 
 def _init_automaton(keywords: List[str] = None):
-    global _automaton
+    global _automaton, _active_keywords
+    keywords_to_load = keywords if keywords is not None else SANCTIONED_KEYWORDS
+
+    # Recorded before the ahocorasick guard, deliberately: the slow fallback
+    # path runs precisely when the automaton could not be built, and it needs
+    # the same universe the fast path would have had.
+    _active_keywords = [k for k in keywords_to_load if is_usable_keyword(k)]
+    _build_fuzzy_index(_active_keywords)
+
     if not HAS_AHOCORASICK:
         return
 
     automaton = ahocorasick.Automaton()
-    keywords_to_load = keywords if keywords is not None else SANCTIONED_KEYWORDS
 
     loaded = 0
     for idx, kw in enumerate(keywords_to_load):
@@ -181,11 +280,103 @@ def _init_automaton(keywords: List[str] = None):
 if HAS_AHOCORASICK:
     _init_automaton() # Boot with hardcoded defaults
 
+# ── Fuzzy matching ────────────────────────────────────────────────────────────
+# How close a name has to be to a sanctioned one to be worth a flag.
+#
+# 92, and measured against the list that is actually in force rather than
+# inherited. Over 13,187 fuzzy-eligible SDN keywords and 1,913 real vessel
+# names the exact path does not flag:
+#
+#   threshold 95 ->  0 newly flagged
+#   threshold 92 ->  0 newly flagged      <- here
+#   threshold 90 ->  6 newly flagged
+#   threshold 88 -> 14 newly flagged
+#
+# The six that appear at 90 are the exact failure this file's history is about,
+# in a new form -- merchant-vessel naming words colliding with short SDN
+# entries:
+#
+#   ETERNAL ACE         ~ "eternal peace"   91.7
+#   AZOV CONFIDENCE     ~ "confidence p"    90.9
+#   DOUBLE HAPPINESS    ~ "happiness i"     90.0
+#   BOSPHORUS S         ~ "bosphorus gate dis ticaret limited sirketi"  90.0
+#
+# So a one-character transliteration like SOVKOMFLOT (90.0 against SOVCOMFLOT)
+# is deliberately *not* caught. That is the trade this threshold makes and it
+# is the conservative side of it: the flag drives the CRITICAL tier, and six
+# innocent vessels raised to CRITICAL costs more than one variant missed.
+# Re-measure before moving it -- the number is only as good as the last time it
+# was run against the live SDN download.
+FUZZY_MATCH_THRESHOLD = 92.0
+
+# The variant half of sanctions screening, and it has to be present.
+#
+# This read `from rapidfuzz import fuzz` inside a bare try/except that set a
+# flag and logged nothing. rapidfuzz is declared in no requirements file and is
+# in no image, so the flag was False in every deployment and the whole fuzzy
+# branch below has never executed. Measured live in the running enricher:
+#
+#   SOVCOMFLOT  -> ['sanctioned_ofac', 'sanctioned_kw:sovcomflot']
+#   SOVKOMFLOT  -> no flags
+#
+# One transliteration character, and shadow-fleet naming is exactly where
+# transliteration varies. The flag it would have raised drives the CRITICAL
+# tier, so the failure was not "fewer matches" -- it was that the platform's
+# top severity was unreachable for any name spelled a little differently from
+# the Treasury file, with nothing anywhere saying the capability was off.
+#
+# Implemented on difflib rather than by adding the dependency: CLAUDE.md's rule
+# is that a third-party package is not added where the standard library serves,
+# and token_set_ratio is twenty lines over SequenceMatcher. rapidfuzz is still
+# preferred when it is present, because it is the faster implementation of the
+# same number.
+def _difflib_token_set_ratio(a: str, b: str) -> float:
+    """rapidfuzz.fuzz.token_set_ratio, on the standard library.
+
+    Tokenise both sides, score the shared tokens against each side's full token
+    set, and take the best of the three comparisons. This is what makes
+    "sovcomflot shipping ltd" and "sovcomflot" a 100 rather than a 61 -- the
+    extra tokens on one side do not penalise a complete match on the other.
+    """
+    from difflib import SequenceMatcher
+
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return 0.0
+    shared = sorted(ta & tb)
+    rest_a, rest_b = sorted(ta - tb), sorted(tb - ta)
+
+    t0 = " ".join(shared)
+    t1 = (t0 + " " + " ".join(rest_a)).strip()
+    t2 = (t0 + " " + " ".join(rest_b)).strip()
+
+    def r(x: str, y: str) -> float:
+        return SequenceMatcher(None, x, y).ratio() * 100.0
+
+    return max(r(t0, t1), r(t0, t2), r(t1, t2))
+
+
 try:
-    from rapidfuzz import fuzz
-    HAS_RAPIDFUZZ = True
+    from rapidfuzz import fuzz as _rapidfuzz
+
+    def token_set_ratio(a: str, b: str) -> float:
+        return float(_rapidfuzz.token_set_ratio(a, b))
+
+    FUZZY_BACKEND = "rapidfuzz"
 except ImportError:
-    HAS_RAPIDFUZZ = False
+    token_set_ratio = _difflib_token_set_ratio
+    FUZZY_BACKEND = "difflib"
+
+# Always true now. Kept as a name because callers and tests read it, and
+# because a future backend that genuinely cannot load should say so here
+# rather than silently disabling a control.
+HAS_RAPIDFUZZ = True
+
+logger.info(
+    "Sanctions fuzzy matching enabled via %s (threshold %.0f, minimum keyword "
+    "length %d).",
+    FUZZY_BACKEND, FUZZY_MATCH_THRESHOLD, MIN_SYNCED_KEYWORD_LEN,
+)
 
 def rebuild_sanctions_from_list(keywords: List[str]):
     """Triggered by Enrichment Service when Redis pushes new OFAC payload."""
@@ -238,10 +429,8 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
             if matched_kw is None or len(original_value) > len(matched_kw):
                 matched_kw = original_value
     else:
-        # Fallback slow path, held to the same two rules.
-        for kw in SANCTIONED_KEYWORDS:
-            if not is_usable_keyword(kw):
-                continue
+        # Fallback slow path, held to the same two rules and the same universe.
+        for kw in _active_keywords:
             if re.search(rf"(?<![0-9a-z]){re.escape(kw.lower())}(?![0-9a-z])", name_lower):
                 if matched_kw is None or len(kw) > len(matched_kw):
                     matched_kw = kw
@@ -253,12 +442,32 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     # Fuzzy matching only where an exact match did not trigger, and only for
     # keywords long enough that near-misses mean something. The old guard was
     # len(kw) >= 5, which is below the length at which a token is distinctive.
-    if not matched_kw and HAS_RAPIDFUZZ and len(name_lower) >= MIN_SYNCED_KEYWORD_LEN:
-        for kw in SANCTIONED_KEYWORDS:
-            if len(kw) >= MIN_SYNCED_KEYWORD_LEN and fuzz.token_set_ratio(name_lower, kw) >= 92.0:
-                flags.append("sanctioned_ofac")
-                flags.append(f"sanctioned_fuzzy:{kw}")
-                break
+    #
+    # Over `_active_keywords`, not the hardcoded constant: the synced SDN list
+    # is the sanctions universe, and offering the variant check seventeen
+    # curated names made it a rounding error against the thing it exists for.
+    if not matched_kw and len(name_lower) >= MIN_SYNCED_KEYWORD_LEN:
+        cached = _fuzzy_cache.get(name_lower)
+        if cached is not None:
+            best_kw, best_score = cached
+        else:
+            name_tokens = set(name_lower.split())
+            joined_len = len(" ".join(sorted(name_tokens)))
+            best_kw, best_score = None, 0.0
+            for idx in _fuzzy_candidates(name_tokens, joined_len, FUZZY_MATCH_THRESHOLD):
+                score = token_set_ratio(name_lower, _fuzzy_terms[idx].lower())
+                if score > best_score:
+                    best_kw, best_score = _fuzzy_terms[idx], score
+            if len(_fuzzy_cache) >= _FUZZY_CACHE_MAX:
+                _fuzzy_cache.clear()
+            _fuzzy_cache[name_lower] = (best_kw, best_score)
+        # The closest match, not the first one past the post. Breaking on the
+        # first hit recorded whichever name the list happened to reach first,
+        # which is the same arbitrary-provenance defect the exact path above
+        # was already repaired for.
+        if best_kw is not None and best_score >= FUZZY_MATCH_THRESHOLD:
+            flags.append("sanctioned_ofac")
+            flags.append(f"sanctioned_fuzzy:{best_kw}")
 
     prefix = (mmsi or "")[:3]
     # High risk: Iran (422), DPRK (442, 445, 447, 619), Russia (273), Syria (468), Cuba (323), Venezuela (775)

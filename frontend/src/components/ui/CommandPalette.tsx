@@ -44,6 +44,7 @@ const PAGES: Command[] = [
   { id: 'p:/intelligence', label: 'Intelligence Feed', kind: 'page', href: '/intelligence' },
   { id: 'p:/osint', label: 'OSINT Matrix', kind: 'page', href: '/osint' },
   { id: 'p:/agents', label: 'Agent Swarm', kind: 'page', href: '/agents' },
+  { id: 'p:/operations', label: 'Operations', kind: 'page', href: '/operations' },
   { id: 'p:/methodology', label: 'Methodology', kind: 'page', href: '/methodology' },
 ];
 
@@ -89,15 +90,18 @@ export function CommandPalette() {
         const events = await fetcher('/events/tradfi?limit=120');
         for (const ev of Array.isArray(events) ? events : []) {
           const d = ev?.domain_data || ev?.financial_data || {};
-          const ticker = String(d.ticker || ev?.primary_entity_id || '').toUpperCase().trim();
+          const ticker = String(d.ticker || ev?.primary_entity_id || '')
+            .toUpperCase()
+            .trim();
           if (!ticker || seenTickers.has(ticker)) continue;
           seenTickers.add(ticker);
           found.push({
             id: `t:${ticker}`,
             label: ticker,
-            hint: ev?.primary_entity_name && ev.primary_entity_name !== ticker
-              ? String(ev.primary_entity_name)
-              : 'recent activity',
+            hint:
+              ev?.primary_entity_name && ev.primary_entity_name !== ticker
+                ? String(ev.primary_entity_name)
+                : 'recent activity',
             kind: 'ticker',
             href: `/charts?symbol=${encodeURIComponent(ticker)}`,
           });
@@ -166,14 +170,14 @@ export function CommandPalette() {
       role="presentation"
     >
       <div
-        className="w-full max-w-xl rounded-xl border border-slate-700 bg-[#0d1017] shadow-2xl overflow-hidden"
+        className="w-full max-w-xl rounded-xl border border-line-strong bg-[#0d1017] shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
       >
-        <div className="flex items-center gap-3 px-4 border-b border-slate-800">
-          <Search className="h-4 w-4 text-slate-500 shrink-0" />
+        <div className="flex items-center gap-3 px-4 border-b border-line">
+          <Search className="h-4 w-4 text-ink-mute shrink-0" />
           <input
             ref={inputRef}
             value={query}
@@ -191,15 +195,17 @@ export function CommandPalette() {
               }
             }}
             placeholder="Search pages, tickers, entities…"
-            className="flex-1 bg-transparent py-3.5 text-sm text-slate-100 placeholder:text-slate-600 outline-none"
+            className="flex-1 bg-transparent py-3.5 text-sm text-ink placeholder:text-ink-mute outline-none"
             aria-label="Search"
           />
-          <kbd className="text-[10px] text-slate-600 border border-slate-700 rounded px-1.5 py-0.5">ESC</kbd>
+          <kbd className="text-micro text-ink-mute border border-line-strong rounded px-1.5 py-0.5">
+            ESC
+          </kbd>
         </div>
 
         <ul className="max-h-[52vh] overflow-y-auto py-1">
           {results.length === 0 && (
-            <li className="px-4 py-6 text-center text-xs text-slate-500">
+            <li className="px-4 py-6 text-center text-xs text-ink-mute">
               Nothing matches “{query}”.
             </li>
           )}
@@ -213,16 +219,20 @@ export function CommandPalette() {
                   onMouseEnter={() => setCursor(i)}
                   onClick={() => go(cmd)}
                   className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
-                    active ? 'bg-cyan-500/10 text-cyan-100' : 'text-slate-300 hover:bg-slate-800/50'
+                    active ? 'bg-cyan-500/10 text-cyan-100' : 'text-ink-dim hover:bg-overlay/50'
                   }`}
                 >
-                  <Icon className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-300' : 'text-slate-500'}`} />
+                  <Icon
+                    className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-300' : 'text-ink-mute'}`}
+                  />
                   <span className="flex-1 truncate">{cmd.label}</span>
-                  {cmd.hint && <span className="text-[10px] text-slate-500 truncate">{cmd.hint}</span>}
-                  <span className="text-[10px] uppercase tracking-wide text-slate-600">
+                  {cmd.hint && (
+                    <span className="text-micro text-ink-mute truncate">{cmd.hint}</span>
+                  )}
+                  <span className="text-micro uppercase tracking-wide text-ink-mute">
                     {KIND_LABEL[cmd.kind]}
                   </span>
-                  {active && <CornerDownLeft className="h-3.5 w-3.5 text-slate-500" />}
+                  {active && <CornerDownLeft className="h-3.5 w-3.5 text-ink-mute" />}
                 </button>
               </li>
             );

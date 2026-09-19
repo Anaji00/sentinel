@@ -17,7 +17,24 @@
  *      scaled (`var_95_pct = 2.4` meaning 2.4%) and others as ratios
  *      (`confidence = 0.87`). Callers must say which they have, so a value can
  *      never be silently scaled twice.
+ *
+ *   3. THE LOCALE IS FIXED. Every `toLocaleString` here passed `undefined` as
+ *      the locale, which means the browser's. The same figure therefore
+ *      rendered as `1,234.50` on one operator's machine and `1.234,50` on
+ *      another's, and a screenshot of a price was not comparable between two
+ *      people looking at the same platform. The convention is already
+ *      en-US throughout -- `$`, `%`, a period for the decimal -- so it is
+ *      stated rather than inherited.
  */
+
+/**
+ * The one locale this application formats in.
+ *
+ * Not a statement about who reads it: a trading console's figures are a
+ * notation, and a notation that changes with the reader's OS settings is a
+ * source of misreading, not of accessibility.
+ */
+export const DISPLAY_LOCALE = 'en-US';
 
 /** Rendered in place of any value that is absent, unmeasured, or not finite. */
 export const ABSENT = '—';
@@ -55,7 +72,7 @@ export function formatNumber(
 ): string {
   const n = coerce(value);
   if (n === null) return fallback;
-  const body = n.toLocaleString(undefined, {
+  const body = n.toLocaleString(DISPLAY_LOCALE, {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
@@ -104,7 +121,13 @@ export interface CurrencyOptions extends NumberOptions {
  */
 export function formatCurrency(
   value: number | string | null | undefined,
-  { decimals, fallback = ABSENT, signed = false, compact = true, symbol = '$' }: CurrencyOptions = {},
+  {
+    decimals,
+    fallback = ABSENT,
+    signed = false,
+    compact = true,
+    symbol = '$',
+  }: CurrencyOptions = {},
 ): string {
   const n = coerce(value);
   if (n === null) return fallback;
@@ -119,7 +142,7 @@ export function formatCurrency(
     return `${sign}${symbol}${formatCompact(abs, { decimals: decimals ?? 1 })}`;
   }
   const places = decimals ?? 2;
-  return `${sign}${symbol}${abs.toLocaleString(undefined, {
+  return `${sign}${symbol}${abs.toLocaleString(DISPLAY_LOCALE, {
     minimumFractionDigits: places,
     maximumFractionDigits: places,
   })}`;
@@ -191,7 +214,9 @@ export function formatTimestamp(
   if (Number.isNaN(d.getTime())) return fallback;
 
   const iso = d.toISOString();
-  return seconds ? `${iso.slice(0, 10)} ${iso.slice(11, 19)}Z` : `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z`;
+  return seconds
+    ? `${iso.slice(0, 10)} ${iso.slice(11, 19)}Z`
+    : `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z`;
 }
 
 /** Calendar date only, e.g. "2026-08-21". */
@@ -261,4 +286,67 @@ export function maskSecret(
   if (!s) return fallback;
   if (s.length <= visible) return '•'.repeat(s.length);
   return `${'•'.repeat(Math.min(16, s.length - visible))}${s.slice(-visible)}`;
+}
+
+/**
+ * A wall-clock time in the operator's chosen zone, with the zone named.
+ *
+ * Eleven sites rendered event times with `new Date(x).toLocaleTimeString()`,
+ * which uses the browser's zone and the browser's locale and labels neither.
+ * Beside a header clock showing a zone the operator had explicitly selected,
+ * that is two different times on one screen with nothing to tell them apart.
+ *
+ * The zone is a required argument. There is no sensible default here: a
+ * timestamp rendered in an unstated zone is the defect, so the caller has to
+ * have asked `useTimeZone()` for one.
+ */
+export function formatClock(
+  value: string | number | Date | null | undefined,
+  zone: string,
+  { fallback = ABSENT, seconds = true, withZone = false }: ClockOptions = {},
+): string {
+  if (value === null || value === undefined || value === '') return fallback;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return fallback;
+
+  try {
+    return new Intl.DateTimeFormat(DISPLAY_LOCALE, {
+      timeZone: zone,
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(seconds ? { second: '2-digit' as const } : {}),
+      hourCycle: 'h23',
+      ...(withZone ? { timeZoneName: 'short' as const } : {}),
+    }).format(d);
+  } catch {
+    // An unknown zone identifier throws. UTC with the suffix is the honest
+    // answer -- it says which zone it is, which is the whole point.
+    const iso = d.toISOString();
+    return seconds ? `${iso.slice(11, 19)}Z` : `${iso.slice(11, 16)}Z`;
+  }
+}
+
+export interface ClockOptions {
+  fallback?: string;
+  /** Include seconds. Default true. */
+  seconds?: boolean;
+  /** Append the zone abbreviation, e.g. "14:32:07 EST". Default false. */
+  withZone?: boolean;
+}
+
+/** Date and time together in the chosen zone, e.g. "2026-09-15 14:32". */
+export function formatDateTime(
+  value: string | number | Date | null | undefined,
+  zone: string,
+  { fallback = ABSENT, seconds = false, withZone = true }: ClockOptions = {},
+): string {
+  if (value === null || value === undefined || value === '') return fallback;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return fallback;
+  try {
+    const date = new Intl.DateTimeFormat('en-CA', { timeZone: zone }).format(d);
+    return `${date} ${formatClock(d, zone, { seconds, withZone })}`;
+  } catch {
+    return formatTimestamp(d, { fallback });
+  }
 }

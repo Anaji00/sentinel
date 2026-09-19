@@ -43,6 +43,16 @@ class SignalMethodology(BaseModel):
     parameters: List[MethodologyParameter]
     data_inputs: List[str]
     validation_gate: str
+    # The callable that actually runs the gate above, as a dotted path.
+    #
+    # `validation_gate` is prose on a public endpoint whose entire purpose is to
+    # let a reader check the platform's claims, and prose cannot be checked.
+    # This audit already found one gate describing a Kupiec test that nothing in
+    # the platform runs; that entry now opens with "None." and says why. This
+    # field is what makes the distinction mechanical rather than remembered:
+    # a gate is either implemented and names its implementation, or it declares
+    # that it is not. test_validation_gates_name_real_code resolves every one.
+    validation_gate_impl: Optional[str] = None
     falsifiability_condition: str
 
 
@@ -87,6 +97,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         ],
         data_inputs=["tradfi:equity_quote", "alpaca_options:chain", "nyfed_sofr:rate"],
         validation_gate="Backtested over historical CAGG bars; signal rejected if annualized yield < 6% or drawdown > 15%",
+        validation_gate_impl="services.reasoning.strategy_backtester:StrategyBacktester.backtest_strategy",
         falsifiability_condition="Realized return underperforms passive buy-and-hold across 3 consecutive expiration cycles.",
     ),
     "granger_causality": SignalMethodology(
@@ -125,6 +136,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         ],
         data_inputs=["tradfi_bars:continuous_aggregates", "graph_topology:candidate_pairs"],
         validation_gate="Candidate edges must pass rolling 30-day Granger F-test with p < 0.05 before ingestion as GRANGER_CAUSES edges.",
+        validation_gate_impl="shared.utils.quant_calc:granger_causality",
         falsifiability_condition="Out-of-sample directional predictive accuracy drops below 50% across a 20-period test window.",
     ),
     "hawkes_point_process": SignalMethodology(
@@ -171,6 +183,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         ],
         data_inputs=["events.enriched:all_domains", "redis:hawkes_tracker"],
         validation_gate="Subcriticality gate: spectral radius must strictly remain < 1.0; branches clamped if self-excitation diverges.",
+        validation_gate_impl="services.correlation.hawkes_correlator:HawkesMLE._spectral_radius",
         falsifiability_condition="Observed inter-arrival event times conform to a homogeneous Poisson process (p > 0.10 via KS test).",
     ),
     "parametric_var_cvar": SignalMethodology(
@@ -258,6 +271,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
         ],
         data_inputs=["quant_engine:win_rate", "quant_engine:risk_reward_ratio", "broker:account_equity"],
         validation_gate="Allocation rejected if calculated Kelly fraction <= 0 or expected value EV <= 0.",
+        validation_gate_impl="shared.utils.quant_calc:kelly_criterion",
         falsifiability_condition="Realized strategy win rate drops below break-even threshold 1/(1+b).",
     ),
 }

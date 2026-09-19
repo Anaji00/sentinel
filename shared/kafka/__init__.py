@@ -125,6 +125,14 @@ class Topics:
     ONTOLOGY_PROPOSALS   = "sentinel.ontology.proposals"
     RULES_FEEDBACK       = "agents.rules.feedback"
     RULES_SYNTHESIZED    = "agents.rules.synthesized"
+    # Co-occurring event types that no rule connects.
+    #
+    # The rule synthesizer's real input. It subscribed to nine topics and
+    # received, in practice, only CORRELATIONS -- which carry a rule_id and are
+    # therefore rule *firings*, so synthesising from them re-derives the rule
+    # that produced them. This carries the opposite signal: patterns the rule
+    # set does not cover.
+    RULE_CANDIDATES      = "agents.rules.candidates"
     CONSENSUS_REPORTS    = "agents.consensus.reports"
     # Declared, never produced to. Heartbeats travel through Redis
     # (sentinel:heartbeat:{component}), which is where every reader already

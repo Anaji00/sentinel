@@ -944,6 +944,189 @@ MIGRATIONS = [
                 WHERE anomaly_breakdown IS NOT NULL;
         """,
         "transactional": True
+    },
+    {
+        "version": "0025_macro_column_entity_index_and_ais_retention",
+        "sql": """
+            -- 1. The macro payload had nowhere to land.
+            --
+            -- `events` carried nine payload columns -- vessel, flight,
+            -- financial, security, prediction_market, crypto, cyber,
+            -- supply_chain, filing -- and db_writer inserted all nine. There
+            -- was no macro_data column and none in the INSERT, while
+            -- collector-macro/economic_calendar.py fills the field on every
+            -- release. A macro release persisted as a headline and a type with
+            -- a null payload: surprise_pct, actual, forecast and previous
+            -- survived the 48-hour Redis window and were gone from the durable
+            -- store, so no backtest, no calibration corpus and no deep-window
+            -- clause could ever see them. supply_chain_data got its column in
+            -- 0016 for exactly this reason; macro was missed.
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS macro_data JSONB;
+
+            -- 2. Restoring the entity index, on the condition 0014 named.
+            --
+            -- 0014 dropped events_entities_idx because named_entities was empty
+            -- on 99.9% of events, and said: "If either field starts being
+            -- written, the index is one statement to restore." It started being
+            -- written -- the news enricher now writes confirmed tickers plus
+            -- the affected_tickers the regulatory collector already resolved,
+            -- which is what made a news-to-mover join possible at all.
+            --
+            -- Without it, /radar/movers runs an unindexed array-overlap scan
+            -- across a ninety-day hypertable on every page load, on the request
+            -- path. This is that one statement.
+            CREATE INDEX IF NOT EXISTS events_entities_idx
+                ON events USING GIN(named_entities);
+
+            -- 3. Bounding the one hypertable nothing reads.
+            --
+            -- vessel_positions takes every AIS position report and appears in
+            -- the tree only in writes -- there is no SELECT against it
+            -- anywhere. It has columnar compression after seven days and, alone
+            -- among the hypertables, no retention policy: 0020 set 400 days on
+            -- tradfi_bars and 90 on events and did not name this one.
+            --
+            -- Ninety days matches `events`, which is the table a reader would
+            -- join it to if one is ever written. Retention rather than a drop:
+            -- the table is cheap to keep bounded and the positions are the
+            -- record a track reconstruction would need.
+            SELECT add_retention_policy('vessel_positions', INTERVAL '90 days', if_not_exists => TRUE);
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0026_daily_aggregate_is_current_and_backfilled",
+        "sql": """
+            -- The per-ticker standing reads tradfi_bars_1d, whose policy is
+            -- `end_offset => INTERVAL '1 day'` with a daily schedule -- so it
+            -- deliberately excludes the current day and refreshes once. A
+            -- watchlist row therefore carried a live day_pct from the snapshot
+            -- sweep beside a change_pct_week that ended a session or two
+            -- earlier, with nothing saying so.
+            --
+            -- Real-time aggregation closes the gap without touching the
+            -- materialisation policy: the view unions the materialised region
+            -- with a live read of the bars past it, so a query sees today.
+            ALTER MATERIALIZED VIEW tradfi_bars_1d
+                SET (timescaledb.materialized_only = false);
+
+            -- And the history behind it. `start_offset => INTERVAL '30 days'`
+            -- means each scheduled refresh only rewrites the trailing month,
+            -- the view was created WITH NO DATA, and nothing in this repository
+            -- calls refresh_continuous_aggregate -- so on any database younger
+            -- than 220 sessions the 50- and 200-day distances stayed null
+            -- permanently, which is the same answer the code gives for "not
+            -- enough history" and therefore indistinguishable from outside.
+            --
+            -- One full pass, once. tradfi_bars is retained for 400 days
+            -- precisely so a 200-day average is reachable; this is what makes
+            -- it reachable.
+            CALL refresh_continuous_aggregate('tradfi_bars_1d', NULL, NULL);
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0027_headline_trigram_index",
+        "sql": """
+            -- Scenario resolution reads headlines with ILIKE and nothing could
+            -- serve it.
+            --
+            -- `_match_signals` asks "has any event in the last 48 hours got a
+            -- headline containing all of these keywords". `events` already
+            -- carries GIN indexes on `tags` and `named_entities`, but those two
+            -- conditions sit in an OR beside `headline ILIKE ...`, and an
+            -- unindexable branch in a disjunction forces a sequential scan of
+            -- the whole window regardless of what the other branches could
+            -- have used. Measured on this deployment: 21.2 seconds per signal
+            -- over 917,000 rows, returning nothing. The tracker runs up to ten
+            -- signals for each of a hundred active scenarios, so the work it
+            -- asked for was hours per cycle; what actually happened is that the
+            -- client cancelled at sixty seconds, 51 times, logging an
+            -- asyncpg QueryCanceledError whose str() is empty -- so the log
+            -- read "Signal match query failed for 'X': " with no reason after
+            -- the colon.
+            --
+            -- pg_trgm is already installed here, so this adds no dependency.
+            -- The index takes roughly two and a half minutes to build across
+            -- the hypertable's 24 chunks, 16 of which are compressed.
+            --
+            -- The index on its own does nothing: a trigram index cannot serve
+            -- `headline ILIKE ALL($1)`, because a ScalarArrayOp is not an
+            -- indexable operator. Measured on a 200,000-row copy, that form
+            -- stays a sequential scan at 229ms while the equivalent AND-chain
+            -- drops to 0.281ms on the same index. scenario_tracker.py issues
+            -- the AND-chain for exactly this reason; changing it back to ALL()
+            -- would silently return this query to a sequential scan.
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+            CREATE INDEX IF NOT EXISTS events_headline_trgm_idx
+                ON events USING GIN (headline gin_trgm_ops);
+        """,
+        "transactional": False,
+        # Measured at 2m19s against the live hypertable; the pool's default
+        # command_timeout of 60 cancels it less than half way through.
+        "timeout": 900
+    },
+    {
+        "version": "0028_vessel_region_recency_index",
+        "sql": """
+            -- "The newest vessels in each watched region" had no index behind it.
+            --
+            -- The global map asks /events/maritime for the newest 250 rows.
+            -- Measured on this deployment, those 250 span 184 seconds and
+            -- contain seven regions: Taiwan Territorial, Singapore Approach,
+            -- Suez, the Black Sea, the Turkish Straits, the South China Sea and
+            -- Malacca. Singapore and Taiwan alone produce roughly 4,400 vessel
+            -- events an hour, so a chokepoint reporting four a day cannot
+            -- appear in a three-minute window however large the limit gets --
+            -- which is why the Strait of Hormuz and Bab-el-Mandeb were absent
+            -- from the map even in the hours when they did report.
+            --
+            -- Reserving a few rows per region is the fix, and it needs an index
+            -- that can seek to one region and walk backwards in time.
+            -- events_region_time_idx is (region, occurred_at DESC) but carries
+            -- no vessel predicate, so the planner preferred
+            -- events_vessel_time_idx and filtered a rare region out of the whole
+            -- stream: 82.7 seconds for twelve regions. With this index the same
+            -- query is 5.6ms, and it builds in 16 seconds.
+            CREATE INDEX IF NOT EXISTS events_vessel_region_time_idx
+                ON events (region, occurred_at DESC)
+                WHERE vessel_data IS NOT NULL;
+
+            -- The aviation layer of the same map has the same shape and the
+            -- same gap.
+            CREATE INDEX IF NOT EXISTS events_flight_region_time_idx
+                ON events (region, occurred_at DESC)
+                WHERE flight_data IS NOT NULL;
+        """,
+        "transactional": False,
+        "timeout": 900
+    },
+    {
+        "version": "0029_tradfi_bars_volume_nullable",
+        "sql": """
+            -- Volume is not always known, and NOT NULL forced the writer to
+            -- choose between inventing a number and dropping the bar. It had
+            -- been dropping the bar.
+            --
+            -- The eleven GICS sector ETFs are served from Finnhub's quote
+            -- endpoint, which returns a price and no volume. The collector was
+            -- corrected once already for answering that with a hardcoded
+            -- 1000.0 -- the five-minute aggregate SUMs this column, so every
+            -- macro bar read exactly 4000 or 5000, the poll count rather than
+            -- the market. It now sends NULL, which is true. But the enricher
+            -- tested `volume <= 0` before persisting, so the honest null became
+            -- a dropped row: XLK published at $188.00 roughly once a minute for
+            -- hours and tradfi_bars held not one sector ETF bar, which is why
+            -- the sector arm of the Hawkes work had nothing to read.
+            --
+            -- SUM() skips nulls and returns NULL for an all-null bucket, so the
+            -- aggregates report "unknown" instead of a fabricated zero. No
+            -- existing row changes: this only permits a value that could not be
+            -- written before.
+            ALTER TABLE tradfi_bars ALTER COLUMN volume DROP NOT NULL;
+        """,
+        "transactional": True
     }
 ]
 
@@ -990,7 +1173,9 @@ async def apply_migrations():
             if is_transactional:
                 await db.execute(sql_script)
             else:
-                await db.execute_without_transaction(sql_script)
+                await db.execute_without_transaction(
+                    sql_script, timeout=migration.get("timeout")
+                )
 
             await db.execute(
                 "INSERT INTO schema_migrations (version) VALUES ($1);", 

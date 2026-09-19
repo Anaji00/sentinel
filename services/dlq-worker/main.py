@@ -32,6 +32,7 @@ from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.db import get_timescale, get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.tasks import safe_create_task
+from shared.utils.dlq_payload import decode_dlq_payload, encode_dlq_payload
 
 # --- SECRETS & CONFIG ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -188,13 +189,26 @@ async def _replay_loop(db, producer, redis_client) -> None:
                 )
                 continue
 
-            payload = row["raw_payload"]
-            if isinstance(payload, (str, bytes)):
-                try:
-                    payload = json.loads(payload)
-                except Exception as decode_err:
-                    await _record_replay_failure(db, row_id, f"payload is not JSON: {decode_err}")
-                    continue
+            # Both forms, because two were written.
+            #
+            # `json.loads` alone was not enough and could not be. Every producer
+            # stored `str(msg.value)` and `msg.value` is bytes, so what the table
+            # holds is the *repr* -- `"b'{\"event_id\": ...}'"` -- which parses
+            # as a JSON string and yields a `str`, not the event. Publishing that
+            # put a string on the topic where the consumer expected a mapping,
+            # and the failure returned here encoded one layer deeper.
+            #
+            # Measured before this: all 8,914 outstanding rows across all six
+            # topics stored `jsonb_typeof = 'string'`. The replay path was
+            # complete, gated, audited, and unable to restore a single event.
+            payload = decode_dlq_payload(row["raw_payload"])
+            if not isinstance(payload, (dict, list)):
+                await _record_replay_failure(
+                    db, row_id,
+                    f"payload is not a publishable document (got {type(payload).__name__}); "
+                    "republishing it would put a bare string on the topic",
+                )
+                continue
 
             try:
                 await producer.send(topic, payload)
@@ -263,7 +277,7 @@ async def _consume_loop(consumer, db, session, producer, redis_client):
                     try:
                         payload = json.loads(message.value.decode("utf-8"))
                     except Exception:
-                        payload = {"raw": str(message.value), "error": "Unparseable bytes"}
+                        payload = {"raw": encode_dlq_payload(message.value), "error": "Unparseable bytes"}
                     
                     original_topic = payload.get("topic", "unknown")
                     error_msg = payload.get("error", "No error provided")
@@ -322,12 +336,51 @@ async def _consume_loop(consumer, db, session, producer, redis_client):
                         continue
 
                     # 2. Save to PostgreSQL (permanently failed or couldn't retry)
-                    permanently_failed = (retry_count >= MAX_RETRIES) or is_poison_pill
+                    #
+                    # A record with no destination or no content cannot be
+                    # replayed, whatever its retry count says.
+                    #
+                    # The retry branch above requires `original_topic !=
+                    # "unknown"`, so an unroutable event skipped it and arrived
+                    # here with retry_count 0 -- and was written as retryable.
+                    # Measured: 2,584 rows with no topic AND an empty payload,
+                    # none of them marked permanently failed, sitting in the
+                    # backlog as if a replay could ever do something with them.
+                    #
+                    # `unknown` is not a topic and `{}` is not a message. Saying
+                    # so at write time is the difference between a queue with a
+                    # 2,584-item tail and a queue with none.
+                    unreplayable = (
+                        original_topic == "unknown"
+                        or not raw_data
+                        or raw_data == {}
+                    )
+                    permanently_failed = (
+                        (retry_count >= MAX_RETRIES) or is_poison_pill or unreplayable
+                    )
+                    # `raw_data`, not `json.dumps(raw_data)`.
+                    #
+                    # The pool registers a jsonb codec whose encoder is already
+                    # json.dumps, so a pre-serialised string is encoded a second
+                    # time and lands as a jsonb *string* rather than a document.
+                    # Measured: all 20,772 rows in failed_events report
+                    # jsonb_typeof = 'string'.
+                    #
+                    # That is the root of the replay defect. `decode_dlq_payload`
+                    # unwraps what it can and the replay refuses to publish
+                    # anything that is not a dict or list -- both correct -- so
+                    # every dead letter was stored in a form the replay path was
+                    # right to refuse. The guard stopped bad republishes; nothing
+                    # made the payloads replayable.
+                    #
+                    # The identical defect this codebase already recorded for
+                    # `scenarios.hypotheses`, in a different table, written by a
+                    # different hand. One codec, two callers unaware of it.
                     try:
                         await db.execute("""
                             INSERT INTO failed_events (original_topic, error_message, raw_payload, retry_count, permanently_failed)
                             VALUES ($1, $2, $3, $4, $5)
-                        """, original_topic, error_msg, json.dumps(raw_data), retry_count, permanently_failed)
+                        """, original_topic, error_msg, raw_data, retry_count, permanently_failed)
                         batch_logger.add(category=f"{original_topic}_perm={permanently_failed}")
                     except Exception as e:
                         logger.error(f"FATAL: Could not save to DLQ database: {e}. Terminating worker.")
@@ -361,7 +414,7 @@ async def main():
     db = await get_timescale()
     redis_client = await get_redis()
     
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="dlq-worker")
     await producer.start()
 
     consumer = SentinelConsumer(

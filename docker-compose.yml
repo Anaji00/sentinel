@@ -14,15 +14,27 @@ services:
       # which Docker records as a failing check, so the container reported
       # unhealthy for the life of the deployment while nginx was serving fine.
       #
-      # busybox wget is in the base image. Port 80 answers with the 301 to
-      # HTTPS, which is a served response and exactly what this needs to know.
+      # busybox wget is in the base image.
       #
-      # Verified against the image rather than reasoned about: `--spider`
-      # returns 0 for the 301 and 1 for "can't connect to remote host". An
-      # earlier spelling piped wget through `grep -qv`, which returned 0 for
-      # the connection-refused message too -- a probe that could only ever say
-      # healthy.
-      test: ["CMD-SHELL", "wget -q -O /dev/null --spider http://127.0.0.1:80/"]
+      # This probed port 80 and claimed `--spider` returns 0 for the 301 to
+      # HTTPS. It does not: busybox wget follows the redirect, reaches the
+      # self-signed certificate on 443, and fails verification --
+      #   ssl_client: SSL_connect ... certificate verify failed
+      # so the container reported unhealthy for the whole life of any
+      # deployment not holding a CA-signed certificate, which is every
+      # deployment before certbot has run. busybox has no `--max-redirect`, so
+      # there is no way to stop it at the 301.
+      #
+      # Probing 443 directly is better anyway: it exercises the listener that
+      # actually serves the application rather than the one that only
+      # redirects away from itself. `--no-check-certificate` is correct here
+      # and not a weakening -- the probe is nginx asking itself over loopback
+      # whether it is up, and whether the certificate is trusted by a public
+      # CA is a question for a client, not for a liveness check.
+      #
+      # Measured in the running image: 0 with the flag, 1 without it, and 1
+      # when nginx is stopped.
+      test: ["CMD-SHELL", "wget -q -O /dev/null --no-check-certificate https://127.0.0.1:443/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -366,8 +378,22 @@ services:
     command: python services/enrichment/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      # Read-only, deliberately.
+      #
+      # These mounts cover the image's own copy of the code for every Python
+      # service, which is why `docker compose build` cannot fail on anything
+      # that matters for them -- a COPY that misses a file, an import that only
+      # resolves because the host has it. That is worth fixing on its own, and
+      # the writable half was worse: a container parsing an untrusted public
+      # feed could write to the source tree the whole platform runs from.
+      # Demonstrated, not assumed:
+      #   $ docker exec sentinel-radar touch /app/services/.probe
+      #   $ ls services/.probe   ->   -rw-r--r-- najia ...
+      # The Dockerfile creates a non-root `sentinel` user for exactly this
+      # reason and the mount handed that user the host tree anyway. nginx.conf
+      # five hundred lines above is mounted :ro, so the suffix was known.
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -414,8 +440,8 @@ services:
       # lull -- and this service calls a model on the semantic path.
       - OLLAMA_KEEP_ALIVE=-1
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -475,8 +501,8 @@ services:
       - OLLAMA_KEEP_ALIVE=-1
       - SENTINEL_SERVICE=reasoning
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -509,8 +535,8 @@ services:
     command: python services/collector-tradfi/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -538,8 +564,8 @@ services:
     command: python services/collector-crypto/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -567,8 +593,8 @@ services:
     command: python services/collector-prediction/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -713,7 +739,19 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0'
+          # Raised from 1.0. The finding this answers was recorded as a memory
+          # problem -- 1.60 GB of float32 vectors against a 1.00 GB limit -- and
+          # int8 quantization settled that: the working set is 554 MiB and the
+          # limit did not move. What surfaced underneath was CPU. Building the
+          # quantized vectors over 504,847 points on a single core saturated it
+          # for hours, and live searches timed out beside it:
+          #   Timeout error: Operation 'Search' timed out after 56.7s
+          #   Timeout error: Operation 'count' timed out after 60s
+          # Optimization is background work that competes with the foreground on
+          # the same quota, so one core means a reindex is an outage. CPU is not
+          # the constrained resource on this host; memory is, and this costs
+          # none of it.
+          cpus: '2.0'
           memory: 1G
     healthcheck:
       disable: true
@@ -747,8 +785,8 @@ services:
     command: python services/collector-cyber/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -776,8 +814,8 @@ services:
       start_period: 120s
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -805,8 +843,8 @@ services:
     command: python services/collector-filings/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -832,8 +870,8 @@ services:
     command: python services/collector-sar/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -859,8 +897,8 @@ services:
     command: python services/collector-ais/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -888,8 +926,8 @@ services:
     command: python services/collector-adsb/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -917,8 +955,8 @@ services:
     command: python services/collector-news/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -953,8 +991,8 @@ services:
     command: python services/collector-social/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -982,8 +1020,8 @@ services:
     command: python services/collector-macro/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1008,8 +1046,8 @@ services:
     command: uvicorn services.api_gateway.routes.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 15
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1025,7 +1063,20 @@ services:
           # alert manager below runs in.
           memory: 512M
     healthcheck:
-      test: [ "CMD", "python", "-c", "import os, urllib.request; r = urllib.request.Request('http://localhost:8000/api/v1/health/', headers={'X-API-KEY': os.environ.get('API_GATEWAY_KEY','')}); urllib.request.urlopen(r)" ]
+      # /health/readiness, not /health/.
+      #
+      # /health/ is behind the API-key dependency, and that dependency rate
+      # limits by identity -- so the healthcheck shared one token bucket with
+      # every other caller presenting the same key. Measured: a 50-request
+      # sweep returned 429 for /api/v1/health/ while readiness and liveness
+      # stayed 200. urlopen raises on 429, so a burst of ordinary traffic
+      # failed the check three times and Docker restarted the gateway --
+      # dropping every in-flight request, which is the failure a rate limiter
+      # exists to prevent.
+      #
+      # readiness is the deeper question anyway: it pings TimescaleDB and Redis
+      # and now returns 503 when either is down, which /health/ never did.
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/readiness')" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -1061,18 +1112,18 @@ services:
       # none at all.
       - SENTINEL_SERVICE=agents-fast
       - AGENT_TIER_FILTER=fast
-      - AGENT_MODEL=qwen2.5:1.5b
+      - AGENT_MODEL=qwen3:0.6b
       # Was gemma3:1b: a different model, so falling back to it evicted the
       # resident one and paid an 89 s reload on the next request that wanted
       # it back. Both tiers name the same model for the same reason the
       # ollama service runs one slot.
-      - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
+      - OLLAMA_FALLBACK_MODEL=qwen3:0.6b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1122,14 +1173,14 @@ services:
       #
       # Revisit if this deployment gets a GPU or a larger CPU allocation, where
       # the two runners would no longer contend.
-      - AGENT_MODEL=qwen2.5:1.5b
-      - OLLAMA_FALLBACK_MODEL=qwen2.5:1.5b
+      - AGENT_MODEL=qwen3:0.6b
+      - OLLAMA_FALLBACK_MODEL=qwen3:0.6b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1179,8 +1230,8 @@ services:
     command: python services/alert_manager/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1265,8 +1316,8 @@ services:
     command: python services/dlq-worker/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1295,8 +1346,8 @@ services:
     command: python services/telemetry-worker/main.py
     env_file: .env
     volumes:
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     restart: always
     deploy:
       resources:
@@ -1319,6 +1370,24 @@ services:
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    configs:
+      # The scrape token, as a file, because prometheus.yml is checked in and a
+      # credential must never be. Compose interpolates METRICS_TOKEN from .env
+      # into a file the container reads and nothing else does.
+      #
+      # Without it every scrape returned 403: the gateway's /metrics is behind
+      # the API-key check, a scraper cannot present a session cookie, and
+      # METRICS_TOKEN -- the mechanism already written for exactly this -- was
+      # set in no environment file, so the token branch never ran.
+      # uid/gid 65534 is `nobody`, which is what the prom/prometheus image runs
+      # as. Left at the default root:root the file mounted 0400 and the process
+      # could not read it -- "unable to read authorization credentials file" --
+      # which fails exactly like the 403 it was added to fix.
+      - source: metrics_token
+        target: /etc/prometheus/metrics_token
+        uid: "65534"
+        gid: "65534"
+        mode: 0400
     deploy:
       resources:
         limits:
@@ -1335,6 +1404,13 @@ services:
     restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      # Served under /grafana/ by the ingress, because Grafana published no port
+      # and nginx had no upstream for it -- so `make obs` started 512 MiB of
+      # dashboard server that nothing could open. Grafana builds its own asset
+      # and redirect URLs, so it has to be told the sub-path or every link it
+      # emits points at the site root.
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
@@ -1378,8 +1454,8 @@ services:
       - PYTHONPATH=/app
     volumes:
       - ./tests:/app/tests
-      - ./services:/app/services
-      - ./shared:/app/shared
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
     working_dir: /app
     command: >
       sh -c "pip install --quiet --no-cache-dir pytest anyio &&
@@ -1410,6 +1486,13 @@ volumes:
   qdrant_data:
   prometheus_data:
   grafana_data:
+configs:
+  # Interpolated from .env at `docker compose up`, so the value lives in exactly
+  # one place and never in a checked-in file. `preflight.sh --generate-secrets`
+  # fills it alongside the other required secrets.
+  metrics_token:
+    content: "${METRICS_TOKEN:?METRICS_TOKEN must be set - run ./scripts/preflight.sh --generate-secrets}"
+
 networks:
   default:
     name: sentinel-network

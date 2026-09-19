@@ -204,3 +204,157 @@ def test_the_serving_path_is_reported():
     """An empty chart and a missing ticker need different fixes."""
     code = _code()
     assert '"source": source' in code
+
+
+# -- a bar needs a price, not a volume ----------------------------------------
+
+
+def test_a_missing_volume_does_not_drop_the_bar():
+    """The comment said "unconditionally persist". The guard was four lines up.
+
+    `if close_p <= 0 or volume <= 0: return None` sat immediately above a block
+    headed "Unconditionally persist closed bar to durable TimescaleDB
+    tradfi_bars hypertable", so any bar whose volume was unknown never reached
+    the INSERT.
+
+    The macro tier serves the eleven GICS sector ETFs and every commodity future
+    from Finnhub's quote endpoint, which reports no volume at all. It had
+    already been corrected once for answering that with a hardcoded 1000.0 --
+    the five-minute aggregate SUMs the column, so every macro bar read exactly
+    4000 or 5000, the poll count rather than the market. Sending the honest
+    None is what made this guard start dropping them.
+
+    Measured: CL=F, BZ=F, GC=F, SI=F and NG=F stopped on 2026-09-04, the day the
+    null was introduced, and tradfi_bars held not one sector ETF bar. The feed
+    was publishing XLK at $188.00 once a minute throughout.
+    """
+    source = (
+        ROOT / "services" / "enrichment" / "enrichers" / "tradfi.py"
+    ).read_text(encoding="utf-8")
+
+    persist = source.index("INSERT INTO tradfi_bars")
+    window = source[max(0, persist - 3000) : persist]
+    assert "if close_p <= 0 or volume <= 0" not in window, (
+        "the volume test must not gate persistence; a bar needs a price"
+    )
+    assert "if close_p <= 0:" in window, "a bar with no price is still not a bar"
+
+
+def test_an_unknown_volume_is_written_as_null_not_zero():
+    """Zero claims the ETF did not trade. That is the 1000.0 mistake inverted."""
+    source = (
+        ROOT / "services" / "enrichment" / "enrichers" / "tradfi.py"
+    ).read_text(encoding="utf-8")
+    assert 'volume_db = None if p.get("volume") is None else volume' in source
+
+
+def test_an_unknown_volume_cannot_erase_a_known_one():
+    """Two tiers can write the same (ticker, time).
+
+    Without COALESCE the last writer wins, and the winner is whichever feed
+    polled last -- so a quote-sourced NULL would overwrite a real Alpaca volume.
+    """
+    source = (
+        ROOT / "services" / "enrichment" / "enrichers" / "tradfi.py"
+    ).read_text(encoding="utf-8")
+    assert "COALESCE(EXCLUDED.volume, tradfi_bars.volume)" in source
+
+
+# -- a dead series is not a series --------------------------------------------
+
+
+def test_a_price_series_is_checked_for_being_alive():
+    """A hundred rows from a dead ticker looked exactly like a hundred live ones.
+
+    `fetch_price_series` had no WHERE on time. The commodity series stopped on
+    2026-09-04 and the discovery job kept publishing from them for 12.7 days:
+    "Statistical Correlation Link: BZ=F <-> CL=F r=1.000, p=0.0000", under FDR
+    control at alpha=0.05. A correlation between two frozen series is perfect by
+    construction, because neither of them moves.
+    """
+    source = (
+        ROOT / "services" / "correlation" / "statistical_discovery.py"
+    ).read_text(encoding="utf-8")
+    assert "MAX_SERIES_STALENESS_SEC" in source
+
+    fetch = source.index("async def fetch_price_series")
+    body = source[fetch : fetch + 4000]
+    assert "seconds')::INTERVAL" in body, (
+        "the series must be bounded in time, not only in row count"
+    )
+    assert "stale_series" in body, "a series going quiet should be counted"
+
+
+def test_the_staleness_bound_survives_a_weekend_but_not_a_fortnight():
+    import services.correlation.statistical_discovery as discovery
+
+    assert discovery.MAX_SERIES_STALENESS_SEC >= 3 * 3600, (
+        "an overnight gap is not a dead feed"
+    )
+    assert discovery.MAX_SERIES_STALENESS_SEC < 12 * 24 * 3600, (
+        "12.7 days of silence must not read as a live series"
+    )
+
+
+def test_freshness_is_asked_once_about_the_newest_bar():
+    """Filtering rows to the window would truncate healthy series too.
+
+    Six hours of five-minute bars is 72, short of the 100 these tests want, so
+    a row filter would weaken every live correlation in order to exclude the
+    dead ones.
+    """
+    source = (
+        ROOT / "services" / "correlation" / "statistical_discovery.py"
+    ).read_text(encoding="utf-8")
+    fetch = source.index("async def fetch_price_series")
+    body = source[fetch : fetch + 4000]
+    cagg = body.index("FROM tradfi_bars_5m")
+    cagg_query = body[cagg : cagg + 260]
+    assert "INTERVAL" not in cagg_query, (
+        "the series query itself stays unbounded; the freshness check is separate"
+    )
+
+
+# -- vectors outliving their events -------------------------------------------
+
+
+def test_vector_retention_matches_the_events_retention():
+    """A point whose event has been dropped can still be returned by a search.
+
+    Nothing in this platform had ever deleted a vector: 596,200 points had
+    accumulated against an `events` hypertable that drops after 90 days, so a
+    similarity hit could cite an event_id that no longer resolves. It also
+    quietly falsified a comment in `find_similar`, which excludes position
+    telemetry from results "for as long as they take to age out".
+    """
+    import services.correlation.soft_correlator as soft
+
+    assert soft.VECTOR_RETENTION_SEC == 90 * 86400, (
+        "the vector window and the events window are two halves of one policy"
+    )
+
+
+def test_the_prune_count_is_exact_not_estimated():
+    """Qdrant's estimating counter is not usable on an unindexed payload field.
+
+    Asked how many points were older than 30, 60, 80 and 90 days it answered
+    298,097 every time -- almost exactly half the collection. The true answers
+    are 731, 202, 167 and 167. The delete selects on the filter so it would
+    still have removed the right points, but the log line and the zero-guard
+    would both have been reading noise.
+    """
+    source = (
+        ROOT / "services" / "correlation" / "soft_correlator.py"
+    ).read_text(encoding="utf-8")
+    prune = source.index("async def prune_expired_vectors")
+    body = source[prune : prune + 3200]
+    assert "exact=True" in body
+    assert "exact=False" not in body
+
+
+def test_the_prune_is_actually_scheduled():
+    """The defect this closes is an absent mechanism, not a broken one."""
+    source = (ROOT / "services" / "correlation" / "main.py").read_text(encoding="utf-8")
+    assert "_vector_retention_loop" in source
+    assert "safe_create_task(_vector_retention_loop())" in source
+    assert "prune_expired_vectors()" in source

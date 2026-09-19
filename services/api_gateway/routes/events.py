@@ -55,6 +55,15 @@ from datetime import datetime
 async def get_domain_events(
     domain: str, 
     limit: int = Query(50, le=500),
+    region_spread: int = Query(
+        0,
+        ge=0,
+        le=5,
+        description=(
+            "Reserve this many of the newest rows for each region before the "
+            "rest of the page is filled by recency. 0 keeps pure recency."
+        ),
+    ),
     min_anomaly: float = Query(0.0, ge=0.0, le=1.0),
     start_time: Optional[str] = Query(None, description="Optional ISO start timestamp"),
     end_time: Optional[str] = Query(None, description="Optional ISO end timestamp"),
@@ -212,12 +221,55 @@ async def get_domain_events(
             # then happens inside it. A sub-type absent from the newest few
             # thousand events is not something a live feed should surface.
             candidate_pool = max(2000, limit * 40)
+
+            # Rows held for regions that would otherwise never reach the page.
+            #
+            # Ranking the candidate pool by region cannot do this, because the
+            # pool is the newest `candidate_pool` rows and the quiet regions are
+            # not in it. Measured here: the newest 250 maritime rows span 184
+            # seconds and carry seven regions, all of them busy ones. Singapore
+            # Approach and Taiwan Territorial alone produce about 4,400 vessel
+            # events an hour, while the Strait of Hormuz produced four in a day
+            # -- so no limit this endpoint can afford to scan will reach it.
+            #
+            # The held rows are fetched by their own lookup instead, one index
+            # seek per region, and unioned into the pool before ranking. On the
+            # index added in migration 0028 that is 16ms for the region list and
+            # 6ms for the seeks; without it, 83 seconds.
+            region_cte = ""
+            region_union = ""
+            region_admit = ""
+            region_priority = ""
+            if region_spread > 0:
+                region_cte = f"""region_held AS (
+                    SELECT e.* FROM (
+                        SELECT DISTINCT region FROM events
+                        WHERE {domain_sql} AND region IS NOT NULL
+                          AND occurred_at > NOW() - INTERVAL '7 days'
+                    ) r
+                    CROSS JOIN LATERAL (
+                        SELECT * FROM events
+                        WHERE region = r.region AND {domain_sql}
+                          AND occurred_at > NOW() - INTERVAL '7 days'
+                        ORDER BY occurred_at DESC
+                        LIMIT {int(region_spread)}
+                    ) e
+                ), """
+                region_union = "UNION SELECT * FROM region_held"
+                region_admit = "OR event_id IN (SELECT event_id FROM region_held)"
+                region_priority = (
+                    "CASE WHEN event_id IN (SELECT event_id FROM region_held) "
+                    "THEN 0 ELSE 3 END +"
+                )
             query = f"""
-                WITH recent AS (
-                    SELECT * FROM events
-                    WHERE {domain_sql}
-                    ORDER BY occurred_at DESC
-                    LIMIT {candidate_pool}
+                WITH {region_cte}recent AS (
+                    SELECT * FROM (
+                        SELECT * FROM events
+                        WHERE {domain_sql}
+                        ORDER BY occurred_at DESC
+                        LIMIT {candidate_pool}
+                    ) pool
+                    {region_union}
                 ), domain_events AS (
                     SELECT event_id, type, occurred_at, primary_entity_id, primary_entity_name,
                            primary_entity_name as entity_name, region, anomaly_score,
@@ -261,7 +313,13 @@ async def get_domain_events(
                            latitude, longitude, headline, summary, domain_data
                     FROM domain_events
                     WHERE type_rank <= {per_type} OR overall_rank <= {limit_idx}
-                    ORDER BY (CASE WHEN type_rank <= {per_type} THEN 0 ELSE 1 END) ASC,
+                          {region_admit}
+                    -- Held rows rank first, for the same reason the per-type
+                    -- reservation does: they are older than the recency fill by
+                    -- construction, so anything that sorts them by time alone
+                    -- drops exactly the rows the reservation exists to keep.
+                    ORDER BY ({region_priority}
+                              CASE WHEN type_rank <= {per_type} THEN 1 ELSE 2 END) ASC,
                              occurred_at DESC
                     LIMIT {limit_idx}
                 )

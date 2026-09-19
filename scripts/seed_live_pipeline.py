@@ -145,20 +145,66 @@ async def seed():
     ]
 
     import json
+
+    # Which typed column each event's payload belongs in.
+    #
+    # The insert named `domain_data` and `raw_payload`, and the events table has
+    # neither. There is no single payload column: the schema carries one jsonb
+    # column per domain -- vessel_data, cyber_data, financial_data, crypto_data,
+    # prediction_market_data and the rest -- and every reader asks for the one
+    # its domain uses. So this script raised `column "domain_data" does not
+    # exist` on its first row and has written nothing for as long as those
+    # columns have been typed.
+    #
+    # An unmapped type is refused rather than guessed at. Putting a vessel
+    # payload in financial_data would produce a row that inserts cleanly and is
+    # invisible to every reader -- the same shape as writing nothing, with none
+    # of the noise.
+    DOMAIN_COLUMN = {
+        "ais_gap_dark_vessel": "vessel_data",
+        "vessel_position": "vessel_data",
+        "bgp_anomaly": "cyber_data",
+        "option_sweep": "financial_data",
+        "volume_anomaly": "financial_data",
+        "liquidation_cascade": "crypto_data",
+        "odds_spike": "prediction_market_data",
+    }
+
     for e in events_data:
+        column = DOMAIN_COLUMN.get(e["type"])
+        if not column:
+            raise SystemExit(
+                f"seed_live_pipeline: no domain column mapped for type "
+                f"{e['type']!r}. Add one to DOMAIN_COLUMN rather than letting "
+                f"the payload land somewhere no reader looks."
+            )
+
+        # Reliability 0.0, and said in the row itself.
+        #
+        # The header discloses that these events are invented; the rows did not.
+        # Once inserted they carried `source: "collector.ais"` and nothing else,
+        # which makes them indistinguishable from measurements to every consumer
+        # downstream. `source_reliability` is the field the platform already
+        # uses to weigh a source, and zero is what a fabrication is worth.
         await db.execute(
-            """
-            INSERT INTO events (event_id, type, source, occurred_at, primary_entity_id, primary_entity_name, region, anomaly_score, summary, domain_data, raw_payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            f"""
+            INSERT INTO events (
+                event_id, type, source, occurred_at, primary_entity_id,
+                primary_entity_name, region, anomaly_score, summary,
+                source_reliability, tags, {column}
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0.0, $10, $11)
             ON CONFLICT (event_id) DO UPDATE SET
               occurred_at = EXCLUDED.occurred_at,
               anomaly_score = EXCLUDED.anomaly_score,
               summary = EXCLUDED.summary,
-              domain_data = EXCLUDED.domain_data;
+              source_reliability = 0.0,
+              tags = EXCLUDED.tags,
+              {column} = EXCLUDED.{column};
             """,
             e["event_id"], e["type"], e["source"], datetime.fromisoformat(e["occurred_at"]),
             e["primary_entity_id"], e["primary_entity_name"], e["region"], e["anomaly_score"],
-            e["summary"], json.dumps(e["domain_data"]), json.dumps(e["raw_payload"])
+            e["summary"], ["fabricated", "demo_fixture"], json.dumps(e["domain_data"])
         )
         # Broadcast to Redis PubSub for real-time WebSocket live feed
         await redis.raw.publish("sentinel:events:live", json.dumps({

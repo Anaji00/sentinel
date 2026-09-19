@@ -22,7 +22,10 @@ from shared.utils.rbac import require_role, Role, get_current_user_role
 from shared.utils.audit_ledger import AuditLedger
 from shared.utils.equities import is_valid_primary_equity
 
+from shared.utils.quiet_failures import swallowed
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+from shared.utils.ticker_stats import read_ticker_stats, ticker_stats_key
+from shared.utils.radar_keys import movers_snapshot_key
 logger = logging.getLogger("api-gateway.watchlists")
 
 router = APIRouter(prefix="/api/v1/watchlists", tags=["Watchlist Governance"])
@@ -98,11 +101,24 @@ async def get_equities_watchlist(redis = Depends(get_redis_client)):
     for item in raw_items:
         ticker = item[0].decode("utf-8") if isinstance(item[0], bytes) else str(item[0])
         score = float(item[1])
-        items.append({
+        row = {
             "ticker": ticker,
+            # The zset score is the moment this ticker was promoted, which is
+            # the radar's eviction order. Named for what it is rather than
+            # overloaded, so the percentages can join beside it.
             "priority_score": score,
             "is_valid_equity": is_valid_primary_equity(ticker),
-        })
+        }
+        items.append(row)
+
+    # What the names have actually been doing, in two round trips rather than
+    # two per row.
+    #
+    # This was an hgetall and a get inside the loop -- a hundred sequential
+    # calls at MAX_WATCHLIST_LIMIT, while the radar route two files away makes
+    # a point in its own docstring of being "one overlap query for the whole
+    # page rather than one per row".
+    await _attach_standing(redis, items)
 
     return {
         "count": len(items),
@@ -255,3 +271,79 @@ async def full_sync_equities_watchlist(
         "tickers": valid_tickers,
         "total_active": new_count,
     }
+
+
+async def _attach_standing(redis_client, rows: list) -> None:
+    """Today's move and the per-ticker standing, for every row, batched.
+
+    A row whose standing could not be read carries `standing_available: False`
+    rather than silently missing fields -- "the store did not answer" and "this
+    ticker has no history" are different facts and a reader acts on them
+    differently.
+    """
+    if redis_client is None or not rows:
+        for row in rows or []:
+            row["standing_available"] = False
+        return
+    raw = getattr(redis_client, "raw", redis_client)
+    tickers = [r["ticker"] for r in rows]
+
+    snapshots = {}
+    try:
+        pipe = raw.pipeline()
+        for ticker in tickers:
+            pipe.hgetall(movers_snapshot_key(ticker))
+        results = await pipe.execute()
+        snapshots = dict(zip(tickers, results or []))
+    except Exception as _exc:
+        swallowed("api_gateway.routes.watchlists.movers", _exc, logger)
+
+    standings = {}
+    try:
+        values = await raw.mget([ticker_stats_key(t) for t in tickers])
+        for ticker, blob in zip(tickers, values or []):
+            if not blob:
+                standings[ticker] = {}
+                continue
+            text = blob if isinstance(blob, str) else blob.decode("utf-8")
+            loaded = json.loads(text)
+            standings[ticker] = loaded if isinstance(loaded, dict) else {}
+    except Exception as _exc:
+        swallowed("api_gateway.routes.watchlists.standing", _exc, logger)
+        standings = {}
+
+    for row in rows:
+        ticker = row["ticker"]
+        row.update(_decode_hash(snapshots.get(ticker)))
+        standing = standings.get(ticker)
+        row["standing_available"] = standing is not None
+        row.update(standing or {})
+
+
+def _decode_hash(detail) -> dict:
+    out = {}
+    for k, v in (detail or {}).items():
+        key = k.decode() if isinstance(k, bytes) else k
+        value = v.decode() if isinstance(v, bytes) else v
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            out[key] = value
+    return out
+
+
+async def read_movers_snapshot(redis_client, ticker: str) -> dict:
+    """Today's move for one ticker, from the radar's board.
+
+    Decoded here once. The same loop had been written out by hand in two other
+    places, which is how a convention becomes three conventions.
+    """
+    if redis_client is None:
+        return {}
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        detail = await raw.hgetall(movers_snapshot_key(ticker))
+    except Exception as _exc:
+        swallowed("api_gateway.routes.watchlists.movers", _exc, logger)
+        return {}
+    return _decode_hash(detail)

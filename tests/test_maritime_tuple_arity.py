@@ -110,4 +110,22 @@ def test_nav_code_is_carried_rather_than_inherited():
 def test_nav_code_reaches_the_scoring_loop():
     source = PATH.read_text(encoding="utf-8")
     assert "is_restricted_nav_status(nav_code)" in source
-    assert 'nav_code = pos.get("NavigationalStatus")' in source
+    assert 'pos.get("NavigationalStatus")' in source, (
+        "nav_code must still be read from the position payload"
+    )
+
+
+def test_a_class_b_report_is_not_given_a_navigational_status():
+    """Class B carries no NavigationalStatus field at all.
+
+    `nav_code = pos.get("NavigationalStatus") or 0` read a missing field as 0,
+    which decodes to "Under way using engine" -- an assertion about a vessel
+    that made none, and indistinguishable from a Class A vessel genuinely
+    reporting 0. Now that the collector subscribes to Class B, that `or 0`
+    would apply to most of the feed.
+    """
+    source = PATH.read_text(encoding="utf-8")
+    assert 'pos.get("NavigationalStatus") or 0' not in source, (
+        "a missing status must stay missing, not decode to status 0"
+    )
+    assert "nav_code = _raw_nav if isinstance(_raw_nav, int) else None" in source

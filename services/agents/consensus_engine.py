@@ -511,12 +511,14 @@ class ConsensusEngine(SentinelAgent):
         return None
 
     async def run_scheduled_review(self) -> Optional[Dict[str, Any]]:
-        report = await self.analyze()
+        # Publishes here: `_scheduled_review_loop` logs what this returns rather
+        # than sending it, so this is the only path that will.
+        report = await self.analyze(publish=True)
         if report.contradictions or report.consensus_signals:
             return report.model_dump()
         return None
 
-    async def analyze(self) -> ConsensusReport:
+    async def analyze(self, publish: bool = False) -> ConsensusReport:
         """
         Full consensus analysis using Subjective Logic fusion.
         Produces consensus signals when agent opinions converge, and
@@ -761,9 +763,18 @@ class ConsensusEngine(SentinelAgent):
         # Persist the report
         await self._persist_report(report)
 
-        # Publish to Kafka if available
+        # Published only when the caller asks.
+        #
+        # This sent unconditionally, and `handle()` also returns the report --
+        # which the agent framework sends to `self.output_topic`, the same
+        # topic. Measured across 250 consecutive messages: 129 distinct
+        # report_ids, 121 of them republished, because both sends land inside
+        # the one second the id is built from.
+        #
+        # It also meant `get_consensus_for_ticker` and `get_contradictions`
+        # published a full report to answer a question about one ticker.
         producer = getattr(self, "producer", None)
-        if producer and (contradictions or consensus_signals or ach_reports):
+        if publish and producer and (contradictions or consensus_signals or ach_reports):
             try:
                 from shared.kafka import Topics
                 await producer.send(
@@ -883,19 +894,12 @@ class ConsensusEngine(SentinelAgent):
             key = "sentinel:consensus:latest"
             await self.redis.raw.set(key, report.model_dump_json(), ex=3600)
 
-            # Store contradiction count for metrics
-            await self.redis.raw.set(
-                "sentinel:consensus:contradiction_count",
-                str(len(report.contradictions)),
-                ex=3600,
-            )
-            # Store ACH count for metrics
-            if report.ach_reports:
-                await self.redis.raw.set(
-                    "sentinel:consensus:ach_count",
-                    str(len(report.ach_reports)),
-                    ex=3600,
-                )
+            # Two derived counters were written here "for metrics" and read
+            # by nothing -- no scraper, no route, no dashboard. Both are
+            # len() of a list on the report that is stored whole at
+            # `sentinel:consensus:latest`, one key up, which *is* read. A
+            # derived value beside its source is a second thing to keep
+            # correct for no reader's benefit.
         except Exception as e:
             logger.debug(f"Failed to persist consensus report: {e}")
 

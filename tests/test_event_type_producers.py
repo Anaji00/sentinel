@@ -98,42 +98,12 @@ def _constructed_event_types() -> set:
     return found
 
 
-# Declared with no producer. Each entry says why it is here, because "nothing
-# emits this" is a different situation for each of them and the difference is
-# what someone reading this needs.
-#
-# Removing an entry is the point: wire a producer, delete the line.
-UNPRODUCED = {
-    # Detection logic exists but stops short of emitting an event.
-    # `sts_zone_risk_multiplier` scores a dark gap by its proximity to a known
-    # ship-to-ship transfer zone; nothing detects the transfer itself
-    # (two vessels co-located and near-stationary), so the event is never built.
-    "VESSEL_STS": "STS zones score gaps; no co-location detector emits the event",
-    "VESSEL_SPOOF": "no AIS identity-spoof detector; position sanity checks reject, they do not emit",
-
-    # Ingested and stored, but published under another type or not as events.
-    #
-    # Four entries were removed from this block when the detection above was
-    # rewritten: HEADLINE, FLIGHT_POSITION, CRYPTO_TRANSFER and
-    # CRYPTO_LIQUIDATION are all emitted, and were recorded here as unproduced
-    # because a regex could not see a conditional or a `getattr`. The
-    # explanations they carried read as findings and were not.
-    "MARKET_CANDLE": "candles are written to tradfi_bars, not published as events",
-    "PREDICTION_MARKET": "the collector emits PREDICTION_MARKET_TRADE",
-    "DARK_POOL": "dark-pool prints arrive as EQUITY_BLOCK",
-    "PRICE_ANOMALY": "price moves arrive as MARKET_ANOMALY",
-    "INFRASTRUCTURE": "superseded by INFRA_EXPOSED and INFRASTRUCTURE_DEGRADED",
-    "VULNERABILITY": "CVEs arrive as INFRA_EXPOSED from the KEV path",
-
-    # Declared for work not started. No consumer depends on these.
-    "CLIMATE_STRESS": "no climate feed",
-    "CUSTOM": "escape hatch for user-defined events; no producer by design",
-    "FUTURES_COT": "no CFTC Commitments of Traders collector",
-    "REGULATORY_EVENT": "no regulatory-action feed",
-    "SPORTS_LINE_MOVEMENT": "no sportsbook collector",
-    "INSIDER_CLUSTER": "clustering of INSIDER_TRADE is not implemented",
-    "NARRATIVE_CLUSTER": "first-story detection scores novelty; it does not emit cluster events",
-}
+# The table moved to shared/models/event_producers.py so the rule engine can
+# read it too. It was complete and correct here and unreachable from the one
+# place that most needed it: thirteen of fifteen shipped correlation rules
+# selected on types recorded in it, and no check connected the two. The tests
+# below are unchanged -- they still hold the table to the syntax tree.
+from shared.models.event_producers import UNPRODUCED  # noqa: E402
 
 
 def test_every_declared_event_type_is_either_produced_or_recorded():

@@ -12,8 +12,13 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, Query, Depends
-from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
+from fastapi import APIRouter, HTTPException, Query, Depends, Request
+from services.api_gateway.dependencies import (
+    get_db,
+    get_db_optional,
+    get_redis_client,
+    require_pro,
+)
 from shared.utils.rbac import require_role, Role
 from pydantic import BaseModel
 import json
@@ -24,9 +29,12 @@ from shared.broker.base import (
     OrderType,
     OrderStatus,
 )
+from shared.broker import get_broker
 from shared.broker.paper import PaperBroker
 from shared.broker.alpaca import AlpacaBroker
 from shared.utils.serialization import to_dto
+from shared.utils.audit_ledger import AuditLedger, AuditLedgerUnavailable
+from shared.utils.feature_flags import FeatureFlagManager
 
 # Client-facing shape of a correlation record. Keeps the response contract
 # independent of the `correlations` table layout.
@@ -353,6 +361,19 @@ def get_execution_broker(redis_client=None) -> BrokerInterface:
     universe -- so selecting the live broker merely because a key exists meant
     configuring a data feed silently switched order execution from simulation to
     a real brokerage account. Live execution now requires ENABLE_LIVE_BROKER.
+
+    The simulated case delegates to `shared.broker.get_broker`, which holds one
+    paper book per process.
+
+    It used to `return PaperBroker(initial_cash=100_000.0, ...)` -- a new book
+    on every request. `shared.broker` grew a `_PAPER_BOOK` singleton precisely
+    to stop that happening, and this second factory kept building its own, so
+    the defect survived on the only order path any UI component calls.
+
+    Measured on the deployment before the change: an order for 10 AAPL returned
+    EXECUTIVE_FILLED with a bracket, and `GET /portfolio/positions` returned
+    zero positions with cash unchanged at 100,000. The operator was told a trade
+    had executed and nothing anywhere had moved.
     """
     live_enabled = os.getenv("ENABLE_LIVE_BROKER", "").strip().lower() in ("1", "true", "yes", "on")
     alpaca_key = os.getenv("ALPACA_API_KEY")
@@ -366,7 +387,7 @@ def get_execution_broker(redis_client=None) -> BrokerInterface:
             paper,
         )
         return AlpacaBroker(api_key=alpaca_key, secret_key=alpaca_secret, paper=paper)
-    return PaperBroker(initial_cash=100_000.0, redis_client=redis_client)
+    return get_broker(broker_type="paper", redis_client=redis_client)
 
 
 class OrderExecutionRequest(BaseModel):
@@ -386,16 +407,46 @@ class OrderExecutionRequest(BaseModel):
     # watchlists 4/4, filings 4/4, flags 4/4 -- and this, the only route that
     # reaches a broker, did not. An API key valid for reading a chart was
     # valid for placing a trade.
-    dependencies=[Depends(require_role(Role.ANALYST))],
+    #
+    # ADMIN, matching `POST /portfolio/orders`, and for the reason already
+    # written there: session cookies resolve to ANALYST by default, so gating
+    # order entry at ANALYST makes every authenticated session an order-entry
+    # principal. Two routes into the same venue answering differently is the
+    # pattern this codebase has now found three times.
+    dependencies=[Depends(require_role(Role.ADMIN))],
 )
 async def execute_trade_order(
     order: OrderExecutionRequest,
+    request: Request,
     redis = Depends(get_redis_client),
+    db = Depends(get_db_optional),
 ):
     """
     Paper Trading & Broker Execution Bridge.
     Routes order execution directly through the shared BrokerInterface (PaperBroker or AlpacaBroker).
+
+    Carries the two guards its sibling route has always had and this one never
+    did: the platform kill switch, and a durable audit entry recorded before
+    anything reaches the venue.
     """
+    actor = getattr(request.state, "identity", "trader")
+    ledger = AuditLedger(redis_client=redis, db_client=db)
+
+    # The kill switch stops order flow, or it stops nothing.
+    #
+    # `POST /portfolio/orders` refuses when `order_execution` is disabled, and
+    # this route -- the one a person can actually reach from the UI -- did not
+    # look at the flag at all. An emergency halt left the only reachable order
+    # path wide open.
+    flags = FeatureFlagManager(redis_client=redis)
+    if not await flags.is_enabled("order_execution"):
+        logger.warning("Order rejected -- execution halted by kill switch (actor=%s).", actor)
+        raise HTTPException(
+            status_code=423,
+            detail="Order rejected: trade execution is currently halted by the "
+                   "platform kill switch.",
+        )
+
     broker = get_execution_broker(redis_client=redis)
     side = OrderSide.BUY if order.action.upper() == "BUY" else OrderSide.SELL
     order_type = OrderType.LIMIT if (order.order_type or "").upper() == "LIMIT" else OrderType.MARKET
@@ -438,6 +489,40 @@ async def execute_trade_order(
     max_reward = round(shares * abs(order.target_price - order.entry_price), 2)
     client_oid = f"sentinel_order_{order.ticker.lower()}_{int(time.time())}"
 
+    # Intent, recorded durably BEFORE execution.
+    #
+    # The interface tells every operator that "every order submission ... is
+    # immutably recorded in a SHA-256 hash-chained ledger". This route wrote
+    # nothing, and it is the only order path the UI has -- so that sentence was
+    # false for every trade a person could place. An executed-but-unaudited
+    # trade is not a recoverable state; a rejected order is.
+    try:
+        await ledger.record_entry(
+            actor=actor,
+            action=f"SUBMIT_{side.value}_ORDER",
+            resource_type="ORDER",
+            resource_id=client_oid,
+            details={
+                "symbol": order.ticker.upper(),
+                "shares": shares,
+                "side": side.value,
+                "order_type": order_type.value,
+                "entry_price": order.entry_price,
+                "stop_loss": order.stop_loss,
+                "target_price": order.target_price,
+                "position_size_usd": order.position_size_usd,
+                "kelly_allocation_pct": order.kelly_allocation_pct,
+                "phase": "intent",
+            },
+        )
+    except AuditLedgerUnavailable as e:
+        logger.error("Refusing order execution -- audit ledger unavailable: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail="Order rejected: the audit ledger is unavailable, so this "
+                   "execution cannot be recorded. No order was placed.",
+        )
+
     try:
         executed_order = await broker.submit_order(
             symbol=order.ticker,
@@ -455,6 +540,30 @@ async def execute_trade_order(
 
         fill_price = executed_order.filled_avg_price or order.entry_price
         broker_label = "Alpaca Broker API v2" if isinstance(broker, AlpacaBroker) else "Sentinel PaperBroker"
+
+        # The outcome. The trade has already happened by now, so a ledger
+        # failure here is logged loudly and cannot un-place the order.
+        try:
+            await ledger.record_entry(
+                actor=actor,
+                action=f"EXECUTE_{side.value}_ORDER",
+                resource_type="ORDER",
+                resource_id=executed_order.order_id or client_oid,
+                details={
+                    "symbol": executed_order.symbol,
+                    "shares": executed_order.filled_qty or executed_order.qty,
+                    "side": side.value,
+                    "status": executed_order.status.value,
+                    "filled_avg_price": executed_order.filled_avg_price,
+                    "bracket_submitted": executed_order.is_bracket,
+                    "phase": "execution",
+                },
+            )
+        except AuditLedgerUnavailable as e:
+            logger.critical(
+                "EXECUTED ORDER %s IS UNAUDITED -- ledger write failed after execution: %s",
+                executed_order.order_id, e,
+            )
 
         return {
             "status": "EXECUTIVE_FILLED" if executed_order.status == OrderStatus.FILLED else "SUBMITTED",

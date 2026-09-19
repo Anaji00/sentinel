@@ -48,8 +48,8 @@ function ResetInner() {
   if (!token) {
     return (
       <AuthShell title="Link not valid" subtitle="NO TOKEN">
-        <div className="space-y-4 text-sm text-slate-300">
-          <p className="text-slate-400">This page needs a reset link from your email.</p>
+        <div className="space-y-4 text-sm text-ink-dim">
+          <p className="text-ink-dim">This page needs a reset link from your email.</p>
           <Link href="/forgot" className="block text-center text-cyan-400 hover:text-cyan-300">
             Request a reset link
           </Link>
@@ -61,7 +61,7 @@ function ResetInner() {
   if (done) {
     return (
       <AuthShell title="Password changed" subtitle="YOU CAN SIGN IN NOW">
-        <div className="space-y-4 text-sm text-slate-300">
+        <div className="space-y-4 text-sm text-ink-dim">
           <p>Your password has been changed. Any other reset links have stopped working.</p>
           <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
             Sign in
@@ -75,18 +75,33 @@ function ResetInner() {
     <AuthShell title="Choose a new password" subtitle="LINK VALID FOR 30 MINUTES">
       <form onSubmit={submit} className="space-y-4">
         <div className="space-y-1">
-          <label htmlFor="pw" className="text-[10px] uppercase tracking-widest text-slate-400">New password</label>
+          <label htmlFor="pw" className="text-micro uppercase tracking-widest text-ink-dim">
+            New password
+          </label>
           <input
-            id="pw" type="password" required autoComplete="new-password" value={password}
-            onChange={(e) => setPassword(e.target.value)} className={fieldClass}
+            id="pw"
+            type="password"
+            required
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className={fieldClass}
             placeholder={`At least ${MIN_PASSWORD_LENGTH} characters`}
           />
         </div>
         <div className="space-y-1">
-          <label htmlFor="pw2" className="text-[10px] uppercase tracking-widest text-slate-400">Confirm</label>
+          <label htmlFor="pw2" className="text-micro uppercase tracking-widest text-ink-dim">
+            Confirm
+          </label>
           <input
-            id="pw2" type="password" required autoComplete="new-password" value={confirm}
-            onChange={(e) => setConfirm(e.target.value)} className={fieldClass} placeholder="Type it again"
+            id="pw2"
+            type="password"
+            required
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            className={fieldClass}
+            placeholder="Type it again"
           />
         </div>
 
@@ -102,7 +117,13 @@ function ResetInner() {
 
 export default function ResetPage() {
   return (
-    <Suspense fallback={<AuthShell title="Loading" subtitle="ONE MOMENT"><p className="text-sm text-slate-400 text-center">Loading…</p></AuthShell>}>
+    <Suspense
+      fallback={
+        <AuthShell title="Loading" subtitle="ONE MOMENT">
+          <p className="text-sm text-ink-dim text-center">Loading…</p>
+        </AuthShell>
+      }
+    >
       <ResetInner />
     </Suspense>
   );

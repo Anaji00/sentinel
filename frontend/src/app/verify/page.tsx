@@ -55,7 +55,7 @@ function VerifyInner() {
   if (state === 'working') {
     return (
       <AuthShell title="Confirming" subtitle="ONE MOMENT">
-        <p className="text-sm text-slate-400 text-center">Checking your link…</p>
+        <p className="text-sm text-ink-dim text-center">Checking your link…</p>
       </AuthShell>
     );
   }
@@ -63,7 +63,7 @@ function VerifyInner() {
   if (state === 'confirmed') {
     return (
       <AuthShell title="Email confirmed" subtitle="YOU ARE ALL SET">
-        <div className="space-y-4 text-sm text-slate-300">
+        <div className="space-y-4 text-sm text-ink-dim">
           <p>Your address is confirmed. Nothing else to do.</p>
           <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
             Sign in
@@ -75,8 +75,8 @@ function VerifyInner() {
 
   return (
     <AuthShell title="Link not valid" subtitle="IT MAY HAVE EXPIRED">
-      <div className="space-y-4 text-sm text-slate-300">
-        <p className="text-slate-400">
+      <div className="space-y-4 text-sm text-ink-dim">
+        <p className="text-ink-dim">
           Confirmation links last 48 hours and can be used once. Request a fresh one below — your
           account still works on the free plan in the meantime.
         </p>
@@ -88,14 +88,21 @@ function VerifyInner() {
         ) : (
           <form onSubmit={resend} className="space-y-3">
             <input
-              type="email" required value={resendEmail} onChange={(e) => setResendEmail(e.target.value)}
-              className={fieldClass} placeholder="you@example.com" aria-label="Email address"
+              type="email"
+              required
+              value={resendEmail}
+              onChange={(e) => setResendEmail(e.target.value)}
+              className={fieldClass}
+              placeholder="you@example.com"
+              aria-label="Email address"
             />
-            <button type="submit" className={buttonClass}>Send a new link</button>
+            <button type="submit" className={buttonClass}>
+              Send a new link
+            </button>
           </form>
         )}
 
-        <Link href="/login" className="block text-center text-xs text-slate-500 hover:text-slate-300">
+        <Link href="/login" className="block text-center text-xs text-ink-mute hover:text-ink-dim">
           Back to sign in
         </Link>
       </div>
@@ -107,7 +114,13 @@ export default function VerifyPage() {
   // useSearchParams needs a Suspense boundary, or the whole route opts out of
   // static rendering and the build warns.
   return (
-    <Suspense fallback={<AuthShell title="Confirming" subtitle="ONE MOMENT"><p className="text-sm text-slate-400 text-center">Loading…</p></AuthShell>}>
+    <Suspense
+      fallback={
+        <AuthShell title="Confirming" subtitle="ONE MOMENT">
+          <p className="text-sm text-ink-dim text-center">Loading…</p>
+        </AuthShell>
+      }
+    >
       <VerifyInner />
     </Suspense>
   );

@@ -22,8 +22,10 @@ export function dedupePositionBatch(batch: NormalizedEvent[]): NormalizedEvent[]
   for (const item of batch) {
     const t = (item.type || '').toLowerCase();
     const isHighFreqPos =
-      t.includes('vessel_position') || t.includes('adsb_position') ||
-      t.includes('ais') || t.includes('adsb');
+      t.includes('vessel_position') ||
+      t.includes('adsb_position') ||
+      t.includes('ais') ||
+      t.includes('adsb');
     // An unattributed position report is still an event: collapsing those
     // together on a missing key would drop all but one of them.
     if (isHighFreqPos && item.primary_entity?.id) {
@@ -51,7 +53,8 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
   useEffect(() => {
     // Determine WebSocket URL dynamically based on current window location
-    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const protocol =
+      typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Default to the same origin the page is served from (through the ingress),
     // NOT a hardcoded :8000 — the gateway port is not published to the host in the
     // deployed stack, and http://...:8000 would be blocked as mixed content on HTTPS.
@@ -60,7 +63,9 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     if (process.env.NEXT_PUBLIC_WS_URL) {
       baseHost = process.env.NEXT_PUBLIC_WS_URL.replace(/^wss?:\/\//, '').replace(/\/+$/, '');
     } else if (process.env.NEXT_PUBLIC_API_URL) {
-      baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '').replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '');
+      baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '')
+        .replace(/\/api\/v1\/?$/, '')
+        .replace(/\/+$/, '');
     }
     const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed`;
 
@@ -103,7 +108,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
               // O(1) dedup check via Set
               if (seenIds.current.has(data.event_id)) return;
               seenIds.current.add(data.event_id);
-              
+
               if (seenIds.current.size > MAX_LIVE_EVENTS * 2) {
                 const ids = Array.from(seenIds.current);
                 seenIds.current = new Set(ids.slice(ids.length - MAX_LIVE_EVENTS));
@@ -200,22 +205,60 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     const s = (e.source || '').toLowerCase();
 
     if (selectedDomain === 'tradfi') {
-      return t.includes('tradfi') || t.includes('option') || t.includes('dark_pool') || t.includes('equity') || t.includes('price') || t.includes('market') || t.includes('insider') || t.includes('futures') || t.includes('earnings') || s.includes('finnhub') || s.includes('alphavantage');
+      return (
+        t.includes('tradfi') ||
+        t.includes('option') ||
+        t.includes('dark_pool') ||
+        t.includes('equity') ||
+        t.includes('price') ||
+        t.includes('market') ||
+        t.includes('insider') ||
+        t.includes('futures') ||
+        t.includes('earnings') ||
+        s.includes('finnhub') ||
+        s.includes('alphavantage')
+      );
     }
     if (selectedDomain === 'crypto') {
-      return t.includes('crypto') || t.includes('funding') || t.includes('interest') || s.includes('binance') || s.includes('coingecko') || s.includes('coinbase');
+      return (
+        t.includes('crypto') ||
+        t.includes('funding') ||
+        t.includes('interest') ||
+        s.includes('binance') ||
+        s.includes('coingecko') ||
+        s.includes('coinbase')
+      );
     }
     if (selectedDomain === 'prediction') {
       return t.includes('pred') || s.includes('polymarket') || s.includes('kalshi');
     }
     if (selectedDomain === 'cyber') {
-      return t.includes('cyber') || t.includes('bgp') || t.includes('breach') || t.includes('ransomware') || t.includes('infra') || t.includes('vulnerability') || s.includes('cisa');
+      return (
+        t.includes('cyber') ||
+        t.includes('bgp') ||
+        t.includes('breach') ||
+        t.includes('ransomware') ||
+        t.includes('infra') ||
+        t.includes('vulnerability') ||
+        s.includes('cisa')
+      );
     }
     if (selectedDomain === 'maritime') {
-      return t.includes('vessel') || t.includes('maritime') || t.includes('ais') || s.includes('ais') || s.includes('aisstream');
+      return (
+        t.includes('vessel') ||
+        t.includes('maritime') ||
+        t.includes('ais') ||
+        s.includes('ais') ||
+        s.includes('aisstream')
+      );
     }
     if (selectedDomain === 'aviation') {
-      return t.includes('flight') || t.includes('aviation') || t.includes('adsb') || s.includes('opensky');
+      return (
+        t.includes('flight') ||
+        t.includes('aviation') ||
+        t.includes('adsb') ||
+        s.includes('opensky')
+      );
     }
     return false;
   });

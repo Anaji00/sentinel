@@ -161,3 +161,43 @@ def test_correlation_keeps_the_tighter_window():
     """Fifteen minutes is correlation's question, not a general freshness rule."""
     source = (ROOT / "services/correlation/main.py").read_text(encoding="utf-8")
     assert 'os.getenv("CORRELATION_MAX_EVENT_AGE_SEC", "900")' in source
+
+
+# --- The bound must hold where the work happens, not only where it is queued --
+
+
+def _reasoning_source() -> str:
+    return (ROOT / "services" / "reasoning" / "main.py").read_text(encoding="utf-8")
+
+
+def test_reasoning_rechecks_freshness_after_taking_its_slot():
+    """Admission proves a cluster was fresh once; synthesis is hours later.
+
+    The reasoning tier admits MAX_INFLIGHT_SYNTHESES clusters against a model
+    that completes roughly eight an hour, so a queued cluster reaches its slot
+    long after it was accepted. With the check only at admission, every one of
+    the last ten scenarios on the live deployment was synthesised 3.5 to 4.3
+    hours after its correlation was detected, against a declared ceiling of one
+    hour -- the guard passed because it ran at the only moment it could not
+    fail.
+    """
+    src = _reasoning_source()
+    body = src.split("async def sem_process_cluster")[1].split("\n    logger.info")[0]
+    assert "is_stale(" in body, (
+        "sem_process_cluster must re-check freshness after acquiring the "
+        "semaphore. Checking only at admission makes the age bound a statement "
+        "about queue entry, not about the analysis that gets published."
+    )
+    assert "REASONING_MAX_CLUSTER_AGE_SEC" in body, (
+        "the re-check must use the same bound as admission, so the two cannot "
+        "drift apart"
+    )
+
+
+def test_reasoning_still_checks_freshness_at_admission():
+    """The late check replaces nothing: cheap rejection stays cheap."""
+    src = _reasoning_source()
+    assert src.count("is_stale(cluster, REASONING_MAX_CLUSTER_AGE_SEC)") >= 2, (
+        "both the admission check and the pre-synthesis check must exist; "
+        "dropping the first makes a backlog drain at inference speed again"
+    )

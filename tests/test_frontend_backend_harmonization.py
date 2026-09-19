@@ -43,7 +43,8 @@ def test_provenance_enum_matches_across_the_boundary():
 
     ts = _read("components/ProvenanceBadge.tsx")
     union = ts.split("export type ProvenanceType =", 1)[1].split(";", 1)[0]
-    frontend = set(re.findall(r'"([a-z_]+)"', union))
+    # Either quote style -- see the note in test_frontend_api_contract.
+    frontend = set(re.findall(r'''["']([a-z_]+)["']''', union))
 
     assert frontend == backend, (
         f"provenance enum drift\n"
@@ -58,7 +59,9 @@ def test_provenance_badge_handles_every_backend_value():
 
     ts = _read("components/ProvenanceBadge.tsx")
     for member in ProvenanceSourceType:
-        assert f'case "{member.value}"' in ts, (
+        # Either quote style -- Prettier is configured with `singleQuote: true`.
+        branch = f'case "{member.value}"' in ts or f"case '{member.value}'" in ts
+        assert branch, (
             f"ProvenanceBadge has no case for {member.value!r}; it would render "
             f"the default label instead"
         )
@@ -112,7 +115,18 @@ def test_account_panel_carries_no_invented_identity_or_quota():
         assert marker not in tsx, f"fabricated value still present in account panel: {marker!r}"
 
     # It must actually consult the session rather than local state.
-    assert "/api/auth/session" in tsx, "account panel does not read the real session"
+    # Either the endpoint directly, or the shared session that reads it. The
+    # three components that each fetched `/api/auth/session` separately now
+    # read one provider, so requiring the literal URL here would push a panel
+    # back to having its own copy of the identity -- which is the thing that
+    # let the header and the live feed disagree.
+    reads_session = "/api/auth/session" in tsx or "useSession()" in tsx
+    assert reads_session, "account panel does not read the real session"
+    if "useSession()" in tsx:
+        provider = _read("components/ui/SessionContext.tsx")
+        assert "/api/auth/session" in provider, (
+            "the shared session must come from the server, not from a literal"
+        )
 
 
 def test_no_fabricated_persona_anywhere_in_the_frontend():
@@ -214,11 +228,19 @@ def test_no_raw_json_dumps_rendered_in_the_ui():
     <pre>, exposing snake_case keys, 17-digit floats and raw epochs to an
     operator reading under time pressure.
     """
+    # Comments are stripped before scanning.
+    #
+    # This exempted DataGrid.tsx by name because its docstring names the pattern
+    # it replaces -- and then the next component to explain the same thing in a
+    # comment failed the check for *describing* the defect rather than having
+    # it. An assertion that matches its own explanatory prose is a defect this
+    # audit has now hit five times, and a by-name exemption list is how it keeps
+    # happening: it grows by one every time someone documents the rule.
     offenders = []
     for path in list(FRONTEND.rglob("*.tsx")):
-        if path.name == "DataGrid.tsx":
-            continue  # its docstring references the pattern it replaces
         text = path.read_text(encoding="utf-8")
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        text = re.sub(r"^\s*//.*$", "", text, flags=re.M)
         for i, line in enumerate(text.splitlines(), 1):
             if "JSON.stringify" in line and "body:" not in line:
                 offenders.append(f"{path.relative_to(FRONTEND)}:{i}")

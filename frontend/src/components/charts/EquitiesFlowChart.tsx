@@ -10,6 +10,8 @@ import { TrendingUp, BarChart2, Radio } from 'lucide-react';
 
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { formatPercent } from '../../lib/format';
+import { PALETTE } from '../../lib/palette';
+import { POLL } from '../ui/DataProvider';
 
 interface SeriesPoint {
   timestamp: string;
@@ -36,7 +38,7 @@ export default function EquitiesFlowChart() {
   const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=SPY,QQQ&limit=60',
     fetcher,
-    { refreshInterval: 3000 }
+    { refreshInterval: POLL.live },
   );
 
   const baseSPY = data?.series?.['SPY'] || [];
@@ -44,11 +46,22 @@ export default function EquitiesFlowChart() {
 
   const spySeries = useMemo(() => {
     const list = [...baseSPY];
-    liveTradfiEvents.forEach(e => {
-      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+    liveTradfiEvents.forEach((e) => {
+      const sym = (
+        e.financial_data?.ticker ||
+        e.primary_entity?.id ||
+        e.primary_entity?.name ||
+        ''
+      ).toUpperCase();
       if (sym === 'SPY') {
         const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
+        if (p)
+          list.push({
+            timestamp: e.occurred_at,
+            price: p,
+            volume: null,
+            anomaly_score: e.anomaly_score,
+          });
       }
     });
     return list.slice(-60);
@@ -56,11 +69,22 @@ export default function EquitiesFlowChart() {
 
   const qqqSeries = useMemo(() => {
     const list = [...baseQQQ];
-    liveTradfiEvents.forEach(e => {
-      const sym = (e.financial_data?.ticker || e.primary_entity?.id || e.primary_entity?.name || '').toUpperCase();
+    liveTradfiEvents.forEach((e) => {
+      const sym = (
+        e.financial_data?.ticker ||
+        e.primary_entity?.id ||
+        e.primary_entity?.name ||
+        ''
+      ).toUpperCase();
       if (sym === 'QQQ') {
         const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
-        if (p) list.push({ timestamp: e.occurred_at, price: p, volume: null, anomaly_score: e.anomaly_score });
+        if (p)
+          list.push({
+            timestamp: e.occurred_at,
+            price: p,
+            volume: null,
+            anomaly_score: e.anomaly_score,
+          });
       }
     });
     return list.slice(-60);
@@ -70,11 +94,17 @@ export default function EquitiesFlowChart() {
 
   const latestSPY = spySeries[spySeries.length - 1]?.price ?? null;
   const startSPY = spySeries[0]?.price ?? null;
-  const spyPct = latestSPY !== null && startSPY !== null && startSPY > 0 ? ((latestSPY - startSPY) / startSPY) * 100 : null;
+  const spyPct =
+    latestSPY !== null && startSPY !== null && startSPY > 0
+      ? ((latestSPY - startSPY) / startSPY) * 100
+      : null;
 
   const latestQQQ = qqqSeries[qqqSeries.length - 1]?.price ?? null;
   const startQQQ = qqqSeries[0]?.price ?? null;
-  const qqqPct = latestQQQ !== null && startQQQ !== null && startQQQ > 0 ? ((latestQQQ - startQQQ) / startQQQ) * 100 : null;
+  const qqqPct =
+    latestQQQ !== null && startQQQ !== null && startQQQ > 0
+      ? ((latestQQQ - startQQQ) / startQQQ) * 100
+      : null;
 
   const pointsCount = Math.max(spySeries.length, qqqSeries.length);
 
@@ -96,10 +126,12 @@ export default function EquitiesFlowChart() {
       const x = (i / Math.max(1, pointsCount - 1)) * width;
 
       const pS = spySeries[i]?.price ?? null;
-      const pctS = pS !== null && startSPY !== null ? ((pS - startSPY) / (startSPY || 1)) * 100 : null;
+      const pctS =
+        pS !== null && startSPY !== null ? ((pS - startSPY) / (startSPY || 1)) * 100 : null;
 
       const pQ = qqqSeries[i]?.price ?? null;
-      const pctQ = pQ !== null && startQQQ !== null ? ((pQ - startQQQ) / (startQQQ || 1)) * 100 : null;
+      const pctQ =
+        pQ !== null && startQQQ !== null ? ((pQ - startQQQ) / (startQQQ || 1)) * 100 : null;
 
       if (pctS !== null) {
         const yS = height - ((pctS - minPct) / (maxPct - minPct)) * height;
@@ -118,37 +150,52 @@ export default function EquitiesFlowChart() {
       });
     }
 
-    const pathSStr = pSPY.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`, '');
-    const pathQStr = pQQQ.reduce((acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`, '');
+    const pathSStr = pSPY.reduce(
+      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
+      '',
+    );
+    const pathQStr = pQQQ.reduce(
+      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
+      '',
+    );
 
     return { pathSPY: pathSStr, pathQQQ: pathQStr, pointsData: combined };
   }, [spySeries, qqqSeries, startSPY, startQQQ, pointsCount, hasData]);
 
-  const activeHoverPoint = hoverIndex !== null && pointsData[hoverIndex] ? pointsData[hoverIndex] : null;
+  const activeHoverPoint =
+    hoverIndex !== null && pointsData[hoverIndex] ? pointsData[hoverIndex] : null;
 
   return (
     <Card
       title="SPY / QQQ EQUITIES RELATIVE PERFORMANCE & VOLUME FLOW"
       badge={
         hasData ? (
-          <Badge variant="live" pulse>ALPACA / SIP TELEMETRY</Badge>
+          <Badge variant="live" pulse>
+            Alpaca / SIP
+          </Badge>
         ) : (
-          <Badge variant="warning" pulse>{describeApiError(error) ?? 'AWAITING LIVE DATA STREAM...'}</Badge>
+          <Badge variant="warning" pulse>
+            {describeApiError(error) ?? 'Waiting for the stream…'}
+          </Badge>
         )
       }
       noPadding
     >
-      <div className="p-4 space-y-3 font-mono">
+      <div className="p-4 space-y-3">
         {/* Metric Summary Ribbon */}
-        <div className="grid grid-cols-3 gap-3 bg-[#080b12] p-3 rounded-lg border border-cyan-500/20 text-xs">
+        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-cyan-500/20 text-xs">
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold">SPY (S&P 500 ETF)</span>
+            <span className="text-ink-dim block text-micro uppercase font-bold">
+              SPY (S&P 500 ETF)
+            </span>
             <div className="flex items-center gap-2 mt-0.5">
               <span className="text-cyan-400 font-extrabold text-base">
                 {latestSPY !== null ? `$${latestSPY.toFixed(2)}` : 'AWAITING FEED...'}
               </span>
               {spyPct !== null && (
-                <span className={`font-bold text-xs ${spyPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                <span
+                  className={`font-bold text-xs ${spyPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                >
                   {formatPercent(spyPct, { decimals: 2, signed: true })}
                 </span>
               )}
@@ -156,13 +203,17 @@ export default function EquitiesFlowChart() {
           </div>
 
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold">QQQ (NASDAQ 100 ETF)</span>
+            <span className="text-ink-dim block text-micro uppercase font-bold">
+              QQQ (NASDAQ 100 ETF)
+            </span>
             <div className="flex items-center gap-2 mt-0.5">
               <span className="text-emerald-400 font-extrabold text-base">
                 {latestQQQ !== null ? `$${latestQQQ.toFixed(2)}` : 'AWAITING FEED...'}
               </span>
               {qqqPct !== null && (
-                <span className={`font-bold text-xs ${qqqPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                <span
+                  className={`font-bold text-xs ${qqqPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                >
                   {formatPercent(qqqPct, { decimals: 2, signed: true })}
                 </span>
               )}
@@ -170,16 +221,19 @@ export default function EquitiesFlowChart() {
           </div>
 
           <div>
-            <span className="text-slate-400 block text-[10px] uppercase font-bold">SERIES SELECTOR</span>
+            <span className="text-ink-dim block text-micro uppercase font-bold">
+              SERIES SELECTOR
+            </span>
             <div className="flex items-center gap-1 mt-1">
-              {(['both', 'spy', 'qqq'] as const).map(mode => (
+              {(['both', 'spy', 'qqq'] as const).map((mode) => (
                 <button
                   key={mode}
                   onClick={() => setActiveSeries(mode)}
-                  className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold transition-all cursor-pointer ${activeSeries === mode
-                      ? 'bg-cyan-500/25 text-[#00f2fe] border border-cyan-500/50 glow-cyan'
-                      : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-                    }`}
+                  className={`px-2 py-0.5 rounded text-micro uppercase font-bold transition-all cursor-pointer ${
+                    activeSeries === mode
+                      ? 'bg-cyan-500/25 text-accent border border-cyan-500/50 glow-cyan'
+                      : 'bg-raised text-ink-dim hover:text-white border border-line'
+                  }`}
                 >
                   {mode}
                 </button>
@@ -190,8 +244,8 @@ export default function EquitiesFlowChart() {
 
         {/* Live SVG Dual Line Area Chart or Awaiting Live Stream State */}
         {hasData ? (
-          <div className="relative bg-[#07090e] p-3 rounded-lg border border-slate-800 overflow-hidden">
-            <div className="flex items-center justify-between text-[10px] text-slate-400 mb-2 font-bold uppercase">
+          <div className="relative bg-page p-3 rounded-lg border border-line overflow-hidden">
+            <div className="flex items-center justify-between text-micro text-ink-dim mb-2 font-bold uppercase">
               <span className="flex items-center gap-3">
                 <span className="flex items-center gap-1 text-cyan-400">
                   <span className="h-2 w-2 rounded-full bg-cyan-400" /> SPY RELATIVE %
@@ -208,16 +262,52 @@ export default function EquitiesFlowChart() {
             </div>
 
             <svg viewBox="0 0 600 180" className="w-full h-44 overflow-visible">
-              <line x1="0" y1="90" x2="600" y2="90" stroke="#334155" strokeDasharray="4 4" strokeWidth="1" />
-              <line x1="0" y1="45" x2="600" y2="45" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.8" />
-              <line x1="0" y1="135" x2="600" y2="135" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.8" />
+              <line
+                x1="0"
+                y1="90"
+                x2="600"
+                y2="90"
+                stroke="#334155"
+                strokeDasharray="4 4"
+                strokeWidth="1"
+              />
+              <line
+                x1="0"
+                y1="45"
+                x2="600"
+                y2="45"
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+                strokeWidth="0.8"
+              />
+              <line
+                x1="0"
+                y1="135"
+                x2="600"
+                y2="135"
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+                strokeWidth="0.8"
+              />
 
               {(activeSeries === 'both' || activeSeries === 'spy') && pathSPY && (
-                <path d={pathSPY} fill="none" stroke="#00f2fe" strokeWidth="2.2" strokeLinecap="round" />
+                <path
+                  d={pathSPY}
+                  fill="none"
+                  stroke={PALETTE.accent}
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                />
               )}
 
               {(activeSeries === 'both' || activeSeries === 'qqq') && pathQQQ && (
-                <path d={pathQQQ} fill="none" stroke="#10b981" strokeWidth="2.2" strokeLinecap="round" />
+                <path
+                  d={pathQQQ}
+                  fill="none"
+                  stroke={PALETTE.positive}
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                />
               )}
 
               {hoverIndex !== null && (
@@ -226,7 +316,7 @@ export default function EquitiesFlowChart() {
                   y1="0"
                   x2={(hoverIndex / Math.max(1, pointsCount - 1)) * 600}
                   y2="180"
-                  stroke="#a855f7"
+                  stroke={PALETTE.info}
                   strokeWidth="1.2"
                   strokeDasharray="2 2"
                 />
@@ -248,15 +338,16 @@ export default function EquitiesFlowChart() {
             </svg>
           </div>
         ) : (
-          <div className="h-44 w-full bg-[#07090e] rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2 font-mono">
+          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
             <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
             <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
               {error
-                ? `SPY / QQQ FEED: ${describeApiError(error)}`
+                ? `SPY / QQQ: ${describeApiError(error)}`
                 : 'AWAITING LIVE DATA STREAM FOR SPY / QQQ EQUITIES'}
             </span>
-            <p className="text-[10px] text-slate-500 max-w-sm">
-              Finnhub & Alpaca WebSocket stream connections active. Ticks will render automatically upon database ingestion.
+            <p className="text-micro text-ink-mute max-w-sm">
+              Finnhub & Alpaca WebSocket stream connections active. Ticks will render automatically
+              upon database ingestion.
             </p>
           </div>
         )}

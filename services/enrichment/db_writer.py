@@ -125,6 +125,11 @@ class DBWriter:
             # read. See migration 0024.
             _dump('anomaly_breakdown'),
             _dump('score_adjustments'),
+            # The tenth payload. Nine had columns and this one did not, so every
+            # economic release reached the durable store with its surprise,
+            # actual, forecast and previous silently dropped. See migration 0025.
+            _dump('macro_data'),
+            _as_uuid(getattr(e, 'trace_id', None)),
         )
 
     async def write_events_batch(self, events: list[NormalizedEvent]):
@@ -134,6 +139,23 @@ class DBWriter:
         values = [self._extract_tuple(e) for e in events]
 
         # FIX: Include longitude ($11) and latitude ($12) columns explicitly in INSERT query
+        # trace_id is the last column below, and was absent entirely.
+        #
+        # It has a column on events, correlations and scenarios, a uuid4 default
+        # on RawEvent and NormalizedEvent, and twenty-four enricher sites that
+        # pass `trace_id=raw.trace_id` from the message to the event it becomes.
+        # This is the only INSERT that writes an event and it never named the
+        # column, so all 6,350,546 rows and all 399,312 correlations held NULL:
+        # the lineage was computed correctly at every step and discarded at the
+        # last one.
+        #
+        # This note lives here, outside the string, for two reasons -- both
+        # learned the hard way in the same hour. A SQL comment inside the column
+        # list broke test_a_list_of_models_survives_the_dump_helper, which parses
+        # that list by splitting on commas and brackets. Moving it inside the
+        # string but above the statement was worse: `#` is not a SQL comment, so
+        # every write failed with `syntax error at or near "#"` and fifteen
+        # events a batch went to the dead-letter queue.
         query = """
             INSERT INTO events (
                 event_id, type, occurred_at, collected_at, source, source_reliability,
@@ -143,7 +165,8 @@ class DBWriter:
                 prediction_market_data, crypto_data, cyber_data, supply_chain_data,
                 filing_data,
                 tags, named_entities, sentiment, anomaly_score, correlation_ids,
-                coordinates, corroboration, anomaly_breakdown, score_adjustments
+                coordinates, corroboration, anomaly_breakdown, score_adjustments,
+                macro_data, trace_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17,
@@ -157,7 +180,7 @@ class DBWriter:
                     ELSE NULL 
                 END
             ,
-                $32, $33, $34
+                $32, $33, $34, $35, $36
             )
             ON CONFLICT (event_id, occurred_at) DO UPDATE SET
                 latitude = COALESCE(EXCLUDED.latitude, events.latitude),

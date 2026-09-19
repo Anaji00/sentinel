@@ -10,19 +10,39 @@ import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from shared.utils.rbac import require_role, Role
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
-from services.reasoning.strategy_backtester import StrategyBacktester
+from services.reasoning.strategy_backtester import (
+    StrategyBacktester,
+    SUPPORTED_TIMEFRAMES,
+)
 
 logger = logging.getLogger("api-gateway.backtest")
+from shared.utils.rates import risk_free_rate
+
 router = APIRouter(prefix="/api/v1/backtest", tags=["Strategy Backtesting & Model Validation"])
 
 
 class RunBacktestRequest(BaseModel):
     ticker: str = Field(default="NVDA", description="Equity ticker symbol")
     strategy_type: str = Field(default="covered_call", description="'covered_call', 'momentum_trend', or 'mean_reversion'")
-    timeframe: str = Field(default="5m", description="'5m', '10m', '15m', '30m', '1h', '4h', '1d'")
+    # Validated, not described. The previous free-text hint offered '10m',
+    # which no continuous aggregate implements.
+    timeframe: str = Field(
+        default="5m",
+        description="One of " + ", ".join(SUPPORTED_TIMEFRAMES),
+    )
+
+    @field_validator("timeframe")
+    @classmethod
+    def _known_timeframe(cls, v: str) -> str:
+        if v not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"unsupported timeframe {v!r}; the platform stores "
+                + ", ".join(SUPPORTED_TIMEFRAMES)
+            )
+        return v
     initial_capital: float = Field(default=100_000.0, ge=1000.0, le=10_000_000.0)
 
 
@@ -48,6 +68,10 @@ async def run_strategy_backtest(
         bars=bars,
         strategy_type=req.strategy_type,
         initial_capital=req.initial_capital,
+        # The short rate the platform measured, resolved here because the
+        # backtest itself is synchronous. Without it the option leg was priced
+        # at a hardcoded 4.5%.
+        risk_free=(await risk_free_rate(redis))[0],
     )
     return report
 
@@ -74,9 +98,13 @@ async def get_all_backtest_results(redis=Depends(get_redis_optional), db=Depends
     # If empty, generate standard baseline reports for default strategies
     if not results:
         backtester = StrategyBacktester(db_client=db, redis_client=redis)
+        # Resolved once for the loop rather than per ticker.
+        rf, _ = await risk_free_rate(redis)
         for ticker, strat in [("NVDA", "covered_call"), ("AAPL", "momentum_trend"), ("MSFT", "mean_reversion")]:
             bars = await backtester.fetch_historical_bars(ticker=ticker, timeframe="5m", limit=200)
-            rep = backtester.backtest_strategy(ticker=ticker, bars=bars, strategy_type=strat)
+            rep = backtester.backtest_strategy(
+                ticker=ticker, bars=bars, strategy_type=strat, risk_free=rf
+            )
             results.append(rep)
 
     return results
@@ -106,4 +134,7 @@ async def get_strategy_backtest_detail(
 
     backtester = StrategyBacktester(db_client=db, redis_client=redis)
     bars = await backtester.fetch_historical_bars(ticker=ticker, timeframe="5m", limit=300)
-    return backtester.backtest_strategy(ticker=ticker, bars=bars, strategy_type=strat_type)
+    return backtester.backtest_strategy(
+        ticker=ticker, bars=bars, strategy_type=strat_type,
+        risk_free=(await risk_free_rate(redis))[0],
+    )

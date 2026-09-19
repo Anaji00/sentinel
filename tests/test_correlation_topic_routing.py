@@ -86,10 +86,29 @@ def test_the_guard_runs_before_the_constructor():
 
 def test_the_analysis_is_kept_rather_than_dropped():
     """Discarding it quietly would fix the DLQ noise and lose the same work.
-    It is cached the way intel briefs on this topic already are."""
+    It is cached the way intel briefs on this topic already are.
+
+    Asserted through the shared key definition rather than the literal. This
+    read `"sentinel:agents:correlation_analysis:" in block`, which was a
+    spelling check: it passed while the key was typed out here and again in the
+    route that reads it, and failed the moment both sides started importing one
+    constant -- which is the state the key-convention ratchet exists to reach.
+    """
+    from shared.utils.agent_conclusions import AGENT_CORRELATION_ANALYSIS_PREFIX
+
     block = SOURCE.split('if "agent" in raw_data and "correlation_id" not in raw_data:')[1][:900]
-    assert "sentinel:agents:correlation_analysis:" in block
+    assert "AGENT_CORRELATION_ANALYSIS_PREFIX" in block, (
+        "the analysis is no longer written under the shared key definition"
+    )
     assert "redis_client.raw.set" in block
+
+    # And the half a name check cannot give: that something reads it back.
+    reader = (ROOT / "services" / "api_gateway" / "routes" / "agents.py").read_text(encoding="utf-8")
+    assert "AGENT_CORRELATION_ANALYSIS_PREFIX" in reader, (
+        "the analysis is cached and nothing serves it, which is where it was "
+        "before /agents/conclusions existed"
+    )
+    assert AGENT_CORRELATION_ANALYSIS_PREFIX.startswith("sentinel:")
 
 
 def test_a_cache_failure_does_not_drop_the_message_loudly():

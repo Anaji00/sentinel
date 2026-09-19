@@ -6,7 +6,12 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 from shared.models.events import entity_cache_key
-from shared.models.events import FilingData, ThirteenFData, SupplyChainData
+from shared.models.events import (
+    FilingData,
+    ThirteenFData,
+    ThirteenFPosition,
+    SupplyChainData,
+)
 from shared.kafka import Topics
 from shared.utils.source_scorecard import baseline_reliability
 from services.enrichment.anomaly_scorer import lift_score
@@ -16,7 +21,7 @@ from shared.models import (
 )
 from shared.utils import quant_calc
 from shared.utils.equities import is_valid_primary_equity
-from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
 from shared.utils.market_session import session_liquidity_factor
 import re 
 
@@ -25,6 +30,7 @@ from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 from shared.utils.quiet_failures import swallowed, dropped
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+from shared.utils.event_identity import derive_event_id
 logger = logging.getLogger("enrichment.tradfi")
 
 
@@ -184,7 +190,11 @@ THIRTEEN_F_MOVEMENT_SCALE = 2.0
 # two weights are what let one outrank another.
 # Sigma at which a volume spike is already clearly significant. The curve is
 # 1 - exp(-z/scale), so this is the point reaching ~63% of the range.
-Z_SCORE_SCALE = 5.0
+#
+# Imported rather than declared: the gateway had its own Z_SCORE_SCALE = 4.5 and
+# used it to multiply a unit score back out into a field called z_score, which
+# is neither the same constant nor the inverse of this curve.
+from shared.utils.anomaly_scale import Z_SCORE_SCALE, z_to_score  # noqa: E402
 
 # Where an earnings surprise, judged on size alone, reaches the top of its band.
 # Fifty percent away from consensus is already extraordinary; the curve
@@ -476,6 +486,36 @@ def _earnings_proximity_lift(days_out: Optional[int], notional: float) -> float:
 
 
 
+async def _read_day_move(redis_client, ticker: str) -> dict:
+    """Today's move and gap for one ticker, from the radar's movers snapshot.
+
+    The radar sweep computes both for every symbol it prices and publishes them
+    per ticker; the enricher never joined to them, so `FinancialData.change_pct_day`
+    and `.gap_pct` were declared and never written. Empty dict when the sweep
+    has not priced this name -- null on the payload, which is "not measured",
+    not "flat".
+    """
+    if redis_client is None:
+        return {}
+    try:
+        from shared.utils.radar_keys import movers_snapshot_key
+
+        raw = getattr(redis_client, "raw", redis_client)
+        detail = await raw.hgetall(movers_snapshot_key(ticker))
+    except Exception as _exc:
+        swallowed("enrichment.tradfi.day_move", _exc, logger, detail=ticker)
+        return {}
+    out = {}
+    for k, v in (detail or {}).items():
+        key = k.decode() if isinstance(k, bytes) else k
+        value = v.decode() if isinstance(v, bytes) else v
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
     def __init__(self, scorer, redis_client, graph_writer, db=None):
@@ -541,8 +581,13 @@ class TradFiEnricher:
                 return res[0] if res else None
         elif source == "nyfed_sofr":
             r_val = p.get("risk_free_rate", 0.045)
-            await self.redis_client.raw.set("sentinel:macro:sofr_rate", str(r_val), ex=86400)
-            await self.redis_client.raw.set("sentinel:macro:risk_free_rate", str(r_val), ex=86400)
+            # Keys named once, in shared/utils/rates.py, beside the reader that
+            # was missing until now. Spelled out here, they were written and
+            # never read by anything: every Sharpe ratio on the platform assumed
+            # a 0% short rate while this line logged a live one.
+            from shared.utils.rates import RISK_FREE_RATE_KEY, SOFR_RATE_KEY
+            await self.redis_client.raw.set(SOFR_RATE_KEY, str(r_val), ex=86400)
+            await self.redis_client.raw.set(RISK_FREE_RATE_KEY, str(r_val), ex=86400)
             logger.info(f"🏛️ SOFR Enricher: Updated live Federal Reserve risk-free rate in Redis: {r_val}")
             return None
         elif source == "sec_form4":
@@ -724,17 +769,29 @@ class TradFiEnricher:
             if anomaly >= 0.5:
                 self.scorer.record_hawkes_event("tradfi")
                 
-            # Trigger multi-timeframe structural candle evaluation & logging for watched equities
-            if is_watched and price > 0:
-                try:
-                    from shared.utils.candles import evaluate_multi_timeframe
-                    ts = raw.occurred_at or datetime.now(timezone.utc)
-                    await evaluate_multi_timeframe(
-                        self.redis_client, self.scorer, domain="tradfi", asset=ticker,
-                        ts=ts, open_p=price, high_p=price, low_p=price, close_p=price, volume=volume
-                    )
-                except Exception as candle_err:
-                    logger.debug(f"Candle evaluation warning for {ticker}: {candle_err}")
+            # The block-trade path no longer builds candles. Two reasons, and
+            # the first is a correctness bug rather than a tidy-up.
+            #
+            # Every trade already goes into the collector's minute aggregator,
+            # and the resulting OHLCV_MINUTE_BAR is routed to
+            # `_enrich_equity_candle`, which calls `evaluate_multi_timeframe`
+            # for the same ticker and therefore the same Redis bucket. Block
+            # trades were also emitted separately as RAW_TRADE and reached this
+            # path, which added the same shares to `block["volume"]` a second
+            # time. `notional_volume = close * volume` is `features[2]`, one of
+            # the three inputs to the structural anomaly score -- so the score
+            # was inflated, and inflated most for the largest prints, which are
+            # the ones it exists to find.
+            #
+            # Second: this call discarded its return value. The bar path binds
+            # the anomalous frames and emits an event per frame; here they were
+            # computed and dropped. One function, treated as a measurement by
+            # one caller and as a side effect by the other, with nothing saying
+            # which it was.
+            #
+            # Removing the call loses no candle: the minute-bar feed builds the
+            # same buckets from the same trades, once, with a real open, high
+            # and low instead of one price repeated four times.
 
             if price > 0:
                 set_pipe.set(quote_key(ticker), price, ex=QUOTE_CACHE_TTL_SEC)
@@ -1198,7 +1255,23 @@ class TradFiEnricher:
             except Exception as e:
                 logger.error(f"Failed to cache latest quote for {ticker}: {e}")
         
-        if close_p <= 0 or volume <= 0: return None
+        # A bar needs a price. It does not need a volume: the macro tier serves
+        # the eleven GICS sector ETFs from Finnhub's quote endpoint, which
+        # reports no volume at all, so `volume` is UNKNOWN for them rather than
+        # zero. Testing both here meant every sector ETF returned before the
+        # "unconditional" persist below and not one bar was ever stored -- the
+        # feed published XLK at $188.00 every seventy seconds for hours and
+        # tradfi_bars held nothing. The volume test still guards the candle and
+        # spike work further down, which genuinely cannot run without it; it is
+        # simply no longer allowed to decide whether the price is recorded.
+        if close_p <= 0:
+            return None
+
+        # Unknown is written as NULL, not as 0.0. A zero would claim the ETF did
+        # not trade, which is the same invention as the hardcoded 1000.0 the
+        # collector was corrected for -- and the 5-minute aggregate SUMs this
+        # column, so a fabricated zero propagates.
+        volume_db = None if p.get("volume") is None else volume
 
         # Unconditionally persist closed bar to durable TimescaleDB tradfi_bars hypertable (§2.1, §2.4)
         ts = raw.occurred_at or datetime.now(timezone.utc)
@@ -1218,15 +1291,27 @@ class TradFiEnricher:
                         high = EXCLUDED.high,
                         low = EXCLUDED.low,
                         close = EXCLUDED.close,
-                        volume = EXCLUDED.volume,
+                        -- A ticker can be served by two tiers at the same
+                        -- timestamp. COALESCE keeps a volume that was actually
+                        -- reported instead of letting a quote-sourced NULL
+                        -- erase it; without this the last writer would win and
+                        -- the winner is whichever feed polled last.
+                        volume = COALESCE(EXCLUDED.volume, tradfi_bars.volume),
                         session = EXCLUDED.session;
                     """,
-                    ticker, ts, open_p, high_p, low_p, close_p, volume, session_tag
+                    ticker, ts, open_p, high_p, low_p, close_p, volume_db, session_tag
                 )
         except Exception as bar_err:
             # Counted, not only whispered. This handler is why bar persistence
             # could fail indefinitely while the enricher reported success.
             swallowed("enrichment.tradfi_bars_persist", bar_err, logger, detail=ticker)
+
+        # Everything below is volume work -- spike detection and multi-timeframe
+        # candle evaluation -- and none of it can run on a bar whose volume is
+        # unknown or zero. This is the second half of the guard that used to sit
+        # above the persist.
+        if volume <= 0:
+            return None
 
         is_watched = await self.scorer.check_watchlist(ticker, "equities")
         if not is_watched:
@@ -1292,32 +1377,83 @@ class TradFiEnricher:
             direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
             headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:+.2f}% on ${notional/1e6:.1f}M vol"
     
-            # Compute Parkinson volatility for the bar
-            parkinson = quant_calc.parkinson_volatility([block["high"]], [block["low"]])
-
             # Multi-bar microstructure from 15-bar rolling history
             history_vol_key = f"tradfi:history{tf}m:{ticker}:volumes"
             history_not_key = f"tradfi:history{tf}m:{ticker}:notionals"
             history_cls_key = f"tradfi:history{tf}m:{ticker}:closes"
+            history_high_key = f"tradfi:history{tf}m:{ticker}:highs"
+            history_low_key = f"tradfi:history{tf}m:{ticker}:lows"
+
+            # The radar's snapshot for this ticker: today's move and the gap.
+            # Read once per event rather than per timeframe.
+            day_move = await _read_day_move(self.redis_client, ticker)
+
+            # None until the history can support it, not 0.0.
+            #
+            # This was `parkinson_volatility([block["high"]], [block["low"]])` --
+            # one bar, in single-element lists, against an estimator that
+            # returns 0.0 below two observations. It was therefore exactly zero
+            # on every event ever emitted, stored on the microstructure payload
+            # and stated in the summary as "Parkinson Volatility: 0.0000".
+            parkinson = None
+            ewma_vol = None
+            skewness = None
+            hurst = None
 
             bar_k_lambda = 0.0
             bar_ami = 0.0
             bar_vwap = block["close"]  # fallback
 
             try:
-                cls_bytes, vol_bytes, not_bytes = await asyncio.gather(
+                cls_bytes, vol_bytes, not_bytes, high_bytes, low_bytes = await asyncio.gather(
                     self.redis_client.raw.lrange(history_cls_key, 0, 14),
                     self.redis_client.raw.lrange(history_vol_key, 0, 14),
                     self.redis_client.raw.lrange(history_not_key, 0, 14),
+                    self.redis_client.raw.lrange(history_high_key, 0, 14),
+                    self.redis_client.raw.lrange(history_low_key, 0, 14),
                 )
                 hist_closes = [float(c) for c in reversed(cls_bytes)] if cls_bytes else []
                 hist_volumes = [float(v) for v in reversed(vol_bytes)] if vol_bytes else []
                 hist_notionals = [float(n) for n in reversed(not_bytes)] if not_bytes else []
+                hist_highs = [float(h) for h in reversed(high_bytes)] if high_bytes else []
+                hist_lows = [float(l) for l in reversed(low_bytes)] if low_bytes else []
 
                 # Append current bar
                 hist_closes.append(block["close"])
                 hist_volumes.append(block["volume"])
                 hist_notionals.append(block["close"] * block["volume"])
+                hist_highs.append(block["high"])
+                hist_lows.append(block["low"])
+
+                # A dispersion over the bars that exist. `parkinson_volatility`
+                # returns 0.0 below two usable observations, which is
+                # indistinguishable from a genuinely flat series, so the
+                # too-short case is answered with None here instead.
+                if len(hist_highs) >= 2 and len(hist_highs) == len(hist_lows):
+                    measured = quant_calc.parkinson_volatility(hist_highs, hist_lows)
+                    parkinson = measured if measured > 0 else None
+
+                # Three metrics that `MarketMicrostructure` declares, all
+                # three already implemented in quant_calc, none of them attached
+                # to the payload until now.
+                #
+                # `realized_skewness` still returns 0.0 when it cannot answer,
+                # and 0.0 is also a symmetric distribution -- so it is read back
+                # as None here rather than asserting symmetry about a series too
+                # short to say anything about. `hurst_exponent` used to do the
+                # same with 0.5 and now returns None itself, which is why only
+                # one of the three needs the guard.
+                if len(hist_closes) >= 6:
+                    returns = quant_calc.simple_returns(hist_closes)
+                    if returns:
+                        measured_ewma = quant_calc.ewma_volatility(returns, annualize=False)
+                        ewma_vol = measured_ewma if measured_ewma > 0 else None
+                        if len(returns) >= 20:
+                            measured_skew = quant_calc.realized_skewness(returns)
+                            skewness = measured_skew if measured_skew != 0.0 else None
+                    # None when the estimator refuses; no sentinel to
+                    # mistake for a measurement.
+                    hurst = quant_calc.hurst_exponent(hist_closes)
 
                 if len(hist_closes) >= 2:
                     # Kyle's λ: ΔP vs signed volumes (guarded by n≥10 inside kyle_lambda)
@@ -1340,6 +1476,9 @@ class TradFiEnricher:
 
             micro = MarketMicrostructure(
                 parkinson_volatility=parkinson,
+                ewma_volatility=ewma_vol,
+                realized_skewness=skewness,
+                hurst_exponent=hurst,
                 vwap=bar_vwap,
                 twap=(block["high"] + block["low"] + block["close"]) / 3.0,
                 realized_volatility=volatility_pct,
@@ -1361,7 +1500,13 @@ class TradFiEnricher:
                 ),
             )
             
-            bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson:.4f}. Anomaly Score: {anomaly:.2f}."
+            # "not enough history" rather than a number, because this line is
+            # the summary the reasoning service puts in front of the model and
+            # a stated 0.0000 is a measurement claim.
+            parkinson_text = (
+                f"{parkinson:.4f}" if parkinson is not None else "not enough history"
+            )
+            bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson_text}. Anomaly Score: {anomaly:.2f}."
 
             # Populate active statistical correlation IDs (§8.2)
             stat_corr_ids = []
@@ -1373,7 +1518,11 @@ class TradFiEnricher:
                 swallowed("enrichment.enrichers.tradfi._enrich_equity_candle", _exc, logger)
 
             events.append(NormalizedEvent(
-                event_id=raw.event_id, trace_id=raw.trace_id,
+                # One id per bar. The same fan-out as the crypto candle path,
+                # and the same repair: the vector index, /events/detail and
+                # every correlation citation key on this field.
+                event_id=derive_event_id(raw.event_id, ticker, tf, candle_observation_ts(block, tf)),
+                trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
                 # The same rule the crypto candle path uses. This carried the
                 # bucket's start, which is stale by up to the timeframe; the
@@ -1396,7 +1545,24 @@ class TradFiEnricher:
                     open_price=block["open"],
                     high_price=block["high"],
                     low_price=block["low"],
-                    close_price=block["close"]
+                    close_price=block["close"],
+                    # Already computed, three lines above, and printed into the
+                    # headline. Carried now, so a rule can select on it.
+                    change_pct_bar=round(price_change_pct * 100.0, 4),
+                    # The day, and the overnight gap, from the radar's own
+                    # sweep. Both fields were declared on FinancialData and
+                    # written by nothing: `event_move_pct` reads
+                    # `change_pct_day` first, so its preferred source was
+                    # always null and every lookup fell through to the bar.
+                    #
+                    # A bar's move and a day's move are different questions and
+                    # the model comment argued the case for keeping them apart
+                    # -- "a name up 6% that gapped 7% and was sold from the open
+                    # is not the name that ground 6% higher through the session"
+                    # -- which was a distinction declared in a type and absent
+                    # from every record.
+                    change_pct_day=day_move.get("day_pct"),
+                    gap_pct=day_move.get("gap_pct"),
                 ),
                 headline=headline,
                 summary=bar_summary,
@@ -1635,14 +1801,26 @@ class TradFiEnricher:
             return None
         try:
             raw = await self.redis_client.raw.get(quote_key(ticker))
-            if not raw:
-                return None
-            data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-            value = data.get("price") or data.get("close") or data.get("last")
-            spot = float(value) if value is not None else None
-            return spot if spot and spot > 0 else None
-        except Exception:
+        except Exception as exc:
+            swallowed("enrichment.tradfi.underlying_spot", exc, logger, detail=ticker)
             return None
+        # parse_quote, not a hand-rolled parse.
+        #
+        # This read `json.loads(raw).get("price")`. Every writer in the tree
+        # stores a bare number -- the cache holds `1623.63` for ASML, not an
+        # object -- and `json.loads("1623.63")` is a float, so `.get` raised
+        # AttributeError into the bare `except` below and this returned None for
+        # every ticker, every time. Measured: underlying_price populated on 0 of
+        # 603 options events, and otm_percentage with it, since that is computed
+        # from the spot.
+        #
+        # The helper exists precisely because this shape has now been written
+        # four times: its own docstring records being repaired in base.py, then
+        # again in the paper broker, then a third time by a repair that copied
+        # the object form and shipped a test whose fixture wrote a format
+        # nothing produces. This was the fourth.
+        spot = parse_quote(raw)
+        return spot if spot and spot > 0 else None
 
     async def _enrich_options_flow(self, raw, p) -> Optional[NormalizedEvent]:
         ticker = (p.get("ticker") or "").upper()
@@ -1841,7 +2019,7 @@ class TradFiEnricher:
         # distinguishable from it and from each other. The curve approaches 1.0
         # and never arrives, which is the honest shape for an unbounded
         # statistic -- there is always a larger spike.
-        base_score = 1.0 - math.exp(-max(0.0, z_score) / Z_SCORE_SCALE)
+        base_score = z_to_score(z_score)
         lift_spent = 0.0
         anomaly = _lift(base_score, w_boost, lift_spent)
         lift_spent += w_boost
@@ -2270,6 +2448,15 @@ class TradFiEnricher:
                 # container indices, and left as None rather than guessed.
                 vessel_class=p.get("vessel_class"),
                 anomaly_flag=is_spike,
+                # Carried rather than dropped. Validated to a list of strings
+                # because everything else in this payload comes from a
+                # collector's own table and this is the one field a downstream
+                # reader would act on.
+                exposed_equities=[
+                    str(t).upper().strip()
+                    for t in (p.get("exposed_equities") or [])
+                    if t and isinstance(t, (str, bytes))
+                ],
             ),
             headline=headline,
             summary=(
@@ -2314,6 +2501,32 @@ class TradFiEnricher:
         )
 
         entity = Entity(id=filer_id, type=EntityType.COMPANY, name=filer_name)
+
+        # Validated on the way in, because these become graph edges.
+        holdings = []
+        for raw_pos in (p.get("top_holdings") or []):
+            if not isinstance(raw_pos, dict):
+                continue
+            try:
+                holdings.append(ThirteenFPosition(**raw_pos))
+            except Exception as exc:
+                swallowed(
+                    "enrichment.tradfi.13f_position", exc, logger,
+                    detail=str(raw_pos.get("issuer_name", ""))[:60],
+                )
+
+        # Positions to the graph before the re-read guard below, not after.
+        #
+        # The guard exists to stop one quarterly filing being *emitted* six
+        # times, and it is right to. But the graph edges are a MERGE of about a
+        # hundred rows keyed on (filer, ticker), so a re-read rewrites the same
+        # edges at no cost -- while putting this after the guard would mean the
+        # ten portfolios already on the platform never reached the graph at all,
+        # because their next genuinely-new filing is a quarter away.
+        #
+        # Suppressing an event and suppressing a database write are different
+        # decisions and were being made by one check.
+        await self._link_13f_holdings(filer_id, filer_name, holdings)
 
         # One filing, one event. The poller re-reads the same quarter.
         #
@@ -2402,9 +2615,82 @@ class TradFiEnricher:
                 report_period=period,
                 total_value_usd=total_val,
                 holdings_count=pos_count,
+                # The positions themselves, which this model has always had a
+                # field for and which nothing has ever filled.
+                #
+                # The collector parses every holding out of the 13F XML,
+                # resolves each issuer to a ticker against SEC's registry and
+                # computes quarter-over-quarter deltas, then publishes the lot.
+                # This enricher read six scalars off the top of that payload and
+                # dropped the rest, so a filing worth hundreds of billions
+                # across dozens of positions arrived as a headline and a count.
+                top_holdings=holdings,
+                new_positions_count=int(p.get("new_positions_count") or 0),
+                exited_positions_count=int(p.get("exited_positions_count") or 0),
             ),
             headline=headline,
             summary=summary,
             tags=tags,
             anomaly_score=round(anomaly, 3),
         )
+
+
+    async def _link_13f_holdings(
+        self, filer_id: str, filer_name: str, holdings
+    ) -> int:
+        """`(InstitutionalFiler)-[:OWNS]->(Company)` for each resolved position.
+
+        `InstitutionalFiler` is in the ontology's allowlist and held zero nodes;
+        `OWNS` held thirteen edges in a graph of three hundred thousand. The
+        data to fill both has been arriving every quarter and stopping here.
+
+        What it buys is a channel the graph could not otherwise express: two
+        companies held by the same fund share a forced seller. That is a real
+        transmission path between names with no supply, sector or competitive
+        relationship at all, and it is the one an unwind travels down.
+
+        Positions whose issuer did not resolve to a ticker are skipped rather
+        than written under their raw name -- an `OWNS` edge to "Ishares Inc"
+        points at nothing, and a node that looks like a company but never
+        prices is worse than an absent edge.
+        """
+        if not self.graph or not holdings:
+            return 0
+
+        written = 0
+        for pos in holdings:
+            ticker = (getattr(pos, "ticker", None) or "").strip().upper()
+            if not ticker:
+                continue
+            try:
+                await self.graph.link_entities(
+                    source_id=filer_id,
+                    relation_type="OWNS",
+                    target_id=ticker,
+                    properties={
+                        # Portfolio weight is the useful number: $65.9B of Apple
+                        # is a different fact about a $50B book than about a
+                        # $300B one, and the position value alone cannot say
+                        # which. Stored as a fraction, like every other weight.
+                        "weight": float(getattr(pos, "weight_pct", 0.0) or 0.0) / 100.0,
+                        "market_value_usd": float(
+                            getattr(pos, "market_value_usd", 0.0) or 0.0
+                        ),
+                        "shares": float(getattr(pos, "shares", 0.0) or 0.0),
+                        "change_type": str(getattr(pos, "change_type", "") or ""),
+                        "source": "sec_edgar_13f",
+                    },
+                    source_label="InstitutionalFiler",
+                    target_label="Company",
+                )
+                written += 1
+            except Exception as exc:
+                swallowed(
+                    "enrichment.tradfi.13f_holding_edge", exc, logger,
+                    detail=f"{filer_id}->{ticker}",
+                )
+        if written:
+            logger.info(
+                "13F: linked %d holdings for %s into the graph.", written, filer_name,
+            )
+        return written

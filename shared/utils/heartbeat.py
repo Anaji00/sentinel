@@ -12,6 +12,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Any, Callable, Union
 
+from shared.utils.liveness import flush as liveness_flush
+
 logger = logging.getLogger("shared.heartbeat")
 
 # What a component has to report for its work to be graded, and the thresholds
@@ -140,6 +142,74 @@ ALL_KNOWN_COMPONENTS = [
 # Components that only run under an opt-in compose profile. Absence is a
 # deployment mode, not a fault, so health scoring must not count them as failed.
 OPTIONAL_COMPONENTS = frozenset({"agents-heavy", "agents-fast"})
+
+from shared.utils.quiet_failures import swallowed
+
+SCAN_SUPPRESSION_PREFIX = "sentinel:health:scan_suppressed:"
+SCAN_SUPPRESSION_TTL_SEC = 900
+
+
+async def record_scan_suppression(redis_client, detector: str, component: str, reason: str) -> None:
+    """Records that a detector declined to scan because its feed was stale.
+
+    The gap detectors do the right thing when a collector's heartbeat goes
+    stale: they suppress the dark-vessel and dark-aircraft alarms that a dead
+    feed would otherwise manufacture, and emit an INFRASTRUCTURE_DEGRADED event
+    scored 0.85.
+
+    Nothing read that event. No correlation rule names the type, so it never
+    became a correlation; the alert manager consumes CORRELATIONS,
+    SCENARIOS_GENERATED and INTEL_BRIEFS rather than ENRICHED_EVENTS, so a 0.85
+    event that never becomes a correlation could never become an alert.
+
+    The stale heartbeat itself *is* surfaced -- /health/data reports every
+    component's heartbeat age, and the HUD reads it. What was not surfaced is
+    the consequence: that a scan did not run, so a reader looking at a quiet
+    vessel_dark count cannot tell a quiet ocean from a suppressed sweep. This
+    is that fact, written where the health route already looks.
+    """
+    if redis_client is None:
+        return
+    try:
+        import json as _json
+        from datetime import datetime, timezone
+
+        raw = getattr(redis_client, "raw", redis_client)
+        await raw.set(
+            f"{SCAN_SUPPRESSION_PREFIX}{detector}",
+            _json.dumps({
+                "detector": detector,
+                "component": component,
+                "reason": reason,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }),
+            ex=SCAN_SUPPRESSION_TTL_SEC,
+        )
+    except Exception as _exc:
+        # A health annotation must never be the reason a detector fails -- but
+        # it must not vanish either, or the surface silently stops reporting
+        # suppressions and reads as "nothing suppressed".
+        swallowed("shared.heartbeat.record_scan_suppression", _exc)
+
+
+async def suppressed_scans(redis_client) -> list:
+    """Detectors currently declining to scan, newest first. [] when none."""
+    if redis_client is None:
+        return []
+    out = []
+    try:
+        import json as _json
+
+        raw = getattr(redis_client, "raw", redis_client)
+        async for key in raw.scan_iter(match=f"{SCAN_SUPPRESSION_PREFIX}*", count=50):
+            blob = await raw.get(key)
+            if blob:
+                out.append(_json.loads(blob if isinstance(blob, str) else blob.decode()))
+    except Exception as _exc:
+        swallowed("shared.heartbeat.suppressed_scans", _exc)
+        return out
+    return sorted(out, key=lambda r: r.get("at") or "", reverse=True)
+
 
 async def get_all_heartbeats_status(redis_client: Any, custom_components: Optional[list] = None) -> dict:
     """
@@ -311,5 +381,26 @@ async def start_heartbeat_task(
             break
         except Exception as e:
             logger.debug(f"Heartbeat loop exception for {component}: {e}")
+
+        # Mechanism liveness rides along with the heartbeat.
+        #
+        # Every service already runs this loop, which is the whole reason the
+        # flush lives here: a liveness registry that each service had to
+        # remember to drain would be one more mechanism nobody wired -- which
+        # is precisely the defect it exists to detect. Hooking it to the beat
+        # means declaring a mechanism is the only thing a caller has to do.
+        #
+        # Separately guarded: a liveness flush that broke the heartbeat would
+        # take a service's health reporting down to record a counter.
+        try:
+            await liveness_flush(redis_client)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            # Counted, not whispered: this deployment emits no DEBUG lines, so
+            # a flush failing here would be silent in exactly the way the
+            # registry exists to make impossible.
+            swallowed("utils.heartbeat.liveness_flush", e, logger, detail=component)
+
         await asyncio.sleep(interval)
 

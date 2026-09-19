@@ -20,7 +20,7 @@ from typing import Optional, List
  
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
-from shared.utils.heartbeat import is_component_healthy
+from shared.utils.heartbeat import record_scan_suppression,  is_component_healthy
 from shared.utils.quiet_failures import swallowed
  
 logger = logging.getLogger("enrichment.gap_detector")
@@ -78,6 +78,16 @@ class VesselGapDetector:
         is_healthy = await is_component_healthy(self.redis, "collector-ais")
         if not is_healthy:
             logger.warning("Collector collector-ais heartbeat is stale/missing. Suppressing VESSEL_DARK scan.")
+
+            # Recorded where /health/data can see it: a suppressed scan
+
+            # is not a quiet feed, and the count alone cannot say which.
+
+            await record_scan_suppression(
+
+                self.redis, "vessel_dark", "collector-ais", "collector heartbeat stale"
+
+            )
             degraded_event = NormalizedEvent(
                 type=EventType.INFRASTRUCTURE_DEGRADED,
                 occurred_at=now,

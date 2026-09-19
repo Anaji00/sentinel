@@ -38,6 +38,7 @@ from services.enrichment.entity_resolver import EntityResolver
 from services.enrichment.gap_detector import VesselGapDetector
 
 from shared.utils.tasks import safe_create_task
+from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.live_feed import worth_broadcasting
 
 # --- THE NEW ENRICHERS ---
@@ -249,6 +250,74 @@ async def _heartbeat_loop(state: dict):
 VOLATILITY_INDEXES = ["QQQ", "SPY"]
 VOLATILITY_INTERVAL_SEC = 900
 VOLATILITY_LOOKBACK_BARS = 240
+
+
+# How often the per-ticker standing is recomputed, and how far back it reads.
+#
+# Daily bars, so there is nothing to gain from running this faster than the
+# bars change; the interval is short enough to pick up a newly watched ticker
+# within the session rather than tomorrow.
+TICKER_STATS_INTERVAL_SEC = 1800
+# 220 sessions: enough for a 200-day average with margin for holidays, and
+# `tradfi_bars` is retained for 400 days specifically so this is reachable.
+TICKER_STATS_LOOKBACK_SESSIONS = 220
+
+
+async def _ticker_stats_loop(timescale, redis_client) -> None:
+    """Where each watched ticker stands, refreshed from its own daily bars.
+
+    `moving_average_distances()` has returned sma_20/50/200, the distance to
+    each and an alignment label for as long as it has existed, and was called
+    from two request handlers that recomputed it and discarded the result. So a
+    watchlist row could say "NVDA, added Tuesday" and nothing else, while the
+    material for "+8.4% this week, 12% above its 50-day" sat in a table nobody
+    joined to it.
+
+    Scoped to the watchlist rather than the universe: about forty tickers at
+    220 closes each, twice an hour, against a radar sweep that already costs
+    11,631 symbols a minute. Widening this to the universe would be a different
+    decision with a different cost, and should be taken on measurement.
+    """
+    from shared.utils.ticker_stats import compute_ticker_stats, write_ticker_stats
+    from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+
+    await asyncio.sleep(90)
+    while True:
+        try:
+            raw_members = await redis_client.raw.zrange(WATCHED_EQUITIES_KEY, 0, -1)
+            tickers = [
+                (m.decode() if isinstance(m, bytes) else str(m)).upper()
+                for m in (raw_members or [])
+            ]
+            if not tickers:
+                logger.debug("Ticker stats: the watchlist is empty; nothing to compute.")
+            written = thin = 0
+            for ticker in tickers:
+                rows = await timescale.query(
+                    "SELECT close FROM tradfi_bars_1d WHERE ticker = $1 "
+                    "ORDER BY bucket_time DESC LIMIT $2",
+                    ticker, TICKER_STATS_LOOKBACK_SESSIONS,
+                )
+                # Oldest first, so the averages and the trailing windows run
+                # forward in time.
+                closes = [r["close"] for r in (rows or []) if r.get("close") is not None]
+                stats = compute_ticker_stats(list(reversed(closes)))
+                if stats is None:
+                    # Too little history to say anything. Recorded as a count
+                    # rather than written as zeros: a row of zeros reads as "at
+                    # its average" to anyone who does not check `sessions`.
+                    thin += 1
+                    continue
+                await write_ticker_stats(redis_client, ticker, stats)
+                written += 1
+            if tickers:
+                logger.info(
+                    "Ticker standing refreshed: %s of %s watched tickers (%s with "
+                    "too little history).", written, len(tickers), thin,
+                )
+        except Exception as _exc:
+            swallowed("enrichment.ticker_stats_loop", _exc, logger)
+        await asyncio.sleep(TICKER_STATS_INTERVAL_SEC)
 
 
 async def _volatility_loop(timescale, redis_client) -> None:
@@ -645,11 +714,14 @@ async def main():
         _volatility_loop(timescale, redis), name="realised-volatility"
     )
     safe_create_task(
+        _ticker_stats_loop(timescale, redis), name="ticker-standing"
+    )
+    safe_create_task(
         _score_diversity_loop(timescale), name="score-diversity"
     )
     
     # Wait for databases to come online
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="enrichment")
     dlq = SentinelProducer(service_name="enrichment-dlq")
     await producer.start()
     # Started, like every other producer.
@@ -676,6 +748,12 @@ async def main():
     maritime = MaritimeEnricher(scorer, redis, graph, resolver)
     aviation = AviationEnricher(scorer, redis, graph, resolver)
     news = NewsEnricher(scorer, redis, graph)
+    # Wired unconditionally, deliberately. Cyber is in RETIRED_DOMAINS and its
+    # collector is gated behind the `cyber` compose profile rather than deleted,
+    # so the profile can be switched on -- and when it is, RAW_CYBER needs a
+    # consumer on the other end. Gating this to match the collector was tried
+    # and reverted: `test_every_produced_topic_has_a_consumer` is right that a
+    # produced topic with no reader is the worse failure.
     cyber = CyberEnricher(scorer, redis, graph)
     tradfi = TradFiEnricher(scorer, redis, graph, db=timescale)
     crypto = CryptoEnricher(scorer, redis, graph)
@@ -769,7 +847,7 @@ async def main():
                         raw_events_by_topic.setdefault(msg.topic, []).append(raw_event)
                     except Exception as e:
                         logger.error(f"POISON PILL / Invalid RawEvent dropped: {e}", exc_info=True)
-                        pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": f"Invalid RawEvent: {e}", "topic": msg.topic, "raw": str(msg.value)}))
+                        pending_dlq_tasks.append(dlq.send(Topics.DLQ, {"error": f"Invalid RawEvent: {e}", "topic": msg.topic, "raw": encode_dlq_payload(msg.value)}))
                 
                 # Each task carries the topic and events it belongs to.
                 #

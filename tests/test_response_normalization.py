@@ -205,10 +205,33 @@ def test_radar_route_normalizes_its_scores():
            / "services" / "api_gateway" / "routes" / "radar.py").read_text(encoding="utf-8")
 
     assert "score_dto(" in src, "radar anomalies are not normalized"
-    assert 'float(r["anomaly_score"] or 0.0) * 4.5' not in src, (
-        "raw unrounded z_score computation still present"
+
+    # The property, not the spelling.
+    #
+    # This asserted the name `Z_SCORE_SCALE` appeared in the route, as a proxy
+    # for "the factor is not inlined". The route did contain it -- its own
+    # Z_SCORE_SCALE = 4.5, against the enricher's 5.0 -- and multiplied a unit
+    # score by it to produce a field called `z_score`. The name was present and
+    # the arithmetic was wrong, which is what a spelling check cannot see.
+    #
+    # What has to hold is that the two are inverses: a sigma compressed into a
+    # score and read back out is the sigma it started as.
+    from shared.utils.anomaly_scale import MAX_REPORTABLE_Z, score_to_z, z_to_score
+
+    for z in (0.5, 1.0, 2.5, 5.0, 10.0, 20.0):
+        assert abs(score_to_z(z_to_score(z)) - z) < 0.01, (
+            f"{z} sigma does not survive the round trip through the unit score"
+        )
+
+    # And that the display cannot be bounded by a constant the way `* 4.5` was:
+    # five, ten and twenty sigma must stay distinguishable.
+    shown = [score_to_z(z_to_score(z)) for z in (5.0, 10.0, 20.0)]
+    assert shown[1] - shown[0] > 1.0 and shown[2] - shown[1] > 1.0, (
+        f"large moves collapse together in the reported z: {shown}"
     )
-    assert "Z_SCORE_SCALE" in src, "magic scaling factor is still inlined"
+    assert score_to_z(1.0) == MAX_REPORTABLE_Z, "a saturated score must not report infinity"
+
+    assert "score_to_z" in src, "the route no longer inverts the enricher's curve"
 
 
 def test_scenarios_route_uses_an_explicit_field_contract():

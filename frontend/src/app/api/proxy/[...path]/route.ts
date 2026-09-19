@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { verifySessionToken } from '../../auth/login/route';
+import { verifySessionToken } from '@/lib/session';
 
 // Its three sibling handlers (auth/login, auth/sso/start, auth/sso/callback)
 // all default to the gateway; this one defaulted to localhost, which inside the
@@ -119,7 +119,7 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   if (!hasSession && !publicPath && !probePath && isDev) {
     console.warn(
       `[proxy] ${pathStr} forwarded without a session (development). ` +
-      'The gateway will treat this as an anonymous caller.'
+        'The gateway will treat this as an anonymous caller.',
     );
   }
 
@@ -144,7 +144,7 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
   } catch (err: any) {
     return NextResponse.json(
       { error: 'Backend gateway proxy error', message: err.message },
-      { status: 502 }
+      { status: 502 },
     );
   }
 }

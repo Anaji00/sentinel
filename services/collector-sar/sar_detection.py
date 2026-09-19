@@ -61,6 +61,43 @@ BLIND_CHOKEPOINTS: Dict[str, Dict[str, float]] = {
 # time rather than an absolute count.
 VV_TARGET_THRESHOLD_DB = float(os.getenv("SAR_VV_THRESHOLD_DB", "0.0"))
 
+
+def _linear(db: float) -> float:
+    """A decibel threshold as the linear ratio the data is actually in.
+
+    This is the whole defect. openEO's SENTINEL1_GRD applies the
+    sigma0-ellipsoid coefficient and hands back LINEAR backscatter, and the
+    comparison below was `value > VV_TARGET_THRESHOLD_DB` -- a dB number
+    against linear power. Sigma0 is a power ratio and is therefore always
+    positive, so `> 0.0` admitted every valid pixel.
+
+    Measured over Bab-el-Mandeb, max over an eight-day window:
+
+        min   0.000102   (-39.9 dB)
+        mean  0.0549     (-12.6 dB)
+        max   122.59     (+20.9 dB)
+
+    And the consequence, in the baselines this platform had already collected:
+
+        bab-el-mandeb      1.0  1.0  1.0  0.99999995 ... 0.99999979
+        strait_of_hormuz   0.99999999 ... 1.0  0.99996635
+        suez_canal         0.99999992 ... 1.0
+
+    Every chokepoint, every pass, ~100% of the water returning like metal. The
+    z-scores computed from that series were differences in the eighth decimal
+    place, so every traffic assessment this collector has ever published --
+    including the ones that reached SUPPLY_CHAIN_METRIC and
+    rule_physical_disruption_repricing -- described noise.
+
+    Converting here rather than restating the constant in linear units keeps
+    the operator-facing knob in the unit the literature uses. 0 dB is 1.0.
+    """
+    return 10.0 ** (db / 10.0)
+
+
+# The comparison value, in the units the pixels arrive in.
+VV_TARGET_THRESHOLD_LINEAR = _linear(VV_TARGET_THRESHOLD_DB)
+
 # How far back to look for an acquisition. The constellation revisit is six
 # days nominal, so a shorter window frequently finds nothing at all, which
 # would look like an empty strait rather than a satellite that has not passed.
@@ -100,7 +137,10 @@ class ChokepointReading:
             "target_density": self.target_density,
             "bbox": self.bbox,
             "instrument": "sentinel-1-sar",
-            "method": f"VV backscatter > {VV_TARGET_THRESHOLD_DB} dB",
+            "method": (
+                f"VV sigma0 > {VV_TARGET_THRESHOLD_LINEAR:.4g} linear "
+                f"({VV_TARGET_THRESHOLD_DB} dB)"
+            ),
             # Stated on every reading, because a reader who takes this for a
             # vessel count will draw conclusions it cannot support.
             "is_vessel_count": False,
@@ -161,6 +201,7 @@ def count_targets(values, threshold_db: float = VV_TARGET_THRESHOLD_DB) -> Tuple
         if v != v:  # NaN
             continue
         water += 1
-        if v > threshold_db:
+        # Linear, because that is what the pixels are. See _linear().
+        if v > _linear(threshold_db):
             targets += 1
     return targets, water

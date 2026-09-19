@@ -29,6 +29,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 from shared.utils.logging import setup_sentinel_logging
@@ -508,6 +509,7 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                                         }
                                     )
                                     await producer.send(Topics.RAW_PREDICTION, raw_event.model_dump(), key="polymarket")
+                                    _collector_metrics("collector-prediction").ingested()
                     finally:
                         injector_task.cancel()
 
@@ -619,6 +621,7 @@ async def poll_kalshi(producer: SentinelProducer):
                                 }
                             )
                             await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
+                            _collector_metrics("collector-prediction").ingested()
                             
                     else:
                         text = await resp.text()
@@ -642,7 +645,7 @@ async def main():
     # §1.1 Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-prediction")
+    metrics = _collector_metrics("collector-prediction")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-prediction"))
 

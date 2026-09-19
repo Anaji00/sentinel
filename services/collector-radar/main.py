@@ -17,7 +17,7 @@ import sys
 import math
 import time
 from datetime import datetime, timezone
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -26,6 +26,8 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.utils.quiet_failures import swallowed
+from shared.utils.market_cap import has_been_resolved, store_market_cap
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.kafka import SentinelProducer, Topics
 from shared.utils.radar_keys import (
     MOVERS_DAY_ZSET,
@@ -301,6 +303,135 @@ def _percent_moves(prev_close: float, day_open: float, day_close: float):
     return out
 
 
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+
+# How many Finnhub profile lookups a minute the backfill may spend.
+#
+# Finnhub's limit is sixty a minute and this key is shared with the tradfi
+# collector, so half of it is the most this may take.
+MCAP_LOOKUPS_PER_PASS = int(os.getenv("RADAR_MCAP_LOOKUPS_PER_PASS", "25"))
+
+# How far in from each end of the board to bother resolving.
+#
+# Only symbols that could appear on a gated board need a market capitalisation,
+# and those are the extremes of the move distribution. Walking inward from both
+# ends resolves the displayable names first and reaches the middle -- which
+# nobody asks about -- never.
+MCAP_CANDIDATE_DEPTH = int(os.getenv("RADAR_MCAP_CANDIDATE_DEPTH", "400"))
+
+
+async def _resolve_market_cap(
+    session, ticker: str
+) -> Optional[Tuple[float, str]]:
+    """Market capitalisation and its currency from Finnhub, or None.
+
+    None covers both "the provider has no figure" -- warrants, units, rights
+    and index tickers, which is most of what tops an ungated board -- and a
+    failed call. The caller records the first as an answer and leaves the
+    second to be retried, because a rate limit is not a statement about the
+    company.
+    """
+    if not FINNHUB_API_KEY:
+        return None
+    url = "https://finnhub.io/api/v1/stock/profile2"
+    try:
+        async with session.get(
+            url, params={"symbol": ticker, "token": FINNHUB_API_KEY}, timeout=15,
+        ) as resp:
+            if resp.status != 200:
+                # 429 included: a rate limit is not an answer about this symbol.
+                raise _MarketCapUnavailable(f"HTTP {resp.status}")
+            profile = await resp.json()
+    except _MarketCapUnavailable:
+        raise
+    except Exception as exc:
+        raise _MarketCapUnavailable(str(exc)[:80])
+    # Finnhub reports millions, in the currency of the PRIMARY listing.
+    #
+    # The currency is returned and was being ignored. TSM's profile2 resolves to
+    # the Taiwan Stock Exchange and reports 61,719,038 million TWD, which this
+    # stored as $61.7 trillion -- fifty times the company and more than world
+    # GDP. The caller decides what to do with a non-USD figure; this only stops
+    # asserting one currency's number in another's name.
+    millions = profile.get("marketCapitalization")
+    try:
+        value = float(millions) if millions is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value * 1_000_000.0, str(profile.get("currency") or "").strip().upper()
+
+
+class _MarketCapUnavailable(Exception):
+    """The provider could not be asked, as opposed to having no figure."""
+
+
+async def _backfill_market_caps(redis_client, session) -> int:
+    """Resolve a bounded number of unresolved board candidates. Returns count.
+
+    Deliberately does not touch the movers board itself. The gate is applied by
+    the endpoint against this cache, so a slow backfill makes the gated board
+    fill in rather than making it wrong.
+    """
+    if not redis_client:
+        return 0
+    raw = getattr(redis_client, "raw", redis_client)
+    try:
+        top = await raw.zrevrange(MOVERS_DAY_ZSET, 0, MCAP_CANDIDATE_DEPTH - 1)
+        bottom = await raw.zrange(MOVERS_DAY_ZSET, 0, MCAP_CANDIDATE_DEPTH - 1)
+    except Exception as _exc:
+        swallowed("collector_radar.market_cap_candidates", _exc, logger)
+        return 0
+
+    # The watchlist, first.
+    #
+    # This walked the movers board alone, which is the two ends of a ranking by
+    # percentage move -- by construction the most volatile microcaps and
+    # warrants on the venue, which is the right population for the gate this
+    # cache was built to serve. It is close to the complement of the watchlist.
+    # Measured: 1,231 symbols resolved, and exactly ONE of them was among the
+    # fifty watched equities. ASML, BRK.B, DXCM and CBRE had never been asked
+    # about at all.
+    #
+    # Every consumer that wants a size-weighted view of the portfolio -- the
+    # Black-Litterman equilibrium prior above all -- reads this cache for the
+    # watched names and finds nothing. The watchlist is fifty symbols on a
+    # weekly TTL, so resolving it costs nothing and it goes first, because
+    # `MCAP_LOOKUPS_PER_PASS` is a budget and the board has four hundred
+    # candidates a pass to spend it on.
+    watched: list = []
+    try:
+        watched = list(await raw.zrange(WATCHED_EQUITIES_KEY, 0, -1))
+    except Exception as _exc:
+        swallowed("collector_radar.market_cap_watchlist", _exc, logger)
+
+    seen, candidates = set(), []
+    for member in watched + list(top) + list(bottom):
+        ticker = member.decode() if isinstance(member, bytes) else str(member)
+        if ticker and ticker not in seen:
+            seen.add(ticker)
+            candidates.append(ticker)
+
+    resolved = 0
+    for ticker in candidates:
+        if resolved >= MCAP_LOOKUPS_PER_PASS:
+            break
+        if await has_been_resolved(redis_client, ticker):
+            continue
+        try:
+            quote = await _resolve_market_cap(session, ticker)
+        except _MarketCapUnavailable as exc:
+            # Not recorded: retry next pass rather than cache a rate limit as
+            # though it were a fact about the company.
+            swallowed("collector_radar.market_cap_lookup", exc, logger, detail=ticker)
+            break
+        usd, currency = quote if quote else (None, None)
+        await store_market_cap(redis_client, ticker, usd, currency)
+        resolved += 1
+    return resolved
+
+
 async def _publish_movers(redis_client, movers: Dict[str, Dict[str, float]], evaluated: int) -> None:
     """One sorted set scored by the day's move, plus the components per ticker.
 
@@ -339,7 +470,7 @@ async def _publish_movers(redis_client, movers: Dict[str, Dict[str, float]], eva
         swallowed("collector_radar.publish_movers", _exc, logger)
 
 
-async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict):
+async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict, metrics: Optional[CollectorMetrics] = None):
     state["polls"] += 1
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
     feed = os.getenv("ALPACA_DATA_FEED", "iex")
@@ -462,7 +593,38 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
     state["total_evaluated"] += total_evaluated
     state["total_anomalies"] += anomalies_detected
 
+    # What actually arrived from upstream, told to the thing that watches for it
+    # not arriving.
+    #
+    # `metrics.start()` and `metrics.watch_for_starvation(source="alpaca")` were
+    # both called in main() and `metrics.ingested()` was called nowhere, because
+    # `metrics` was local to main() and the data arrives here. So `_ingested`
+    # stayed 0 for the life of the process and the watcher took its first branch
+    # forever:
+    #
+    #   collector-radar has received NOTHING from alpaca in 360s despite a
+    #   successful connection. The credential may be inactive...
+    #
+    # logged at ERROR, while this function was evaluating 11,672 symbols a poll.
+    # A starvation alarm that is always on is worse than no alarm: it is the
+    # loudest message this platform emits, it blames the operator's credentials,
+    # and it is the one thing that would be ignored when a feed genuinely died.
+    if metrics is not None and total_evaluated:
+        metrics.ingested(total_evaluated)
+
     await _publish_movers(radar.redis, movers, total_evaluated)
+
+    # Resolve a few more board candidates while the session is open.
+    #
+    # Bounded and best-effort: the gated board fills in over successive sweeps
+    # rather than blocking this one. Deliberately after the publish, so a
+    # Finnhub problem can never delay or prevent the movers board itself.
+    try:
+        n = await _backfill_market_caps(radar.redis, session)
+        if n:
+            logger.info("Resolved market capitalisation for %d board candidate(s).", n)
+    except Exception as _exc:
+        swallowed("collector_radar.market_cap_backfill", _exc, logger)
 
     if total_evaluated > 0:
         top_str = f" | Top Dynamic Mover: {top_ticker} (Z={max_z:.2f}, ${top_price*top_vol/1e6:.2f}M)" if top_ticker else ""
@@ -521,7 +683,7 @@ async def main():
                         )
                 alpha, z_threshold = await regime.get_dynamic_thresholds()
                 logger.info(f"Starting radar evaluation cycle | dynamic thresholds: alpha={alpha:.4f}, z_threshold={z_threshold:.2f}")
-                await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state)
+                await poll_alpaca_snapshots(session, producer, radar, universe, alpha, z_threshold, state, metrics)
                 elapsed = asyncio.get_event_loop().time() - t0
 
                 # Paced by the session, not by a constant.

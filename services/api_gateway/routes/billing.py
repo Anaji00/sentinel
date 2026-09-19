@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional
+from services.api_gateway.audit_actions import record_admin_action
 from shared.utils import stripe_client
 from shared.utils.accounts import ACTIVE_STATUSES, Tier, account_from_row, normalize_email
 from shared.utils.quiet_failures import swallowed
@@ -295,6 +296,35 @@ async def stripe_webhook(request: Request, db=Depends(get_db_optional)):
     await _apply_subscription(
         db, user_id=user_id, customer_id=customer_id,
         subscription_id=subscription_id, status=status_after, ends_at=ends_at,
+    )
+
+    # Entitlement changes belong in the tamper-evident ledger.
+    #
+    # This is the line where an account gains or loses paid access, and it was
+    # the largest remaining gap in ledger coverage: billing was one of six route
+    # modules exposing a mutating endpoint and writing nothing. A subscription
+    # that silently became `active`, or a cancellation somebody disputes, had no
+    # hash-chained record at all -- only a `subscription_events` row, which is an
+    # ordinary table that an operator with database access can edit.
+    #
+    # Stripe is the actor, not a signed-in admin: this endpoint is
+    # unauthenticated by necessity and verified by signature instead, so
+    # recording a user here would name someone who did not do it.
+    await record_admin_action(
+        redis=None,
+        db=db,
+        user={"sub": f"stripe:{event_type}"},
+        action="subscription_changed",
+        resource_type="user_subscription",
+        resource_id=str(user_id),
+        details={
+            "stripe_event_id": event_id,
+            "stripe_event_type": event_type,
+            "status_before": status_before,
+            "status_after": status_after,
+            "subscription_id": subscription_id,
+            "ends_at": ends_at.isoformat() if hasattr(ends_at, "isoformat") else ends_at,
+        },
     )
 
     try:

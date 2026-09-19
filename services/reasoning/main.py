@@ -13,6 +13,15 @@ import asyncio
 import json
 import math
 import logging
+from typing import Optional
+from shared.utils.agent_conclusions import (
+    AGENT_CORRELATION_ANALYSIS_PREFIX,
+    HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_INVERSE_CORRELATION_PREFIX,
+    MACRO_RATES_REGIME_KEY,
+    MACRO_SPREAD_2Y10Y_KEY,
+    TRADFI_BACKFILL_REPORT_KEY,
+)
 import os
 import sys
 import re
@@ -63,7 +72,9 @@ from shared.utils.freshness import is_stale
 REASONING_MAX_CLUSTER_AGE_SEC = int(os.getenv("REASONING_MAX_CLUSTER_AGE_SEC", "3600"))
 from shared.utils.inference_budget import InferenceBudget
 from shared.utils.tasks import safe_create_task
+from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.backpressure import declare_pressure, clear_pressure
+from shared.utils.rule_feedback import conversion_rates, conversion_weight
 from shared.utils.heartbeat import start_heartbeat_task
 
 def _jsonable(value):
@@ -255,15 +266,16 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         group_id="reasoning-service-group",
         auto_offset_reset="latest",
     )
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="reasoning")
     await consumer.start()
     await producer.start()
 
-    from shared.utils.ollama import OllamaClient, OLLAMA_TIMEOUT
-
-    connector = aiohttp.TCPConnector(limit=10)
-    session = aiohttp.ClientSession(connector=connector, timeout=OLLAMA_TIMEOUT)
-    ollama_client = OllamaClient(session, redis_client=redis_client)
+    # A TCPConnector, an aiohttp.ClientSession and an OllamaClient were built
+    # here and never referenced again. The session was never closed either, so
+    # it was held for the process lifetime and surfaced as an unclosed-session
+    # warning at shutdown. The real inference path is in scenario_generator,
+    # which lazily creates its own session and its own client -- and passes a
+    # `model` argument this construction omitted, which is what dated it.
 
     _start_time = time.monotonic()
     _processed = 0
@@ -309,6 +321,34 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     )
     _shed = 0
     _stale = 0
+    _queue_expired = 0
+
+    # Per-rule conversion record, refreshed in the background.
+    #
+    # Read by the ranker, which stays pure: it is handed the map rather than
+    # fetching it, so two replicas facing the same batch and the same priors
+    # still make the same choice. Empty until the first refresh, and an empty
+    # map means every rule competes on the cluster's own merits -- which is the
+    # behaviour this had before, so a cold start loses nothing.
+    _conversion_priors: dict = {}
+
+    async def _conversion_prior_loop():
+        nonlocal _conversion_priors
+        while True:
+            try:
+                rates = await conversion_rates(db, days=2)
+                if rates:
+                    _conversion_priors = rates
+                    logger.info(
+                        "Rule conversion priors refreshed for %d rule(s); "
+                        "best %.3f%%, worst %.3f%%",
+                        len(rates), 100 * max(rates.values()), 100 * min(rates.values()),
+                    )
+            except Exception as e:
+                logger.debug("Conversion prior refresh failed: %s", e)
+            await asyncio.sleep(1800)
+
+    safe_create_task(_conversion_prior_loop(), name="reasoning-conversion-priors")
 
     # Detached syntheses, bounded so a slow model cannot turn backlog into
     # unbounded memory. Rarely approached: the semaphore admits three at a time.
@@ -323,6 +363,17 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
         a warning at garbage-collection time, hiding every real failure.
         """
         nonlocal _processed, _scenarios, _errors
+
+        # Release the lane the dispatch claimed.
+        #
+        # The claim is sized for a worker that never returns, so without this
+        # the slot sits idle from the moment the synthesis finishes until the
+        # cooldown expires. Unconditional, and before the error branches: a
+        # synthesis that failed has stopped using the model just as surely as
+        # one that succeeded, and holding the lane for a cluster that is already
+        # in the DLQ would shed live work to protect nothing.
+        safe_create_task(_budget.finish(), name="reasoning-budget-finish")
+
         if task.cancelled():
             return
         err = task.exception()
@@ -340,6 +391,35 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
 
     async def sem_process_cluster(cluster, *args):
         async with sem:
+            # Freshness is a property of the moment work is done, not of the
+            # moment it was queued.
+            #
+            # The admission check above proves a cluster was fresh when it was
+            # accepted. It says nothing about when it is synthesised, and the
+            # gap is the whole queue: MAX_INFLIGHT_SYNTHESES clusters are
+            # admitted against a tier that completes roughly eight an hour, so
+            # a slot is reached hours after it was claimed. Measured on this
+            # deployment, every one of the last ten scenarios was synthesised
+            # 3.5 to 4.3 hours after its correlation was detected -- against a
+            # declared ceiling of one hour. The service was not ignoring its
+            # own bound; it was checking it at the only point where it was
+            # guaranteed to pass.
+            #
+            # Re-checking here costs nothing and makes the bound true. A
+            # cluster that expired while waiting is dropped at its turn rather
+            # than argued through two model passes, which also lets the ones
+            # behind it run sooner.
+            nonlocal _queue_expired
+            if is_stale(cluster, REASONING_MAX_CLUSTER_AGE_SEC):
+                _queue_expired += 1
+                if _queue_expired % 100 == 1:
+                    logger.warning(
+                        "Reasoning dropped %s cluster(s) that expired while "
+                        "queued (older than %ss at their turn). Admission is "
+                        "outrunning synthesis.",
+                        _queue_expired, REASONING_MAX_CLUSTER_AGE_SEC,
+                    )
+                return None
             return await process_cluster(cluster, *args)
 
     logger.info("Sentinel Reasoning Engine Online. Listening for anomalies...")
@@ -391,7 +471,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                 agent_name = str(raw_data.get("agent") or "unknown")
                                 try:
                                     await redis_client.raw.set(
-                                        f"sentinel:agents:correlation_analysis:{agent_name}",
+                                        f"{AGENT_CORRELATION_ANALYSIS_PREFIX}{agent_name}",
                                         json.dumps(raw_data),
                                         ex=3600,
                                     )
@@ -455,12 +535,41 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
 
                         except Exception as parse_e:
                             logger.error(f"Failed parsing reasoning message: {parse_e}", exc_info=True)
-                            await producer.send(Topics.DLQ, {"error": str(parse_e), "raw": str(message.value)})
+                            await producer.send(Topics.DLQ, {"error": str(parse_e), "raw": encode_dlq_payload(message.value)})
                 # Spend the available capacity on the best of the batch.
                 for cluster, raw_data in sorted(
-                    eligible, key=_reasoning_priority, reverse=True
+                    eligible, key=lambda it: _reasoning_priority(it, _conversion_priors), reverse=True
                 ):
-                    if not await _budget.is_available():
+                    # Claim the lane, do not merely look at it.
+                    #
+                    # This was `is_available()`, which is documented as a
+                    # read-only peek that deliberately does not claim. Nothing
+                    # else in the tree ever claimed this lane either --
+                    # `try_acquire` has one call site and it is the agent tier,
+                    # on the un-laned key -- so
+                    # `sentinel:inference:budget:reasoning:qwen2.5:1.5b` had
+                    # never existed. Sampled four times its TTL was -2.
+                    #
+                    # A peek at a key nothing sets is always free, so the gate
+                    # below never refused, `declare_pressure` was never called,
+                    # the Redis flag stayed unset and the correlation engine's
+                    # semantic-path pause -- wired on both sides -- could not
+                    # fire. Four mechanisms downstream of a condition that was
+                    # unsatisfiable by construction: "Reasoning shed N clusters"
+                    # logged 0 times in 9.4 hours of uptime.
+                    #
+                    # The lane itself is right and stays. Sharing the agents'
+                    # key was tried and is what the lane exists to undo: five
+                    # agents on a busier stream re-claimed the slot before it
+                    # expired, this service sheds whenever the slot is busy, and
+                    # it shed every cluster for the lifetime of the deployment.
+                    # The bound this lane is supposed to enforce -- one
+                    # reasoning inference at a time -- is only real if something
+                    # takes it.
+                    if not await _budget.try_acquire(
+                        score=_reasoning_priority((cluster, raw_data)),
+                        domain=getattr(cluster, "primary_domain", None),
+                    ):
                         _shed += 1
 
                         # Say so upstream.
@@ -577,12 +686,46 @@ async def _tracker_loop(tracker: ScenarioTracker):
 # Tier weights for reasoning admission. A tier is the correlation layer's own
 # judgement of how much a cluster matters, and it was reaching the scheduler as
 # no input at all.
-_REASONING_TIER_WEIGHT = {
-    "CRITICAL": 1.0,
-    "INTELLIGENCE": 0.75,
-    "ALERT": 0.5,
-    "MONITOR": 0.25,
-}
+# Severity, as the platform already orders it.
+#
+# This table named MONITOR, which is not an AlertTier, and omitted ELEVATED,
+# which is -- so every ELEVATED cluster fell to the 0.25 default and ranked
+# below both of the tiers beneath it. Measured over the scenario set: ELEVATED
+# findings scored 0.31 against ALERT at 0.52, on a queue that admits about
+# thirty-six clusters an hour and sheds the rest.
+#
+# Derived from `AlertTier` rather than restated, so a tier added to the enum
+# cannot silently acquire the floor weight. The rank-to-weight curve is linear
+# from 0.25 at the least severe to 1.0 at the most, which preserves the three
+# weights the old table got right.
+def _tier_weights() -> dict:
+    from shared.models.events import AlertTier
+
+    # The canonical order, matching `event_store._tier_rank`.
+    order = ["WATCH", "ALERT", "ELEVATED", "INTELLIGENCE", "CRITICAL"]
+    declared = [t.value.upper() for t in AlertTier]
+    ranked = [name for name in order if name in declared]
+    # A tier the enum gained and this order does not know about sorts last
+    # rather than vanishing.
+    ranked += [name for name in declared if name not in ranked]
+
+    span = max(1, len(ranked) - 1)
+    return {
+        name: round(0.25 + 0.75 * (i / span), 4)
+        for i, name in enumerate(ranked)
+    }
+
+
+_REASONING_TIER_WEIGHT = _tier_weights()
+
+# Every tier the enum declares has a weight, checked at import for the same
+# reason the rule-evidence guard is: a severity band silently ranked at the
+# floor is invisible in the output -- the queue simply admits fewer of them.
+assert not {
+    t.value.upper() for t in __import__(
+        "shared.models.events", fromlist=["AlertTier"]
+    ).AlertTier
+} - set(_REASONING_TIER_WEIGHT), "an AlertTier has no reasoning weight"
 
 # What a cluster keeps when the score behind it measured nothing at all.
 #
@@ -592,7 +735,7 @@ _REASONING_TIER_WEIGHT = {
 REASONING_COVERAGE_FLOOR = 0.6
 
 
-def _reasoning_priority(item) -> float:
+def _reasoning_priority(item, priors: Optional[dict] = None) -> float:
     """How much a cluster is worth spending an inference slot on.
 
     Reasoning admits roughly 36 clusters an hour against a stream producing far
@@ -683,6 +826,19 @@ def _reasoning_priority(item) -> float:
             # match.
             ranked *= REASONING_COVERAGE_FLOOR + (1.0 - REASONING_COVERAGE_FLOOR) * frac
 
+    # What this rule has produced before.
+    #
+    # Everything above is a property of the cluster in hand. None of it is a
+    # memory of whether this rule's clusters have ever become a scenario, so
+    # HAWKES_EXCITATION -- 5,786 firings in 48 hours converting at 0.05% --
+    # competed on equal terms with chokepoint evasion at 5.26%, and won on
+    # volume. Two rules are 77% of everything this tier is offered.
+    #
+    # A multiplier with a floor, not a gate: a rule that has never converted
+    # still competes, and a rule with no record competes exactly as it did
+    # before. Applied last so it scales the judgement rather than replacing it.
+    ranked *= conversion_weight(str(getattr(cluster, "rule_id", "") or ""), priors)
+
     return round(ranked, 6)
 
 
@@ -715,7 +871,7 @@ async def main():
 
     context_builder = ContextBuilder(db)
     generator       = ScenarioGenerator(db, redis_client=redis_client) 
-    tracker_producer = SentinelProducer()
+    tracker_producer = SentinelProducer(service_name="reasoning-tracker")
     await tracker_producer.start()
     # Redis, which this was never given.
     #

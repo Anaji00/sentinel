@@ -100,7 +100,7 @@ async def run_task_queue_worker(redis_client, agents: dict):
 # small model anyway, paying the full timeout each time.
 #
 # AGENT_MODEL carries the tier's choice, so the tier decides rather than a
-# literal buried in this file. Both tiers currently name qwen2.5:1.5b: the
+# literal buried in this file. Both tiers currently name qwen3:0.6b: the
 # ollama container runs one model slot, because two resident models meant two
 # llama.cpp runners at six threads each against a six-core quota, and that
 # collapses rather than degrades. docker-compose.yml records the measurements.
@@ -108,7 +108,24 @@ async def run_task_queue_worker(redis_client, agents: dict):
 # This comment previously claimed compose set qwen2.5:3b for agents-heavy. It
 # did not, and had not for as long as the comment existed -- the tiering it
 # described was gone and the sentence describing it was not.
-HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
+HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen3:0.6b")
+
+# The same value under a name the fast-tier call sites can use.
+#
+# Six agents named "qwen2.5:1.5b" as a literal `model=` argument, and
+# `build_agent` resolves `model or os.getenv("AGENT_MODEL", ...)` -- an explicit
+# argument wins. So AGENT_MODEL governed four agents and was silently overridden
+# for six, which is the arrangement the comment above says this file does not
+# have. Changing the tier's model in compose would have moved half the swarm and
+# left the rest on the old one, with nothing reporting the split.
+FAST_MODEL = os.getenv("AGENT_MODEL", "qwen3:0.6b")
+
+# What a fast-tier agent falls back to when its first choice fails.
+#
+# One model slot means a fallback to a *different* model is an eviction and a
+# reload, so the ladder points at the same model deliberately: a retry should
+# cost a retry, not a 47-second model swap.
+FAST_FALLBACK = os.getenv("OLLAMA_FALLBACK_MODEL", FAST_MODEL)
 
 
 def build_agent(
@@ -134,8 +151,8 @@ def build_agent(
         auto_offset_reset="latest",
     )
 
-    producer = SentinelProducer()
-    dlq      = SentinelProducer()
+    producer = SentinelProducer(service_name="agents")
+    dlq      = SentinelProducer(service_name="agents-dlq")
 
     # Per-agent environment variable resolution with tiered defaults
     env_name = agent_name.upper().replace("-", "_")
@@ -200,8 +217,12 @@ async def main():
     safe_create_task(soft_correlator._load(), name="soft-correlator-load")
 
     # ── TIERED PER-AGENT MODEL ALLOCATION ───────────────────────────────────────
-    # Heavy Analytical Tier: Deep reasoning (qwen2.5:7b -> qwen2.5:1.5b fallback)
-    # Fast Operational Tier: Ultra-fast routing/classification (qwen2.5:1.5b -> gemma3:1b fallback)
+    # Both tiers run AGENT_MODEL -- qwen3:0.6b -- and fall back to it.
+    #
+    # The tier split is which agents run where, not which model they use: one
+    # ollama slot means a second resident model is an eviction, not a choice.
+    # This comment described a qwen2.5:7b heavy tier and a gemma3:1b fallback
+    # ladder, neither of which the file has set for some time.
 
     # ── CONSOLIDATED 5 CORE ENGINES ──────────────────────────────────────────
 
@@ -216,7 +237,7 @@ async def main():
         group_id="agent-macro-intelligence",
         shared_infra=shared_infra,
         model=HEAVY_MODEL,
-        fallback_model="qwen2.5:1.5b",
+        fallback_model=FAST_FALLBACK,
     )
 
     quant_trading_engine = build_agent(
@@ -244,7 +265,7 @@ async def main():
         group_id="agent-quant-trading",
         shared_infra=shared_infra,
         model=HEAVY_MODEL,
-        fallback_model="qwen2.5:1.5b",
+        fallback_model=FAST_FALLBACK,
     )
 
     knowledge_graph_engine = build_agent(
@@ -262,7 +283,7 @@ async def main():
         ],
         group_id="agent-knowledge-graph",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -275,7 +296,7 @@ async def main():
         ],
         group_id="agent-radar-orchestrator",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -283,13 +304,24 @@ async def main():
         RuleSynthesizerAgent,
         agent_name="rule_synthesizer",
         input_topics=[
+            # RULE_CANDIDATES is the one this agent exists for.
+            #
+            # It subscribed to nine topics and had a branch for five, and what
+            # it actually received was CORRELATIONS at ~150/hour -- all of them
+            # dropped, because a correlation carries a rule_id and is therefore
+            # a rule *firing*. Synthesising from one re-derives the rule that
+            # produced it. CORRELATIONS is kept because the analyst-feedback and
+            # scenario paths still arrive alongside it, but the signal that
+            # makes this agent able to learn anything is the uncovered
+            # co-occurrence the correlation service now emits.
+            Topics.RULE_CANDIDATES,
             Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES, Topics.MACRO_DECOUPLING,
             Topics.MACRO_ASSESSMENT, Topics.INSIDER_CLUSTERS
         ],
         group_id="agent-rule-synthesizer",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -303,7 +335,7 @@ async def main():
         group_id="supervisor-group",
         shared_infra=shared_infra,
         model=HEAVY_MODEL,
-        fallback_model="qwen2.5:1.5b",
+        fallback_model=FAST_FALLBACK,
     )
 
     consensus_engine = build_agent(
@@ -321,7 +353,7 @@ async def main():
         ],
         group_id="agent-consensus-engine",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -334,7 +366,7 @@ async def main():
         group_id="agent-adversarial-wargamer",
         shared_infra=shared_infra,
         model=HEAVY_MODEL,
-        fallback_model="qwen2.5:1.5b",
+        fallback_model=FAST_FALLBACK,
     )
 
     edge_validator_agent = build_agent(
@@ -345,7 +377,7 @@ async def main():
         ],
         group_id="agent-edge-validator",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -357,7 +389,7 @@ async def main():
         ],
         group_id="agent-stock-correlation",
         shared_infra=shared_infra,
-        model="qwen2.5:1.5b",
+        model=FAST_MODEL,
         fallback_model=HEAVY_MODEL,
     )
 
@@ -419,12 +451,18 @@ async def main():
         safe_create_task(agent_inst.run(), name=name)
         for name, agent_inst in active_agents.items()
     ]
-    tasks.append(
-        safe_create_task(
-            run_task_queue_worker(shared_infra["redis"], active_agents),
-            name="task_queue_worker",
-        )
-    )
+    # The task-queue worker is not started.
+    #
+    # It ran a BLPOP across sentinel:tasks:high/normal/low on a one-second
+    # timeout, forever, in every agent-tier process, and nothing has ever put an
+    # item on those queues: the only producer is `BaseAgent.enqueue_task`, which
+    # every agent inherits and no agent calls -- it appears once in the
+    # repository, at its own definition.
+    #
+    # So this held a blocking Redis connection per tier for a queue with no
+    # writer. Both halves are left in place, because the mechanism is sound and
+    # a caller may want it; what is removed is paying for it while nothing does.
+    # Starting it again is this block, uncommented, plus a producer.
 
     # Register liveness for this tier. Every other service already does this;
     # without it the agent tiers are invisible to the health system and the
@@ -507,4 +545,18 @@ if __name__ == "__main__":
     # Forcing the WindowsSelectorEventLoopPolicy ensures maximum compatibility and stability on Windows machines.
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # A clean stop, not a crash.
+        #
+        # `handle_sigterm` raises KeyboardInterrupt deliberately so the gather
+        # unwinds and every agent gets its shutdown path. Left uncaught here,
+        # asyncio prints the full traceback *after* the code has already logged
+        # "Agent swarm shut down cleanly" -- so a normal `docker compose restart`
+        # ends with a Traceback in the log, and anything grepping for one counts
+        # it as a failure. It cost two commands to establish that this
+        # deployment's only "error" in ten minutes was a container stopping on
+        # request, which is the same shape as the inference-shed lines that were
+        # logged at ERROR: a routine event rendered as a fault.
+        logger.info("Agent swarm stopped on signal.")

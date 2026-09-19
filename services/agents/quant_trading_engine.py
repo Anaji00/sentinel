@@ -38,6 +38,7 @@ from shared.utils.equities import is_major_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.candles import candle_cache_key
+from shared.utils.market_cap import cached_market_cap
 
 logger = logging.getLogger("agent.quant_trading")
 
@@ -182,6 +183,33 @@ class PortfolioMetrics(BaseModel):
 # of tracked claims.
 MAX_RECORDED_PLAYS = int(os.getenv("QUANT_MAX_RECORDED_PLAYS", "8"))
 
+# Black-Litterman universe and its guards.
+#
+# The allocation inverts a sample covariance estimated from daily bars. With the
+# ~37 daily observations this deployment holds per ticker, twelve assets is
+# comfortable and forty is not: a covariance with more assets than observations
+# is singular, and `pinv` would return a pseudo-inverse of noise rather than
+# refusing. BL_MIN_OBSERVATIONS_PER_ASSET keeps the universe below what the
+# history can actually support, shrinking the universe rather than the honesty
+# of the estimate.
+BL_UNIVERSE_MAX = int(os.getenv("QUANT_BL_UNIVERSE_MAX", "12"))
+BL_MIN_OBSERVATIONS_PER_ASSET = 3
+BL_MIN_OBSERVATIONS = 20
+BL_LOOKBACK_DAYS = int(os.getenv("QUANT_BL_LOOKBACK_DAYS", "120"))
+
+# Trading days, for turning a daily expected return into the annual figure a
+# brief is read in.
+BL_TRADING_DAYS = 252.0
+
+# View uncertainty, as the variance of the error on a view.
+#
+# Black-Litterman weights a view against the equilibrium prior by its Omega. A
+# conviction of 1.0 must not produce zero uncertainty -- that is an infinitely
+# confident view and it would drive the posterior on its own -- so the floor is
+# real and the scale is what an unconvinced view costs.
+BL_VIEW_UNCERTAINTY_FLOOR = 0.0025
+BL_VIEW_UNCERTAINTY_SCALE = 0.02
+
 
 class TradingSignal(BaseModel):
     ticker: str
@@ -219,6 +247,7 @@ class FinancialAdviceBrief(BaseModel):
 from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import swallowed
+from shared.utils.rates import risk_free_rate
 
 
 # ── CONSOLIDATED QUANT TRADING ENGINE ──────────────────────────────────────────
@@ -462,7 +491,16 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 bars_per_year = quant_calc.periods_per_year(
                     self.PRICE_TIMEFRAME, quant_calc.classify_asset_class(ticker)
                 )
-                sr = quant_calc.sharpe_ratio(returns, annualize=True, trading_days=bars_per_year)
+                # Against the rate the platform collects, not against zero.
+                #
+                # The comment above records fixing the *other* default in this
+                # same call -- trading_days -- and walked past this one. A
+                # Sharpe computed with risk_free_rate=0.0 overstates every
+                # strategy by the whole of the short rate, in one direction.
+                rf, rf_live = await risk_free_rate(self.redis)
+                sr = quant_calc.sharpe_ratio(
+                    returns, risk_free_rate=rf, annualize=True, trading_days=bars_per_year
+                )
                 mdd, _, _ = quant_calc.max_drawdown(closes)
             else:
                 # Not measured, and said so.
@@ -516,7 +554,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                     alert_tier=AlertTier.INTELLIGENCE,
                     primary_domain="financial",
                     confidence_score=float(high_conf_peers[0].discovery_confidence),
-                    summary_headline=f"📈 Peer Decoupling Detected: {ticker} vs {', '.join(peer_ids[:3])}",
+                    summary_headline=f"Peer Decoupling Detected: {ticker} vs {', '.join(peer_ids[:3])}",
                     supporting_headlines=[f"{p.ticker}: {p.rationale}" for p in high_conf_peers[:3]],
                     metrics_summary={
                         "catalyst_category": discovery.catalyst_category,
@@ -632,7 +670,10 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         ewma_vol = quant_calc.ewma_volatility(returns, annualize=True, trading_days=bars_per_year)
         var_95 = quant_calc.var_historical(returns, confidence=0.95, position_value=10_000)
         cvar_95 = quant_calc.cvar_historical(returns, confidence=0.95, position_value=10_000)
-        cvar_99 = quant_calc.cvar_historical(returns, confidence=0.99, position_value=10_000)
+        # cvar_99 at a notional was computed here and never read; the figure
+        # this advisory publishes is cvar_99_pct, derived below from the
+        # per-unit form. Removed rather than left as a line that looks like an
+        # output.
 
         # Express VaR/CVaR at a 1-day horizon — the convention a reader assumes
         # when no horizon is stated — rather than the raw per-bar figure.
@@ -645,8 +686,11 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             quant_calc.scale_var_to_horizon(cvar_99_bar, bars_per_year, daily_periods) * 100.0, 2
         )
         risk_horizon = "1-day"
+        risk_free, risk_free_is_live = await risk_free_rate(self.redis)
         sharpe_ratio_val = round(
-            float(quant_calc.sharpe_ratio(returns, annualize=True, trading_days=bars_per_year)), 2
+            float(quant_calc.sharpe_ratio(
+                returns, risk_free_rate=risk_free, annualize=True, trading_days=bars_per_year
+            )), 2
         )
 
         # ── EMPIRICAL KELLY INPUTS ──────────────────────────────────────────────
@@ -750,7 +794,25 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             "index_membership": [],
             "supply_chain": [],
             "competitors": [],
+            # Peers this platform derived rather than a vendor published, kept
+            # apart from `competitors` on purpose: PEER_OF comes from the
+            # statistical discovery pass, and its strongest edges are BZ=F->CL=F
+            # and GC=F->SI=F -- the commodity series that stopped updating on
+            # 2026-09-04. Merging the two would hand a reader one list and no way
+            # to tell which half to trust.
+            "statistical_peers": [],
+            # Companies sharing this one's sector, and how many there are.
+            #
+            # The cohort size is carried because "one of 37 semiconductor names"
+            # and "one of 3" are different statements about how much a peer
+            # comparison is worth, and a bare list of eight cannot tell them
+            # apart.
+            "sector_peers": [],
+            "sector_cohort_size": 0,
             "correlated_entities": [],
+            # Why each correlated entity is here. An entity with no predicate is
+            # a name; with one it is a claim that can be checked.
+            "relationship_provenance": {},
         }
         try:
             neo4j_client = self.neo4j or await get_neo4j()
@@ -759,15 +821,64 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 struct_query = """
                 MATCH (inst) WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
                 OPTIONAL MATCH (inst)-[:OPERATES_IN]->(s:Sector)
-                OPTIONAL MATCH (inst)-[:MEMBER_OF]->(idx:Index)
-                OPTIONAL MATCH (inst)-[:SUPPLIER_TO|CUSTOMER_OF|SUPPLIES]-(sc:Entity)
-                OPTIONAL MATCH (inst)-[:COMPETES_WITH]-(comp:Entity)
+                OPTIONAL MATCH (inst)-[:MEMBER_OF]->(idx)
+                OPTIONAL MATCH (inst)-[:SUPPLIER_TO|CUSTOMER_OF|SUPPLIES|PURCHASES_FROM]-(sc)
+                // The label constraints on these two are dropped, and the
+                // fourth supply predicate added, for the reason 585 records:
+                // a node's label is decided by whichever producer wrote it
+                // first, so pinning the far end to one label reads a slice of
+                // the graph rather than the graph.
+                //
+                // `(sc:Entity)` was the sharper of the two. The supply-chain
+                // writer emits Company-to-Company edges -- because a supplier
+                // *is* a company -- so with that constraint in place the
+                // `supply_chain` field would have stayed empty no matter how
+                // many edges were written, and the symptom would have been
+                // identical to having written none.
+                //
+                // `(idx:Index)` had the same shape: the Index label held zero
+                // nodes until this session, so anything MEMBER_OF ever reached
+                // was labelled something else.
+                OPTIONAL MATCH (inst)-[:COMPETES_WITH]-(comp)
+                OPTIONAL MATCH (inst)-[:PEER_OF]-(peer)
                 RETURN coalesce(s.name, s.id) AS sector,
                        collect(DISTINCT coalesce(idx.name, idx.id)) AS indices,
                        collect(DISTINCT coalesce(sc.name, sc.id)) AS supply_chain,
-                       collect(DISTINCT coalesce(comp.name, comp.id)) AS competitors
+                       collect(DISTINCT coalesce(comp.name, comp.id)) AS competitors,
+                       collect(DISTINCT coalesce(peer.name, peer.id)) AS statistical_peers
                 """
                 struct_rows = await neo4j_client.query(struct_query, {"ticker": ticker.upper()})
+
+                # The sector cohort: one hop past the sector this already reads.
+                #
+                # Kept as its own query rather than another OPTIONAL MATCH in
+                # the one above, because a second traversal inside the same
+                # pattern multiplies its row count against every other
+                # collect() in it.
+                sector_query = """
+                MATCH (inst)-[:OPERATES_IN]->(s:Sector)<-[:OPERATES_IN]-(sib)
+                WHERE (toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker)
+                  AND sib <> inst
+                WITH s, sib, size([(sib)--() | 1]) AS degree
+                ORDER BY degree DESC
+                RETURN coalesce(s.name, s.id) AS sector,
+                       count(sib) AS cohort,
+                       collect(coalesce(sib.name, sib.id))[0..8] AS peers
+                """
+                try:
+                    sector_rows = await neo4j_client.query(
+                        sector_query, {"ticker": ticker.upper()}
+                    )
+                    if sector_rows and sector_rows[0]:
+                        row = sector_rows[0]
+                        graph_context["sector_peers"] = [p for p in (row.get("peers") or []) if p]
+                        graph_context["sector_cohort_size"] = int(row.get("cohort") or 0)
+                        # The sector name comes free with the cohort, and this
+                        # path reaches tickers the OPTIONAL MATCH above misses.
+                        if not graph_context["sector"] and row.get("sector"):
+                            graph_context["sector"] = row["sector"]
+                except Exception as exc:
+                    logger.debug("Sector cohort lookup for %s bypass: %s", ticker, exc)
                 if struct_rows and struct_rows[0]:
                     sr = struct_rows[0]
                     if sr.get("sector"):
@@ -778,13 +889,33 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                         graph_context["supply_chain"] = [x for x in sr["supply_chain"] if x]
                     if sr.get("competitors"):
                         graph_context["competitors"] = [x for x in sr["competitors"] if x]
+                    if sr.get("statistical_peers"):
+                        graph_context["statistical_peers"] = [
+                            x for x in sr["statistical_peers"] if x
+                        ]
 
                 # 2. Exposure & statistical correlations
                 graph_query = """
-                MATCH (e:Entity)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES]-(inst:Entity)
+                # SYMPATHY_MOVER is added and two others were not.
+                #
+                # Sampled before including them: SYMPATHY_MOVER links real
+                # tickers -- IEFA to MSFT, SI=F to NVDA -- and is 177 edges of
+                # measured co-movement, the largest unread source there was.
+                #
+                # HAS_EXPOSURE_IN (139) and MACRO_CORRELATED (10) point at
+                # `market_anomaly`, `finnhub_equities`, `Global Sentiment
+                # Analysis` and `volatile_5m_candle`: event types, a source
+                # name, and prose fragments. Reading them would have traded an
+                # empty field for one that names a collector as a correlated
+                # company.
+                MATCH (e)-[r:COMMODITY_EXPOSURE|SUPPLIES|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES|SYMPATHY_MOVER]-(inst)
                 WHERE toUpper(inst.name) = $ticker OR toUpper(inst.id) = $ticker
-                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity, type(r) AS predicate, coalesce(r.confidence, $unrated) AS confidence
-                LIMIT 5
+                RETURN DISTINCT coalesce(e.name, e.id) AS correlated_entity,
+                       type(r) AS predicate,
+                       coalesce(r.confidence, $unrated) AS confidence,
+                       r.weight AS weight
+                ORDER BY coalesce(r.weight, r.confidence, $unrated) DESC
+                LIMIT 12
                 """
                 rows = await neo4j_client.query(graph_query, {"ticker": ticker.upper(), "unrated": UNRATED_EDGE_CONFIDENCE})
                 if rows:
@@ -793,6 +924,12 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                         for r in rows if r.get("correlated_entity")
                     ]
                     graph_context["correlated_entities"] = [r['correlated_entity'] for r in rows if r.get("correlated_entity")]
+                    # Which predicate put each name here, so a reader can weigh
+                    # a measured co-movement against a vendor's assertion.
+                    graph_context["relationship_provenance"] = {
+                        r["correlated_entity"]: r["predicate"]
+                        for r in rows if r.get("correlated_entity") and r.get("predicate")
+                    }
         except Exception as e:
             logger.debug(f"Graph context lookup for {ticker} bypass: {e}")
 
@@ -806,6 +943,28 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
             graph_topo_lines.append(f"Supply Chain Linkages: {', '.join(graph_context['supply_chain'])}")
         if graph_context["competitors"]:
             graph_topo_lines.append(f"Key Competitors: {', '.join(graph_context['competitors'])}")
+        # The three lines below close a gap this block had every time it ran:
+        # the fields existed on graph_context and reached the stored record at
+        # the end of the method, but nothing rendered them, so the model never
+        # saw them. A field computed and not read is the same as a field that
+        # was never computed.
+        if graph_context["statistical_peers"]:
+            # Named as derived, not asserted. These come from this platform's
+            # own discovery pass, and its strongest PEER_OF edges are BZ=F->CL=F
+            # and GC=F->SI=F -- two names for one series, and a commodity feed
+            # that stopped on 2026-09-04. A reader told where a claim came from
+            # can discount it; a reader handed one merged list cannot.
+            graph_topo_lines.append(
+                f"Statistically Derived Peers: {', '.join(graph_context['statistical_peers'])}"
+            )
+        if graph_context["sector_peers"]:
+            # The cohort size travels with the list because "one of 37
+            # semiconductor names" and "one of 3" are different statements about
+            # what a peer comparison is worth, and eight names cannot say which.
+            graph_topo_lines.append(
+                f"Sector Cohort ({graph_context['sector_cohort_size']} companies): "
+                f"{', '.join(graph_context['sector_peers'])}"
+            )
 
         graph_topo_block = ("\n        GRAPH TOPOLOGY & EXPOSURES:\n        - " + "\n        - ".join(graph_topo_lines) + "\n") if graph_topo_lines else ""
         graph_block = f"\n        VALIDATED GRAPH CORRELATIONS:\n        - " + "\n        - ".join(graph_correlations) + "\n" if graph_correlations else ""
@@ -964,8 +1123,16 @@ Return raw JSON matching schema:"""
                     brief.covered_call_overlays.append(cc_rec)
 
             # Gate Black-Litterman allocations on feature flag (§B.3)
+            #
+            # The gate is checked first so a kill switch costs nothing: it used
+            # to be the only line that touched this field, clearing a list that
+            # nothing had ever filled.
             if not await self.flags.is_enabled("black_litterman", ticker=ticker):
                 brief.black_litterman_allocations = []
+            else:
+                brief.black_litterman_allocations = await self._black_litterman_allocations(
+                    brief, watched_set
+                )
 
             # Force-write PortfolioMetrics from real computed values (§1.6, §1.7, §1.8)
             if not brief.portfolio_metrics:
@@ -1280,6 +1447,226 @@ Return raw JSON matching schema:"""
             lows.append(float(row.get("low") or close))
         return (closes, highs, lows) if closes else None
 
+    async def _aligned_daily_closes(
+        self, tickers: List[str]
+    ) -> Tuple[List[str], List[List[float]]]:
+        """Daily closes for several tickers on the dates they all traded.
+
+        A covariance across assets is only defined on shared observations. Bars
+        are pulled for the whole universe in one query and then intersected on
+        bucket_time, because two tickers with forty bars each and no dates in
+        common carry no covariance information at all -- and reading them
+        separately would hide that behind two healthy-looking series.
+        """
+        if not self.db or not tickers:
+            return [], []
+        try:
+            rows = await self.db.query(
+                """
+                SELECT ticker, bucket_time, close
+                FROM tradfi_bars_1d
+                WHERE ticker = ANY($1::text[])
+                  AND close IS NOT NULL AND close > 0
+                  AND bucket_time > NOW() - ($2 || ' days')::INTERVAL
+                ORDER BY bucket_time
+                """,
+                tickers, str(BL_LOOKBACK_DAYS),
+            )
+        except Exception as e:
+            self.logger.debug("Black-Litterman bar lookup failed: %s", e)
+            return [], []
+
+        by_ticker: Dict[str, Dict[Any, float]] = {}
+        for row in rows or []:
+            try:
+                symbol = str(row["ticker"]).upper()
+                by_ticker.setdefault(symbol, {})[row["bucket_time"]] = float(row["close"])
+            except (TypeError, ValueError, KeyError) as _exc:
+                swallowed("agents.quant_trading_engine._aligned_daily_closes", _exc, logger)
+
+        present = [t for t in tickers if len(by_ticker.get(t, {})) >= BL_MIN_OBSERVATIONS]
+        if len(present) < 2:
+            return [], []
+
+        # The universe is chosen FOR its shared support, not in spite of it.
+        #
+        # Taking the largest N by market cap and then intersecting lets one
+        # late-joining ticker decide the estimate for all of them. Measured
+        # here: six names carried 43-49 daily bars back to 13 July, TT and ALNY
+        # joined the watchlist a month later with 21, and the intersection of
+        # all eight was 15 dates -- fewer observations than twice the number of
+        # assets, which is a rank-deficient covariance dressed up as a portfolio.
+        #
+        # So candidates are walked in market-cap order and each is admitted only
+        # if the universe still clears BL_MIN_OBSERVATIONS_PER_ASSET shared days
+        # per asset with it included. A name that would cost more history than
+        # it adds breadth is skipped, not allowed to shrink everyone's window.
+        chosen: List[str] = []
+        shared_dates: set = set()
+        for symbol in present:
+            candidate_dates = set(by_ticker[symbol])
+            merged = candidate_dates if not chosen else (shared_dates & candidate_dates)
+            width = len(merged)
+            if width < BL_MIN_OBSERVATIONS:
+                continue
+            if width < BL_MIN_OBSERVATIONS_PER_ASSET * (len(chosen) + 1):
+                continue
+            chosen.append(symbol)
+            shared_dates = merged
+            if len(chosen) >= BL_UNIVERSE_MAX:
+                break
+
+        if len(chosen) < 2 or len(shared_dates) < BL_MIN_OBSERVATIONS:
+            return [], []
+
+        ordered = sorted(shared_dates)
+        return chosen, [[by_ticker[t][d] for d in ordered] for t in chosen]
+
+    async def _black_litterman_allocations(
+        self, brief: "FinancialAdviceBrief", watched: Optional[set]
+    ) -> List[BlackLittermanAllocation]:
+        """The portfolio allocation this brief has always declared and never made.
+
+        `black_litterman_allocations` is in the brief schema, the frontend
+        renders it, the feature flag gates it and `quant_calc` implements the
+        maths with a passing test. Nothing ever called it: the only line that
+        touched the field cleared it when the flag was off, so the list was
+        empty in all 25 briefs and would have stayed empty whatever the flag
+        said. This is the caller.
+
+        The equilibrium prior is market-capitalisation weighted, from the caps
+        the movers gate already resolves and caches. The views are this brief's
+        own conviction plays -- which is the whole point of the model: it is the
+        mechanism for blending a house view into a market prior, and the house
+        view is the thing this engine spends its inference budget producing.
+        """
+        if not self.db or not self.redis:
+            return []
+
+        candidates = sorted({str(t).upper().strip() for t in (watched or set()) if t})
+        if len(candidates) < 2:
+            return []
+
+        # Size first: the prior is capitalisation-weighted, so a ticker with no
+        # resolved cap has no weight and cannot be in the universe. `Unknown is
+        # not small` -- the same rule the movers board gates on.
+        caps: Dict[str, float] = {}
+        for symbol in candidates:
+            cap = await cached_market_cap(self.redis, symbol)
+            if cap and cap > 0:
+                caps[symbol] = cap
+        if len(caps) < 2:
+            return []
+
+        ranked = sorted(caps, key=lambda s: caps[s], reverse=True)[: BL_UNIVERSE_MAX * 3]
+        universe, closes = await self._aligned_daily_closes(ranked)
+        if len(universe) < 2:
+            return []
+
+        returns = [
+            [
+                (series[i] - series[i - 1]) / series[i - 1]
+                for i in range(1, len(series))
+                if series[i - 1] > 0
+            ]
+            for series in closes
+        ]
+        width = min(len(r) for r in returns)
+        if width < BL_MIN_OBSERVATIONS - 1:
+            return []
+
+        try:
+            cov = np.cov(np.array([r[-width:] for r in returns], dtype=np.float64))
+            cov_matrix = np.atleast_2d(cov).tolist()
+        except Exception as _exc:
+            swallowed("agents.quant_trading_engine._bl_covariance", _exc, logger)
+            return []
+
+        # The views: this brief's own directional calls, on the names that are
+        # actually in the universe. A play on a ticker with no market cap or no
+        # shared history is not a view the model can express, and is dropped
+        # rather than quietly applied to the wrong row.
+        index = {symbol: i for i, symbol in enumerate(universe)}
+        views_matrix: List[List[float]] = []
+        view_returns: List[float] = []
+        view_uncertainties: List[float] = []
+        for play in brief.highest_conviction_plays:
+            symbol = str(getattr(play, "ticker", "") or "").upper()
+            position = index.get(symbol)
+            if position is None:
+                continue
+            move = getattr(play, "expected_move_pct", None)
+            if move is None:
+                continue
+            try:
+                magnitude = abs(float(move)) / 100.0
+            except (TypeError, ValueError):
+                continue
+            if magnitude <= 0:
+                continue
+            action = str(getattr(play, "action", "") or "").upper()
+            if action == "HOLD":
+                continue
+            row = [0.0] * len(universe)
+            row[position] = 1.0
+            views_matrix.append(row)
+            view_returns.append(-magnitude if action == "SELL" else magnitude)
+            conviction = float(getattr(play, "conviction_score", 0.0) or 0.0)
+            view_uncertainties.append(
+                BL_VIEW_UNCERTAINTY_FLOOR
+                + BL_VIEW_UNCERTAINTY_SCALE * (1.0 - max(0.0, min(1.0, conviction)))
+            )
+
+        # numpy on a 12x12 is microseconds, but it is still synchronous work on
+        # the loop that serves every other agent, so it goes to the executor.
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    quant_calc.black_litterman_optimization,
+                    {symbol: caps[symbol] for symbol in universe},
+                    cov_matrix,
+                    views_matrix,
+                    view_returns,
+                    view_uncertainties,
+                ),
+            )
+        except Exception as _exc:
+            swallowed("agents.quant_trading_engine._bl_optimize", _exc, logger)
+            return []
+
+        weights = (result or {}).get("optimal_weights") or {}
+        expected = (result or {}).get("expected_returns") or {}
+        if not weights:
+            return []
+
+        total_cap = sum(caps[symbol] for symbol in universe) or 1.0
+        allocations: List[BlackLittermanAllocation] = []
+        for symbol in universe:
+            try:
+                allocations.append(
+                    BlackLittermanAllocation(
+                        ticker=symbol,
+                        target_weight_pct=round(float(weights.get(symbol, 0.0)), 2),
+                        # Daily returns, reported annualised, because a weight
+                        # is read next to it and a per-day figure beside a
+                        # portfolio weight reads as an annual one.
+                        expected_return_pct=round(
+                            float(expected.get(symbol, 0.0)) * BL_TRADING_DAYS * 100.0, 2
+                        ),
+                        equilibrium_weight_pct=round(caps[symbol] / total_cap * 100.0, 2),
+                    )
+                )
+            except Exception as _exc:
+                swallowed("agents.quant_trading_engine._bl_allocation", _exc, logger)
+
+        if allocations:
+            self.logger.info(
+                "Black-Litterman: %d assets, %d views, %d shared observations",
+                len(universe), len(views_matrix), width,
+            )
+        return allocations
+
     def _compute_ta(self, closes: List[float], highs: List[float], lows: List[float]) -> Dict[str, Any]:
         return compute_ta_indicators(closes, highs, lows)
 
@@ -1308,7 +1695,99 @@ Return raw JSON matching schema:"""
             neo4j_client = self.neo4j or await get_neo4j()
             if not neo4j_client:
                 return []
-            q = "MATCH (e:Entity)-[r]-(t:Entity {id: $ticker}) RETURN e.id AS related_id, type(r) AS rel_type, coalesce(r.confidence, $unrated) AS confidence LIMIT 10"
+            # Match on either key, under any label, because one ticker is two
+            # nodes.
+            #
+            # This asked for `(e:Entity)-[r]-(t:Entity {id: $ticker})`, which
+            # requires the subject to carry an `id` AND the Entity label AND the
+            # other end to carry it too. The supervisor merges on (label, name),
+            # so `upsert_equity` (label "Company") and `link_entities` (default
+            # "Entity") build two nodes per ticker. 50 tickers are split. On
+            # NVDA the halves hold:
+            #
+            #   Company  GRANGER_CAUSES 16, PEER_OF 6, STATISTICALLY_* 5,
+            #            SYMPATHY_MOVER 4, OPERATES_IN 1          = 32
+            #   Entity   RELATED_TO 2, HAS_EXPOSURE_IN 1, SYMPATHY_MOVER 1 = 4
+            #
+            # and this query read the Entity half. The Entity Graph line of the
+            # prompt was near-empty while the semiconductor cohort sat one label
+            # away.
+            #
+            # `OR` rather than `coalesce(t.name, t.id)`: coalesce takes `name`
+            # when it exists, so a node named "NVIDIA Corp" with id "NVDA" would
+            # stop matching the ticker entirely.
+            #
+            # Left unlabelled and open on relationship type after checking what
+            # that admits: across every company-named node the graph holds no
+            # TRANSACTED_WITH edge at all, so the 38,556 crypto-wallet edges
+            # cannot reach here. HAS_EXPOSURE_IN and MACRO_CORRELATED are
+            # excluded because their targets are event types and source names
+            # (`market_anomaly`, `finnhub_equities`), not entities.
+            #
+            # ORDER BY is not decoration: the caller slices [:3], so without one
+            # the three facts shown to the model were whichever three Neo4j
+            # happened to return.
+            # Ranked by effect size, because the confidence is saturated.
+            #
+            # Measured over all 116 GRANGER_CAUSES edges: `confidence` is
+            # 1 - p_value, and the discovery pass only writes an edge once the
+            # p-value has cleared a significance filter, so 102 of the 116 sit
+            # at exactly 1.0. Ordering by it produced a 9-way tie at the top and
+            # the caller's [:3] then picked three of the nine arbitrarily.
+            #
+            # `f_stat` on the same edges has 116 distinct values across 116
+            # edges, spanning 4.64 to 217.5 -- the filter never touched it. For
+            # NVDA it reorders the top three from an arbitrary slice of the tie
+            # to QQQ (36.7), AVGO (31.2), TLT (21.7).
+            #
+            # This is the fifth score found saturated by the same mechanism: a
+            # number derived from a quantity some earlier filter had already
+            # guaranteed. Kept as a tie-break rather than the primary key so
+            # predicates that carry no f_stat still order sensibly against each
+            # other.
+            #
+            # max(f_stat) grouped by (entity, predicate) because Granger edges
+            # repeat per lag -- AVGO appears at lag 1 and lag 2 -- and two rows
+            # for one relationship would eat two of the three slots the prompt
+            # has.
+            # Labels listed, and `id` dropped, because both are measurable.
+            #
+            # Every label carries a RANGE index on `name` and none carries one
+            # on `id`, so `t.id = $ticker` forces a label scan. Checked whether
+            # it buys anything: across Company, Entity and CryptoAsset there are
+            # zero nodes whose `id` differs from their `name`. It is a redundant
+            # predicate that was costing the index.
+            #
+            # Timed warm, same 36 edges returned:
+            #   name only, labelled            2 ms
+            #   name or id, labelled         600 ms
+            #   name or id, unlabelled      1016 ms
+            #   the original                 358 ms -- and it returned 3 edges
+            #
+            # Company|Entity|CryptoAsset and not "any label" because Flag holds
+            # 124 ticker-shaped names: a two-letter vessel flag code would
+            # otherwise answer a lookup for a two-letter ticker and attach a
+            # ship registry to an equity brief.
+            #
+            # Three nodes in the graph carry no label at all -- AS, CL=F and VXX,
+            # 37 edges between them -- and no label-scoped query can reach them.
+            # That is a writer defect, recorded separately rather than papered
+            # over here by dropping back to a scan of all 253,000 nodes.
+            q = """
+                MATCH (t:Company|Entity|CryptoAsset)
+                WHERE t.name = $ticker
+                MATCH (t)-[r]-(e)
+                WHERE NOT type(r) IN ['HAS_EXPOSURE_IN', 'MACRO_CORRELATED']
+                  AND coalesce(e.name, e.id) IS NOT NULL
+                WITH coalesce(e.name, e.id) AS related_id,
+                     type(r) AS rel_type,
+                     max(coalesce(r.weight, r.confidence, $unrated)) AS confidence,
+                     max(r.f_stat) AS strength,
+                     min(r.lag) AS lag
+                RETURN related_id, rel_type, confidence, strength, lag
+                ORDER BY confidence DESC, coalesce(strength, 0.0) DESC
+                LIMIT 10
+            """
             rows = await neo4j_client.query(q, {"ticker": ticker.upper(), "unrated": UNRATED_EDGE_CONFIDENCE})
             return rows or []
         except Exception as e:

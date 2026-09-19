@@ -154,6 +154,32 @@ async def publish_now() -> bool:
             payload[f"c|{name}"] = str(value)
         for name, value in _GAUGE_METRICS.items():
             payload[f"g|{name}"] = str(value)
+
+        # Latency, which nothing outside this process could previously read.
+        #
+        # `observe_latency` fills `_LATENCY_HISTOGRAMS`, `get_summary` turns it
+        # into count/avg/p50/p95/p99 -- and this function published counters and
+        # gauges only. So every latency in the platform lived and died inside
+        # the process that measured it: the aggregator never saw one, /metrics
+        # never exported one, and Prometheus has never held a single latency
+        # series. The Grafana panel bound to `sentinel_ollama_latency_seconds`
+        # could not have worked whatever it was named.
+        #
+        # Published as gauges rather than a histogram type: the aggregator
+        # already understands gauges, the percentiles are computed at the source
+        # where the raw observations are, and a real Prometheus histogram would
+        # need bucket boundaries this platform has no basis to choose yet.
+        for name, vals in _LATENCY_HISTOGRAMS.items():
+            if not vals:
+                continue
+            ordered = sorted(vals)
+            n = len(ordered)
+            payload[f"g|{name}_seconds_count"] = str(n)
+            payload[f"g|{name}_seconds_avg"] = str(sum(ordered) / n)
+            payload[f"g|{name}_seconds_p50"] = str(ordered[int(n * 0.50)])
+            payload[f"g|{name}_seconds_p95"] = str(ordered[min(int(n * 0.95), n - 1)])
+            payload[f"g|{name}_seconds_p99"] = str(ordered[min(int(n * 0.99), n - 1)])
+
         if not payload:
             return True
 
@@ -193,6 +219,18 @@ async def collect_all(redis_client: Any = None) -> Dict[str, Dict[str, float]]:
         "counters": {k: float(v) for k, v in _COUNTER_METRICS.items()},
         "gauges": dict(_GAUGE_METRICS),
     }
+    # The local fallback has to carry latency too, or a Redis outage silently
+    # drops the one metric family that was already invisible.
+    for _name, _vals in _LATENCY_HISTOGRAMS.items():
+        if not _vals:
+            continue
+        _ordered = sorted(_vals)
+        _n = len(_ordered)
+        local["gauges"][f"{_name}_seconds_count"] = float(_n)
+        local["gauges"][f"{_name}_seconds_avg"] = sum(_ordered) / _n
+        local["gauges"][f"{_name}_seconds_p50"] = _ordered[int(_n * 0.50)]
+        local["gauges"][f"{_name}_seconds_p95"] = _ordered[min(int(_n * 0.95), _n - 1)]
+        local["gauges"][f"{_name}_seconds_p99"] = _ordered[min(int(_n * 0.99), _n - 1)]
     client = redis_client or _redis_client
     if not client:
         return local

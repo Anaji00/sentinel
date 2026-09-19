@@ -97,6 +97,28 @@ class AlertTier(str, Enum):
     INTELLIGENCE = "INTELLIGENCE"
     CRITICAL = "CRITICAL"
 
+
+#: How a tier is stored. `correlations.alert_tier` is an integer column.
+#:
+#: The mapping lived only inside `event_store._persist`, so anything reading the
+#: column had to know it by heart. The signal-attribution spec did not, and
+#: compared the integer against the enum's name:
+#:
+#:     "sql": "c.alert_tier = 'CRITICAL'"
+#:     -> invalid input syntax for type integer: "CRITICAL"
+#:
+#: That signal has been unmeasurable since it was written, and reported as a
+#: malformed predicate rather than as a missing mapping, so the report said
+#: "not measurable" where the truth was "nobody wrote this down twice the same
+#: way". Ordered, so a comparison can be `>=` as well as `=`.
+ALERT_TIER_DB_VALUE: dict[str, int] = {
+    AlertTier.WATCH.value: 1,
+    AlertTier.ALERT.value: 2,
+    AlertTier.ELEVATED.value: 3,
+    AlertTier.INTELLIGENCE.value: 4,
+    AlertTier.CRITICAL.value: 5,
+}
+
 class ScenarioStatus(str, Enum):
     HYPOTHESIS = "hypothesis"
     CONFIRMED = "confirmed"
@@ -297,6 +319,16 @@ _LABEL_TO_ENTITY_TYPE = {
     "company": EntityType.COMPANY,
     "cryptoasset": EntityType.INSTRUMENT,
     "instrument": EntityType.INSTRUMENT,
+    # Commodity, Index and MacroFactor are instruments too, and were missing
+    # here only because nothing ever produced them: all three labels had a
+    # RANGE index and zero nodes, with crude oil and QQQ stored as `:Company`.
+    # Without these entries they would fall to UNKNOWN, which returns an
+    # identifier exactly as written -- and an identifier whose spelling depends
+    # on its producer is how `0x...` and `0X...` became 6,366 and 139,047
+    # separate nodes for the same addresses.
+    "commodity": EntityType.INSTRUMENT,
+    "index": EntityType.INSTRUMENT,
+    "macrofactor": EntityType.INSTRUMENT,
     "vessel": EntityType.VESSEL,
     "aircraft": EntityType.AIRCRAFT,
     "wallet": EntityType.WALLET,
@@ -452,6 +484,10 @@ class PredictionMarketData(BaseModel):
        return self.price_usd
 
 class CryptoData(BaseModel):
+    # See FinancialData.change_pct_bar: the crypto candle enricher computes the
+    # same `price_change_pct`, prints it into the same kind of headline, and
+    # dropped it in the same place.
+
     pair: str
     trade_type: str
     side: str
@@ -460,6 +496,7 @@ class CryptoData(BaseModel):
     high_price: Optional[float] = None
     low_price: Optional[float] = None
     close_price: Optional[float] = None
+    change_pct_bar: Optional[float] = None
     size_tokens: float
 
     # What the transfer was worth, as distinct from how many tokens moved.
@@ -496,6 +533,29 @@ class FinancialData(BaseModel):
     # comment explaining that workaround.
     notional_usd: Optional[float] = None
     volume: Optional[int] = None
+
+    # How far it moved, as a percentage, on the record rather than in the prose.
+    #
+    # `price_change_pct` is computed for every candle in the tradfi and crypto
+    # enrichers, reaches the headline string and the anomaly score, and stopped
+    # there. Both open and close were stored, so a determined reader could
+    # recover the bar's own move -- but only that bar's, and only by dividing
+    # two fields that nothing said were meant to be divided.
+    #
+    # The cost was in the rule DSL. A correlation clause can select on
+    # `min_anomaly`, which answers "was this unusual for this instrument", and
+    # had no way to express "moved a lot" -- so a rule about a repricing had to
+    # be written as a rule about unusualness and hope the two agreed. They do
+    # not: a thin name moving 0.4% on ten times its normal volume scores higher
+    # than a mega-cap down 9%.
+    #
+    # Three fields because one number cannot separate two different days. A
+    # name up 6% that gapped 7% and was sold from the open is not the name that
+    # ground 6% higher through the session.
+    change_pct_bar: Optional[float] = None
+    change_pct_day: Optional[float] = None
+    gap_pct: Optional[float] = None
+
     open_interest: Optional[int] = None
     implied_volatility: Optional[float] = None
     underlying_price: Optional[float] = None
@@ -620,6 +680,20 @@ class SupplyChainData(BaseModel):
     vessel_class: Optional[str] = None
     anomaly_flag: bool = False
 
+    # The tickers a move in this index actually reaches.
+    #
+    # `collector-macro/freight.py` has always attached this -- ZIM, MATX, SBLK,
+    # GOGL, DAC, CAT, VALE, NUE, CL=F -- and the model had no field for it, so
+    # the enricher built SupplyChainData from seven named arguments and the list
+    # went no further than the raw payload.
+    #
+    # It is the only thing in a freight event that names something tradeable.
+    # The event's primary entity is the index itself (BDI, FBX_GLOBAL, HARPEX),
+    # which is not an equity or a crypto major, so the quant engine drops every
+    # one of them at its supported-asset gate. 4,219 freight events have been
+    # stored and not one has reached the financial reasoning tier.
+    exposed_equities: List[str] = Field(default_factory=list)
+
 class SecurityData(BaseModel):
     breach_type: Optional[str] = None
     affected_org: Optional[str] = None
@@ -666,12 +740,28 @@ class ScoreAdjustment(BaseModel):
 class AnomalyBreakdown(BaseModel):
     """Dimensional anomaly sub-scores — gives agents structured reasoning inputs."""
     composite_score: float = 0.0
-    spatial_score: float = 0.0
-    temporal_score: float = 0.0
-    volume_z_score: float = 0.0
-    volatility_z_score: float = 0.0
-    cross_domain_correlation_score: float = 0.0
-    ewma_volatility: float = 0.0
+
+    # None, not 0.0, for a dimension this event's scorer did not measure.
+    #
+    # `/explain/event/{id}` builds its waterfall from whichever of these is not
+    # None, and defaulting them to 0.0 made every one of them look measured. An
+    # economic-calendar event sets only `volatility_z_score` and rendered four
+    # more dimensions at zero beside it; a tradfi block trade sets volume and
+    # cross-domain and rendered spatial and temporal the same way. A bar
+    # labelled "Spatial Dispersion 0.0" on an equity trade is not a small
+    # number, it is a claim that a measurement was taken and found nothing.
+    #
+    # This is the distinction the rest of this model already keeps between
+    # absence and zero -- `coverage_fraction` below is Optional for exactly the
+    # same reason, and both `_coverage_of` implementations return None rather
+    # than 0.0 so an event from a path that does not report it is not penalised
+    # for a field it never had.
+    spatial_score: Optional[float] = None
+    temporal_score: Optional[float] = None
+    volume_z_score: Optional[float] = None
+    volatility_z_score: Optional[float] = None
+    cross_domain_correlation_score: Optional[float] = None
+    ewma_volatility: Optional[float] = None
     is_significant: bool = False
     domain: str = "temporal"
     # What backed the composite score, carried onto the event.
@@ -1001,6 +1091,108 @@ class NormalizedEvent(BaseModel):
 
         parts.append(f"AnomalyScore: {self.anomaly_score:.2f}")
         return " | ".join(parts)
+
+# Every payload that carries a percentage move, and the field each calls it.
+#
+# Module level, and the single definition: the deep correlation window derives
+# a SQL expression from this tuple rather than hand-writing a COALESCE, because
+# a second copy of this list is how `min_abs_move_pct` came to mean one thing in
+# the cached window and nothing at all in the banded one.
+#
+# `supply_chain_data` was missed on the first pass, which the freight scenarios
+# caught: the collector computes `change_pct` and the enricher stores it as
+# `change_14d_pct`, so a freight index has always known how far it moved and
+# this helper could not see it. A rule about a repricing that silently excludes
+# the freight half is worse than one with no threshold.
+#
+# `macro_data.surprise_pct` was here and has been removed. It is a percentage,
+# and it is not a price move: it measures how far an economic print landed from
+# consensus. The clause that reads this mapping tells the synthesiser "the price
+# moved this far", and a CPI print 1.6% above forecast was satisfying it. Units
+# agreed; meaning did not. A rule that wants a large surprise should say so with
+# a clause of its own rather than borrow this one.
+PAYLOAD_MOVE_FIELDS = (
+    ("financial_data", ("change_pct_day", "change_pct_bar")),
+    ("crypto_data", ("change_pct_bar",)),
+    ("supply_chain_data", ("change_14d_pct",)),
+)
+
+
+def move_pct_sql(alias: str = "") -> str:
+    """The same mapping as a SQL expression, for reads that go to Postgres.
+
+    Built from `PAYLOAD_MOVE_FIELDS` rather than written out, so a payload
+    added there reaches the durable window without a second edit. Each field is
+    extracted as text and cast with a guard: `->>` on a missing key yields NULL,
+    and a value that is not a number would raise, so the cast is wrapped in a
+    regex test rather than left to fail the whole query.
+    """
+    prefix = f"{alias}." if alias else ""
+    parts = []
+    for payload_name, fields in PAYLOAD_MOVE_FIELDS:
+        for field in fields:
+            expr = f"{prefix}{payload_name}->>'{field}'"
+            parts.append(
+                f"CASE WHEN {expr} ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+                f"THEN ({expr})::double precision END"
+            )
+    return "COALESCE(" + ", ".join(parts) + ")"
+
+
+def _as_percent(value) -> Optional[float]:
+    """A finite number, or None. No bare `except: pass` in the caller.
+
+    A value that will not parse is not an error to be swallowed here -- it is
+    simply not a move, and the caller goes on to the next place one might be.
+    Written as a returned None rather than a caught-and-ignored exception so
+    the quiet-failure check can tell the two apart, which is the distinction
+    that check exists for.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def event_move_pct(event) -> Optional[float]:
+    """How far the subject moved on this event, as a percentage, or None.
+
+    The move lives on whichever domain payload the event carries -- the tradfi
+    and crypto candle enrichers both compute it -- so a reader that wants "did
+    this move" should not have to know which domain it is looking at.
+
+    None rather than 0.0 when no payload carries one: an event with no price
+    attached has not been flat, it has not been measured, and a rule selecting
+    on magnitude must not admit it.
+    """
+    if event is None:
+        return None
+    getter = event.get if isinstance(event, dict) else lambda k, d=None: getattr(event, k, d)
+
+    # A row from the correlation window carries the move already flattened.
+    #
+    # That cache stores an explicit projection rather than the event -- no
+    # payload columns at all, deliberately, because holding them in full
+    # multiplied a 321,535-member structure. So the move travels as one float
+    # beside `anomaly_score`, and this is where a cached row answers from.
+    flat = _as_percent(getter("move_pct"))
+    if flat is not None:
+        return flat
+
+    for payload_name, fields in PAYLOAD_MOVE_FIELDS:
+        payload = getter(payload_name)
+        if not payload:
+            continue
+        sub = payload.get if isinstance(payload, dict) else lambda k, d=None: getattr(payload, k, d)
+        for field in fields:
+            number = _as_percent(sub(field))
+            if number is not None:
+                return number
+    return None
+
 
 class CorrelationCluster(BaseModel):
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))

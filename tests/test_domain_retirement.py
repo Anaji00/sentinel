@@ -23,6 +23,7 @@ retired watch zones keep their coordinates.
 """
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -348,3 +349,60 @@ def test_the_retired_situations_still_assert_something():
     for scenario in (PORT_RANSOMWARE, GPS_INTERFERENCE, CYBER_MARKET_IMPACT, KEV_EXPLOITATION):
         assert scenario.expect_rule == "", f"{scenario.name} still expects a rule"
         assert scenario.why, "the situation itself is still described"
+
+
+def test_no_start_target_brings_up_a_retired_collector_alongside_the_others():
+    """A retirement has to survive the next person who types "start everything".
+
+    `test_the_collector_is_out_of_the_default_profile_and_still_startable`
+    above checks the compose side: collector-cyber carries `profiles: [cyber]`
+    and `make cyber` can still raise it. Nothing checked the Makefile side --
+    that no *other* start target pulls that profile in alongside the rest.
+
+    It matters because the profile name is the only thing standing between a
+    retired collector and a running one, and the obvious way to redeploy after
+    a code change is to name every profile you can see:
+
+        COMPOSE_PROFILES=collectors,agents,cyber,obs docker compose up -d
+
+    which is how this deployment came to be ingesting a retired domain again on
+    16 September -- 200 ransomware events in 45 minutes, into a domain whose
+    two rules are withdrawn and whose scoring the retirement commit measured as
+    degenerate. Nothing failed. The collector came up healthy and stayed
+    healthy, because a retired collector and a live one are the same program.
+
+    `make budget` already encodes the right answer -- its four operating modes
+    are {collectors}, {agents}, {collectors,obs}, {agents,obs}, and cyber is in
+    none of them. This ties that arrangement to RETIRED_DOMAINS so the two
+    cannot drift apart, and so the next retirement inherits the check instead
+    of having to remember it.
+    """
+    from shared.models.events import RETIRED_DOMAINS
+
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert RETIRED_DOMAINS, "nothing is retired; this check has no subject"
+
+    for domain in sorted(RETIRED_DOMAINS):
+        service = f"collector-{domain}"
+        if service not in compose["services"]:
+            continue
+        profiles = compose["services"][service].get("profiles") or []
+        assert profiles, f"{service} is retired but starts in the default profile"
+
+        # Every line that raises containers, and the profiles it names.
+        for line in makefile.splitlines():
+            if "up -d" not in line or "--profile" not in line:
+                continue
+            named = set(re.findall(r"--profile\s+([a-z-]+)", line))
+            overlap = named.intersection(profiles)
+            if not overlap:
+                continue
+            # The one deliberate escape hatch: a target named for the retired
+            # domain itself, which is what makes the retirement reversible.
+            assert named == overlap, (
+                f"{line.strip()!r} starts the retired {service} alongside "
+                f"{sorted(named - overlap)}. A retired collector may only be "
+                f"raised on its own, by `make {domain}`."
+            )

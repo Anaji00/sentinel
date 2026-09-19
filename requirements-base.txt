@@ -20,3 +20,19 @@ simplefix==1.0.12
 # credentials flow, process-graph construction and batch-job polling, and
 # reimplementing those over aiohttp would be a large surface to get subtly wrong.
 openeo==0.51.0
+
+# Region classification, declared rather than inherited.
+#
+# shared/utils/regions.py imports shapely and falls back to bounding-box checks
+# when the import fails. Those are not two implementations of one answer:
+# measured over 400 real vessel positions the two paths disagree on 113 of them
+# (28.2%), because a bounding box is not the polygon it encloses. Keelung and
+# Taiwan's north coast classify as "Taiwan Territorial" with shapely and as
+# "Taiwan Strait" without it, and chokepoint traffic counts key on that name --
+# the number a blockade would be measured against.
+#
+# It was present only because openeo and geopandas happen to require it. Neither
+# is a geometry dependency of this platform's own, so removing or bumping either
+# would have silently moved every container onto the other classifier. This line
+# is what stops that being invisible.
+shapely==2.1.2

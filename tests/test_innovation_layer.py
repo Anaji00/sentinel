@@ -324,8 +324,20 @@ def test_search_does_not_load_an_embedding_model_in_the_gateway():
     src = inspect.getsource(search)
     assert "SentenceTransformer" not in src
     assert "sentence_transformers" not in src
+
     # Retrieval works from the vector already stored with the event.
-    assert "with_vectors=True" in src
+    #
+    # Spelled either way: this asserted the qdrant-client keyword
+    # `with_vectors=True`, and the route now speaks Qdrant's REST API, whose
+    # field is `with_vector`. The transport changed because `qdrant_client` is
+    # declared in requirements-ml.txt and the gateway builds from the base
+    # image, so the import had never once succeeded here -- semantic search
+    # reported itself unavailable against half a million indexed vectors. What
+    # this test is actually about is that no embedding model is loaded in this
+    # container, and that the query vector comes from the index rather than
+    # from a model, which both still hold.
+    asks_for_stored_vector = "with_vectors=True" in src or '"with_vector": True' in src
+    assert asks_for_stored_vector, "the query vector must come from the index, not a model"
 
 
 def test_similarity_floor_allows_an_honest_empty_result():

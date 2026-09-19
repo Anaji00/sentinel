@@ -11,6 +11,7 @@ Note: TimescaleClient.query() uses asyncpg's connection.fetch() which
 """
 
 import logging
+import re
 import os
 import json
 import asyncio as _asyncio
@@ -164,6 +165,17 @@ class Neo4jClient:
 
 # ── TIMESCALEDB ───────────────────────────────────────────────────────────────
 
+def _is_only_comments(statement: str) -> bool:
+    """True when a fragment carries no executable SQL.
+
+    Splitting a commented script leaves trailing fragments that are nothing but
+    a comment; sending one to Postgres is a syntax error.
+    """
+    body = re.sub(r"/\*.*?\*/", "", statement, flags=re.S)
+    body = re.sub(r"--[^\n]*", "", body)
+    return not body.strip()
+
+
 class TimescaleClient:
 
     def __init__(self):
@@ -255,16 +267,130 @@ class TimescaleClient:
             async with conn.transaction():
                 await conn.execute(sql, *params)
 
-    async def execute_without_transaction(self, sql: str, *params):
+    @staticmethod
+    def _split_statements(sql: str) -> List[str]:
+        """A script into its statements, respecting quotes and dollar-quoting.
+
+        Naive splitting on ";" breaks on a semicolon inside a string literal or
+        a $$-quoted function body, and this runs DDL against a live database --
+        so it tracks what it is inside of rather than assuming.
         """
-        Executes SQL statements without wrapping them in an explicit transaction block.
-        Required for TimescaleDB Continuous Aggregates (CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous))
-        and background policy management functions which cannot run inside a transaction block.
+        statements: List[str] = []
+        buf: List[str] = []
+        i = 0
+        n = len(sql)
+        in_single = in_double = in_line_comment = in_block_comment = False
+        dollar_tag = None
+
+        while i < n:
+            ch = sql[i]
+            two = sql[i:i + 2]
+
+            if in_line_comment:
+                buf.append(ch)
+                if ch == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+            if in_block_comment:
+                buf.append(ch)
+                if two == "*/":
+                    buf.append(sql[i + 1])
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if dollar_tag:
+                buf.append(ch)
+                if sql.startswith(dollar_tag, i):
+                    buf.extend(sql[i + 1:i + len(dollar_tag)])
+                    i += len(dollar_tag)
+                    dollar_tag = None
+                    continue
+                i += 1
+                continue
+            if in_single:
+                buf.append(ch)
+                if ch == "'":
+                    in_single = False
+                i += 1
+                continue
+            if in_double:
+                buf.append(ch)
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+
+            if two == "--":
+                in_line_comment = True
+                buf.append(ch)
+                i += 1
+                continue
+            if two == "/*":
+                in_block_comment = True
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                in_double = True
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "$":
+                end = sql.find("$", i + 1)
+                if end != -1 and sql[i + 1:end].replace("_", "").isalnum() or (end == i + 1):
+                    dollar_tag = sql[i:end + 1]
+                    buf.append(sql[i:end + 1])
+                    i = end + 1
+                    continue
+            if ch == ";":
+                statements.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+
+            buf.append(ch)
+            i += 1
+
+        statements.append("".join(buf))
+        return [s for s in (stmt.strip() for stmt in statements) if s and not _is_only_comments(s)]
+
+    async def execute_without_transaction(self, sql: str, *params, timeout: float = None):
+        """Executes each statement on its own, outside any transaction block.
+
+        Required by TimescaleDB's policy and refresh functions, which refuse to
+        run inside one. This sent the whole script in a single call, and asyncpg
+        sends a multi-statement script over the simple query protocol -- which
+        Postgres wraps in one implicit transaction, so the method did the exact
+        thing its name says it does not. Migration 0026 is what found it:
+        `refresh_continuous_aggregate() cannot run inside a transaction block`.
+
+        Statements are sent one at a time. A single statement is its own
+        implicit transaction, which is not a transaction *block*, and that is
+        the distinction these functions test for.
         """
         if len(params) == 1 and isinstance(params[0], tuple):
             params = params[0]
+        statements = self._split_statements(sql) if not params else [sql]
         async with self._pool.acquire() as conn:
-            await conn.execute(sql, *params)
+            for statement in statements:
+                # `timeout` overrides the pool's command_timeout for this
+                # statement alone. The pool is built with 60 seconds, which
+                # suits the request path and not DDL: a GIN index across this
+                # hypertable's 24 chunks takes about 140 seconds, and without
+                # an override the client cancels its own migration and the
+                # migrator exits non-zero having changed nothing.
+                if timeout is None:
+                    await conn.execute(statement, *params)
+                else:
+                    await conn.execute(statement, *params, timeout=timeout)
 
     async def execute_many(self, sql: str, rows: List[tuple]):
         """High-performance batch execution."""

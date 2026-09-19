@@ -27,7 +27,18 @@ from typing import Any, Mapping, Sequence
 # ── What a clause may contain ───────────────────────────────────────────────
 
 # What to look for, and how far back.
-SELECTION_KEYS: tuple = ("event_types", "hours", "min_anomaly", "tags")
+SELECTION_KEYS: tuple = (
+    "event_types", "hours", "min_anomaly", "tags", "min_abs_move_pct",
+)
+
+# `min_anomaly` answers "was this unusual for this instrument".
+# `min_abs_move_pct` answers "did the price actually move", and the two are not
+# the same question: a thin name up 0.4% on ten times its normal volume scores
+# higher on the first than a mega-cap down 9% does. Every rule about a
+# repricing had to be written in terms of unusualness and hope the two agreed.
+#
+# Absolute, because a rule about a shock is about magnitude; direction is
+# expressed by the event types and tags a clause already selects on.
 
 # What connects the evidence to the trigger. A clause declaring none of these
 # is asserting that falling in the same window is itself the relationship.

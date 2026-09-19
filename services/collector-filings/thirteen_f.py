@@ -129,7 +129,7 @@ def _rebuild_stripped_index() -> None:
     """Derive the suffix-stripped index from whatever is in the title map."""
     _STRIPPED_TITLE_TO_TICKER.clear()
     for title, ticker in _DYNAMIC_TITLE_TO_TICKER.items():
-        t_base, t_class = _normalize_issuer(title)
+        t_base, t_class = _normalize_issuer(_registry_key(title))
         if t_base:
             _STRIPPED_TITLE_TO_TICKER.setdefault(f"{t_base}|{t_class}", ticker)
 
@@ -149,7 +149,7 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
     if redis_client:
         try:
             raw_redis = getattr(redis_client, "raw", redis_client)
-            cached = await raw_redis.get("sentinel:sec:company_tickers:map")
+            cached = await raw_redis.get(_REGISTRY_CACHE_KEY)
             if cached:
                 data = json.loads(cached.decode("utf-8") if isinstance(cached, bytes) else str(cached))
                 _DYNAMIC_TITLE_TO_TICKER = data.get("title_to_ticker", {})
@@ -171,10 +171,23 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                     title = str(item.get("title", "")).upper()
                     cik = str(item.get("cik_str", ""))
                     if ticker and title:
-                        clean_title = re.sub(r"[^A-Z0-9 ]", "", title).strip()
-                        _DYNAMIC_TITLE_TO_TICKER[clean_title] = ticker
-                        _DYNAMIC_TITLE_TO_TICKER[title] = ticker
-                        t_base, t_class = _normalize_issuer(clean_title)
+                        clean_title = _registry_key(title)
+                        # setdefault, not assignment: first listing wins.
+                        #
+                        # SEC lists Alphabet four times under one title --
+                        # GOOGL, GOOG, GOOGM, GOOGN, in that order -- and plain
+                        # assignment kept the last, so `ALPHABET INC` resolved
+                        # to GOOGN. That is a real SEC-registered security and
+                        # not a tradeable common line, and it is what the 13F
+                        # holdings were being tagged with.
+                        #
+                        # The stripped index below already used setdefault for
+                        # exactly this reason, with a comment saying so. These
+                        # two maps had opposite precedence rules and this one is
+                        # consulted first, so its answer won.
+                        _DYNAMIC_TITLE_TO_TICKER.setdefault(clean_title, ticker)
+                        _DYNAMIC_TITLE_TO_TICKER.setdefault(title, ticker)
+                        t_base, t_class = _normalize_issuer(clean_title)  # already keyed
                         # First writer wins: the registry lists share classes in
                         # order, so "ALPHABET" resolves to GOOGL rather than to
                         # whichever class was enumerated last.
@@ -191,13 +204,50 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                             "title_to_ticker": _DYNAMIC_TITLE_TO_TICKER,
                             "cik_to_ticker": _DYNAMIC_CIK_TO_TICKER,
                         })
-                        await raw_redis.set("sentinel:sec:company_tickers:map", payload, ex=86400 * 7)
+                        await raw_redis.set(_REGISTRY_CACHE_KEY, payload, ex=86400 * 7)
                     except Exception as _exc:
                         swallowed("collector_filings.thirteen_f.load_sec_company_tickers", _exc, logger)
     except Exception as e:
         logger.debug(f"Notice fetching SEC company tickers: {e}")
 
     return _DYNAMIC_TITLE_TO_TICKER
+
+
+# SEC appends the state of incorporation to a registered name: the registry
+# holds "VERISIGN INC/CA", and a 13F reports the issuer as "VERISIGN INC".
+# Versioned, because the cached map is a *derived* structure and the rule that
+# derives it changed.
+#
+# The old cache holds the collapsed title->ticker map built under last-write-wins,
+# so it already contains GOOGN for Alphabet and HTZWW for Hertz -- the first
+# listing is gone and cannot be recovered from it. The loader returns early when
+# that cache is warm, so without a new key the fix would sit inert behind a
+# seven-day TTL on every deployment that already has one.
+_REGISTRY_CACHE_KEY = "sentinel:sec:company_tickers:map:v2"
+
+
+_STATE_SUFFIX = re.compile(r"/[A-Z]{2,3}(?![A-Z])")
+
+
+def _registry_key(name: str) -> str:
+    """The spelling both sides of a ticker lookup have to agree on.
+
+    Used for the registry titles *and* the issuer names, because the two were
+    normalised differently and so could not match. Two measured failures it
+    fixes, out of 33 unresolved holdings in 100:
+
+      "Amazon.com Inc" -> the old rule deleted the period rather than
+      replacing it, giving AMAZONCOM, while the registry's "AMAZON COM INC"
+      reduced to AMAZON. Punctuation now becomes a space.
+
+      "VERISIGN INC" -> the registry lists "VERISIGN INC/CA", and the state
+      suffix survived every strip. It is removed before anything else.
+    """
+    if not name:
+        return ""
+    text = _STATE_SUFFIX.sub(" ", str(name).upper())
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return " ".join(text.split())
 
 
 def resolve_ticker_dynamically(issuer_name: Optional[str], cusip: Optional[str] = None) -> Optional[str]:
@@ -212,7 +262,7 @@ def resolve_ticker_dynamically(issuer_name: Optional[str], cusip: Optional[str] 
     if clean_name in _DYNAMIC_TITLE_TO_TICKER:
         return _DYNAMIC_TITLE_TO_TICKER[clean_name]
 
-    alphanumeric_name = re.sub(r"[^A-Z0-9 ]", "", clean_name).strip()
+    alphanumeric_name = _registry_key(clean_name)
     if alphanumeric_name in _DYNAMIC_TITLE_TO_TICKER:
         return _DYNAMIC_TITLE_TO_TICKER[alphanumeric_name]
 
@@ -251,12 +301,46 @@ def resolve_ticker_dynamically(issuer_name: Optional[str], cusip: Optional[str] 
     if best_ticker:
         return best_ticker
 
+    # Last resort: the 13F name is a truncation of a registry title.
+    #
+    # SEC caps `nameOfIssuer` in the 13F schema, so long names arrive cut off
+    # mid-word: "Taiwan Semiconductor Manufac" against the registry's "TAIWAN
+    # SEMICONDUCTOR MANUFACTURING CO LTD". No amount of suffix stripping closes
+    # that, because the truncation is inside a word.
+    #
+    # Two guards, because a prefix match is otherwise an excellent way to
+    # resolve one company to another. The prefix must be long enough that it
+    # cannot be a short common name, and it must match exactly one registry
+    # entry -- if two companies share it, the name genuinely does not identify
+    # one of them and None is the honest answer.
+    if len(alphanumeric_name) >= _MIN_TRUNCATION_PREFIX_LEN:
+        # No word boundary is required, because the cut lands mid-word:
+        # "TAIWAN SEMICONDUCTOR MANUFAC" against "...MANUFACTURING CO LTD".
+        #
+        # Uniqueness is measured over registry *titles*, not tickers. One
+        # company can hold several tickers -- TSM and TSMWF are both Taiwan
+        # Semiconductor -- and requiring a unique ticker would reject exactly
+        # the large multiply-listed companies this is for. A unique title means
+        # one company, and the map already holds that company's primary
+        # listing because the loader keeps the first.
+        matches = {
+            title for title in _DYNAMIC_TITLE_TO_TICKER
+            if title.startswith(alphanumeric_name)
+        }
+        if len(matches) == 1:
+            return _DYNAMIC_TITLE_TO_TICKER[matches.pop()]
+
     return None
 
 
 # A registry title shorter than this cannot identify a company by containment;
 # it is an abbreviation that collides with ordinary words.
 _MIN_ANCHORED_TITLE_LEN = 4
+
+# How much of a name must survive truncation before a prefix match is allowed.
+# Twenty characters is comfortably past the point where a prefix could be an
+# ordinary short company name, and well inside SEC's field cap.
+_MIN_TRUNCATION_PREFIX_LEN = 20
 
 # Suffixes that carry no identity. Order matters only in that they are stripped
 # repeatedly from the end until none match.
@@ -265,6 +349,10 @@ _CORPORATE_SUFFIXES = (
     "LIMITED", "PLC", "LLC", "LP", "LLP", "SA", "NV", "AG", "SE", "AB", "ASA",
     "HOLDING", "HOLDINGS", "GROUP", "COM", "NEW", "THE", "TRUST",
     "ADR", "SPONSORED", "SHS", "ORD",
+    # Abbreviations a 13F uses where the registry spells the word out.
+    # "CROWDSTRIKE HLDGS INC" against "CrowdStrike Holdings, Inc." failed on
+    # this alone.
+    "HLDG", "HLDGS", "CP", "CORPS", "COS", "LTDA",
 )
 
 # The share-class marker, which is identity and must not be stripped away with

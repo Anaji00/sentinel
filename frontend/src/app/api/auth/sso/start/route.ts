@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { SSO_STATE_COOKIE } from '@/lib/session';
 
 const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
@@ -10,7 +11,6 @@ const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000'
 // 'strict': the browser arrives back at the callback from the identity
 // provider's domain, and a strict cookie is not sent on that navigation --
 // which would break every sign-in.
-export const SSO_STATE_COOKIE = 'sentinel_sso_state';
 
 /**
  * Whether SSO is available, and where to send the browser to use it.

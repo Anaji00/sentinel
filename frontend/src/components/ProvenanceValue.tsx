@@ -1,8 +1,8 @@
-"use client";
+'use client';
 
-import React from "react";
-import ProvenanceBadge, { ProvenanceType } from "./ProvenanceBadge";
-import { formatCurrency, formatNumber, formatPercent } from "../lib/format";
+import React from 'react';
+import ProvenanceBadge, { ProvenanceType } from './ProvenanceBadge';
+import { formatCurrency, formatNumber, formatPercent } from '../lib/format';
 
 export interface ProvenanceInfo {
   source_type: ProvenanceType;
@@ -17,7 +17,7 @@ export interface ProvenanceInfo {
 interface ProvenanceValueProps {
   value: number | string | null | undefined;
   provenance?: ProvenanceInfo;
-  format?: "currency" | "percent" | "number" | "raw";
+  format?: 'currency' | 'percent' | 'number' | 'raw';
   decimals?: number;
   prefix?: string;
   suffix?: string;
@@ -28,26 +28,33 @@ interface ProvenanceValueProps {
 export const ProvenanceValue: React.FC<ProvenanceValueProps> = ({
   value,
   provenance,
-  format = "raw",
+  format = 'raw',
   decimals = 2,
-  prefix = "",
-  suffix = "",
+  prefix = '',
+  suffix = '',
   showBadge = true,
-  className = "",
+  className = '',
 }) => {
-  const isPlaceholder = !provenance || provenance.source_type === "disclosed_placeholder" || value === null || value === undefined;
+  const isPlaceholder =
+    !provenance ||
+    provenance.source_type === 'disclosed_placeholder' ||
+    value === null ||
+    value === undefined;
 
   // Zero-Fabrication Rule: If placeholder or undefined, NEVER output a number
   if (isPlaceholder) {
     return (
       <div className={`inline-flex items-center gap-2 ${className}`}>
-        <span className="font-mono text-slate-500 font-bold tracking-wider select-none" title="Pending telemetry/historical baseline">
+        <span
+          className="font-mono text-ink-mute font-bold tracking-wider select-none"
+          title="Pending telemetry/historical baseline"
+        >
           —
         </span>
         {showBadge && (
           <ProvenanceBadge
             sourceType="disclosed_placeholder"
-            methodology={provenance?.methodology || "Insufficient historical data"}
+            methodology={provenance?.methodology || 'Insufficient historical data'}
           />
         )}
       </div>
@@ -57,27 +64,29 @@ export const ProvenanceValue: React.FC<ProvenanceValueProps> = ({
   // Delegates to the canonical formatters rather than reimplementing them, so a
   // provenance-wrapped value and a bare one render identically.
   let formatted = String(value);
-  const numVal = typeof value === "number" ? value : parseFloat(String(value));
+  const numVal = typeof value === 'number' ? value : parseFloat(String(value));
 
   if (!isNaN(numVal)) {
-    if (format === "currency") {
+    if (format === 'currency') {
       formatted = formatCurrency(numVal, { decimals });
-    } else if (format === "percent") {
+    } else if (format === 'percent') {
       // Values reaching here are already scaled (the backend emits *_pct
       // fields); a ratio would need `from: 'ratio'` at the call site.
       formatted = formatPercent(numVal, { decimals });
-    } else if (format === "number") {
+    } else if (format === 'number') {
       formatted = formatNumber(numVal, { decimals });
     }
   }
 
-  const isLlm = provenance?.source_type === "llm_inference";
-  const textStyle = isLlm ? "text-purple-300 font-medium" : "text-white font-bold";
+  const isLlm = provenance?.source_type === 'llm_inference';
+  const textStyle = isLlm ? 'text-purple-300 font-medium' : 'text-white font-bold';
 
   return (
     <div className={`inline-flex items-center gap-2 ${className}`}>
       <span className={`${textStyle} font-mono`}>
-        {prefix}{formatted}{suffix}
+        {prefix}
+        {formatted}
+        {suffix}
       </span>
       {showBadge && provenance && (
         <ProvenanceBadge

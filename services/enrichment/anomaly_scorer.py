@@ -6,7 +6,7 @@ import time
 import numpy as np
 import logging
 from shared.utils.metrics import MetricsCollector
-from shared.models.events import event_domain as canonical_domain
+from shared.models.events import AnomalyBreakdown, ScoreAdjustment, event_domain as canonical_domain
 from shared.utils import quant_calc
 from shared.utils.streaming_detectors import (
     FALLBACK_MAX_SCORE,
@@ -221,6 +221,48 @@ def lift_score(anomaly: float, weight: float, spent: float = 0.0) -> float:
     return round(base + (1.0 - base) * min(remaining, w), 6)
 
 
+def lift_and_record(anomaly: float, weight: float, spent: float, reason: str, trail: list) -> float:
+    """`lift_score`, with the step it took written down.
+
+    `ScoreAdjustment` -- a reason and a delta -- has been in the event model and
+    in the events table since migration 0024, is read by
+    `/explain/event/{id}` to render the derivation of a score, and was written
+    by almost nothing: 21 of 127,933 events in two hours carried one.
+
+    The derivations themselves were never missing. The crypto transfer path
+    takes a size score and lifts it three times, for a suspect counterparty, a
+    watchlisted wallet and transfer frequency, then caps the result -- five
+    steps, each with a name and a number, discarded as soon as the next line
+    reassigned `anomaly`. This records what the lift actually moved rather than
+    the weight it was asked for, because the two differ once the headroom
+    budget is partly spent, and the delta is the honest quantity: it is what
+    changed.
+
+    A step that moves nothing is not recorded. A waterfall of zeroes describes
+    the code rather than the event.
+    """
+    before = anomaly
+    after = lift_score(anomaly, weight, spent)
+    delta = round(float(after) - float(before), 6)
+    if delta:
+        trail.append(ScoreAdjustment(reason=reason, delta=delta))
+    return after
+
+
+def record_cap(anomaly: float, ceiling: float, reason: str, trail: list) -> float:
+    """A ceiling applied, recorded as the negative step it is.
+
+    The cap is part of the derivation and is the step most worth seeing: a
+    reader asking why a $354m transfer scored 0.95 rather than 1.0 is asking
+    about exactly this line.
+    """
+    capped = round(min(float(anomaly), float(ceiling)), 6)
+    delta = round(capped - float(anomaly), 6)
+    if delta:
+        trail.append(ScoreAdjustment(reason=reason, delta=delta))
+    return capped
+
+
 # The significance cut used before a domain has calibrated one, and where Redis
 # is unavailable. The value the no-Redis path has always used, kept so that an
 # uncalibrated domain behaves exactly as it did.
@@ -253,14 +295,14 @@ class DynamicAnomalyScorer:
         # ── PER-DOMAIN STREAMING RRCF DETECTORS (§1.1) ───────────────────────
         # Distinct, independent RRCF models for all 8 Sentinel domains
         self._rrcf_detectors: Dict[str, RRCFDetector] = {
-            "maritime":   RRCFDetector(num_trees=40, window_size=256),
-            "aviation":   RRCFDetector(num_trees=40, window_size=256),
-            "tradfi":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3),
-            "crypto":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3),
-            "macro":      RRCFDetector(num_trees=30, window_size=256),
-            "cyber":      RRCFDetector(num_trees=30, window_size=128),
-            "news":       RRCFDetector(num_trees=30, window_size=256),
-            "prediction": RRCFDetector(num_trees=30, window_size=256),
+            "maritime":   RRCFDetector(num_trees=40, window_size=256, name="maritime"),
+            "aviation":   RRCFDetector(num_trees=40, window_size=256, name="aviation"),
+            "tradfi":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3, name="tradfi"),
+            "crypto":     RRCFDetector(num_trees=40, window_size=256, shingle_size=3, name="crypto"),
+            "macro":      RRCFDetector(num_trees=30, window_size=256, name="macro"),
+            "cyber":      RRCFDetector(num_trees=30, window_size=128, name="cyber"),
+            "news":       RRCFDetector(num_trees=30, window_size=256, name="news"),
+            "prediction": RRCFDetector(num_trees=30, window_size=256, name="prediction"),
         }
 
         # ── CONFORMAL Z-SCORE CALIBRATORS (§1.3) ─────────────────────────────
@@ -497,6 +539,9 @@ class DynamicAnomalyScorer:
             num_trees=domain_detector.num_trees,
             window_size=domain_detector.window_size,
             shingle_size=getattr(domain_detector, "shingle_size", 1),
+            # Split detectors are created at runtime, so this is the one whose
+            # name an operator has no other way to discover.
+            name=key,
         )
         self._rrcf_detectors[key] = detector
         logger.info(
@@ -746,11 +791,13 @@ class DynamicAnomalyScorer:
         lat: float, lon: float, speed: float, heading: float,
         timestamp: float,
         extra_features: Optional[list] = None,
+        domain: Optional[str] = None,
     ) -> dict:
         """Score a single kinematic event using Kalman residuals + RRCF."""
         res = await self.score_kinematic_event_batch(
             [entity_id], [lat], [lon], [speed], [heading], [timestamp],
             [extra_features] if extra_features else None,
+            domain=domain,
         )
         return res[0]
 
@@ -760,6 +807,7 @@ class DynamicAnomalyScorer:
         lats: list, lons: list, speeds: list, headings: list,
         timestamps: list,
         extra_features_list: Optional[list] = None,
+        domain: Optional[str] = None,
     ) -> list:
         """
         Score kinematic events using Kalman prediction residuals fed into RRCF.
@@ -768,14 +816,53 @@ class DynamicAnomalyScorer:
         previous trajectory. The *residuals* (predicted vs actual) are the
         features that catch spoofing, dark-period jumps, and impossible maneuvers.
         """
-        # Determine specific kinematic domain (maritime vs aviation) (§1.1)
-        sample_entity = str(entities[0]).lower() if entities else ""
-        domain = "aviation" if sample_entity.startswith("icao") or "adsb" in sample_entity else "maritime"
-        detector = self._rrcf_detectors.get(domain) or self._rrcf_detectors.get("maritime")
-        if not detector:
-            return [{"score": 0.5, "is_significant": False, "domain": domain, "scoring_degraded": True}
-                    for _ in entities]
+        # The caller says which domain this is. It used to be inferred:
+        #
+        #     domain = "aviation" if sample_entity.startswith("icao")
+        #                            or "adsb" in sample_entity else "maritime"
+        #
+        # An aviation entity is a bare ICAO24 hex code -- `78927f`, `89916c`,
+        # read from the live table -- which starts with neither. So every
+        # aviation batch resolved to "maritime", and the dedicated aviation
+        # detector constructed above has never scored a single point.
+        #
+        # It did not fail quietly either. Maritime builds an 8-feature vector
+        # (5 residuals + 3 extras) and aviation a 6-feature one (5 + altitude),
+        # so every aviation batch hit the maritime detector's tree and raised
+        #
+        #     operands could not be broadcast together with shapes (6,) (8,)
+        #
+        # which the aviation enricher caught and turned into a floor score for
+        # every aircraft. Aviation kinematic scoring has therefore never
+        # worked. The shape mismatch is the lucky part: had the two domains
+        # agreed on a feature count, aviation would have silently polluted the
+        # maritime detector's trees instead, and nothing would have raised.
+        resolved_domain = (domain or "").strip().lower()
+        if not resolved_domain:
+            sample_entity = str(entities[0]).lower() if entities else ""
+            resolved_domain = (
+                "aviation"
+                if sample_entity.startswith("icao") or "adsb" in sample_entity
+                else "maritime"
+            )
+            logger.warning(
+                "score_kinematic_event_batch called without a domain; guessed %r from "
+                "entity %r. Pass domain= explicitly: an ICAO24 code is "
+                "indistinguishable from an MMSI by inspection.",
+                resolved_domain, entities[0] if entities else None,
+            )
+        domain = resolved_domain
 
+        detector = self._rrcf_detectors.get(domain)
+        if detector is None:
+            # Falling back to another domain's detector mixes two populations
+            # in one tree, which is what the guess above was doing. Refusing is
+            # the honest outcome.
+            logger.error("No RRCF detector for kinematic domain %r; not scoring.", domain)
+            return [
+                {"score": 0.5, "is_significant": False, "domain": domain, "scoring_degraded": True}
+                for _ in entities
+            ]
         results = []
         points = []
         # Which items carry a usable kinematic reading.
@@ -1165,8 +1252,14 @@ class DynamicAnomalyScorer:
             features_list.append([n, q, 0.0, 0.0, 0.0])
             entities.append(t[0])
             
-        res = await self.score_event_batch("crypto_trade", entities, features_list)
-        return [r["score"] for r in res]
+        # The whole result, not only the number.
+        #
+        # This returned `[r["score"] for r in res]` and dropped the coverage,
+        # the significance flag and the domain that `score_event_batch` had
+        # just computed -- on the highest-volume path this platform has. 57,234
+        # crypto events an hour reached the store with no breakdown because the
+        # fields existed for the length of this return statement.
+        return await self.score_event_batch("crypto_trade", entities, features_list)
 
     async def score_crypto_candle(self, asset: str, features: list) -> Dict[str, Any]:
         """Scores a candle. The caller's feature list is left as it was found.
@@ -1495,3 +1588,65 @@ class DynamicAnomalyScorer:
             return math.sqrt(max(0.0, new_var))
         except Exception:
             return 0.0
+
+
+def breakdown_from_score(score_dict: Optional[dict], domain: str) -> Optional[AnomalyBreakdown]:
+    """An AnomalyBreakdown from whatever the scorer actually measured.
+
+    `anomaly_breakdown` was written by one enricher of eight. Measured over an
+    hour: 57,234 crypto events, 7,370 vessel, 2,152 flight, 660 market, 421
+    options and 62 filing events carried none, against 198 equity events that
+    carried one -- so `/explain/event/{id}` had nothing to read for 99.7% of the
+    platform, which is the state migration 0024 was written to end.
+
+    The reason it stayed that way is that a breakdown was treated as a thing
+    each domain had to invent five sub-scores for. Most of it is not: the
+    composite score, whether it cleared the bar, which domain scored it and what
+    backed the number are produced by the shared scorer for every domain
+    already, and were simply never carried onto the event.
+
+    So this fills what was measured and leaves the rest None. Nothing is
+    fabricated to populate a column: a dimension this scorer did not compute
+    stays absent, and the explain endpoint renders only what is present.
+    """
+    if not isinstance(score_dict, dict):
+        return None
+
+    coverage = score_dict.get("coverage")
+    fraction = basis = None
+    if isinstance(coverage, dict):
+        raw_fraction = coverage.get("fraction")
+        if raw_fraction is not None:
+            try:
+                fraction = max(0.0, min(1.0, float(raw_fraction)))
+            except (TypeError, ValueError):
+                fraction = None
+        basis = coverage.get("basis") or None
+
+    try:
+        composite = float(score_dict.get("score") or 0.0)
+    except (TypeError, ValueError):
+        composite = 0.0
+
+    # The kinematic path measures a spatial residual: how far the hull or
+    # airframe is from where its own filter predicted. That is a spatial
+    # anomaly in the sense this field means, and it is the one sub-score the
+    # maritime and aviation domains genuinely have. It is normalised the way
+    # every other score on this platform is, so a reader comparing dimensions is
+    # comparing like with like.
+    spatial = None
+    residual = score_dict.get("residual_distance")
+    if residual is not None:
+        try:
+            spatial = round(1.0 - math.exp(-abs(float(residual)) / 5.0), 4)
+        except (TypeError, ValueError, OverflowError):
+            spatial = None
+
+    return AnomalyBreakdown(
+        composite_score=round(composite, 4),
+        spatial_score=spatial,
+        is_significant=bool(score_dict.get("is_significant", False)),
+        domain=str(score_dict.get("domain") or domain or "temporal"),
+        coverage_fraction=fraction,
+        coverage_basis=basis,
+    )

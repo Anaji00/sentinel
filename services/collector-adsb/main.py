@@ -59,6 +59,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 from shared.utils.source_freshness import mark_source_filtered
 from shared.utils.quiet_failures import swallowed
@@ -309,6 +310,7 @@ async def poll_zone(
                         key = parsed["icao24"] or "unknown",
                     )
                     published += 1
+                    _collector_metrics("collector-adsb").ingested()
 
                     if is_emergency:
                         logger.warning(
@@ -388,7 +390,7 @@ async def main():
         redis = await get_redis()
         # Throughput counters. The heartbeat proves this process is alive;
         # these prove it is still producing.
-        metrics = CollectorMetrics("collector-adsb")
+        metrics = _collector_metrics("collector-adsb")
         await metrics.start(redis)
         hb_task = safe_create_task(start_heartbeat_task(redis, "collector-adsb"))
         await collect(producer, redis_client=redis)

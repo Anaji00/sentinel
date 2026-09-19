@@ -37,6 +37,23 @@ from typing import Dict, List, Optional, Sequence
 
 logger = logging.getLogger("shared.chokepoints")
 
+_repeats: Dict[str, int] = {}
+
+
+def repeated(site: str, key: str) -> None:
+    """Count a reading dropped as a re-read, and say so as it becomes routine.
+
+    Silence here would be the defect this function exists to fix: a baseline
+    that stops growing for a good reason and a baseline that stops growing
+    because nothing is being written look identical from outside.
+    """
+    n = _repeats[site] = _repeats.get(site, 0) + 1
+    if n == 1 or n % 25 == 0:
+        logger.info(
+            "%s: %s reading(s) not added to a baseline because the window "
+            "returned the same acquisition as last time (%s).", site, n, key,
+        )
+
 # Observations required before a baseline means anything.
 #
 # Below this the standard deviation is mostly an artefact of which few readings
@@ -55,6 +72,37 @@ NOTABLE_SIGMA = 2.0
 
 _BASELINE_KEY = "sentinel:chokepoint:baseline:{source}:{chokepoint}"
 
+# Appended to the key when a source states how it was calibrated.
+#
+# A z-score compares a reading against readings taken the same way. When the
+# SAR threshold was corrected -- it had been comparing a decibel number against
+# linear backscatter, so every density was ~1.0 -- the corrected readings came
+# back around 0.001. Scored against the old history, the first one would have
+# been about a thousand sigma below the mean, and this collector would have
+# announced that every chokepoint it watches had emptied simultaneously.
+#
+# So the calibration is part of the identity of the series. Change it and a new
+# baseline starts, which is the honest behaviour: there is no history for the
+# new measurement, and `assess` already refuses to judge a reading it has no
+# history for.
+_CALIBRATED_KEY = "sentinel:chokepoint:baseline:{source}@{calibration}:{chokepoint}"
+
+# The latest per-cell radar grid for a chokepoint.
+#
+# Current state rather than a time series: the question it answers is "where was
+# the metal on the most recent pass", and the answer is replaced wholesale each
+# time the satellite comes round. It lives here rather than in either caller
+# because the collector writes it and the API reads it, and two spellings of one
+# key is how this platform lost a watchlist lookup.
+GRID_KEY = "sentinel:chokepoint:grid:{chokepoint}"
+
+
+def grid_key(chokepoint: str) -> str:
+    """The grid key for one chokepoint, normalised the way the baseline is."""
+    return GRID_KEY.format(
+        chokepoint=str(chokepoint).strip().lower().replace(" ", "_")
+    )
+
 
 @dataclass(frozen=True)
 class TrafficReading:
@@ -64,6 +112,10 @@ class TrafficReading:
     source: str          # "ais" or "sar"
     value: float
     observed_at: str
+    # How this number was produced, when the producer can say. Two readings with
+    # different calibrations are not the same measurement and must not share a
+    # baseline; see _CALIBRATED_KEY.
+    calibration: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,10 +155,20 @@ class TrafficAssessment:
         }
 
 
-def baseline_key(source: str, chokepoint: str) -> str:
-    return _BASELINE_KEY.format(
-        source=str(source).strip().lower(),
-        chokepoint=str(chokepoint).strip().lower().replace(" ", "_"),
+def baseline_key(source: str, chokepoint: str, calibration: str = "") -> str:
+    """The history key for one source's readings of one chokepoint.
+
+    `calibration` names how the number was produced. Sources that do not state
+    one keep the original key, so nothing that was already accumulating a
+    baseline loses it.
+    """
+    source = str(source).strip().lower()
+    chokepoint = str(chokepoint).strip().lower().replace(" ", "_")
+    calibration = str(calibration or "").strip().lower().replace(" ", "_")
+    if not calibration:
+        return _BASELINE_KEY.format(source=source, chokepoint=chokepoint)
+    return _CALIBRATED_KEY.format(
+        source=source, calibration=calibration, chokepoint=chokepoint,
     )
 
 
@@ -155,7 +217,9 @@ async def record_and_assess(redis_client, reading: TrafficReading) -> Optional[T
     which is how a first sighting was made to look ordinary elsewhere in this
     system.
     """
-    key = baseline_key(reading.source, reading.chokepoint)
+    key = baseline_key(
+        reading.source, reading.chokepoint, getattr(reading, "calibration", ""),
+    )
     history: List[float] = []
     try:
         raw = await redis_client.raw.lrange(key, 0, BASELINE_WINDOW - 1)
@@ -166,6 +230,27 @@ async def record_and_assess(redis_client, reading: TrafficReading) -> Optional[T
         logger.debug(f"Chokepoint baseline read failed for {key}: {e}")
 
     assessment = assess(reading, history)
+
+    # One observation per acquisition, not one per sweep.
+    #
+    # The SAR window is eight days wide and reduced with max-over-time, so a
+    # daily sweep re-reads the same acquisitions and returns bit-identical
+    # numbers. Appending each of those made a baseline of fifteen observations
+    # out of three: measured on this deployment, bab-el-mandeb held 3 distinct
+    # values across 15 entries and strait_of_hormuz 4 across 9.
+    #
+    # It inflates the count past MIN_BASELINE_OBSERVATIONS on a third of the
+    # evidence, and it drives the standard deviation toward zero -- so the first
+    # reading that genuinely differs scores an enormous z against a series that
+    # never moved because nothing new was ever read.
+    #
+    # Equality is the right test here rather than a timestamp: these are the
+    # same pixels through the same computation, so a repeat is exact. Two
+    # distinct acquisitions agreeing to sixteen significant figures is not a
+    # thing that happens.
+    if history and history[0] == reading.value:
+        repeated("chokepoints.baseline.same_acquisition", key)
+        return assessment
 
     try:
         await redis_client.raw.lpush(key, reading.value)

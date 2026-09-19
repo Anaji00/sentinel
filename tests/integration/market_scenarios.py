@@ -40,7 +40,10 @@ from shared.models.events import (  # noqa: E402
     Entity,
     EntityType,
     EventType,
+    FinancialData,
+    MacroReleaseData,
     NormalizedEvent,
+    SupplyChainData,
 )
 
 
@@ -193,7 +196,14 @@ class RecordingDB:
         rows = [r for r in self.rows if all(self._holds(p, r, args) for p in predicates)]
         rows.sort(key=lambda r: (r["anomaly_score"], r["occurred_at_epoch"]), reverse=True)
         limit = int(sql.split("LIMIT", 1)[1].strip())
-        return [dict(r) for r in rows[:limit]]
+        out = [dict(r) for r in rows[:limit]]
+        # Derived columns, answered rather than omitted. A double that returns
+        # the stored row and not the projection makes a query look correct when
+        # the code reading it will find the column absent.
+        if "AS move_pct" in sql:
+            for row in out:
+                row["move_pct"] = _row_move_pct(row)
+        return out
 
     _PLACEHOLDER = re.compile(r"\$(\d+)")
 
@@ -222,6 +232,15 @@ class RecordingDB:
             return bool(set(self._arg(predicate, args)) & set(row.get("tags") or []))
         if predicate.startswith("event_id::text <>"):
             return row["event_id"] != self._arg(predicate, args)
+        if predicate.startswith("ABS(COALESCE("):
+            # The magnitude filter, over the same payloads the real COALESCE
+            # walks. No price on this event is not "flat": excluded, as in
+            # Postgres, where the COALESCE is NULL and the comparison is not
+            # true.
+            move = _row_move_pct(row)
+            if move is None:
+                return False
+            return abs(move) >= float(self._arg(predicate, args))
         raise self.UnsupportedPredicate(
             f"{predicate!r} is not a predicate this double knows how to apply. "
             f"_deep_window has grown a filter the scenario tests are silently "
@@ -255,6 +274,14 @@ class Beat:
     named_entities: List[str] = field(default_factory=list)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # How far the price moved, in percent, for the beats where that is part of
+    # the situation being described.
+    #
+    # A scenario had no way to say "and the freight rate moved 4%", so a rule
+    # written to require a move -- which is what a rule named for a repricing
+    # should require -- excluded every beat in the suite. The situations always
+    # included the move; only the harness could not express it.
+    move_pct: Optional[float] = None
 
 
 @dataclass
@@ -291,6 +318,38 @@ class Scenario:
     expect_min_domains: int = 1
 
 
+# Which payload a domain puts its move in. The same mapping `event_move_pct`
+# reads, from the writing side.
+_MOVE_PAYLOAD_BY_TYPE = {
+    "supply_chain_metric": ("supply_chain_data", "change_14d_pct", SupplyChainData),
+    "macro_release": ("macro_data", "surprise_pct", MacroReleaseData),
+}
+
+
+def _move_payload(beat: Beat) -> dict:
+    """The domain payload carrying this beat's move, if it has one.
+
+    Built through the real model, so a payload that cannot be constructed here
+    is one the platform could not have produced either. `SupplyChainData`
+    requires an index name, which is the sort of thing a hand-built fixture
+    quietly omits and a real enricher never does.
+    """
+    if beat.move_pct is None:
+        return {}
+    name, field, model = _MOVE_PAYLOAD_BY_TYPE.get(
+        beat.event_type, ("financial_data", "change_pct_bar", FinancialData)
+    )
+    payload = {field: beat.move_pct}
+    for required, value in (
+        ("index_name", beat.entity_id),
+        ("indicator", beat.entity_id),
+        ("ticker", beat.entity_id),
+    ):
+        if required in model.model_fields and required not in payload:
+            payload[required] = value
+    return {name: model(**payload)}
+
+
 def _event(beat: Beat, trigger_at: datetime) -> NormalizedEvent:
     """A NormalizedEvent for one beat, validated by the real model."""
     return NormalizedEvent(
@@ -307,15 +366,57 @@ def _event(beat: Beat, trigger_at: datetime) -> NormalizedEvent:
         longitude=beat.longitude,
         headline=beat.headline or f"{beat.event_type} on {beat.entity_id}",
         anomaly_score=beat.anomaly,
+        **_move_payload(beat),
         tags=list(beat.tags),
         named_entities=list(beat.named_entities),
     )
 
 
+def _row_move_pct(row: Dict[str, Any]) -> Optional[float]:
+    """What `move_pct_sql()` computes in Postgres, over the same mapping.
+
+    Reads `PAYLOAD_MOVE_FIELDS` rather than restating which payload carries a
+    move, so a domain added there is covered here without a second edit. None
+    when no payload carries one -- in Postgres the COALESCE is NULL and the
+    comparison is not true, which excludes the row rather than treating it as
+    flat.
+    """
+    from shared.models.events import PAYLOAD_MOVE_FIELDS
+
+    for payload_name, fields in PAYLOAD_MOVE_FIELDS:
+        payload = row.get(payload_name) or {}
+        for field in fields:
+            value = payload.get(field)
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number == number:
+                return number
+    return None
+
+
 def _as_row(event: NormalizedEvent) -> Dict[str, Any]:
-    """One event as the `events` table stores it."""
+    """One event as the `events` table stores it.
+
+    Including the domain payload columns. This used to mirror the column list
+    `_deep_window` selected, which made the double correct only for as long as
+    that query stayed the same -- and the query grew a derived column, computed
+    from payloads this row did not carry, so every long-window row came back
+    with no move and the magnitude filter excluded all of them.
+    """
     pe = event.primary_entity
+    payloads = {}
+    for name in ("financial_data", "crypto_data", "supply_chain_data", "macro_data"):
+        value = getattr(event, name, None)
+        if value is not None:
+            payloads[name] = (
+                value.model_dump() if hasattr(value, "model_dump") else dict(value)
+            )
     return {
+        **payloads,
         "event_id": event.event_id,
         "type": event.type.value,
         "source": event.source,

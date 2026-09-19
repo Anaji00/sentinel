@@ -18,6 +18,8 @@ import asyncio
 import hashlib
 import json
 import logging
+
+from shared.utils.filings_keys import PROMINENT_CIKS_KEY
 import os
 import sys
 import time
@@ -40,6 +42,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 from shared.utils.entity_resolution import seed_aliases
@@ -326,6 +329,7 @@ async def poll_company_filings(
             )
 
             await producer.send(Topics.RAW_FILINGS, event.model_dump(), key=ticker)
+            _collector_metrics("collector-filings").ingested()
             new_count += 1
 
     except Exception as e:
@@ -394,7 +398,7 @@ async def seed_prominent_13f_reports(session: aiohttp.ClientSession, producer: S
 
             # Store in Redis: latest report and list of prominent filers
             await raw_redis.set(f"sentinel:13f:{cik}:latest", report_json, ex=86400 * 30)
-            await raw_redis.sadd("sentinel:13f:prominent_ciks", cik)
+            await raw_redis.sadd(PROMINENT_CIKS_KEY, cik)
 
             # Update consensus accumulator for top holdings
             for h in report.top_holdings:
@@ -450,7 +454,7 @@ async def main():
     # Universal 15s heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-filings")
+    metrics = _collector_metrics("collector-filings")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-filings"))
 

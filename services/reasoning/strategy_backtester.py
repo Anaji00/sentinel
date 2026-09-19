@@ -140,6 +140,29 @@ def _coerce_bar(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         return None
 
+class _UnsupportedTimeframe(LookupError):
+    """A timeframe with no continuous aggregate behind it.
+
+    Its own type so the fall-through to the candle cache is distinguishable
+    from a query that failed -- which is the distinction the bare
+    `except Exception: logger.debug(...)` below used to erase.
+    """
+
+    def __init__(self, timeframe: str):
+        super().__init__(f"no continuous aggregate for timeframe {timeframe!r}")
+
+
+# The timeframes this platform can actually serve a backtest for.
+#
+# One list, exported, because the API's `timeframe` field described
+# "'5m', '10m', '15m', '30m', '1h', '4h', '1d'" as a free-text hint while
+# `table_map` below named a `tradfi_bars_10m` that shared/db/init.sql never
+# creates. A request for 10m validated, reached the store, raised
+# UndefinedTableError into a debug log and silently became Yahoo's 15-minute
+# bars labelled as ten. The set that exists and the set that is offered are now
+# the same object.
+SUPPORTED_TIMEFRAMES = ("5m", "15m", "30m", "1h", "4h", "1d", "1w", "1mth")
+
 # Minimum authentic bars required to produce a statistically meaningful backtest.
 # Below this the engine reports INSUFFICIENT_DATA — it never interpolates or
 # synthesizes bars, because a validation verdict derived from invented prices is
@@ -180,19 +203,48 @@ class StrategyBacktester:
         ticker_upper = ticker.strip().upper()
 
         if self.db:
+            # The continuous aggregates that exist, and only those.
+            #
+            # This mapped "10m" to `tradfi_bars_10m`, which shared/db/init.sql
+            # never creates -- the aggregates are 5m, 15m, 30m, 1h, 4h, 1d, 1w
+            # and 1mth. A 10m backtest raised UndefinedTableError into the
+            # `logger.debug` below and fell through to Redis as though the store
+            # held nothing.
             table_map = {
                 "5m": "tradfi_bars_5m",
-                "10m": "tradfi_bars_10m",
                 "15m": "tradfi_bars_15m",
                 "30m": "tradfi_bars_30m",
                 "1h": "tradfi_bars_1h",
                 "4h": "tradfi_bars_4h",
                 "1d": "tradfi_bars_1d",
+                "1w": "tradfi_bars_1w",
+                "1mth": "tradfi_bars_1mth",
             }
-            target_table = table_map.get(timeframe, "tradfi_bars_5m")
+            # No silent default. Falling back to the 5m table for an unmapped
+            # timeframe returns five-minute bars labelled as something else,
+            # which is worse than returning nothing: the backtest reports a
+            # result computed on the wrong series.
+            target_table = table_map.get(timeframe)
+            if target_table is None:
+                logger.warning(
+                    "No continuous aggregate for timeframe %r; skipping the "
+                    "TimescaleDB path for %s. Known timeframes: %s.",
+                    timeframe, ticker_upper, ", ".join(sorted(table_map)),
+                )
             try:
+                if target_table is None:
+                    # Reported at WARNING above, where the known timeframes can
+                    # be named. Raising here only to reach the fall-through.
+                    raise _UnsupportedTimeframe(timeframe)
+                # `vwap` is not a column on any of these views, and is not in
+                # any .sql file in the repository. Selecting it raised
+                # UndefinedColumnError for *every* timeframe, into the
+                # `logger.debug` below -- so the backtester has never read a bar
+                # from the platform's own store, and fell through to the Redis
+                # cache or an external REST call on every run. 3,464,069 bars
+                # sat unread. The row builder already defaults it from close.
                 query = f"""
-                    SELECT bucket_time, open, high, low, close, volume, vwap
+                    SELECT bucket_time, open, high, low, close, volume
                     FROM {target_table}
                     WHERE ticker = $1
                     ORDER BY bucket_time ASC
@@ -209,8 +261,21 @@ class StrategyBacktester:
                         "volume": float(r.get("volume", 0.0)),
                         "vwap": float(r.get("vwap", r["close"])),
                     })
+            except _UnsupportedTimeframe as e:
+                logger.info(
+                    "Skipping the TimescaleDB path for %s: %s. Trying the "
+                    "candle cache next.", ticker_upper, e,
+                )
             except Exception as e:
-                logger.debug(f"TimescaleDB bar fetch for {ticker_upper} fallback: {e}")
+                # WARNING, not DEBUG. At DEBUG this line hid a query that could
+                # never succeed for the entire life of the file, and the caller
+                # cannot tell "the store has no bars for this symbol" from "the
+                # query was malformed" -- both arrive here as an empty list.
+                logger.warning(
+                    "TimescaleDB bar fetch failed for %s (%s) from %s: %s. "
+                    "Falling back to the candle cache.",
+                    ticker_upper, timeframe, target_table, e,
+                )
 
         # 2. Redis candle cache. The key MUST carry the timeframe segment — every
         #    writer in the platform emits `sentinel:candles:{tf}:{ticker}`.
@@ -401,10 +466,19 @@ class StrategyBacktester:
         bars: List[Dict[str, Any]],
         strategy_type: str = "covered_call",
         initial_capital: float = 100_000.0,
+        risk_free: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Executes discrete chronological backtest across historical bars.
+
+        `risk_free` is the short rate used to price the option leg. This method
+        is synchronous and the live rate lives in Redis, so the caller resolves
+        it; None falls back to the labelled assumption rather than to the 0.045
+        that used to be typed into the Black-Scholes call.
         """
+        from shared.utils.rates import ASSUMED_RISK_FREE_RATE
+
+        risk_free = ASSUMED_RISK_FREE_RATE if risk_free is None else float(risk_free)
         if len(bars) < MIN_BARS_FOR_BACKTEST:
             # Fail closed. A validation verdict computed from fabricated prices is
             # indistinguishable downstream from a real one, so no verdict is issued.
@@ -502,8 +576,11 @@ class StrategyBacktester:
                     # old form multiplied an annual figure by 0.5 and called the
                     # result a 30-delta strike, which it was not in any units.
                     strike = round(entry_price * (1.0 + STRIKE_SIGMA_MULT * sigma * math.sqrt(T_years)), 2)
+                    # The live short rate, not a typed-in one. 0.045 was
+                    # hardcoded here while the collector's measured SOFR sat in
+                    # Redis under a key nothing read.
                     call_premium = round(quant_calc.black_scholes_call_price(
-                        S=entry_price, K=strike, T=T_years, r=0.045, sigma=sigma
+                        S=entry_price, K=strike, T=T_years, r=risk_free, sigma=sigma
                     ), 2)
                     conviction = round(min(0.95, 0.50 + 0.10 * z_score), 2)
 

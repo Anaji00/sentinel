@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
+import { signSessionToken } from '@/lib/session';
 
 // Fail closed: no hardcoded secret defaults. SESSION_SECRET must match the API
 // gateway's SESSION_SECRET, because the gateway verifies the cookie this route
@@ -9,62 +9,6 @@ const SESSION_SECRET = process.env.SESSION_SECRET;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'vance@sentinel-quant.io';
 const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
-// The token carries the account's role. Without it the gateway falls back to
-// ANALYST for every session, which is why the BFF used to attach the operator's
-// master API key to proxied calls instead -- making every signed-in visitor an
-// admin and rendering any subscription gate decorative.
-// Exported so the SSO callback mints byte-identical cookies. A second
-// implementation there would be a second place for the session format to
-// drift, and a cookie signed slightly differently fails verification in a
-// way that looks like an expired login.
-export function signSessionToken(email: string, role: string, expiresAt: number): string {
-  const payload = `${email}:${role}:${expiresAt}`;
-  const hmac = crypto.createHmac('sha256', SESSION_SECRET as string).update(payload).digest('hex');
-  return `${Buffer.from(payload).toString('base64url')}.${hmac}`;
-}
-
-export function verifySessionToken(token: string): { valid: boolean; email?: string; role?: string } {
-  try {
-    if (!SESSION_SECRET) return { valid: false };
-    const [encodedPayload, signature] = token.split('.');
-    if (!encodedPayload || !signature) return { valid: false };
-
-    const payload = Buffer.from(encodedPayload, 'base64url').toString('utf8');
-    // `email:role:expiresAt`, falling back to the older `email:expiresAt` so
-    // cookies minted before roles were carried keep working until they expire.
-    const segments = payload.split(':');
-    let email: string, role: string, expiresAtStr: string;
-    if (segments.length >= 3) {
-      [email, role, expiresAtStr] = segments;
-    } else {
-      // VIEWER, not ANALYST -- the same rule the gateway applies.
-      //
-      // ANALYST carries write access to cases, watchlists and reports. A cookie
-      // minted before roles were encoded says nothing about what its holder may
-      // do, and the least privilege is the only safe reading of silence.
-      [email, expiresAtStr] = segments;
-      role = 'VIEWER';
-    }
-    const expiresAt = parseInt(expiresAtStr, 10);
-
-    if (isNaN(expiresAt) || Date.now() > expiresAt) return { valid: false };
-
-    const expectedHmac = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
-    // Length-mismatched buffers make timingSafeEqual throw, which the catch
-    // below would turn into a plain `invalid` -- check first so the comparison
-    // is reached only when it can be constant-time.
-    const sigBuf = Buffer.from(signature);
-    const expBuf = Buffer.from(expectedHmac);
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-      return { valid: false };
-    }
-
-    return { valid: true, email, role };
-  } catch (e) {
-    return { valid: false };
-  }
-}
-
 export async function POST(req: NextRequest) {
   try {
     // Fail closed if the signing secret isn't configured — never mint a cookie
@@ -72,7 +16,7 @@ export async function POST(req: NextRequest) {
     if (!SESSION_SECRET) {
       return NextResponse.json(
         { success: false, error: 'Authentication is not configured' },
-        { status: 500 }
+        { status: 500 },
       );
     }
 
@@ -123,7 +67,7 @@ export async function POST(req: NextRequest) {
     if (!isAuthenticated) {
       return NextResponse.json(
         { success: false, error: 'Invalid corporate credentials or API key' },
-        { status: 401 }
+        { status: 401 },
       );
     }
 
@@ -137,7 +81,8 @@ export async function POST(req: NextRequest) {
       user: account ?? { email: sessionEmail, role: 'admin' },
     });
 
-    const isProduction = process.env.NODE_ENV === 'production' || process.env.SENTINEL_ENV === 'production';
+    const isProduction =
+      process.env.NODE_ENV === 'production' || process.env.SENTINEL_ENV === 'production';
     const isSecureCookie = isProduction || process.env.COOKIE_SECURE !== 'false';
 
     response.cookies.set({
@@ -154,7 +99,7 @@ export async function POST(req: NextRequest) {
   } catch (error: any) {
     return NextResponse.json(
       { success: false, error: 'Authentication service error' },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

@@ -245,6 +245,40 @@ def test_a_list_of_models_survives_the_dump_helper():
         score_adjustments=[ScoreAdjustment(reason="volume_capitulation_x1.4", delta=0.08)],
     )
     row = DBWriter(None)._extract_tuple(event)
-    assert row[-1] == [{"reason": "volume_capitulation_x1.4", "delta": 0.08}], (
+
+    # Addressed by column name, not by position.
+    #
+    # This read `row[-1]`, which was the adjustments only for as long as they
+    # happened to be last in the INSERT. Adding the macro_data column in
+    # migration 0025 appended one element and the assertion silently began
+    # checking a different field -- a test pinned to a position rather than to
+    # the thing it is about.
+    columns = _insert_columns()
+    assert len(columns) == len(row), (
+        f"the INSERT names {len(columns)} bound columns and the tuple carries "
+        f"{len(row)}; one of them was changed without the other"
+    )
+    adjustments = row[columns.index("score_adjustments")]
+    assert adjustments == [{"reason": "volume_capitulation_x1.4", "delta": 0.08}], (
         "the adjustments must reach asyncpg as plain dicts"
     )
+
+
+def _insert_columns() -> list:
+    """The bound columns of db_writer's INSERT, in placeholder order.
+
+    `coordinates` is in the column list and is supplied by a CASE expression
+    rather than a placeholder, so it is not part of the value tuple and is
+    dropped here.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "services" / "enrichment" / "db_writer.py"
+    text = src.read_text(encoding="utf-8")
+    block = text[text.index("INSERT INTO events"):]
+    names = block.split("(", 1)[1].split(")", 1)[0]
+    return [
+        c.strip() for c in re.split(r",\s*", names.replace(chr(10), " "))
+        if c.strip() and c.strip() != "coordinates"
+    ]

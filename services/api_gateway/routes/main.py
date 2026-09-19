@@ -36,6 +36,7 @@ from services.api_gateway.routes import (
     integrations,
     scenarios,
     events,
+    chokepoints,
     graph,
     radar,
     agents,
@@ -165,6 +166,10 @@ app.include_router(billing.router)
 app.include_router(system.router)
 app.include_router(scenarios.router)
 app.include_router(events.router)
+# Which straits are reporting, and from which instrument. The distinction it
+# preserves is "quiet" versus "not observed": AIS is silent over Hormuz and
+# Bab-el-Mandeb, and Sentinel-1 is not.
+app.include_router(chokepoints.router)
 app.include_router(graph.router)
 app.include_router(radar.router)
 app.include_router(agents.router)

@@ -23,6 +23,8 @@ These tests pin the three things that failure needed:
 """
 import json
 
+import pathlib
+
 import pytest
 
 from tests.integration.market_scenarios import (
@@ -48,16 +50,19 @@ def test_the_dsl_the_agent_writes_is_the_dsl_the_engine_reads():
     silently deleted on the way through; a key the model declares and the
     engine never reads is a promise to an operator that nothing keeps.
     """
+    from shared.models.correlation_rules import CLAUSE_KEYS
     from services.agents.rule_agent import CorrelationDef
 
     declared = set(CorrelationDef.model_fields)
 
-    # Every key `evaluate_dynamic_rules` and its helpers look up on a clause.
-    read_by_engine = {
-        "event_types", "hours", "min_anomaly", "tags", "region",
-        "same_entity", "shared_tags", "proximity_km",
-        "precedes_trigger", "follows_trigger", "within_minutes",
-    }
+    # The vocabulary, read from the module that defines it.
+    #
+    # This was a hand-written set restating all eleven keys -- the fourth copy
+    # of a contract that `shared/models/correlation_rules.py` exists to hold
+    # once, and whose own docstring names `tests/` as one of the three copies
+    # that had already drifted. Adding a twelfth key to the DSL made this fail
+    # while the writer, the reader and the shared definition all agreed.
+    read_by_engine = set(CLAUSE_KEYS)
 
     assert declared == read_by_engine, (
         f"only the agent declares: {sorted(declared - read_by_engine)}\n"
@@ -378,3 +383,22 @@ def test_the_prompt_teaches_every_join_the_dsl_accepts():
     for key in ("same_entity", "region", "shared_tags", "proximity_km",
                 "precedes_trigger", "follows_trigger", "within_minutes"):
         assert key in prompt, f"the prompt never mentions {key}"
+
+
+def test_every_clause_key_is_actually_looked_up_by_the_engine():
+    """The other half, and the one a shared constant cannot give for free.
+
+    `CLAUSE_KEYS` says what the vocabulary is; it cannot say that the evaluator
+    reads each one. A key present in the DSL and in the model but never looked
+    up in `main.py` is a promise to an operator that nothing keeps -- which is
+    what `same_entity` was before the join requirement was added.
+    """
+    from shared.models.correlation_rules import CLAUSE_KEYS
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    engine = (root / "services" / "correlation" / "main.py").read_text(encoding="utf-8")
+    missing = [key for key in sorted(CLAUSE_KEYS) if repr(key).strip("'") not in engine]
+    assert not missing, (
+        f"declared in the DSL and never read by the evaluator: {missing}. "
+        f"A clause key nothing looks up is deleted in effect, not in form."
+    )

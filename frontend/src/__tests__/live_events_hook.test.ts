@@ -17,10 +17,25 @@ import {
 describe('useLiveEvents buffering', () => {
   it('keeps one position report per entity and every non-position event', () => {
     const batch = [
-      { event_id: '1', type: 'vessel_position', primary_entity: { id: 'MMSI_100' }, latitude: 26.5 },
-      { event_id: '2', type: 'vessel_position', primary_entity: { id: 'MMSI_100' }, latitude: 26.51 },
+      {
+        event_id: '1',
+        type: 'vessel_position',
+        primary_entity: { id: 'MMSI_100' },
+        latitude: 26.5,
+      },
+      {
+        event_id: '2',
+        type: 'vessel_position',
+        primary_entity: { id: 'MMSI_100' },
+        latitude: 26.51,
+      },
       { event_id: '3', type: 'vessel_position', primary_entity: { id: 'MMSI_200' }, latitude: 1.3 },
-      { event_id: '4', type: 'cyber_attack', primary_entity: { id: 'IP_1.1.1.1' }, anomaly_score: 0.9 },
+      {
+        event_id: '4',
+        type: 'cyber_attack',
+        primary_entity: { id: 'IP_1.1.1.1' },
+        anomaly_score: 0.9,
+      },
     ] as any[];
 
     const out = dedupePositionBatch(batch);

@@ -73,7 +73,11 @@ def test_the_arrays_are_compared_as_text():
     test_the_match_is_conjunctive below. The cast is the part this pins.
     """
     source = _source()
-    assert "OR tags @> $3::text[]" in source
+    assert "OR tags @> $2::text[]" in source
+    assert "OR named_entities @> $3::text[]" in source
+    # The entity-keyed lookup compares the same two columns and must cast them
+    # the same way. It was numbered separately and so was never pinned here.
+    assert "OR tags @> $4::text[]" in source
     assert "OR named_entities @> $4::text[]" in source
 
 
@@ -103,8 +107,22 @@ def test_the_match_is_conjunctive():
     positive on noise.
     """
     source = _source()
-    assert "headline ILIKE ALL($2)" in source
-    assert "OR tags @> $3::text[]" in source
+
+    # The hot path builds one ILIKE per keyword and joins them with AND. That
+    # is the same guarantee ALL() gave -- every keyword must appear -- in a form
+    # an index can serve; ALL() over an array is a ScalarArrayOp and measured at
+    # 21.2 seconds a signal against 0.281ms for this form. What matters to this
+    # test is the joiner: " OR ".join here would silently restore the 89%
+    # rubber stamp while every other assertion still passed.
+    assert 'f"headline ILIKE ${n}"' in source
+    joiner = source.split('like_clause = " AND ".join(')
+    assert len(joiner) == 2, "the keyword clauses must be joined with AND"
+    assert "OR tags @> $2::text[]" in source
+
+    # The entity-keyed lookup is narrowed by an indexed equality first, so its
+    # ALL() costs little and stays as it is -- but it must stay conjunctive too.
+    assert "OR headline ILIKE ALL($3)" in source
+
     # Deliberately not asserting the absence of "&&" or "ILIKE ANY": the module
     # explains the old operators in prose, and a test that fails on its own
     # explanation is a trap this audit already sprang three times.

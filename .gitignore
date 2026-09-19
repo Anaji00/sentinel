@@ -38,3 +38,6 @@ postgres_data/
 neo4j_data/
 redis_data/
 kafka_data/
+# Pre-merge graph backups written by scripts/merge_split_graph_nodes.py.
+# 18MB of node and relationship state; belongs on disk, not in history.
+graph_merge_backup*.jsonl

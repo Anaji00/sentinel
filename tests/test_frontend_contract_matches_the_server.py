@@ -47,14 +47,40 @@ SESSION_ROUTE = ROOT / "services" / "api_gateway" / "routes" / "auth.py"
 
 
 def _ts_interfaces() -> dict:
-    """Field names per exported interface, comments stripped."""
+    """Field names per exported interface, comments stripped.
+
+    Indentation-independent. This matched ``^\\s{4}`` -- exactly four leading
+    spaces -- and the project's Prettier config produces two, so running the
+    repository's own formatter over `types.ts` emptied every interface. The
+    gate above then found nothing unreachable and passed, while the two
+    allowlist tests failed with "no longer declared" against fields that were
+    still right there. A contract check that depends on how many spaces precede
+    a field is checking the formatter, not the contract.
+
+    Brace depth is what actually separates a field of this interface from a
+    field of an object nested inside it, so that is what is tracked.
+    """
     text = TYPES_TS.read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     text = re.sub(r"^\s*//.*$", "", text, flags=re.M)
     out = {}
     for match in re.finditer(r"export interface (\w+)\s*\{(.*?)\n\}", text, flags=re.S):
-        body = match.group(2)
-        out[match.group(1)] = re.findall(r"^\s{4}(\w+)\??\s*:", body, flags=re.M)
+        fields, depth = [], 0
+        for line in match.group(2).split("\n"):
+            stripped = line.strip()
+            if depth == 0:
+                field = re.match(r"(\w+)\??\s*:", stripped)
+                if field:
+                    fields.append(field.group(1))
+            depth += line.count("{") - line.count("}")
+        out[match.group(1)] = fields
+    # An empty parse is a broken parser, not an empty contract: every check
+    # built on this one passes trivially when it returns nothing.
+    assert out, "no exported interfaces parsed out of types.ts"
+    assert all(out.values()), (
+        "these interfaces parsed with no fields: "
+        + ", ".join(sorted(k for k, v in out.items() if not v))
+    )
     return out
 
 

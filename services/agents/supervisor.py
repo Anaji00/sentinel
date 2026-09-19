@@ -22,6 +22,7 @@ from shared.models.ontology import (
     is_valid_predicate,
     normalize_predicate,
     is_valid_node_label,
+    resolve_node_label,
 )
 from shared.utils.quiet_failures import swallowed
 
@@ -73,6 +74,35 @@ def _edge_stats(props: dict) -> dict:
         "half_life": _measured(props, "half_life"),
         "lag": _measured(props, "lag", int),
     }
+
+
+# Relationship properties the supervisor manages itself. A producer cannot
+# overwrite these through the passthrough -- a bad `confidence` in an extras map
+# would be indistinguishable from a measured one.
+_MANAGED_EDGE_KEYS = frozenset({
+    "weight", "confidence", "relationship", "direction", "method", "window",
+    "coefficient", "p_value", "lag", "f_stat", "branching_ratio", "half_life",
+    "source", "created_at", "updated_at", "last_updated",
+})
+
+
+def _edge_extras(props) -> dict:
+    """Producer-specific edge properties, filtered to what Neo4j can store.
+
+    Scalars only. A nested dict or list raises at write time and would take the
+    whole batch with it, and the properties worth keeping here -- a position
+    value, a share count, a change type -- are all scalar anyway.
+    """
+    if not isinstance(props, dict):
+        return {}
+    out = {}
+    for key, value in props.items():
+        name = str(key)
+        if name in _MANAGED_EDGE_KEYS or name.startswith("_"):
+            continue
+        if isinstance(value, bool) or isinstance(value, (int, float, str)):
+            out[name] = value
+    return out
 
 
 def _as_unit_interval(value, default=1.0):
@@ -140,11 +170,25 @@ def _describe_proposals(proposals: List[dict]) -> str:
     nodes: List[str] = []
     links: List[str] = []
     tagged: List[str] = []
+    dropped = 0
     for p in proposals:
         if not isinstance(p, dict):
             continue
         action = str(p.get("action") or "")
-        entity_id = str(p.get("entity_id") or "?")
+        # A proposal with no id or no action is refused by execute_proposal --
+        # `if not entity_id or not action: return`, before the lock is taken --
+        # so nothing reaches the graph for it.
+        #
+        # This counted it as a merge anyway. `entity_id` fell back to the string
+        # "?" and the final `else` appended it to `nodes`, so the receipt read
+        # "Entities merged: ?" for a write that was silently declined. Measured
+        # on 600 consecutive receipts, it was the single most frequent thing the
+        # supervisor said: 46 of them, 7.7%, every one describing a commit that
+        # did not happen.
+        if not p.get("entity_id") or not action:
+            dropped += 1
+            continue
+        entity_id = str(p.get("entity_id"))
         data = p.get("data") if isinstance(p.get("data"), dict) else {}
         target = data.get("target_id") or data.get("sympathy_ticker")
         if action == "MERGE_ONTOLOGY_NODE":
@@ -164,6 +208,11 @@ def _describe_proposals(proposals: List[dict]) -> str:
         parts.append(f"Relationships written: {'; '.join(links[:5])}" + (f" (+{len(links) - 5} more)" if len(links) > 5 else ""))
     if tagged:
         parts.append(f"Entities tagged: {', '.join(tagged[:5])}" + (f" (+{len(tagged) - 5} more)" if len(tagged) > 5 else ""))
+    if dropped:
+        # Named, not hidden. A proposal the supervisor refuses is a real event --
+        # something upstream produced a graph change with no subject -- and a
+        # receipt that omits it reads as a clean commit.
+        parts.append(f"Refused, no entity_id: {dropped}")
     return " | ".join(parts) if parts else "No graph changes committed."
 
 
@@ -176,6 +225,7 @@ class GraphSupervisor(SentinelAgent):
         actually takes -- build_agent constructs it like every other agent, and
         start_supervisor() below is only reachable from __main__.
         """
+        await ensure_graph_indexes(self.neo4j)
         await backfill_node_types(self.neo4j, self.redis)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -303,8 +353,10 @@ class GraphSupervisor(SentinelAgent):
                     continue
 
                 if action == "MERGE_ONTOLOGY_NODE":
-                    raw_label = data.get("label", "Entity")
-                    label = raw_label if is_valid_node_label(raw_label) else "Entity"
+                    label = resolve_node_label(
+                        data.get("label"), entity_id,
+                        source="supervisor.batch.MERGE_ONTOLOGY_NODE",
+                    )
                     if label not in nodes_by_label:
                         nodes_by_label[label] = []
                     nodes_by_label[label].append({
@@ -320,14 +372,21 @@ class GraphSupervisor(SentinelAgent):
                 elif action in ("LINK_ENTITY", "ADD_SYMPATHY_EDGE"):
                     relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
                     if is_valid_predicate(relation):
-                        raw_src = data.get("source_label", "Entity")
-                        raw_tgt = data.get("target_label", "Entity")
-                        source_label = raw_src if is_valid_node_label(raw_src) else "Entity"
-                        target_label = raw_tgt if is_valid_node_label(raw_tgt) else "Entity"
-                        
                         target_id = data.get("target_id") or data.get("sympathy_ticker")
                         if not target_id:
                             continue
+
+                        # Resolved after target_id is known, because the label
+                        # now depends on what the symbol is and no longer only
+                        # on what the producer claimed it was.
+                        source_label = resolve_node_label(
+                            data.get("source_label"), entity_id,
+                            source=f"supervisor.batch.{action}",
+                        )
+                        target_label = resolve_node_label(
+                            data.get("target_label"), target_id,
+                            source=f"supervisor.batch.{action}",
+                        )
 
                         rel_key = (source_label, relation, target_label)
                         if rel_key not in links_by_relation:
@@ -337,6 +396,8 @@ class GraphSupervisor(SentinelAgent):
                         links_by_relation[rel_key].append({
                             "id": graph_node_id(entity_id, source_label),
                             "target_id": graph_node_id(target_id, target_label),
+                            "source": str(props.get("source") or data.get("source") or ""),
+                            "extra": _edge_extras(props),
                             "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
                             "confidence": _as_unit_interval(
                         data.get("confidence", props.get("conviction", data.get("conviction"))),
@@ -390,7 +451,21 @@ class GraphSupervisor(SentinelAgent):
                 ON CREATE SET b.id = row.target_id, b.created_at = timestamp(), b.type = '{target_label}'
                 MERGE (a)-[r:{relation}]->(b)
                 ON CREATE SET r.created_at = timestamp()
-                SET r.weight = row.weight,
+                    // Who asserted this edge.
+                    //
+                    // Every producer attaches `source` in `properties` and this
+                    // SET list dropped it, because the list is fixed and
+                    // `source` was not on it. The bridge writers mark their
+                    // edges `domain_bridge_prior` precisely so a reader can
+                    // tell a stated prior from a measurement -- and without
+                    // this line a 0.55 asserted from a table is
+                    // indistinguishable from a 0.55 somebody computed.
+                    //
+                    // Same shape as the freight payload that named its exposed
+                    // equities and was dropped by an enricher building a model
+                    // from seven named arguments.
+                SET r.source = row.source,
+                    r.weight = row.weight,
                     r.confidence = row.confidence,
                     r.relationship = row.relationship,
                     r.direction = row.direction,
@@ -404,6 +479,20 @@ class GraphSupervisor(SentinelAgent):
                     r.half_life = row.half_life,
                     r.updated_at = timestamp(),
                     r.last_updated = timestamp()
+                // Whatever else the producer sent.
+                //
+                // The named list above is closed, so any predicate with its own
+                // vocabulary loses it silently. Measured on the 13F holdings:
+                // `weight` and `source` survived while `market_value_usd`,
+                // `shares` and `change_type` did not, so an OWNS edge recorded
+                // that a fund holds 3.9% of a company but not that the position
+                // is worth billions or that it was cut this quarter.
+                //
+                // Adding three more names would have fixed those three and left
+                // the next producer in the same place. `+=` merges a map, and
+                // the caller filters it to scalars and refuses the managed keys,
+                // so this cannot overwrite confidence or weight with junk.
+                SET r += coalesce(row.extra, {{}})
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
 
@@ -432,8 +521,10 @@ class GraphSupervisor(SentinelAgent):
 
         try:
             if action == "MERGE_ONTOLOGY_NODE":
-                raw_label = data.get("label", "Entity")
-                label = raw_label if is_valid_node_label(raw_label) else "Entity"
+                label = resolve_node_label(
+                    data.get("label"), entity_id,
+                    source="supervisor.MERGE_ONTOLOGY_NODE",
+                )
 
                 cypher = f"""
                 MERGE (e:{label} {{name: $name}})
@@ -464,10 +555,12 @@ class GraphSupervisor(SentinelAgent):
                 if not target_id:
                     return
 
-                raw_src = data.get("source_label", "Entity")
-                raw_tgt = data.get("target_label", "Entity")
-                source_label = raw_src if is_valid_node_label(raw_src) else "Entity"
-                target_label = raw_tgt if is_valid_node_label(raw_tgt) else "Entity"
+                source_label = resolve_node_label(
+                    data.get("source_label"), entity_id, source=f"supervisor.{action}",
+                )
+                target_label = resolve_node_label(
+                    data.get("target_label"), target_id, source=f"supervisor.{action}",
+                )
 
                 relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
                 
@@ -483,7 +576,8 @@ class GraphSupervisor(SentinelAgent):
                 ON CREATE SET b.id = $target_id, b.created_at = timestamp(), b.type = '{target_label}'
                 MERGE (a)-[r:{relation}]->(b)
                 ON CREATE SET r.created_at = timestamp()
-                SET r.weight = $weight,
+                SET r.source = $source,
+                    r.weight = $weight,
                     r.confidence = $confidence,
                     r.relationship = $relationship,
                     r.direction = $direction,
@@ -497,10 +591,13 @@ class GraphSupervisor(SentinelAgent):
                     r.half_life = $half_life,
                     r.updated_at = timestamp(),
                     r.last_updated = timestamp()
+                SET r += $extra
                 """
                 await self.neo4j.execute(cypher, {
                     "id": graph_node_id(entity_id, source_label),
                     "target_id": graph_node_id(target_id, target_label),
+                    "source": str(props.get("source") or data.get("source") or ""),
+                    "extra": _edge_extras(props),
                     "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
                     "confidence": _as_unit_interval(
                         data.get("confidence", props.get("conviction", data.get("conviction"))),
@@ -516,8 +613,9 @@ class GraphSupervisor(SentinelAgent):
 
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
-                raw_label = data.get("label", "Entity")
-                label = raw_label if is_valid_node_label(raw_label) else "Entity"
+                label = resolve_node_label(
+                    data.get("label"), entity_id, source="supervisor.ADD_TAGS",
+                )
                 if not tags:
                     return
 
@@ -577,6 +675,53 @@ BACKFILL_VERSION = "1"
 # Batched so a quarter-million-node update cannot hold a single transaction open
 # long enough to stall the writes this service exists to perform.
 BACKFILL_BATCH = 5000
+
+
+async def ensure_graph_indexes(neo4j_client) -> int:
+    """One index per label the supervisor is allowed to MERGE on.
+
+    Every write this service makes is `MERGE (e:<Label> {name: $name})`, and the
+    graph carried exactly one property index -- `Entity(name)` -- created before
+    this code and by nothing in it. So a MERGE on any other label is a full
+    label scan, measured on the live graph:
+
+        Entity    253,072 nodes, indexed   ->        1 db hit
+        Vessel      9,421 nodes            ->   18,843 db hits
+        Aircraft   23,682 nodes            ->   47,365 db hits
+
+    Two db hits per node, on every proposal, growing with the graph. The cost is
+    not the query time today so much as the shape: it gets worse every day the
+    platform runs, and the ontology path is one of the highest-volume writers in
+    the system.
+
+    RANGE indexes rather than uniqueness constraints, deliberately. A constraint
+    would also stop MERGE creating a second node for the same name under
+    concurrency -- which is worth having -- but it fails on existing duplicates,
+    and this graph has 2,368 name-only Vessel nodes whose relationship to the
+    mmsi-keyed ones has not been established. An index is safe to add now; the
+    constraint is a decision that needs that question answered first.
+
+    Idempotent: IF NOT EXISTS, run at every start.
+    """
+    if not neo4j_client:
+        return 0
+    created = 0
+    for label in sorted(ALLOWED_NODE_LABELS):
+        # Index name must be a valid identifier; the label is already
+        # allowlisted, which is what makes the interpolation safe.
+        try:
+            await neo4j_client.query(
+                f"CREATE INDEX idx_{label.lower()}_name IF NOT EXISTS "
+                f"FOR (n:{label}) ON (n.name)"
+            )
+            created += 1
+        except Exception as exc:
+            swallowed("agents.supervisor.ensure_graph_indexes", exc, logger)
+    logger.info(
+        "Graph name indexes ensured for %d allowed label(s); a MERGE on an "
+        "unindexed label was scanning the whole label.", created,
+    )
+    return created
 
 
 async def backfill_node_types(neo4j_client, redis_client) -> None:
@@ -660,8 +805,8 @@ async def start_supervisor():
     db_client = await get_timescale()
     neo4j_client = await get_neo4j()
 
-    producer = SentinelProducer()
-    dlq = SentinelProducer()
+    producer = SentinelProducer(service_name="agent-supervisor")
+    dlq = SentinelProducer(service_name="agent-supervisor-dlq")
     consumer = SentinelConsumer(
         topics=[Topics.ONTOLOGY_PROPOSALS],
         group_id="supervisor-group",

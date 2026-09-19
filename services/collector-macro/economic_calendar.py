@@ -30,6 +30,8 @@ from typing import Dict, List, Tuple, Optional, Any
 from shared.models import NormalizedEvent, EventType, EntityType, Entity, MacroReleaseData, AnomalyBreakdown
 from shared.kafka import SentinelProducer, Topics
 
+from shared.utils.quiet_failures import dropped, swallowed
+
 logger = logging.getLogger("feed.macro_calendar")
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
@@ -157,10 +159,35 @@ class EconomicCalendarCollector:
             url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
             async with session.get(url) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("economicCalendar", [])
+                    return (await resp.json()).get("economicCalendar", [])
+
+                # Anything else is said out loud, once.
+                #
+                # aiohttp does not raise on a 4xx, so this fell through to
+                # `return []` and the `except` below never saw it. The loop then
+                # polled every 120 seconds, received nothing, and logged nothing
+                # -- the caller only logs when `events` is non-empty.
+                #
+                # Measured consequence: this endpoint is premium on Finnhub and
+                # answers 403 for this key, so the platform has ingested
+                # **zero** CPI, payroll, FOMC, PCE or GDP releases in its entire
+                # history. Every one of the 4,219 `macro_release` events on the
+                # platform comes from the freight poller. The absence was
+                # indistinguishable from a quiet calendar.
+                #
+                # `dropped` counts and escalates rather than logging every two
+                # minutes forever: loud on the first, at powers of ten, and once
+                # per interval after that.
+                dropped(
+                    "collector_macro.economic_calendar_unavailable",
+                    f"Finnhub /calendar/economic returned {resp.status}"
+                    + (" (premium endpoint, not available on this key)"
+                       if resp.status == 403 else ""),
+                    logger,
+                    detail="no CPI/NFP/FOMC/PCE/GDP releases will be ingested",
+                )
         except Exception as e:
-            logger.debug(f"Finnhub economic calendar fetch fallback: {e}")
+            swallowed("collector_macro.economic_calendar_fetch", e, logger)
         return []
 
     def build_macro_release_event(

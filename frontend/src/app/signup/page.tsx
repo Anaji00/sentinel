@@ -63,7 +63,7 @@ export default function SignupPage() {
         title={emailSent ? 'Check your email' : 'Your account is ready'}
         subtitle={emailSent ? 'ONE STEP LEFT' : 'NOTHING TO CONFIRM'}
       >
-        <div className="space-y-4 text-sm text-slate-300 leading-relaxed">
+        <div className="space-y-4 text-sm text-ink-dim leading-relaxed">
           {emailSent ? (
             <p>
               We sent a confirmation link to <span className="text-cyan-400">{email}</span>. It
@@ -75,12 +75,15 @@ export default function SignupPage() {
                 'Email confirmation is not available on this deployment, so no link was sent. Sign in and use the platform now.'}
             </p>
           )}
-          <p className="text-slate-400">
+          <p className="text-ink-dim">
             Your account is already active on the free plan — the whole analyst platform, every
             domain and all dashboards.
-            {emailSent ? ' Confirming just proves the address is yours.' : ''}
+            {emailSent ? 'Confirming just proves the address is yours.' : ''}
           </p>
-          <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300 text-sm">
+          <Link
+            href="/login"
+            className="block text-center text-cyan-400 hover:text-cyan-300 text-sm"
+          >
             Go to sign in
           </Link>
         </div>
@@ -92,31 +95,51 @@ export default function SignupPage() {
     <AuthShell title="Create your account" subtitle="FREE — NO CARD REQUIRED">
       <form onSubmit={submit} className="space-y-4">
         <div className="space-y-1">
-          <label htmlFor="email" className="text-[10px] uppercase tracking-widest text-slate-400">Email</label>
-          <input
-            id="email" type="email" required autoComplete="email" value={email}
-            onChange={(e) => setEmail(e.target.value)} className={fieldClass} placeholder="you@example.com"
-          />
-        </div>
-
-        <div className="space-y-1">
-          <label htmlFor="name" className="text-[10px] uppercase tracking-widest text-slate-400">
-            Name <span className="text-slate-600">(optional)</span>
+          <label htmlFor="email" className="text-micro uppercase tracking-widest text-ink-dim">
+            Email
           </label>
           <input
-            id="name" type="text" autoComplete="name" value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)} className={fieldClass} placeholder="How we address you"
+            id="email"
+            type="email"
+            required
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className={fieldClass}
+            placeholder="you@example.com"
           />
         </div>
 
         <div className="space-y-1">
-          <label htmlFor="password" className="text-[10px] uppercase tracking-widest text-slate-400">Password</label>
+          <label htmlFor="name" className="text-micro uppercase tracking-widest text-ink-dim">
+            Name <span className="text-ink-mute">(optional)</span>
+          </label>
           <input
-            id="password" type="password" required autoComplete="new-password" value={password}
-            onChange={(e) => setPassword(e.target.value)} className={fieldClass}
+            id="name"
+            type="text"
+            autoComplete="name"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            className={fieldClass}
+            placeholder="How we address you"
+          />
+        </div>
+
+        <div className="space-y-1">
+          <label htmlFor="password" className="text-micro uppercase tracking-widest text-ink-dim">
+            Password
+          </label>
+          <input
+            id="password"
+            type="password"
+            required
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className={fieldClass}
             placeholder={`At least ${MIN_PASSWORD_LENGTH} characters`}
           />
-          <p className="text-[10px] text-slate-500 pt-1">
+          <p className="text-micro text-ink-mute pt-1">
             {password.length > 0 && password.length < MIN_PASSWORD_LENGTH
               ? `${MIN_PASSWORD_LENGTH - password.length} more character${MIN_PASSWORD_LENGTH - password.length === 1 ? '' : 's'} needed`
               : `Minimum ${MIN_PASSWORD_LENGTH} characters`}
@@ -129,9 +152,11 @@ export default function SignupPage() {
           {busy ? 'Creating…' : 'Create account'}
         </button>
 
-        <p className="text-center text-xs text-slate-500">
-          Already have one?{' '}
-          <Link href="/login" className="text-cyan-400 hover:text-cyan-300">Sign in</Link>
+        <p className="text-center text-xs text-ink-mute">
+          Already have one?{''}
+          <Link href="/login" className="text-cyan-400 hover:text-cyan-300">
+            Sign in
+          </Link>
         </p>
       </form>
     </AuthShell>

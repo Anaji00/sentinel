@@ -27,12 +27,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
 from shared.utils.serialization import score_dto
+from shared.utils.vector_index import EVENT_COLLECTION
 
 logger = logging.getLogger("api-gateway.search")
 
 router = APIRouter(prefix="/api/v1/search", tags=["Semantic Retrieval"])
 
-QDRANT_COLLECTION = "sentinel_events"
+# One definition, shared with the correlator that writes these vectors.
+# This read `sentinel_events`, which Qdrant 404s, while the writer had long
+# since moved to the versioned name -- so every semantic query reported the
+# index unavailable against half a million points.
+QDRANT_COLLECTION = EVENT_COLLECTION
 
 # Cosine similarity below this is noise: with 768-dimensional embeddings almost
 # any pair scores weakly positive, so an unfiltered nearest-neighbour list
@@ -41,41 +46,100 @@ QDRANT_COLLECTION = "sentinel_events"
 MIN_SIMILARITY = 0.55
 
 
-async def _qdrant():
-    """Async Qdrant client, or None when the dependency is unavailable.
+def _qdrant_base() -> str:
+    host = os.getenv("QDRANT_HOST", "qdrant")
+    port = os.getenv("QDRANT_PORT") or "6333"
+    return f"http://{host}:{port}"
 
-    Imported lazily so the gateway starts without qdrant-client installed --
-    semantic search then reports itself unavailable rather than breaking
-    every other route in the process.
+
+class VectorIndexUnavailable(RuntimeError):
+    """The index cannot be queried, and which of the reasons it is.
+
+    `reason` is deliberately specific. The endpoint used to answer every
+    failure with "Qdrant unreachable or collection absent", which is two
+    guesses and covered neither of the two things that were actually wrong --
+    an uninstalled client library and a collection name that had never
+    existed. An operator reading "unavailable" needs to know whether to
+    restart a container, fix a network, or run an indexer.
     """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def _qdrant_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """One Qdrant REST call.
+
+    `aiohttp` rather than `qdrant_client`: the client package lives in
+    `requirements-ml.txt` and this container is built from the base image, so
+    importing it has never succeeded here. aiohttp is already a base
+    dependency and Qdrant's four operations are four HTTP requests.
+    """
+    import aiohttp
+
+    url = f"{_qdrant_base()}{path}"
+    # Thirty seconds, matching the platform's own client timeout. Ten was
+    # too tight: a cold search over half a million vectors returned 502
+    # 'Qdrant unreachable' when Qdrant was answering perfectly well, which
+    # is the same conflation this endpoint was just fixed for.
+    timeout = aiohttp.ClientTimeout(total=30)
     try:
-        from qdrant_client import AsyncQdrantClient
-    except ImportError:
-        logger.warning("qdrant-client not installed; semantic search disabled.")
-        return None
-    try:
-        host = os.getenv("QDRANT_HOST", "qdrant")
-        client = AsyncQdrantClient(host=host, port=int(os.getenv("QDRANT_PORT", "6333")))
-        if not await client.collection_exists(QDRANT_COLLECTION):
-            logger.warning("Qdrant collection '%s' does not exist yet.", QDRANT_COLLECTION)
-            return None
-        return client
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=body) as resp:
+                if resp.status == 404:
+                    raise VectorIndexUnavailable(
+                        f"collection '{QDRANT_COLLECTION}' does not exist"
+                    )
+                if resp.status >= 400:
+                    raise VectorIndexUnavailable(
+                        f"Qdrant returned HTTP {resp.status} for {path}"
+                    )
+                payload = await resp.json()
+    except VectorIndexUnavailable:
+        raise
     except Exception as e:
-        logger.warning("Qdrant unreachable: %s", e)
-        return None
+        raise VectorIndexUnavailable(f"Qdrant unreachable at {_qdrant_base()}: {e}") from e
+
+    return payload.get("result") or {}
 
 
-def _hit_to_dto(hit: Any) -> Dict[str, Any]:
-    """Normalizes a Qdrant hit into the platform's response shape."""
-    payload = getattr(hit, "payload", None) or {}
+async def _assert_index_ready() -> None:
+    """Raises with the specific reason, or returns having confirmed the index."""
+    import aiohttp
+
+    url = f"{_qdrant_base()}/collections/{QDRANT_COLLECTION}"
+    timeout = aiohttp.ClientTimeout(total=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 404:
+                    raise VectorIndexUnavailable(
+                        f"collection '{QDRANT_COLLECTION}' does not exist"
+                    )
+                if resp.status >= 400:
+                    raise VectorIndexUnavailable(f"Qdrant returned HTTP {resp.status}")
+    except VectorIndexUnavailable:
+        raise
+    except Exception as e:
+        raise VectorIndexUnavailable(f"Qdrant unreachable at {_qdrant_base()}: {e}") from e
+
+
+def _hit_to_dto(hit: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalizes a Qdrant hit into the platform's response shape.
+
+    A plain dict now, because the REST API returns JSON rather than the
+    client's objects. The field names are Qdrant's own.
+    """
+    payload = hit.get("payload") or {}
     return score_dto({
-        "event_id": payload.get("event_id") or str(getattr(hit, "id", "")),
+        "event_id": payload.get("event_id") or str(hit.get("id", "")),
         "type": payload.get("type"),
         "domain": payload.get("domain"),
         "region": payload.get("region"),
         "occurred_at": payload.get("occurred_at"),
         "anomaly_score": payload.get("anomaly"),
-        "similarity": float(getattr(hit, "score", 0.0)),
+        "similarity": float(hit.get("score") or 0.0),
     })
 
 
@@ -97,42 +161,47 @@ async def find_similar_events(
     loaded here. Returns an empty list -- not an error -- when the corpus holds
     nothing above the similarity floor.
     """
-    client = await _qdrant()
-    if client is None:
+    try:
+        await _assert_index_ready()
+    except VectorIndexUnavailable as e:
         raise HTTPException(
             status_code=503,
-            detail="Semantic search unavailable: the vector index is not reachable.",
+            detail=f"Semantic search unavailable: {e.reason}",
         )
 
     try:
-        stored = await client.retrieve(
-            collection_name=QDRANT_COLLECTION,
-            ids=[event_id],
-            with_vectors=True,
+        stored = await _qdrant_post(
+            f"/collections/{QDRANT_COLLECTION}/points",
+            {"ids": [event_id], "with_vector": True, "with_payload": False},
         )
-        if not stored:
+        points = stored if isinstance(stored, list) else stored.get("points") or []
+        if not points:
             raise HTTPException(
                 status_code=404,
                 detail=f"Event '{event_id}' has no embedding indexed. "
                        f"Only enriched events are retrievable.",
             )
 
-        vector = getattr(stored[0], "vector", None)
+        vector = points[0].get("vector")
         if not vector:
             raise HTTPException(status_code=404, detail="Indexed event carries no vector.")
 
         # limit + 1: the query event is its own nearest neighbour and is
         # filtered out below, so ask for one extra to still return `limit`.
-        hits = await client.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=vector,
-            limit=limit + 1,
-            score_threshold=min_similarity,
+        hits = await _qdrant_post(
+            f"/collections/{QDRANT_COLLECTION}/points/search",
+            {
+                "vector": vector,
+                "limit": limit + 1,
+                "score_threshold": min_similarity,
+                "with_payload": True,
+            },
         )
+        hits = hits if isinstance(hits, list) else hits.get("points") or []
 
         results: List[Dict[str, Any]] = []
         for hit in hits:
-            payload = getattr(hit, "payload", None) or {}
+            payload = hit.get("payload") or {}
             if payload.get("event_id") == event_id:
                 continue
             if exclude_domain and payload.get("domain") == exclude_domain:
@@ -162,20 +231,29 @@ async def search_status():
     Exposed because "no results" and "index empty" look identical from a
     dashboard, and they call for completely different responses.
     """
-    client = await _qdrant()
-    if client is None:
-        return {
-            "available": False,
-            "reason": "Qdrant unreachable or collection absent",
-            "indexed_events": None,
-        }
     try:
-        info = await client.count(collection_name=QDRANT_COLLECTION, exact=False)
+        await _assert_index_ready()
+        info = await _qdrant_post(
+            f"/collections/{QDRANT_COLLECTION}/points/count", {"exact": False}
+        )
         return {
             "available": True,
             "collection": QDRANT_COLLECTION,
-            "indexed_events": int(getattr(info, "count", 0)),
+            "indexed_events": int(info.get("count") or 0),
             "min_similarity_default": MIN_SIMILARITY,
         }
+    except VectorIndexUnavailable as e:
+        # The specific reason, not a guess covering three of them.
+        return {
+            "available": False,
+            "reason": e.reason,
+            "collection": QDRANT_COLLECTION,
+            "indexed_events": None,
+        }
     except Exception as e:
-        return {"available": False, "reason": str(e), "indexed_events": None}
+        return {
+            "available": False,
+            "reason": f"unexpected error: {e}",
+            "collection": QDRANT_COLLECTION,
+            "indexed_events": None,
+        }

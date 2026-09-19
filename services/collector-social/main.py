@@ -39,6 +39,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 
 POLL_INTERVAL_SEC = 60
@@ -166,6 +167,7 @@ async def poll_telegram_channel(
             )
 
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=channel)
+            _collector_metrics("collector-social").ingested()
             new_count += 1
 
     except Exception as e:
@@ -234,6 +236,7 @@ async def poll_reddit_subreddit(
             )
 
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=subreddit)
+            _collector_metrics("collector-social").ingested()
             new_count += 1
 
     except Exception as e:
@@ -303,6 +306,7 @@ async def poll_twitter_handle(
                 }
             )
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=handle)
+            _collector_metrics("collector-social").ingested()
             new_count += 1
 
     except Exception as e:
@@ -350,7 +354,7 @@ async def main():
     # §1.1 Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-social")
+    metrics = _collector_metrics("collector-social")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-social"))
 

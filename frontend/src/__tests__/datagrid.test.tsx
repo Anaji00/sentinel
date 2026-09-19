@@ -84,19 +84,25 @@ describe('DataGrid replaces raw JSON rendering', () => {
   });
 
   it('renders scalar arrays as compact chips with an overflow count', () => {
-    const html = render(<DataGrid data={{ tags: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'] }} />);
+    const html = render(
+      <DataGrid data={{ tags: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'] }} />,
+    );
     expect(html).toContain('+2');
   });
 
   it('omits requested fields', () => {
-    const html = render(<DataGrid data={{ keep: 1, raw_payload: { huge: true } }} omit={['raw_payload']} />);
+    const html = render(
+      <DataGrid data={{ keep: 1, raw_payload: { huge: true } }} omit={['raw_payload']} />,
+    );
     expect(html).toContain('Keep');
     expect(html).not.toContain('Raw Payload');
   });
 
   it('shows an explicit empty state instead of a blank panel', () => {
     expect(render(<DataGrid data={{}} />)).toContain('No structured detail available');
-    expect(render(<DataGrid data={null} emptyLabel="Nothing reported" />)).toContain('Nothing reported');
+    expect(render(<DataGrid data={null} emptyLabel="Nothing reported" />)).toContain(
+      'Nothing reported',
+    );
   });
 
   it('never emits a serialized object literal', () => {

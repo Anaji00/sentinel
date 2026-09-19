@@ -3,7 +3,32 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: "sentinel-api-gateway"
+  # One job, deliberately.
+  #
+  # The gateway's /metrics does not render its own process counters -- it
+  # delegates to the aggregating implementation, which reads every Sentinel
+  # service's metrics out of Redis. So a single scrape here covers all thirty
+  # processes, and adding a job per service would double-count them.
+  #
+  # Two things were wrong and both returned nothing. `metrics_path: /metrics`
+  # is right and was right; what failed was authentication -- the endpoint sits
+  # behind the API-key check, a scraper cannot present a session cookie, and the
+  # METRICS_TOKEN branch written for exactly this case was set in no environment
+  # file. Every scrape since this file was written returned 403 Forbidden, so
+  # Prometheus held one target, permanently down, and Grafana had nothing to
+  # draw.
+  - job_name: "sentinel"
     metrics_path: "/metrics"
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
     static_configs:
       - targets: ["api-gateway:8000"]
+        labels:
+          platform: "sentinel"
+
+  # Prometheus' own health, so "the scrape is failing" and "the scraper is
+  # down" are answerable from inside Prometheus rather than only from outside.
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

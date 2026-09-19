@@ -55,6 +55,15 @@ ANOMALY_TO_Z = 5.0
 
 
 
+def _hurst_text(h) -> str:
+    """The value, or a statement that there is none.
+
+    `hurst_exponent` used to return 0.5 when it could not compute, and 0.5
+    fails `> 0.5`, so every refusal printed as a confident "Mean-Reverting".
+    """
+    return f"{h:.3f}" if h is not None else "n/a"
+
+
 def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
     """EPS surprise on an event, or 0.0 when it is not an earnings event."""
     for container in (
@@ -547,8 +556,8 @@ class RadarAgent(SentinelAgent):
             # over 5-minute bars than over hourly ones, and an unqualified
             # percentage invites the reader to assume the wrong one.
             regime_str = (
-                f"Hurst Exponent: {hurst_val:.3f} "
-                f"({'Trending' if hurst_val > 0.5 else 'Mean-Reverting'}) | "
+                f"Hurst Exponent: {_hurst_text(hurst_val)} "
+                f"({quant_calc.hurst_regime(hurst_val) or 'NOT MEASURED'}) | "
                 f"GARCH(1,1) Volatility: {garch_vol:.2%} "
                 f"[over {len(closes)} {tf_label} bars]"
             )

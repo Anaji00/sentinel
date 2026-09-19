@@ -28,7 +28,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
-          "expr": "sentinel_ollama_latency_seconds{quantile=\"0.95\"}",
+          "expr": "sentinel_ollama_latency_seconds_p95{quantile=\"0.95\"}",
           "legendFormat": "Latency p95"
         }
       ]
@@ -39,7 +39,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
-          "expr": "sentinel_ollama_semaphore_wait_seconds",
+          "expr": "sentinel_ollama_semaphore_wait_seconds_p95",
           "legendFormat": "Semaphore Wait"
         }
       ]
@@ -50,7 +50,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
-          "expr": "sentinel_ollama_timeouts",
+          "expr": "sentinel_ollama_timeouts_total",
           "legendFormat": "Timeouts"
         }
       ]

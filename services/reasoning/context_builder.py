@@ -106,7 +106,6 @@ class ContextBuilder:
         active_bulletins = await self._fetch_active_bulletins(cluster.entity_ids)
         consensus_report = await self._fetch_consensus_report()
         
-        pattern_matches = self._fetch_pattern_matches(cluster) 
         
         all_events = ([trigger] if trigger else []) + (supporting or [])
         compressed_events_table = self._compress_event_sequence(all_events)
@@ -124,7 +123,15 @@ class ContextBuilder:
             "supporting_events": supporting,
             "compressed_events_table": compressed_events_table,
             "entity_graph": entity_graph,
-            "historical_patterns": pattern_matches, 
+            # `historical_patterns` is gone from this dict.
+            #
+            # It was filled by a stub that returned [] and read by nobody: the
+            # scenario generator never looked the key up, because the real
+            # patterns reach it as a separate argument from
+            # PatternLibrary.find_similar() in reasoning/main.py. Two dead ends
+            # pointed at each other, and the key read as a populated one -- so a
+            # future prompt rendering it would have told the model there are no
+            # precedents while the precedents sat in the next argument.
             "recent_headlines": recent_news,
             "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_intel_briefs": agent_intel,
@@ -349,21 +356,6 @@ class ContextBuilder:
             return []
         
 
-    def _fetch_pattern_matches(self, cluster: CorrelationCluster) -> List[Dict]:
-        """
-        Stub — returns empty list.
- 
-        Pattern matching is handled by PatternLibrary.find_similar() in
-        reasoning/main.py, which passes results directly to
-        scenario_generator.generate(). If you ever want the context
-        builder to bundle patterns itself (e.g. for a standalone call),
-        inject a PatternLibrary instance and call it here.
- 
-        TODO Phase 2: wire in PatternLibrary if the calling pattern changes.
-        """
-        return []
- 
-        
     def _serialize_row(self, row: Dict) -> Dict:
         """
         Make a DB row JSON-safe (convert datetime, parse JSONB).

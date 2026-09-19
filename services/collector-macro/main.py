@@ -43,6 +43,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
@@ -91,6 +92,34 @@ MACRO_TICKERS = {
     # macro instruments, so they belong to the macro collector.
     "HYG":  "High Yield Corporate Bond ETF",
     "LQD":  "Investment Grade Corporate Bond ETF",
+
+    # The eleven GICS sector ETFs, for the same reason HYG and LQD are here.
+    #
+    # `discover_sector_hawkes_contagion` builds a point process per sector out
+    # of these funds' returns and fits a Hawkes kernel to find which sector's
+    # volatility excites which. It is wired end to end -- it writes
+    # HAWKES_EXCITES edges, it runs on a ten-minute loop -- and it has produced
+    # nothing, because `tradfi_bars` holds **zero bars for all eleven**.
+    #
+    # They were not missing by oversight. `is_valid_primary_equity` classifies
+    # every one of them INDEX_SECTOR_ETF, "not a company", which is correct for
+    # an equity watchlist and is what kept them out of the tradfi collector's
+    # subscription budget. Nothing then collected them anywhere else, so the
+    # exclusion that was right for one consumer starved the only consumer that
+    # needed them.
+    #
+    # They are macro instruments and this is where macro instruments live.
+    "XLK":  "Technology Select Sector SPDR",
+    "XLV":  "Health Care Select Sector SPDR",
+    "XLF":  "Financial Select Sector SPDR",
+    "XLY":  "Consumer Discretionary Select Sector SPDR",
+    "XLC":  "Communication Services Select Sector SPDR",
+    "XLI":  "Industrial Select Sector SPDR",
+    "XLP":  "Consumer Staples Select Sector SPDR",
+    "XLE":  "Energy Select Sector SPDR",
+    "XLU":  "Utilities Select Sector SPDR",
+    "XLRE": "Real Estate Select Sector SPDR",
+    "XLB":  "Materials Select Sector SPDR",
 }
 
 # Proxy ETF map for Alpaca & Finnhub APIs
@@ -650,6 +679,7 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
                 }
 
                 await producer.send(Topics.RAW_TRADFI, payload, key=ticker)
+                _collector_metrics("collector-macro").ingested()
 
                 _last_published[ticker] = fingerprint
                 published += 1
@@ -687,7 +717,7 @@ async def main():
     if redis_client:
         # Throughput counters. The heartbeat proves this process is alive;
         # these prove it is still producing.
-        metrics = CollectorMetrics("collector-macro")
+        metrics = _collector_metrics("collector-macro")
         await metrics.start(redis_client)
         hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-macro"))
 

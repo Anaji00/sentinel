@@ -32,6 +32,7 @@ subject nobody else will ever look at.
 """
 
 import logging
+import os
 import time
 from typing import Any, Iterable, List, Optional
 
@@ -49,6 +50,31 @@ FOCUS_KEY = "sentinel:focus:entities"
 # Long enough that an agent on a thirty-minute review cycle sees it at least
 # once.
 FOCUS_TTL_SEC = 2700
+
+# How long the single most recent subject in a domain survives.
+#
+# The TTL above is a statement about how fast a situation decays. It is also,
+# accidentally, a statement about how often a domain has to produce -- and the
+# domains do not produce at the same rate. Measured on the live focus set:
+#
+#   offered, lifetime   maritime 98  crypto 87  aviation 95  tradfi 39
+#   present, right now  maritime  4  crypto  4  unknown   4  tradfi  0
+#
+# The per-domain cap already stops a busy domain crowding a quiet one out on
+# count. It does nothing about recency: tradfi subjects are offered roughly
+# once every eight hours, so they sit inside a forty-five minute window about
+# nine per cent of the time and `stock_correlation_agent` -- whose domains are
+# tradfi, market, equity and macro -- consults an empty set for the rest.
+#
+# So the quiet domains get the coordination least, which is backwards: they are
+# the ones where two agents landing on one subject by chance is least likely,
+# and therefore the ones a focus set exists to help.
+#
+# One subject per domain is kept past the TTL, up to this longer ceiling. It is
+# one, not four, because the point is to give a quiet domain *something* to
+# converge on rather than to pin the swarm to a stale list -- and `prioritise`
+# only reorders, so a slightly old suggestion costs an ordering, not a slot.
+FOCUS_FLOOR_TTL_SEC = int(os.getenv("FOCUS_FLOOR_TTL_SEC", str(6 * 3600)))
 
 # How many subjects the set holds. Small on purpose -- a focus list of fifty is
 # a watchlist, and the platform already has watchlists. This is meant to be the
@@ -129,13 +155,29 @@ async def offer_focus(
                 if len(names) > FOCUS_MAX_PER_DOMAIN:
                     # `members` is oldest-first, so the head of each list is.
                     surplus.extend(names[: len(names) - FOCUS_MAX_PER_DOMAIN])
+
+            # The floor: the newest subject in each domain is re-scored so it
+            # outlives the ordinary window. Without it a domain that offers
+            # rarely is absent from the set most of the time, which is the
+            # opposite of what a coordination mechanism should do -- see
+            # FOCUS_FLOOR_TTL_SEC.
+            for d, names in by_domain.items():
+                newest = names[-1]
+                if newest in surplus:
+                    continue
+                await raw.zadd(
+                    FOCUS_KEY,
+                    {newest: now - FOCUS_TTL_SEC + FOCUS_FLOOR_TTL_SEC},
+                    xx=True, gt=True,
+                )
             if surplus:
                 await raw.zrem(FOCUS_KEY, *surplus)
                 await raw.hdel(FOCUS_DOMAIN_KEY, *surplus)
 
         await raw.zremrangebyrank(FOCUS_KEY, 0, -(FOCUS_MAX + 1))
-        await raw.expire(FOCUS_KEY, FOCUS_TTL_SEC)
-        await raw.expire(FOCUS_DOMAIN_KEY, FOCUS_TTL_SEC)
+        # The keys themselves live as long as the longest thing in them.
+        await raw.expire(FOCUS_KEY, FOCUS_FLOOR_TTL_SEC)
+        await raw.expire(FOCUS_DOMAIN_KEY, FOCUS_FLOOR_TTL_SEC)
         if offered_by:
             logger.debug("%s offered %s for a second opinion.", offered_by, subject)
         return True

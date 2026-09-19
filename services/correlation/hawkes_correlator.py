@@ -31,6 +31,14 @@ from shared.models.events import event_domain as canonical_domain
 import bisect
 import json
 import logging
+from shared.utils.agent_conclusions import (
+    AGENT_CORRELATION_ANALYSIS_PREFIX,
+    HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_INVERSE_CORRELATION_PREFIX,
+    MACRO_RATES_REGIME_KEY,
+    MACRO_SPREAD_2Y10Y_KEY,
+    TRADFI_BACKFILL_REPORT_KEY,
+)
 import math
 import time
 
@@ -598,7 +606,7 @@ class CrossDomainHawkesCorrelator:
                 )
                 # Also publish branching ratios for dashboard consumption
                 await self._redis.raw.set(
-                    "sentinel:hawkes:branching_ratios",
+                    HAWKES_BRANCHING_RATIOS_KEY,
                     json.dumps(self._branching_ratios),
                     ex=86400,
                 )

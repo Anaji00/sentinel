@@ -22,7 +22,7 @@ from shared.utils.regions import routine_band_score
 from shared.kafka import Topics
 from shared.utils.source_scorecard import baseline_reliability
 
-from services.enrichment.anomaly_scorer import lift_score
+from services.enrichment.anomaly_scorer import breakdown_from_score, lift_score
 
 
 def _kinematic_score(kin, default: float = 0.10) -> float:
@@ -128,6 +128,10 @@ class AviationEnricher:
         try:
             kinematic_results = await self.scorer.score_kinematic_event_batch(
                 entities, lats, lons, speeds, headings, timestamps, extras,
+                # Named, because an ICAO24 hex code cannot be told from an MMSI
+                # by looking at it -- and the guess that used to be made here
+                # sent every aircraft to the maritime detector.
+                domain="aviation",
             )
         except Exception as e:
             # A failed batch must not lose the batch. Each aircraft falls back
@@ -156,7 +160,10 @@ class AviationEnricher:
         pipe = self.redis.raw.pipeline()
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned), score_res in zip(parsed, scoring_results):
+        # kinematic_results joins the loop so the breakdown can carry what the
+        # detector measured. The failure branch above builds one empty dict per
+        # aircraft rather than a shorter list, so the three stay aligned.
+        for (raw, p, icao24, lat, lon, callsign, squawk, is_emerg, region, country, flags, is_sanctioned), score_res, kin in zip(parsed, scoring_results, kinematic_results):
             speed = _as_float(p.get("velocity") or p.get("speed"))
             heading = _as_float(p.get("true_track") or p.get("heading"))
             if isinstance(score_res, Exception):
@@ -253,6 +260,10 @@ class AviationEnricher:
                 headline=headline,
                 tags=tags,
                 anomaly_score=anomaly,
+                # 2,152 flight events in the measured hour carried no breakdown.
+                # The kinematic detector had produced coverage, significance and
+                # a spatial residual for every one of them.
+                anomaly_breakdown=breakdown_from_score(kin, "aviation"),
                 flight_data=flight_data,
             )
             results.append(event)

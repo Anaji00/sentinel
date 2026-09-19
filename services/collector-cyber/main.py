@@ -366,6 +366,26 @@ async def poll_cisa_kev(
 
 # ── RANSOMWARE.LIVE ───────────────────────────────────────────────────────────
 
+def _parse_feed_timestamp(raw) -> "Optional[datetime]":
+    """An ISO timestamp from the feed, or None if it does not parse.
+
+    None rather than a substituted `now()`: an event whose time is unknown and
+    one that happened this second are different facts, and the caller decides
+    what to do about the first.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    # A feed clock ahead of ours would sit at the top of every correlation
+    # window forever; this audit has already repaired that once.
+    return min(parsed, datetime.now(timezone.utc))
+
+
 async def poll_ransomware(
     # This function checks a community-run API that scrapes Dark Web ransomware blogs
     # to see who got hacked recently.
@@ -389,23 +409,55 @@ async def poll_ransomware(
         new_count = 0
         send_tasks = []
         for victim in victims:
-            victim_id = victim.get("id") or victim.get("post_title", "")
-            if victim_id in seen_ids:
+            # The field names the server actually sends.
+            #
+            # This read "victim", "id" and "url", and api.ransomware.live sends
+            # none of them. Its keys are: activity, country, data_size,
+            # description, discovered, group_name, infostealer, post_title,
+            # post_url, published, ransom, screenshot, website.
+            #
+            # The victim name survived only by accident, through a fallback that
+            # happened to name the real field -- while the operator line below
+            # had no fallback and printed `None` for every critical-sector
+            # compromise. The leak-site URL was dropped for all 7,951 stored
+            # events although the server sends it for 62% of rows, and the
+            # company description, sent for 98%, was discarded entirely.
+            name = (
+                victim.get("post_title")
+                or victim.get("website")
+                or victim.get("victim")
+                or ""
+            ).strip()
+            victim_id = victim.get("id") or name
+            if not victim_id or victim_id in seen_ids:
                 continue
             seen_ids.add(victim_id)
 
             sector  = (victim.get("activity") or victim.get("sector") or "").lower()
             country = (victim.get("country") or "")[:2].upper()
 
+            # When the leak was posted, not when we happened to poll.
+            #
+            # occurred_at was datetime.now(). The feed spans four days, so every
+            # victim in it was recorded as having happened at poll time -- on a
+            # platform whose entire premise is correlating things by when they
+            # occurred. With an in-memory dedupe set that also resets on every
+            # restart, one incident became 22 events across three days: 7,951
+            # rows for 1,233 distinct victims.
+            posted = _parse_feed_timestamp(
+                victim.get("published") or victim.get("discovered")
+            )
+
             event = RawEvent(
                 source="ransomware_feed",
-                occurred_at=datetime.now(timezone.utc),
+                occurred_at=posted or datetime.now(timezone.utc),
                 raw_payload={
-                    "victim":       victim.get("victim") or victim.get("post_title", ""),
+                    "victim":       name,
                     "group":        victim.get("group_name", "Unknown"),
                     "sector":       sector,
                     "country_code": country,
-                    "url":          victim.get("url", ""),
+                    "url":          victim.get("post_url") or victim.get("website") or "",
+                    "description":  (victim.get("description") or "")[:2000],
                     "data_types":   [],
                 },
             )
@@ -414,8 +466,9 @@ async def poll_ransomware(
 
             if any(kw in sector for kw in CRITICAL_SECTORS):
                 logger.info(
-                    f"🔴 RANSOMWARE (critical sector): "
-                    f"{victim.get('victim')} — {victim.get('group_name')} [{sector}]"
+                    f"RANSOMWARE (critical sector): "
+                    f"{name or 'unnamed victim'} — "
+                    f"{victim.get('group_name', 'unknown group')} [{sector}]"
                 )
 
         if send_tasks:

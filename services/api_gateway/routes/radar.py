@@ -16,6 +16,7 @@ from shared.utils.candles import (
 )
 
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+from shared.utils.ticker_stats import read_ticker_stats
 from shared.utils.radar_keys import (
     MOVERS_DAY_ZSET,
     RADAR_BASELINE_PREFIX,
@@ -24,9 +25,26 @@ from shared.utils.radar_keys import (
 )
 logger = logging.getLogger("api-gateway.radar")
 
-# Anomaly scores are unit-normalized [0,1]; this maps them onto a z-like scale
-# for display. Named rather than inlined so the relationship is auditable.
-Z_SCORE_SCALE = 4.5
+# Anomaly scores are unit-normalised [0,1]. The enrichers get there with
+# `1 - exp(-z/5)`, so the way back is `-5 * ln(1 - score)` -- not a
+# multiplication, and not by 4.5.
+#
+# What was here read: "maps them onto a z-like scale for display. Named rather
+# than inlined so the relationship is auditable." The relationship was
+# auditable and it was wrong: `score * 4.5` is bounded above by 4.5, so five,
+# ten and twenty sigma displayed as 2.84, 3.89 and 4.42 and converged on the
+# ceiling -- in the field named for the quantity that tells them apart.
+from shared.utils.anomaly_scale import score_to_z
+# One decoder for the movers hash, defined beside the watchlist reader
+# that also needs it.
+from services.api_gateway.routes.watchlists import read_movers_snapshot
+from shared.utils.market_cap import DEFAULT_MIN_MARKET_CAP_USD, cached_market_cap
+from shared.utils.equities import TICKER_SHAPED_STOPWORDS
+
+# How far down the ranking a gated request will look before giving up.
+# Bounds the request path against a session where thousands of microcaps
+# move and the qualifying names sit a long way down.
+MOVERS_WALK_CAP = int(os.getenv('MOVERS_WALK_CAP', '3000'))
 
 router = APIRouter(prefix="/api/v1/radar", tags=["Quantitative Radar"])
 
@@ -66,12 +84,44 @@ async def get_radar_anomalies(
                     "entity_name": e_name,
                     "anomaly_score": score,
                     "occurred_at": r["occurred_at"],
-                    "z_score": score * Z_SCORE_SCALE,
+                    # A z-equivalent, not a measured sigma: this inverts the
+                    # curve the tradfi enricher applies, and not every score
+                    # reaching this route came through it.
+                    "z_score": score_to_z(score),
                     "region": r["region"] or "US Equities",
                     "details": r["domain_data"] or {}
                 }))
         except Exception as e:
             logger.warning(f"Error querying radar anomalies from DB: {e}")
+
+    # What each of those names has actually been doing.
+    #
+    # A volume spike on a stock up 14% and the same spike on one that has not
+    # moved are different events, and this endpoint returned a z-score for both
+    # and no way to tell them apart. The move comes from the radar's own sweep
+    # and the standing from daily bars; neither costs a query here.
+    if redis and anomalies:
+        for anomaly in anomalies:
+            ticker = anomaly.get("ticker")
+            if not ticker:
+                continue
+            try:
+                detail = await redis.raw.hgetall(movers_snapshot_key(ticker))
+                for k, v in (detail or {}).items():
+                    key = k.decode() if isinstance(k, bytes) else k
+                    value = v.decode() if isinstance(v, bytes) else v
+                    try:
+                        anomaly[key] = float(value)
+                    except (TypeError, ValueError):
+                        anomaly[key] = value
+            except Exception as _exc:
+                swallowed("api_gateway.routes.radar.anomaly_move", _exc, logger)
+            # None means the store did not answer; {} means no standing.
+            stats = await read_ticker_stats(redis, ticker) or {}
+            for field in ("dist_sma_50_pct", "dist_sma_200_pct", "ma_alignment",
+                          "change_pct_week"):
+                if field in stats:
+                    anomaly[field] = stats[field]
 
     # Fallback to current dynamic watchlist if cold start
     watchlist = []
@@ -97,6 +147,9 @@ async def get_radar_anomalies(
                             row[key] = value
                 except Exception as _exc:
                     swallowed("api_gateway.routes.radar.watchlist_move", _exc, logger)
+                # Where it stands, as well as what it did today. A row used to
+                # carry the moment it was promoted and nothing else.
+                row.update(await read_ticker_stats(redis, t) or {})
                 watchlist.append(row)
         except Exception as e:
             logger.warning(f"Error reading sentinel:watched:equities from Redis: {e}")
@@ -118,7 +171,17 @@ import time
 async def get_movers(
     direction: str = Query("gainers", pattern="^(gainers|losers)$"),
     limit: int = Query(20, ge=1, le=200),
+    window_hours: int = Query(24, ge=1, le=168, description="Window for the news join"),
+    min_market_cap_usd: float = Query(
+        DEFAULT_MIN_MARKET_CAP_USD,
+        ge=0,
+        description=(
+            "Exclude anything smaller than this, in USD. 0 disables the gate "
+            "and returns the raw board, warrants included."
+        ),
+    ),
     redis = Depends(get_redis_client),
+    db = Depends(get_db_optional),
 ):
     """The day's biggest moves, from bars the radar was already downloading.
 
@@ -135,11 +198,49 @@ async def get_movers(
         raise HTTPException(status_code=503, detail="Movers store is unavailable.")
 
     raw = redis.raw
+
+    # Walk further than `limit` when a gate is on.
+    #
+    # The board is ranked by percentage move over the radar's whole sweep, and
+    # the top of that ranking is warrants and sub-dollar tickers whose previous
+    # close was a rounding error -- MSAIW moved 18,800% from $0.0001. Taking
+    # the first `limit` rows and filtering them would return an almost empty
+    # board; the qualifying companies are further down, so this pages until it
+    # has `limit` of them or runs out of patience.
+    #
+    # WALK_CAP bounds the work: each page is a zset read plus a cached lookup
+    # per ticker, and an unbounded walk over 11,579 symbols would put the
+    # request path at the mercy of how many microcaps happened to move today.
+    page = max(limit, 100)
+    walked = 0
+    rows = []
     try:
-        if direction == "gainers":
-            rows = await raw.zrevrange(MOVERS_DAY_ZSET, 0, limit - 1, withscores=True)
-        else:
-            rows = await raw.zrange(MOVERS_DAY_ZSET, 0, limit - 1, withscores=True)
+        while len(rows) < limit and walked < MOVERS_WALK_CAP:
+            if direction == "gainers":
+                chunk = await raw.zrevrange(
+                    MOVERS_DAY_ZSET, walked, walked + page - 1, withscores=True,
+                )
+            else:
+                chunk = await raw.zrange(
+                    MOVERS_DAY_ZSET, walked, walked + page - 1, withscores=True,
+                )
+            if not chunk:
+                break
+            walked += len(chunk)
+            if min_market_cap_usd <= 0:
+                rows.extend(chunk)
+                break
+            for member, score in chunk:
+                if len(rows) >= limit:
+                    break
+                ticker = member.decode() if isinstance(member, bytes) else str(member)
+                cap = await cached_market_cap(redis, ticker)
+                # Unknown is excluded, not admitted. A gated board that quietly
+                # contains unmeasured names cannot make the claim it exists to
+                # make; the cost is that it is sparse until the radar's
+                # backfill has resolved enough of the candidates.
+                if cap is not None and cap >= min_market_cap_usd:
+                    rows.append((member, score))
     except Exception as _exc:
         swallowed("api_gateway.routes.radar.movers", _exc, logger)
         raise HTTPException(status_code=503, detail="Movers store could not be read.")
@@ -148,26 +249,37 @@ async def get_movers(
         # Empty is a real answer -- before the market opens there are no moves
         # -- and it is not the same as the store being unreachable, which is a
         # 503 above.
-        return {"direction": direction, "count": 0, "movers": [], "as_of": None}
+        #
+        # The same shape as a populated board. This returned four keys against
+        # the seven below, so a client reading `sector_concentration` found it
+        # undefined for most of the day, which is when the board is empty.
+        return {
+            "direction": direction,
+            "count": 0,
+            "movers": [],
+            "as_of": None,
+            "news_window_hours": window_hours,
+            "movers_without_news_in_window": [] if db else None,
+            "sector_concentration": {},
+            "min_market_cap_usd": min_market_cap_usd,
+            "candidates_walked": walked,
+        }
 
     movers = []
     as_of = None
     for member, score in rows:
         ticker = member.decode() if isinstance(member, bytes) else str(member)
+        # day_pct is the percentage move and is what the board is ranked by;
+        # market_cap_usd rides along so a reader can see what passed the gate
+        # rather than having to trust that one was applied.
         entry = {"ticker": ticker, "day_pct": round(float(score), 4)}
-        try:
-            detail = await raw.hgetall(movers_snapshot_key(ticker))
-            for k, v in (detail or {}).items():
-                key = k.decode() if isinstance(k, bytes) else k
-                value = v.decode() if isinstance(v, bytes) else v
-                if key == "day_pct":
-                    continue
-                try:
-                    entry[key] = float(value)
-                except (TypeError, ValueError):
-                    entry[key] = value
-        except Exception as _exc:
-            swallowed("api_gateway.routes.radar.mover_detail", _exc, logger)
+        entry["market_cap_usd"] = await cached_market_cap(redis, ticker)
+        # The decode loop this used to inline is `read_movers_snapshot`, whose
+        # own docstring said it replaced two hand-written copies. It replaced
+        # one; this was the other.
+        detail = await read_movers_snapshot(redis, ticker)
+        detail.pop("day_pct", None)
+        entry.update(detail)
         movers.append(entry)
 
     try:
@@ -176,7 +288,173 @@ async def get_movers(
     except Exception as _exc:
         swallowed("api_gateway.routes.radar.movers_as_of", _exc, logger)
 
-    return {"direction": direction, "count": len(movers), "movers": movers, "as_of": as_of}
+    # The two joins that make this something other than a stock screener.
+    #
+    # A ranked list of percentages is a commodity; anyone can buy one. What is
+    # not a commodity is that this platform holds the other side of both
+    # questions and has never joined them.
+    tickers = [m["ticker"] for m in movers]
+    # Whether the join ran, not whether a database object exists.
+    #
+    # This asked `if db`, so a present database whose query raised left every
+    # `news_events` at None, `== 0` false for all of them, and the field
+    # returned `[]` -- which reads as "every mover on this board has news". The
+    # one distinction the code took care to draw was the one it got wrong.
+    news_joined = await _attach_news_counts(db, movers, tickers, window_hours)
+    sectors = await _attach_sectors(redis, movers, tickers)
+
+    unexplained = [m["ticker"] for m in movers if m.get("news_events") == 0]
+    return {
+        "direction": direction,
+        "count": len(movers),
+        "movers": movers,
+        "as_of": as_of,
+        "news_window_hours": window_hours,
+        # Named for what it is. A mover with no news in the window is not
+        # "unexplained" as a fact about the world -- it is unexplained *by what
+        # this platform collected*, which is a narrower and checkable claim,
+        # and `news_events: null` says the join could not run at all.
+        "movers_without_news_in_window": unexplained if news_joined else None,
+        # Eight of twenty sharing a sector is a rotation, not eight stories.
+        "sector_concentration": sectors,
+    }
+
+
+# News event types, as the correlation rules define them, minus the ones
+# nothing emits.
+#
+# This was ("headline", "narrative_cluster", "social_signal"), taken from the
+# news rule's trigger list so the join and the rules could not disagree about
+# what counts as news. They agreed, and were both wrong about the same third of
+# it: `narrative_cluster` has no producer -- first-story detection scores
+# novelty and never emits a cluster event -- and the platform records that in
+# shared/models/event_producers.py.
+#
+# The rules list it deliberately, beside the live types, so a clause keeps
+# matching if a producer ever appears. A COUNT(*) has no such reason: an extra
+# member of `= ANY(...)` that can never match is a column of zeros with a name
+# that suggests otherwise. So the rule list is the source and the producer
+# table is the filter.
+_RULE_NEWS_TYPES = ("headline", "narrative_cluster", "social_signal")
+
+
+def _news_types() -> tuple:
+    from shared.models.event_producers import unproduced_values
+
+    dead = unproduced_values()
+    return tuple(t for t in _RULE_NEWS_TYPES if t not in dead)
+
+
+_NEWS_TYPES = _news_types()
+
+# Ticker-shaped words the news counter will not ask about. See the note in
+# `_attach_news_counts`. US is deliberately kept -- it is a real subject.
+_NON_SUBJECT_TICKERS = TICKER_SHAPED_STOPWORDS - {"US"}
+
+
+async def _attach_news_counts(db, movers, tickers, window_hours: int) -> bool:
+    """How many news events named each mover in the window.
+
+    A count rather than a verdict. `named_entities` is the resolved ticker list
+    the news enricher writes -- `affected_tickers` from the feed plus what the
+    extractor found -- and it carries a GIN index, so this is one overlap query
+    for the whole page rather than one per row.
+
+    Null when there is no database: "the join did not run" and "no news" are
+    different answers and the caller has to be able to tell them apart.
+    """
+    for mover in movers:
+        mover["news_events"] = None
+    if db is None or not tickers:
+        return False
+
+    # A ticker that is also an English word is not asked about.
+    #
+    # `named_entities` is matched against the board's own tickers, and both are
+    # stored as bare uppercase tokens -- so a mover called ON, IT, A, ALL, SO or
+    # ARE is indistinguishable from the preposition. The historical corpus
+    # carries 23,173 rows of exactly that: the ticker extractor accepted any
+    # short alphabetic word until it was corrected on 1 September, leaving THE
+    # (10,200), ON (4,673) and A (7,169) among the most frequent "named
+    # entities" the platform has ever stored. ON Semiconductor would have
+    # counted every headline containing the word "on".
+    #
+    # It does not bite today: the contamination stops on 1 September and this
+    # window caps at 168 hours, so the two no longer overlap. That is a fact
+    # about today's date, not about the code, and it stops being true if the
+    # window is ever widened or a writer regresses.
+    #
+    # TICKER_SHAPED_STOPWORDS is the writer's own list of ticker-shaped words it
+    # refuses to emit, so excluding them here costs nothing that is currently
+    # written and protects the count from everything that was. US is kept: the
+    # correlation engine records it as a real subject, spaCy tagging "United
+    # States".
+    askable = [t for t in tickers if t and t.upper() not in _NON_SUBJECT_TICKERS]
+    if not askable:
+        for mover in movers:
+            mover["news_events"] = 0
+        return True
+
+    try:
+        rows = await db.query(
+            """
+            SELECT ticker, COUNT(*) AS n
+            FROM (
+                SELECT UNNEST(named_entities) AS ticker
+                FROM events
+                WHERE occurred_at >= NOW() - INTERVAL '1 hour' * $2
+                  AND type = ANY($3)
+                  AND named_entities && $1::text[]
+            ) named
+            WHERE ticker = ANY($1::text[])
+            GROUP BY ticker
+            """,
+            askable, window_hours, list(_NEWS_TYPES),
+        )
+        counts = {r["ticker"]: int(r["n"] or 0) for r in (rows or [])}
+        for mover in movers:
+            mover["news_events"] = counts.get(mover["ticker"], 0)
+        return True
+    except Exception as _exc:
+        swallowed("api_gateway.routes.radar.movers_news", _exc, logger)
+        return False
+
+
+async def _attach_sectors(redis, movers, tickers) -> dict:
+    """Each mover's sector, and how concentrated the board is.
+
+    From the reference data the enrichment service already caches per symbol.
+    A sector nobody has resolved is "UNKNOWN" rather than omitted, so the
+    concentration figures add up to the page.
+    """
+    concentration: dict = {}
+    if redis is None:
+        return concentration
+    import json as _json
+
+    from services.enrichment.ref_data import REFDATA_PREFIX
+
+    raw = getattr(redis, "raw", redis)
+    # One try per mover, not one around the loop.
+    #
+    # A single malformed cached blob at position three used to leave movers
+    # four through twenty with no `sector` key and a concentration that no
+    # longer added up to the page it describes -- which is the one property
+    # this function was written to have.
+    for mover in movers:
+        sector = "UNKNOWN"
+        try:
+            cached = await raw.get(f"{REFDATA_PREFIX}{mover['ticker']}")
+            if cached:
+                payload = _json.loads(
+                    cached.decode() if isinstance(cached, bytes) else cached
+                )
+                sector = (payload.get("sector") or "").strip() or "UNKNOWN"
+        except Exception as _exc:
+            swallowed("api_gateway.routes.radar.movers_sectors", _exc, logger)
+        mover["sector"] = sector
+        concentration[sector] = concentration.get(sector, 0) + 1
+    return dict(sorted(concentration.items(), key=lambda kv: -kv[1]))
 
 
 @router.get("/sweeps")

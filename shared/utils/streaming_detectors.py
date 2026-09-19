@@ -78,7 +78,17 @@ class RRCFDetector:
         num_trees: int = 40,
         window_size: int = 256,
         shingle_size: int = 1,
+        name: str = "unnamed",
     ):
+        # Which detector this is, for the warnings below.
+        #
+        # They already read `self.name`, and no `name`
+        # attribute existed anywhere -- so every one of the eight domain
+        # detectors logged as 'unnamed'. The tree-reset warning says "the
+        # forest is running below its configured size", which is written to be
+        # acted on and could not be: an operator reading it could not tell
+        # whether maritime, crypto or cyber had degraded.
+        self.name = name
         self.num_trees = num_trees
         self.window_size = window_size
         self.shingle_size = shingle_size
@@ -191,7 +201,7 @@ class RRCFDetector:
                         "RRCF tree reset (%s total) in detector '%s': %s. "
                         "A reset tree contributes nothing until it refills, so "
                         "the forest is running below its configured size.",
-                        self._tree_resets, getattr(self, "name", "unnamed"), e,
+                        self._tree_resets, self.name, e,
                     )
                 try:
                     fresh_tree = rrcf.RCTree()
@@ -216,7 +226,7 @@ class RRCFDetector:
                 "RRCF forest produced no valid tree for detector '%s' "
                 "(%s trees, %s resets). Falling back to the streaming estimator "
                 "rather than reporting zero anomaly.",
-                getattr(self, "name", "unnamed"), self.num_trees, self._tree_resets,
+                self.name, self.num_trees, self._tree_resets,
             )
             return self._insert_fallback(point)
 

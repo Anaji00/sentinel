@@ -6,7 +6,6 @@ import { PanelSkeleton } from '@/components/ui/Skeleton';
 
 /** Client islands for the macro view. */
 
-
 const FinancialAdvisorAdvice = dynamic(() => import('@/components/FinancialAdvisorAdvice'), {
   loading: () => <PanelSkeleton title="Loading Macro Risk Advisor..." />,
   ssr: false,

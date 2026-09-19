@@ -38,6 +38,13 @@ from shared.models.events import graph_node_id
 from shared.utils.confidence_calibration import calibrate as calibrate_confidence
 
 
+from shared.utils.cooccurrence import (
+    mark_proposed,
+    record_notable_event,
+    rule_candidates,
+)
+
+
 async def _calibrated(redis_client, raw_confidence: float):
     """Map a heuristic confidence onto the empirical rate, and keep both.
 
@@ -82,6 +89,7 @@ from shared.utils.streaming_detectors import FirstStoryDetector
 from services.correlation.soft_correlator import POSITION_TELEMETRY_TYPES
 from shared.utils.freshness import is_stale as _shared_is_stale
 from shared.utils.tasks import safe_create_task
+from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.backpressure import is_under_pressure
 from shared.utils.metrics import MetricsCollector
 from shared.utils.counterparty import is_null_address
@@ -102,7 +110,7 @@ SEMANTIC_INTELLIGENCE_SCORE = float(os.getenv("SEMANTIC_INTELLIGENCE_SCORE", "6.
 PEER_MAX_TICKERS = int(os.getenv("PEER_MAX_TICKERS", "60"))
 PEER_SERIES_BARS = int(os.getenv("PEER_SERIES_BARS", "120"))
 from shared.utils.heartbeat import start_heartbeat_task
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 _dynamic_rules_cache = {}
 
@@ -117,7 +125,68 @@ _dynamic_rules_cache = {}
 # Reconciliation is version-gated rather than unconditional, because these
 # rules are meant to be edited at runtime and overwriting an operator's change
 # on every restart would be worse than the problem it fixes.
-RULE_DEFINITION_VERSION = 5
+
+def _assert_rules_can_see_their_evidence(rules) -> None:
+    """Every dead event type a rule names is accompanied by the live one.
+
+    The platform records which event types nothing emits, with a reason for
+    each -- `shared/models/event_producers.py`. Nothing connected that record
+    to the rule engine, which was its largest consumer: thirteen of fifteen
+    rules named at least one unproduced type.
+
+    Naming one is not itself an error. This rule set chose, deliberately, to
+    list the dead type beside the live one so a clause matches today and keeps
+    matching if a producer appears later. What is an error is naming the dead
+    type *alone*, which is a leg that can never match, and a list of nothing
+    but dead types, which is a clause that can never match at all.
+
+    Raised at import, like the DSL contract guard, because a rule that cannot
+    see its evidence is not a degraded rule -- it is a different rule from the
+    one whose name goes in the alert.
+    """
+    from shared.models.event_producers import ARRIVES_AS, UNPRODUCED, unproduced_values
+
+    dead = unproduced_values()
+    problems = []
+
+    def check(rule_id, where, types):
+        types = [types] if isinstance(types, str) else list(types or [])
+        if not types:
+            return
+        if all(t in dead for t in types):
+            problems.append(
+                f"  {rule_id}: {where} names only types with no producer "
+                f"({', '.join(types)}) -- it can never match"
+            )
+            return
+        for t in types:
+            if t not in dead:
+                continue
+            arrives = ARRIVES_AS.get(t.upper())
+            if arrives and arrives.lower() not in types:
+                problems.append(
+                    f"  {rule_id}: {where} names '{t}', which has no producer "
+                    f"-- it arrives as '{arrives.lower()}', which is not in the list"
+                )
+
+    for rule in rules or []:
+        rid = rule.get("rule_id", "<unnamed>")
+        check(rid, "trigger_event_type", rule.get("trigger_event_type"))
+        for i, clause in enumerate(rule.get("correlations") or []):
+            if isinstance(clause, dict):
+                check(rid, f"correlations[{i}].event_types", clause.get("event_types"))
+
+    if problems:
+        raise RuntimeError(
+            "Shipped rules cannot see the evidence they select on:\n"
+            + "\n".join(problems)
+            + "\n\nSee shared/models/event_producers.py -- either name the type "
+            "that arrives beside the one that does not, or wire the producer "
+            "and delete its entry there."
+        )
+
+
+RULE_DEFINITION_VERSION = 7
 
 # What each tier is allowed to claim, per hour, before it stops being that tier.
 #
@@ -199,7 +268,7 @@ SHIPPED_RULES = [
         # very little individually.
         "rule_id": "rule_informed_trading_sequence",
         "rule_name": "Informed Trading Sequence",
-        "trigger_event_type": ["price_anomaly", "equity_block"],
+        "trigger_event_type": ["price_anomaly", "market_anomaly", "equity_block"],
         "conditions": {"min_anomaly": 0.5},
         "correlations": [
             {
@@ -225,9 +294,9 @@ SHIPPED_RULES = [
     {
         "rule_id": "rule_financial_block_volume_spike",
         "rule_name": "Equity Block & Options Convergence",
-        "trigger_event_type": ["equity_block", "price_anomaly"],
+        "trigger_event_type": ["equity_block", "price_anomaly", "market_anomaly"],
         "conditions": {"min_anomaly": 0.25},
-        "correlations": [{"event_types": ["options_flow", "dark_pool", "insider_trade", "market_anomaly", "price_anomaly"], "hours": 48, "min_anomaly": 0.25, "same_entity": True}],
+        "correlations": [{"event_types": ["options_flow", "dark_pool", "equity_block", "insider_trade", "market_anomaly", "price_anomaly"], "hours": 48, "min_anomaly": 0.25, "same_entity": True}],
         "alert_tier": "ELEVATED",
         "expires_at": int(time.time()) + 315360000,
         "definition_version": RULE_DEFINITION_VERSION
@@ -411,9 +480,23 @@ SHIPPED_RULES = [
         # the disruption is observable in AIS days before it is observable in a
         # rate. Joined on the subject -- the route, the strait, the operator --
         # because a vessel and a freight index are never the same entity.
+        # The rule is named for a repricing, so it asks for one.
+        #
+        # `min_anomaly` alone could not: it measures how unusual an event was
+        # for its own instrument, so a thin freight index ticking 0.3% on a
+        # quiet day scores higher than crude down 6%. The clause matched, the
+        # rule fired, and the finding said a disruption had repriced something
+        # that had not moved. `min_abs_move_pct` is the question the rule's own
+        # name was asking all along, and until this build the DSL had no way to
+        # write it down.
+        #
+        # 1.5% rather than something rounder: freight and energy indices move
+        # less than equities, and a threshold set for a stock would silence the
+        # rule on exactly the markets it is about.
         "correlations": [{
             "event_types": ["supply_chain_metric", "price_anomaly", "macro_release", "market_anomaly"],
-            "hours": 96, "min_anomaly": 0.25, "shared_tags": True,
+            "hours": 96, "min_anomaly": 0.25, "min_abs_move_pct": 1.5,
+            "shared_tags": True,
         }],
         "alert_tier": "ELEVATED",
         "expires_at": int(time.time()) + 315360000,
@@ -429,7 +512,7 @@ SHIPPED_RULES = [
         # preceded both the 2021 Kabul evacuation and the 2022 build-up, and the
         # platform has been collecting ADS-B for it the whole time.
         "correlations": [{
-            "event_types": ["flight_dark", "flight_anomaly", "vessel_dark", "vessel_sts"],
+            "event_types": ["flight_dark", "flight_anomaly", "vessel_dark"],
             "hours": 48, "min_anomaly": 0.25, "region": True,
         }],
         "alert_tier": "ELEVATED",
@@ -477,6 +560,9 @@ SHIPPED_RULES = [
         "definition_version": RULE_DEFINITION_VERSION
     }
 ]
+
+# Checked here, at import, before anything can install or evaluate them.
+_assert_rules_can_see_their_evidence(SHIPPED_RULES)
 
 # Rules this build has withdrawn, and the reason.
 #
@@ -704,6 +790,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         corr.get("event_types"),
                         hours=corr.get("hours", 48),
                         min_anomaly=corr.get("min_anomaly", 0.0),
+                        min_abs_move_pct=corr.get("min_abs_move_pct"),
                         tags=corr.get("tags"),
                         # `region: True` means "wherever the trigger is", which is
                         # how a geographic join is expressed without naming a
@@ -988,7 +1075,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         # types, so the title claimed aviation on evidence that
                         # contained none.
                         summary_headline=(
-                            f"🚨 {rule.get('rule_name', rule.get('rule_id'))}: {entity_name} "
+                            f"{rule.get('rule_name', rule.get('rule_id'))}: {entity_name} "
                             f"[matched: {', '.join(sorted(domains_triggered)) or 'none'}]"
                         ),
                         supporting_headlines=supporting_headlines,
@@ -1396,14 +1483,47 @@ _STRUCTURAL_TAGS = frozenset(
 )
 
 
+# Words that are not subjects, however they got into named_entities.
+#
+# The ticker extractor used to accept any short alphabetic word, so THE
+# (14,770), TO (12,271), OF (10,508) and AND (10,466) are among the most
+# frequent "named entities" this platform has ever stored -- the first real
+# subject, Iran, appears at rank 25 with a seventh of THE's count. The writer
+# was corrected on 1 September with an 11,821-symbol allowlist and the daily
+# share fell from 36% to 3%, the residual being entirely 'US', which spaCy
+# correctly tags as a GPE for "United States".
+#
+# The corpus was never repaired, and it cannot be cheaply: `events` is a
+# compressed hypertable, and rewriting named_entities on 21,256 historical rows
+# asks TimescaleDB to decompress 1.9M tuples, which it refuses outright at the
+# default per-transaction limit. So the repair belongs here, at the one place
+# both token functions pass through, where it costs a set lookup.
+#
+# It matters because `_shares_a_subject` requires an overlap to reach one
+# side's *identity*: two unrelated events that both stored THE were sharing a
+# subject by this engine's own definition.
+#
+# 'US' is deliberately absent -- it is a real subject.
+_NON_SUBJECT_TOKENS = frozenset({
+    "of", "to", "the", "a", "an", "and", "in", "on", "for", "at", "by",
+    "with", "as", "is", "it", "or", "be", "are", "from", "that", "this",
+    "has", "have", "said", "says", "new", "more", "over", "its",
+})
+
+
 def _fold(raw) -> set:
-    """Case-folded tokens, with the structural vocabulary removed."""
+    """Case-folded tokens, with the structural and non-subject vocabulary removed."""
     tokens = set()
     for token in raw:
         if not token:
             continue
         text = str(token).strip().lower()
-        if text and text not in _STRUCTURAL_TAGS and text != "unknown":
+        if (
+            text
+            and text not in _STRUCTURAL_TAGS
+            and text not in _NON_SUBJECT_TOKENS
+            and text != "unknown"
+        ):
             tokens.add(text)
     return tokens
 
@@ -1940,7 +2060,7 @@ async def main():
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "correlation"))
     
     store    = EventStore(redis_client, db_client)
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="correlation")
     discovery_engine = StatisticalDiscoveryEngine(
         db_client=db_client,
         redis_client=redis_client,
@@ -2036,7 +2156,7 @@ async def main():
             swallowed("correlation.main._stream_live_correlation.focus", _exc, logger)
 
         try:
-            headline = c.summary_headline or f"🚨 CORRELATION ALERT: {c.rule_name} (Tier: {c.alert_tier.value if hasattr(c.alert_tier, 'value') else c.alert_tier})"
+            headline = c.summary_headline or f"CORRELATION ALERT: {c.rule_name} (Tier: {c.alert_tier.value if hasattr(c.alert_tier, 'value') else c.alert_tier})"
             pe_id = c.primary_entity_id or (c.entity_ids[0] if c.entity_ids else "CORRELATION")
             pe_name = c.primary_entity_name or (c.entity_names[0] if c.entity_names else (c.rule_name or c.rule_id))
             primary_entities_list = []
@@ -2076,6 +2196,12 @@ async def main():
 
     async def _process_correlation_event(event: NormalizedEvent, precomputed_embedding=None):
         nonlocal corr_fired, processed, stale_skipped
+        # corr_fired is the service-lifetime total, read by the heartbeat;
+        # fired_here is this event's own. It has to be a separate local rather
+        # than a delta against corr_fired, because these handlers run together
+        # under asyncio.gather -- a delta would absorb every correlation a
+        # sibling event fired while this one was awaiting.
+        fired_here = 0
         try:
             # 0. Refuse to correlate history.
             #
@@ -2122,7 +2248,7 @@ async def main():
                     _cas_conf, cascade_cluster.alert_tier
                 )
                 if not cascade_cluster.summary_headline:
-                    cascade_cluster.summary_headline = f"🌐 Cascade Alert: {cascade_cluster.rule_name}"
+                    cascade_cluster.summary_headline = f"Cascade Alert: {cascade_cluster.rule_name}"
                 await store.save_correlation(cascade_cluster)
                 await producer.send(
                     Topics.CORRELATIONS,
@@ -2131,6 +2257,7 @@ async def main():
                 )
                 await _stream_live_correlation(cascade_cluster)
                 corr_fired += 1
+                fired_here += 1
                 logger.info(f"🚨 Geopolitical Cascade Alert Fired: {cascade_cluster.correlation_id}")
 
             # Pause the semantic path while reasoning is saturated.
@@ -2160,6 +2287,7 @@ async def main():
                 )
                 await _stream_live_correlation(c)
                 corr_fired += 1
+                fired_here += 1
                 logger.info(f"⚡ Dynamic Rule {c.rule_id} Fired for event {event.event_id}")
             
             # 2. Record event in Hawkes process and check for cross-domain excitation
@@ -2174,6 +2302,20 @@ async def main():
             # both the crypto and the equity candle paths, so the type
             # alone cannot say which domain excited which.
             event_domain = resolve_event_domain(event)
+
+            # What this co-occurred with, for the rule candidates pass.
+            #
+            # Recorded for every notable event, not only for ones no rule
+            # matched: a rule firing for this event does not mean the pair is
+            # covered, and coverage is computed from the rule definitions
+            # afterwards rather than guessed at here. Gated at 0.6 -- one hour
+            # of live traffic is 64,750 events and 1,035 of them clear it.
+            await record_notable_event(
+                getattr(store, "_redis", None),
+                event.type.value if hasattr(event.type, "value") else str(event.type),
+                event_domain,
+                float(getattr(event, "anomaly_score", 0.0) or 0.0),
+            )
             event_ts = event.occurred_at.timestamp() if event.occurred_at else time.time()
             hawkes_state = hawkes_correlator.record_event(event_domain, event_ts)
 
@@ -2201,7 +2343,7 @@ async def main():
                         primary_domain=top_forecast["source_domain"],
                         confidence_score=_fc_conf,
                         summary_headline=(
-                            f"⚡ Hawkes Excitation: {top_forecast['source_domain']} → {top_forecast['target_domain']} "
+                            f"Hawkes Excitation: {top_forecast['source_domain']} → {top_forecast['target_domain']} "
                             f"({top_forecast['excess_multiplier']:.1f}x above baseline)"
                         ),
                         supporting_headlines=[top_forecast["narrative"]],
@@ -2244,9 +2386,7 @@ async def main():
                     await producer.send(Topics.CORRELATIONS, forecast_cluster.model_dump(), key=forecast_cluster.correlation_id)
                     await _stream_live_correlation(forecast_cluster)
                     corr_fired += 1
-
-            if corr_fired > 0:
-                logger.info(f"🔥 Event {event.event_id} generated {corr_fired} correlation clusters.")
+                    fired_here += 1
 
             # 3. Story-level deduplication for news/headline events (§2.3)
             # Check if this is a news/headline event and if it's a duplicate story
@@ -2554,7 +2694,7 @@ async def main():
                         # other; it should never present as certainty.
                         confidence_score=_sem_conf,
                         summary_headline=(
-                            f"🧠 Semantic Resemblance: {e_name} across "
+                            f"Semantic Resemblance: {e_name} across "
                             f"{distinct_subjects} subject(s) in "
                             f"{semantic_domain_count} domain(s)"
                         ),
@@ -2633,6 +2773,12 @@ async def main():
                         )
                         await _stream_live_correlation(cluster)
                         corr_fired += 1
+                        fired_here += 1
+
+            if fired_here > 0:
+                logger.info(
+                    f"🔥 Event {event.event_id} generated {fired_here} correlation clusters."
+                )
 
         except Exception as e:
             import traceback
@@ -2803,6 +2949,65 @@ async def main():
                 logger.error(f"Threshold calibration loop error: {e}")
             await asyncio.sleep(1800)
 
+    # Background task: propose rule candidates from uncovered co-occurrences.
+    async def _rule_candidate_loop():
+        # Past the startup burst, so the first pass reads a window that
+        # describes the platform running rather than the platform starting.
+        await asyncio.sleep(300)
+        while True:
+            try:
+                rules = list(_dynamic_rules_cache.values()) + list(SHIPPED_RULES or [])
+                candidates = await rule_candidates(redis_client, rules)
+                if candidates:
+                    for candidate in candidates:
+                        await producer.send(
+                            Topics.RULE_CANDIDATES,
+                            {
+                                "type": "rule_candidate",
+                                **candidate,
+                                "detected_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                            key=candidate["pair_key"],
+                        )
+                    await mark_proposed(
+                        redis_client, [c["pair_key"] for c in candidates]
+                    )
+                    logger.info(
+                        "🧩 Proposed %d rule candidate(s) the rule set does not "
+                        "cover: %s",
+                        len(candidates),
+                        ", ".join(
+                            f"{c['event_type_a']}+{c['event_type_b']}"
+                            f"({c['times_seen']}x)" for c in candidates
+                        ),
+                    )
+                else:
+                    # A quiet pass and a dead loop look identical without this.
+                    logger.debug(
+                        "Rule candidate pass ran; no uncovered pair has reached "
+                        "the threshold this cycle."
+                    )
+            except Exception as e:
+                logger.error(f"Rule candidate loop error: {e}")
+            await asyncio.sleep(1800)
+
+    # Background task: drop vector points whose event has aged out.
+    #
+    # Daily, and offset past startup so a restart loop cannot turn this into a
+    # delete storm. Nothing has ever pruned this index -- 596,154 points against
+    # a table that keeps ninety days -- so the first pass removes a backlog and
+    # every pass after it removes a day.
+    async def _vector_retention_loop():
+        await asyncio.sleep(900)
+        while True:
+            try:
+                await soft_correlator.prune_expired_vectors()
+            except Exception as e:
+                logger.error(f"Vector retention loop error: {e}")
+            await asyncio.sleep(86400)
+
+    safe_create_task(_vector_retention_loop())
+    safe_create_task(_rule_candidate_loop())
     safe_create_task(_hawkes_refit_loop())
     safe_create_task(_statistical_discovery_loop())
     safe_create_task(_edge_retest_loop())
@@ -2842,9 +3047,28 @@ async def main():
                                     
                         except Exception as e:
                             errors += 1
-                            logger.error(f"Failed to parse event: {e}")
+                            # Counted and collapsed, not shouted once per event.
+                            #
+                            # A model change deployed to the producer and not to
+                            # this consumer made every enriched event fail
+                            # validation here. That is the right outcome -- the
+                            # event genuinely did not match the schema -- but it
+                            # logged one full pydantic report per event: 3,652
+                            # failures and 21,022 log lines in twenty minutes,
+                            # roughly three a second, each one a paragraph. The
+                            # signal was there and buried in its own volume.
+                            #
+                            # `dropped` counts every occurrence, logs the first,
+                            # then powers of ten, then once an interval -- so a
+                            # sustained schema break is one loud line and a
+                            # rising number rather than a wall.
+                            dropped(
+                                "correlation.event_parse",
+                                logger,
+                                detail=f"{type(e).__name__}: {str(e)[:200]}",
+                            )
                             try:
-                                await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": str(e), "raw": str(message.value)})
+                                await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": str(e), "raw": encode_dlq_payload(message.value)})
                             except Exception as dlq_err:
                                 logger.debug(f"DLQ send failed for parse error (event lost): {dlq_err}")
                     

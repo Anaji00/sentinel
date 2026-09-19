@@ -433,6 +433,14 @@ TANKER_GOES_DARK = Scenario(
     expect_evidence_types=("vessel_sts",),
 )
 
+# The moves these scenarios describe, as data rather than as prose.
+#
+# Every headline below already stated one -- "+41% week over week", "+3.4%",
+# "+28%" -- which is exactly what the platform itself was doing: computing the
+# percentage, printing it into the headline, and storing nothing. A rule named
+# for a repricing now requires one, so the scenarios that describe a repricing
+# have to carry it, and the fourth headline here had no number at all until it
+# was asked for a measurement.
 CHOKEPOINT_TO_FREIGHT = Scenario(
     name="Chokepoint disruption shows up in freight and energy",
     domain="maritime",
@@ -453,11 +461,13 @@ CHOKEPOINT_TO_FREIGHT = Scenario(
         Beat("supply_chain_metric", "FREIGHT-CONTAINER", 20 * HOUR, 0.68,
              entity_type=EntityType.INSTRUMENT, region="Red Sea",
              headline="Asia-Europe container rate +41% week over week",
+             move_pct=41.0,
              named_entities=["MAERSK", "RED SEA"],
              source="freightos"),
         Beat("price_anomaly", "BRENT", 14 * HOUR, 0.62,
              entity_type=EntityType.INSTRUMENT,
              headline="Brent +3.4% on shipping disruption",
+             move_pct=3.4,
              named_entities=["RED SEA"],
              source="alpaca"),
     ],
@@ -559,11 +569,13 @@ CLIMATE_TO_COMMODITY = Scenario(
         Beat("supply_chain_metric", "FREIGHT-DRYBULK", 2 * DAY, 0.66,
              entity_type=EntityType.INSTRUMENT,
              headline="Dry bulk rates +28% on Panama routing",
+             move_pct=28.0,
              named_entities=["PANAMA CANAL"],
              source="freightos"),
         Beat("price_anomaly", "CORN", 1 * DAY, 0.59,
              entity_type=EntityType.INSTRUMENT,
-             headline="Corn futures up on export routing costs",
+             headline="Corn futures +2.1% on export routing costs",
+             move_pct=2.1,
              named_entities=["PANAMA CANAL"],
              source="alpaca"),
     ],

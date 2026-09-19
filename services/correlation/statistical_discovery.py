@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from typing import Dict, List, Tuple, Set, Optional, Any
 from datetime import datetime, timezone
@@ -30,7 +31,7 @@ from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
 from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistration
 from shared.utils.regime import current_regime
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("correlation.statistical_discovery")
 
@@ -82,6 +83,20 @@ def _granger_p(gc_result: Dict[str, Any]) -> float:
     except (TypeError, ValueError):
         return 1.0
     return val if math.isfinite(val) else 1.0
+
+# How old the newest bar may be before a series is not a series any more.
+#
+# `fetch_price_series` had no WHERE on time, so a hundred rows from a dead
+# ticker were indistinguishable from a hundred rows from a live one. CL=F, BZ=F,
+# GC=F, SI=F and NG=F stopped on 2026-09-04 and this job went on publishing from
+# them for 12.7 days -- "Statistical Correlation Link: BZ=F <-> CL=F r=1.000,
+# p=0.0000" under FDR control at alpha=0.05, which lends a dead series the full
+# authority of a live measurement. A correlation between two frozen series is
+# perfect by construction: neither moves.
+#
+# Six hours spans an overnight gap and a weekend morning without complaining,
+# and is two orders of magnitude short of twelve days.
+MAX_SERIES_STALENESS_SEC = int(os.getenv("DISCOVERY_MAX_SERIES_STALENESS_SEC", str(6 * 3600)))
 
 # Core candidate seed tickers (Tech / Semi / Defense / Energy / Macro Proxies)
 DEFAULT_WATCHLIST_TICKERS = [
@@ -274,6 +289,36 @@ class StatisticalDiscoveryEngine:
 
         try:
             # Query 5-minute continuous aggregate first
+            # Is this series alive at all?
+            #
+            # Asked once, about the newest bar, rather than by filtering rows to
+            # a window. The distinction matters: filtering rows would also
+            # truncate a healthy series to whatever fits the window -- six hours
+            # of five-minute bars is 72, short of the 100 these tests want -- so
+            # it would weaken every live correlation to exclude the dead ones.
+            # A series is either current or it is not, and that is a property of
+            # its last observation.
+            fresh = await self.db.query(
+                """
+                SELECT 1
+                FROM tradfi_bars
+                WHERE ticker = $1
+                  AND time > NOW() - ($2 || ' seconds')::INTERVAL
+                LIMIT 1
+                """,
+                ticker.upper(), str(MAX_SERIES_STALENESS_SEC),
+            )
+            if not fresh:
+                # Counted, not silent: a series going quiet is the event this
+                # missed for twelve days, and it should be visible when it
+                # happens rather than inferred from correlations that look odd.
+                dropped(
+                    "correlation.statistical_discovery.stale_series",
+                    logger,
+                    detail=ticker.upper(),
+                )
+                return []
+
             query_cagg = """
             SELECT close FROM tradfi_bars_5m
             WHERE ticker = $1

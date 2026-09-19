@@ -12,6 +12,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData, MarketMicrostructure
+from shared.models.events import ScoreAdjustment
 from shared.kafka import Topics
 from shared.utils.source_scorecard import baseline_reliability
 from shared.utils import quant_calc
@@ -23,7 +24,7 @@ from shared.utils.tasks import safe_create_task
 from shared.utils.counterparty import (
     choose_primary, is_infrastructure, is_null_address, note_counterparty,
 )
-from services.enrichment.anomaly_scorer import lift_score
+from services.enrichment.anomaly_scorer import breakdown_from_score, lift_and_record, lift_score, record_cap
 from shared.utils.materiality import apply_materiality, move_materiality
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 
@@ -31,6 +32,7 @@ from shared.utils.quiet_failures import swallowed, dropped
 # One definition, shared with the tradfi candle path: the two were
 # stamping the same kind of event by different rules.
 from shared.utils.candles import candle_observation_ts
+from shared.utils.event_identity import derive_event_id
 from shared.utils.feature_flags import FeatureFlagManager
 logger = logging.getLogger("enrichment.crypto")
 
@@ -259,6 +261,62 @@ class CryptoEnricher:
             
         return normalized_events
         
+    # How long a proposed edge stays suppressed, and how much the weight has to
+    # move before it is worth saying again.
+    #
+    # Six hours is long enough to collapse a trading burst between two addresses
+    # and short enough that a relationship re-established the next day is
+    # re-asserted rather than assumed. The delta is deliberately generous: this
+    # gate exists to drop the proposals that carry no information, not to
+    # second-guess the scorer.
+    EDGE_PROPOSAL_TTL_SEC = 21_600
+    EDGE_WEIGHT_DELTA = 0.15
+
+    NODE_MERGE_TTL_SEC = 86_400
+
+    async def _node_merge_is_due(self, entity_id: str) -> bool:
+        """True at most once a day per entity. Fails open, like the edge gate."""
+        if not self.redis:
+            return True
+        key = f"sentinel:ontology:node:{entity_id}"
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            # SET NX is the whole check: it succeeds only when the key is absent.
+            return bool(await raw.set(key, "1", ex=self.NODE_MERGE_TTL_SEC, nx=True))
+        except Exception as exc:
+            swallowed("enrichment.enrichers.crypto._node_merge_is_due", exc, logger)
+            return True
+
+    async def _edge_is_worth_proposing(self, source: str, target: str, weight: float) -> bool:
+        """True when this edge is new, or its weight has risen materially.
+
+        Fails open. A Redis that cannot answer must not silence a graph
+        proposal: losing an edge is worse than proposing it twice, which is the
+        same reasoning the dead-letter retry counter uses two files over.
+        """
+        if not self.redis:
+            return True
+        key = f"sentinel:ontology:edge:{source}:{target}"
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            previous = await raw.get(key)
+            if previous is not None:
+                try:
+                    if float(weight) <= float(previous) + self.EDGE_WEIGHT_DELTA:
+                        return False
+                except (TypeError, ValueError) as exc:
+                    # An unreadable stored weight means the gate cannot compare,
+                    # so it proposes and overwrites. Reported rather than passed
+                    # over: a key that stops parsing is the gate quietly turning
+                    # itself off, which is the shape of defect this whole audit
+                    # is about.
+                    swallowed("enrichment.enrichers.crypto._edge_weight_parse", exc, logger)
+            await raw.set(key, str(float(weight)), ex=self.EDGE_PROPOSAL_TTL_SEC)
+            return True
+        except Exception as exc:
+            swallowed("enrichment.enrichers.crypto._edge_is_worth_proposing", exc, logger)
+            return True
+
     async def _enrich_spot_trade_batch(self, spot_trades: list) -> list:
         parsed_events = []
         trades_for_scoring = []
@@ -307,7 +365,11 @@ class CryptoEnricher:
         
         results = []
         for i, (raw, p, asset, side, price, qty, notional) in enumerate(parsed_events):
-            anomaly = scores[i]
+            # score_crypto_trade_batch now yields the scorer's full result
+            # rather than a bare float, so the breakdown below has coverage and
+            # significance to carry.
+            score_dict = scores[i] if isinstance(scores[i], dict) else {"score": scores[i]}
+            anomaly = score_dict.get("score", 0.0)
             is_watched_wallets, is_watched_equities, f_boost = check_results[i]
             is_watched = is_watched_wallets or is_watched_equities
             w_boost = 0.15 if is_watched else 0.0
@@ -376,6 +438,10 @@ class CryptoEnricher:
                 headline=headline,
                 tags=tags,
                 anomaly_score=round(anomaly, 3),
+                # The largest single gap in explainability coverage: 57,234 of
+                # these an hour, none carrying a breakdown, against 198 equity
+                # events that did.
+                anomaly_breakdown=breakdown_from_score(score_dict, "crypto"),
                 market_microstructure=micro,
             ))
             
@@ -816,18 +882,38 @@ class CryptoEnricher:
             
             tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()]
 
-            await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                "entity_id": asset,
-                "action": "MERGE_ONTOLOGY_NODE",
-                "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
-            }, key=asset)
+            # The asset node, once a day, not once a bar.
+            #
+            # This fired on every candle for every timeframe, so BCHUSDT was
+            # proposed twenty times and AVAXUSDT nineteen in a 732-message
+            # sample -- re-merging a node whose label and domain never change.
+            # After the wallet-edge gate this was the entire remaining 12% of
+            # re-assertion on the topic.
+            #
+            # A day rather than six hours: an asset classification does not
+            # move, and the merge is idempotent, so the only thing frequency
+            # buys is Neo4j write load.
+            if await self._node_merge_is_due(asset):
+                await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                    "entity_id": asset,
+                    "action": "MERGE_ONTOLOGY_NODE",
+                    "data": {"label": "CryptoAsset", "primary_domain": "financial", "confidence": anomaly}
+                }, key=asset)
             
             entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
             direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
             headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% (Range Vol: {volatility_pct*100:.2f}%) on ${notional/1e6:.1f}M vol"
     
             events.append(NormalizedEvent(
-                event_id=raw.event_id, trace_id=raw.trace_id,
+                # One id per bar, not one per batch.
+                #
+                # This inherited `raw.event_id` inside a loop that emits one
+                # event per OHLCV bar, so six XRPUSDT observations at six
+                # different times carried one identity. Live over seven days:
+                # 20,302 coinbase_candles rows under 12,246 ids. Derived rather
+                # than random, so reprocessing the same bar yields the same id.
+                event_id=derive_event_id(raw.event_id, asset, tf, candle_observation_ts(block, tf)),
+                trace_id=raw.trace_id,
                 type=EventType.MARKET_ANOMALY,
                 # The bar's close, not its open.
                 #
@@ -855,7 +941,10 @@ class CryptoEnricher:
                     open_price=block["open"],
                     high_price=block["high"],
                     low_price=block["low"],
-                    close_price=block["close"]
+                    close_price=block["close"],
+                    # Computed at the top of this loop and printed into the
+                    # headline; carried now so a rule can select on it.
+                    change_pct_bar=round(price_change_pct * 100.0, 4),
                 ),
                 headline=headline,
                 tags=tags,
@@ -903,8 +992,16 @@ class CryptoEnricher:
         # floor -- while only a $50M+ move registered at all.
         size_score = _notional_score(notional)
 
+        # Initialised before the branch, not inside it.
+        #
+        # The event is built after both arms, so a trail defined only in the
+        # promoted arm is a NameError on the baseline path -- which is most
+        # transfers. The baseline arm has a derivation of its own worth showing
+        # anyway: a size score and the ceiling that holds it down.
+        trail = [ScoreAdjustment(reason="notional_size_score", delta=round(float(size_score), 6))]
+
         if not is_whale and not (is_suspect and is_alertable):
-            anomaly = round(min(0.35, size_score), 4)
+            anomaly = round(record_cap(size_score, 0.35, "unpromoted_transfer_ceiling", trail), 4)
             tags = ["crypto", "transfer", "baseline_data"]
             # The provenance still travels with the event even when it is not
             # promoted; a reader filtering for watched wallets still finds it.
@@ -925,15 +1022,22 @@ class CryptoEnricher:
                 # A watched counterparty is a reason to look, not a verdict, and
                 # it lifts the size signal rather than overwriting it. `max()`
                 # here flattened every transfer under $1M onto the same number.
-                anomaly = lift_score(anomaly, _SUSPECT_LIFT_WEIGHT)
+                anomaly = lift_and_record(
+                    anomaly, _SUSPECT_LIFT_WEIGHT, 0.0, "suspect_counterparty", trail
+                )
                 suspect_spent = _SUSPECT_LIFT_WEIGHT
 
             is_w_sender = await self.scorer.check_watchlist(sender, "wallets") if sender != "UNKNOWN" else False
             is_w_receiver = await self.scorer.check_watchlist(wallet, "wallets") if wallet != "UNKNOWN" else False
             w_boost = 0.15 if (is_w_sender or is_w_receiver) else 0.0
             f_boost = await self.scorer.track_frequency(wallet, "crypto_transfer")
-            anomaly = lift_score(anomaly, w_boost, suspect_spent)
-            anomaly = round(lift_score(anomaly, f_boost, suspect_spent + w_boost), 4)
+            anomaly = lift_and_record(anomaly, w_boost, suspect_spent, "watchlisted_wallet", trail)
+            anomaly = round(
+                lift_and_record(
+                    anomaly, f_boost, suspect_spent + w_boost, "transfer_frequency", trail
+                ),
+                4,
+            )
 
             # The lifts must not carry it past the ceiling the size score
             # already respects.
@@ -946,7 +1050,7 @@ class CryptoEnricher:
             # at 1.000 and 124 above the cap, every one of them a large transfer
             # tagged suspect_wallet, which is to say the ceiling held for the
             # evidence and was lost to the corroboration.
-            anomaly = round(min(anomaly, FALLBACK_MAX_SCORE), 4)
+            anomaly = round(record_cap(anomaly, FALLBACK_MAX_SCORE, "notional_score_ceiling", trail), 4)
 
             tags = ["crypto", asset.lower()]
             tags.append("whale_transfer" if is_whale else "watched_wallet_transfer")
@@ -973,15 +1077,47 @@ class CryptoEnricher:
                     logger.error(f"Redis connection failed while saving wallet {wallet[:6]}: {e}")
 
             if sender != "UNKNOWN" and wallet != "UNKNOWN":
-                await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                    "entity_id": sender,
-                    "action": "LINK_ENTITY",
-                    # The relationship this actually is. Recorded as RELATED_TO,
-                    # this was three quarters of every edge in the graph and
-                    # said only that two addresses had something to do with
-                    # each other.
-                    "data": {"target_id": wallet, "target_label": "Wallet", "relation_type": "TRANSACTED_WITH", "weight": anomaly}
-                }, key=sender)
+                # New edges, and edges whose weight has moved. Not every transfer.
+                #
+                # This proposed the sender->receiver link on every transfer, so a
+                # pair that trades repeatedly re-asserted an edge the graph
+                # already held. Measured on 800 consecutive proposals: 510
+                # distinct edges, 36.3% re-assertion, one wallet pair proposed
+                # thirty-nine times -- and the ontology topics were moving faster
+                # than the enriched events feeding them (780/min and 247/min
+                # against 281/min), for 430,527 relationships in total.
+                #
+                # Suppressing outright would lose the signal: `weight` is this
+                # transfer's anomaly, so a large movement on a known edge is
+                # exactly what should still be reported. So the rule is the edge
+                # being new, or the weight having risen materially since the last
+                # time it was proposed -- which keeps the informative
+                # re-assertions and drops the ones that say nothing.
+                if await self._edge_is_worth_proposing(sender, wallet, anomaly):
+                    await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
+                        "entity_id": sender,
+                        "action": "LINK_ENTITY",
+                        # The relationship this actually is. Recorded as RELATED_TO,
+                        # this was three quarters of every edge in the graph and
+                        # said only that two addresses had something to do with
+                        # each other.
+                        # Both ends are wallets, and only one said so.
+                        #
+                        # `target_label` was set and `source_label` was not, so
+                        # the receiver became a `:Wallet` and the sender fell
+                        # back to `:Entity` -- on an edge whose two endpoints
+                        # are, by construction, both Ethereum addresses. Half of
+                        # every transfer was rebuilding the untyped mass that
+                        # 255,677 nodes were just relabelled out of, at 1,455
+                        # fallbacks and climbing.
+                        "data": {
+                            "target_id": wallet,
+                            "source_label": "Wallet",
+                            "target_label": "Wallet",
+                            "relation_type": "TRANSACTED_WITH",
+                            "weight": anomaly,
+                        }
+                    }, key=sender)
 
         # Which side of this transfer is an actor?
         #
@@ -1035,6 +1171,11 @@ class CryptoEnricher:
             headline=headline,
             tags=tags,
             anomaly_score=round(anomaly, 3),
+            # The five steps that produced that number. This path had no
+            # breakdown to carry -- it runs no detector, so there is no coverage
+            # or sub-score -- but it has a derivation, and the derivation is
+            # what /explain exists to show.
+            score_adjustments=trail,
         )
 
     async def _enrich_liquidation(self, raw, p) -> Optional[NormalizedEvent]:

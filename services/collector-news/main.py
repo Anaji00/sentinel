@@ -44,6 +44,7 @@ from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
  
@@ -266,7 +267,12 @@ async def poll_feed(
                 await producer.send(Topics.RAW_NEWS, event.model_dump(mode="json"), key=feed_name)
             except Exception as e:
                 logger.error(f"{feed_name}: Failed to send event — {e}")
+                _collector_metrics("collector-news").upstream_error(feed_name)
                 continue
+            # Recorded where the publish succeeds. The metrics object is built
+            # in main() and the data arrives here, which is why this counter
+            # read a flat zero while the feed worked.
+            _collector_metrics("collector-news").ingested()
             await dedup.mark_seen(url)
             new_count += 1
 
@@ -330,7 +336,7 @@ async def main():
     # §1.1 Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-news")
+    metrics = _collector_metrics("collector-news")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-news"))
 

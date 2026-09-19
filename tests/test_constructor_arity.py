@@ -35,9 +35,16 @@ from check_constructor_arity import scan  # noqa: E402
 #
 # Both are Binance streams, which carry their subscription in the URL and need
 # no post-connect frame. The two sockets that do need one pass `on_connect`.
+#
+# Keyed by line, so any edit above them moves the key and this test fails with
+# the two call sites unchanged. That failure means "re-read these and confirm
+# the reason still holds", not "bump the numbers" -- the exemption is the claim
+# that these sockets need no post-connect frame, and only reading them can say
+# whether that is still true. It was checked, and it was, when telemetry
+# recording shifted both sites by four and five lines.
 ALLOWED = {
-    ("services", "collector-crypto", "main.py", 196),
-    ("services", "collector-crypto", "main.py", 330),
+    ("services", "collector-crypto", "main.py", 200),
+    ("services", "collector-crypto", "main.py", 335),
 }
 
 

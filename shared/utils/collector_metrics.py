@@ -24,7 +24,7 @@ is `time() - last_success`, i.e. staleness.
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from shared.utils.metrics import MetricsCollector, bind_redis
 from shared.utils.tasks import safe_create_task
@@ -176,3 +176,38 @@ class CollectorMetrics:
             "upstream_errors": self._errors,
             "reject_ratio": self.reject_ratio,
         }
+
+
+# One instance per collector name, reachable from anywhere in the process.
+#
+# The counters underneath are already process-global -- `MetricsCollector` is a
+# module-level dict -- but `_ingested` and `_last_ingest_at` are not, and those
+# are what `watch_for_starvation` reads. So a second CollectorMetrics built in a
+# fetch function would increment the exported series correctly while leaving the
+# watcher in the instance held by main() convinced nothing had ever arrived.
+#
+# That scope mismatch is the whole reason this is needed. The radar collector
+# called `metrics.start()` and `metrics.watch_for_starvation()` in main() and
+# `metrics.ingested()` nowhere, because `metrics` was local to main() and the
+# data arrives three functions away; the AIS collector called `.ingested()` on a
+# name its scope never defined and the NameError was swallowed by a broad
+# `except`. Nine collectors still construct the object in main() and publish
+# from elsewhere, which is why nine of them export a flat zero.
+#
+# Handing out one instance per name makes "record what just arrived" a one-line
+# call at the publish site, with no argument to thread through and no second
+# instance to disagree with the first.
+_INSTANCES: Dict[str, "CollectorMetrics"] = {}
+
+
+def for_service(name: str) -> "CollectorMetrics":
+    """The CollectorMetrics for this collector, creating it once.
+
+    `start()` still has to be called once, by whoever owns the Redis client --
+    this only removes the need to pass the object down a call stack.
+    """
+    existing = _INSTANCES.get(name)
+    if existing is None:
+        existing = CollectorMetrics(name)
+        _INSTANCES[name] = existing
+    return existing

@@ -75,7 +75,7 @@ describe('fetcher failure reporting', () => {
 
   const failWith = (status: number | null, detail?: string) => {
     vi.spyOn(apiClient, 'get').mockRejectedValue(
-      status === null ? new Error('Network Error') : { response: { status, data: { detail } } }
+      status === null ? new Error('Network Error') : { response: { status, data: { detail } } },
     );
   };
 
@@ -113,9 +113,9 @@ describe('fetcher failure reporting', () => {
     // symbols". Four chart components read it and showed "AWAITING LIVE DATA
     // STREAM..." through an outage.
     failWith(503);
-    await expect(
-      fetcher('/radar/market-series?symbols=BTCUSD&limit=60')
-    ).rejects.toBeInstanceOf(ApiError);
+    await expect(fetcher('/radar/market-series?symbols=BTCUSD&limit=60')).rejects.toBeInstanceOf(
+      ApiError,
+    );
   });
 
   it('still answers an empty market series, which is a different thing', async () => {
@@ -149,14 +149,17 @@ describe('describeApiError', () => {
     expect(describeApiError(undefined)).toBeNull();
   });
 
+  // Sentence case, not caps: these strings are shown to a reader at the
+  // moment something has gone wrong, and the app no longer shouts. What is
+  // being asserted is that the four states stay distinguishable.
   it('distinguishes the four things a panel would act on differently', () => {
-    expect(describeApiError(new ApiError('/x', null))).toBe('FEED UNREACHABLE');
-    expect(describeApiError(new ApiError('/x', 401))).toBe('SESSION EXPIRED');
-    expect(describeApiError(new ApiError('/x', 404))).toBe('ENDPOINT NOT FOUND');
-    expect(describeApiError(new ApiError('/x', 500))).toBe('FEED ERROR 500');
+    expect(describeApiError(new ApiError('/x', null))).toBe('Feed unreachable');
+    expect(describeApiError(new ApiError('/x', 401))).toBe('Session expired');
+    expect(describeApiError(new ApiError('/x', 404))).toBe('Endpoint not found');
+    expect(describeApiError(new ApiError('/x', 500))).toBe('Feed error 500');
   });
 
   it('still says something for an error it did not throw itself', () => {
-    expect(describeApiError(new Error('boom'))).toBe('FEED ERROR');
+    expect(describeApiError(new Error('boom'))).toBe('Feed error');
   });
 });

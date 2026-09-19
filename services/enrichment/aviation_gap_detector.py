@@ -17,7 +17,7 @@ from typing import Optional, List, Dict
 from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.models.events import FlightData
-from shared.utils.heartbeat import is_component_healthy
+from shared.utils.heartbeat import record_scan_suppression,  is_component_healthy
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("enrichment.aviation_gap_detector")
@@ -119,6 +119,16 @@ class AviationGapDetector:
         is_healthy = await is_component_healthy(self.redis, "collector-adsb", max_staleness_seconds=300)
         if not is_healthy:
             logger.warning("Collector collector-adsb heartbeat is stale/missing. Suppressing FLIGHT_DARK scan.")
+
+            # Recorded where /health/data can see it: a suppressed scan
+
+            # is not a quiet feed, and the count alone cannot say which.
+
+            await record_scan_suppression(
+
+                self.redis, "flight_dark", "collector-adsb", "collector heartbeat stale"
+
+            )
             degraded_event = NormalizedEvent(
                 type=EventType.INFRASTRUCTURE_DEGRADED,
                 occurred_at=now,

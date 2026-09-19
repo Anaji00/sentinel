@@ -126,7 +126,7 @@ async def submit_feedback(req: FeedbackRequest, redis=Depends(get_redis_optional
     # the consensus engine receive human judgement in a shape they already read.
     try:
         from shared.kafka import SentinelProducer, Topics
-        producer = SentinelProducer()
+        producer = SentinelProducer(service_name="api-gateway-feedback")
         await producer.start()
         try:
             await producer.send(

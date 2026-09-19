@@ -15,12 +15,15 @@ export const Badge: React.FC<BadgeProps> = ({
   pulse = false,
   className = '',
 }) => {
-  const variantStyles: Record<BadgeVariant, { bg: string; text: string; border: string; dot: string }> = {
+  const variantStyles: Record<
+    BadgeVariant,
+    { bg: string; text: string; border: string; dot: string }
+  > = {
     live: {
       bg: 'bg-cyan-950/60',
-      text: 'text-[#66fcf1]',
-      border: 'border-[#66fcf1]/40',
-      dot: 'bg-[#66fcf1]',
+      text: 'text-accent',
+      border: 'border-accent/40',
+      dot: 'bg-accent',
     },
     anomaly: {
       bg: 'bg-rose-950/60',
@@ -47,9 +50,9 @@ export const Badge: React.FC<BadgeProps> = ({
       dot: 'bg-sky-400',
     },
     neutral: {
-      bg: 'bg-slate-800/60',
-      text: 'text-slate-300',
-      border: 'border-slate-700/50',
+      bg: 'bg-overlay/60',
+      text: 'text-ink-dim',
+      border: 'border-line-strong/50',
       dot: 'bg-slate-400',
     },
   };
@@ -58,11 +61,13 @@ export const Badge: React.FC<BadgeProps> = ({
 
   return (
     <span
-      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-widest border transition-all duration-200 ${style.bg} ${style.text} ${style.border} ${className}`}
+      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-micro font-medium border transition-all duration-200 ${style.bg} ${style.text} ${style.border} ${className}`}
     >
       {pulse && (
         <span className="relative flex h-2 w-2">
-          <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${style.dot}`} />
+          <span
+            className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${style.dot}`}
+          />
           <span className={`relative inline-flex rounded-full h-2 w-2 ${style.dot}`} />
         </span>
       )}

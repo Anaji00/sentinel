@@ -101,7 +101,32 @@ WATCH_ZONES = [
     [[-2.0, 1.0],   [6.0,  9.0]],   # Gulf of Guinea
 ]
  
-MESSAGE_TYPES = ["PositionReport", "ShipStaticData"]
+# What to ask AISStream for.
+#
+# This was ["PositionReport", "ShipStaticData"] -- Class A only. AISStream
+# serves 25 types, and measured over one 3-minute window on the Taiwan box with
+# no filter at all: 261 messages arrived, of which this list admitted 101.
+# The 160 discarded were Class B:
+#
+#   StandardClassBPositionReport   89   position, speed, course, no nav status
+#   ExtendedClassBPositionReport   47   the same plus name and ship type
+#   StaticDataReport               24   Class B identity, no position
+#
+# Class B is what fishing boats, tugs, tenders, pilot craft and small coastal
+# traffic carry. In a chokepoint that is not the background -- it is most of
+# the movement, and small craft massing near a strait is the kind of thing this
+# platform exists to notice. 61.3% of the feed was being dropped at the
+# subscription for no stated reason.
+#
+# StaticDataReport is admitted for the same reason ShipStaticData is: it names
+# the vessel, and a position without a name is a contact rather than a ship.
+MESSAGE_TYPES = [
+    "PositionReport",
+    "ShipStaticData",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+    "StaticDataReport",
+]
 
 # ── TIMESTAMP PARSER ──────────────────────────────────────────────────────────
 
@@ -252,6 +277,21 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
                         data = json.loads(raw_msg)
                         msg_type = data.get("MessageType", "Unknown")
                         counter.increment(msg_type)
+
+                        # The handshake is not an observation.
+                        #
+                        # Every connection produced one SubscriptionConfirmation
+                        # onto the maritime topic, where the enricher has no
+                        # branch for it and counted it as dropped input. It is
+                        # one message per reconnect, which is exactly the volume
+                        # at which a real unrouted feed would be indistinguishable
+                        # from it.
+                        if msg_type == "SubscriptionConfirmation":
+                            logger.info(
+                                "Subscription confirmed (compression=%s).",
+                                (data.get("Message") or {}).get("CompressionEnabled"),
+                            )
+                            continue
                         meta = data.get("MetaData", {})
                         mmsi = str(meta.get("MMSI", "unknown"))
                         try:

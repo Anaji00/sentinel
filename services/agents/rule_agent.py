@@ -11,7 +11,13 @@ from shared.kafka import Topics
 from shared.utils.text import clip
 from shared.utils.quiet_failures import swallowed
 from shared.utils.entity_resolution import is_plausible_entity_name
-from shared.utils.rule_feedback import firing_counts, rule_performance
+from shared.utils.rule_feedback import (
+    firing_counts,
+    firing_counts_from_history,
+    record_rule_verdict,
+    rule_performance,
+    should_deprecate,
+)
 from shared.utils.quiet_failures import dropped
 from shared.models.correlation_rules import (
     CLAUSE_KEYS,
@@ -150,6 +156,14 @@ class CorrelationDef(BaseModel):
     hours: int
     min_anomaly: float
     tags: Optional[List[str]] = None
+    # `min_anomaly` answers "was this unusual for this instrument";
+    # `min_abs_move_pct` answers "did the price actually move". They are not the
+    # same question -- a thin name up 0.4% on ten times its normal volume scores
+    # higher on the first than a mega-cap down 9% does -- so a rule about a
+    # repricing had to be written in terms of unusualness and hope the two
+    # agreed. Absolute, because a rule about a shock is about magnitude;
+    # direction is expressed by the event types and tags a clause selects on.
+    min_abs_move_pct: Optional[float] = None
     # The joins. `region` takes a place name, or `true` meaning "wherever the
     # trigger is"; the others are flags.
     region: Optional[Union[str, bool]] = None
@@ -348,28 +362,60 @@ class RuleSynthesizerAgent(SentinelAgent):
     def output_topic(self) -> str:
         return Topics.RULES_SYNTHESIZED
 
+    async def _deprecate_rule(self, rule_id: str) -> None:
+        """Remove a rule from the live set and tell the correlation engine."""
+        await self.redis.raw.hdel("sentinel:correlation:dynamic_rules", rule_id)
+        # Tombstone, so the correlation engine hot-reloads without the rule.
+        tombstone = json.dumps({"rule_id": rule_id, "deprecated": True})
+        await self.redis.raw.publish("sentinel:correlation:rule_updates", tombstone)
+        if self._producer:
+            await self._producer.send(Topics.TELEMETRY, {
+                "agent": "rule_synthesizer",
+                "event": "rule_deprecated",
+                "rule_id": rule_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+
     async def handle(self, message: dict) -> None:
         """
         Triggered when the Macro Strategist publishes a new brief OR when a rule fails.
         """
         # Feedback Loop: Handle Rule Failure
-        if message.get("type") == "rule_failure":
+        # Feedback Loop: a scenario's verdict on the rule that produced it.
+        if message.get("type") in ("rule_failure", "rule_success"):
             rule_id = message.get("rule_id")
             if rule_id:
-                self.logger.warning(f"Deprecating failed rule: {rule_id}")
-                # Remove from HASH
-                await self.redis.raw.hdel("sentinel:correlation:dynamic_rules", rule_id)
-                # Publish tombstone for hot-reloading
-                tombstone = json.dumps({"rule_id": rule_id, "deprecated": True})
-                await self.redis.raw.publish("sentinel:correlation:rule_updates", tombstone)
-                # Emit Telemetry
-                if self._producer:
-                    await self._producer.send(Topics.TELEMETRY, {
-                        "agent": "rule_synthesizer",
-                        "event": "rule_deprecated",
-                        "rule_id": rule_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
+                # One verdict is not a record.
+                #
+                # This deprecated on arrival: a rule's first denied scenario
+                # deleted it from the dynamic-rule hash and published a
+                # tombstone. Measured over this deployment's life, 145 rules
+                # were synthesised, 3 ever produced a correlation that reached a
+                # scenario, and all 3 were denied -- so all 3 died on their only
+                # verdict. Platform-wide, 536 of 818 resolved scenarios are
+                # denied, so a rule confirming at a genuine 40% had a 60% chance
+                # of deletion the first time it was judged.
+                #
+                # The bar for deletion sits above that base rate deliberately;
+                # see NEGATIVE_SHARE_FOR_DEPRECATION. needs_review, which the
+                # analyst branch below uses, is the bar for spending an
+                # inference on a prune pass, which is a different question.
+                record = await record_rule_verdict(
+                    self.redis, rule_id, message.get("type") == "rule_failure",
+                )
+                if should_deprecate(record["total"], record["negative"]):
+                    self.logger.warning(
+                        "Deprecating rule %s: %s negative of %s verdicts, "
+                        "against a platform base rate of 65.5%% denied.",
+                        rule_id, record["negative"], record["total"],
+                    )
+                    await self._deprecate_rule(rule_id)
+                else:
+                    self.logger.info(
+                        "Rule %s verdict recorded (%s negative of %s); keeping it.",
+                        rule_id, record["negative"], record["total"],
+                    )
             return
 
         summary = ""
@@ -409,8 +455,51 @@ class RuleSynthesizerAgent(SentinelAgent):
                 )
             return
 
+        # A pattern that keeps happening and that no rule connects.
+        #
+        # The only input to this agent that is neither a rule's own output nor a
+        # narrative summary: the correlation service counts co-occurring event
+        # types above 0.6, subtracts every pair some rule already names, and
+        # proposes what is left once it has recurred enough times to be worth an
+        # inference. That is the difference between a rule set that grows from
+        # evidence and one that grows from its own echo.
+        if message.get("type") == "rule_candidate":
+            a = message.get("event_type_a")
+            b = message.get("event_type_b")
+            if not a or not b:
+                dropped(
+                    "agents.rule_synthesizer.candidate_without_types",
+                    "a rule candidate named no event types",
+                    self.logger, detail=str(sorted(message))[:120],
+                )
+                return
+            seen = message.get("times_seen")
+            cross = " across domains" if message.get("cross_domain") else ""
+            self.logger.info(
+                "Rule candidate: %s + %s seen %s time(s)%s, covered by no rule.",
+                a, b, seen, cross,
+            )
+            # Built line by line rather than with embedded escapes, which
+            # is how a heredoc turned this into a syntax error once already.
+            _nl = chr(10)
+            prompt_context = _nl.join([
+                "Two event types keep occurring together and no existing "
+                "rule connects them.",
+                f"TYPE A: {a} (domain: {message.get('domain_a')})",
+                f"TYPE B: {b} (domain: {message.get('domain_b')})",
+                f"TIMES SEEN TOGETHER: {seen}, within "
+                f"{message.get('window_sec')}s of each other, counting "
+                f"only events scoring at or above {message.get('min_anomaly')}.",
+                f"CROSS-DOMAIN: {bool(message.get('cross_domain'))}",
+                "This is an observed pattern, not a rule's output. Decide "
+                "whether it is worth a rule, and if so write one that "
+                "triggers on one of these types and requires the other as "
+                "evidence.",
+            ])
+            summary = f"{a} co-occurring with {b}"
+
         # Branch based on message structure
-        if "scenario_id" in message:
+        elif "scenario_id" in message:
             summary = message.get("headline", "")
             hypotheses = message.get("hypotheses", [])
             sig = message.get("significance", "")
@@ -757,7 +846,19 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
         if not active_rules:
             return
 
-        fired = await firing_counts(self.redis)
+        # The durable record first, the in-process counter only as a fallback.
+        #
+        # `firing_counts` reads MetricsCollector, which resets on every restart
+        # of the correlation service, so a rule that fired 1,606 times in a week
+        # was presented to this curator as having fired 3 times -- and the two
+        # rules that fire most on the platform did not appear at all. The
+        # `correlations` table holds the same firings durably, keyed by rule_id.
+        # getattr, because this runs on agents built without a database
+        # handle too, and a missing one must degrade to the metric rather
+        # than take the prune pass down.
+        fired = await firing_counts_from_history(getattr(self, "db", None))
+        if not fired:
+            fired = await firing_counts(self.redis)
 
         rule_summaries = []
         for r_id, r_json in active_rules.items():

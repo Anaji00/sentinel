@@ -30,6 +30,7 @@ import time
 from collections import deque
 from typing import Optional
 from shared.utils.quiet_failures import swallowed
+from shared.utils.liveness import declare as _declare, fired as _fired
 
 logger = logging.getLogger("shared.inference_budget")
 
@@ -68,6 +69,11 @@ PRIORITY_COOLDOWN_SEC = 240
 # the collectors, enrichment and correlation tiers share the rest, so the gap is
 # what stops the reasoning tier from crowding out the pipeline feeding it.
 MIN_GAP_SEC = float(os.getenv("INFERENCE_MIN_GAP_SEC", "60"))
+
+# Finding 538: this bar had never once refused a candidate, and nothing said so.
+_declare("inference.admission.holdback",
+         "the adaptive admission bar refused a below-bar inference candidate")
+_declare("inference.budget.claimed", "an inference slot was claimed")
 
 # What this deployment is actually for. Vessel and aircraft telemetry is volume;
 # these are the domains a person reads. An event from one of them earns a
@@ -166,10 +172,27 @@ class InferenceBudget:
         self.admitted = 0
         self.shed = 0
         self.held_back = 0
-        # Recent candidate scores, per process. Deliberately not shared through
-        # Redis: the bar asks "is this good compared with what I have been
-        # seeing", and one extra round trip per candidate on a stream this size
-        # would cost more than the selection is worth.
+        # Recent candidate scores. Shared through Redis, with this deque as the
+        # fallback when Redis is unavailable.
+        #
+        # It was per-process, on the reasoning that "one extra round trip per
+        # candidate on a stream this size would cost more than the selection is
+        # worth". That rationale assumed this runs on the event stream. It does
+        # not: it runs once per *inference attempt*, and the platform performed
+        # 487 inferences in twenty-four hours. Twenty round trips an hour is not
+        # a cost worth protecting.
+        #
+        # What the per-process version cost instead was the whole mechanism.
+        # The bar needs ADMISSION_MIN_HISTORY (32) samples before it applies,
+        # and with ~20 candidates an hour spread across thirteen agents, no
+        # process reaches 32 before the next deploy restarts it. Measured: the
+        # "held back N below-bar candidate(s)" line logs on the very first
+        # holdback and **has never appeared in any container's logs**. The
+        # selection was correct, deployed, and had never once applied.
+        #
+        # Sharing it also makes it mean the right thing. One model slot is one
+        # resource; thirteen private bars are thirteen different standards for
+        # what deserves it, none of which can see what the others declined.
         self._recent_scores: deque = deque(maxlen=ADMISSION_HISTORY)
         self._last_admit: float = time.monotonic()
 
@@ -182,6 +205,15 @@ class InferenceBudget:
     @property
     def _waiters_key(self) -> str:
         return f"{self._key}:waiters"
+
+    @property
+    def _scores_key(self) -> str:
+        """Recent candidate scores for this model, shared across agents.
+
+        Keyed on the model rather than the lane: the contended resource is the
+        model server, so the standard for "worth a slot" belongs to it.
+        """
+        return f"sentinel:inference:admission:{self.model}"
 
     @property
     def _seen_key(self) -> str:
@@ -318,8 +350,9 @@ class InferenceBudget:
         # The bar is a percentile of recent scores rather than a fixed
         # threshold, for the same reason the detectors are: only the deployment
         # knows what ordinary looks like.
-        if not self._passes_admission_bar(score):
+        if not await self._passes_admission_bar(score):
             self.held_back += 1
+            _fired("inference.admission.holdback")
             if self.held_back % 500 == 1:
                 logger.info(
                     "Inference budget: held back %s below-bar candidate(s) for %s "
@@ -354,6 +387,7 @@ class InferenceBudget:
                         await raw.hdel(self._seen_key, self.owner)
                     except Exception as _exc:
                         swallowed("utils.inference_budget.try_acquire", _exc, logger)
+                _fired("inference.budget.claimed")
                 return True
             await self._note_interest()
             self.shed += 1
@@ -369,7 +403,41 @@ class InferenceBudget:
             self.admitted += 1
             return True
 
-    def _passes_admission_bar(self, score: Optional[float]) -> bool:
+    async def _record_and_read_scores(self, value: float) -> list:
+        """Append this score to the shared window and return the window.
+
+        Falls back to the per-process deque when Redis is unavailable, so a
+        Redis outage degrades the bar to what it used to be rather than
+        disabling admission control entirely.
+        """
+        self._recent_scores.append(value)
+        if self.redis is None:
+            return list(self._recent_scores)
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            pipe = raw.pipeline()
+            pipe.lpush(self._scores_key, repr(float(value)))
+            pipe.ltrim(self._scores_key, 0, ADMISSION_HISTORY - 1)
+            # Long enough to survive a deploy, short enough that a bar fitted to
+            # a market that has since closed does not govern the next one.
+            pipe.expire(self._scores_key, 6 * 3600)
+            await pipe.execute()
+            rows = await raw.lrange(self._scores_key, 0, ADMISSION_HISTORY - 1)
+        except Exception as _exc:
+            swallowed("utils.inference_budget._scores", _exc, logger)
+            return list(self._recent_scores)
+
+        out = []
+        for row in rows or []:
+            try:
+                out.append(float(row.decode("utf-8") if isinstance(row, bytes) else row))
+            except (TypeError, ValueError):
+                continue
+        # An empty or unreadable reply must not read as "no history", which
+        # admits everything; the local deque is the honest fallback.
+        return out or list(self._recent_scores)
+
+    async def _passes_admission_bar(self, score: Optional[float]) -> bool:
         """Whether this candidate is worth the slot, given what else has arrived.
 
         Three ways to pass, and the last two are the safety rails:
@@ -388,9 +456,9 @@ class InferenceBudget:
         except (TypeError, ValueError):
             return True
 
-        self._recent_scores.append(value)
+        window = await self._record_and_read_scores(value)
 
-        if len(self._recent_scores) < ADMISSION_MIN_HISTORY:
+        if len(window) < ADMISSION_MIN_HISTORY:
             # Too little history to say what "better than usual" means. A bar
             # computed from a handful of samples would mostly encode their order.
             return True
@@ -398,7 +466,7 @@ class InferenceBudget:
         if (time.monotonic() - self._last_admit) >= MAX_HOLDBACK_SEC:
             return True
 
-        ranked = sorted(self._recent_scores)
+        ranked = sorted(window)
         index = min(len(ranked) - 1, int(len(ranked) * ADMISSION_PERCENTILE))
         return value >= ranked[index]
 

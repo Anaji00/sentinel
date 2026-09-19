@@ -153,7 +153,50 @@ def test_hurst_exponent_bounds():
     np.random.seed(42)
     series = list(np.cumsum(np.random.normal(0, 1, 100)))
     h = quant_calc.hurst_exponent(series)
-    assert 0.0 <= h <= 1.0
+    assert h is not None and 0.0 <= h <= 1.0
+
+
+def test_hurst_refuses_rather_than_returning_the_null():
+    """The sentinel was 0.5, which is also a meaningful measurement.
+
+    Five early returns handed back 0.5 when the estimator could not compute,
+    and the one consumer labelled `Trending if h > 0.5 else Mean-Reverting` --
+    so every refusal printed as a confident "Mean-Reverting".
+    """
+    assert quant_calc.hurst_exponent([1.0, 2.0, 3.0]) is None
+    assert quant_calc.hurst_exponent([100.0] * 200) is None, "a flat line has no regime"
+    assert quant_calc.hurst_regime(None) is None
+
+
+def test_a_random_walk_is_not_labelled_mean_reverting():
+    """Measured, not assumed: the null sits near 0.43 on these window sizes.
+
+    Classical R/S is biased low here even after the Anis-Lloyd correction, so a
+    threshold written at the theoretical 0.5 called a genuine random walk
+    mean-reverting in 35 of 40 trials.
+    """
+    labels = []
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        walk = list(100.0 + np.cumsum(rng.normal(0, 1.0, 300)))
+        labels.append(quant_calc.hurst_regime(quant_calc.hurst_exponent(walk)))
+    assert labels.count("RANDOM_WALK") >= 16, (
+        f"a random walk should read as one: {labels}"
+    )
+    assert labels.count("MEAN_REVERTING") == 0, "the null is on the wrong side of the threshold"
+
+
+def test_mean_reversion_is_still_detected():
+    """The estimator's ordering is sound; only the contract around it was not."""
+    labels = []
+    for seed in range(10):
+        rng = np.random.default_rng(seed)
+        series, level = [100.0], 100.0
+        for _ in range(300):
+            level = 100.0 + (level - 100.0) * -0.55 + rng.normal(0, 1.0)
+            series.append(level)
+        labels.append(quant_calc.hurst_regime(quant_calc.hurst_exponent(series)))
+    assert all(l == "MEAN_REVERTING" for l in labels), labels
 
 
 # ── 5. MICROSTRUCTURE & LIQUIDITY METRICS ────────────────────────────────────

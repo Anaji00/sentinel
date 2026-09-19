@@ -16,12 +16,15 @@ queue is a Redis list so a request an operator made outlives a worker restart.
 
 import json
 import logging
+
+from shared.utils.serialization import iso_or_none
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from shared.utils.rbac import require_role, Role
+from services.api_gateway.audit_actions import record_admin_action
 from services.api_gateway.dependencies import get_redis_client, get_db_optional
 
 logger = logging.getLogger("api-gateway.dlq")
@@ -74,8 +77,8 @@ async def dlq_summary(db=Depends(get_db_optional)) -> Dict[str, Any]:
             "resolved": int(r["resolved"] or 0),
             "outstanding": int(r["outstanding"] or 0),
             "permanently_failed": int(r["permanently_failed"] or 0),
-            "oldest": r["oldest"].isoformat() if r["oldest"] else None,
-            "newest": r["newest"].isoformat() if r["newest"] else None,
+            "oldest": iso_or_none(r["oldest"]),
+            "newest": iso_or_none(r["newest"]),
         }
         for r in rows
     ]
@@ -129,7 +132,7 @@ async def list_failed_events(
         "events": [
             {
                 "id": int(r["id"]),
-                "failed_at": r["failed_at"].isoformat() if r["failed_at"] else None,
+                "failed_at": iso_or_none(r["failed_at"]),
                 "topic": r["original_topic"],
                 # Truncated: these are stack-trace tails and the list view is a
                 # triage surface, not a debugger.
@@ -137,7 +140,7 @@ async def list_failed_events(
                 "retry_count": int(r["retry_count"] or 0),
                 "permanently_failed": bool(r["permanently_failed"]),
                 "resolved": bool(r["resolved"]),
-                "resolved_at": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+                "resolved_at": iso_or_none(r["resolved_at"]),
                 "resolved_by": r["resolved_by"],
                 "replay_count": int(r["replay_count"] or 0),
                 "last_replay_error": r["last_replay_error"],
@@ -147,12 +150,13 @@ async def list_failed_events(
     }
 
 
-@router.post("/replay", dependencies=[Depends(require_role(Role.ADMIN))])
+@router.post("/replay")
 async def replay_failed_events(
     body: ReplayRequest,
     request: Request,
     db=Depends(get_db_optional),
     redis=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.ADMIN)),
 ) -> Dict[str, Any]:
     """Queue dead letters to be republished on the topic they failed on.
 
@@ -190,6 +194,22 @@ async def replay_failed_events(
             break
 
     logger.info("DLQ replay queued: %d row(s) by %s", queued, requester)
+
+    # A replay is indistinguishable from fresh ingestion once the events land,
+    # so the ledger is the only place the difference survives.
+    if queued:
+        await record_admin_action(
+            redis=redis, db=db, user=user,
+            action="REPLAY_DEAD_LETTERS",
+            resource_type="FAILED_EVENTS",
+            resource_id=",".join(str(i) for i in eligible[:20]) or "none",
+            details={
+                "queued": queued,
+                "skipped": len(skipped),
+                "topics": sorted({r["original_topic"] for r in rows if r.get("original_topic")}),
+            },
+        )
+
     return {
         "queued": queued,
         "skipped": skipped,

@@ -9,7 +9,7 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 .DEFAULT_GOAL := help
 
-.PHONY: help setup preflight up analyst reasoning obs down stop ps logs health bootstrap \
+.PHONY: help setup preflight up analyst reasoning obs build down stop ps logs health bootstrap \
         budget backup restore test verify migrate psql redis clean nuke
 
 help: ## Show available targets
@@ -39,6 +39,20 @@ reasoning: preflight ## Start the LLM swarm (stops collectors — they do not co
 	$(COMPOSE) --profile collectors down
 	$(COMPOSE) --profile agents up -d
 	@$(MAKE) --no-print-directory health
+
+build: ## Rebuild every image, including the ones behind profiles
+	@# `docker compose build` with no profiles builds 9 of the 30 images: a
+	@# service behind a profile is not in the default set, so it is skipped
+	@# silently. Twenty-one of them were last built days before the code they
+	@# run, and nothing said so.
+	@#
+	@# Named profiles rather than --all-profiles, so the retired cyber
+	@# collector is not quietly rebuilt back into the working set. `make
+	@# cyber` is the one way in, and test_domain_retirement asserts it.
+	$(COMPOSE) --profile collectors --profile agents --profile obs build
+	@echo ""
+	@echo "  Built every image in collectors, agents and obs."
+	@echo "  The retired cyber collector is excluded; 'make cyber' builds it."
 
 obs: ## Add Prometheus + Grafana + Kafka UI to the running mode
 	$(COMPOSE) --profile obs up -d

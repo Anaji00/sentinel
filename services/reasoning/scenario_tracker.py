@@ -417,26 +417,43 @@ class ScenarioTracker:
                 except Exception as e:
                     logger.error(f"Failed to update source scorecard for scenario {scenario_id}: {e}")
                 
-            if status_change == ScenarioStatus.DENIED and self._producer:
+            # Both verdicts, for every rule.
+            #
+            # This published only on DENIED, so 282 confirmations produced no
+            # message and a rule could be penalised but never credited -- the
+            # record a curator reads was negative by construction.
+            #
+            # It also filtered on `startswith("syn_") or startswith("rule_")`,
+            # which excludes SEMANTIC_001 and HAWKES_EXCITATION. Those two are
+            # 81% of the correlation stream and account for 203 of the 536
+            # denials this platform has recorded -- 37.9% of all the negative
+            # evidence there is, dropped before it was sent, from the two rules
+            # whose weight most needs measuring.
+            if status_change in (ScenarioStatus.DENIED, ScenarioStatus.CONFIRMED) and self._producer:
                 try:
-                    # Fetch the rule_id that created this scenario's cluster
                     rows = await self._db.query("""
-                        SELECT c.rule_id 
+                        SELECT c.rule_id
                         FROM scenarios s
                         JOIN correlations c ON s.correlation_id = c.correlation_id
                         WHERE s.scenario_id = $1
                     """, scenario_id)
-                    
+
                     if rows and rows[0].get("rule_id"):
                         rule_id = rows[0]["rule_id"]
-                        if rule_id.startswith("syn_") or rule_id.startswith("rule_"):
-                            await self._producer.send(Topics.RULES_FEEDBACK, {
-                                "type": "rule_failure",
-                                "rule_id": rule_id,
-                                "scenario_id": scenario_id,
-                                "reason": f"Scenario denied. {'; '.join(notes)}"
-                            })
-                            logger.info(f"Published rule_failure feedback for rule {rule_id}")
+                        denied = status_change == ScenarioStatus.DENIED
+                        await self._producer.send(Topics.RULES_FEEDBACK, {
+                            "type": "rule_failure" if denied else "rule_success",
+                            "rule_id": rule_id,
+                            "scenario_id": scenario_id,
+                            "reason": (
+                                f"Scenario denied. {'; '.join(notes)}" if denied
+                                else "Scenario confirmed."
+                            ),
+                        })
+                        logger.info(
+                            "Published rule_%s feedback for rule %s",
+                            "failure" if denied else "success", rule_id,
+                        )
                 except Exception as e:
                     logger.error(f"Failed to publish rule feedback: {e}")
 
@@ -518,20 +535,38 @@ class ScenarioTracker:
                 # while the loop reported "Checking 100 active scenarios" every
                 # thirty minutes. The confidence numbers this system produces
                 # have never once been scored against an outcome.
-                rows = await self._db.query("""
+                # One ILIKE per keyword, ANDed -- not ILIKE ALL($n).
+                #
+                # The semantics are identical: every keyword must appear. The
+                # plan is not. ALL() over an array is a ScalarArrayOp, and no
+                # index can serve one, so the branch forced a sequential scan
+                # of the whole 48-hour window -- and because it sits in an OR,
+                # it dragged the two GIN indexes on `tags` and `named_entities`
+                # down with it. Measured here: 21.2 seconds per signal across
+                # 917,000 rows, returning nothing, against a client that gives
+                # up at 60. On a 200,000-row copy carrying the trigram index
+                # added in migration 0027, ALL() stays a sequential scan at
+                # 229ms while this form is a bitmap index scan at 0.281ms.
+                #
+                # Built from range(), so the interpolation carries integers and
+                # never a keyword; the keywords stay bound parameters.
+                like_clause = " AND ".join(
+                    f"headline ILIKE ${n}" for n in range(4, 4 + len(keywords))
+                ) or "FALSE"
+                rows = await self._db.query(f"""
                     SELECT 1 FROM events
                     WHERE occurred_at > $1
                       AND (
-                        headline ILIKE ALL($2)
-                        OR tags @> $3::text[]
-                        OR named_entities @> $4::text[]
+                        ({like_clause})
+                        OR tags @> $2::text[]
+                        OR named_entities @> $3::text[]
                       )
                     LIMIT 1
-                """, 
-                    cutoff, 
-                    [f"%{k}%" for k in keywords], # ILIKE ANY mapping
-                    keywords,                     # tags && array
-                    keywords                      # named_entities && array
+                """,
+                    cutoff,
+                    keywords,
+                    keywords,
+                    *[f"%{k}%" for k in keywords],
                 )
                 
                 if rows: 

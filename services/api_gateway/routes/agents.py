@@ -1,6 +1,18 @@
 import json
 import logging
-from fastapi import APIRouter, Depends, Query
+
+from shared.utils.serialization import iso_or_none
+from shared.utils.agent_conclusions import (
+    AGENT_CORRELATION_ANALYSIS_PREFIX,
+    HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_INVERSE_CORRELATION_PREFIX,
+    MACRO_RATES_REGIME_KEY,
+    MACRO_SPREAD_2Y10Y_KEY,
+    TRADFI_BACKFILL_REPORT_KEY,
+)
+
+from shared.utils.filings_keys import PROMINENT_CIKS_KEY
+from fastapi import APIRouter, Depends, HTTPException, Query
 from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
 from shared.utils.heartbeat import get_all_heartbeats_status
 from shared.utils.quiet_failures import swallowed
@@ -227,7 +239,7 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
                 "cascade_probability": row.get("confidence"),
                 "recommendations": row.get("recommendations") or [],
                 "occurred_at": (
-                    row["occurred_at"].isoformat() if row.get("occurred_at") else None
+                    iso_or_none(row.get("occurred_at"))
                 ),
                 "caused_by": row.get("rule_name"),
             })
@@ -270,3 +282,108 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
         "wargame_predictions": wargame_predictions,
         "calibration": calibration,
     }
+
+
+# ── The agent tier's persisted conclusions ───────────────────────────────────
+
+# Seven keys were written by one service and read by nothing at all -- each
+# appeared exactly once in the repository, at the line that wrote it. They are
+# not bookkeeping: the macro engine's rates regime, its inverse-correlation
+# pairs and a hundred-point history of the 2s10s spread are the outputs of the
+# work that engine exists to do, and the Hawkes branching ratios are the
+# cross-domain excitation matrix the correlation service learns.
+#
+# Giving them a reader is the smaller half of the fix. The larger half is that
+# a conclusion with no surface is indistinguishable from a conclusion that was
+# never reached, and this endpoint makes the difference checkable: every field
+# below reports `null` when its key is absent, so "the engine has not run" and
+# "the engine ran and found nothing" stay apart.
+_CONCLUSION_KEYS = {
+    "rates_regime": MACRO_RATES_REGIME_KEY,
+    "hawkes_branching_ratios": HAWKES_BRANCHING_RATIOS_KEY,
+    "tradfi_backfill": TRADFI_BACKFILL_REPORT_KEY,
+}
+
+
+@router.get("/conclusions", dependencies=[Depends(require_pro("reasoning"))])
+async def get_agent_conclusions(redis=Depends(get_redis_client)):
+    """What the agent tier has concluded and stored, as it stored it.
+
+    Read-only and unaggregated on purpose: this is the raw persisted state, so a
+    reader comparing it against what a dashboard claims can see which of the two
+    is wrong.
+    """
+    if not redis:
+        raise HTTPException(status_code=503, detail="State store is unavailable.")
+    raw = redis.raw
+    out = {}
+
+    for field, key in _CONCLUSION_KEYS.items():
+        out[field] = None
+        try:
+            blob = await raw.get(key)
+            if blob:
+                text = blob if isinstance(blob, str) else blob.decode("utf-8")
+                try:
+                    out[field] = json.loads(text)
+                except json.JSONDecodeError:
+                    out[field] = text
+        except Exception as _exc:
+            swallowed(f"api_gateway.routes.agents.conclusions.{field}", _exc, logger)
+
+    # The 2s10s spread is a list rather than a document: rpush'd and trimmed to
+    # a hundred points, and never read until now.
+    out["yield_spread_2y10y_bps"] = None
+    try:
+        series = await raw.lrange(MACRO_SPREAD_2Y10Y_KEY, 0, -1)
+        if series:
+            values = []
+            for item in series:
+                text = item if isinstance(item, str) else item.decode("utf-8")
+                try:
+                    values.append(float(text))
+                except (TypeError, ValueError):
+                    continue
+            out["yield_spread_2y10y_bps"] = {
+                "points": values,
+                "latest": values[-1] if values else None,
+                "inverted": (values[-1] < 0) if values else None,
+            }
+    except Exception as _exc:
+        swallowed("api_gateway.routes.agents.conclusions.spread", _exc, logger)
+
+    # Pair-scoped keys, scanned rather than listed: the writers key them by the
+    # pair they describe.
+    for field, pattern in (
+        ("inverse_correlations", f"{MACRO_INVERSE_CORRELATION_PREFIX}*"),
+        ("correlation_analysis", f"{AGENT_CORRELATION_ANALYSIS_PREFIX}*"),
+    ):
+        rows = []
+        try:
+            async for key in raw.scan_iter(match=pattern, count=100):
+                name = key.decode() if isinstance(key, bytes) else str(key)
+                blob = await raw.get(name)
+                if not blob:
+                    continue
+                text = blob if isinstance(blob, str) else blob.decode("utf-8")
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    payload = text
+                rows.append({"key": name.rsplit(":", 1)[-1], "value": payload})
+        except Exception as _exc:
+            swallowed(f"api_gateway.routes.agents.conclusions.{field}", _exc, logger)
+        out[field] = rows
+
+    # A curated set the filings collector builds and nothing consulted.
+    out["prominent_ciks"] = None
+    try:
+        members = await raw.smembers(PROMINENT_CIKS_KEY)
+        if members is not None:
+            out["prominent_ciks"] = sorted(
+                (m.decode() if isinstance(m, bytes) else str(m)) for m in members
+            )
+    except Exception as _exc:
+        swallowed("api_gateway.routes.agents.conclusions.ciks", _exc, logger)
+
+    return out

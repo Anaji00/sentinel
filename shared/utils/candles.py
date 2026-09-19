@@ -193,6 +193,17 @@ async def evaluate_multi_timeframe(
 
                 history_vol_key = f"{domain}:history{tf}m:{asset}:volumes"
                 history_not_key = f"{domain}:history{tf}m:{asset}:notionals"
+                # The bar's range, kept for the same fifteen bars as its close.
+                #
+                # Parkinson's estimator is a dispersion over n bars and refuses
+                # to answer on fewer than two, so the candle enricher -- which
+                # called it with this one bar's high and low, wrapped in
+                # single-element lists -- got exactly 0.0 on every event it has
+                # ever emitted, and printed that zero into the summary the model
+                # reads. Closes, volumes and notionals were already retained
+                # here; the two columns the estimator actually needs were not.
+                history_high_key = f"{domain}:history{tf}m:{asset}:highs"
+                history_low_key = f"{domain}:history{tf}m:{asset}:lows"
 
                 pipe = redis_client.raw.pipeline()
                 pipe.lpush(history_key, bar_close)
@@ -204,6 +215,12 @@ async def evaluate_multi_timeframe(
                 pipe.lpush(history_not_key, bar_notional)
                 pipe.ltrim(history_not_key, 0, 14)
                 pipe.expire(history_not_key, 604800)
+                pipe.lpush(history_high_key, block["high"])
+                pipe.ltrim(history_high_key, 0, 14)
+                pipe.expire(history_high_key, 604800)
+                pipe.lpush(history_low_key, block["low"])
+                pipe.ltrim(history_low_key, 0, 14)
+                pipe.expire(history_low_key, 604800)
                 await pipe.execute()
                 
                 # Also store complete OHLCV bar object under the canonical candle key.

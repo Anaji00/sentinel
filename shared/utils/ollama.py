@@ -37,7 +37,10 @@ INFERENCE_CHAIN_DEADLINE_SEC = float(os.getenv("INFERENCE_CHAIN_DEADLINE_SEC", "
 LLM_CACHE_TTL_SEC = int(os.getenv("LLM_CACHE_TTL_SEC", "300"))
  
 OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
-DEFAULT_MODEL_NAME = "qwen2.5:1.5b"
+# The fallback when AGENT_MODEL is unset. Kept in step with what compose and
+# .env actually name, because a default that disagrees with the deployment is a
+# second configuration nobody is reading.
+DEFAULT_MODEL_NAME = "qwen3:0.6b"
 # Default is what the tiers actually run. "qwen2.5:7b" was a 4.7 GB image
 # against a 4.5 GB container limit -- unloadable, so any caller that reached
 # this default timed out rather than answering.
@@ -140,7 +143,19 @@ def _inference_threads() -> Optional[int]:
 # The defaults stay low for callers that do not state a need; a caller that asks
 # for more has a schema that requires it, and truncating that request produces
 # text no parser can use.
-SMALL_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_SMALL_DEFAULT_TOKENS", "384"))
+# 192, halved from 384.
+#
+# This is the FLOOR for a caller that names no budget, not a cap on anyone:
+# `_schema_default_tokens` raises it for a schema that plainly needs more, and
+# the truncation retry doubles and tries again when the estimate is wrong low.
+# So the cost of halving it is borne only by callers whose schema does not
+# justify the tokens, and it is recoverable where it is wrong.
+#
+# The gain is not marginal. Generation is linear in tokens and this host
+# measures 2.5 tok/s under load, so every 100 tokens is 40 seconds of the
+# platform's scarcest resource -- and at 2 concurrent slots, 192 tokens rather
+# than 384 is roughly twice the answers per hour from the same machine.
+SMALL_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_SMALL_DEFAULT_TOKENS", "192"))
 # Measured: a scenario at 1024 tokens produced 4,056 characters and still had
 # not closed its JSON. The schema is three nested hypotheses of seven fields
 # each plus five top-level fields, so a complete answer runs past 1,500 tokens.
@@ -226,6 +241,17 @@ def observe_generation_rate(data: dict) -> None:
         _OBSERVED_TOK_PER_SEC = _TOK_RATE_ALPHA * rate + (1 - _TOK_RATE_ALPHA) * _OBSERVED_TOK_PER_SEC
     _tok_rate_samples += 1
 
+    # Persisted as it is learned, so the next restart starts from the measured
+    # rate instead of the floor. Fire-and-forget: sizing must not wait on Redis.
+    if _tok_rate_redis is not None and _tok_rate_samples % 5 == 0:
+        try:
+            asyncio.get_running_loop().create_task(persist_generation_rate())
+        except RuntimeError as exc:
+            # No running loop -- a synchronous caller, or interpreter shutdown.
+            # The next observation inside a loop persists it, so this costs the
+            # memory and nothing else.
+            swallowed("shared.utils.ollama.persist_generation_rate", exc, logger)
+
     if _tok_rate_samples in (1, 3, 10, 50) or _tok_rate_samples % 250 == 0:
         logger.info(
             "Generation rate measured from the server's own telemetry: %.1f tok/s "
@@ -233,6 +259,82 @@ def observe_generation_rate(data: dict) -> None:
             "wall-clock figure including queue time.",
             _OBSERVED_TOK_PER_SEC, _tok_rate_samples, _TOK_RATE_FLOOR,
         )
+
+
+# Where the learned rate lives between restarts.
+#
+# `_OBSERVED_TOK_PER_SEC` is a module global in each of three separate
+# processes, reset to None every time any of them restarts. Three samples are
+# required before it is trusted and a generation takes about three minutes, so
+# the deployment spends most of its life at the 2.5 floor -- while the host's
+# own telemetry says 10.2 tok/s. Observed live, two consecutive log lines:
+#
+#   Generation rate measured from the server's own telemetry: 10.2 tok/s
+#     over 1 sample(s). The configured floor is 2.5 ...
+#   Capping num_predict 1800 -> 900: at 2.5 tok/s this host cannot produce
+#     more before the 600s timeout ...
+#
+# At 2.5 tok/s the 600s timeout affords 900 tokens and the cap fires; at the
+# measured 10.2 it affords 6,120 and no cap applies. So every answer the
+# reasoning tier produced was sized against a number four times too pessimistic.
+#
+# Redis is already a dependency of every process that talks to Ollama, so one
+# float under one key makes the measurement survive a restart and be shared
+# rather than re-learned three times. Best-effort throughout: a Redis that is
+# down must not stop a generation, it only costs the memory.
+_TOK_RATE_REDIS_KEY = "sentinel:ollama:observed_tok_per_sec"
+_tok_rate_redis: Any = None
+_tok_rate_loaded = False
+
+
+def bind_rate_store(redis_client: Any) -> None:
+    """Hands this process the Redis client to persist the learned rate through."""
+    global _tok_rate_redis
+    _tok_rate_redis = redis_client
+
+
+async def load_generation_rate() -> Optional[float]:
+    """Restores a rate learned by this process or another one, if there is one."""
+    global _OBSERVED_TOK_PER_SEC, _tok_rate_samples, _tok_rate_loaded
+    if _tok_rate_redis is None:
+        return None
+    try:
+        raw = getattr(_tok_rate_redis, "raw", _tok_rate_redis)
+        stored = await raw.get(_TOK_RATE_REDIS_KEY)
+        if stored is None:
+            return None
+        value = float(stored.decode() if isinstance(stored, bytes) else stored)
+        if not (_TOK_RATE_FLOOR <= value <= _TOK_RATE_CEILING):
+            return None
+        _OBSERVED_TOK_PER_SEC = value
+        # A restored rate is already earned. Starting the sample count at the
+        # trust threshold is the whole point: otherwise the first three
+        # generations after every restart are sized against the floor again,
+        # which is the defect.
+        _tok_rate_samples = max(_tok_rate_samples, _TOK_RATE_MIN_SAMPLES)
+        _tok_rate_loaded = True
+        logger.info(
+            "Restored generation rate %.1f tok/s from Redis; answers are sized "
+            "against it rather than the %.1f floor.", value, _TOK_RATE_FLOOR,
+        )
+        return value
+    except Exception as exc:
+        logger.debug("Could not restore generation rate: %s", exc)
+        return None
+
+
+async def persist_generation_rate() -> None:
+    """Writes the current learned rate back, so the next process starts there."""
+    if _tok_rate_redis is None or _OBSERVED_TOK_PER_SEC is None:
+        return
+    try:
+        raw = getattr(_tok_rate_redis, "raw", _tok_rate_redis)
+        # Given a TTL deliberately. A host that is replaced or reconfigured
+        # should re-learn rather than inherit a number from a machine that no
+        # longer exists; a week is long enough to survive any restart.
+        await raw.set(_TOK_RATE_REDIS_KEY, f"{_OBSERVED_TOK_PER_SEC:.4f}", ex=604800)
+    except Exception as exc:
+        logger.debug("Could not persist generation rate: %s", exc)
 
 
 def generation_rate() -> float:
@@ -555,6 +657,14 @@ def _schema_default_tokens(schema: Optional[Union[str, dict]], floor: int, ceili
     return max(floor, min(estimate, ceiling))
 
 
+# Whether models that support a reasoning trace should emit one.
+#
+# Off. See the note at the `think` payload key: a trace costs the same tokens as
+# an answer and this host has no spare ones. Left configurable so a deployment
+# with a GPU can turn it on without editing code.
+_THINKING_ENABLED = os.getenv("OLLAMA_THINKING", "0").strip().lower() in ("1", "true", "yes")
+
+
 def _bounded_num_predict(
     requested: Optional[int],
     is_small_model: bool,
@@ -627,6 +737,19 @@ class OllamaClient:
         self._last_completion: Optional[float] = None
         self._requests_since_completion: int = 0
         self._stall_reported: bool = False
+
+        # The learned generation rate follows the client, because every
+        # construction site already has the Redis handle and none of them
+        # should have to remember this. First client to be built in a process
+        # restores the rate; the rest are no-ops.
+        if redis_client is not None and _tok_rate_redis is None:
+            bind_rate_store(redis_client)
+            try:
+                asyncio.get_running_loop().create_task(load_generation_rate())
+            except RuntimeError as exc:
+                # Constructed outside a loop. The restore is best-effort and
+                # the floor is a correct, merely pessimistic, starting point.
+                swallowed("shared.utils.ollama.load_generation_rate", exc, logger)
 
     def _note_request(self) -> None:
         """Called as a request goes out. Reports a stall the first time it sees one."""
@@ -961,6 +1084,19 @@ class OllamaClient:
                 sem_start = time.monotonic()
                 async with semaphore:
                     sem_wait = time.monotonic() - sem_start
+                    # Both the aggregate and the per-service series, the way
+                    # ollama_calls just below already does it.
+                    #
+                    # Only the per-service name was written, so the platform's
+                    # one Grafana dashboard -- which asks for
+                    # sentinel_ollama_semaphore_wait_seconds,
+                    # sentinel_ollama_latency_seconds and
+                    # sentinel_ollama_timeouts -- was bound to three series
+                    # Prometheus has never held. Confirmed against the live
+                    # scrape: of the four panels, one resolved. A panel on an
+                    # unwritten name draws a flat zero, and a flat zero is
+                    # what a calm, working system looks like.
+                    MetricsCollector.observe_latency("ollama_semaphore_wait", sem_wait)
                     MetricsCollector.observe_latency(f"ollama_semaphore_wait_seconds_{self.service_name}", sem_wait)
 
                     MetricsCollector.increment("ollama_calls_total")
@@ -986,8 +1122,11 @@ class OllamaClient:
                         # actually needed.
                         truncated = self.last_truncated
                         failed_budget = self.last_effective_predict
-                        MetricsCollector.observe_latency(f"ollama_latency_{self.service_name}", time.monotonic() - call_start)
+                        _elapsed = time.monotonic() - call_start
+                        MetricsCollector.observe_latency("ollama_latency", _elapsed)
+                        MetricsCollector.observe_latency(f"ollama_latency_{self.service_name}", _elapsed)
                     except (InferenceError, asyncio.TimeoutError) as call_err:
+                        MetricsCollector.increment("ollama_timeouts_total")
                         MetricsCollector.increment(f"ollama_timeouts_{self.service_name}")
                         raise call_err
 
@@ -1254,6 +1393,21 @@ class OllamaClient:
         _threads = _inference_threads()
         if _threads is not None:
             payload["options"]["num_thread"] = _threads
+
+        # Thinking off, for models that have it.
+        #
+        # Qwen3 emits a <think> trace before its answer and does so by default.
+        # On a GPU that is a good trade; here it is ruinous. This host generates
+        # at ~2.5 tok/s under load, so a 400-token reasoning trace nobody reads
+        # is 160 seconds of the platform's scarcest resource, spent before the
+        # answer starts -- and the answer is then cut short by the same
+        # num_predict budget the trace has just consumed.
+        #
+        # Sent unconditionally: Ollama ignores `think` for models that do not
+        # support it, so one line covers the whole fleet rather than a table of
+        # which models reason and which do not.
+        payload["think"] = _THINKING_ENABLED
+
         if format:
             payload["format"] = format
             

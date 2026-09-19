@@ -75,6 +75,7 @@ def _message_domain(message: Dict[str, Any]) -> str:
     return str(source) if source else ""
 
 from shared.utils.tasks import safe_create_task
+from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.focus import offer_focus, prioritise
 from shared.utils.quote_cache import quote_key
 # The same set the correlation layer refuses to treat as corroboration. One
@@ -851,7 +852,7 @@ class SentinelAgent(ABC):
                             tasks.append((safe_create_task(self._dispatch(payload)), msg))
                         except json.JSONDecodeError as e:
                             self.logger.error(f"POISON PILL dropped: {e}")
-                            await self._send_dlq({"raw": str(msg.value)}, "JSONDecodeError", self.input_topics[0])
+                            await self._send_dlq({"raw": encode_dlq_payload(msg.value)}, "JSONDecodeError", self.input_topics[0])
 
                     # Reading is decoupled from thinking. Awaiting the batch here
                     # meant one slow inference froze the loop: a single measured
@@ -933,7 +934,7 @@ class SentinelAgent(ABC):
         try:
             payload = json.loads(msg.value.decode("utf-8"))
         except Exception:
-            payload = {"raw": str(msg.value)}
+            payload = {"raw": encode_dlq_payload(msg.value)}
         safe_create_task(
             self._send_dlq(payload, f"UnhandledException: {type(err).__name__}: {err}", topic_name)
         )
@@ -1178,11 +1179,34 @@ class SentinelAgent(ABC):
             stalled_seconds = (now - stalled_since).total_seconds() if stalled_since else 0.0
 
             stall_note = f" STALLED {int(stalled_seconds)}s" if stalled_seconds >= HEARTBEAT_INTERVAL else ""
-            self.logger.info(
-                f"♥ {self.name} | processed={self._processed} errors={self._errors} "
+
+            # `errors=0` is not a statement of health when nothing was attempted.
+            #
+            # Observed live: `radar_agent | processed=0 errors=0 rate=0.00/s
+            # STALLED 606s`. Every number on that line is literally correct and
+            # the line as a whole reads as a healthy agent, because "no errors"
+            # is what a working component says. An agent that has never
+            # processed a single message has no error rate to report -- it has
+            # an absence, and absence and zero are different readings.
+            #
+            # So the count is qualified rather than dropped, and a stall is
+            # logged at WARNING. A heartbeat exists to make a silent agent
+            # audible; at INFO, among a heartbeat a minute from nine agents, it
+            # was audible only to somebody already looking.
+            if self._processed == 0:
+                error_note = "errors=0 (nothing attempted)"
+            else:
+                error_note = f"errors={self._errors}"
+
+            line = (
+                f"♥ {self.name} | processed={self._processed} {error_note} "
                 f"rate={window_rate:.2f}/s (lifetime {lifetime_rate:.2f}/s){stall_note}"
                 f"{quiet_heartbeat_line()}"
             )
+            if stall_note:
+                self.logger.warning(line)
+            else:
+                self.logger.info(line)
 
             last_processed = self._processed
             last_sample_at = now
@@ -1234,20 +1258,11 @@ class SentinelAgent(ABC):
                 )
             except Exception as hb_err:
                 self.logger.debug(f"Progress heartbeat failed for {self.name}: {hb_err}")
-            try:
-                await self.redis.raw.set(
-                    f"sentinel:agents:health:{self.name}",
-                    json.dumps({
-                        "processed": self._processed,
-                        "errors":    self._errors,
-                        "uptime_s":  int(elapsed),
-                        "ts":        datetime.now(timezone.utc).isoformat(),
-                    }),
-                    ex=120, 
-                )
-            except Exception as _exc:
-                swallowed("agents.base._heartbeat_loop", _exc)
-
+            # Per-agent processed/errors/uptime already reach the product:
+            # the agent tier's heartbeat carries an `agent_detail` block with
+            # both counters, and /agents/processes reads it. This key was a
+            # second store of the same fact, written every beat and read by
+            # nothing -- two writers for one number, which is how they drift.
             # Publish state digest for cross-agent context drift detection (§3.3)
             try:
                 digest = {
@@ -1994,17 +2009,55 @@ class SentinelAgent(ABC):
         Prevents cross-domain context pollution while giving the LLM deep awareness.
         """
         try:
-            # We use TimescaleDB directly for the absolute source of truth.
+            # Two indexed lookups, not one OR that can use neither.
+            #
+            # This was a single scan with `primary_entity_id ILIKE $1 OR
+            # headline ILIKE $2`. An OR across two columns forces one access
+            # path, so the planner fell back to the occurred_at index and
+            # filtered everything else by hand: measured on this deployment,
+            # 454,020 rows removed by filter and 37.5 seconds of execution, for
+            # a ticker with no matches.
+            #
+            # It runs inline while an agent is processing a message, so those
+            # 37 seconds are 37 seconds the agent is not consuming anything.
+            # radar_agent was logging "STALLED 182s" during an open market with
+            # this as the last thing it did, and the exception it raised had an
+            # empty message -- asyncio.TimeoutError stringifies to "" -- so the
+            # log line read "Failed to fetch entity context for EPRT: " and
+            # named neither the cause nor the cost.
+            #
+            # Split, each branch uses an index that already exists:
+            # events_entity_id_upper_time_idx for the identifier, the GIN
+            # trigram index from migration 0027 for the headline. Measured after:
+            # EPRT 39.4s -> 0.18s, WDC 36.6s -> 0.02s, NVDA 11.1s -> 0.06s, with
+            # the same rows returned.
+            #
+            # `upper(...) = upper(...)` rather than ILIKE because the caller
+            # passes a bare entity name: with no wildcards ILIKE is equality
+            # that no index can serve, and the expression index is built on
+            # exactly this shape.
             query = """
-                SELECT type, headline, anomaly_score, occurred_at
-                FROM events
-                WHERE occurred_at > NOW() - INTERVAL '24 hours'
-                  AND (
-                    primary_entity_id ILIKE $1 
-                    OR headline ILIKE $2
-                  )
-                  AND (anomaly_score >= 0.5 OR type = 'headline')
-                ORDER BY occurred_at DESC
+                WITH by_entity AS (
+                    SELECT type, headline, anomaly_score, occurred_at
+                    FROM events
+                    WHERE upper(primary_entity_id) = upper($1)
+                      AND occurred_at > NOW() - INTERVAL '24 hours'
+                      AND (anomaly_score >= 0.5 OR type = 'headline')
+                    ORDER BY occurred_at DESC
+                    LIMIT 5
+                ), by_headline AS (
+                    SELECT type, headline, anomaly_score, occurred_at
+                    FROM events
+                    WHERE headline ILIKE $2
+                      AND occurred_at > NOW() - INTERVAL '24 hours'
+                      AND (anomaly_score >= 0.5 OR type = 'headline')
+                    ORDER BY occurred_at DESC
+                    LIMIT 5
+                )
+                SELECT DISTINCT ON (occurred_at, headline)
+                       type, headline, anomaly_score, occurred_at
+                FROM (SELECT * FROM by_entity UNION ALL SELECT * FROM by_headline) u
+                ORDER BY occurred_at DESC, headline
                 LIMIT 5
             """
             rows = await self.db.query(query, entity_name, f"%{entity_name}%")
@@ -2017,7 +2070,19 @@ class SentinelAgent(ABC):
                 context += f"- [{r['type']}] {sanitize_untrusted(r['headline'])} {score}\n"
             return context + "\n"
         except Exception as e:
-            self.logger.error(f"Failed to fetch entity context for {entity_name}: {e}")
+            # The type, not only the message.
+            #
+            # `asyncio.TimeoutError` stringifies to the empty string, so this
+            # line read "Failed to fetch entity context for EPRT: " and stopped
+            # -- an error that names the subject and not the failure. It is the
+            # same shape as the "SEC Form 4 error: " that hid a connection
+            # timeout for nine days. There are ~125 `logger.error(f"...: {e}")`
+            # sites in this tree and any of them can produce a blank tail; this
+            # is the one that was costing an agent three minutes at a time.
+            self.logger.error(
+                "Failed to fetch entity context for %s: %s: %s",
+                entity_name, type(e).__name__, e,
+            )
             return ""
 
     async def fetch_global_context(self) -> str:

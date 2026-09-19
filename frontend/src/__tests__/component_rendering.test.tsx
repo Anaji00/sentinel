@@ -25,14 +25,14 @@ describe('GlobalMap Anti-Collision & Marker Optimization Unit Tests', () => {
     };
 
     const coLocatedVessels = [
-      { id: 'v1', lat: 26.5000, lon: 56.5000 },
-      { id: 'v2', lat: 26.5000, lon: 56.5000 },
-      { id: 'v3', lat: 26.5000, lon: 56.5000 },
+      { id: 'v1', lat: 26.5, lon: 56.5 },
+      { id: 'v2', lat: 26.5, lon: 56.5 },
+      { id: 'v3', lat: 26.5, lon: 56.5 },
     ];
 
     const deconflicted = applySpatialAntiCollision(coLocatedVessels);
-    expect(deconflicted[0].lat).toBe(26.5000);
-    expect(deconflicted[1].lat).not.toBe(26.5000);
-    expect(Math.abs(deconflicted[1].lat - 26.5000)).toBeLessThan(0.01);
+    expect(deconflicted[0].lat).toBe(26.5);
+    expect(deconflicted[1].lat).not.toBe(26.5);
+    expect(Math.abs(deconflicted[1].lat - 26.5)).toBeLessThan(0.01);
   });
 });

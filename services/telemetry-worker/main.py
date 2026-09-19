@@ -207,7 +207,7 @@ async def main():
         except Exception as e:
             logger.debug("Metrics binding skipped: %s", e)
 
-    producer = SentinelProducer()
+    producer = SentinelProducer(service_name="telemetry-worker")
     await producer.start()
 
     # ── WIRE MODEL DRIFT SCHEDULER (§6.1, §6.2) ──────────────────────────────

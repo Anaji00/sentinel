@@ -112,3 +112,33 @@ async def get_system_metrics_json(redis=Depends(get_redis_optional)):
         "latencies": MetricsCollector.get_summary()["latencies"],
         "circuit_breakers": all_breakers(),
     }
+
+@router.get("/liveness")
+async def get_mechanism_liveness(redis=Depends(get_redis_optional)):
+    """Which declared mechanisms have run, how often, and when they last did.
+
+    The question this answers is the one that produced the largest single class
+    of defect in this platform's audit: a mechanism built correctly, wired
+    correctly, deployed, and never once executed. The admission bar that had
+    never refused a candidate; the focus set that never reached the financial
+    domain; the volume/open-interest chain wired end to end and receiving
+    nothing; a vector index nobody had pruned. None was visible from the code,
+    because the code was right every time.
+
+    `never` is the list worth reading. A declared mechanism with a lifetime
+    count of zero is a claim the platform makes about itself and has never once
+    honoured.
+    """
+    from shared.utils.liveness import report
+
+    rows = await report(redis)
+    never = [r for r in rows if r["never"]]
+    return {
+        "declared": len(rows),
+        "never_fired": len(never),
+        # Named separately rather than left for a caller to filter, because the
+        # filtered list is the entire point and a summary count is easy to skim
+        # past.
+        "never": [{"mechanism": r["mechanism"], "describes": r["describes"]} for r in never],
+        "mechanisms": rows,
+    }

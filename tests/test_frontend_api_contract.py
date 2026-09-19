@@ -199,7 +199,13 @@ def _frontend_provenance_union() -> set[str]:
     src = (FRONTEND / "components" / "ProvenanceBadge.tsx").read_text(encoding="utf-8")
     match = re.search(r"export type ProvenanceType\s*=\s*(.*?);", src, re.S)
     assert match, "ProvenanceBadge no longer declares a ProvenanceType union"
-    return set(re.findall(r'"([a-z_]+)"', match.group(1)))
+    # Either quote style: Prettier is configured with `singleQuote: true`,
+    # and a parser that accepts only `"` reads an empty union out of a
+    # correctly-formatted file -- which is how this check came to compare two
+    # empty sets and pass while asserting nothing.
+    union = set(re.findall(r'''["']([a-z_]+)["']''', match.group(1)))
+    assert union, "the ProvenanceType union parsed as empty"
+    return union
 
 
 def test_the_provenance_vocabulary_is_the_same_on_both_sides():
@@ -224,7 +230,7 @@ def test_the_provenance_vocabulary_is_the_same_on_both_sides():
 
 def test_the_badge_handles_every_declared_provenance_type():
     src = (FRONTEND / "components" / "ProvenanceBadge.tsx").read_text(encoding="utf-8")
-    handled = set(re.findall(r'case\s+"([a-z_]+)":', src))
+    handled = set(re.findall(r'''case\s+["']([a-z_]+)["']:''', src))
     declared = _frontend_provenance_union()
     missing = sorted(declared - handled)
     assert not missing, (

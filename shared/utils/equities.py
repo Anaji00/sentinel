@@ -113,6 +113,116 @@ def is_supported_asset(ticker: str) -> bool:
     """
     return is_valid_primary_equity(ticker) or is_major_crypto(ticker)
 
+
+# ── ASSET CLASS ──────────────────────────────────────────────────────────────
+#
+# `is_macro_asset` answers "is this not an equity", which is the question the
+# correlation split needed. It cannot answer "what kind of thing is this",
+# which is what the knowledge graph needs in order to give a node a label.
+#
+# Measured against the live graph, nothing was answering it: crude oil, gold,
+# Brent, QQQ and SPY are all stored as `:Company`, the `Commodity`, `Index` and
+# `Location` labels have RANGE indexes and zero nodes, and no edge anywhere
+# joins a vessel or a region to a company. A physical-disruption signal cannot
+# reach an energy equity because the commodity it would travel through is
+# typed as a corporation.
+#
+# The groups below are the ones already written as comments inside
+# MACRO_SYMBOLS, promoted to data so something other than a reader can use them.
+
+# The physical good itself: a futures contract on a commodity that exists.
+COMMODITY_SYMBOLS: Set[str] = {
+    # Energy
+    "CL=F", "BZ=F", "NG=F", "RB=F", "HO=F",
+    # Metals
+    "GC=F", "SI=F", "HG=F", "PL=F", "PA=F",
+    # Agriculture
+    "ZC=F", "ZW=F", "ZS=F", "KC=F", "SB=F", "CC=F", "CT=F", "LE=F",
+}
+
+# Funds and benchmarks. A vehicle that tracks something is not the thing.
+#
+# USO, GLD and XLE sit here rather than under COMMODITY_SYMBOLS even though
+# they are how most portfolios hold oil, gold and energy: they are issuers'
+# products, they can trade away from the underlying, and XLE and GDX hold
+# equities outright. The exposure they carry is a fact about them worth an
+# edge -- COMMODITY_EXPOSURE, which the vocabulary already defines -- not a
+# reason to call a fund a barrel of oil.
+INDEX_SYMBOLS: Set[str] = {
+    "ES=F", "NQ=F", "YM=F", "RTY=F",
+    "SPY", "QQQ", "DIA", "IWM", "VOO", "VTI",
+    "USO", "UNG", "BNO", "XLE", "GLD", "SLV", "IAU", "GDX", "CPER", "DBA",
+    "LQD", "HYG", "AGG", "BND",
+}
+
+# Rates, volatility and currency: priced levels rather than tradeable objects.
+MACRO_FACTOR_SYMBOLS: Set[str] = {
+    "ZN=F", "ZB=F", "ZF=F", "ZT=F", "TLT", "IEF", "SHY", "TIP",
+    "US10Y", "US02Y", "US2Y", "US30Y", "US05Y",
+    "VIX", "VXX", "UVXY", "VIXY", "SVXY", "VX=F",
+    "DX=F", "6E=F", "6J=F", "6B=F", "DXY",
+}
+
+# What each class is called in the graph. Kept here beside the symbol sets so
+# the two cannot drift; the ontology imports this rather than restating it.
+ASSET_CLASS_TO_LABEL: Dict[str, str] = {
+    "commodity": "Commodity",
+    "index": "Index",
+    "macro_factor": "MacroFactor",
+    "crypto": "CryptoAsset",
+    "equity": "Company",
+}
+
+
+def asset_class(ticker: str) -> Optional[str]:
+    """What kind of instrument a symbol is, or None if it is not one.
+
+    Returns one of: commodity, index, macro_factor, crypto, equity.
+
+    None means "this is not a recognisable instrument symbol", which is a
+    different answer from "equity" and must stay different: a caller that
+    treats an unrecognised string as an equity is how 257,473 nodes of every
+    kind ended up sharing one label.
+    """
+    if not ticker or not isinstance(ticker, str):
+        return None
+    sym = ticker.strip().upper()
+    if not sym:
+        return None
+
+    # Explicit membership first: ES=F is a futures contract but an index one,
+    # and a suffix rule alone would call it a commodity.
+    if sym in COMMODITY_SYMBOLS:
+        return "commodity"
+    if sym in INDEX_SYMBOLS:
+        return "index"
+    if sym in MACRO_FACTOR_SYMBOLS:
+        return "macro_factor"
+    if is_major_crypto(sym):
+        return "crypto"
+
+    # Then shape, for symbols no list names.
+    if sym.startswith("^"):
+        return "index"
+    if sym.endswith("=X") or re.match(r"^US\d{1,2}Y$", sym):
+        return "macro_factor"
+    if sym.endswith("=F"):
+        # An unlisted futures contract. Commodity is the larger family by a
+        # wide margin and the one whose mislabelling costs a traversal, but
+        # this is a guess and does not pretend otherwise.
+        return "commodity"
+
+    if is_valid_primary_equity(sym) or looks_like_plain_ticker(sym):
+        return "equity"
+    return None
+
+
+def looks_like_plain_ticker(raw: str) -> bool:
+    """A bare 1-5 letter symbol, optionally with a class suffix."""
+    if not raw or not isinstance(raw, str):
+        return False
+    return bool(re.match(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$", raw.strip().upper()))
+
 # ── COMPILED REGEX PATTERNS ──────────────────────────────────────────────────
 
 # OCC Options Contract Pattern (e.g. AAPL240816C00220000)

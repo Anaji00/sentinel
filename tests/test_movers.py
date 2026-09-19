@@ -300,3 +300,49 @@ def test_the_latest_price_cache_is_read_the_way_it_is_written():
     broker = _code(ROOT / "shared" / "broker" / "paper.py")
     assert "parse_quote(" in broker
     assert 'quote.get("price")' not in broker
+
+
+def test_no_quote_cache_reader_parses_it_as_an_object():
+    """The pin above named one file, so the fourth copy landed somewhere else.
+
+    `_underlying_spot` in the tradfi enricher read the cache with
+    `json.loads(raw).get("price")`. The cache holds `1623.63` for ASML, so that
+    raised AttributeError into a bare `except` and returned None for every
+    ticker -- underlying_price populated on 0 of 603 options events, and
+    otm_percentage with it, because the OTM calculation needs the spot.
+
+    Checking every reader rather than one named file is the difference between
+    a test that caught this and the one that did not.
+    """
+    import re
+
+    read_sites = []
+    for path in ROOT.rglob("*.py"):
+        if any(part in {"node_modules", ".git", "__pycache__", "tests"} for part in path.parts):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "get(quote_key(" not in text:
+            continue
+        # Code only. Both readers carry a comment describing the old
+        # object-form parse directly above the correct one, and a scan
+        # that reads prose finds the explanation and calls it the defect.
+        lines = [
+            "" if ln.lstrip().startswith("#") else ln
+            for ln in text.split('\n')
+        ]
+        for i, line in enumerate(lines):
+            if "get(quote_key(" in line:
+                window = "\n".join(lines[i:i + 18])
+                read_sites.append((path.relative_to(ROOT), i + 1, window))
+
+    assert read_sites, "the quote cache must have readers; this test found none"
+
+    offenders = [
+        f"{rel}:{ln}"
+        for rel, ln, window in read_sites
+        if re.search(r"""[.]get[(]\s*['\"](?:price|close|last)['\"]\s*[)]""", window)
+    ]
+    assert not offenders, (
+        "these read the latest-price cache as an object, but every writer in "
+        "the tree stores a bare number: " + ", ".join(offenders)
+    )

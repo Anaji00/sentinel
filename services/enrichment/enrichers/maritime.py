@@ -8,6 +8,7 @@ structured events that the rest of the system can understand.
 """
  
 import json
+import uuid
 import logging
 import asyncio
 import time
@@ -29,8 +30,15 @@ from shared.utils.sanctions import check_sanctions, mmsi_to_country
 # all point at this key; it did not exist. Flagged hulls are written here so a
 # vessel named in a headline is recognised the way a watched ticker is.
 from shared.utils.watchlists import WATCHED_VESSELS_KEY, WATCHED_VESSELS_TTL_SEC
+from shared.utils.maritime_behaviour import (
+    STS_MAX_SPEED_KNOTS,
+    STS_MAX_SEPARATION_NM,
+    implausible_position,
+    impossible_transit,
+    sts_pair,
+)
 from shared.utils.regions import classify_region, routine_band_score
-from services.enrichment.anomaly_scorer import lift_score
+from services.enrichment.anomaly_scorer import breakdown_from_score, lift_score
  
 logger = logging.getLogger("enrichment.maritime")
  
@@ -44,6 +52,35 @@ logger = logging.getLogger("enrichment.maritime")
 # A bearing that is not known is None, which every consumer already handles,
 # rather than a number no compass can show.
 AIS_HEADING_UNAVAILABLE = 511
+
+# Which AIS message types carry a position, and which carry an identity.
+#
+# Class A (PositionReport) is the only one the collector used to subscribe to,
+# so these branches only ever had to name it. Class B carries the same geometry
+# under a different key -- and ExtendedClassBPositionReport carries the ship's
+# name and type as well, which Class A position reports do not.
+#
+# Ordered most common first; the lookup is a set, but the order is how a reader
+# learns which of these actually turns up.
+_POSITION_MESSAGE_TYPES = frozenset({
+    "PositionReport",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+})
+
+_STATIC_MESSAGE_TYPES = frozenset({
+    "ShipStaticData",
+    "StaticDataReport",
+})
+
+# The block inside `Message` that holds the geometry, per type. AISStream keys
+# the body by the message type name, so this is a lookup rather than a chain of
+# `or {}` that would silently prefer whichever key happened to come first.
+_POSITION_BODY_KEYS = (
+    "PositionReport",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+)
 AIS_COG_UNAVAILABLE = 360.0
 
 
@@ -103,6 +140,321 @@ def _as_float(value) -> Optional[float]:
         return None
 
 
+def _ais_imo(static: dict) -> Optional[str]:
+    """The IMO number from a ShipStaticData block, or None.
+
+    The one identifier on an AIS message that does not change. MMSI is assigned
+    by the flag state and is reassigned with the flag -- re-registration is the
+    ordinary way a vessel breaks continuity with its own history, and it is the
+    first thing a sanctioned owner does. IMO is issued once, to the hull, for
+    the life of the hull.
+
+    This platform runs `check_sanctions` and a flags path over exactly that
+    population and was discarding the field at parse time, keeping the name
+    (which changes), the destination (which changes) and the type.
+
+    Zero is AIS for "not stated" and is not an IMO.
+    """
+    for key in ("ImoNumber", "IMONumber", "Imo", "imo"):
+        raw = static.get(key)
+        if raw in (None, "", 0, "0"):
+            continue
+        try:
+            number = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return str(number)
+    return None
+
+
+def _ais_draught(static: dict) -> Optional[float]:
+    """Maximum static draught in metres, or None.
+
+    Loaded or in ballast, which is the question a tanker transit turns on: a
+    VLCC at 22m is carrying and the same hull at 9m is not. AIS reports it in
+    decimetres in the raw NMEA and AISStream decodes it to metres; values
+    outside a plausible hull range are dropped rather than stored, because 0 is
+    the "not available" sentinel and would read as "riding empty".
+    """
+    for key in ("MaximumStaticDraught", "Draught", "draught"):
+        raw = static.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            metres = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0.1 <= metres <= 30.0:
+            return round(metres, 2)
+    return None
+
+
+def _ais_length(static: dict) -> Optional[float]:
+    """Overall length in metres from the AIS dimension block, or None.
+
+    AIS reports the antenna's offsets from bow, stern, port and starboard
+    rather than a length; the hull is the sum of the fore and aft offsets. A
+    zero in both is "not available".
+    """
+    dim = static.get("Dimension") or static.get("dimension") or {}
+    if not isinstance(dim, dict):
+        return None
+    total = 0.0
+    for key in ("A", "B", "a", "b"):
+        raw = dim.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            total += float(raw)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 1) if 1.0 <= total <= 500.0 else None
+
+
+def _ais_eta(static: dict) -> Optional[str]:
+    """The reported ETA as an ISO-like string, or None.
+
+    AIS carries month, day, hour and minute with no year -- the sender does not
+    state one -- so this is rendered as the partial value it is rather than
+    guessed into a full timestamp. Month 0 or day 0 is "not available".
+    """
+    eta = static.get("Eta") or static.get("ETA") or static.get("eta")
+    if not isinstance(eta, dict):
+        return None
+    try:
+        month = int(eta.get("Month") or eta.get("month") or 0)
+        day = int(eta.get("Day") or eta.get("day") or 0)
+        hour = int(eta.get("Hour") or eta.get("hour") or 0)
+        minute = int(eta.get("Minute") or eta.get("minute") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"--{month:02d}-{day:02d}T{hour:02d}:{minute:02d}Z"
+
+
+# Vessels currently reporting stationary, as a Redis GEO set. One bounded
+# radius query answers "who else is stopped within a cable of this hull",
+# against a scan of every `vessel:last_seen:*` key -- which the gap detector's
+# own docstring records as the mistake it had to stop making.
+STOPPED_VESSELS_GEO_KEY = "sentinel:vessels:stopped"
+STOPPED_GEO_TTL_SEC = 6 * 3600
+
+# An STS claim names both hulls, so it is written once per pair rather than once
+# per report. Without this a two-hour transfer emits an event every few seconds
+# from both transponders.
+STS_DEDUP_TTL_SEC = 6 * 3600
+
+# How many co-location checks one batch may spend. See the call site.
+STS_CHECKS_PER_BATCH = 40
+
+
+async def _previous_positions(redis_client, mmsis: list) -> dict:
+    """The last stored report for each hull, keyed by MMSI. One mget."""
+    out = {}
+    if redis_client is None or not mmsis:
+        return out
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        keys = [f"vessel:last_seen:{m}" for m in mmsis]
+        values = await raw.mget(keys)
+        for mmsi, blob in zip(mmsis, values or []):
+            if not blob:
+                continue
+            text = blob if isinstance(blob, str) else blob.decode("utf-8")
+            row = json.loads(text)
+            # `ts` is an ISO string for the gap detector; the behaviours need a
+            # number. Written as `epoch` since this change, parsed from the ISO
+            # form for rows stored before it.
+            if row.get("epoch") is None and row.get("ts"):
+                try:
+                    row["epoch"] = datetime.fromisoformat(row["ts"]).timestamp()
+                except (TypeError, ValueError):
+                    continue
+            row["ts"] = row.get("epoch")
+            out[mmsi] = row
+    except Exception as _exc:
+        swallowed("enrichment.maritime.previous_positions", _exc, logger)
+    return out
+
+
+async def _stopped_neighbour(redis_client, mmsi: str, lat: float, lon: float):
+    """The nearest other stopped hull that satisfies `sts_pair`, or None."""
+    if redis_client is None:
+        return None
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        near = await raw.geosearch(
+            STOPPED_VESSELS_GEO_KEY,
+            longitude=lon, latitude=lat,
+            radius=STS_MAX_SEPARATION_NM * 1852.0, unit="m",
+            count=8, sort="ASC",
+        )
+    except Exception as _exc:
+        swallowed("enrichment.maritime.stopped_neighbour", _exc, logger)
+        return None
+
+    candidates = []
+    for entry in near or []:
+        name = entry[0] if isinstance(entry, (list, tuple)) else entry
+        name = name.decode() if isinstance(name, bytes) else str(name)
+        if name != str(mmsi):
+            candidates.append(name)
+    if not candidates:
+        return None
+
+    rows = await _previous_positions(redis_client, [str(mmsi)] + candidates)
+    mine = rows.get(str(mmsi))
+    if not mine:
+        return None
+    now = datetime.now(timezone.utc).timestamp()
+    for other_mmsi in candidates:
+        theirs = rows.get(other_mmsi)
+        if not theirs:
+            continue
+        evidence = sts_pair(mine, theirs, now=now)
+        if not evidence:
+            continue
+        # One claim per pair per window, whichever transponder reports first.
+        pair_key = ":".join(sorted((str(mmsi), other_mmsi)))
+        try:
+            claimed = await getattr(redis_client, "raw", redis_client).set(
+                f"sentinel:vessels:sts_seen:{pair_key}", "1",
+                ex=STS_DEDUP_TTL_SEC, nx=True,
+            )
+        except Exception as _exc:
+            swallowed("enrichment.maritime.sts_dedup", _exc, logger)
+            claimed = True
+        if not claimed:
+            return None
+        return {"mmsi": other_mmsi, **evidence}
+    return None
+
+
+def _spoof_event(raw, mmsi, vessel, lat, lon, region, flags, vtype, transit):
+    """A transponder reported a position it could not have reached."""
+    name = (vessel or {}).get("name") or mmsi
+    return NormalizedEvent(
+        event_id=str(uuid.uuid4()),
+        trace_id=raw.trace_id,
+        type=EventType.VESSEL_SPOOF,
+        occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+        source=raw.source,
+        source_reliability=baseline_reliability(raw.source),
+        primary_entity=Entity(
+            id=mmsi, type=EntityType.VESSEL, name=name, flags=flags,
+            country_code=mmsi_to_country(mmsi) or None,
+        ),
+        latitude=lat, longitude=lon, region=region,
+        country_code=mmsi_to_country(mmsi) or None,
+        headline=(
+            f"AIS identity anomaly: {name} implies "
+            f"{transit['implied_speed_knots']} kn over {transit['distance_nm']} nm"
+        ),
+        summary=(
+            f"Two consecutive AIS reports for MMSI {mmsi} are {transit['distance_nm']} nm "
+            f"apart {transit['elapsed_seconds']:.0f} seconds apart, implying "
+            f"{transit['implied_speed_knots']} knots against a "
+            f"{transit['threshold_knots']}-knot plausibility bound. Either two "
+            f"transmitters share this identity or one position is fabricated. "
+            f"This is a statement about the data, not about the vessel."
+        ),
+        vessel_data=VesselData(
+            mmsi=mmsi, latitude=lat, longitude=lon,
+            vessel_type=vtype, last_seen_region=region,
+        ),
+        tags=["maritime", "vessel_spoof", "ais_integrity"] + (["sanctioned"] if flags else []),
+        named_entities=[str(name)],
+        anomaly_score=0.82,
+    )
+
+
+def _inland_event(raw, mmsi, vessel, lat, lon, region, flags, vtype, evidence):
+    """A transponder reported a position that is not water."""
+    name = (vessel or {}).get("name") or mmsi
+    return NormalizedEvent(
+        event_id=str(uuid.uuid4()),
+        trace_id=raw.trace_id,
+        type=EventType.VESSEL_SPOOF,
+        occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+        source=raw.source,
+        source_reliability=baseline_reliability(raw.source),
+        primary_entity=Entity(
+            id=mmsi, type=EntityType.VESSEL, name=name, flags=flags,
+            country_code=mmsi_to_country(mmsi) or None,
+        ),
+        latitude=lat, longitude=lon, region=region,
+        country_code=mmsi_to_country(mmsi) or None,
+        headline=(
+            f"AIS position anomaly: {name} reporting inland in "
+            f"{evidence['reported_region']}"
+        ),
+        summary=(
+            f"MMSI {mmsi} reported {lat:.3f}, {lon:.3f}, which falls inside "
+            f"{evidence['reported_region']} and inside no maritime region. A hull "
+            f"cannot be there. Unlike the transit check this needs no previous "
+            f"report, so it catches a transponder that sits still in the wrong "
+            f"place as well as one that jumps. This is a statement about the "
+            f"data, not about the vessel."
+        ),
+        vessel_data=VesselData(
+            mmsi=mmsi, latitude=lat, longitude=lon,
+            vessel_type=vtype, last_seen_region=region,
+        ),
+        tags=["maritime", "vessel_spoof", "ais_integrity", "position_inland"]
+             + (["sanctioned"] if flags else []),
+        named_entities=[str(name)],
+        # Below the transit anomaly's 0.82. A jump between two reports is two
+        # observations contradicting each other; this is one observation
+        # contradicting the coastline, which is a weaker claim -- a coarse
+        # polygon near a river mouth or a port basin can put a real hull just
+        # inside a land region.
+        anomaly_score=0.74,
+    )
+
+
+def _sts_event(raw, mmsi, vessel, lat, lon, region, partner, vtype=None):
+    """Two hulls stopped alongside each other for long enough to move cargo."""
+    name = (vessel or {}).get("name") or mmsi
+    flags = (vessel or {}).get("flags") or []
+    return NormalizedEvent(
+        event_id=str(uuid.uuid4()),
+        trace_id=raw.trace_id,
+        type=EventType.VESSEL_STS,
+        occurred_at=raw.occurred_at or datetime.now(timezone.utc),
+        source=raw.source,
+        source_reliability=baseline_reliability(raw.source),
+        primary_entity=Entity(
+            id=mmsi, type=EntityType.VESSEL, name=name, flags=flags,
+            country_code=mmsi_to_country(mmsi) or None,
+        ),
+        latitude=partner["midpoint"]["lat"], longitude=partner["midpoint"]["lon"],
+        region=region, country_code=mmsi_to_country(mmsi) or None,
+        headline=(
+            f"Possible STS: {name} alongside MMSI {partner['mmsi']} for "
+            f"{partner['dwell_hours']}h at {partner['separation_nm']} nm"
+        ),
+        summary=(
+            f"MMSI {mmsi} and MMSI {partner['mmsi']} have been within "
+            f"{partner['separation_nm']} nm of each other, both under "
+            f"{max(partner['speed_knots'])} knots, for {partner['dwell_hours']} hours in "
+            f"{region or 'open water'}. That geometry is a ship-to-ship transfer or a "
+            f"rendezvous; it is not a berth, because neither hull is alongside a quay, "
+            f"and it is not traffic, because neither is making way."
+        ),
+        vessel_data=VesselData(
+            mmsi=mmsi, latitude=lat, longitude=lon,
+            vessel_type=vtype, last_seen_region=region,
+        ),
+        tags=["maritime", "vessel_sts", "co_location"] + (["sanctioned"] if flags else []),
+        named_entities=[str(name), str(partner["mmsi"])],
+        anomaly_score=0.78,
+    )
+
+
 class MaritimeEnricher:
     # ── STRICT DI ALIGNMENT ──
     def __init__(self, scorer, redis_client, graph_writer, resolver=None):
@@ -125,9 +477,9 @@ class MaritimeEnricher:
         for raw in events:
             payload = raw.raw_payload
             msg_type = payload.get("MessageType", "")
-            if msg_type == "PositionReport":
+            if msg_type in _POSITION_MESSAGE_TYPES:
                 positions.append(raw)
-            elif msg_type == "ShipStaticData":
+            elif msg_type in _STATIC_MESSAGE_TYPES:
                 statics.append(raw)
             elif payload.get("instrument") == "sentinel-1-sar":
                 # Radar, not AIS.
@@ -289,7 +641,12 @@ class MaritimeEnricher:
             if not mmsi or mmsi == "0": continue
             
             msg = payload.get("Message") or {}
-            pos = msg.get("PositionReport") or {}
+            pos = {}
+            for _key in _POSITION_BODY_KEYS:
+                candidate = msg.get(_key)
+                if candidate:
+                    pos = candidate
+                    break
             lat = pos.get("Latitude")
             lon = pos.get("Longitude")
             if lat is None or lon is None: continue
@@ -310,8 +667,14 @@ class MaritimeEnricher:
             # and a missing one were the same value.
             speed = _ais_sog(pos.get("Sog"))
             heading = _ais_heading(pos.get("TrueHeading"))
-            nav_code = pos.get("NavigationalStatus") or 0
-            nav_status = decode_nav_status(nav_code)
+            # `or 0` here would read a Class B report -- which has no
+            # NavigationalStatus field at all -- as status 0, "Under way using
+            # engine". That is an assertion about a vessel that made none, and
+            # it is the same defect as the map's invented 12.4 knots. Class A
+            # always carries the field, so its genuine 0 is still a 0.
+            _raw_nav = pos.get("NavigationalStatus")
+            nav_code = _raw_nav if isinstance(_raw_nav, int) else None
+            nav_status = decode_nav_status(nav_code) if nav_code is not None else None
             region = classify_region(lat, lon)
             
             parsed.append((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region))
@@ -355,6 +718,7 @@ class MaritimeEnricher:
         scores = await self.scorer.score_kinematic_event_batch(
             entities, lats_list, lons_list, speeds_list, headings_list,
             timestamps_list, extra_features_list,
+            domain="maritime",
         )
         
         # Batch watchlist & frequency checks concurrently to avoid sequential awaits blocking
@@ -366,7 +730,15 @@ class MaritimeEnricher:
             ))
         check_results = await asyncio.gather(*check_tasks)
         
+        # Each hull's previous report, for the two behaviours below. One mget
+        # for the batch rather than a get per vessel.
+        previous_positions = await _previous_positions(
+            self.redis, [row[3] for row in parsed]
+        )
+
         results = []
+        spoof_events: list = []
+        sts_events: list = []
         pipe = self.redis.raw.pipeline()
         for idx, ((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel, score_dict) in enumerate(zip(parsed, vessels, scores)):
             raw_anomaly = score_dict.get("score", 0.0)
@@ -435,22 +807,119 @@ class MaritimeEnricher:
                 anomaly = lift_score(raw_anomaly, w_boost)
                 anomaly = lift_score(anomaly, f_boost, w_boost)
 
+            observed_at = (raw.occurred_at or datetime.now(timezone.utc))
+
+            # The epoch beside the ISO string, and when this hull last started
+            # sitting still.
+            #
+            # `ts` was written as an ISO string for the gap detector to read as
+            # a timestamp. Two behaviours need it as a number and need one more
+            # fact besides: a transfer is not "these two are close", it is
+            # "these two have been stopped together for hours", and that cannot
+            # be recovered from a single report.
+            previous = previous_positions.get(mmsi) or {}
+            was_stopped = float(previous.get("speed") or 99.0) <= STS_MAX_SPEED_KNOTS
+            now_stopped = (speed is not None) and float(speed) <= STS_MAX_SPEED_KNOTS
+            stationary_since = (
+                previous.get("stationary_since") if (was_stopped and now_stopped)
+                else (observed_at.timestamp() if now_stopped else None)
+            )
+
             pipe.set(
                 f"vessel:last_seen:{mmsi}",
                 json.dumps({
                     "lat": lat, "lon": lon, "heading": heading,
-                    "region": region, "speed": speed, "ts": (raw.occurred_at or datetime.now(timezone.utc)).isoformat(),
+                    "region": region, "speed": speed, "ts": observed_at.isoformat(),
+                    "epoch": observed_at.timestamp(),
+                    "stationary_since": stationary_since,
                 }),
-                ex = 172800 
+                ex = 172800
             )
+
+            # A geo index of vessels currently stopped, so co-location is a
+            # bounded radius query rather than a scan of every hull afloat.
+            # Redis GEO was available and unused; the alternative is O(N) over
+            # `vessel:last_seen:*`, which the gap detector's own docstring
+            # records as the mistake it had to stop making.
+            if now_stopped and lat is not None and lon is not None:
+                pipe.geoadd(STOPPED_VESSELS_GEO_KEY, (lon, lat, mmsi))
+                pipe.expire(STOPPED_VESSELS_GEO_KEY, STOPPED_GEO_TTL_SEC)
+            else:
+                pipe.zrem(STOPPED_VESSELS_GEO_KEY, mmsi)
             
-            results.append((raw, meta, mmsi, lat, lon, speed, heading, nav_status, nav_code, region, vessel, flags, vtype, anomaly))
-            
+            # The breakdown travels with the row, for the reason the note above
+            # the next loop gives: that loop does not unpack the scorer's
+            # output, so reading `score_dict` there would silently bind the last
+            # vessel's score to every event -- which is exactly what `nav_code`
+            # did before it was moved into this tuple.
+            results.append((raw, meta, mmsi, lat, lon, speed, heading, nav_status, nav_code, region, vessel, flags, vtype, anomaly,
+                            breakdown_from_score(score_dict, "maritime")))
+
+            # -- identity spoofing -------------------------------------------
+            #
+            # Two reports that cannot both be true. The Kalman filter already
+            # turns this into a residual and the residual into a score; what was
+            # missing is the claim. A score says "unusual"; VESSEL_SPOOF says
+            # "this transponder reported a position it could not have reached",
+            # which is a different sentence and the one the rule asks for.
+            prev = previous_positions.get(mmsi)
+            if prev and lat is not None and lon is not None:
+                transit = impossible_transit(
+                    prev,
+                    {"lat": lat, "lon": lon, "ts": observed_at.timestamp()},
+                )
+                if transit:
+                    spoof_events.append(_spoof_event(
+                        raw, mmsi, vessel, lat, lon, region, flags, vtype, transit
+                    ))
+
+            # A position that is not water, checked with no previous report.
+            #
+            # The transit test above needs two reports and measures the speed
+            # between them, so a transponder that simply sits inland is passed:
+            # 65 vessel positions in seven days classified into an airspace
+            # region and tripped nothing, including one 200km from the Red Sea
+            # coast and one on land north of Hormuz.
+            if lat is not None and lon is not None:
+                inland = implausible_position(lat, lon)
+                if inland:
+                    spoof_events.append(_inland_event(
+                        raw, mmsi, vessel, lat, lon, region, flags, vtype, inland
+                    ))
+
         await pipe.execute()
+
+        # -- ship-to-ship transfer -------------------------------------------
+        #
+        # Co-location is checked after the batch is written, so a pair reported
+        # in the same batch is visible to the query. Only for hulls that are
+        # themselves stopped: a moving vessel cannot be alongside.
+        # Bounded per batch. Each check is a geosearch plus an mget, and while
+        # the stopped filter already removes most reports -- a vessel under way
+        # cannot be alongside -- an anchorage-heavy feed can leave a lot of
+        # them. A transfer lasts hours and both hulls report every few minutes,
+        # so a pair missed in this batch is seen in the next one; spending the
+        # whole batch budget on one crowded anchorage is the worse trade.
+        checked = 0
+        for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel in zip(parsed, vessels):
+            if checked >= STS_CHECKS_PER_BATCH:
+                break
+            if speed is None or float(speed) > STS_MAX_SPEED_KNOTS:
+                continue
+            if lat is None or lon is None:
+                continue
+            checked += 1
+            partner = await _stopped_neighbour(self.redis, mmsi, lat, lon)
+            if partner:
+                sts_events.append(_sts_event(
+                    raw, mmsi, vessel, lat, lon, region, partner, vtype=None
+                ))
+
+        behaviour_events = [e for e in (spoof_events + sts_events) if e]
         
         # Batch graph updates
         graph_tasks = []
-        for (_, _, mmsi, _, _, _, _, _, _, region, vessel, flags, vtype, _) in results:
+        for (_, _, mmsi, _, _, _, _, _, _, region, vessel, flags, vtype, _, _) in results:
             graph_tasks.append(self.graph.upsert_vessel(mmsi, {
                 "name": vessel.get("name", ""),
                 "vessel_type": vtype,
@@ -471,7 +940,7 @@ class MaritimeEnricher:
         # last vessel's status, applied to every vessel in this one. Python does
         # not complain, and the value is a plausible integer, so the emergency
         # flag was simply wrong rather than absent.
-        for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, nav_code, region, vessel, flags, vtype, anomaly) in results:
+        for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, nav_code, region, vessel, flags, vtype, anomaly, breakdown) in results:
             is_sanctioned = bool(flags)
             # By code, not by prose in the label -- see the note at the
             # nav_anomaly assignment above.
@@ -522,8 +991,25 @@ class MaritimeEnricher:
                 ),
                 tags = self._tags(region, vtype, flags),
                 anomaly_score = anomaly,
+                # What backed this score, carried onto the event.
+                #
+                # The scorer has always returned coverage, significance and its
+                # own domain for kinematic events, and the Kalman residual is a
+                # genuine spatial measurement. None of it reached the event, so
+                # `/explain/event/{id}` had nothing to read for any vessel --
+                # 7,370 of them in the hour this was measured, against 198
+                # equity events that did carry a breakdown.
+                anomaly_breakdown = breakdown,
             ))
-            
+
+        # The two behaviours detected above, alongside the position reports.
+        #
+        # `rule_maritime_chokepoint_evasion` triggers on vessel_dark, vessel_sts
+        # and vessel_spoof and correlates on the same three. Two of the three
+        # had no producer at either end, so the rule was a dark-gap rule wearing
+        # the name of an evasion rule.
+        final_events.extend(behaviour_events)
+
         return final_events
     
     # ── Static ────────────────────────────────────────────────────────────────
@@ -535,14 +1021,31 @@ class MaritimeEnricher:
         dest = str(s.get("Destination", "")).strip()
         code = int(s.get("Type") or 0)
         vtype = decode_vessel_type(code)
+
+        # The rest of the block. `VesselData` has declared all four of these
+        # since it was written; the handler read three fields out of the
+        # message and dropped the ones that identify the hull and say whether
+        # it is loaded.
+        imo = _ais_imo(s)
+        draught = _ais_draught(s)
+        length_m = _ais_length(s)
+        eta = _ais_eta(s)
         
         flags = check_sanctions(name, mmsi)
+        if imo:
+            # A hull that has changed MMSI keeps its IMO, which is the whole
+            # reason the field is worth carrying on this platform.
+            flags = list(dict.fromkeys(list(flags or []) + list(check_sanctions(name, imo) or [])))
 
+        # The IMO travels with the cached identity, so a later position report
+        # -- which carries no static block at all -- can be joined to the hull
+        # rather than only to the MMSI that happens to be transmitting it.
         await self.redis.raw.set(
             f"vessel:info:{mmsi}",
             json.dumps({ "name": name, "destination": dest,
-                        "vessel_type": vtype, "flags": flags }),
-            ex = 864000 
+                        "vessel_type": vtype, "flags": flags,
+                        "imo": imo, "draught": draught }),
+            ex = 864000
         )
         await self.graph.upsert_vessel(mmsi, {"name": name, "vessel_type": vtype, "flags": flags})
 
@@ -559,6 +1062,7 @@ class MaritimeEnricher:
             vessel_data = VesselData(
                 mmsi=mmsi, vessel_type=vtype, destination=dest, cargo_type=code,
                 flag_state=mmsi_to_country(mmsi) or None,
+                imo=imo, draught=draught, length_meters=length_m, eta=eta,
             ),
             country_code = mmsi_to_country(mmsi) or None,
             tags = [vtype.lower(), "static_data"],

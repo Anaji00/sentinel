@@ -29,7 +29,7 @@ from shared.utils.tasks import safe_create_task
 logger = logging.getLogger("correlation.soft")
 from functools import partial
 # Import datetime for handling time-based logic.
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 # Import type hints for better code readability and IDE support.
 from typing import List, Optional, Dict
 
@@ -38,6 +38,9 @@ from shared.models import NormalizedEvent
 from shared.models.events import event_domain as canonical_domain
 from shared.models.events import resolve_event_domain
 from shared.utils.ollama import OllamaClient
+from shared.utils.vector_index import EVENT_COLLECTION as _EVENT_COLLECTION
+from shared.utils.quiet_failures import swallowed
+from shared.utils.liveness import declare as _declare, fired as _fired
 # Initialize the logger specific to this soft correlation module.
 logger = logging.getLogger("correlation.soft")
 
@@ -48,7 +51,22 @@ logger = logging.getLogger("correlation.soft")
 # frame; comparing them against corrected ones would be worse than either
 # alone. A new collection separates them without deleting anything -- the old
 # one can be dropped once nothing needs it.
-EVENT_COLLECTION = "sentinel_events_v2"
+# Imported rather than declared: the API that reads these vectors had its
+# own copy of this name and the two had drifted apart.
+EVENT_COLLECTION = _EVENT_COLLECTION
+
+# How long a vector outlives nothing.
+#
+# Set to the `events` hypertable's own retention, because a point whose event
+# has been dropped can still be returned by a similarity search and then cannot
+# be fetched. Migration 0020 sets `drop_after: 90 days`; if that changes, this
+# is the other half and has to change with it. Nothing pruned this index before:
+# 596,154 points had accumulated against a table that keeps ninety days.
+VECTOR_RETENTION_SEC = int(os.getenv("VECTOR_RETENTION_SEC", str(90 * 86400)))
+
+# Finding 545: nothing had ever deleted a vector.
+_declare("correlation.vectors.pruned",
+         "vector points whose events aged out were removed from the index")
 
 # Event types that say only "this thing is here now".
 #
@@ -549,6 +567,79 @@ class SoftCorrelator:
             # Log the error. (Note: 'debug44' appears to be a typo for 'debug' or 'error' in the original code).
             logger.debug(f"Qdrant store failed for event{event.event_id}: {e}", exc_info=True)
     
+    async def prune_expired_vectors(self) -> int:
+        """Drop vector points whose event no longer exists. Returns the count.
+
+        Nothing in this platform has ever deleted a vector. `events` drops after
+        90 days and the index grew to 596,154 points against it, so every point
+        older than the retention window describes an event that cannot be
+        fetched: `/search/similar/{event_id}` returns a neighbour whose row is
+        gone, and the semantic path cites evidence nobody can open.
+
+        It also quietly falsifies a comment one method below, which excludes
+        position telemetry from results "for as long as they take to age out".
+        Nothing was ageing out.
+
+        Pruning by the payload's own `occurred_at` rather than by comparing
+        against Timescale: the two systems already agree on that field, one
+        filtered delete replaces 596,154 existence checks, and an event deleted
+        early for any other reason is not this sweep's business.
+        """
+        if not self._client:
+            return 0
+        try:
+            from qdrant_client.http import models
+
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=VECTOR_RETENTION_SEC)
+            stale = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="occurred_at",
+                        range=models.DatetimeRange(lt=cutoff),
+                    )
+                ]
+            )
+            # Counted before the delete so the log says what was removed. Qdrant
+            # reports an operation status, not a row count.
+            #
+            # exact=True, and the difference is not a nicety. `occurred_at` is an
+            # unindexed payload string, and the estimating counter answered
+            # 298,097 -- almost exactly half the collection -- for every cutoff
+            # it was given: 30 days, 60, 80 and 90 all returned the identical
+            # number. The true figures are 731, 202, 167 and 167. The delete
+            # itself would still have been right, because it selects on the
+            # filter rather than on this number, but the line below would have
+            # reported three orders of magnitude more than it removed, and the
+            # zero-guard would have been reading noise.
+            try:
+                measured = await self._client.count(
+                    collection_name=EVENT_COLLECTION, count_filter=stale, exact=True
+                )
+                n = int(getattr(measured, "count", 0) or 0)
+            except Exception as _exc:
+                swallowed("correlation.soft_correlator.prune_count", _exc, logger)
+                n = 0
+
+            if n <= 0:
+                return 0
+
+            await self._client.delete(
+                collection_name=EVENT_COLLECTION,
+                points_selector=models.FilterSelector(filter=stale),
+            )
+            _fired("correlation.vectors.pruned", n)
+            logger.info(
+                "Pruned %d vector point(s) older than %d days; their events had "
+                "already aged out of retention.",
+                n, VECTOR_RETENTION_SEC // 86400,
+            )
+            return n
+        except Exception as exc:
+            # A failed sweep leaves orphans, which is the previous state rather
+            # than a new fault.
+            swallowed("correlation.soft_correlator.prune_expired_vectors", exc, logger)
+            return 0
+
     async def find_similar(
             self, 
             embedding: List[float],

@@ -18,7 +18,12 @@ Supported Relationship Families:
 import logging
 from typing import Optional, Dict, Any, List
 from shared.kafka import SentinelProducer, Topics
-from shared.models.ontology import is_valid_predicate, normalize_predicate, is_valid_node_label
+from shared.models.ontology import (
+    is_valid_predicate,
+    normalize_predicate,
+    is_valid_node_label,
+    resolve_node_label,
+)
 
 logger = logging.getLogger("enrichment.graph")
 
@@ -312,14 +317,20 @@ class GraphWriter:
         if not source_id or not target_id or not relation_type:
             return
         
-        normalized_rel = normalize_predicate(relation_type, default="RELATED_TO")
+        normalized_rel = normalize_predicate(
+            relation_type, default="RELATED_TO", source="graph_writer.link_entities",
+        )
         properties = properties or {}
         
         try:
             link_data = {
                 "target_id": str(target_id).upper(),
-                "source_label": source_label if is_valid_node_label(source_label) else "Entity",
-                "target_label": target_label if is_valid_node_label(target_label) else "Entity",
+                "source_label": resolve_node_label(
+                    source_label, source_id, source="graph_writer.link_entities",
+                ),
+                "target_label": resolve_node_label(
+                    target_label, target_id, source="graph_writer.link_entities",
+                ),
                 "relation_type": normalized_rel,
                 "weight": float(properties.get("weight", 1.0)),
                 # An unrated relationship is left unrated, not asserted at 1.0.
@@ -357,7 +368,9 @@ class GraphWriter:
                 "action": "ADD_TAGS",
                 "data": {
                     "tags": tags,
-                    "label": label if is_valid_node_label(label) else "Entity"
+                    "label": resolve_node_label(
+                        label, entity_id, source="graph_writer.add_tags",
+                    )
                 }
             }
             await self.producer.send(Topics.ONTOLOGY_PROPOSALS, tag_proposal, key=str(entity_id).upper())

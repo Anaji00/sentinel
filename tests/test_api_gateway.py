@@ -342,13 +342,38 @@ def test_covered_calls_zscore_view_lookup():
 
 
 def test_broker_execution_order_dispatch():
-    from services.api_gateway.dependencies import create_jwt_token, get_redis_client
+    from services.api_gateway.dependencies import (
+        create_jwt_token,
+        get_db_optional,
+        get_redis_client,
+    )
     client = TestClient(app)
-    client.cookies.set("sentinel_session", create_jwt_token({"sub": "admin@sentinel.io"}))
+    # ADMIN, because this route now requires it -- matching POST
+    # /portfolio/orders, which reaches the same venue and always has.
+    #
+    # The cookie here said `admin@sentinel.io` and minted a token with the
+    # default role, which is ANALYST. That is exactly the hazard portfolio.py
+    # documents: the address in a session says nothing about the principal, so
+    # gating order entry at ANALYST makes every signed-in visitor an order-entry
+    # principal.
+    client.cookies.set(
+        "sentinel_session",
+        create_jwt_token({"sub": "admin@sentinel.io"}, role="ADMIN"),
+    )
 
     mock_redis = MagicMock()
     mock_redis.raw.get = AsyncMock(return_value=None)
     app.dependency_overrides[get_redis_client] = lambda: mock_redis
+
+    # A durable store, because the route now refuses to place an order it
+    # cannot record. That refusal is the point -- an executed-but-unaudited
+    # trade is not a recoverable state -- so the test supplies a ledger rather
+    # than the route dropping the requirement.
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock(return_value=None)
+    mock_db.query = AsyncMock(return_value=[])
+    mock_db.query_one = AsyncMock(return_value=None)
+    app.dependency_overrides[get_db_optional] = lambda: mock_db
 
     try:
         order_payload = {
@@ -379,8 +404,22 @@ def test_broker_execution_order_dispatch():
         assert data["bracket_submitted"] is True
         assert data["target_price"] == 245.0
         assert data["stop_loss"] == 210.0
+
+        # And the half this never checked: an ordinary session is refused.
+        # Without this the role gate could be removed and every assertion
+        # above would still pass.
+        client.cookies.set(
+            "sentinel_session",
+            create_jwt_token({"sub": "analyst@sentinel.io"}, role="ANALYST"),
+        )
+        refused = client.post("/api/v1/trading/orders/execute", json=order_payload)
+        assert refused.status_code == 403, (
+            "an ANALYST session must not be able to place an order: session "
+            "cookies resolve to ANALYST by default"
+        )
     finally:
         app.dependency_overrides.pop(get_redis_client, None)
+        app.dependency_overrides.pop(get_db_optional, None)
 
 
 def test_social_twitter_poller_rss_parsing():

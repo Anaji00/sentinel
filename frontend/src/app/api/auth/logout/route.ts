@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server';
 
 export async function POST() {
   const response = NextResponse.json({ success: true });
-  const isProduction = process.env.NODE_ENV === 'production' || process.env.SENTINEL_ENV === 'production';
+  const isProduction =
+    process.env.NODE_ENV === 'production' || process.env.SENTINEL_ENV === 'production';
   const isSecureCookie = isProduction || process.env.COOKIE_SECURE !== 'false';
 
   response.cookies.set({

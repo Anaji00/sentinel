@@ -219,7 +219,11 @@ def test_the_header_shows_the_signed_in_user_not_a_persona():
     src = _code(HEADER)
     for invented in ("A. VANCE", "INSTITUTIONAL", '"AV"', ">AV<"):
         assert invented not in src, f"fabricated identity is back: {invented!r}"
-    assert "/api/auth/session" in src, "identity must come from the session"
+    # See the note in test_frontend_backend_harmonization: identity is read
+    # once, by the provider, and consumed here through useSession().
+    assert "/api/auth/session" in src or "useSession()" in src, (
+        "identity must come from the session"
+    )
 
 
 def test_the_header_reports_a_measured_agent_count():

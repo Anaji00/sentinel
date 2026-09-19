@@ -5,8 +5,8 @@ Data Health Dashboard, Liveness/Readiness Probes, and Secrets Audit.
 """
 
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Request
-from shared.utils.heartbeat import get_all_heartbeats_status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from shared.utils.heartbeat import get_all_heartbeats_status, suppressed_scans
 from shared.utils.source_freshness import source_freshness, stale_sources, degraded_sources
 from shared.utils.secrets import audit_secrets_environment
 from shared.utils.quiet_failures import swallowed
@@ -38,10 +38,18 @@ async def get_liveness():
 
 @router.get("/readiness")
 async def get_readiness(
+    response: Response,
     db = Depends(get_db_optional),
     redis = Depends(get_redis_optional),
 ):
-    """Deep readiness check verifying TimescaleDB and Redis connectivity."""
+    """Deep readiness check verifying TimescaleDB and Redis connectivity.
+
+    The status code is the answer. This computed `status_code = 200 if ready
+    else 503` into a local and then returned a bare dict, so FastAPI replied
+    200 whatever the probes found -- a readiness endpoint that could report
+    DEGRADED in its body and never once fail. Anything reading it the way
+    readiness endpoints are read, by status, saw a permanently ready service.
+    """
     db_ok = False
     redis_ok = False
 
@@ -61,7 +69,7 @@ async def get_readiness(
             logger.warning(f"Readiness Redis probe failed: {e}")
 
     ready = db_ok and redis_ok
-    status_code = 200 if ready else 503
+    response.status_code = 200 if ready else 503
     return {
         "status": "READY" if ready else "DEGRADED",
         "database": "CONNECTED" if db_ok else "DISCONNECTED",
@@ -94,6 +102,19 @@ async def get_data_health_dashboard(
             status["sources"] = freshness
             status["stale_sources"] = [r["source"] for r in stale]
             status["stale_source_count"] = len(stale)
+
+            # Detectors that declined to scan because their feed was stale.
+            #
+            # The gap detectors suppress dark-vessel and dark-aircraft alarms
+            # when the collector heartbeat is stale -- correctly, because a dead
+            # feed makes every tracked object look dark. That suppression was
+            # recorded only as an INFRASTRUCTURE_DEGRADED event, which no rule
+            # names, no alert path consumes and no surface showed. Without it a
+            # quiet vessel_dark count and a sweep that never ran are the same
+            # number.
+            suppressed = await suppressed_scans(redis)
+            status["suppressed_scans"] = suppressed
+            status["suppressed_scan_count"] = len(suppressed)
             # Alive but no longer producing at the rate it used to. Silence is
             # caught above; decay is not, because the cadence a source is
             # judged against decays with it.

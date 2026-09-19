@@ -24,6 +24,8 @@ import useSWR from 'swr';
 import { Activity, AlertTriangle, Bot, GitBranch, Scale } from 'lucide-react';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
+import { formatNumber } from '../lib/format';
+import { POLL } from './ui/DataProvider';
 
 interface AgentProcess {
   name: string | null;
@@ -81,9 +83,11 @@ const STATUS_TONE: Record<string, string> = {
 function Stat({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
   return (
     <div className="min-w-0">
-      <div className="text-[10px] uppercase tracking-wider text-slate-500">{label}</div>
-      <div className="text-lg font-semibold text-slate-100 tabular-nums leading-tight truncate">{value}</div>
-      {hint && <div className="text-[10px] text-slate-500 truncate">{hint}</div>}
+      <div className="text-micro uppercase tracking-wider text-ink-mute">{label}</div>
+      <div className="text-lg font-semibold text-ink tabular-nums leading-tight truncate">
+        {value}
+      </div>
+      {hint && <div className="text-micro text-ink-mute truncate">{hint}</div>}
     </div>
   );
 }
@@ -92,10 +96,10 @@ export default function AgentSwarmTelemetry() {
   const { data: processes, error: procError } = useSWR<{
     active_agents_count: number;
     agents: AgentProcess[];
-  }>('/agents/processes', fetcher, { refreshInterval: 8000 });
+  }>('/agents/processes', fetcher, { refreshInterval: POLL.standard });
 
   const { data: swarm } = useSWR<SwarmIntelligence>('/agents/swarm', fetcher, {
-    refreshInterval: 10000,
+    refreshInterval: POLL.standard,
   });
 
   const agents = (processes?.agents || []).filter((a) => a.name);
@@ -104,29 +108,29 @@ export default function AgentSwarmTelemetry() {
 
   return (
     <Card className="h-full flex flex-col overflow-hidden">
-      <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 border-b border-slate-800 bg-slate-950/50 shrink-0">
+      <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 border-b border-line bg-page/50 shrink-0">
         <div className="flex items-center gap-2.5">
           <Bot className="h-4 w-4 text-cyan-300" />
           <div>
-            <h2 className="text-xs font-semibold tracking-wide text-slate-100 uppercase">Agent Swarm</h2>
-            <p className="text-[10px] text-slate-500">Liveness and current conclusions</p>
+            <h2 className="text-xs font-semibold tracking-wide text-ink uppercase">Agent Swarm</h2>
+            <p className="text-micro text-ink-mute">Liveness and current conclusions</p>
           </div>
         </div>
-        <div className="text-[11px] text-slate-400 tabular-nums">
+        <div className="text-micro text-ink-dim tabular-nums">
           {procError ? (
             <span className="text-rose-400">telemetry unavailable</span>
           ) : processes ? (
             <span>
-              <strong className="text-slate-100">{online}</strong> of {agents.length} healthy
+              <strong className="text-ink">{online}</strong> of {agents.length} healthy
             </span>
           ) : (
-            <span className="text-slate-500">loading…</span>
+            <span className="text-ink-mute">loading…</span>
           )}
         </div>
       </div>
 
       {/* Swarm conclusions. Empty is shown as empty. */}
-      <div className="px-4 py-3 border-b border-slate-800 bg-slate-950/30 shrink-0">
+      <div className="px-4 py-3 border-b border-line bg-page/30 shrink-0">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Stat label="Open predictions" value={swarm ? swarm.open_predictions : '—'} />
           <Stat
@@ -143,48 +147,53 @@ export default function AgentSwarmTelemetry() {
         </div>
 
         {cons && (
-          <div className="mt-3 flex items-start gap-2 text-[11px] leading-relaxed">
-            <GitBranch className="h-3.5 w-3.5 text-slate-500 mt-0.5 shrink-0" />
-            <p className="text-slate-300">
-              {cons.summary || 'No consensus report published yet.'}
-            </p>
+          <div className="mt-3 flex items-start gap-2 text-micro leading-relaxed">
+            <GitBranch className="h-3.5 w-3.5 text-ink-mute mt-0.5 shrink-0" />
+            <p className="text-ink-dim">{cons.summary || 'No consensus report published yet.'}</p>
           </div>
         )}
 
         {cons && cons.stale_agents.length > 0 && (
-          <div className="mt-2 flex items-center gap-2 text-[11px] text-amber-300">
+          <div className="mt-2 flex items-center gap-2 text-micro text-amber-300">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>Context drift: {cons.stale_agents.join(', ')}</span>
+            <span>Context drift: {cons.stale_agents.join(',')}</span>
           </div>
         )}
       </div>
 
       <div className="flex-1 overflow-y-auto">
         {agents.length === 0 && (
-          <div className="p-6 text-center text-xs text-slate-500">
+          <div className="p-6 text-center text-xs text-ink-mute">
             {processes?.agents?.[0]?.detail || 'No agent roster reported.'}
           </div>
         )}
 
-        <ul className="divide-y divide-slate-800/70">
+        <ul className="divide-y divide-line/70">
           {agents.map((ag) => (
-            <li key={`${ag.tier}:${ag.name}`} className="px-4 py-2.5 hover:bg-slate-900/40 transition-colors">
+            <li
+              key={`${ag.tier}:${ag.name}`}
+              className="px-4 py-2.5 hover:bg-raised/40 transition-colors"
+            >
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <span
                     className={`h-2 w-2 rounded-full shrink-0 ${STATUS_TONE[ag.status] || 'bg-slate-600'}`}
                     title={ag.status}
                   />
-                  <span className="text-xs text-slate-200 truncate">{ag.name?.replace(/_/g, ' ')}</span>
+                  <span className="text-xs text-ink truncate">{ag.name?.replace(/_/g, ' ')}</span>
                 </div>
-                <div className="flex items-center gap-3 text-[10px] text-slate-500 shrink-0 tabular-nums">
+                <div className="flex items-center gap-3 text-micro text-ink-mute shrink-0 tabular-nums">
                   {typeof ag.processed === 'number' && (
-                    <span title="messages processed">{ag.processed.toLocaleString()}</span>
+                    <span title="messages processed">
+                      {formatNumber(ag.processed, { decimals: 0 })}
+                    </span>
                   )}
                   {typeof ag.errors === 'number' && ag.errors > 0 && (
-                    <span className="text-rose-400" title="errors">{ag.errors}</span>
+                    <span className="text-rose-400" title="errors">
+                      {ag.errors}
+                    </span>
                   )}
-                  <span className="px-1.5 py-0.5 rounded bg-slate-800/80 text-slate-400">
+                  <span className="px-1.5 py-0.5 rounded bg-overlay/80 text-ink-dim">
                     {ag.model || 'model unreported'}
                   </span>
                   <span className="uppercase tracking-wide">{ag.tier}</span>
@@ -195,20 +204,20 @@ export default function AgentSwarmTelemetry() {
         </ul>
 
         {swarm && swarm.bulletins.length > 0 && (
-          <div className="border-t border-slate-800">
-            <div className="px-4 py-2 flex items-center gap-2 text-[10px] uppercase tracking-wider text-slate-500">
+          <div className="border-t border-line">
+            <div className="px-4 py-2 flex items-center gap-2 text-micro uppercase tracking-wider text-ink-mute">
               <Activity className="h-3 w-3" /> Open bulletins
             </div>
-            <ul className="divide-y divide-slate-800/70">
+            <ul className="divide-y divide-line/70">
               {swarm.bulletins.slice(0, 8).map((b, i) => (
-                <li key={i} className="px-4 py-2 text-[11px]">
-                  <div className="flex items-center gap-2 text-slate-500">
+                <li key={i} className="px-4 py-2 text-micro">
+                  <div className="flex items-center gap-2 text-ink-mute">
                     <span className="text-cyan-300">{b.agent_name?.replace(/_/g, ' ')}</span>
                     <span>·</span>
                     <span>{b.bulletin_type}</span>
-                    {b.ticker && <span className="text-slate-300">{b.ticker}</span>}
+                    {b.ticker && <span className="text-ink-dim">{b.ticker}</span>}
                   </div>
-                  <p className="text-slate-300 mt-0.5 line-clamp-2">{b.summary}</p>
+                  <p className="text-ink-dim mt-0.5 line-clamp-2">{b.summary}</p>
                 </li>
               ))}
             </ul>
@@ -216,16 +225,19 @@ export default function AgentSwarmTelemetry() {
         )}
 
         {swarm && swarm.scorecards.length > 0 && (
-          <div className="border-t border-slate-800">
-            <div className="px-4 py-2 flex items-center gap-2 text-[10px] uppercase tracking-wider text-slate-500">
+          <div className="border-t border-line">
+            <div className="px-4 py-2 flex items-center gap-2 text-micro uppercase tracking-wider text-ink-mute">
               <Scale className="h-3 w-3" /> Track record
             </div>
-            <ul className="divide-y divide-slate-800/70">
+            <ul className="divide-y divide-line/70">
               {swarm.scorecards.map((s) => (
-                <li key={s.agent_name} className="px-4 py-2 flex items-center justify-between text-[11px]">
-                  <span className="text-slate-300">{s.agent_name?.replace(/_/g, ' ')}</span>
-                  <span className="text-slate-500 tabular-nums">
-                    {s.predictions_correct ?? 0}/{s.predictions_made ?? 0} · weight{' '}
+                <li
+                  key={s.agent_name}
+                  className="px-4 py-2 flex items-center justify-between text-micro"
+                >
+                  <span className="text-ink-dim">{s.agent_name?.replace(/_/g, ' ')}</span>
+                  <span className="text-ink-mute tabular-nums">
+                    {s.predictions_correct ?? 0}/{s.predictions_made ?? 0} · weight{''}
                     {(s.consensus_weight ?? 0).toFixed(2)}
                   </span>
                 </li>

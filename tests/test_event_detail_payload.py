@@ -113,13 +113,50 @@ def test_the_client_calls_the_detail_route():
 # ── the query must stay bounded ──────────────────────────────────────────────
 
 def test_the_interleaving_runs_over_a_bounded_pool():
-    """Ranking all 131,937 crypto rows to return fifty timed out at 90s."""
+    """Ranking all 131,937 crypto rows to return fifty timed out at 90s.
+
+    The CTE is now `WITH {region_cte}recent AS (`, because a caller asking for
+    region coverage gets a second CTE in front of this one. What this test
+    pins is unchanged: the pool is the newest `candidate_pool` rows, not the
+    table.
+    """
     code = _code(ROUTE)
     assert "candidate_pool" in code
-    assert "WITH recent AS (" in code
-    block = code[code.index("WITH recent AS ("):]
-    assert "ORDER BY occurred_at DESC" in block[:300]
-    assert "LIMIT {candidate_pool}" in block[:300]
+    assert "recent AS (" in code
+    block = code[code.index("recent AS ("):]
+    assert "ORDER BY occurred_at DESC" in block[:400]
+    assert "LIMIT {candidate_pool}" in block[:400]
+
+
+def test_region_reserved_rows_are_fetched_outside_the_pool():
+    """A region the pool cannot reach cannot be rescued by ranking the pool.
+
+    The newest 250 maritime rows span 184 seconds on this deployment and carry
+    seven regions. Singapore Approach and Taiwan Territorial alone produce about
+    4,400 vessel events an hour, so the Strait of Hormuz at four a day is not in
+    the candidate pool at any size the endpoint can afford -- which is why the
+    held rows get their own lookup and are unioned in, rather than being
+    selected by another ROW_NUMBER over `recent`.
+    """
+    code = _code(ROUTE)
+    assert "region_held AS (" in code
+    assert "CROSS JOIN LATERAL" in code, (
+        "the reserved rows must be fetched per region, one index seek each"
+    )
+    assert "UNION SELECT * FROM region_held" in code, (
+        "held rows must enter the pool; admitting them in the filter alone "
+        "cannot help, because a row outside the pool never reaches the filter"
+    )
+    assert "OR event_id IN (SELECT event_id FROM region_held)" in code, (
+        "and they must survive the type-rank/recency cut that follows"
+    )
+
+
+def test_the_region_index_backs_the_reserved_lookup():
+    """Without it the planner uses the vessel index and filters: 83 seconds."""
+    code = MIGRATE.read_text(encoding="utf-8")
+    assert "events_vessel_region_time_idx" in code
+    assert "events_flight_region_time_idx" in code
 
 
 def test_the_pool_is_large_enough_to_interleave():

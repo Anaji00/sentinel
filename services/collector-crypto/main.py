@@ -34,6 +34,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 
@@ -119,6 +120,7 @@ async def stream_coinbase_market_data(producer: SentinelProducer):
                                 }
                             )
                             await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=symbol)
+                            _collector_metrics("collector-crypto").ingested()
         except Exception as e:
             logger.error(f"Error handling Coinbase WS message: {e}")
 
@@ -139,6 +141,7 @@ async def stream_coinbase_market_data(producer: SentinelProducer):
                             }
                         )
                         await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=sym)
+                        _collector_metrics("collector-crypto").ingested()
                         candles[sym] = {"o": None, "h": 0, "l": float('inf'), "c": 0, "v": 0}
             except Exception as err:
                 logger.error(f"Coinbase candle emitter error: {err}")
@@ -190,6 +193,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
                 }
             )
             await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+            _collector_metrics("collector-crypto").ingested()
         except Exception as e:
             logger.error(f"Error handling Binance Liquidation WS message: {e}")
 
@@ -319,6 +323,7 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
                         },
                     )
                     await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                    _collector_metrics("collector-crypto").ingested()
                     logger.info(
                         f"⚡ FUNDING RATE EXTREME | {symbol} | Rate: {funding_rate:.6f} | "
                         f"Basis: {basis_bps:.2f}bps | Mark: {mark_price:.2f} | Index: {index_price:.2f}"
@@ -502,6 +507,7 @@ async def poll_okx_perpetuals(producer: SentinelProducer, redis_client):
                         },
                     )
                     await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=inst)
+                    _collector_metrics("collector-crypto").ingested()
                     emitted += 1
 
                 if emitted:
@@ -588,6 +594,7 @@ async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
                                         },
                                     )
                                     await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                                    _collector_metrics("collector-crypto").ingested()
                                     count += 1
                             elif resp.status == 429:
                                 logger.warning("OI Poller: Binance rate limited, backing off 60s.")
@@ -718,6 +725,7 @@ async def _stream_chain_whales(chain_name: str, wss_url: str, contracts_map: dic
                         }
                     )
                     await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
+                    _collector_metrics("collector-crypto").ingested()
         except Exception as e:
             logger.debug(f"Error parsing {chain_name} log message: {e}")
 
@@ -840,6 +848,7 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
                                 }
                             )
                             await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=asset)
+                            _collector_metrics("collector-crypto").ingested()
                             logger.info(
                                 f"⚡ Cross-Venue Divergence Detected | {asset} | "
                                 f"Funding Spread: {funding_diff_bps:.1f} bps (Binance {f_binance*100:.4f}% vs Bybit {f_bybit*100:.4f}%)"
@@ -865,7 +874,7 @@ async def main():
     # §1.1 Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-crypto")
+    metrics = _collector_metrics("collector-crypto")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-crypto"))
 

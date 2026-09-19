@@ -73,7 +73,29 @@ class SentinelConsoleFormatter(logging.Formatter):
         time_str = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
         name_str = f"{BOLD}{BLUE}[{record.name}]{RESET}"
 
-        return f"{DIM}{time_str}{RESET} {name_str} {msg}"
+        line = f"{DIM}{time_str}{RESET} {name_str} {msg}"
+
+        # The traceback, which this formatter dropped.
+        #
+        # logging.Formatter.format() appends formatException(record.exc_info)
+        # after the message; this override builds its line by hand and returned
+        # it, so every `exc_info=True` in the tree -- 54 call sites -- logged
+        # its message and discarded the stack. What that looked like in
+        # production: `logger.error("SEC Form 4 error: %s", e, exc_info=True)`
+        # printing `SEC Form 4 error: ` and nothing else, because asyncpg's
+        # QueryCanceledError and several aiohttp errors have an empty str() and
+        # the traceback that would have identified them was never emitted.
+        #
+        # Cached on the record the way the base class caches it, so a second
+        # handler formatting the same record does not re-render the traceback.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            line = f"{line}\n{DIM}{record.exc_text}{RESET}"
+        if record.stack_info:
+            line = f"{line}\n{DIM}{self.formatStack(record.stack_info)}{RESET}"
+
+        return line
 
 
 # Noisy third-party loggers to suppress to WARNING or higher

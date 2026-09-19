@@ -38,6 +38,7 @@ nine thousand are opposite findings and look similar in a table.
 import logging
 import math
 from typing import Any, Dict, List, Optional
+from shared.models.events import ALERT_TIER_DB_VALUE, AlertTier
 
 logger = logging.getLogger("reasoning.signal_attribution")
 
@@ -93,7 +94,11 @@ ATTRIBUTED_SIGNALS: Dict[str, Dict[str, Any]] = {
         "describes": "the correlation layer was confident",
     },
     "critical_tier": {
-        "sql": "c.alert_tier = 'CRITICAL'",
+        # The integer the column actually stores, not the enum's name. This
+        # read `c.alert_tier = 'CRITICAL'` and the column is an integer, so the
+        # signal has been unmeasurable since it was written -- reported as a
+        # malformed predicate rather than as the mapping nobody shared.
+        "sql": f"c.alert_tier = {ALERT_TIER_DB_VALUE[AlertTier.CRITICAL.value]}",
         "describes": "filed at the top severity",
     },
     "options_flow_present": {
@@ -117,6 +122,44 @@ def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple:
     centre = (p + z * z / (2 * n)) / denom
     margin = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
     return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+# How much older than its scenario a trigger event may be, plus room.
+#
+# Seven days, against a measured maximum of 124 hours between a trigger event's
+# `occurred_at` and its scenario's `created_at` over 966 scenarios in 30 days.
+# A correlation cannot cite an event it has not seen and the correlation
+# windows are hours rather than days, so the margin is wide by design.
+TRIGGER_LAG_MARGIN_DAYS = 7
+
+# The trigger events, fetched by id instead of joined against the table.
+#
+# `events` is a compressed hypertable segmented by `type` and ordered by
+# `occurred_at`, so a predicate on `event_id` cannot use the primary key: every
+# segment has to be decompressed to evaluate it. `LEFT JOIN events ON
+# e.event_id = c.trigger_event_id` therefore planned as a scan of every chunk --
+# dozens of `ColumnarScan on _hyper_1_13xx_chunk` at 50,000 rows apiece -- once
+# per signal, ten times per request. The endpoint timed out at 120 seconds on a
+# seven-day window.
+#
+# It was never a volume problem. Measured on the deployment, same window, same
+# answer:
+#
+#     joined against the table          46,306 ms
+#     fetched by an explicit id list       336 ms
+#
+# The resolved set is small -- 35 scenarios over seven days -- so its trigger
+# ids are collected first and the events come back as a handful of rows, which
+# every per-signal query then joins against instead of the hypertable. The
+# predicates are untouched: they still read `e.anomaly_score`, `e.tags` and the
+# rest, because the CTE carries the same column names.
+#
+# MATERIALIZED is deliberate. Inlined, the planner is free to push the
+# id-array predicate back down into the ten separate scans it was just taken
+# out of.
+TRIGGER_EVENT_COLUMNS = (
+    "event_id, occurred_at, anomaly_score, corroboration, tags, source_reliability"
+)
 
 
 async def attribute_signals(db_client, lookback_days: int = LOOKBACK_DAYS) -> Dict[str, Any]:
@@ -162,10 +205,36 @@ async def attribute_signals(db_client, lookback_days: int = LOOKBACK_DAYS) -> Di
     base_rate = confirmed / float(total)
     results: List[Dict[str, Any]] = []
 
+    # The trigger ids for this window, once. See TRIGGER_EVENT_COLUMNS above
+    # for why these are fetched rather than joined.
+    try:
+        id_rows = await db_client.query(
+            f"""
+            SELECT DISTINCT c.trigger_event_id AS event_id
+            FROM scenarios s
+            JOIN correlations c ON s.correlation_id = c.correlation_id
+            WHERE s.status IN ('confirmed', 'denied')
+              AND s.created_at > NOW() - INTERVAL '{int(lookback_days)} days'
+              AND c.trigger_event_id IS NOT NULL
+            """
+        )
+    except Exception as e:
+        logger.debug("Signal attribution trigger-id query failed: %s", e)
+        return {"available": False, "reason": str(e)}
+
+    trigger_ids = [str(r.get("event_id")) for r in (id_rows or []) if r.get("event_id")]
+
     for name, spec in ATTRIBUTED_SIGNALS.items():
         try:
             rows = await db_client.query(
                 f"""
+                WITH e AS MATERIALIZED (
+                    SELECT {TRIGGER_EVENT_COLUMNS}
+                    FROM events
+                    WHERE event_id = ANY($1::uuid[])
+                      AND occurred_at > NOW() - INTERVAL
+                          '{int(lookback_days) + TRIGGER_LAG_MARGIN_DAYS} days'
+                )
                 SELECT
                     count(*) FILTER (WHERE {spec['sql']})                              AS present_n,
                     count(*) FILTER (WHERE {spec['sql']} AND s.status = 'confirmed')   AS present_ok,
@@ -173,10 +242,11 @@ async def attribute_signals(db_client, lookback_days: int = LOOKBACK_DAYS) -> Di
                     count(*) FILTER (WHERE NOT ({spec['sql']}) AND s.status = 'confirmed') AS absent_ok
                 FROM scenarios s
                 JOIN correlations c ON s.correlation_id = c.correlation_id
-                LEFT JOIN events e ON e.event_id = c.trigger_event_id
+                LEFT JOIN e ON e.event_id = c.trigger_event_id
                 WHERE s.status IN ('confirmed', 'denied')
                   AND s.created_at > NOW() - INTERVAL '{int(lookback_days)} days'
-                """
+                """,
+                trigger_ids,
             )
         except Exception as e:
             # One malformed predicate must not lose the whole report.

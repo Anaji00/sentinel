@@ -8,11 +8,20 @@ import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
 import { NormalizedEvent } from '../lib/types';
 import { DataGrid } from './ui/DataGrid';
+import { IconLock } from '@/components/ui/icons';
+import { ClockTime } from './ui/ClockTime';
+import { useDialog } from './ui/useDialog';
+import { POLL } from './ui/DataProvider';
 
 export default function CyberIntelligencePanel() {
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedEvent, setSelectedEvent] = useState<NormalizedEvent | null>(null);
+
+  // Escape, focus trap, focus restore, backdrop dismiss. This overlay had
+  // none of them: a keyboard user could tab out of it into the page behind,
+  // which is still focusable and now invisible under the backdrop.
+  const dialog = useDialog(Boolean(selectedEvent), () => setSelectedEvent(null), 'Threat detail');
 
   // An archive, polled at an archive's pace.
   //
@@ -24,15 +33,15 @@ export default function CyberIntelligencePanel() {
   const { data: cyberEvents, error: cyberError } = useSWR<NormalizedEvent[]>(
     '/events/cyber?limit=100',
     fetcher,
-    { refreshInterval: 60000 }
+    { refreshInterval: POLL.slow },
   );
 
   // The age of the newest row, which is what tells a reader whether they are
   // looking at intelligence or at history.
   const newestAgeHours = useMemo(() => {
     const newest = (cyberEvents || [])
-      .map(e => new Date(e.occurred_at).getTime())
-      .filter(t => Number.isFinite(t))
+      .map((e) => new Date(e.occurred_at).getTime())
+      .filter((t) => Number.isFinite(t))
       .sort((a, b) => b - a)[0];
     if (!newest) return null;
     return (Date.now() - newest) / 3_600_000;
@@ -46,35 +55,46 @@ export default function CyberIntelligencePanel() {
   ];
 
   const filteredEvents = useMemo(() => {
-    return (cyberEvents || []).filter(e => {
+    return (cyberEvents || []).filter((e) => {
       const headlineStr = (e.headline || e.summary || '').toLowerCase();
       const entityStr = (e.primary_entity_name || e.entity_name || '').toLowerCase();
       const typeStr = (e.type || '').toLowerCase();
       const q = searchQuery.toLowerCase();
 
-      const matchesSearch = !q || headlineStr.includes(q) || entityStr.includes(q) || typeStr.includes(q);
+      const matchesSearch =
+        !q || headlineStr.includes(q) || entityStr.includes(q) || typeStr.includes(q);
       if (!matchesSearch) return false;
       if (activeFilter === 'all') return true;
 
-      if (activeFilter === 'cve') return typeStr.includes('vulnerability') || headlineStr.includes('cve');
-      if (activeFilter === 'bgp') return typeStr.includes('bgp') || headlineStr.includes('bgp') || headlineStr.includes('route');
-      if (activeFilter === 'ransomware') return typeStr.includes('ransomware') || headlineStr.includes('ransomware') || headlineStr.includes('breach');
+      if (activeFilter === 'cve')
+        return typeStr.includes('vulnerability') || headlineStr.includes('cve');
+      if (activeFilter === 'bgp')
+        return (
+          typeStr.includes('bgp') || headlineStr.includes('bgp') || headlineStr.includes('route')
+        );
+      if (activeFilter === 'ransomware')
+        return (
+          typeStr.includes('ransomware') ||
+          headlineStr.includes('ransomware') ||
+          headlineStr.includes('breach')
+        );
       return true;
     });
   }, [cyberEvents, activeFilter, searchQuery]);
 
   const criticalCount = useMemo(() => {
-    return (cyberEvents || []).filter(e => e.anomaly_score >= 0.75 || (e.security_data?.cvss_score || 0) >= 8.0).length;
+    return (cyberEvents || []).filter(
+      (e) => e.anomaly_score >= 0.75 || (e.security_data?.cvss_score || 0) >= 8.0,
+    ).length;
   }, [cyberEvents]);
 
   const cisaKevCount = useMemo(() => {
-    return (cyberEvents || []).filter(e => e.security_data?.cisa_kev).length;
+    return (cyberEvents || []).filter((e) => e.security_data?.cisa_kev).length;
   }, [cyberEvents]);
 
   return (
     <Card
-      title="CYBER INTELLIGENCE & INFRASTRUCTURE HUD"
-      /* Not live, and it must not say so.
+      title="CYBER INTELLIGENCE & INFRASTRUCTURE HUD" /* Not live, and it must not say so.
        *
        * This read `variant="live" pulse` with the text "CISA & BGP REAL-TIME".
        * The moment the collector left the default profile that became a false
@@ -84,38 +104,40 @@ export default function CyberIntelligencePanel() {
        * defect. */
       badge={
         <Badge variant={describeApiError(cyberError) ? 'warning' : 'neutral'}>
-          {describeApiError(cyberError)
-            ?? (newestAgeHours === null
+          {describeApiError(cyberError) ??
+            (newestAgeHours === null
               ? 'RETIRED FEED — NO ARCHIVE'
               : `RETIRED FEED — ARCHIVE, NEWEST ${Math.floor(newestAgeHours)}H OLD`)}
         </Badge>
       }
-      headerAction={
-        <Tabs
-          tabs={filterTabs}
-          activeTab={activeFilter}
-          onChange={setActiveFilter}
-        />
-      }
+      headerAction={<Tabs tabs={filterTabs} activeTab={activeFilter} onChange={setActiveFilter} />}
       noPadding
     >
-      <div className="p-3.5 space-y-3 font-mono">
+      <div className="p-3.5 space-y-3">
         {/* Metric Summary HUD */}
         <div className="grid grid-cols-4 gap-2.5">
-          <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl">
-            <div className="text-slate-400 text-[10px] uppercase font-bold">Threat Events Monitored</div>
-            <div className="text-base font-bold text-rose-400 mt-0.5">{cyberEvents?.length || 0}</div>
+          <div className="p-2.5 bg-page border border-line rounded-xl">
+            <div className="text-ink-dim text-micro uppercase font-bold">
+              Threat Events Monitored
+            </div>
+            <div className="text-base font-bold text-rose-400 mt-0.5">
+              {cyberEvents?.length || 0}
+            </div>
           </div>
-          <div className="p-2.5 bg-slate-950 border border-rose-500/30 rounded-xl">
-            <div className="text-slate-400 text-[10px] uppercase font-bold">Critical Vulnerabilities</div>
+          <div className="p-2.5 bg-page border border-rose-500/30 rounded-xl">
+            <div className="text-ink-dim text-micro uppercase font-bold">
+              Critical Vulnerabilities
+            </div>
             <div className="text-base font-bold text-rose-400 mt-0.5">{criticalCount}</div>
           </div>
-          <div className="p-2.5 bg-slate-950 border border-amber-500/30 rounded-xl">
-            <div className="text-slate-400 text-[10px] uppercase font-bold">CISA KEV Exploits Active</div>
+          <div className="p-2.5 bg-page border border-amber-500/30 rounded-xl">
+            <div className="text-ink-dim text-micro uppercase font-bold">
+              CISA KEV Exploits Active
+            </div>
             <div className="text-base font-bold text-amber-300 mt-0.5">{cisaKevCount}</div>
           </div>
-          <div className="p-2.5 bg-slate-950 border border-purple-500/30 rounded-xl">
-            <div className="text-slate-400 text-[10px] uppercase font-bold">Routing Stream</div>
+          <div className="p-2.5 bg-page border border-purple-500/30 rounded-xl">
+            <div className="text-ink-dim text-micro uppercase font-bold">Routing Stream</div>
             <div className="text-base font-bold text-purple-400 mt-0.5">BGP HIJACK DETECTOR</div>
           </div>
         </div>
@@ -127,7 +149,7 @@ export default function CyberIntelligencePanel() {
             placeholder="Search by CVE-ID, target organisation, ASN, or ransomware group..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-[#080a10] border border-rose-500/20 rounded-xl px-3.5 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-rose-400/60 font-mono transition-colors"
+            className="w-full bg-inset border border-rose-500/20 rounded-xl px-3.5 py-2 text-xs text-ink placeholder-slate-500 focus:outline-none focus:border-rose-400/60 font-mono transition-colors"
           />
         </div>
 
@@ -142,57 +164,68 @@ export default function CyberIntelligencePanel() {
                 <div
                   key={e.event_id || i}
                   onClick={() => setSelectedEvent(e)}
-                  className={`p-3 bg-slate-900/70 rounded-xl border transition-all cursor-pointer hover:bg-slate-900/95 ${
+                  className={`p-3 bg-raised/70 rounded-xl border transition-all cursor-pointer hover:bg-raised/95 ${
                     isCritical
-                      ? 'border-rose-500/40 hover:border-rose-400 shadow-[0_0_15px_rgba(244,63,94,0.15)]'
-                      : 'border-slate-800 hover:border-purple-500/50'
+                      ? 'border-rose-500/40 hover:border-rose-400 shadow-panel'
+                      : 'border-line hover:border-purple-500/50'
                   }`}
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-rose-400 font-bold text-xs uppercase flex items-center gap-1">
-                        🔐 {sd.cve_id || sd.affected_org || e.primary_entity_name || 'Cyber Target'}
+                        {sd.cve_id || sd.affected_org || e.primary_entity_name || 'Cyber Target'}
                       </span>
                       {sd.cvss_score !== undefined && (
-                        <span className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded border ${
-                          sd.cvss_score >= 9.0 ? 'bg-rose-500/20 text-rose-300 border-rose-500/40' : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                        }`}>
+                        <span
+                          className={`text-micro font-extrabold px-1.5 py-0.5 rounded border ${
+                            sd.cvss_score >= 9.0
+                              ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                              : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                          }`}
+                        >
                           CVSS {sd.cvss_score.toFixed(1)}
                         </span>
                       )}
                       {sd.cisa_kev && (
-                        <span className="px-1.5 py-0.5 rounded border border-rose-500/40 bg-rose-500/20 text-rose-300 font-extrabold text-[9px]">
+                        <span className="px-1.5 py-0.5 rounded border border-rose-500/40 bg-rose-500/20 text-rose-300 font-extrabold text-micro">
                           CISA KEV ACTIVE
                         </span>
                       )}
                       {sd.asn && (
-                        <span className="text-[10px] text-slate-400 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800">
+                        <span className="text-micro text-ink-dim bg-page px-1.5 py-0.5 rounded border border-line">
                           {sd.asn}
                         </span>
                       )}
                     </div>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
-                      isCritical
-                        ? 'bg-rose-500/20 text-rose-400 border-rose-500/40'
-                        : 'bg-purple-500/20 text-purple-300 border-purple-500/40'
-                    }`}>
+                    <span
+                      className={`text-micro font-bold px-2 py-0.5 rounded border ${
+                        isCritical
+                          ? 'bg-rose-500/20 text-rose-400 border-rose-500/40'
+                          : 'bg-purple-500/20 text-purple-300 border-purple-500/40'
+                      }`}
+                    >
                       SCORE: {e.anomaly_score.toFixed(2)}
                     </span>
                   </div>
 
-                  <p className="text-slate-200 text-xs font-sans font-semibold leading-snug">
+                  <p className="text-ink text-xs font-sans font-semibold leading-snug">
                     {e.headline || e.summary}
                   </p>
 
-                  <div className="mt-2 text-[10px] text-slate-400 flex justify-between items-center pt-1 border-t border-slate-800/80">
-                    <span>Source: <span className="text-cyan-400 font-bold">{e.source || 'CISA Feed'}</span></span>
-                    <span>{new Date(e.occurred_at).toLocaleTimeString()}</span>
+                  <div className="mt-2 text-micro text-ink-dim flex justify-between items-center pt-1 border-t border-line/80">
+                    <span>
+                      Source:{' '}
+                      <span className="text-cyan-400 font-bold">{e.source || 'CISA Feed'}</span>
+                    </span>
+                    <span>
+                      <ClockTime value={e.occurred_at} />
+                    </span>
                   </div>
                 </div>
               );
             })
           ) : (
-            <div className="p-8 text-center border border-dashed border-rose-500/20 rounded-xl text-slate-400 text-xs">
+            <div className="p-8 text-center border border-dashed border-rose-500/20 rounded-xl text-ink-dim text-xs">
               No matching cyber threat events found.
             </div>
           )}
@@ -201,65 +234,138 @@ export default function CyberIntelligencePanel() {
 
       {/* Cyber Event Inspector Modal */}
       {selectedEvent && (
-        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 font-mono">
-          <div className="bg-[#0b0e17] border border-rose-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-[0_0_40px_rgba(244,63,94,0.25)] text-xs text-slate-200">
+        <div
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+          {...dialog.overlayProps}
+        >
+          <div
+            className="bg-raised border border-rose-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
+            {...dialog.panelProps}
+          >
             <div className="flex items-center justify-between border-b border-rose-500/30 pb-3">
               <div className="flex items-center gap-2">
-                <span className="text-lg">🔐</span>
-                <span className="font-bold text-rose-400 uppercase tracking-wider">CYBER THREAT TELEMETRY INSPECTOR</span>
+                <span className="text-lg">
+                  <IconLock className="inline-block shrink-0" />
+                </span>
+                <span className="font-bold text-rose-400 uppercase tracking-wider">
+                  Threat detail
+                </span>
               </div>
               <button
                 onClick={() => setSelectedEvent(null)}
-                className="text-slate-400 hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-slate-800 cursor-pointer"
+                className="text-ink-dim hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
               >
-                ✕ CLOSE
+                CLOSE
               </button>
             </div>
 
             <div className="space-y-3">
               <div>
-                <span className="text-slate-400 block mb-0.5 text-[10px] uppercase font-bold">THREAT HEADLINE:</span>
-                <p className="text-white font-bold font-sans text-sm">{selectedEvent.headline || selectedEvent.summary}</p>
+                <span className="text-ink-dim block mb-0.5 text-micro uppercase font-bold">
+                  THREAT HEADLINE:
+                </span>
+                <p className="text-white font-bold font-sans text-sm">
+                  {selectedEvent.headline || selectedEvent.summary}
+                </p>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 bg-slate-950 p-3 rounded-xl border border-slate-800">
-                <div><span className="text-slate-400">EVENT ID:</span> <span className="text-rose-300 font-bold block truncate">{selectedEvent.event_id}</span></div>
-                <div><span className="text-slate-400">SOURCE:</span> <span className="text-rose-300 font-bold block">{selectedEvent.source}</span></div>
-                <div><span className="text-slate-400">ANOMALY SCORE:</span> <span className="text-rose-400 font-bold block">{selectedEvent.anomaly_score.toFixed(2)}</span></div>
-                <div><span className="text-slate-400">TIMESTAMP:</span> <span className="text-slate-200 block">{new Date(selectedEvent.occurred_at).toUTCString()}</span></div>
+              <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line">
+                <div>
+                  <span className="text-ink-dim">EVENT ID:</span>{' '}
+                  <span className="text-rose-300 font-bold block truncate">
+                    {selectedEvent.event_id}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-ink-dim">SOURCE:</span>{' '}
+                  <span className="text-rose-300 font-bold block">{selectedEvent.source}</span>
+                </div>
+                <div>
+                  <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
+                  <span className="text-rose-400 font-bold block">
+                    {selectedEvent.anomaly_score.toFixed(2)}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-ink-dim">TIMESTAMP:</span>{' '}
+                  <span className="text-ink block">
+                    {new Date(selectedEvent.occurred_at).toUTCString()}
+                  </span>
+                </div>
               </div>
 
               {selectedEvent.security_data && (
-                <div className="p-3 bg-slate-950 rounded-xl border border-rose-500/30 space-y-2">
-                  <span className="text-rose-400 font-bold block text-[11px]">VULNERABILITY & ROUTING DETAILS</span>
-                  <div className="grid grid-cols-2 gap-2 text-[10px]">
-                    <div><span className="text-slate-400 block">CVE ID:</span> <span className="text-white font-bold">{selectedEvent.security_data.cve_id || 'N/A'}</span></div>
-                    <div><span className="text-slate-400 block">CVSS Score:</span> <span className="text-white font-bold">{selectedEvent.security_data.cvss_score ? selectedEvent.security_data.cvss_score.toFixed(1) : 'N/A'}</span></div>
-                    <div><span className="text-slate-400 block">Affected Org:</span> <span className="text-cyan-300 font-bold">{selectedEvent.security_data.affected_org || 'N/A'}</span></div>
-                    <div><span className="text-slate-400 block">IP / ASN:</span> <span className="text-purple-300 font-bold">{selectedEvent.security_data.ip_address || selectedEvent.security_data.asn || 'N/A'}</span></div>
+                <div className="p-3 bg-page rounded-xl border border-rose-500/30 space-y-2">
+                  <span className="text-rose-400 font-bold block text-micro">
+                    Vulnerability and routing
+                  </span>
+                  <div className="grid grid-cols-2 gap-2 text-micro">
+                    <div>
+                      <span className="text-ink-dim block">CVE ID:</span>{' '}
+                      <span className="text-white font-bold">
+                        {selectedEvent.security_data.cve_id || 'N/A'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-ink-dim block">CVSS Score:</span>{' '}
+                      <span className="text-white font-bold">
+                        {selectedEvent.security_data.cvss_score
+                          ? selectedEvent.security_data.cvss_score.toFixed(1)
+                          : 'N/A'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-ink-dim block">Affected Org:</span>{' '}
+                      <span className="text-cyan-300 font-bold">
+                        {selectedEvent.security_data.affected_org || 'N/A'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-ink-dim block">IP / ASN:</span>{' '}
+                      <span className="text-purple-300 font-bold">
+                        {selectedEvent.security_data.ip_address ||
+                          selectedEvent.security_data.asn ||
+                          'N/A'}
+                      </span>
+                    </div>
                     {/* The announced prefix, which used to arrive as `ip_address`
                         and rendered above under a label naming neither. */}
                     {selectedEvent.security_data.route_leak_prefix && (
-                      <div><span className="text-slate-400 block">Announced Prefix:</span> <span className="text-amber-300 font-bold">{selectedEvent.security_data.route_leak_prefix}</span></div>
+                      <div>
+                        <span className="text-ink-dim block">Announced Prefix:</span>{' '}
+                        <span className="text-amber-300 font-bold">
+                          {selectedEvent.security_data.route_leak_prefix}
+                        </span>
+                      </div>
                     )}
                     {selectedEvent.security_data.ransomware_group && (
-                      <div><span className="text-slate-400 block">Claiming Group:</span> <span className="text-rose-300 font-bold">{selectedEvent.security_data.ransomware_group}</span></div>
+                      <div>
+                        <span className="text-ink-dim block">Claiming Group:</span>{' '}
+                        <span className="text-rose-300 font-bold">
+                          {selectedEvent.security_data.ransomware_group}
+                        </span>
+                      </div>
                     )}
                   </div>
                 </div>
               )}
 
               <div>
-                <span className="text-rose-400 font-bold block mb-1 text-[10px]">RAW THREAT PAYLOAD:</span>
+                <span className="text-rose-400 font-bold block mb-1 text-micro">
+                  RAW THREAT PAYLOAD:
+                </span>
                 <div className="max-h-64 overflow-y-auto">
-                  <DataGrid data={selectedEvent.security_data || selectedEvent.domain_data || selectedEvent} omit={['raw_payload']} />
+                  <DataGrid
+                    data={selectedEvent.security_data || selectedEvent.domain_data || selectedEvent}
+                    omit={['raw_payload']}
+                  />
                 </div>
               </div>
             </div>
 
             <button
               onClick={() => setSelectedEvent(null)}
-              className="w-full py-2 bg-slate-900 text-rose-400 border border-rose-500/40 rounded-xl text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer"
+              className="w-full py-2 bg-raised text-rose-400 border border-rose-500/40 rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
             >
               DISMISS
             </button>

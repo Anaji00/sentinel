@@ -95,3 +95,73 @@ async def test_the_two_validators_agree():
 def test_a_junk_ticker_is_rejected_without_raising():
     for junk in ("", "   ", None, 42, "TOOLONGTICKER"):
         assert is_valid_primary_equity(junk) is False
+
+
+# -- what Alpaca's equity endpoint will parse ----------------------------------
+
+def test_alpaca_snapshot_filter_drops_only_non_equity_symbology():
+    """One unparseable symbol 400s the whole snapshot request.
+
+    CORE_MACRO_SYMBOLS deliberately carries CL=F, GC=F and ZB=F so the
+    discovery engine has both legs of a macro relationship. The same list feeds
+    Alpaca's equity snapshot endpoint, which rejects the entire request when any
+    symbol in it is unparseable -- so one futures ticker cost the other
+    forty-nine symbols their extended-hours snapshots, once a minute.
+
+    Verified against the live endpoint: TLT, HYG, SPY, QQQ and AAPL return 200;
+    TNX, VIX and DXY return 200 with an empty body; only the `=F` futures 400.
+    The filter is therefore on symbology, not on membership of the macro list --
+    excluding the list itself would drop TLT and HYG, which Alpaca prices.
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "services" / "collector-tradfi" / "main.py").read_text(encoding="utf-8")
+    pattern = re.search(r'_ALPACA_EQUITY_SYMBOL = re\.compile\(r"([^"]+)"\)', src)
+    assert pattern, "_ALPACA_EQUITY_SYMBOL must stay a module-level compiled pattern"
+    rx = re.compile(pattern.group(1))
+
+    for keep in ("AAPL", "SPY", "QQQ", "TLT", "HYG", "TNX", "VIX", "DXY", "BRK.B"):
+        assert rx.match(keep), f"{keep} is priced by Alpaca and must be requested"
+
+    for drop in ("CL=F", "GC=F", "ZB=F", "BTCUSDT"):
+        assert not rx.match(drop), f"{drop} would 400 the whole batch"
+
+
+def test_the_snapshot_request_uses_the_filtered_list():
+    """A filter the request does not read is the defect it was written for."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "services" / "collector-tradfi" / "main.py").read_text(encoding="utf-8")
+    url_line = next(
+        ln for ln in src.splitlines() if "stocks/snapshots?symbols=" in ln
+    )
+    assert "snapshot_symbols" in url_line, (
+        "the snapshot URL must be built from the filtered list, not from the "
+        "raw subscription universe"
+    )
+
+
+def test_the_websocket_subscription_is_equities_only():
+    """Six of fifty slots were held by symbols the feed cannot serve.
+
+    Measured over eight hours of a regular session: CL=F, GC=F, ZB=F, DXY, TNX
+    and VIX produced zero bars, while AAPL produced 229 and NVDA 255 -- and TLT
+    and HYG, the two ETFs in the same CORE_MACRO_SYMBOLS list, produced theirs.
+    The list is not the problem; the symbology is.
+
+    Finnhub's cap is what makes it cost something: those six were 12% of the
+    streaming budget, on the feed whose limit is the reason
+    select_subscription_symbols exists.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "services" / "collector-tradfi" / "main.py").read_text(encoding="utf-8")
+    body = src.split("desired_subs = ")[1].split("to_add = ")[0]
+    assert "_ALPACA_EQUITY_SYMBOL.match" in body, (
+        "the websocket subscription must be filtered to equity symbology, the "
+        "same way the snapshot request is"
+    )

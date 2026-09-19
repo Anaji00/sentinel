@@ -1,5 +1,3 @@
-import json
-from datetime import datetime, timezone
 """
 shared/utils/entity_resolution.py
 
@@ -38,8 +36,11 @@ missed merge is merely a smaller graph. Fuzzy candidates are surfaced through
 suggest_merges() for a human to confirm, and never applied automatically.
 """
 
+import asyncio
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from shared.utils.quiet_failures import swallowed
 
@@ -94,6 +95,10 @@ _LEGAL_FORMS = [
 _NOISE_TOKENS = {"THE", "AND", "OF"}
 
 _PUNCT = re.compile(r"[^A-Z0-9 ]+")
+# Trailing possessive, in the straight and typographic forms news feeds
+# actually emit. Anchored to a word boundary so "IT'S" style contractions
+# inside a longer token are untouched.
+_POSSESSIVE = re.compile(r"['’ʼ]S\b")
 _WS = re.compile(r"\s+")
 _TICKERISH = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 
@@ -150,6 +155,17 @@ def normalize_name(raw: Any) -> str:
     text = str(raw).strip().upper()
     if not text:
         return ""
+
+    # Possessives, before punctuation becomes whitespace.
+    #
+    # _PUNCT replaces every non-alphanumeric with a space, so "Boris Johnson's"
+    # became "BORIS JOHNSON S" -- a second entity for every subject a headline
+    # mentions possessively. Live merge candidates showed it plainly:
+    # BORIS JOHNSON ~ BORIS JOHNSON S, DONALD TRUMP JR ~ DONALD TRUMP JR S,
+    # ANTHONY JOSHUA ~ ANTHONY JOSHUA S. News writes about people in the
+    # possessive constantly, so this split a large share of the person entities
+    # the news path produces.
+    text = _POSSESSIVE.sub("", text)
 
     text = _PUNCT.sub(" ", text)
     text = _WS.sub(" ", text).strip()
@@ -551,6 +567,86 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _length_bound_ok(la: int, lb: int, threshold: float) -> bool:
+    """Can two strings of these lengths possibly reach `threshold`?
+
+    difflib's ratio is 2*M/T, where M is the number of matched characters and T
+    the total length of both strings. M cannot exceed the shorter string, so
+
+        ratio <= 2 * min(la, lb) / (la + lb)
+
+    is an upper bound that depends on nothing but the lengths. At the 0.90 used
+    for merge suggestions this admits only pairs whose lengths are within about
+    22% of each other, and it is a *bound* rather than a heuristic -- a pair it
+    rejects could not have scored the threshold however similar the characters.
+    """
+    if la <= 0 or lb <= 0:
+        return False
+    return (2.0 * min(la, lb)) / (la + lb) >= threshold
+
+
+def _scan_pairs(
+    keys: List[str],
+    folded: Dict[str, str],
+    rejected: set,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """The pairwise pass, synchronous and off the event loop.
+
+    This was an unguarded double loop over every folded name, inline in an
+    async handler. With the 2,000-row scan above it, that is 1,999,000 difflib
+    comparisons on the event loop before `limit` is applied -- measured on the
+    running gateway at 61.0s for the call, during which an unrelated
+    `health/sources` that normally answers in 0.02s took 31.0s because it was
+    queued behind this. One page load, the whole gateway stalled, and CLAUDE.md
+    names the rule it breaks.
+
+    Two changes, both needed. Names are visited in length order so the bound
+    above can stop each inner loop instead of filtering inside it, which turns
+    the quadratic into a sweep over a narrow window; and difflib's own
+    `real_quick_ratio`/`quick_ratio` upper bounds are consulted before the real
+    comparison, which is what they exist for. The caller runs this in a thread.
+    """
+    from difflib import SequenceMatcher
+
+    ordered = sorted(keys, key=len)
+    out: List[Dict[str, Any]] = []
+    matcher = SequenceMatcher()
+
+    for i, a in enumerate(ordered):
+        la = len(a)
+        matcher.set_seq2(a)
+        for b in ordered[i + 1:]:
+            lb = len(b)
+            # Sorted by length, so once the bound fails it fails for every
+            # remaining b and the inner loop is done.
+            if not _length_bound_ok(la, lb, MERGE_SUGGESTION_RATIO):
+                break
+            pair_id = f"{a}|{b}" if a < b else f"{b}|{a}"
+            if pair_id in rejected:
+                continue
+            matcher.set_seq1(b)
+            # Two progressively tighter upper bounds before the O(n*m) pass.
+            if matcher.real_quick_ratio() < MERGE_SUGGESTION_RATIO:
+                continue
+            if matcher.quick_ratio() < MERGE_SUGGESTION_RATIO:
+                continue
+            ratio = matcher.ratio()
+            if ratio >= MERGE_SUGGESTION_RATIO:
+                first, second = (a, b) if a < b else (b, a)
+                out.append({
+                    "pair_id": pair_id,
+                    "a": first,
+                    "b": second,
+                    "a_seen_as": folded[first],
+                    "b_seen_as": folded[second],
+                    "similarity": round(ratio, 4),
+                })
+
+    out.sort(key=lambda r: -r["similarity"])
+    return out[:limit]
+
+
 async def suggest_merges(
     redis_client: Any,
     names: List[str],
@@ -580,26 +676,12 @@ async def suggest_merges(
         except Exception:
             rejected = set()
 
-    keys = sorted(folded)
-    out: List[Dict[str, Any]] = []
-    for i, a in enumerate(keys):
-        for b in keys[i + 1:]:
-            pair_id = f"{a}|{b}"
-            if pair_id in rejected:
-                continue
-            ratio = _similarity(a, b)
-            if ratio >= MERGE_SUGGESTION_RATIO:
-                out.append({
-                    "pair_id": pair_id,
-                    "a": a,
-                    "b": b,
-                    "a_seen_as": folded[a],
-                    "b_seen_as": folded[b],
-                    "similarity": round(ratio, 4),
-                })
-
-    out.sort(key=lambda r: -r["similarity"])
-    return out[:limit]
+    # Off the event loop. The pass is pure CPU over in-memory strings, which is
+    # exactly what CLAUDE.md requires explicit thread-pool offloading for, and
+    # what a single `/operations` page load was holding the gateway on.
+    return await asyncio.to_thread(
+        _scan_pairs, sorted(folded), folded, rejected, limit
+    )
 
 
 async def reject_merge(redis_client: Any, pair_id: str) -> bool:

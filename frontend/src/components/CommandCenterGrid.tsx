@@ -3,12 +3,13 @@
 import React, { useState, Suspense } from 'react';
 import dynamic from 'next/dynamic';
 import { PanelSkeleton } from './ui/Skeleton';
+import StateStrip from './StateStrip';
+import { IconFlow, IconGraph, IconRadar, IconTarget, IconUp } from './ui/icons';
 
 const IntelligenceFeed = dynamic(() => import('./IntelligenceFeed'), {
   loading: () => <PanelSkeleton title="Loading Stream..." />,
   ssr: false,
 });
-
 
 const QuantRadarPanel = dynamic(() => import('./QuantRadarPanel'), {
   loading: () => <PanelSkeleton title="Loading Radar..." />,
@@ -20,120 +21,133 @@ const FinancialAdvisorAdvice = dynamic(() => import('./FinancialAdvisorAdvice'),
   ssr: false,
 });
 
+// The gainers and losers board. Everything under it -- the sweep, the sorted
+// set, the per-ticker standing, the news and sector joins -- has been running
+// and serving `/radar/movers`, and no component fetched it.
+const MoversBoard = dynamic(() => import('./MoversBoard'), {
+  loading: () => <PanelSkeleton title="Loading Movers..." />,
+  ssr: false,
+});
+
 const BondYieldsChart = dynamic(() => import('./charts/BondYieldsChart'), {
   loading: () => <PanelSkeleton title="Loading Bond Yields..." />,
   ssr: false,
 });
 
-type ViewMode = 'all' | 'intelligence' | 'radar' | 'advisor' | 'charts';
+/** The panels, their labels and their marks -- declared once.
+ *
+ * Two separate literal arrays described the same five panels, one for the
+ * presets and one for the toggles, and they had already drifted: the preset
+ * list carried a `charts` entry that the `all` reset did not restore. */
+const PANELS = [
+  { key: 'intelligence', label: 'Intelligence', Icon: IconFlow },
+  { key: 'radar', label: 'Radar', Icon: IconRadar },
+  { key: 'movers', label: 'Movers', Icon: IconUp },
+  { key: 'advisor', label: 'Portfolio', Icon: IconTarget },
+  { key: 'charts', label: 'Charts', Icon: IconGraph },
+] as const;
+
+type PanelKey = (typeof PANELS)[number]['key'];
+
+type Visibility = Record<PanelKey, boolean>;
+
+// Charts starts closed: five panels inside a viewport-height grid gives each
+// one under 300px, which is not enough for a chart to say anything.
+const INITIAL: Visibility = {
+  intelligence: true,
+  radar: true,
+  movers: true,
+  advisor: true,
+  charts: false,
+};
 
 export function CommandCenterGrid() {
-  const [activeView, setActiveView] = useState<ViewMode>('all');
-  const [visibleFeeds, setVisibleFeeds] = useState<{ [key: string]: boolean }>({
-    intelligence: true,
-    radar: true,
-    advisor: true,
-  });
+  const [visibleFeeds, setVisibleFeeds] = useState<Visibility>(INITIAL);
 
-  const toggleFeed = (key: string) => {
+  const toggleFeed = (key: PanelKey) => {
     setVisibleFeeds((prev) => {
       const next = { ...prev, [key]: !prev[key] };
-      // Ensure at least one feed remains visible
+      // Hiding the last one leaves an empty page whose only way back is the
+      // control the operator just used, which is worse than refusing the click.
       if (!Object.values(next).some(Boolean)) return prev;
       return next;
     });
   };
 
-  const setViewMode = (mode: ViewMode) => {
-    setActiveView(mode);
-    if (mode === 'all') {
-      setVisibleFeeds({ intelligence: true, radar: true, advisor: true });
-    } else {
-      setVisibleFeeds({
-        intelligence: mode === 'intelligence',
-        radar: mode === 'radar',
-        advisor: mode === 'advisor',
-        charts: mode === 'charts',
-      });
-    }
-  };
+  const showAll = () =>
+    setVisibleFeeds(
+      PANELS.reduce((acc, panel) => ({ ...acc, [panel.key]: true }), {} as Visibility),
+    );
 
+  const allVisible = PANELS.every((panel) => visibleFeeds[panel.key]);
   const visibleCount = Object.values(visibleFeeds).filter(Boolean).length;
 
-  // Determine dynamic grid layout style based on visible feed count
-  let gridStyleClass = "grid grid-cols-1 md:grid-cols-2 grid-rows-2 gap-3 h-full w-full";
+  // Row count follows the panel count, and only the multi-column layouts pin
+  // themselves to the viewport height.
+  //
+  // This was a fixed `grid-rows-2` at every width. Below `md` there is one
+  // column, so four visible feeds needed four rows, got two, and the last two
+  // rendered on top of the first two -- measured as an 79x16px overlap between
+  // two different panels' text. A single column instead gets auto rows with a
+  // sensible minimum and lets the page scroll, which is what a narrow screen
+  // wants anyway.
+  const SINGLE_COL = 'grid grid-cols-1 auto-rows-[minmax(20rem,auto)] gap-3 w-full md:h-full';
+
+  // The event stream is the reason this page exists; the rest are context for
+  // it. Equal quarters said otherwise. Above `lg` the feed keeps a full column
+  // and the others share the remaining two, which also stops a three-line panel
+  // header from wrapping inside a 350px box.
+  let gridStyleClass = `${SINGLE_COL} md:grid-cols-2 md:grid-rows-2`;
   if (visibleCount === 1) {
-    gridStyleClass = "grid grid-cols-1 grid-rows-1 gap-0 h-full w-full";
+    gridStyleClass = 'grid grid-cols-1 grid-rows-1 gap-0 h-full w-full';
   } else if (visibleCount === 2) {
-    gridStyleClass = "grid grid-cols-1 md:grid-cols-2 grid-rows-1 gap-3 h-full w-full";
+    gridStyleClass = `${SINGLE_COL} md:grid-cols-2 md:grid-rows-1`;
   } else if (visibleCount === 3) {
-    gridStyleClass = "grid grid-cols-1 md:grid-cols-3 grid-rows-1 gap-3 h-full w-full";
+    gridStyleClass = `${SINGLE_COL} md:grid-cols-3 md:grid-rows-1`;
+  } else if (visibleCount >= 4) {
+    gridStyleClass = `${SINGLE_COL} md:grid-cols-2 md:grid-rows-2 lg:grid-cols-3`;
   }
 
   return (
-    <div className="h-full w-full flex flex-col bg-[#05070c] p-3 space-y-2.5 font-mono overflow-hidden">
-      {/* Top HUD Feed Selector & Dynamic View Toggles */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-[#0b0e17] rounded-xl border border-cyan-500/20 shrink-0 shadow-lg text-xs">
-        <div className="flex items-center gap-2">
-          <span className="h-2 w-2 rounded-full bg-[#00f2fe] animate-pulse" />
-          <span className="text-[#00f2fe] font-extrabold tracking-wider uppercase text-[11px]">
-            COMMAND FEEDS ({visibleCount} ACTIVE)
-          </span>
-        </div>
+    <div className="min-h-full w-full flex flex-col bg-page p-2 sm:p-3 space-y-2.5 md:h-full md:overflow-hidden">
+      <StateStrip />
 
-        {/* View Mode Preset Buttons */}
-        <div className="flex items-center gap-1.5 text-[10px] overflow-x-auto">
-          {[
-            { id: 'all', label: 'ALL FEEDS (4-GRID)', icon: '🎛️' },
-            { id: 'intelligence', label: 'INTELLIGENCE STREAM', icon: '📡' },
-            { id: 'radar', label: 'QUANT RADAR', icon: '⚡' },
-            { id: 'advisor', label: 'PORTFOLIO ALLOCATOR', icon: '💼' },
-            { id: 'charts', label: 'MARKET CHARTS', icon: '📈' },
-          ].map((view) => (
+      {/* One control, one source of truth.
+          `visibleFeeds` is the state; "All" is a reset rather than a seventh
+          mode, so no preset can disagree with what is actually shown. */}
+      <div className="flex flex-wrap items-center gap-2 px-1 shrink-0">
+        <span className="stat-label">Panels</span>
+        <div className="flex flex-wrap items-center gap-1.5 text-micro">
+          <button
+            onClick={showAll}
+            disabled={allVisible}
+            className="rounded-md border border-line px-2.5 py-1 font-medium text-ink-dim transition-colors enabled:cursor-pointer enabled:hover:border-line-strong enabled:hover:text-ink disabled:opacity-40"
+          >
+            All
+          </button>
+          {PANELS.map((panel) => (
             <button
-              key={view.id}
-              onClick={() => setViewMode(view.id as ViewMode)}
-              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-                activeView === view.id
-                  ? 'bg-[#00f2fe] text-[#06080d] border border-white'
-                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              key={panel.key}
+              onClick={() => toggleFeed(panel.key)}
+              aria-pressed={Boolean(visibleFeeds[panel.key])}
+              className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-medium transition-colors cursor-pointer ${
+                visibleFeeds[panel.key]
+                  ? 'border-line-accent bg-accent-dim text-accent'
+                  : 'border-line text-ink-mute hover:text-ink-dim'
               }`}
             >
-              <span>{view.icon}</span>
-              <span>{view.label}</span>
-            </button>
-          ))}
-        </div>
-
-        {/* Individual Feed Toggles */}
-        <div className="flex items-center gap-1 text-[9px] text-slate-400">
-          <span className="uppercase font-bold mr-1">TOGGLE:</span>
-          {[
-            { key: 'intelligence', label: 'STREAM' },
-            { key: 'radar', label: 'RADAR' },
-            { key: 'advisor', label: 'ALLOCATOR' },
-            { key: 'charts', label: 'CHARTS' },
-          ].map((f) => (
-            <button
-              key={f.key}
-              onClick={() => toggleFeed(f.key)}
-              className={`px-2 py-0.5 rounded font-bold transition-all cursor-pointer border ${
-                visibleFeeds[f.key]
-                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-                  : 'bg-slate-950 text-slate-600 border-slate-800 line-through opacity-60'
-              }`}
-            >
-              {f.label}
+              <panel.Icon />
+              {panel.label}
             </button>
           ))}
         </div>
       </div>
 
       {/* Dynamic Screen Scaling Layout Grid */}
-      <div className="flex-1 min-h-0 w-full relative">
+      <div className="flex-1 md:min-h-0 w-full relative">
         <div className={gridStyleClass}>
           {visibleFeeds.intelligence && (
-            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+            <div className="panel panel-interactive flex flex-col overflow-hidden min-h-0 h-full w-full md:row-span-2">
               <div className="flex-1 min-h-0 relative">
                 <Suspense fallback={<PanelSkeleton title="Stream Loading..." />}>
                   <IntelligenceFeed />
@@ -142,9 +156,18 @@ export function CommandCenterGrid() {
             </div>
           )}
 
+          {visibleFeeds.movers && (
+            <div className="flex flex-col rounded-xl overflow-hidden min-h-0 h-full w-full transition-all">
+              <div className="flex-1 min-h-0 relative">
+                <Suspense fallback={<PanelSkeleton title="Movers Loading..." />}>
+                  <MoversBoard />
+                </Suspense>
+              </div>
+            </div>
+          )}
 
           {visibleFeeds.radar && (
-            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+            <div className="panel panel-interactive flex flex-col overflow-hidden min-h-0 h-full w-full">
               <div className="flex-1 min-h-0 relative">
                 <Suspense fallback={<PanelSkeleton title="Radar Loading..." />}>
                   <QuantRadarPanel />
@@ -154,7 +177,7 @@ export function CommandCenterGrid() {
           )}
 
           {visibleFeeds.advisor && (
-            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+            <div className="panel panel-interactive flex flex-col overflow-hidden min-h-0 h-full w-full">
               <div className="flex-1 min-h-0 relative">
                 <Suspense fallback={<PanelSkeleton title="Advisor Loading..." />}>
                   <FinancialAdvisorAdvice />
@@ -164,7 +187,7 @@ export function CommandCenterGrid() {
           )}
 
           {visibleFeeds.charts && (
-            <div className="flex flex-col bg-[#0b0e17] rounded-xl border border-slate-800/80 hover:border-cyan-500/40 shadow-xl overflow-hidden min-h-0 h-full w-full transition-all">
+            <div className="panel panel-interactive flex flex-col overflow-hidden min-h-0 h-full w-full">
               <div className="flex-1 min-h-0 relative">
                 <Suspense fallback={<PanelSkeleton title="Charts Loading..." />}>
                   <BondYieldsChart />

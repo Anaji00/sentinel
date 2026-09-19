@@ -18,6 +18,14 @@ import asyncio
 import aiohttp
 import json
 import logging
+from shared.utils.agent_conclusions import (
+    AGENT_CORRELATION_ANALYSIS_PREFIX,
+    HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_INVERSE_CORRELATION_PREFIX,
+    MACRO_RATES_REGIME_KEY,
+    MACRO_SPREAD_2Y10Y_KEY,
+    TRADFI_BACKFILL_REPORT_KEY,
+)
 import os
 import re
 import sys
@@ -46,9 +54,11 @@ from shared.utils.equities import is_valid_primary_equity, parse_occ_option_symb
 from shared.utils.logging import setup_sentinel_logging
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+from shared.utils.liveness import declare as _declare, fired as _fired
 
 # What counts as a block, per instrument rather than per market.
 #
@@ -220,6 +230,24 @@ MAX_CORE_SHARE = float(os.getenv("CORE_EQUITY_MAX_SHARE", "0.5"))
 # the event volume; macro carries the relationships that volume cannot express.
 MACRO_CORE_SHARE = float(os.getenv("CORE_MACRO_SHARE", "0.4"))
 
+# What Alpaca's equity endpoints will parse.
+#
+# CORE_MACRO_SYMBOLS deliberately carries instruments that are not equities --
+# CL=F, GC=F and ZB=F are Yahoo futures tickers, added so the discovery engine
+# has both legs of a macro relationship to correlate. The websocket universe
+# and the Alpaca snapshot universe are the same list, and Alpaca rejects the
+# entire request when any one symbol in it is unparseable: one futures ticker
+# returned `400 invalid symbol: CL=F` and took the other forty-nine symbols'
+# extended-hours snapshots with it, once a minute, for the whole pre-market
+# session.
+#
+# Verified against the live endpoint rather than assumed: TLT, HYG, SPY, QQQ
+# and AAPL all return 200; TNX, VIX and DXY return 200 with an empty body, so
+# they cost nothing and are left in; only the `=F` futures 400. The rule is
+# therefore symbology, not membership of the macro list -- excluding the list
+# would drop TLT and HYG, which Alpaca prices perfectly well.
+_ALPACA_EQUITY_SYMBOL = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
+
 FINNHUB_SUBSCRIPTION_LIMIT = int(os.getenv("FINNHUB_SUBSCRIPTION_LIMIT", "50"))
 
 # How long a single read may block before the loop checks for staleness. Short,
@@ -350,7 +378,10 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
         # clustering, the insider correlation rule and the Form 4 enricher have
         # all sat idle: not a routing defect, a 403 nobody could see.
         skipped_non_form4 = 0
-        async with session.get(url, timeout=15, headers={"User-Agent": SEC_USER_AGENT}) as resp:
+        # 30s, not 15. SEC answers in 0.3-5.5 seconds when the connection is
+        # sound, so this is headroom for a slow cold connect rather than
+        # patience with a broken one.
+        async with session.get(url, timeout=SEC_FORM4_TIMEOUT_SEC, headers={"User-Agent": SEC_USER_AGENT}) as resp:
             if resp.status != 200:
                 logger.warning(
                     "SEC Form 4 feed returned HTTP %s. Insider events will not "
@@ -405,6 +436,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                 }
             )
             await producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
+            _collector_metrics("collector-tradfi").ingested()
     except Exception as e:
         logger.error("SEC Form 4 error: %s", e, exc_info=True)
 
@@ -533,6 +565,7 @@ class OHLCVAggregator:
                         raw_payload=candle
                     )
                     await self.producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                    _collector_metrics("collector-tradfi").ingested()
                     count += 1
                     try:
                         # Store 1m base candle
@@ -617,7 +650,30 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                 # Core anchors first, discoveries after -- and the result is
                 # already clamped to the Finnhub limit by construction, so the
                 # separate truncation that used to follow is unnecessary.
-                desired_subs = set(select_subscription_symbols(discovered))
+                # The websocket carries equities, so ask it only for equities.
+                #
+                # CORE_MACRO_SYMBOLS puts CL=F, GC=F, ZB=F, DXY, TNX and VIX in
+                # this list so the discovery engine has both legs of a macro
+                # relationship. Finnhub's equity socket does not serve them:
+                # measured over eight hours of a regular session, those six
+                # produced zero bars while AAPL produced 229 and NVDA 255, and
+                # TLT and HYG -- the two ETFs in the same core list -- produced
+                # theirs. So this is symbology, not the list.
+                #
+                # The cost is the subscription cap. Six of fifty slots, 12% of
+                # the streaming budget, were held by symbols that have never
+                # delivered a trade, on a feed whose limit is the reason
+                # select_subscription_symbols exists at all. Those instruments
+                # reach the platform through the macro collector's ETF proxies
+                # instead, which is where their symbology is handled.
+                #
+                # Same root cause as the Alpaca snapshot filter above, on a
+                # different consumer: there it 400s the whole request, here it
+                # silently costs capacity.
+                desired_subs = {
+                    t for t in select_subscription_symbols(discovered)
+                    if _ALPACA_EQUITY_SYMBOL.match(t)
+                }
 
                 to_add = desired_subs - current_subs
                 to_remove = current_subs - desired_subs
@@ -761,6 +817,7 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    _collector_metrics("collector-tradfi").ingested()
                 finally:
                     sync_task.cancel()
                     flush_task.cancel()
@@ -784,6 +841,10 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         logger.warning("Alpaca API credentials missing. Extended-hours equities polling disabled.")
         return
+
+    # Which symbols the snapshot request last dropped, so a stable watchlist
+    # says so once instead of once a minute.
+    _last_rejected_symbols: list = []
 
     headers = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -822,8 +883,19 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                     await asyncio.sleep(60)
                     continue
 
-                if is_extended and symbols:
-                    url = f"https://data.alpaca.markets/v2/stocks/snapshots?symbols={','.join(symbols[:50])}&feed={feed}"
+                snapshot_symbols = [
+                    s for s in symbols[:50] if _ALPACA_EQUITY_SYMBOL.match(s)
+                ]
+                if is_extended and snapshot_symbols:
+                    _rejected = [s for s in symbols[:50] if s not in snapshot_symbols]
+                    if _rejected and _rejected != _last_rejected_symbols:
+                        _last_rejected_symbols[:] = _rejected
+                        logger.info(
+                            "Extended-hours snapshots exclude %s: not equity "
+                            "symbology, and one of them 400s the whole batch.",
+                            ", ".join(_rejected),
+                        )
+                    url = f"https://data.alpaca.markets/v2/stocks/snapshots?symbols={','.join(snapshot_symbols)}&feed={feed}"
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
@@ -879,6 +951,7 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    _collector_metrics("collector-tradfi").ingested()
 
                                 await redis_client.raw.set(
                                     quote_key(ticker), str(price), ex=QUOTE_CACHE_TTL_SEC,
@@ -913,6 +986,96 @@ _last_option_trade: dict = {}
 # Contracts to remember before pruning. A day's chain across the watchlist is a
 # few thousand; this keeps well clear of that without growing without bound.
 _MAX_OPTION_FINGERPRINTS = 20000
+
+
+# Open interest settles overnight, so it is a daily fact cached for half a day.
+#
+# Long enough that one lookup serves every trade in a contract for a session,
+# short enough that the figure is never more than one settlement stale. The
+# provider dates it itself and is typically two days behind, which is normal:
+# open interest is what was outstanding at the last settlement, and the ratio
+# below is deliberately today's volume against it.
+_OPTION_OI_TTL_SEC = 12 * 3600
+_OPTION_OI_PREFIX = "sentinel:options:oi:"
+
+# Finding 570: the volume/open-interest chain was wired end to end and received
+# nothing for the life of the deployment.
+_declare("options.open_interest.resolved",
+         "open interest was fetched for a contract that cleared the size gate")
+
+# Alpaca serves contract reference data from the trading API, not the market
+# data host the snapshots come from.
+_ALPACA_CONTRACTS_URL = os.getenv(
+    "ALPACA_CONTRACTS_URL", "https://paper-api.alpaca.markets/v2/options/contracts"
+)
+
+
+async def _contract_open_interest(session, redis_client, contract: str):
+    """Contracts outstanding for one option, or None.
+
+    The snapshot endpoint this collector polls does not carry open interest.
+    Measured across 300 contracts it returns dailyBar, latestQuote, latestTrade,
+    minuteBar and prevDailyBar and nothing else, so `snapshot.get("openInterest")`
+    was None every time -- and with it `volume_oi_ratio`, which the enricher
+    computes, the event model declares and the flow board was meant to rank on.
+    Across 1,828 options events in 24 hours, exactly zero carried either.
+
+    The figure does exist, one endpoint over: 28 of 28 near-the-money NVDA
+    contracts return real open interest. It is fetched per contract rather than
+    per underlying because a full chain is thousands of rows, and it is asked
+    only for contracts that have already cleared the size and premium gate --
+    roughly 1,400 distinct contracts a day, once each, against a cache.
+
+    Why this matters for what the board shows: ranked by premium alone the flow
+    is 89 deep-in-the-money contracts to 2 far out-of-the-money ones, because
+    premium is dominated by intrinsic value and a deep ITM contract is a
+    delta-one substitute rather than a directional bet. Volume against open
+    interest is the standard discriminator and does not have that bias: a ratio
+    above 1 means more contracts changed hands today than were outstanding at
+    the start of it, which cannot be closing flow alone.
+    """
+    if not contract:
+        return None
+    key = f"{_OPTION_OI_PREFIX}{contract}"
+    raw = getattr(redis_client, "raw", None) if redis_client is not None else None
+
+    if raw is not None:
+        try:
+            cached = await raw.get(key)
+            if cached is not None:
+                text = cached.decode() if isinstance(cached, bytes) else str(cached)
+                # "none" is a real answer -- the provider has no figure for this
+                # contract -- and is cached so it is not re-asked all session.
+                if text == "none":
+                    return None
+                return int(float(text))
+        except Exception as _exc:
+            swallowed("collector_tradfi.option_oi_cache", _exc, logger)
+
+    value = None
+    try:
+        async with session.get(f"{_ALPACA_CONTRACTS_URL}/{contract}") as resp:
+            if resp.status == 200:
+                body = await resp.json()
+                oi = body.get("open_interest")
+                if oi is not None:
+                    value = int(float(oi))
+            elif resp.status in (401, 403, 429):
+                # Not an answer about this contract. Left uncached so it is
+                # retried, rather than recording a rate limit as a fact.
+                return None
+    except Exception as _exc:
+        swallowed("collector_tradfi.option_oi_fetch", _exc, logger, detail=contract)
+        return None
+
+    if raw is not None:
+        try:
+            await raw.set(key, "none" if value is None else str(value), ex=_OPTION_OI_TTL_SEC)
+        except Exception as _exc:
+            swallowed("collector_tradfi.option_oi_store", _exc, logger)
+    if value is not None:
+        _fired("options.open_interest.resolved")
+    return value
 
 
 async def _option_trade_is_new(redis_client, contract: str, fingerprint: str) -> bool:
@@ -963,6 +1126,9 @@ def _prune_option_fingerprints() -> None:
 # SEC fair-access requires a User-Agent naming the requester with a contact
 # address they read. The collector-filings service takes the same variable, so
 # one setting covers both SEC callers.
+# How long to wait for EDGAR. Measured: 0.3s to 5.5s on a sound connection.
+SEC_FORM4_TIMEOUT_SEC = int(os.getenv("SEC_FORM4_TIMEOUT_SEC", "30"))
+
 SEC_USER_AGENT = os.getenv(
     "SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local"
 )
@@ -999,6 +1165,9 @@ async def poll_options(producer: SentinelProducer, redis_client):
     async with aiohttp.ClientSession(timeout=session_timeout, headers=headers) as session:
         while True:
             total_sweeps = 0
+            # Contracts this cycle actually looked at, counted here because the
+            # heartbeat below cannot otherwise know it. See the note there.
+            contracts_seen = 0
             try:
                 raw_symbols = await redis_client.raw.zrange(REDIS_EQUITIES_KEY, 0, -1)
                 raw_symbols = [s.decode() if isinstance(s, bytes) else s for s in raw_symbols] if raw_symbols else []
@@ -1021,6 +1190,7 @@ async def poll_options(producer: SentinelProducer, redis_client):
 
                             count = 0
                             for contract, snapshot in snapshots.items():
+                                contracts_seen += 1
                                 latest_trade = snapshot.get("latestTrade")
                                 if not latest_trade:
                                     continue
@@ -1107,6 +1277,16 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                     greeks_val = snapshot.get("greeks") or {}
                                     iv_val = snapshot.get("impliedVolatility") if snapshot.get("impliedVolatility") is not None else snapshot.get("implied_volatility")
                                     oi_val = snapshot.get("openInterest") if snapshot.get("openInterest") is not None else snapshot.get("open_interest")
+                                    # The snapshot has never carried it on this
+                                    # feed; the contracts endpoint does. Asked
+                                    # only now, after the trade has cleared both
+                                    # the novelty check and the size gate, so
+                                    # the lookup is bounded by contracts that
+                                    # actually traded in size.
+                                    if oi_val is None:
+                                        oi_val = await _contract_open_interest(
+                                            session, redis_client, contract
+                                        )
 
                                     event = RawEvent(
                                         source="alpaca_options",
@@ -1127,6 +1307,7 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    _collector_metrics("collector-tradfi").ingested()
                                     count += 1
                                     total_sweeps += 1
 
@@ -1142,10 +1323,19 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
 
                 _prune_option_fingerprints()
+                # "Contracts tracked" reported `len(_last_option_trade)`, which
+                # is the IN-PROCESS FALLBACK map -- populated only when Redis is
+                # unavailable. With Redis healthy it is empty by design, so the
+                # heartbeat printed "Contracts tracked: 0" on every cycle while
+                # 3,018 contract fingerprints sat in Redis doing their job. A
+                # number that reads as "tracking nothing" when tracking is
+                # working is worse than no number: it describes which branch the
+                # code took, not what the collector saw.
                 logger.info(
                     "⏱️ Options Poller Heartbeat: Checked %s equity tickers | "
-                    "Sweeps published: %s | Contracts tracked: %s",
-                    len(symbols[:50]), total_sweeps, len(_last_option_trade),
+                    "Sweeps published: %s | Contracts seen: %s%s",
+                    len(symbols[:50]), total_sweeps, contracts_seen,
+                    f" | fallback map: {len(_last_option_trade)}" if _last_option_trade else "",
                 )
             except Exception as e:
                 logger.error(f"Error in Options flow collector: {e}", exc_info=True)
@@ -1154,7 +1344,23 @@ async def poll_options(producer: SentinelProducer, redis_client):
 
 
 async def run_polling(producer: SentinelProducer, redis_client):
-    connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
+    # force_close, because the connection is not worth keeping.
+    #
+    # This session lives for the life of the process and polls SEC once a
+    # minute. A keep-alive connection idle for sixty seconds is routinely closed
+    # at the far end, and aiohttp then hands the next request a socket nobody is
+    # listening on -- which does not fail, it hangs, until the timeout fires.
+    #
+    # That is the whole of the "intermittent EDGAR feed": measured from inside
+    # this container, three requests down a reused pool at the poller's own
+    # cadence gave one TimeoutError and two successes, and the same three with
+    # force_close gave three successes in 0.3s, 1.4s and 0.4s. A direct request
+    # outside the pool returns 23,122 bytes in 2.7 seconds, and the User-Agent
+    # is accepted -- so SEC was never the problem.
+    #
+    # Reuse buys nothing at one request a minute. The handshake costs
+    # milliseconds; the stale socket cost nine days of insider data.
+    connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             await asyncio.gather(
@@ -1284,8 +1490,25 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                                         if profile_resp.status == 200:
                                             profile_data = await profile_resp.json()
                                             mcap_raw = profile_data.get("marketCapitalization", 0)
-                                            mcap_b = float(mcap_raw) / 1000.0 if mcap_raw else 0.0
-                                            await redis_client.raw.set(mcap_cache_key, str(mcap_b), ex=86400)
+                                            # Finnhub reports this in the currency
+                                            # of the primary listing, and the floor
+                                            # below is 500 billion DOLLARS. TSM's
+                                            # profile resolves to Taiwan and reads
+                                            # 61,719,038 million TWD, which clears a
+                                            # 500bn floor by a factor of 123 -- so a
+                                            # non-USD listing could inject itself
+                                            # into the watchlist on its exchange
+                                            # rate rather than its size. Every
+                                            # currency weaker than the dollar fails
+                                            # this way, which is most of them.
+                                            currency = str(
+                                                profile_data.get("currency") or ""
+                                            ).strip().upper()
+                                            if currency and currency != "USD":
+                                                mcap_b = 0.0
+                                            else:
+                                                mcap_b = float(mcap_raw) / 1000.0 if mcap_raw else 0.0
+                                                await redis_client.raw.set(mcap_cache_key, str(mcap_b), ex=86400)
                                         elif profile_resp.status == 429:
                                             logger.debug(f"Finnhub rate limited during mcap lookup for {symbol}")
                                             mcap_b = None
@@ -1345,6 +1568,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                         },
                     )
                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=symbol)
+                    _collector_metrics("collector-tradfi").ingested()
                     emit_count += 1
 
                 if emit_count > 0 or watchlist_count > 0:
@@ -1594,6 +1818,7 @@ async def run_institutional_fix(producer: SentinelProducer, redis_client):
                                 }
                             )
                             await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=sym)
+                            _collector_metrics("collector-tradfi").ingested()
                         except Exception as fe:
                             logger.warning(f"Error parsing FIX message: {fe}")
         except Exception as e:
@@ -1692,7 +1917,7 @@ async def _run_historical_backfill(redis_client) -> None:
 
     try:
         raw = getattr(redis_client, "raw", redis_client)
-        await raw.set("sentinel:backfill:tradfi:last", json.dumps(report, default=str), ex=86400 * 7)
+        await raw.set(TRADFI_BACKFILL_REPORT_KEY, json.dumps(report, default=str), ex=86400 * 7)
     except Exception as e:
         logger.debug("Could not record backfill report: %s", e)
 
@@ -1735,7 +1960,7 @@ async def main():
     # §1.1 — Universal heartbeat
     # Throughput counters. The heartbeat proves this process is alive;
     # these prove it is still producing.
-    metrics = CollectorMetrics("collector-tradfi")
+    metrics = _collector_metrics("collector-tradfi")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-tradfi"))
 

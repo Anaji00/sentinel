@@ -13,6 +13,9 @@ import asyncio
 import time
 import json
 import logging
+
+from shared.models.events import ALERT_TIER_DB_VALUE
+from shared.models.events import event_move_pct, move_pct_sql
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -249,6 +252,17 @@ class EventStore:
                 # source.
                 "source": getattr(event, "source", None),
                 "anomaly_score": event.anomaly_score,
+                # How far the subject moved, flattened to one number.
+                #
+                # `anomaly_score` answers "was this unusual for this
+                # instrument" and a rule about a repricing needs the other
+                # question, which the two disagree about constantly: a thin
+                # name up 0.4% on ten times its normal volume outranks a
+                # mega-cap down 9%. The payload that carries it differs by
+                # domain and this projection holds no payloads, so the number
+                # travels on its own rather than the four objects it could
+                # have come from.
+                "move_pct": event_move_pct(event),
                 "tags": event.tags,
                 "region": event.region,
                 "latitude": event.latitude,
@@ -305,6 +319,7 @@ class EventStore:
         hours:       int   = 48,
         region:      str   = None,
         min_anomaly: float = 0.0,
+        min_abs_move_pct: Optional[float] = None,
         tags:        List[str] = None,
         limit:       int   = 50,
         entity_id:   Optional[str] = None,
@@ -378,6 +393,18 @@ class EventStore:
                         continue
                     if min_anomaly > 0 and e["anomaly_score"] < min_anomaly:
                         continue
+                    # "Moved a lot", which min_anomaly cannot express.
+                    #
+                    # Filtered here in Python rather than in SQL because the
+                    # move lives inside a JSONB payload whose column differs by
+                    # domain, and because both windows -- the Redis cache and
+                    # the Postgres band below it -- reach this same loop. An
+                    # event carrying no price payload is excluded rather than
+                    # treated as flat.
+                    if min_abs_move_pct is not None:
+                        move = event_move_pct(e)
+                        if move is None or abs(move) < min_abs_move_pct:
+                            continue
                     if event_types and e["type"] not in event_types:
                         continue
                     # Same-name correlation, for rules that mean one company.
@@ -444,6 +471,15 @@ class EventStore:
                     older_than=time.time() - (CACHED_WINDOW_HOURS * 3600),
                     newer_than=cutoff,
                     min_anomaly=min_anomaly,
+                    # The same question the cached half above was asked.
+                    #
+                    # This argument was missing, and the deep rows were appended
+                    # after the Python filter that applies it -- so a clause
+                    # asking for 96 hours got a magnitude threshold for the
+                    # first 48 and none for the rest. The rule the threshold was
+                    # written for, `rule_physical_disruption_repricing`, is a
+                    # 96-hour rule.
+                    min_abs_move_pct=min_abs_move_pct,
                     region=region,
                     tags=tags,
                     entity_id=entity_id,
@@ -470,6 +506,7 @@ class EventStore:
         older_than: float,
         newer_than: float,
         min_anomaly: float = 0.0,
+        min_abs_move_pct: Optional[float] = None,
         region: Optional[str] = None,
         tags: Optional[List[str]] = None,
         entity_id: Optional[str] = None,
@@ -535,9 +572,18 @@ class EventStore:
         if exclude_event_id:
             where.append(f"event_id::text <> {_bind(str(exclude_event_id))}")
 
+        # Magnitude, derived from the one mapping that says where a move
+        # lives. Selected as well as filtered, so `event_move_pct` finds it
+        # flattened on these rows exactly as it does on cached ones -- this
+        # projection carries no payload columns, which is why filtering alone
+        # would have excluded every historical row instead of the quiet ones.
+        if min_abs_move_pct is not None:
+            where.append(f"ABS({move_pct_sql()}) >= {_bind(float(min_abs_move_pct))}")
+
         sql = f"""
             SELECT event_id::text AS event_id, type, source, anomaly_score, tags,
                    region, headline, summary, named_entities,
+                   {move_pct_sql()} AS move_pct,
                    primary_entity_id AS entity_id,
                    primary_entity_name AS entity_name,
                    primary_entity_type AS entity_type,
@@ -582,6 +628,10 @@ class EventStore:
             e["tags"] = list(e.get("tags") or [])
             e["named_entities"] = list(e.get("named_entities") or [])
             e["occurred_at_epoch"] = float(e.get("occurred_at_epoch") or 0.0)
+            # Null stays null: "no price on this event" is not "flat".
+            e["move_pct"] = (
+                float(e["move_pct"]) if e.get("move_pct") is not None else None
+            )
             # The cached payload carries the canonical domain; derive the same
             # one here rather than leaving the key absent, which reads as
             # "unknown domain" to every consumer of this list.
@@ -596,7 +646,7 @@ class EventStore:
         the correlation engine from processing the next event.
         """
         try:
-            tier_map = {"WATCH": 1, "ALERT": 2, "ELEVATED": 3, "INTELLIGENCE": 4, "CRITICAL": 5}
+            tier_map = ALERT_TIER_DB_VALUE
             tier_str = cluster.alert_tier.value if hasattr(cluster.alert_tier, 'value') else str(cluster.alert_tier)
             tier_int = tier_map.get(str(tier_str).upper(), 2)
 
@@ -614,9 +664,15 @@ class EventStore:
                     entity_ids, description, tags,
                     confidence_score, primary_domain, summary_headline,
                     supporting_headlines, metrics_summary,
-                    primary_entity_id, primary_entity_name, entity_names
+                    primary_entity_id, primary_entity_name, entity_names,
+                    -- The trigger event's thread, carried onto the cluster it
+                    -- caused. CorrelationCluster has declared `trace_id` since
+                    -- the model was written and this column list omitted it, so
+                    -- all 399,312 stored correlations hold NULL and no finding
+                    -- can be traced back to the observation behind it.
+                    trace_id
                 ) VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7::uuid[], $8, $9, $10,
-                          $11, $12, $13, $14, $15::jsonb, $16, $17, $18)
+                          $11, $12, $13, $14, $15::jsonb, $16, $17, $18, $19::uuid)
             """, 
                 cluster.correlation_id,
                 cluster.rule_id,
@@ -641,6 +697,7 @@ class EventStore:
                 getattr(cluster, "primary_entity_id", None),
                 getattr(cluster, "primary_entity_name", None),
                 getattr(cluster, "entity_names", None),
+                getattr(cluster, "trace_id", None),
             )
             logger.info(f"💾 Persisted correlation {cluster.correlation_id} to TimescaleDB.")
 

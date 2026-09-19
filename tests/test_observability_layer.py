@@ -284,7 +284,13 @@ async def test_half_open_trial_closes_the_circuit_on_recovery():
         await b.call(fail)
     assert b.state is CircuitState.OPEN
 
-    await asyncio.sleep(0.06)
+    # Three times the recovery window, not 1.2x.
+    #
+    # This slept 0.06 against a 0.05 timeout -- a 10ms margin -- and failed once
+    # in a full-suite run while passing alone every time. The assertion is that
+    # a half-open trial succeeds *after* the window, so waiting longer tests it
+    # just as well and stops the result depending on the scheduler.
+    await asyncio.sleep(0.15)
     assert await b.call(ok) == 1
     assert b.state is CircuitState.CLOSED
 
@@ -303,7 +309,8 @@ async def test_repeated_failure_backs_off_instead_of_probing_forever():
         await b.call(fail)
     first = b._current_timeout
 
-    await asyncio.sleep(0.06)
+    # Same 10ms margin as the test above, same fix.
+    await asyncio.sleep(0.15)
     with pytest.raises(ConnectionError):
         await b.call(fail)  # failed trial
 

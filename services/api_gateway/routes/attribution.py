@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
 from shared.utils.rbac import require_role, Role
+from services.api_gateway.audit_actions import record_admin_action
 from shared.utils.entity_resolution import (
     canonical_key,
     record_alias,
@@ -76,6 +77,28 @@ async def resolve_one(
     }
 
 
+# Subjects whose name is a *name*, and not an identifier.
+#
+# This scanned every primary_entity_name in a 30-day window, and the window is
+# overwhelmingly identifiers: measured on the live table, 65,435 distinct
+# wallets, 48,088 aircraft, 14,347 vessels, 2,670 autonomous systems and 2,116
+# instruments against 6,877 companies. For all of those a one-character
+# difference is a *different subject* -- AS1 and AS10 are unrelated networks,
+# AAL and AAAU are unrelated securities -- so similarity is not evidence of a
+# shared identity, it is the opposite.
+#
+# It showed. The five candidates this endpoint proposed on the live deployment
+# were 00000000 ~ 200000000, AAR713 ~ AAR7613, AAR761 ~ AAR7613, AAR761 ~
+# AAR761D and AAR762 ~ AAR7623: five aircraft callsigns, offered to an operator
+# as pairs to merge into one identity. A confirmed merge sits at the top of the
+# resolution order and is a wrong link in every correlation that follows.
+#
+# `company` is the type the function was written for -- its own docstring
+# reaches for "Delta Air Lines" and "Delta Apparel" -- and media_source is the
+# other place the same spelling problem occurs (bbc_world vs BBC World).
+MERGEABLE_ENTITY_TYPES = ("company", "media_source")
+
+
 @router.get("/entities/merge-candidates")
 async def get_merge_candidates(
     limit: int = Query(25, ge=1, le=100),
@@ -97,9 +120,11 @@ async def get_merge_candidates(
             FROM events
             WHERE primary_entity_name IS NOT NULL
               AND primary_entity_name <> ''
+              AND primary_entity_type = ANY($1::text[])
               AND occurred_at > NOW() - INTERVAL '30 days'
             LIMIT 2000
-            """
+            """,
+            list(MERGEABLE_ENTITY_TYPES),
         )
     except Exception as e:
         logger.debug("Merge candidate scan failed: %s", e)
@@ -116,6 +141,7 @@ async def get_merge_candidates(
 async def post_alias(
     req: AliasRequest,
     redis=Depends(get_redis_optional),
+    db=Depends(get_db_optional),
     user: Dict[str, Any] = Depends(require_role(Role.ANALYST)),
 ):
     """Records that two spellings name the same subject.
@@ -151,6 +177,16 @@ async def post_alias(
             status_code=400,
             detail="alias not recorded: empty, unavailable, or identical to the canonical form",
         )
+    # An alias sits at the top of the resolution order and is a wrong link in
+    # every correlation that follows it. The Redis provenance hash above records
+    # who asserted it; the ledger is what makes that record tamper-evident.
+    await record_admin_action(
+        redis=redis, db=db, user=user,
+        action="MERGE_ENTITY_ALIAS",
+        resource_type="ENTITY",
+        resource_id=canonical_key(req.canonical) or req.canonical,
+        details={"alias": req.alias, "canonical": req.canonical},
+    )
     return {"alias": req.alias, "canonical": canonical_key(req.canonical), "recorded": True}
 
 

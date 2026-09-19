@@ -20,22 +20,18 @@
 
 import React, { useState, useEffect } from 'react';
 import useSWR from 'swr';
-import { Command } from 'lucide-react';
+import { Command, Menu } from 'lucide-react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { IconLock } from './icons';
 import SystemHealthHUD from '../SystemHealthHUD';
 import { apiClient, fetcher } from '../../lib/api';
 import { useTelemetryStore } from '../../lib/store';
 import { AccountProfileModal } from '../AccountProfileModal';
-
-const TIMEZONES: Array<[string, string]> = [
-  ['America/New_York', 'US EST'],
-  ['UTC', 'UTC'],
-  ['America/Chicago', 'US CST'],
-  ['America/Denver', 'US MST'],
-  ['America/Los_Angeles', 'US PST'],
-  ['Europe/London', 'GMT'],
-  ['Europe/Paris', 'CET'],
-  ['Asia/Tokyo', 'JST'],
-];
+import { useNav } from './NavContext';
+import { TIMEZONES, useTimeZone } from './TimeZoneContext';
+import { useSession } from './SessionContext';
+import { POLL } from '../ui/DataProvider';
 
 /** Initials for the avatar, from whatever the session actually gives us. */
 function initialsFor(email?: string | null): string {
@@ -47,8 +43,13 @@ function initialsFor(email?: string | null): string {
 }
 
 export const Header: React.FC = () => {
+  const { drawerOpen, toggleDrawer } = useNav();
+  const pathname = usePathname();
   const [time, setTime] = useState<string>('');
-  const [timezone, setTimezone] = useState<string>('America/New_York');
+  // Shared, not local. This select governs every timestamp the application
+  // renders -- it used to govern only the clock beside it, while the event
+  // rows below rendered in whatever zone the machine happened to be in.
+  const { zone: timezone, setZone: setTimezone } = useTimeZone();
   const [latency, setLatency] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
   const [isMac, setIsMac] = useState<boolean>(false);
@@ -57,16 +58,14 @@ export const Header: React.FC = () => {
   // Distinct from "connecting": the feed was refused for lack of a session.
   const authRequired = useTelemetryStore((state) => state.authRequired);
 
-  const { data: session } = useSWR<{ authenticated: boolean; user?: { email: string; role: string } }>(
-    '/api/auth/session',
-    (url: string) => fetch(url).then((r) => (r.ok ? r.json() : { authenticated: false })),
-    { refreshInterval: 60000 },
-  );
+  // One shared session, rather than this component, the account modal and
+  // the live-events hook each asking separately and disagreeing.
+  const session = useSession();
 
   const { data: processes } = useSWR<{ active_agents_count: number }>(
     '/agents/processes',
     fetcher,
-    { refreshInterval: 15000 },
+    { refreshInterval: POLL.standard },
   );
 
   useEffect(() => {
@@ -91,7 +90,7 @@ export const Header: React.FC = () => {
         });
         setTime(`${p.hour}:${p.minute}:${p.second} ${p.timeZoneName || ''}`);
       } catch {
-        setTime(now.toISOString().substring(11, 19) + ' UTC');
+        setTime(now.toISOString().substring(11, 19) + 'UTC');
       }
     };
     updateClock();
@@ -116,60 +115,93 @@ export const Header: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  const email = session?.user?.email;
-  const role = session?.user?.role;
+  const { email, role, status } = session;
+
+  // Signing in returns the operator to the page they were on, which is the
+  // whole reason this control exists in the header rather than only on the
+  // login screen.
+  const signInHref = `/login?next=${encodeURIComponent(pathname || '/')}`;
   const agentCount = processes?.active_agents_count;
 
-  const streamTone = isConnected ? 'tone-positive' : authRequired ? 'tone-negative' : 'tone-caution';
+  const streamTone = isConnected
+    ? 'tone-positive'
+    : authRequired
+      ? 'tone-negative'
+      : 'tone-caution';
   const streamDot = isConnected ? 'bg-emerald-400' : authRequired ? 'bg-rose-400' : 'bg-amber-400';
 
   return (
     <header
       className="h-14 min-h-[56px] w-full shrink-0 z-40 flex items-center justify-between gap-4
-                 px-4 sm:px-6 bg-[var(--bg-inset)] border-b border-[var(--border-subtle)]"
+                 px-4 sm:px-6 bg-inset border-b border-line"
     >
       {/* Identity */}
       <div className="flex items-center gap-3 shrink-0 min-w-0">
-        <div className="h-8 w-8 rounded-lg bg-[var(--accent-dim)] border border-[var(--border-accent)]
-                        flex items-center justify-center shrink-0">
-          <span className="text-[var(--accent)] font-semibold text-sm">S</span>
+        {/* The only way to the navigation below `md`, where the sidebar leaves
+            the flow. Above it the sidebar is always visible and this is not. */}
+        <button
+          type="button"
+          onClick={toggleDrawer}
+          aria-label={drawerOpen ? 'Close navigation' : 'Open navigation'}
+          aria-expanded={drawerOpen}
+          className="md:hidden -ml-1 flex h-8 w-8 items-center justify-center rounded-md
+                     text-ink-dim hover:text-ink hover:bg-overlay/60
+                     transition-colors outline-none focus-visible:ring-1
+                     focus-visible:ring-cyan-400/60"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+        <div
+          className="h-8 w-8 rounded-lg bg-accent-dim border border-line-accent
+                        flex items-center justify-center shrink-0"
+        >
+          <span className="text-accent font-semibold text-sm">S</span>
         </div>
         <div className="min-w-0">
-          <h1 className="text-sm font-semibold text-slate-100 leading-tight truncate">Sentinel</h1>
-          <p className="text-[10px] text-slate-500 leading-tight truncate hidden sm:block">
+          {/* Not an <h1>. The brand sits in the chrome on every route, so an
+              h1 here gave each page two top-level headings and made the
+              document outline start with the product name rather than with
+              what the page is. */}
+          <span className="block text-sm font-semibold text-ink leading-tight truncate">
+            Sentinel
+          </span>
+          <p className="text-micro text-ink-mute leading-tight truncate hidden sm:block">
             Multi-domain intelligence
           </p>
         </div>
       </div>
 
       {/* Measured state */}
-      <div className="hidden lg:flex items-center gap-4 text-[11px] min-w-0">
+      <div className="hidden lg:flex items-center gap-4 text-micro min-w-0">
         <span className="flex items-center gap-1.5 whitespace-nowrap">
           <span className={`h-1.5 w-1.5 rounded-full ${streamDot}`} />
-          <span className="text-slate-500">Stream</span>
+          <span className="text-ink-mute">Stream</span>
           {authRequired ? (
-            <a href="/login" className="text-rose-400 hover:text-rose-300 underline underline-offset-2">
+            <Link
+              href={signInHref}
+              className="text-negative underline underline-offset-2 hover:text-ink"
+            >
               sign in
-            </a>
+            </Link>
           ) : (
             <span className={streamTone}>{isConnected ? 'live' : 'connecting'}</span>
           )}
         </span>
 
-        <span className="text-slate-700">·</span>
+        <span className="text-ink-mute">·</span>
 
         <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-slate-500">Agents</span>
-          <span className="text-slate-300 tabular">
+          <span className="text-ink-mute">Agents</span>
+          <span className="text-ink-dim tabular">
             {typeof agentCount === 'number' ? agentCount : '—'}
           </span>
         </span>
 
-        <span className="text-slate-700">·</span>
+        <span className="text-ink-mute">·</span>
 
         <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-slate-500">Gateway</span>
-          <span className={latency === null ? 'tone-negative' : 'text-slate-300 tabular'}>
+          <span className="text-ink-mute">Gateway</span>
+          <span className={latency === null ? 'tone-negative' : 'text-ink-dim tabular'}>
             {latency === null ? 'unreachable' : `${latency}ms`}
           </span>
         </span>
@@ -178,7 +210,7 @@ export const Header: React.FC = () => {
       {/* Controls */}
       <div className="flex items-center gap-2 sm:gap-3 shrink-0">
         <span
-          className="hidden xl:flex items-center gap-1 text-[10px] text-slate-500 border border-[var(--border-subtle)]
+          className="hidden xl:flex items-center gap-1 text-micro text-ink-mute border border-line
                      rounded px-1.5 py-1"
           title="Open the command palette"
         >
@@ -187,14 +219,17 @@ export const Header: React.FC = () => {
         </span>
 
         <div className="hidden xl:flex items-center gap-2">
-          <span className="text-[11px] text-slate-300 tabular whitespace-nowrap" suppressHydrationWarning>
+          <span
+            className="text-micro text-ink-dim tabular whitespace-nowrap"
+            suppressHydrationWarning
+          >
             {time}
           </span>
           <select
             value={timezone}
             onChange={(e) => setTimezone(e.target.value)}
-            className="bg-[var(--bg-raised)] text-[10px] text-slate-400 border border-[var(--border-subtle)]
-                       rounded px-1.5 py-1 outline-none cursor-pointer hover:text-slate-200 transition-colors"
+            className="bg-raised text-micro text-ink-dim border border-line
+                       rounded px-1.5 py-1 outline-none cursor-pointer hover:text-ink transition-colors"
             aria-label="Clock timezone"
           >
             {TIMEZONES.map(([tz, label]) => (
@@ -207,25 +242,40 @@ export const Header: React.FC = () => {
 
         <SystemHealthHUD />
 
-        <button
-          onClick={() => setIsProfileOpen(true)}
-          className="flex items-center gap-2 pl-1.5 pr-2.5 py-1.5 rounded-lg border border-[var(--border-subtle)]
-                     hover:border-[var(--border-strong)] hover:bg-[var(--bg-raised)] transition-colors"
-          title="Account"
-        >
-          <span className="h-6 w-6 rounded bg-[var(--accent-dim)] border border-[var(--border-accent)]
-                           flex items-center justify-center text-[10px] font-semibold text-[var(--accent)]">
-            {initialsFor(email)}
-          </span>
-          <span className="hidden sm:flex flex-col text-left min-w-0">
-            <span className="text-[11px] text-slate-200 leading-tight truncate max-w-[160px]">
-              {email || 'Not signed in'}
+        {/* Three states, and the third is why this is not a ternary.
+            While the session is still being established the control renders a
+            quiet placeholder: flashing "Sign in" at an operator who is signed
+            in, on every page load, is how an interface teaches someone to
+            distrust what it says. */}
+        {status === 'loading' ? (
+          <div aria-hidden className="h-9 w-9 rounded-lg border border-line bg-raised sm:w-36" />
+        ) : status === 'anonymous' ? (
+          <Link
+            href={signInHref}
+            className="flex cursor-pointer items-center gap-2 rounded-lg border border-line-accent bg-accent-dim px-3 py-1.5 text-micro font-semibold text-accent transition-colors hover:border-accent"
+          >
+            <IconLock />
+            Sign in
+          </Link>
+        ) : (
+          <button
+            onClick={() => setIsProfileOpen(true)}
+            aria-label={`Account: ${email ?? 'signed in'}`}
+            className="flex cursor-pointer items-center gap-2 rounded-lg border border-line py-1.5 pl-1.5 pr-2.5 transition-colors hover:border-line-strong hover:bg-raised"
+          >
+            <span className="flex h-6 w-6 items-center justify-center rounded border border-line-accent bg-accent-dim text-micro font-semibold text-accent">
+              {initialsFor(email)}
             </span>
-            {role && (
-              <span className="text-[9px] text-slate-500 leading-tight uppercase tracking-wide">{role}</span>
-            )}
-          </span>
-        </button>
+            <span className="hidden min-w-0 flex-col text-left sm:flex">
+              <span className="max-w-[160px] truncate text-micro leading-tight text-ink">
+                {email}
+              </span>
+              {role && (
+                <span className="text-micro leading-tight tracking-wide text-ink-mute">{role}</span>
+              )}
+            </span>
+          </button>
+        )}
       </div>
 
       <AccountProfileModal isOpen={isProfileOpen} onClose={() => setIsProfileOpen(false)} />

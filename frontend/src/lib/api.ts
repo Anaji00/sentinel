@@ -5,7 +5,7 @@
  * STRICT POLICY: 100% authentic live external data or clean "AWAITING LIVE DATA STREAM..." state.
  */
 
-import axios from "axios";
+import axios from 'axios';
 
 /** Where the client sends requests.
  *
@@ -45,30 +45,32 @@ apiClient.interceptors.response.use(
   (error) => {
     const status = error.response?.status;
     const endpoint = error.config?.url || 'API';
-    console.warn(`[Sentinel API] Endpoint '${endpoint}' returned HTTP status ${status || 'Network/Connection Unavailable'}`);
+    console.warn(
+      `[Sentinel API] Endpoint '${endpoint}' returned HTTP status ${status || 'Network/Connection Unavailable'}`,
+    );
     return Promise.reject(error);
-  }
+  },
 );
 
 const SYMBOL_YAF_MAP: Record<string, string> = {
-  SPX: "^GSPC",
-  NDX: "^NDX",
-  SPY: "^GSPC",
-  QQQ: "^NDX",
-  DJI: "^DJI",
-  VIX: "^VIX",
-  WTI: "CL=F",
-  BRENT: "BZ=F",
-  GLD: "GC=F",
-  US30: "^TYX",
-  US30Y: "^TYX",
-  US10Y: "^TNX",
-  US2Y: "2YY=F",
-  US02Y: "2YY=F",
-  "2Y": "2YY=F",
-  "2YR": "2YY=F",
-  TLT: "TLT",
-  SHY: "SHY",
+  SPX: '^GSPC',
+  NDX: '^NDX',
+  SPY: '^GSPC',
+  QQQ: '^NDX',
+  DJI: '^DJI',
+  VIX: '^VIX',
+  WTI: 'CL=F',
+  BRENT: 'BZ=F',
+  GLD: 'GC=F',
+  US30: '^TYX',
+  US30Y: '^TYX',
+  US10Y: '^TNX',
+  US2Y: '2YY=F',
+  US02Y: '2YY=F',
+  '2Y': '2YY=F',
+  '2YR': '2YY=F',
+  TLT: 'TLT',
+  SHY: 'SHY',
 };
 
 /**
@@ -109,7 +111,7 @@ export class ApiError extends Error {
     super(
       status === null
         ? `Could not reach the API for ${url}`
-        : `API returned ${status} for ${url}${detail ? `: ${detail}` : ''}`
+        : `API returned ${status} for ${url}${detail ? `: ${detail}` : ''}`,
     );
     this.name = 'ApiError';
     this.status = status;
@@ -140,12 +142,12 @@ export class ApiError extends Error {
 export function describeApiError(err: unknown): string | null {
   if (!err) return null;
   if (err instanceof ApiError) {
-    if (err.isUnreachable) return 'FEED UNREACHABLE';
-    if (err.isUnauthenticated) return 'SESSION EXPIRED';
-    if (err.isMissing) return 'ENDPOINT NOT FOUND';
-    return `FEED ERROR ${err.status}`;
+    if (err.isUnreachable) return 'Feed unreachable';
+    if (err.isUnauthenticated) return 'Session expired';
+    if (err.isMissing) return 'Endpoint not found';
+    return `Feed error ${err.status}`;
   }
-  return 'FEED ERROR';
+  return 'Feed error';
 }
 
 export const fetcher = async (url: string) => {
@@ -174,7 +176,10 @@ export const fetcher = async (url: string) => {
     const dummyUrl = new URL(normalizedUrl, 'http://localhost:8000/api/v1');
     const symbolsParam = dummyUrl.searchParams.get('symbols');
     if (!symbolsParam) return { symbols: [], series: {} };
-    const targetSymbols = symbolsParam.split(',').map((s: string) => s.trim().toUpperCase()).filter(Boolean);
+    const targetSymbols = symbolsParam
+      .split(',')
+      .map((s: string) => s.trim().toUpperCase())
+      .filter(Boolean);
     const limit = parseInt(dummyUrl.searchParams.get('limit') || '60', 10);
 
     // `data` is a real response by the time control reaches here: a failed
@@ -222,9 +227,6 @@ export const fetcher = async (url: string) => {
       series: seriesData,
     };
   }
-
-
-
 
   // A 200 carrying a literal null body. Rare, and not a success.
   if (data === null) {
