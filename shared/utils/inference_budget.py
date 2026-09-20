@@ -48,14 +48,29 @@ logger = logging.getLogger("shared.inference_budget")
 # The slot was idle for roughly 80% of every cycle it held, and the swarm
 # managed one inference in six hours. A constant derived from a measurement
 # needs to expire with it; this one outlived its by a factor of five.
-DEFAULT_COOLDOWN_SEC = 600
+# Re-derived for a measured 20.23 tok/s.
+#
+# This is the ceiling for work that never reports back -- a crash, a hang, a
+# container killed mid-inference -- not the spacing between inferences, which
+# is MIN_GAP_SEC below once `finish()` is called.
+#
+# It has now been wrong twice in the same direction, for the same reason. It was
+# set from ~8-minute inferences, the host got faster and it "outlived its
+# measurement by a factor of five". qwen3:0.6b measures 20.23 tok/s against the
+# 2.5 this was last sized for, so a 384-token answer is 19 seconds and 600 is
+# thirty-one times the work it is supposed to bound.
+#
+# 180: still nine times a measured inference, which is ample for a worker that
+# has genuinely hung, and no longer a number that rations a resource it was
+# never meant to ration.
+DEFAULT_COOLDOWN_SEC = int(os.getenv("INFERENCE_DEFAULT_COOLDOWN_SEC", "180"))
 
 # After work on a priority domain the slot is released sooner, so those domains
 # win more of the swarm's scarce inference over time. This is not a second lane:
 # there is still exactly one slot and one inference at a time. Only how long the
 # slot stays held varies, which shifts the *share* without raising concurrency
 # on a single-threaded model server.
-PRIORITY_COOLDOWN_SEC = 240
+PRIORITY_COOLDOWN_SEC = int(os.getenv("INFERENCE_PRIORITY_COOLDOWN_SEC", "90"))
 
 # How long the slot stays held once the work it covered has actually finished.
 #
@@ -68,7 +83,23 @@ PRIORITY_COOLDOWN_SEC = 240
 # pin Ollama at 100% forever. It is capped at six of the host's twelve cores and
 # the collectors, enrichment and correlation tiers share the rest, so the gap is
 # what stops the reasoning tier from crowding out the pipeline feeding it.
-MIN_GAP_SEC = float(os.getenv("INFERENCE_MIN_GAP_SEC", "60"))
+# 30, halved from 60, and this one is NOT simply a function of model speed.
+#
+# The gap exists so the model server does not pin its six cores continuously and
+# starve the collectors, enrichment and correlation tiers that share the rest of
+# the host -- the constraint that made widening Ollama's CPU quota measurably
+# *slower* (43.3 -> 34.0 inferences/hour when it was given two more cores).
+#
+# What changed is the cost of one inference, not the principle. At 2.5 tok/s a
+# 384-token answer occupied the model for 154 seconds; at the measured 20.23 it
+# occupies it for 19. So the same 60-second gap that bought the pipeline a 28%
+# duty cycle now buys it 76%, which is more protection than it was ever asked
+# to provide.
+#
+# 30 puts Ollama at roughly 39% duty rather than 24%, which is still well under
+# what starved the pipeline before. Raise it again if collector or correlation
+# throughput drops after this.
+MIN_GAP_SEC = float(os.getenv("INFERENCE_MIN_GAP_SEC", "30"))
 
 # Finding 538: this bar had never once refused a candidate, and nothing said so.
 _declare("inference.admission.holdback",
@@ -105,6 +136,19 @@ def is_priority_domain(domain: Optional[str]) -> bool:
 # candidate is admitted regardless. An idle slot helps nobody, and a selection
 # rule that can refuse forever is worse than no selection rule.
 ADMISSION_PERCENTILE = float(os.getenv("INFERENCE_ADMISSION_PERCENTILE", "0.60"))
+# What a routine domain must clear instead.
+#
+# Telemetry is about ninety per cent of ingest and the least informative per
+# event, so it wins most of the slots simply by arriving most often. This is the
+# admission-side counterpart to the priority cooldown, which already shortens
+# the hold for news, filings and market data once a slot has been claimed.
+#
+# Deliberately not a ban and deliberately close to the base bar: an exceptional
+# vessel or aircraft event is exactly what this platform exists to catch, and it
+# still clears p80. What it no longer does is outrank a filing on volume alone.
+ROUTINE_ADMISSION_PERCENTILE = float(
+    os.getenv("INFERENCE_ROUTINE_ADMISSION_PERCENTILE", "0.80")
+)
 ADMISSION_HISTORY = int(os.getenv("INFERENCE_ADMISSION_HISTORY", "256"))
 ADMISSION_MIN_HISTORY = int(os.getenv("INFERENCE_ADMISSION_MIN_HISTORY", "32"))
 MAX_HOLDBACK_SEC = float(os.getenv("INFERENCE_MAX_HOLDBACK_SEC", "90"))
@@ -350,7 +394,7 @@ class InferenceBudget:
         # The bar is a percentile of recent scores rather than a fixed
         # threshold, for the same reason the detectors are: only the deployment
         # knows what ordinary looks like.
-        if not await self._passes_admission_bar(score):
+        if not await self._passes_admission_bar(score, domain):
             self.held_back += 1
             _fired("inference.admission.holdback")
             if self.held_back % 500 == 1:
@@ -437,7 +481,9 @@ class InferenceBudget:
         # admits everything; the local deque is the honest fallback.
         return out or list(self._recent_scores)
 
-    async def _passes_admission_bar(self, score: Optional[float]) -> bool:
+    async def _passes_admission_bar(
+        self, score: Optional[float], domain: Optional[str] = None
+    ) -> bool:
         """Whether this candidate is worth the slot, given what else has arrived.
 
         Three ways to pass, and the last two are the safety rails:
@@ -447,6 +493,20 @@ class InferenceBudget:
             would silently disable a caller that simply does not score its work;
           * nothing has been admitted for MAX_HOLDBACK_SEC, so holding out any
             longer wastes the slot the selection exists to spend well.
+
+        The bar itself is now domain-aware, because it was the one part of this
+        class that was not. A vessel position fix and an SEC filing arrived at
+        the same percentile and competed as equals, while telemetry is roughly
+        ninety per cent of what this platform ingests -- 12,549 crypto transfers
+        and 1,701 vessel positions in a quarter hour against 235 financial
+        events. The cooldown already distinguishes them once a slot is *held*;
+        nothing distinguished them when one was being *won*.
+
+        A higher bar for routine domains is not a filter on those domains: a
+        genuinely exceptional position fix still clears a higher percentile, and
+        the holdback rail still admits whatever arrives after a quiet spell. It
+        shifts the share, which is what the priority cooldown does at the other
+        end of the same slot.
         """
         if score is None:
             return True
@@ -466,8 +526,12 @@ class InferenceBudget:
         if (time.monotonic() - self._last_admit) >= MAX_HOLDBACK_SEC:
             return True
 
+        percentile = (
+            ADMISSION_PERCENTILE if is_priority_domain(domain)
+            else ROUTINE_ADMISSION_PERCENTILE
+        )
         ranked = sorted(window)
-        index = min(len(ranked) - 1, int(len(ranked) * ADMISSION_PERCENTILE))
+        index = min(len(ranked) - 1, int(len(ranked) * percentile))
         return value >= ranked[index]
 
     async def is_available(self) -> bool:

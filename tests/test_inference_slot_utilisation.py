@@ -48,7 +48,9 @@ from shared.utils.inference_budget import (  # noqa: E402
     InferenceBudget,
 )
 
-MEASURED_INFERENCE_SEC = 110.0
+# 19.0, from 110.0. qwen3:0.6b measures 20.23 tok/s against the ~2.5 the old
+# figure was taken at, so a 384-token answer is ~19 seconds.
+MEASURED_INFERENCE_SEC = 19.0
 
 
 class TtlRedis:
@@ -93,10 +95,29 @@ class BrokenRedis:
 
 # -- the waste, as arithmetic --------------------------------------------------
 
-def test_the_hold_was_far_longer_than_the_work():
-    """Stated as numbers so the next person to change either notices the other."""
-    idle_fraction = 1 - (MEASURED_INFERENCE_SEC / DEFAULT_COOLDOWN_SEC)
-    assert idle_fraction > 0.75, "the cooldown no longer dominates; revisit this file"
+def test_the_hold_is_no_longer_dominated_by_idle_time():
+    """The waste this file was written to prove has been removed.
+
+    It asserted `idle_fraction > 0.75` -- that the slot sat unused for most of
+    every cycle -- as evidence of the defect. With the cooldown re-derived
+    against a measured 20.23 tok/s that fraction is now ~0.89 on the ceiling
+    and, more importantly, healthy work is governed by MIN_GAP_SEC rather than
+    by the ceiling at all, because `finish()` shortens the hold the moment an
+    inference returns.
+
+    The assertion is inverted deliberately: this file now guards against the
+    cooldown drifting back into rationing, which is the failure it documented.
+    """
+    healthy_cycle = MEASURED_INFERENCE_SEC + MIN_GAP_SEC
+    assert healthy_cycle < DEFAULT_COOLDOWN_SEC, (
+        "a completed inference plus its gap should cost far less than the "
+        "hang ceiling, or finish() is buying nothing"
+    )
+    assert MEASURED_INFERENCE_SEC / healthy_cycle > 0.25, (
+        f"the model works {MEASURED_INFERENCE_SEC}s of every {healthy_cycle}s. "
+        "Below a quarter, the gap is rationing rather than protecting the "
+        "pipeline -- re-derive MIN_GAP_SEC against the current token rate."
+    )
 
 
 def test_completion_gap_is_shorter_than_the_crash_ceiling():

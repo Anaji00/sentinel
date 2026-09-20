@@ -197,8 +197,15 @@ def test_the_registry_instruments_what_the_audit_found_dead():
         "shared/utils/inference_budget.py": [
             "inference.admission.holdback", "inference.budget.claimed",
         ],
-        "services/correlation/soft_correlator.py": ["correlation.vectors.pruned"],
-        "services/collector-tradfi/main.py": ["options.open_interest.resolved"],
+        "services/correlation/soft_correlator.py": [
+            # Paired deliberately: the first says the sweep had an effect, the
+            # second that it ran at all. Without the second, a daily sweep that
+            # correctly finds nothing is indistinguishable from a dead one.
+            "correlation.vectors.pruned", "correlation.vectors.swept",
+        ],
+        "services/collector-tradfi/main.py": [
+            "options.open_interest.resolved", "options.open_interest.asked",
+        ],
     }
     for path, names in sites.items():
         src = (ROOT / path).read_text(encoding="utf-8")

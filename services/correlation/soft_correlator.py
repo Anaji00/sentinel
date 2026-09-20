@@ -68,6 +68,16 @@ VECTOR_RETENTION_SEC = int(os.getenv("VECTOR_RETENTION_SEC", str(90 * 86400)))
 _declare("correlation.vectors.pruned",
          "vector points whose events aged out were removed from the index")
 
+# Ran, as distinct from had an effect.
+#
+# The count above fires only when the sweep removes something, so a sweep that
+# runs daily and correctly finds nothing is indistinguishable from one that
+# never runs -- which is the exact absence-vs-zero confusion the registry
+# exists to end, reproduced inside it. "Swept 30, pruned 0" is a healthy
+# mechanism; "swept 0" is the finding.
+_declare("correlation.vectors.swept",
+         "the vector retention sweep ran, whether or not it removed anything")
+
 # Event types that say only "this thing is here now".
 #
 # A position fix makes no claim, so there is nothing for it to converge with,
@@ -620,6 +630,7 @@ class SoftCorrelator:
                 swallowed("correlation.soft_correlator.prune_count", _exc, logger)
                 n = 0
 
+            _fired("correlation.vectors.swept")
             if n <= 0:
                 return 0
 

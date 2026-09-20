@@ -157,7 +157,7 @@ def build_agent(
     # Per-agent environment variable resolution with tiered defaults
     env_name = agent_name.upper().replace("-", "_")
     selected_model = model or os.getenv(f"{env_name}_MODEL", os.getenv("AGENT_MODEL", DEFAULT_MODEL))
-    selected_fallback = fallback_model or os.getenv(f"{env_name}_FALLBACK_MODEL", os.getenv("OLLAMA_FALLBACK_MODEL", "gemma:2b"))
+    selected_fallback = fallback_model or os.getenv(f"{env_name}_FALLBACK_MODEL", os.getenv("OLLAMA_FALLBACK_MODEL", FAST_MODEL))
 
     return AgentClass(
         agent_name=agent_name,

@@ -53,6 +53,70 @@ SCAN_BATCH = 500
 MAX_QUOTE_KEYS = 2000
 
 
+# Which macro asset this pass compares the equity against.
+#
+# This was `macro_assets[0]`, and the list is a Redis SCAN of
+# `sentinel:quotes:latest:*` split by asset class -- deterministic in practice.
+# Measured 2026-09-19, three consecutive runs returned the identical ordering
+# and therefore the identical choice:
+#
+#     18 macro assets available, ZW=F selected every time
+#     never examined: VXX HYG US10Y NQ=F BZ=F NG=F CL=F SI=F TIP
+#                     LQD US2Y ZC=F TLT GC=F US30Y ES=F XLE
+#
+# Seventeen of eighteen had never been looked at once. Volatility, credit, the
+# whole yield curve, oil, gold and the index futures -- the assets that
+# actually transmit to equities -- were unreachable, while every correlation
+# the platform had ever published was wheat against something.
+#
+# Least-recently-examined rather than round-robin over an index: the list's
+# length and order both change as quotes expire, so a counter modulo its
+# length silently skips entries. A symbol absent from the hash sorts first,
+# which makes a newly collected asset the next one looked at rather than the
+# last.
+#
+# Deliberately not routed through `prioritise`. Focus exists so two agents
+# converge on one subject and consensus can form, and the consensus engine
+# keys on the equity side -- which still uses focus. The macro asset is the
+# axis of the comparison, not its subject, so coverage is what it owes.
+MACRO_ROTATION_KEY = "sentinel:correlations:macro_rotation"
+
+
+async def _next_macro_asset(redis_client, macro_assets: List[str]) -> str:
+    """The macro asset examined longest ago, or one never examined at all.
+
+    Falls back to the caller's existing behaviour if Redis cannot answer: a
+    rotation that fails closed would stop the agent, and picking the head of
+    the list is exactly what it did before.
+    """
+    if not macro_assets:
+        return ""
+    raw = getattr(redis_client, "raw", None) if redis_client is not None else None
+    if raw is None:
+        return macro_assets[0]
+    try:
+        seen = await raw.hgetall(MACRO_ROTATION_KEY) or {}
+
+        def _last(symbol: str) -> float:
+            value = seen.get(symbol) or seen.get(symbol.encode())
+            if value is None:
+                return 0.0
+            try:
+                return float(value.decode() if isinstance(value, bytes) else value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Ties broken by the incoming order, so behaviour is stable on a cold
+        # hash rather than dependent on dict iteration.
+        chosen = min(macro_assets, key=lambda s: (_last(s), macro_assets.index(s)))
+        await raw.hset(MACRO_ROTATION_KEY, chosen, str(time.time()))
+        return chosen
+    except Exception as _exc:
+        swallowed("agents.stock_correlation_agent.macro_rotation", _exc, logger)
+        return macro_assets[0]
+
+
+
 # The price was arriving inside the identifier.
 #
 # The prompt renders the pair as "equity CPB ($21.53)" so the model has the
@@ -145,8 +209,8 @@ class StockCorrelationAgent(SentinelAgent):
         producer=None,
         consumer=None,
         dlq=None,
-        model: str = "qwen2.5:1.5b",
-        fallback_model: Optional[str] = "gemma3:1b",
+        model: str = "qwen3:0.6b",
+        fallback_model: Optional[str] = "qwen3:0.6b",
     ):
         super().__init__(
             agent_name=agent_name,
@@ -290,7 +354,7 @@ class StockCorrelationAgent(SentinelAgent):
             except Exception as _exc:
                 swallowed("agents.stock_correlation_agent.focus", _exc, logger)
 
-            target_macro = macro_assets[0]
+            target_macro = await _next_macro_asset(self.redis, macro_assets)
             target_equity = ticker if ticker in equities else equities[0]
 
             dedup_key = f"stock_corr_task:{target_macro}:{target_equity}:{int(time.time() // 600)}"

@@ -41,6 +41,7 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.adaptive_poll import AdaptivePoll
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
@@ -95,6 +96,9 @@ SEC_HEADERS = {
 }
 
 POLL_INTERVAL_SEC = 90
+
+# Paces the EDGAR loop on what it actually produces. See the note at the sleep.
+_poll_pacer = AdaptivePoll(base_seconds=POLL_INTERVAL_SEC)
 
 # Beyond this, a 13F cannot be the current one.
 #
@@ -458,7 +462,19 @@ async def main():
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-filings"))
 
-    connector = aiohttp.TCPConnector(limit=10)
+    # force_close, for the reason collector-tradfi's EDGAR poller needed it.
+    #
+    # This session lives for the life of the process and polls SEC on a loop. A
+    # keep-alive connection idle between cycles is closed at the far end, and
+    # aiohttp then hands the next request a socket nobody is listening on --
+    # which does not fail, it hangs until the timeout fires. Live evidence here:
+    # 157 suppressed TimeoutErrors on `collector_filings.firehose.fetch (8-K)`,
+    # and poll cycles taking 21-26 seconds to ingest nothing.
+    #
+    # The identical defect was measured and fixed in the Form 4 poller, which
+    # went from a failure every three minutes to none. Same root, second
+    # service.
+    connector = aiohttp.TCPConnector(limit=10, force_close=True)
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             # The firehose resolves every filer through this registry, so it is
@@ -539,7 +555,25 @@ async def main():
                     f"{len(tasks) - 1} watched companies + the current-filings feed in {elapsed:.1f}s"
                 )
 
-                await asyncio.sleep(POLL_INTERVAL_SEC)
+                # Sleep on yield, not on the clock.
+                #
+                # Measured over seven days, filings by hour UTC: hour 20 carries
+                # 527 (the post-close 8-K and Form 4 surge), hours 10-21 carry
+                # 107-212 each, and hours 0, 1, 4-9 and 22 carry ZERO, every
+                # day. At a flat 90s that is ~360 cycles a night, each taking
+                # 21-26 seconds, to ingest nothing.
+                #
+                # Pacing by the *market session* would be wrong here and worth
+                # saying why: filings peak in the hour the equity calendar calls
+                # AFTER_HOURS, which carries a 3x slowdown, so session pacing
+                # would back this feed off exactly when it is busiest. Yield is
+                # the honest signal -- it needs no timezone and follows a
+                # publication schedule that changes without anyone editing a
+                # table.
+                #
+                # Nine dead hours: 360 cycles becomes 38. One filing resets it
+                # to the base interval immediately.
+                await asyncio.sleep(_poll_pacer.after(new_filings))
     finally:
         hb_task.cancel()
         await producer.close()

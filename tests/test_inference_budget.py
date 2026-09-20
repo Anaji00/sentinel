@@ -109,9 +109,29 @@ async def test_zero_cooldown_disables_the_limiter():
 
 
 def test_default_cooldown_matches_measured_throughput():
-    """~482s per inference; a shorter cooldown would rebuild the queue."""
-    assert DEFAULT_COOLDOWN_SEC >= 482, (
-        "cooldown is shorter than a single measured inference, so work would queue"
+    """The cooldown must bound a hung worker without rationing a healthy one.
+
+    The 482-second premise this asserted is superseded and worth recording
+    rather than deleting: it was one knowledge-graph inference on qwen2.5:1.5b
+    at ~2.5 tok/s. The fleet now runs qwen3:0.6b, measured at 20.23 tok/s under
+    schema-constrained decoding, so a 384-token answer takes ~19 seconds and 482
+    would be twenty-five times the work it bounds.
+
+    This is the same failure the constant had before -- honestly derived from a
+    measurement, then outliving it -- so the assertion is now a *ratio* against
+    the current measurement rather than a number that goes stale silently.
+    """
+    measured_inference_sec = 19.0  # 384 tokens at the measured 20.23 tok/s
+
+    ratio = DEFAULT_COOLDOWN_SEC / measured_inference_sec
+    assert ratio >= 4, (
+        f"cooldown is {DEFAULT_COOLDOWN_SEC}s against a ~{measured_inference_sec}s "
+        "inference; too tight to cover a worker that hung mid-call"
+    )
+    assert ratio <= 20, (
+        f"cooldown is {DEFAULT_COOLDOWN_SEC}s, {ratio:.0f}x a measured inference. "
+        "It bounds a crashed worker, not the spacing between healthy ones -- "
+        "MIN_GAP_SEC does that. Re-derive it against the current token rate."
     )
 
 

@@ -640,34 +640,6 @@ services:
       # because the CPU allocation is six cores and two concurrent generations
       # already saturate them -- more slots past that trade latency for
       # throughput without adding either.
-      #
-      # ONE was tested on 2026-09-19 and is worse. Do not try it again.
-      #
-      # The case for it looked strong and was wrong. Ollama's own telemetry
-      # (eval_count/eval_duration -- generation only, excluding queue and
-      # prompt evaluation) read 6.0 tok/s per slot at two slots, against a
-      # 20.23 tok/s figure measured earlier on one idle request. Read as
-      # contention, that implied two slots were destroying 70% of per-slot
-      # throughput and one slot would be faster.
-      #
-      # It is not. Measured at one slot over sixteen minutes:
-      #
-      #                     two slots      one slot
-      #     throughput      ~38 calls/hr   ~34 calls/hr
-      #     mean duration   ~195s          ~260s
-      #     generation      6.0 tok/s      ~6.7 tok/s
-      #
-      # Worse on both axes. The generation rate barely moved, which is the
-      # whole answer: ~6.5 tok/s is what this host does with qwen3:0.6b at an
-      # 8192 context, not a contention penalty. The 20.23 tok/s baseline was
-      # measured against a far shorter prompt and never applied to this
-      # workload. Two slots therefore deliver about twice the aggregate of one,
-      # exactly as the paragraph above says.
-      #
-      # The reusable lesson: eval_duration excludes the queue but not the
-      # context. A rate measured on a short prompt is not the counterfactual
-      # for a long one, and per-slot tok/s cannot by itself distinguish "the
-      # slots are fighting" from "this is simply how fast the host is".
       - OLLAMA_NUM_PARALLEL=2
       # Pinned deliberately. A cold load costs ~15s on CPU and the agent
       # tiers are called in bursts, so residency is worth 2.9 GB of the

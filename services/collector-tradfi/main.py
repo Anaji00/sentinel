@@ -1003,6 +1003,16 @@ _OPTION_OI_PREFIX = "sentinel:options:oi:"
 _declare("options.open_interest.resolved",
          "open interest was fetched for a contract that cleared the size gate")
 
+# Asked, as distinct from answered.
+#
+# The count above fires only when a provider returns a figure, so a chain that
+# asks constantly and is refused every time reads as "never fired" -- the same
+# shape as one nothing ever calls. Separating them makes the difference
+# legible: "asked 400, resolved 0" is a provider problem, "asked 0" is a
+# wiring problem, and finding 570 could not tell which it was.
+_declare("options.open_interest.asked",
+         "a contract cleared the size gate and open interest was requested")
+
 # Alpaca serves contract reference data from the trading API, not the market
 # data host the snapshots come from.
 _ALPACA_CONTRACTS_URL = os.getenv(
@@ -1053,6 +1063,7 @@ async def _contract_open_interest(session, redis_client, contract: str):
             swallowed("collector_tradfi.option_oi_cache", _exc, logger)
 
     value = None
+    _fired("options.open_interest.asked")
     try:
         async with session.get(f"{_ALPACA_CONTRACTS_URL}/{contract}") as resp:
             if resp.status == 200:

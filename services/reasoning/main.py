@@ -315,8 +315,8 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     # output; the lane bounds concurrency to one reasoning inference at a time.
     _budget = InferenceBudget(
         redis_client,
-        os.getenv("AGENT_MODEL", "qwen2.5:1.5b"),
-        cooldown_sec=int(os.getenv("REASONING_COOLDOWN_SEC", "120")),
+        os.getenv("AGENT_MODEL", "qwen3:0.6b"),
+        cooldown_sec=int(os.getenv("REASONING_COOLDOWN_SEC", "60")),
         lane="reasoning",
     )
     _shed = 0

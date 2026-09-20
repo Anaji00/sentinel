@@ -100,11 +100,40 @@ def test_the_allowlist_excludes_models_too_large_for_the_container(compose):
 
 
 def test_fallback_selection_honours_the_allowlist():
-    """The filter, not the comment, is what keeps an unloadable model out."""
+    """The filter, not the comment, is what keeps an unloadable model out.
+
+    The allowlist narrowed to one entry when the fleet moved to qwen3:0.6b, and
+    the reason is the point of this test. `_get_fallback_model` picks any pulled
+    model the list admits that is not the one that just failed -- and under
+    OLLAMA_MAX_LOADED_MODELS=1, loading it EVICTS the resident model and pays a
+    reload. Observed: qwen3:0.6b configured on every agent, one Ollama
+    connection error fired the discovery path, and gemma3:1b ended up resident
+    with UNTIL=Forever while the whole fleet was asking for qwen3.
+
+    With one entry the discovery finds nothing and the caller retries the
+    primary, which the client already logs as the correct outcome: "No secondary
+    fallback model pulled in local Ollama. Retrying on 'qwen3:0.6b'".
+    """
     from shared.utils.ollama import _permitted
 
-    pulled = ["llama3:latest", "qwen2.5:7b", "qwen2.5:3b", "gemma:2b", "qwen2.5:1.5b"]
-    assert _permitted(pulled) == ["qwen2.5:3b", "gemma:2b", "qwen2.5:1.5b"]
+    pulled = ["llama3:latest", "qwen2.5:7b", "qwen2.5:3b", "gemma:2b",
+              "qwen2.5:1.5b", "qwen3:0.6b"]
+    assert _permitted(pulled) == ["qwen3:0.6b"]
+
+    # The original guard, unchanged: a model this host cannot serve must never
+    # be reachable however the list is edited.
+    assert "llama3:latest" not in _permitted(pulled)
+    assert "qwen2.5:7b" not in _permitted(pulled)
+
+
+def test_a_cross_family_fallback_cannot_be_selected():
+    """One resident model means a second family is an eviction, not a fallback."""
+    from shared.utils.ollama import OLLAMA_ALLOWED_MODELS
+
+    assert len(OLLAMA_ALLOWED_MODELS) == 1, (
+        "widen this only alongside OLLAMA_MAX_LOADED_MODELS, or a single "
+        "connection error will evict the model the fleet is configured for"
+    )
 
 
 def test_an_empty_allowlist_means_no_opinion_not_no_models(monkeypatch):

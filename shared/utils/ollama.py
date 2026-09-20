@@ -45,7 +45,7 @@ DEFAULT_MODEL_NAME = "qwen3:0.6b"
 # against a 4.5 GB container limit -- unloadable, so any caller that reached
 # this default timed out rather than answering.
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", DEFAULT_MODEL_NAME)
-OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
+OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen3:0.6b")
 
 # Models this deployment is permitted to load, whatever `ollama list` returns.
 #
@@ -59,10 +59,40 @@ OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
 # Six models are pulled on this host and four of them fit. Listing the four is
 # the whole mechanism: an unloadable model is skipped at the point the choice is
 # made rather than discovered by timing out.
+#
+# qwen3:0.6b and qwen3:1.7b added when the fleet moved to qwen3. The 0.6b is
+# 522 MB against qwen2.5:1.5b's 986 MB, and CPU generation is bound by bytes
+# moved per token, so roughly half the weights is roughly twice the tokens a
+# second on the same cores. qwen2.5:1.5b stays listed as a manual escape hatch;
+# nothing routes to it automatically any more, because the configured fallback
+# now names qwen3:0.6b and a fallback to a *different* model would be an
+# eviction and a reload against one model slot.
+#
+# Qwen3 emits a reasoning trace by default. See `_THINKING_ENABLED` -- every
+# request sends `think: false`, without which a 400-token trace nobody reads
+# costs 160 seconds here before the answer begins.
 OLLAMA_ALLOWED_MODELS = frozenset(
     m.strip()
     for m in os.getenv(
-        "OLLAMA_ALLOWED_MODELS", "qwen2.5:1.5b,qwen2.5:3b,gemma:2b,gemma3:1b"
+        "OLLAMA_ALLOWED_MODELS",
+        # One family, because only one model may be resident.
+        #
+        # `_get_fallback_model` picks any pulled model this list admits that is
+        # not the one that just failed -- and under OLLAMA_MAX_LOADED_MODELS=1
+        # loading it EVICTS the resident model and pays a reload. Observed
+        # directly: qwen3:0.6b was configured everywhere, a single Ollama
+        # connection error fired the discovery path, and gemma3:1b ended up
+        # resident with UNTIL=Forever while every agent was asking for qwen3.
+        #
+        # The codebase already settled this for the tiers -- "Both tiers name
+        # the same model for the same reason" -- but the discovery path was
+        # still allowed to reach across families. With one entry it finds
+        # nothing and the caller retries the primary, which is the behaviour
+        # the log already describes as correct: "No secondary fallback model
+        # pulled in local Ollama. Retrying on 'qwen3:0.6b'".
+        #
+        # Widen this only alongside OLLAMA_MAX_LOADED_MODELS.
+        "qwen3:0.6b",
     ).split(",")
     if m.strip()
 )
@@ -143,26 +173,35 @@ def _inference_threads() -> Optional[int]:
 # The defaults stay low for callers that do not state a need; a caller that asks
 # for more has a schema that requires it, and truncating that request produces
 # text no parser can use.
-# 192, halved from 384.
+# 640, and the arithmetic that halved it to 192 was wrong.
 #
-# This is the FLOOR for a caller that names no budget, not a cap on anyone:
-# `_schema_default_tokens` raises it for a schema that plainly needs more, and
-# the truncation retry doubles and tries again when the estimate is wrong low.
-# So the cost of halving it is borne only by callers whose schema does not
-# justify the tokens, and it is recoverable where it is wrong.
+# The claim was that "every 100 tokens is 40 seconds at 2.5 tok/s, so halving
+# the budget roughly doubles answers per hour". That treats num_predict as a
+# target. It is a maximum: with schema-constrained decoding the model stops
+# when the JSON object closes, and it was measured stopping early -- a request
+# for 120 tokens returned after 67. An answer that completes in 200 tokens
+# costs 200 tokens whether the budget says 192, 384 or 640, so lowering the
+# ceiling buys nothing from the answers that already fit.
 #
-# The gain is not marginal. Generation is linear in tokens and this host
-# measures 2.5 tok/s under load, so every 100 tokens is 40 seconds of the
-# platform's scarcest resource -- and at 2 concurrent slots, 192 tokens rather
-# than 384 is roughly twice the answers per hour from the same machine.
-SMALL_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_SMALL_DEFAULT_TOKENS", "192"))
+# What lowering it does buy is truncation. A truncated answer is not a shorter
+# answer: `_extract_json` needs a closing brace, so the response is unusable,
+# and the retry doubles the budget and runs the whole inference again. On a
+# host affording ~43 inferences an hour that is two slots spent for one result
+# -- so the cut made throughput worse in exactly the cases where it bit.
+#
+# 640 rather than higher because `max_deliverable_tokens()` is 900 at the
+# current measured rate, and a default sitting at the ceiling leaves the retry
+# nothing to double into. That cap is computed from the observed generation
+# rate rather than configured, so a faster model raises it without this number
+# changing.
+SMALL_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_SMALL_DEFAULT_TOKENS", "640"))
 # Measured: a scenario at 1024 tokens produced 4,056 characters and still had
 # not closed its JSON. The schema is three nested hypotheses of seven fields
 # each plus five top-level fields, so a complete answer runs past 1,500 tokens.
 # Generation is linear in tokens -- 1024 took ~2m40s here -- which is why the
 # default stays low and only a caller that declares a large schema pays for it.
 SMALL_MODEL_MAX_TOKENS = int(os.getenv("OLLAMA_SMALL_MAX_TOKENS", "2048"))
-LARGE_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_LARGE_DEFAULT_TOKENS", "512"))
+LARGE_MODEL_DEFAULT_TOKENS = int(os.getenv("OLLAMA_LARGE_DEFAULT_TOKENS", "768"))
 LARGE_MODEL_MAX_TOKENS = int(os.getenv("OLLAMA_LARGE_MAX_TOKENS", "2048"))
 
 
@@ -475,7 +514,7 @@ OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL
 # and llama3 advertises 11,760 characters against qwen2.5:1.5b's 7,664. A
 # service defaulting here would build prompts half again too large and have
 # their middles cut on arrival.
-DEFAULT_MODEL = "qwen2.5:1.5b"
+DEFAULT_MODEL = "qwen3:0.6b"
 
 # Model Tier Preference Lists
 #
@@ -483,8 +522,12 @@ DEFAULT_MODEL = "qwen2.5:1.5b"
 # lightweight one, which made it reachable as a fallback from anywhere. Both
 # tiers now list installed Qwen and Gemma models only, largest first in the
 # heavy tier and smallest first in the lightweight one.
-MODEL_TIER_LIGHTWEIGHT = ["gemma:2b", "qwen2.5:1.5b", "qwen2.5:3b"]
-MODEL_TIER_HEAVY       = ["qwen2.5:7b", "qwen2.5:3b", "gemma:2b"]
+# Unused, and kept accurate rather than deleted while anything still imports
+# them by name. They named gemma:2b first for the lightweight tier, which is
+# neither what runs nor what should be reached for: see OLLAMA_ALLOWED_MODELS
+# above for why a second family is an eviction rather than a fallback.
+MODEL_TIER_LIGHTWEIGHT = ["qwen3:0.6b", "qwen3:1.7b"]
+MODEL_TIER_HEAVY       = ["qwen3:1.7b", "qwen3:0.6b"]
 
 _GLOBAL_OLLAMA_SEMAPHORE: Optional[asyncio.Semaphore] = None
 _GLOBAL_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None

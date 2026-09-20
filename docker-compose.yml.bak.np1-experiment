@@ -641,33 +641,25 @@ services:
       # already saturate them -- more slots past that trade latency for
       # throughput without adding either.
       #
-      # ONE was tested on 2026-09-19 and is worse. Do not try it again.
+      # THREE, under test, and the paragraph above predicts this will not help.
       #
-      # The case for it looked strong and was wrong. Ollama's own telemetry
-      # (eval_count/eval_duration -- generation only, excluding queue and
-      # prompt evaluation) read 6.0 tok/s per slot at two slots, against a
-      # 20.23 tok/s figure measured earlier on one idle request. Read as
-      # contention, that implied two slots were destroying 70% of per-slot
-      # throughput and one slot would be faster.
+      # The reasoning there was written for qwen2.5:1.5b. The fleet now runs
+      # qwen3:0.6b, a third of the weights, so the question is whether two
+      # concurrent generations still saturate six cores. Sampled eight times
+      # over forty seconds at NUM_PARALLEL=2 they do: 516-595% of the 600%
+      # quota, with memory at 3.16-3.19 of 5 GiB.
       #
-      # It is not. Measured at one slot over sixteen minutes:
+      # The reason to test anyway is that prompt evaluation and token generation
+      # are different workloads -- the first is compute-bound and parallelises,
+      # the second is memory-bandwidth-bound and does not -- and telemetry shows
+      # 44-67% of each call is prompt evaluation. A third slot could overlap one
+      # request's prompt with another's generation. If it cannot, latency rises
+      # and throughput does not, which is what the original note predicts.
       #
-      #                     two slots      one slot
-      #     throughput      ~38 calls/hr   ~34 calls/hr
-      #     mean duration   ~195s          ~260s
-      #     generation      6.0 tok/s      ~6.7 tok/s
-      #
-      # Worse on both axes. The generation rate barely moved, which is the
-      # whole answer: ~6.5 tok/s is what this host does with qwen3:0.6b at an
-      # 8192 context, not a contention penalty. The 20.23 tok/s baseline was
-      # measured against a far shorter prompt and never applied to this
-      # workload. Two slots therefore deliver about twice the aggregate of one,
-      # exactly as the paragraph above says.
-      #
-      # The reusable lesson: eval_duration excludes the queue but not the
-      # context. A rate measured on a short prompt is not the counterfactual
-      # for a long one, and per-slot tok/s cannot by itself distinguish "the
-      # slots are fighting" from "this is simply how fast the host is".
+      # Baseline to beat, measured over 30 minutes at 2 slots:
+      #   12 generate calls, mean ~35s (39.9, 20.2, 41.9, 51.2, 21.8)
+      #   7 agent completions
+      # Revert to 2 if per-call latency rises without call volume rising.
       - OLLAMA_NUM_PARALLEL=2
       # Pinned deliberately. A cold load costs ~15s on CPU and the agent
       # tiers are called in bursts, so residency is worth 2.9 GB of the

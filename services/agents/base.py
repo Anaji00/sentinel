@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from shared.kafka import Topics
 from shared.utils.regime import current_regime as shared_current_regime
-from shared.utils.quiet_failures import swallowed, heartbeat_line as quiet_heartbeat_line
+from shared.utils.quiet_failures import dropped, swallowed, heartbeat_line as quiet_heartbeat_line
 from shared.utils.metrics import MetricsCollector
 from shared.utils.freshness import is_stale
 from shared.utils.live_feed import agent_narrative
@@ -181,6 +182,47 @@ def is_scoreable_direction(value) -> bool:
 #
 # Was 0.85, which put every silent agent above most measured findings.
 AGENT_UNSTATED_CONFIDENCE = 0.30
+
+
+# How much of one swarm-written entry reaches another agent's prompt.
+#
+# The counts in the global context were always capped -- five memories, five
+# bulletins -- but the length of each was not, and the entries are written by
+# the model. Measured 2026-09-19: memories and bulletins were 2,518 and 1,634
+# characters, 73% of a 5,711-character block that three agents pay for on every
+# call, and four of the five memories restated the same two ticker pairs.
+#
+# 200 matches what the macro brief has always used one section above
+# (`sanitize_untrusted(headline, max_chars=200)`). A claim survives that; the
+# model's rationale for the claim does not, and the rationale was the growth.
+PROMPT_ENTRY_MAX_CHARS = int(os.getenv("AGENT_PROMPT_ENTRY_MAX_CHARS", "200"))
+
+
+def _prompt_entry_topic(text: object) -> str:
+    """What an entry is *about*, for collapsing restatements of one finding.
+
+    Memories and bulletins are written as "<claim>: <reasoning>", and the
+    reasoning is regenerated per call while the claim stays put -- so five
+    entries become two distinct findings and three near-duplicates of them.
+    Keyed on the claim the duplicates collapse, and the slots they held go to
+    findings the reader has not already seen.
+    """
+    raw = str(text or "").strip()
+    # `publish_bulletin` mirrors into memory as "[alert] <claim>: <reasoning>",
+    # so the same claim reaches the two stores with and without its type tag.
+    # Without stripping it the de-duplication compares "[alert] Correlation X"
+    # against "Correlation X" and concludes they are different findings.
+    if raw.startswith("["):
+        closed = raw.find("]")
+        if 0 < closed < 40:
+            raw = raw[closed + 1:].lstrip()
+    # ...and it appends " (conviction 0.60)" on the way in, so the same claim
+    # differs at its tail as well as its head. A summary with no colon at all
+    # -- "SELL GOOGL @ $7.16 -> $6.89 (Kelly 2.0%)" is one -- is compared whole,
+    # which is precisely where that suffix decides the answer.
+    raw = re.sub(r"\s*\(conviction\s+[0-9.]+\)\s*$", "", raw)
+    head = raw.split(":", 1)[0]
+    return re.sub(r"\s+", " ", head).strip().lower()[:120]
 
 
 class _NoBriefToPublish(Exception):
@@ -1124,7 +1166,27 @@ class SentinelAgent(ABC):
 
                 elapsed = time.monotonic() - t0
                 if elapsed > 10:
-                    self.logger.warning(f"Slow dispatch: {elapsed:.1f}s")
+                    # Counted, because a batched agent logs this once per item.
+                    #
+                    # radar_agent submits to an InferenceBatcher, so eight
+                    # messages wait on one flush and all eight exceed the
+                    # threshold at the same instant: observed as eight identical
+                    # "Slow dispatch: 376.2s" lines at one timestamp, against a
+                    # single Ollama call that took 47.9 seconds. Read literally
+                    # that says the system is eight times slower than it is,
+                    # when it is in fact one inference amortised across eight
+                    # decisions -- which is the batcher working exactly as
+                    # designed.
+                    #
+                    # `dropped` collapses the repeats into a count and logs the
+                    # first, then powers of ten, so a genuine change in dispatch
+                    # latency is still visible without a batch flush looking
+                    # like a fault.
+                    dropped(
+                        f"agents.{self.name}.slow_dispatch",
+                        self.logger,
+                        detail=f"{elapsed:.1f}s",
+                    )
             except SchemaViolationError as e:
                 self._errors += 1
                 await self._send_dlq(raw, f"SchemaViolationError: {str(e)}", self.input_topics[0])
@@ -1351,19 +1413,47 @@ class SentinelAgent(ABC):
             return "Failed to fetch memories."
 
     async def get_cross_agent_context(self, ticker: Optional[str] = None, entity_id: Optional[str] = None, limit: int = 3) -> str:
+        """Peer intelligence for prompt injection: bulletins, consensus, memories.
+
+        Measured on the running deployment 2026-09-19 this block was 3,264
+        characters -- about 816 tokens -- carried by six agents, which made it
+        larger than the global context block that only three carry. Three
+        things were wrong with it and all three are fixed here.
+
+        Uncapped. Entries are model-written and the cap that the global block
+        gained applies just as much one function away.
+
+        Doubled. `publish_bulletin` mirrors every bulletin into episodic
+        memory, so the same claim arrived once under Active Bulletins and again
+        verbatim under Cross-Agent Memories -- roughly half the block was one
+        set of claims printed twice. The mirror is worth keeping (a conclusion
+        is worth recalling), so the de-duplication belongs here, at the read.
+
+        Silent for its own author. The peer filter is right -- this is
+        cross-agent context -- but the agent producing nearly all of the
+        swarm's output received 338 characters where its peers received 3,264,
+        and with nothing to read it re-derived the same correlation every ten
+        minutes. When there are no peers to quote, its own recent conclusions
+        are the thing that stops it repeating them.
         """
-        Concise, fully dynamic helper for agents to retrieve active bulletins, cross-agent memories, and swarm consensus for LLM prompt injection.
-        Filtering out self-memories ensures strictly peer-agent intelligence is provided.
-        """
-        lines = []
+        lines: List[str] = []
         lookup_key = ticker or entity_id
+        shown_topics = set()
+        own_memories: List[str] = []
+
         try:
             bulletins = await self.read_bulletins(ticker=lookup_key)
             if bulletins:
                 # Exclude self-bulletins for pure cross-agent context
                 peer_bulletins = [b for b in bulletins if b.agent_name != self.name]
-                if peer_bulletins:
-                    bulletin_strs = [f"[{b.agent_name}->{b.bulletin_type}] {b.summary}" for b in peer_bulletins[:3]]
+                bulletin_strs = []
+                for b in peer_bulletins[:3]:
+                    topic = _prompt_entry_topic(b.summary)
+                    if topic:
+                        shown_topics.add(topic)
+                    summary = sanitize_untrusted(b.summary, max_chars=PROMPT_ENTRY_MAX_CHARS)
+                    bulletin_strs.append(f"[{b.agent_name}->{b.bulletin_type}] {summary}")
+                if bulletin_strs:
                     lines.append("Active Bulletins:\n- " + "\n- ".join(bulletin_strs))
         except Exception as e:
             self.logger.debug(f"Bulletin fetch error: {e}")
@@ -1379,7 +1469,7 @@ class SentinelAgent(ABC):
             self.logger.debug(f"Consensus fetch error: {e}")
 
         try:
-            raw_mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, limit * 2)
+            raw_mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, limit * 4)
             if raw_mems:
                 mem_strs = []
                 for raw in raw_mems:
@@ -1387,14 +1477,31 @@ class SentinelAgent(ABC):
                         m = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
                         text = m.get('text', '')
                         agent_name = m.get('agent', 'Agent')
-                        if text and agent_name != self.name:
-                            mem_strs.append(f"[{agent_name}]: {text}")
+                        if not text:
+                            continue
+                        body = sanitize_untrusted(text, max_chars=PROMPT_ENTRY_MAX_CHARS)
+                        if agent_name == self.name:
+                            if len(own_memories) < limit:
+                                own_memories.append(f"- {body}")
+                            continue
+                        topic = _prompt_entry_topic(text)
+                        # Already said once, in the section above.
+                        if topic and topic in shown_topics:
+                            continue
+                        if topic:
+                            shown_topics.add(topic)
+                        mem_strs.append(f"[{agent_name}]: {body}")
                     except Exception as _exc:
                         swallowed("agents.base.get_cross_agent_context", _exc)
                 if mem_strs:
                     lines.append("Cross-Agent Memories:\n- " + "\n- ".join(mem_strs[:limit]))
         except Exception as e:
             self.logger.debug(f"Memory fetch error: {e}")
+
+        # Nothing from anyone else. Labelled as its own so the model does not
+        # read its previous conclusion as independent corroboration of itself.
+        if not lines and own_memories:
+            lines.append("Your Own Recent Conclusions (do not restate):\n" + "\n".join(own_memories))
 
         return "\n".join(lines) if lines else ""
 
@@ -1549,11 +1656,18 @@ class SentinelAgent(ABC):
                 + (f" (conviction {bulletin.conviction:.2f})" if bulletin.conviction else "")
             )
 
-            # Also publish to PubSub for real-time listeners
-            await self.redis.raw.publish(
-                "sentinel:bulletins:stream",
-                bulletin.model_dump_json(),
-            )
+            # There is no PubSub fan-out here any more.
+            #
+            # This published `bulletin.model_dump_json()` to
+            # `sentinel:bulletins:stream` on every bulletin. That channel name
+            # appeared exactly once in the tree -- at the publish -- and
+            # `PUBSUB NUMSUB` answered 0 on the running deployment. PUBLISH to
+            # a channel with no subscriber is discarded by Redis, so this
+            # serialised every bulletin to JSON in order to drop it.
+            #
+            # Bulletins reach their readers through the per-agent keys that
+            # `read_bulletins` scans, which is what the consensus engine and
+            # the prompt builders actually use.
             self.logger.debug(f"Published bulletin: {bulletin_type} | {summary[:60]}")
         except Exception as e:
             self.logger.warning(f"Failed to publish bulletin: {e}")
@@ -1631,20 +1745,70 @@ class SentinelAgent(ABC):
     async def get_bulletins_for_prompt(self, types: Optional[List[str]] = None, limit: int = 5) -> str:
         """
         Returns a formatted string of active bulletins for LLM prompt injection.
+
+        Four filters, all about what is worth another agent's context window
+        rather than about what is true:
+
+        - A bulletin at zero conviction asserts nothing. The field defaults to
+          0.5, so zero is a value an agent set deliberately rather than one it
+          left unset, and printing it spends tokens saying "no opinion, and
+          here is the reasoning behind having none".
+        - One finding restated is one finding. The quant and correlation
+          engines re-derive the same call every run and the model rewords the
+          rationale each time, so recency alone fills the section with a single
+          claim wearing several coats.
+        - One agent is not a swarm. Sorted by recency, the section belongs to
+          whichever agent runs most often: measured 2026-09-19, four of five
+          live bulletins were `stock_correlation_agent`, and the consensus
+          engine reported `contributing_agents: 1` on every signal it had.
+          Round-robin does not make a quiet agent publish, but it does stop a
+          prolific one from burying it once it has.
+        - A claim needs its subject, not its argument. Capped at the same 200
+          characters the macro brief one section above has always used.
         """
         types = types or ["regime_change", "signal", "alert", "thesis"]
-        bulletins = await self.subscribe_bulletins(types, limit=limit)
+        # Over-read, for the reason the memory block over-reads: filtering a
+        # five-row read would shrink this section instead of sharpening it.
+        bulletins = await self.subscribe_bulletins(types, limit=max(limit * 4, 20))
         if not bulletins:
             return ""
-        context = "\n### ACTIVE AGENT BULLETINS ###\n"
+
+        # Distinct claims, newest first.
+        by_agent: Dict[str, List[AgentBulletin]] = {}
+        seen = set()
         for b in bulletins:
+            if b.conviction <= 0:
+                continue
+            key = (b.agent_name, b.bulletin_type, b.ticker, _prompt_entry_topic(b.summary))
+            if key in seen:
+                continue
+            seen.add(key)
+            by_agent.setdefault(b.agent_name, []).append(b)
+
+        # One from each agent, then a second from each, until the section is
+        # full. Insertion order is recency order, so the most recent publisher
+        # still leads; what it can no longer do is take every row.
+        ordered: List[AgentBulletin] = []
+        while len(ordered) < limit and any(by_agent.values()):
+            for name in list(by_agent):
+                if not by_agent[name]:
+                    continue
+                ordered.append(by_agent[name].pop(0))
+                if len(ordered) >= limit:
+                    break
+
+        if not ordered:
+            return ""
+        shown = []
+        for b in ordered:
             direction_str = f" ({b.expected_direction})" if b.expected_direction else ""
             ticker_str = f" [{b.ticker}]" if b.ticker else ""
-            context += (
+            summary = sanitize_untrusted(b.summary, max_chars=PROMPT_ENTRY_MAX_CHARS)
+            shown.append(
                 f"- [{b.agent_name}] {b.bulletin_type}{ticker_str}{direction_str} "
-                f"(conviction: {b.conviction:.0%}): {b.summary}\n"
+                f"(conviction: {b.conviction:.0%}): {summary}\n"
             )
-        return context + "\n"
+        return "\n### ACTIVE AGENT BULLETINS ###\n" + "".join(shown) + "\n"
 
     # ── AGENT SELF-CALIBRATION & PREDICTION TRACKING ───────────────────────
 
@@ -2166,18 +2330,38 @@ class SentinelAgent(ABC):
                 # which appears exactly once in the tree -- here -- and is written
                 # by nothing, so this section has always been empty while
                 # write_agent_memory wrote to a key nothing in this path read.
-                mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, 4)
+                # Twenty read, five shown. Reading only five and then dropping
+                # duplicates would shrink the section rather than improve it;
+                # the surplus refills the slots a collapsed restatement frees.
+                mems = await self.redis.raw.zrevrange("sentinel:agents:episodic_memory", 0, 19)
                 if mems:
-                    context += "\nSHARED SWARM MEMORIES & INTEL:\n"
+                    shown, seen_topics = [], set()
                     for m in mems:
                         text = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                        agent = "?"
                         # Stored as JSON by write_agent_memory.
                         try:
                             _entry = json.loads(text)
-                            text = f"[{_entry.get('agent', '?')}] {_entry.get('text', '')}"
+                            agent = _entry.get("agent", "?")
+                            text = _entry.get("text", "")
                         except (ValueError, TypeError) as _exc:
                             swallowed("agents.base.fetch_global_context", _exc)
-                        context += f"- {text}\n"
+                        topic = _prompt_entry_topic(text)
+                        if topic and topic in seen_topics:
+                            continue
+                        seen_topics.add(topic)
+                        # Sanitised as well as capped. This text is written by a
+                        # model out of ingested headlines, so it is laundered
+                        # untrusted input on its way into another agent's prompt,
+                        # and every other ingested string in this method already
+                        # passes through here.
+                        body = sanitize_untrusted(text, max_chars=PROMPT_ENTRY_MAX_CHARS)
+                        shown.append(f"- [{agent}] {body}\n")
+                        if len(shown) >= 5:
+                            break
+                    if shown:
+                        context += "\nSHARED SWARM MEMORIES & INTEL:\n"
+                        context += "".join(shown)
             except Exception as mx:
                 self.logger.debug(f"Shared memory miss in global context: {mx}")
 
@@ -2210,7 +2394,7 @@ class SentinelAgent(ABC):
                 getattr(self, "redis", None),
                 getattr(self, "model", None) or "default",
                 cooldown_sec=(
-                    int(os.getenv("AGENT_LANE_COOLDOWN_SEC", "300"))
+                    int(os.getenv("AGENT_LANE_COOLDOWN_SEC", "120"))
                     if self.INFERENCE_LANE else DEFAULT_COOLDOWN_SEC
                 ),
                 lane=self.INFERENCE_LANE,
@@ -2964,7 +3148,7 @@ class SentinelAgent(ABC):
                 schema=TickerVerificationDecision,
                 temperature=0.0,
                 num_predict=128,
-                fallback_model="gemma3:1b"
+                fallback_model=DEFAULT_MODEL
             )
 
             if decision.valid:
