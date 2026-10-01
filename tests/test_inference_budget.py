@@ -12,13 +12,18 @@ would never be done. So the intake sheds instead of queuing.
 """
 import pathlib
 import sys
+import time
 
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from shared.utils.inference_budget import DEFAULT_COOLDOWN_SEC, InferenceBudget  # noqa: E402
+from shared.utils.inference_budget import (  # noqa: E402
+    ADMISSION_MIN_HISTORY,
+    DEFAULT_COOLDOWN_SEC,
+    InferenceBudget,
+)
 
 
 class FakeRedis:
@@ -250,7 +255,12 @@ def test_the_peek_precedes_dedup_marking_in_the_engine():
     """Marking a message processed and then shedding it burns the dedup key for
     an hour, so the same headline is suppressed later when capacity exists."""
     src = (ROOT / "services/agents/knowledge_graph_engine.py").read_text(encoding="utf-8")
-    peek_at = src.index("is_available()")
+    # The peek is now `capacity_or_defer`, which asks the same capacity
+    # question and, when the answer is no, holds the candidate instead of
+    # discarding it. The ordering property is unchanged and is why this test
+    # exists: deciding to defer after marking the work done burns the dedup
+    # key, so the same headline is suppressed when capacity appears.
+    peek_at = src.index("capacity_or_defer(message)")
     mark_at = src.index("mark_processed(dedup_key")
     assert peek_at < mark_at, "the engine marks work as done before deciding to shed it"
 
@@ -325,3 +335,71 @@ def test_priority_hold_can_never_exceed_the_standard_hold():
     """A misconfiguration that made 'priority' wait longer would invert intent."""
     b = InferenceBudget(None, "m", cooldown_sec=100, priority_cooldown_sec=9999)
     assert b.priority_cooldown_sec <= b.cooldown_sec
+
+
+# ── the bar only guards a contended slot ─────────────────────────────────────
+
+
+class FakeRedisSlotHeld(FakeRedisWithExists):
+    """A slot somebody already holds."""
+
+    async def exists(self, key):
+        return 1
+
+
+class FakeRedisExistsBroken(FakeRedisWithExists):
+    async def exists(self, key):
+        raise ConnectionError("redis is down")
+
+
+async def _fill_window(budget, value=0.9):
+    """Enough history that the percentile means something."""
+    for _ in range(ADMISSION_MIN_HISTORY + 5):
+        await budget._record_and_read_scores(value)
+
+
+@pytest.mark.anyio
+async def test_an_idle_slot_admits_a_below_bar_candidate():
+    """Selection applied to an unused resource is loss, not selection.
+
+    Measured 2026-09-20 on the running deployment: ninety samples over three
+    minutes found the shared slot held 35% of the time, while the bar had
+    refused 11,405 candidates against 1,479 admitted. A percentile is the right
+    way to spend a contended slot and the wrong way to spend an idle one.
+    """
+    budget = InferenceBudget(FakeRedisWithExists(), "m")
+    budget._last_admit = time.monotonic()       # holdback rail not in play
+    await _fill_window(budget)
+    assert await budget._passes_admission_bar(0.01, domain="vessel") is True
+
+
+@pytest.mark.anyio
+async def test_a_held_slot_still_applies_the_bar():
+    """Contention is exactly what the percentile exists for.
+
+    This is the half that keeps a weekday honest: the measurement above was
+    taken on a Sunday, and a filled queue must restore the old behaviour with
+    no further change.
+    """
+    budget = InferenceBudget(FakeRedisSlotHeld(), "m")
+    budget._last_admit = time.monotonic()
+    await _fill_window(budget)
+    assert await budget._passes_admission_bar(0.01, domain="vessel") is False
+
+
+@pytest.mark.anyio
+async def test_an_above_bar_candidate_passes_either_way():
+    for redis in (FakeRedisWithExists(), FakeRedisSlotHeld()):
+        budget = InferenceBudget(redis, "m")
+        budget._last_admit = time.monotonic()
+        await _fill_window(budget, value=0.1)
+        assert await budget._passes_admission_bar(0.99, domain="vessel") is True
+
+
+@pytest.mark.anyio
+async def test_a_redis_failure_leaves_the_bar_as_strict_as_before():
+    """Unable to tell must not read as "the slot is free"."""
+    budget = InferenceBudget(FakeRedisExistsBroken(), "m")
+    budget._last_admit = time.monotonic()
+    await _fill_window(budget)
+    assert await budget._passes_admission_bar(0.01, domain="vessel") is False

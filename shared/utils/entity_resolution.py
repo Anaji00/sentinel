@@ -290,11 +290,35 @@ def canonical_key(raw: Any) -> str:
     """
     if raw is None:
         return ""
-    text = str(raw).strip()
+    text = _strip_decoration(str(raw).strip())
     if looks_like_ticker(text):
         return text.upper()
     normalised = normalize_name(text)
     return normalised or text.upper()
+
+
+# A ticker with a price stuck to it is still that ticker.
+#
+# Measured: "AAPL", "Apple Inc." and "APPLE INC" all fold to AAPL, so genuine
+# name variants were never the problem. `CPB ($21.53)` folded to `CPB 21 53` --
+# a subject of its own, unable to corroborate or contradict the CPB that every
+# other agent published. That exact string is recorded elsewhere in this audit
+# as a bulletin's ticker.
+#
+# Only a trailing parenthetical is removed, and only when what remains still
+# looks like a symbol. "SLTA V (GP), L.L.C." keeps its shape and stays a
+# company name rather than becoming the ticker GP, which is the other half of
+# the same mistake.
+_DECORATION = re.compile(r"\s*\((?:[^()]*)\)\s*$")
+
+
+def _strip_decoration(text: str) -> str:
+    if not text or "(" not in text:
+        return text
+    stripped = _DECORATION.sub("", text).strip()
+    if stripped and stripped != text and looks_like_ticker(stripped):
+        return stripped
+    return text
 
 
 async def resolve_entity(

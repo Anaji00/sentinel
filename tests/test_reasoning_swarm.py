@@ -24,7 +24,6 @@ from services.agents.consensus_engine import (
 from services.agents.adversarial_wargamer import (
     AdversarialWargamerAgent,
     WargameSimulationOutput,
-    SimulationBoard,
     SimulationMove,
 )
 from services.agents.edge_validator import validate_edges
@@ -79,11 +78,15 @@ def test_adversarial_wargamer_entity_extraction_and_handle():
         agent.redis = MagicMock()
         agent.redis.raw = AsyncMock()
 
-        async def mock_execute_telemetry(message, system_prompt, user_prompt, schema, temperature=0.0):
-            # The personas arrive as one board rather than three separate
-            # calls; see tests/test_wargame_slot_cost.py for why.
-            if schema == SimulationBoard:
-                return SimulationBoard(moves=[
+        async def mock_execute_telemetry(message, system_prompt, user_prompt, schema,
+                                         temperature=0.0, **kwargs):
+            # **kwargs so a new call-site argument -- num_predict, sized for
+            # the combined schema -- does not surface as a TypeError that the
+            # handler's own `except Exception` turns into a silent None.
+            # The personas and the arbitration arrive as one answer rather than
+            # two calls; see tests/test_wargame_slot_cost.py for why.
+            return WargameSimulationOutput(
+                moves=[
                     SimulationMove(
                         persona_name="State_Saboteur", proposed_counter_action="Target supply lines",
                         target_entity_id="NVDA", disruption_potential_percent=80,
@@ -94,8 +97,7 @@ def test_adversarial_wargamer_entity_extraction_and_handle():
                         target_entity_id="NVDA", disruption_potential_percent=30,
                         strategic_rationale="Remove the single point of failure",
                     ),
-                ])
-            return WargameSimulationOutput(
+                ],
                 primary_vulnerability_isolated="Supply chain choke point", cascade_failure_probability=75,
                 predicted_next_target_entity_id="NVDA", remediation_recommendation="Hedge positions"
             )

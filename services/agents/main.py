@@ -271,15 +271,33 @@ async def main():
     knowledge_graph_engine = build_agent(
         KnowledgeGraphEngine,
         agent_name="knowledge_graph_engine",
+        # Two firehoses removed, both of which this agent dropped in full.
+        #
+        # Measured 2026-09-20 against the running broker:
+        #
+        #     sentinel.ontology.proposals   2,815,243 messages
+        #     agents.ontology.updates       3,138,845 messages
+        #
+        # ONTOLOGY_PROPOSALS is this agent's own output -- `_merge_graph_triples`
+        # and `_classify_and_merge_entity` both publish there -- and handle()
+        # refuses anything carrying a supervisor graph action on its second
+        # branch. Sampled 30 consecutive proposals: 26 LINK_ENTITY, 4
+        # MERGE_ONTOLOGY_NODE, none with a headline. Every one dropped.
+        #
+        # ONTOLOGY_UPDATES was added so the supervisor's decisions would reach
+        # the engine that owns the graph. handle() has no branch that applies
+        # one: a receipt carries no headline, so it falls out at the same guard.
+        # The intent was never implemented, and the subscription cost 3.1M
+        # dispatches to discover that. Re-add it with a branch that acts on it,
+        # not before.
+        #
+        # What is left is what this agent can act on. The cost was not academic:
+        # it processed 112,661 messages in the hour this was measured and
+        # produced one inference.
         input_topics=[
             Topics.RAW_NEWS, Topics.ENRICHED_EVENTS, Topics.UNKNOWN_ENTITIES,
-            Topics.CORRELATIONS, Topics.ONTOLOGY_PROPOSALS, Topics.QUANT_DISCOVERIES,
+            Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES,
             Topics.MACRO_ASSESSMENT, Topics.SCENARIOS_GENERATED,
-            # Ontology decisions the supervisor makes, applied by the engine
-            # that owns the graph. The supervisor declared this as its output
-            # topic and nothing subscribed, so every accepted or rejected
-            # ontology change was published into an empty room.
-            Topics.ONTOLOGY_UPDATES
         ],
         group_id="agent-knowledge-graph",
         shared_infra=shared_infra,
@@ -315,8 +333,20 @@ async def main():
             # makes this agent able to learn anything is the uncovered
             # co-occurrence the correlation service now emits.
             Topics.RULE_CANDIDATES,
-            Topics.RAW_NEWS, Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
+            # RAW_NEWS is gone. Splitting the unrouted counter away from the
+            # deliberate refusal of rule firings made the one genuine routing
+            # gap visible within three minutes, and it was this: a raw news
+            # item has no `brief`, so it reached the default branch, found no
+            # headline_summary and was discarded. 49,464 messages lifetime,
+            # the second-largest input here. The analysed form of the same
+            # material is INTEL_BRIEFS at 1,148, which this agent already has
+            # a branch for -- so the subscription was 43x the cost of the one
+            # it duplicates, for nothing.
+            Topics.INTEL_BRIEFS, Topics.RULES_FEEDBACK, Topics.SCENARIOS_GENERATED,
             Topics.CORRELATIONS, Topics.QUANT_DISCOVERIES, Topics.MACRO_DECOUPLING,
+            # INSIDER_CLUSTERS has carried 0 messages in the platform's
+            # lifetime. Kept: a subscription to a silent topic costs nothing at
+            # runtime, and quant_trading_engine does produce to it.
             Topics.MACRO_ASSESSMENT, Topics.INSIDER_CLUSTERS
         ],
         group_id="agent-rule-synthesizer",
@@ -328,10 +358,24 @@ async def main():
     supervisor_agent = build_agent(
         GraphSupervisor,
         agent_name="supervisor",
-        input_topics=[
-            Topics.RAW_NEWS, Topics.ONTOLOGY_PROPOSALS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS,
-            Topics.SCENARIOS_GENERATED
-        ],
+        # One topic, because one topic carries proposals.
+        #
+        # It also read RAW_NEWS, CORRELATIONS, INTEL_BRIEFS and
+        # SCENARIOS_GENERATED. None of those is a graph proposal, and
+        # `handle()` treats every dict as one: `execute_proposal` refuses
+        # anything without an entity_id and action, and then a receipt was
+        # returned anyway and published to ONTOLOGY_UPDATES. Measured on the
+        # running deployment, that topic held 3,120,653 messages and every
+        # sampled one was a supervisor receipt -- a quarter of them announcing
+        # a refusal. knowledge_graph_engine subscribes to it expecting ontology
+        # decisions and drops all of them, so the most expensive agent in the
+        # tier was reading several million lines of another agent's
+        # bookkeeping.
+        #
+        # The standalone runner at the foot of supervisor.py already declared
+        # exactly this one topic, which is the clearest statement of intent
+        # available.
+        input_topics=[Topics.ONTOLOGY_PROPOSALS],
         group_id="supervisor-group",
         shared_infra=shared_infra,
         model=HEAVY_MODEL,
@@ -372,9 +416,14 @@ async def main():
     edge_validator_agent = build_agent(
         EdgeValidatorAgent,
         agent_name="edge_validator",
-        input_topics=[
-            Topics.RAW_NEWS, Topics.QUANT_DISCOVERIES, Topics.CORRELATIONS, Topics.INTEL_BRIEFS
-        ],
+        # This agent is scheduled, not reactive: `handle()` returns None for
+        # every message it is given, unconditionally, and all its work happens
+        # in the five-minute sweep started by `run()`. It was subscribed to
+        # RAW_NEWS, CORRELATIONS and INTEL_BRIEFS -- the three busiest topics
+        # it reads -- and deserialised every one of them in order to return
+        # None. QUANT_DISCOVERIES is kept because it is the topic the sweep
+        # publishes to and is small enough to be free: 117 messages, lifetime.
+        input_topics=[Topics.QUANT_DISCOVERIES],
         group_id="agent-edge-validator",
         shared_infra=shared_infra,
         model=FAST_MODEL,
@@ -421,7 +470,11 @@ async def main():
         "stock_correlation":          stock_correlation_agent,
     }
 
-    logger.info(f"Consolidated Swarm built: 8 core engines live.")
+    # Distinct objects, not map entries: eleven of the entries above are
+    # back-compat aliases onto engines already counted. The literal this
+    # replaces said 8, and had said 8 since before there were 10.
+    _distinct_engines = {id(a): a for a in agents_by_name.values()}
+    logger.info(f"Consolidated Swarm built: {len(_distinct_engines)} core engines.")
     logger.info(f"Ollama model: {os.getenv('AGENT_MODEL', DEFAULT_MODEL)}")
     logger.info("=" * 60)
 
@@ -483,6 +536,17 @@ async def main():
             "model": os.getenv("AGENT_MODEL", ""),
             "fallback_model": os.getenv("OLLAMA_FALLBACK_MODEL", ""),
             "agents": sorted(active_agents.keys()),
+            # The agents this process is running, once each.
+            #
+            # This iterated `agents_by_name`, which holds 21 entries for 10
+            # agents: eleven of them are back-compat aliases for the task queue,
+            # and that queue is not started. So the roster published 21 rows,
+            # macro_intelligence_engine five times and quant four. It was also
+            # unfiltered by tier, so agents-fast published detail for the five
+            # heavy agents it does not run -- each reporting processed=0,
+            # because the object exists here and the work happens in the other
+            # container. Across both tiers that was 42 rows describing 10
+            # agents, and a working agent indistinguishable from a dead one.
             "agent_detail": [
                 {
                     "name": ag.name,
@@ -492,7 +556,7 @@ async def main():
                     "processed": int(getattr(ag, "_processed", 0) or 0),
                     "errors": int(getattr(ag, "_errors", 0) or 0),
                 }
-                for ag in agents_by_name.values()
+                for ag in active_agents.values()
             ],
         }
 
@@ -507,7 +571,7 @@ async def main():
     )
 
     logger.info(f"Swarm launched with AGENT_TIER_FILTER='{tier_filter}' ({len(tasks)-1} active agents).")
-    for ag in agents_by_name.values():
+    for ag in active_agents.values():
         logger.info(f"Agent: {ag.name:<26} | Model: {ag.model:<10} | Fallback: {ag.fallback_model:<10} | Topics: {len(ag.input_topics)}")
 
     try:
@@ -530,7 +594,9 @@ async def main():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for ag in agents_by_name.values():
+        # Once per object. `agents_by_name` maps five names onto
+        # macro_intelligence_engine, so this closed it five times.
+        for ag in {id(a): a for a in agents_by_name.values()}.values():
             try:
                 await ag.close()
             except Exception as _exc:

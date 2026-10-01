@@ -78,13 +78,22 @@ def test_a_bare_except_exception_cannot_catch_a_shed():
 
 # -- the slot cost -------------------------------------------------------------
 
-def test_the_personas_are_one_call_not_three():
-    """Four races for an all-or-nothing four-slot operation."""
+def test_the_whole_wargame_is_one_call():
+    """Four races became two, and two became one.
+
+    The argument this file was written to make -- an all-or-nothing operation
+    must not ask for its slots as independent races -- was applied to the three
+    persona turns and left the board/arbitration pair untouched. Measured
+    2026-09-20 over the agent's whole history: 685 persona boards completed,
+    30 arbitrations, 0 predictions recorded. 655 paid-for boards were discarded
+    because the second call sheds independently of the first.
+    """
     tree = ast.parse(_source())
     names = {n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
 
-    assert "_execute_persona_board" in names
+    assert "_execute_wargame" in names
     assert "_execute_persona_turn" not in names, "the per-persona call still exists"
+    assert "_execute_persona_board" not in names, "the board is still a separate claim"
 
 
 def test_the_personas_are_not_gathered_concurrently():
@@ -92,8 +101,8 @@ def test_the_personas_are_not_gathered_concurrently():
     assert "asyncio.gather" not in source, "concurrent persona claims are back"
 
 
-def test_the_wargame_makes_at_most_two_inference_calls():
-    """One persona board, one arbitration. Anything more re-creates the race."""
+def test_the_wargame_makes_exactly_one_inference_call():
+    """Anything more re-creates the race this file exists to close."""
     tree = ast.parse(_source())
     calls = [
         node for node in ast.walk(tree)
@@ -101,7 +110,10 @@ def test_the_wargame_makes_at_most_two_inference_calls():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_execute_with_telemetry"
     ]
-    assert len(calls) == 2, f"{len(calls)} inference call sites; the budget affords two"
+    assert len(calls) == 1, (
+        f"{len(calls)} inference call sites; a second one sheds independently "
+        "of the first and discards whatever the first paid for"
+    )
 
 
 def test_every_persona_is_still_played():
@@ -111,29 +123,58 @@ def test_every_persona_is_still_played():
         assert persona in source
 
 
-def test_the_board_carries_one_move_per_persona():
-    from services.agents.adversarial_wargamer import SimulationBoard, SimulationMove
+def test_the_outcome_carries_one_move_per_persona():
+    from services.agents.adversarial_wargamer import (
+        SimulationMove,
+        WargameSimulationOutput,
+    )
 
-    board = SimulationBoard(moves=[
+    board = WargameSimulationOutput(
+        primary_vulnerability_isolated="v",
+        cascade_failure_probability=50,
+        predicted_next_target_entity_id="NVDA",
+        remediation_recommendation="r",
+        moves=[
         SimulationMove(
             persona_name=name,
             proposed_counter_action="act",
             target_entity_id="NVDA",
             strategic_rationale="because",
         )
-        for name in ("State_Saboteur", "Financial_Short_Seller", "Asymmetric_Defender")
-    ])
+            for name in ("State_Saboteur", "Financial_Short_Seller", "Asymmetric_Defender")
+        ],
+    )
     assert len(board.moves) == 3
     assert {m.persona_name for m in board.moves} == {
         "State_Saboteur", "Financial_Short_Seller", "Asymmetric_Defender"
     }
 
 
-def test_an_empty_board_is_representable():
-    """The schema must not force the model to invent moves it does not have."""
-    from services.agents.adversarial_wargamer import SimulationBoard
+def test_an_empty_board_is_refused_by_the_schema():
+    """The earlier decision was right for a board-only call and wrong for this one.
 
-    assert SimulationBoard().moves == []
+    When the board was its own inference, an empty `moves` meant the model had
+    declined, and forcing a minimum would have made it invent one. Combined,
+    the model is answering both halves in a single response: it filled the
+    required scalars and returned `moves: []` twice running, and because Ollama
+    builds its grammar from the schema, a field with a default is one it may
+    legally omit. Raising num_predict to 1024 changed nothing -- the budget was
+    never the constraint, the schema was.
+
+    An empty array now means half the task was skipped, not that anything was
+    declined. Code minting a placeholder move stays forbidden; see
+    test_no_placeholder_move_is_fabricated.
+    """
+    import pydantic
+    from services.agents.adversarial_wargamer import WargameSimulationOutput
+
+    with pytest.raises(pydantic.ValidationError):
+        WargameSimulationOutput(
+            primary_vulnerability_isolated="v",
+            cascade_failure_probability=0,
+            predicted_next_target_entity_id="NONE",
+            remediation_recommendation="r",
+        )
 
 
 # -- a declined wargame must stay declined -------------------------------------
@@ -152,12 +193,12 @@ def test_no_placeholder_move_is_fabricated():
     assert 'proposed_counter_action="PASS"' not in source
 
 
-def test_the_board_returns_none_rather_than_a_placeholder_on_failure():
-    """A model error is not a wargame. The caller reads None as "skip"."""
+def test_a_model_failure_returns_none_rather_than_a_placeholder():
+    """A model error is not a wargame. handle() reads it as "skip"."""
     tree = ast.parse(_source())
     board = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_execute_persona_board"
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle"
     )
     handlers = [n for n in ast.walk(board) if isinstance(n, ast.ExceptHandler)]
     generic = [
@@ -174,13 +215,13 @@ def test_the_board_returns_none_rather_than_a_placeholder_on_failure():
             )
 
 
-def test_a_shed_propagates_out_of_the_board():
+def test_a_shed_propagates_out_of_the_wargame():
     """The dispatch loop distinguishes a shed from an error; absorbing one here
     would report declined work as completed-with-nothing."""
     tree = ast.parse(_source())
     board = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_execute_persona_board"
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle"
     )
     shed = [
         h for h in ast.walk(board)
@@ -198,7 +239,7 @@ def test_a_shed_propagates_out_of_the_board():
 def test_capacity_is_checked_before_context_is_built():
     """The Neo4j subgraph query must not be paid for work that cannot run."""
     source = _source()
-    gate = source.index("self._inference_budget.is_available()")
+    gate = source.index("self.capacity_or_defer(message)")
     context = source.index("_fetch_subgraph_context(entity_ids)")
     assert gate < context, "context is built before capacity is checked"
 
@@ -217,3 +258,58 @@ def test_the_significance_gate_still_holds(message, worth):
     from services.agents.adversarial_wargamer import _is_worth_simulating
 
     assert _is_worth_simulating(message) is worth
+
+
+# -- the target has to name something ------------------------------------------
+
+def test_the_predicted_target_is_validated_against_the_entities_given():
+    """First combined run, live 2026-09-20 13:03:51:
+
+        predicted_next_target_entity_id:
+            '50 events across 2 domains (aviation, maritime)'
+
+    The cluster's own summary, echoed into an identity field. The prompt already
+    forbids inventing a target; the model did it anyway, which is the case a
+    prompt instruction cannot cover. Recorded, that puts a sentence where every
+    consumer reads a ticker -- the defect this audit logged as a bulletin whose
+    ticker was "CPB ($21.53)".
+    """
+    source = _source()
+    assert "target_is_named" in source, "nothing checks the target names a real entity"
+    assert "known = {str(e).strip().upper() for e in entity_ids}" in source
+    # The prediction and the bulletin must both be gated on it.
+    assert "if target_is_named and" in source, "a prediction can still be recorded on prose"
+    assert "ticker=target if target_is_named else None" in source, (
+        "a bulletin can still carry a prose ticker, and consensus fuses by ticker"
+    )
+
+
+def test_the_combined_call_is_given_room_for_both_halves():
+    """`moves: []` on the first run: the grammar's required scalars were filled
+    and the array had no budget left."""
+    source = _source()
+    assert "num_predict=1024" in source, (
+        "the combined schema is still sized for an arbitration alone"
+    )
+
+
+def test_a_model_authored_probability_cannot_become_certainty():
+    """The first prediction this agent ever recorded came back at conviction 1.0.
+
+    `cascade_failure_probability` is an integer the model writes; it said 100.
+    Conviction reaches the consensus engine's Subjective Logic fusion, where an
+    opinion at exactly 1.0 drives uncertainty to zero -- so one model saying
+    "100%" outweighs every measured opinion beside it. The platform already
+    refuses certainty elsewhere (FALLBACK_MAX_SCORE, RULE_CONF_CEILING); neither
+    reached an agent bulletin.
+    """
+    from services.agents.adversarial_wargamer import _MAX_MODEL_CONVICTION
+
+    assert 0.0 < _MAX_MODEL_CONVICTION < 1.0
+    source = _source()
+    assert "min(1.0, synthesis.cascade_failure_probability" not in source, (
+        "a model-authored 100 still becomes certainty"
+    )
+    assert source.count("min(_MAX_MODEL_CONVICTION, synthesis.cascade_failure_probability") == 2, (
+        "the prediction and the bulletin must both be bounded"
+    )

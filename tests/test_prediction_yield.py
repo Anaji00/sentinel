@@ -27,6 +27,7 @@ produced:
 import sys
 from pathlib import Path
 
+NL = chr(10)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -96,7 +97,14 @@ def test_the_ttl_always_exceeds_the_horizon(horizon_hours):
 
 
 def test_the_buffer_is_configurable():
-    source = (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+    source = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     assert "PREDICTION_RESOLUTION_BUFFER_SEC" in source
     assert 'os.getenv("PREDICTION_RESOLUTION_BUFFER_SEC"' in source
 

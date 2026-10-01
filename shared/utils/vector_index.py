@@ -29,7 +29,17 @@ from __future__ import annotations
 #: The collection every reader and writer of event vectors must use.
 EVENT_COLLECTION = "sentinel_events_v2"
 
-#: Concept vectors, written by the ontology path. Separate space, separate name.
+#: A capability that was never built. Nothing writes it and nothing queries it.
+#:
+#: The docstring here used to say "written by the ontology path", and there is
+#: no such writer anywhere in the tree -- this constant is referenced only by
+#: `__all__` below. Measured on the running deployment 2026-09-20: the
+#: collection exists in Qdrant holding 0 points, against 664,969 in
+#: EVENT_COLLECTION, and reports a `grey` status, which is Qdrant saying no
+#: shard was ever brought up for it.
+#:
+#: Kept for the same reason as RETIRED_EVENT_COLLECTION: a name a check can
+#: assert against. The collection itself is residue in the store.
 CONCEPT_COLLECTION = "sentinel_concepts"
 
 #: Dimensions of the vectors actually stored.

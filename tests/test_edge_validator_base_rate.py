@@ -26,15 +26,32 @@ from services.agents.edge_validator import (
 
 
 class _DB:
-    """A query double that answers by matching on the SQL, not by position."""
+    """A query double that answers by matching on the SQL, not by position.
 
-    def __init__(self, n, span_sec):
+    It did not, in fact, match on anything: one row was returned for every
+    query regardless of what was asked. That was adequate while `_base_rate`
+    issued a single statement and stopped being so when it grew three -- a
+    qualifying count, an observed-at-all count, and a span -- because a double
+    that answers `n = 0` to all of them describes an entity the platform has
+    never recorded, which is now a different verdict from one that reacts
+    rarely. The docstring described the behaviour this class did not have.
+    """
+
+    def __init__(self, n, span_sec, observed=None):
         self._n, self._span = n, span_sec
+        # Observed by default. Every test written before the untestable-target
+        # guard is about an entity the platform records and which simply does
+        # not react often, so that is the case they should keep exercising.
+        self._observed = float(observed) if observed is not None else max(float(n), 1.0)
         self.calls = []
 
     async def query(self, sql, *args):
         self.calls.append((sql, args))
-        return [{"n": self._n, "span_sec": self._span}]
+        if "span_sec" in sql:
+            return [{"span_sec": self._span}]
+        if "anomaly_score" in sql:
+            return [{"n": self._n}]
+        return [{"n": self._observed}]
 
 
 # ── the statistic ────────────────────────────────────────────────────────────
@@ -129,3 +146,47 @@ def test_ticker_punctuation_is_escaped_not_interpreted():
     py = _word_pattern("BRK.B").replace(r"\m", r"\b").replace(r"\M", r"\b")
     assert _re.search(py, "BRK.B rallied", _re.I)
     assert not _re.search(py, "BRKXB rallied", _re.I)
+
+
+# ── an entity the platform has never recorded ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_unobserved_target_is_untestable_not_refuted():
+    """Zero events is absence of measurement, not absence of reaction.
+
+    The first sweep that ever completed decayed all seven of its edges on
+    "0/50 hits vs base 1.7%". 1.7% is the no-qualifying-events floor, and the
+    targets -- US10Y, GC=F, BTCUSD, VOLATILE_1M_CANDLE -- carried zero rows in
+    the events table at all. Each sweep would have taken another 5% off a
+    confidence nothing had measured.
+    """
+    calls = []
+
+    class _DB:
+        async def query(self, sql, *args):
+            calls.append(sql)
+            # Both the qualifying count and the observed count come back zero.
+            return [{"n": 0.0}]
+
+    assert await _base_rate(_DB(), "US10Y") is None
+    assert len(calls) == 2, "the observed-at-all count must be asked for"
+
+
+@pytest.mark.asyncio
+async def test_an_observed_but_quiet_target_keeps_the_floor():
+    """Rarely reacting is a real signal and must still be gradeable."""
+    seen = {"i": 0}
+
+    class _DB:
+        async def query(self, sql, *args):
+            seen["i"] += 1
+            if seen["i"] == 1:
+                return [{"n": 0.0}]        # none clearing the anomaly threshold
+            if seen["i"] == 2:
+                return [{"n": 412.0}]      # but the entity is observed
+            return [{"span_sec": 30 * 86400.0}]
+
+    rate = await _base_rate(_DB(), "PBF")
+    assert rate is not None
+    assert 0.0 < rate < 0.05, rate

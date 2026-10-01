@@ -505,11 +505,82 @@ class RuleSynthesizerAgent(SentinelAgent):
             sig = message.get("significance", "")
             self.logger.debug(f"Synthesizing rules based on Reasoning Scenario: {summary}")
             prompt_context = f"A new AI-generated reasoning scenario has been generated:\nSUMMARY: {summary}\nSIGNIFICANCE: {sig}\nHYPOTHESES: {hypotheses}"
-        elif message.get("type") == "quant_discovery":
-            summary = message.get("description", "")
-            entities = message.get("correlated_assets", [])
+        elif isinstance(message.get("assessment"), dict) and message.get("assessment", {}).get("macro_asset"):
+            # A cross-asset correlation the stock agent discovered.
+            #
+            # `stock_correlation_agent` publishes {agent, created_at,
+            # assessment} to MACRO_DECOUPLING, this agent subscribes to that
+            # topic, and no branch matched the shape -- so every discovered
+            # macro-to-equity relationship reached the rule synthesiser and was
+            # counted as unroutable. It is the one input here that is already a
+            # measured, named relationship between two instruments, which is
+            # the raw material a rule is made of.
+            a = message.get("assessment") or {}
+            summary = (
+                f"{a.get('macro_asset')} vs {a.get('equity_ticker')}: "
+                f"{a.get('correlation_type')}"
+            )
+            entities = [
+                x for x in (a.get("macro_asset"), a.get("equity_ticker")) if x
+            ]
+            self.logger.debug(f"Synthesizing rules based on Macro Correlation: {summary}")
+            prompt_context = (
+                "A cross-asset correlation has been measured between a macro "
+                "instrument and an equity:\n"
+                f"MACRO ASSET: {a.get('macro_asset')}\n"
+                f"EQUITY: {a.get('equity_ticker')}\n"
+                f"RELATIONSHIP: {a.get('correlation_type')}\n"
+                f"TRANSMISSION: {a.get('transmission_channel')}\n"
+                f"CONVICTION: {a.get('conviction')}\n"
+                f"RATIONALE: {a.get('agentic_rationale')}"
+            )
+        elif isinstance(message.get("discovery"), dict) or message.get("type") == "quant_discovery":
+            # The branch read `type == "quant_discovery"`, `description` and
+            # `correlated_assets`. quant_trading_engine publishes none of those
+            # three: it sends {agent, agent_run_id, trigger, discovery,
+            # quality_metrics, created_at}, with the finding nested under
+            # `discovery`. So every quant discovery reaching this agent fell
+            # through to the default branch and was counted as unroutable --
+            # found within nine minutes of splitting that counter away from the
+            # deliberate refusal of rule firings, which had been burying it.
+            #
+            # The old keys are kept as a fallback so a different producer on
+            # this topic still lands.
+            d = message.get("discovery") or {}
+            primary = d.get("primary_ticker") or ""
+            # A peer the statistics could not support is not evidence for a
+            # rule. `verification` defaults to "untested" precisely so an
+            # unverified peer is never mistaken for one that passed Granger.
+            peers = [
+                p for p in (d.get("peer_tickers") or [])
+                if isinstance(p, dict) and p.get("ticker")
+            ]
+            verified = [p for p in peers if p.get("verification") not in (None, "", "untested")]
+            macro = [
+                m.get("symbol") for m in (d.get("macro_instruments") or [])
+                if isinstance(m, dict) and m.get("symbol")
+            ]
+            summary = message.get("description", "") or (
+                f"{primary} peers under catalyst '{d.get('catalyst_category') or 'unstated'}'"
+            )
+            entities = message.get("correlated_assets") or (
+                [primary] + [p["ticker"] for p in peers] + macro
+            )
+            _peer_lines = chr(10).join(
+                f"- {p['ticker']} ({p.get('relation') or 'unstated'}, "
+                f"confidence {p.get('discovery_confidence')}, {p.get('verification') or 'untested'})"
+                for p in (verified or peers)
+            )
             self.logger.debug(f"Synthesizing rules based on Quant Discovery: {summary}")
-            prompt_context = f"A new quantitative peer relationship has been discovered:\nSUMMARY: {summary}\nASSETS: {entities}"
+            prompt_context = (
+                "A new quantitative peer relationship has been discovered:" + chr(10)
+                + f"PRIMARY: {primary}" + chr(10)
+                + f"CATALYST: {d.get('catalyst_category') or 'unstated'}" + chr(10)
+                + f"STRUCTURAL DECOUPLING: {bool(d.get('structural_decoupling'))}" + chr(10)
+                + f"PEERS ({len(verified)} of {len(peers)} statistically verified):" + chr(10)
+                + (_peer_lines or "- none") + chr(10)
+                + f"MACRO INSTRUMENTS: {macro or 'none'}"
+            )
         else:
             brief = message.get("brief", {})
             summary = brief.get("headline_summary", "")
@@ -521,11 +592,41 @@ class RuleSynthesizerAgent(SentinelAgent):
                 # its own chains: one unmatched shape is a new producer being
                 # wired up, the same shape unmatched ten thousand times is a
                 # feed being thrown away, and only the count tells them apart.
+                #
+                # A correlation carries a rule_id and is therefore a rule
+                # *firing*; synthesising from one re-derives the rule that
+                # produced it, so refusing it is correct. It was landing in the
+                # same counter as a genuine routing gap at ~150/hour, which is
+                # what "only the count tells them apart" cannot survive. Named
+                # separately so the refusal reads as working and the gap reads
+                # as a gap.
+                if message.get("rule_id"):
+                    dropped(
+                        "agents.rule_synthesizer.rule_firing",
+                        "a correlation is a rule firing, not material for a new rule",
+                        self.logger,
+                        detail=f"rule_id={message.get('rule_id')}",
+                        # No variant. A rule firing is one known kind, and
+                        # keying the ladder by rule_id made every on-chain
+                        # cluster rule -- whose id carries the cluster's
+                        # address -- a variant of its own, so each firing
+                        # escalated on its own count of one. That is the noise
+                        # the variant was added to remove, reintroduced by
+                        # fingerprinting the instance instead of the kind.
+                    )
+                    return
+                # sorted(message)[:8] named a 20-key correlation by its eight
+                # alphabetically-first keys, and rule_id sorts after
+                # metrics_summary -- so the diagnostic for a routing decision
+                # hid the field the routing turns on. Report every key, and
+                # give each distinct shape its own escalation ladder.
+                keys = sorted(message)
                 dropped(
                     "agents.rule_synthesizer.unrouted_message",
                     "no branch matched this message shape",
                     self.logger,
-                    detail=f"keys={sorted(message)[:8]}",
+                    detail=f"{len(keys)} keys: {keys}",
+                    variant=",".join(keys),
                 )
                 return
             self.logger.debug(f"Synthesizing rules based on macro shift: {summary}")

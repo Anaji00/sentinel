@@ -31,6 +31,8 @@ from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS
 from services.reasoning.calibration_harness import ThresholdCalibrationHarness
 from services.correlation.edge_survival import EdgeSurvivalTracker, EdgeRegistration
 from shared.utils.regime import current_regime
+from shared.utils.entity_resolution import looks_like_ticker
+from shared.utils.equities import asset_class
 from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("correlation.statistical_discovery")
@@ -167,9 +169,47 @@ class StatisticalDiscoveryEngine:
                 records = await self.neo4j.query(query)
                 for r in (records or []):
                     src, tgt = r.get("src"), r.get("tgt")
-                    if src and tgt and src != tgt and len(src) <= 10 and len(tgt) <= 10:
-                        pair = (src, tgt) if src < tgt else (tgt, src)
-                        pairs.add(pair)
+                    if not (src and tgt and src != tgt and len(src) <= 10 and len(tgt) <= 10):
+                        continue
+                    # A short uppercase string is not an instrument.
+                    #
+                    # The only gate was length, so anything the graph called an
+                    # entity became a candidate for Granger causality and
+                    # cointegration. Measured on the live candidate list:
+                    # EVENT1, EVENT2, EVENT3, EVENT_1, EVENT_2, EVENT_3 --
+                    # which are nodes named `event_1` and `event(s)`, model
+                    # output stored as entities -- alongside MEA1304, a flight
+                    # callsign, and ARZANA and MISHELL, which are vessels.
+                    #
+                    # `asset_class` returns None for all of them and a real
+                    # class for CL=F, GC=F, BTC-USD and QQQ, which the
+                    # ticker-shape predicates reject. It is not perfect:
+                    # APATE, a vessel, is five uppercase letters and classifies
+                    # as an equity. It has no bars, so it still shows up in the
+                    # "no usable price history" report below rather than
+                    # silently consuming an evaluation.
+                    if asset_class(src) is None or asset_class(tgt) is None:
+                        dropped(
+                            "correlation.candidate_not_an_instrument",
+                            "a graph entity that is not a tradeable symbol",
+                            logger,
+                            detail=f"{src}/{tgt}",
+                            # The kind, not the instance. Keying on the symbol
+                            # would make each of the graph's entity names its
+                            # own first occurrence, which is entry 680 in this
+                            # document, committed by me one line at a time.
+                            # Two kinds are worth telling apart: a vessel named
+                            # APATE is shaped exactly like a ticker and needs a
+                            # different answer from a node called `event(s)`.
+                            variant=(
+                                "ticker_shaped"
+                                if looks_like_ticker(src) or looks_like_ticker(tgt)
+                                else "not_a_symbol"
+                            ),
+                        )
+                        continue
+                    pair = (src, tgt) if src < tgt else (tgt, src)
+                    pairs.add(pair)
             except Exception as e:
                 logger.debug(f"Neo4j topology pair extraction fallback: {e}")
 
@@ -312,10 +352,23 @@ class StatisticalDiscoveryEngine:
                 # Counted, not silent: a series going quiet is the event this
                 # missed for twelve days, and it should be visible when it
                 # happens rather than inferred from correlations that look odd.
+                # Keyed by asset class, not by ticker.
+                #
+                # 421 series were refused in fifteen minutes on a Sunday, which
+                # is correct -- equities have no bar since Friday's close -- and
+                # was indistinguishable in the count from the feed failing.
+                # Equity markets close and crypto does not, so the class is
+                # what separates "the market is shut" from "this feed stopped":
+                # every equity stale at once is a weekend, crypto stale at all
+                # is a fault. Keying on the ticker would make each of several
+                # hundred symbols its own first occurrence, which is the
+                # mistake made once already in this audit.
                 dropped(
                     "correlation.statistical_discovery.stale_series",
+                    f"no bar within {MAX_SERIES_STALENESS_SEC}s; not correlated",
                     logger,
                     detail=ticker.upper(),
+                    variant=asset_class(ticker) or "unclassified",
                 )
                 return []
 

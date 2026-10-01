@@ -285,6 +285,55 @@ def _render_metrics(rows: Optional[List[Dict[str, Any]]], label: str) -> str:
     return json.dumps(rows, separators=(',', ':'), default=str)
 
 
+# What counts as severe enough to trigger a macro review.
+#
+# The branch below read `computed_severity` or `severity` and compared against
+# 4. Measured 2026-09-20 on 434 consecutive live enriched.events:
+#
+#     carries severity            0   (0%)
+#     carries computed_severity   0   (0%)
+#     carries anomaly_score     434   (100%)
+#
+# `severity` is the 1-5 integer an IntelBrief carries, and this agent does not
+# subscribe to INTEL_BRIEFS. `computed_severity` is written by the knowledge
+# graph engine onto that same topic. So both names were read on a stream that
+# carries neither, the comparison was against 0 every time, and the
+# high-severity trigger could not fire -- 77,880 messages processed at 12.75/s
+# and zero inferences in twenty-four hours.
+#
+# 0.8 is 4 on the 1-5 scale, so the bar is unchanged; what changes is that the
+# agent can now read the scale its input actually uses. Both are accepted,
+# because an IntelBrief reaching here later should still work.
+_MACRO_REVIEW_SEVERITY = 4.0        # the 1-5 scale intel briefs use
+_MACRO_REVIEW_ANOMALY = 0.8         # the same bar on the 0-1 scale events use
+
+
+def _is_macro_review_worthy(message: Dict[str, Any]) -> bool:
+    """Whether this event is severe enough to re-derive the macro picture."""
+    for key in ("computed_severity", "severity"):
+        value = message.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value) >= _MACRO_REVIEW_SEVERITY
+        except (TypeError, ValueError):
+            continue
+    value = message.get("anomaly_score")
+    if value is not None:
+        try:
+            return float(value) >= _MACRO_REVIEW_ANOMALY
+        except (TypeError, ValueError) as e:
+            # anomaly_score is the one field 100% of this agent's input
+            # carries, and reading the wrong scale is what kept this engine at
+            # zero inferences for a day. A non-numeric one silently restores
+            # that state, so it is counted rather than assumed absent.
+            swallowed(
+                "agents.macro_review.anomaly_not_numeric", e,
+                detail=f"anomaly_score={value!r}", variant=type(value).__name__,
+            )
+    return False
+
+
 class MacroIntelligenceEngine(SentinelAgent):
     """
     Unified Macro Intelligence Engine.
@@ -342,8 +391,7 @@ class MacroIntelligenceEngine(SentinelAgent):
                 await self._process_cointegration(macro_asset, float(price))
 
         # ── 4. HIGH SEVERITY MACRO INTEL TRIGGER ──────────────────────────────
-        severity = message.get("computed_severity") or message.get("severity") or 0
-        if severity >= 4:
+        if _is_macro_review_worthy(message):
             await self._run_macro_review_now(trigger_event=message)
 
         return None
@@ -360,7 +408,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
 
         # Single atomic Redis mget for all macro quote dependencies
@@ -692,7 +740,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
         fd = message.get("financial_data") or {}
         option_type = str(raw.get("option_type") or fd.get("side") or "CALL").upper()
@@ -1041,7 +1089,7 @@ class MacroIntelligenceEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(trigger_event):
             return None
         logger.info("Initiating Master Macro Trend Review...")
         cooccurrence = await self.redis.raw.zrevrange("sentinel:ontology:cooccurrence", 0, 10, withscores=True)

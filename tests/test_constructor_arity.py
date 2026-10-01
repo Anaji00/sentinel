@@ -42,9 +42,15 @@ from check_constructor_arity import scan  # noqa: E402
 # that these sockets need no post-connect frame, and only reading them can say
 # whether that is still true. It was checked, and it was, when telemetry
 # recording shifted both sites by four and five lines.
+# Keyed by line, so any edit above a call site moves it and this list has to
+# follow. Both entries below shifted by five when a comment was added further
+# up the file; they are the same two call sites, omitting the same
+# `on_connect`, for the same accepted reason. Worth knowing that the cost of
+# this key is a failing suite on unrelated edits -- keying on the enclosing
+# function would survive the drift.
 ALLOWED = {
-    ("services", "collector-crypto", "main.py", 200),
-    ("services", "collector-crypto", "main.py", 335),
+    ("services", "collector-crypto", "main.py", 205),
+    ("services", "collector-crypto", "main.py", 340),
 }
 
 

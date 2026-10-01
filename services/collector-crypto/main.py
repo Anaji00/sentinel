@@ -58,10 +58,15 @@ WHALE_THRESHOLD_USD = 250_000
 
 # Coinbase Advanced Trade WebSocket URI
 COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
-COINBASE_PRODUCTS = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", 
-    "ADA-USD", "AVAX-USD", "DOT-USD", "LINK-USD", "BCH-USD"
-]
+# Narrowed to the two assets this platform actually reasons about.
+#
+# The platform is an equities platform with a crypto sidecar, and the sidecar
+# was the majority of everything it collected: measured over six hours, 176,094
+# of 240,789 events came from crypto sources, at a mean anomaly of 0.02-0.07.
+# Every downstream stage -- enrichment, correlation, the agents' gates and the
+# inference budget -- paid for that ratio, and the eight assets below BTC and
+# ETH produced no finding this audit has recorded.
+COINBASE_PRODUCTS = ["BTC-USD", "ETH-USD"]
 
 # ── 1. COINBASE SPOT TRADES & OHLCV CANDLES ───────────────────────────────────
 
@@ -362,7 +367,7 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
 
 OKX_BASE = "https://www.okx.com/api/v5"
 OKX_POLL_INTERVAL_SEC = int(os.getenv("OKX_POLL_INTERVAL_SEC", "300"))
-OKX_TOP_N = int(os.getenv("OKX_PERP_SYMBOLS", "12"))
+OKX_TOP_N = int(os.getenv("OKX_PERP_SYMBOLS", "2"))
 
 # Emit only when funding moves enough to mean something. OKX pays funding every
 # eight hours, so polling every five minutes mostly re-reads the same number;
@@ -742,28 +747,37 @@ async def _stream_chain_whales(chain_name: str, wss_url: str, contracts_map: dic
 
 
 async def stream_onchain_whales(producer: SentinelProducer, redis_client):
-    """Monitors whale transfers across Ethereum, Arbitrum, and Base."""
+    """Monitors BTC- and ETH-denominated whale transfers on Ethereum.
+
+    Narrowed from three chains and four tokens. Measured over one hour, the
+    stream was 13,249 USDC and USDT wallet-to-wallet transfers -- stablecoin
+    movement, which is neither of the two assets this platform reasons about
+    and was the largest single source of events in the system.
+
+    Stablecoins are not a signal about BTC or ETH; they are the denominator.
+    A $250,000 USDC transfer between two unnamed wallets says nothing an
+    equities desk can act on, and 13,000 an hour of them set the agenda for
+    every stage downstream.
+    """
     eth_contracts = {
-        "0xdac17f958d2ee523a2206206994597c13d831ec7": {"symbol": "USDT", "decimals": 6},
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {"symbol": "USDC", "decimals": 6},
-        "0x6b175474e89094c44da98b954eedeac495271d0f": {"symbol": "DAI", "decimals": 18},
         "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": {"symbol": "WBTC", "decimals": 8},
-    }
-    arb_contracts = {
-        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": {"symbol": "USDT", "decimals": 6},
-        "0xaf88d065e77c8cc2239327c5edb3a432268e5831": {"symbol": "USDC", "decimals": 6},
-        "0x912ce59144191c1204e64559fe8253a0e49e6548": {"symbol": "ARB", "decimals": 18},
-    }
-    base_contracts = {
-        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": {"symbol": "USDC", "decimals": 6},
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {"symbol": "WETH", "decimals": 18},
         "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": {"symbol": "cbBTC", "decimals": 8},
     }
+    # The Arbitrum and Base contract maps are gone with their streams. A map
+    # kept beside a runner that no longer reads it is the shape this audit
+    # spends most of its time finding; ARB_WSS_URL and BASE_WSS_URL remain as
+    # configuration, so restoring a chain is adding one line here and one in
+    # the gather below.
 
     try:
+        # Ethereum only. Arbitrum and Base are L2 stablecoin traffic, which is
+        # neither BTC nor ETH and was the single largest source of events on
+        # the platform: 70,569 of the 96,107 crypto-chain events in two hours,
+        # arbitrum at a mean anomaly of 0.012. Dropping them removes roughly
+        # three quarters of on-chain volume and no signal this audit measured.
         await asyncio.gather(
             _stream_chain_whales("ethereum", ETH_WSS_URL, eth_contracts, producer, redis_client),
-            _stream_chain_whales("arbitrum", ARB_WSS_URL, arb_contracts, producer, redis_client),
-            _stream_chain_whales("base", BASE_WSS_URL, base_contracts, producer, redis_client),
         )
     except Exception as e:
         logger.debug(f"Multi-chain whale runner notice: {e}")
@@ -777,7 +791,7 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
     between Binance, Bybit, and Kraken/Coinbase.
     """
     import aiohttp
-    ASSETS = ["BTC", "ETH", "SOL"]
+    ASSETS = ["BTC", "ETH"]
     logger.info("⚡ Cross-Exchange Funding & Basis Divergence Engine Online.")
 
     while True:

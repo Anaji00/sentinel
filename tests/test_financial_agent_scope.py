@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+NL = chr(10)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -75,14 +76,28 @@ def test_the_quant_gate_admits_crypto_majors():
 
 
 def test_verification_no_longer_instructs_the_model_to_reject_altcoins():
-    src = (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+    src = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     assert "is a crypto altcoin (ETH, SOL, XRP, DOGE, etc.), set valid=false" not in src
     assert "is_supported_asset(clean_ticker)" in src
 
 
 def test_a_crypto_major_short_circuits_the_model_call():
     """Membership of a fixed set is not a question worth an inference for."""
-    src = (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+    src = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     fn = src[src.index("async def verify_ticker_with_reasoning"):][:1200]
     assert "if is_major_crypto(clean_ticker):" in fn
     assert fn.index("if is_major_crypto(clean_ticker):") < fn.index("prompt = f")

@@ -63,6 +63,7 @@ from .base import (
     AGENT_DIGEST_STALE_AFTER_SEC, canonical_direction,
 )
 from shared.kafka import Topics
+from shared.utils.equities import asset_class
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.consensus")
@@ -427,8 +428,25 @@ class EvidenceContributor(BaseModel):
 
 
 class ConsensusSignal(BaseModel):
-    """Weighted consensus for a ticker."""
+    """Weighted consensus for a subject, which is not always an instrument.
+
+    The field is called `ticker` and measured live it is frequently not one.
+    Of eleven distinct subjects across the four most recent reports, five were
+    flight callsigns or vessel names -- ETD8MY, FDX10, JAL8664, SAMANYOLU,
+    RAGNAR -- each carrying `direction: "bearish"` and a `consensus_score`
+    beside TSLA, GOOGL and ETHUSDT, in the same shape and with nothing to tell
+    them apart. "Bearish ETD8MY at -0.475" is a statement about an aircraft in
+    the vocabulary of a trade.
+
+    `asset_class` is how a reader tells the two apart. `shared.utils.equities`
+    already answers it, and its own docstring insists the distinction be kept:
+    None means "not a recognisable instrument symbol", which is a different
+    answer from "equity".
+    """
     ticker: str
+    #: "equity", "crypto", "commodity", "index", "macro_factor" -- or None when
+    #: the subject is not a tradeable instrument at all.
+    asset_class: Optional[str] = None
     direction: str  # "bullish", "bearish", "mixed"
     consensus_score: float = 0.0  # -1.0 (strong bearish) to 1.0 (strong bullish)
     contributing_agents: int = 0
@@ -603,6 +621,7 @@ class ConsensusEngine(SentinelAgent):
                 opinion = SubjectiveOpinion.from_bulletin(b, weight, base_rate=prior)
                 consensus_signals.append(ConsensusSignal(
                     ticker=ticker,
+                    asset_class=asset_class(ticker),
                     direction=self._map_direction(direction),
                     consensus_score=self._direction_to_score(direction) * b.conviction * weight,
                     contributing_agents=1,
@@ -736,6 +755,7 @@ class ConsensusEngine(SentinelAgent):
 
                 consensus_signals.append(ConsensusSignal(
                     ticker=ticker,
+                    asset_class=asset_class(ticker),
                     direction=consensus_direction,
                     consensus_score=round(consensus_score, 4),
                     contributing_agents=total_agents,

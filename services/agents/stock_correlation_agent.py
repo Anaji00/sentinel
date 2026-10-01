@@ -256,7 +256,7 @@ class StockCorrelationAgent(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
         if not isinstance(message, dict):
             return None

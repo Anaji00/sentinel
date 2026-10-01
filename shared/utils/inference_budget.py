@@ -105,6 +105,8 @@ MIN_GAP_SEC = float(os.getenv("INFERENCE_MIN_GAP_SEC", "30"))
 _declare("inference.admission.holdback",
          "the adaptive admission bar refused a below-bar inference candidate")
 _declare("inference.budget.claimed", "an inference slot was claimed")
+_declare("inference.admission.idle_capacity",
+         "a candidate was admitted because the model server was idle")
 
 # What this deployment is actually for. Vessel and aircraft telemetry is volume;
 # these are the domains a person reads. An event from one of them earns a
@@ -526,6 +528,29 @@ class InferenceBudget:
         if (time.monotonic() - self._last_admit) >= MAX_HOLDBACK_SEC:
             return True
 
+        # An idle model server is not a scarce one.
+        #
+        # This bar exists to spend a contended slot on the best candidate
+        # available. Measured 2026-09-20, ninety samples over three minutes,
+        # the shared slot was held 35% of the time and free 65% -- while the
+        # bar was refusing 88.5% of everything offered to it (11,405 held back
+        # against 1,479 claimed). Selection was being applied to a resource
+        # that was sitting unused, which is not selection, it is loss.
+        #
+        # Asking the key rather than lowering the percentile, deliberately:
+        # the percentile is right when the slot is contended, and a weekday
+        # that fills the queue restores exactly the old behaviour with no
+        # further change. This was measured on a Sunday and must not encode
+        # a Sunday.
+        #
+        # Safe against the obvious race. Several callers can see a free slot
+        # at once and all clear this line; only one wins the atomic SET NX
+        # below, and the rest are shed as before. Passing the bar is not
+        # holding the slot.
+        if not await self._slot_is_held():
+            _fired("inference.admission.idle_capacity")
+            return True
+
         percentile = (
             ADMISSION_PERCENTILE if is_priority_domain(domain)
             else ROUTINE_ADMISSION_PERCENTILE
@@ -533,6 +558,26 @@ class InferenceBudget:
         ranked = sorted(window)
         index = min(len(ranked) - 1, int(len(ranked) * percentile))
         return value >= ranked[index]
+
+    async def _slot_is_held(self) -> bool:
+        """Whether anything currently holds this budget's slot.
+
+        Answers True when it cannot tell, so a Redis problem leaves the
+        admission bar exactly as strict as it was rather than opening it.
+        """
+        if self.redis is None:
+            return True
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            held = await raw.exists(self._key)
+        except Exception as exc:
+            swallowed("utils.inference_budget.slot_is_held", exc, logger)
+            return True
+        if isinstance(held, bool):
+            return held
+        if isinstance(held, int):
+            return held > 0
+        return True
 
     async def is_available(self) -> bool:
         """Read-only peek: would a claim succeed right now?

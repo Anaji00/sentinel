@@ -2950,6 +2950,9 @@ async def main():
             await asyncio.sleep(1800)
 
     # Background task: propose rule candidates from uncovered co-occurrences.
+    # Pass counter, so a quiet loop is audible without being noisy.
+    _candidate_passes = [0]
+
     async def _rule_candidate_loop():
         # Past the startup burst, so the first pass reads a window that
         # describes the platform running rather than the platform starting.
@@ -2982,11 +2985,28 @@ async def main():
                         ),
                     )
                 else:
-                    # A quiet pass and a dead loop look identical without this.
-                    logger.debug(
-                        "Rule candidate pass ran; no uncovered pair has reached "
-                        "the threshold this cycle."
-                    )
+                    # A quiet pass and a dead loop look identical without this
+                    # -- and they still did, because DEBUG is not emitted by
+                    # this deployment. The line existed to draw exactly this
+                    # distinction and was written at a level nobody reads.
+                    #
+                    # Measured 2026-09-20: agents.rules.candidates holds 24
+                    # messages for the platform's entire life, and there was no
+                    # way to tell from the logs whether the loop was running and
+                    # finding nothing or had stopped. The rule synthesiser is
+                    # the platform's learning loop and this topic is what the
+                    # main.py comment calls "the signal that makes this agent
+                    # able to learn anything".
+                    #
+                    # First pass and then every tenth, so a healthy quiet loop
+                    # is audible without a line every thirty minutes forever.
+                    _candidate_passes[0] += 1
+                    if _candidate_passes[0] == 1 or _candidate_passes[0] % 10 == 0:
+                        logger.info(
+                            "Rule candidate pass #%s ran; no uncovered pair has "
+                            "reached the threshold. %s rule(s) in the cache.",
+                            _candidate_passes[0], len(rules),
+                        )
             except Exception as e:
                 logger.error(f"Rule candidate loop error: {e}")
             await asyncio.sleep(1800)
@@ -3064,8 +3084,10 @@ async def main():
                             # rising number rather than a wall.
                             dropped(
                                 "correlation.event_parse",
+                                "an enriched event did not parse; sent to the DLQ",
                                 logger,
                                 detail=f"{type(e).__name__}: {str(e)[:200]}",
+                                variant=type(e).__name__,
                             )
                             try:
                                 await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": str(e), "raw": encode_dlq_payload(message.value)})

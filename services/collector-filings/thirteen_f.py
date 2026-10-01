@@ -19,14 +19,26 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
+import os
+
 import aiohttp
 from pydantic import BaseModel, Field
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("collector.filings.13f")
 
+# Read, not hardcoded.
+#
+# `main.py` takes this from SEC_USER_AGENT and warns on every boot while it is
+# still the placeholder; this copy was a literal, so setting the environment
+# fixed the filing feed and left the 13F path still announcing
+# research@sentinel.local to EDGAR. SEC fair access wants a contact that is
+# read, and blocks by IP for repeated anonymous traffic -- so the one path that
+# kept the placeholder was the one that could get the whole host blocked.
 SEC_HEADERS = {
-    "User-Agent": "Sentinel-Intelligence-Platform/1.0 research@sentinel.local",
+    "User-Agent": os.getenv(
+        "SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local"
+    ),
     "Accept-Encoding": "gzip, deflate",
 }
 

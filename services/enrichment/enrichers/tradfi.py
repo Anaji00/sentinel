@@ -2123,7 +2123,23 @@ class TradFiEnricher:
             report_dt = datetime.strptime(str(report_date), "%Y-%m-%d").date()
             days_out = (report_dt - datetime.now(timezone.utc).date()).days
             if 0 <= days_out <= EARNINGS_LOOKAHEAD_DAYS:
-                proximity = 1.0 - (days_out / max(1.0, float(EARNINGS_LOOKAHEAD_DAYS)))
+                # Divided by the window plus one, not by the window.
+                #
+                # `days_out / EARNINGS_LOOKAHEAD_DAYS` is exactly 1.0 at the
+                # far edge, so proximity was 0.0 there -- and the far edge is
+                # where every event is. The collector emits a report when it
+                # first enters the lookahead window, which is the day
+                # days_out == EARNINGS_LOOKAHEAD_DAYS. Measured over 36 hours:
+                # all 50 events carried report_date 2026-09-28, seven days out,
+                # and all 50 scored exactly PRE_ANNOUNCEMENT_FLOOR.
+                #
+                # So the term that was supposed to make this vary could not
+                # vary, and the scorer written to replace a flat 0.3 produced a
+                # flat 0.20. Dividing by the window plus one keeps the ranking
+                # monotone -- today 1.0, the far edge 1/8 -- and leaves 0.0 to
+                # mean "outside the window", which is the only case that should
+                # contribute nothing.
+                proximity = 1.0 - (days_out / float(EARNINGS_LOOKAHEAD_DAYS + 1))
         except (ValueError, TypeError):
             proximity = 0.0
 

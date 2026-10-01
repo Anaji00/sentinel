@@ -107,7 +107,19 @@ def test_predictions_are_still_only_made_by_directional_agents():
         if "record_prediction(" in path.read_text(encoding="utf-8")
         and "async def record_prediction" not in path.read_text(encoding="utf-8")
     }
-    assert callers == {"adversarial_wargamer.py", "quant_trading_engine.py"}
+    # base.py is the shared bulletin path, not a third directional agent.
+    #
+    # `_record_bulletin_prediction` has always called `record_prediction`, and
+    # this set never showed it because the exclusion above skipped whichever
+    # file *defined* the method -- which was base.py until the prediction
+    # scoring mixin was extracted. The call is gated on
+    # `is_scoreable_direction(expected_direction)`, so it fires only for a
+    # directional bulletin, which is the property this test is about.
+    assert callers == {
+        "adversarial_wargamer.py",
+        "quant_trading_engine.py",
+        "base.py",
+    }
 
 
 # -- a bulletin nobody can attribute is outside every comparison ---------------

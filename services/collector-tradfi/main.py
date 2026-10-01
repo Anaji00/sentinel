@@ -56,7 +56,8 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
-from shared.utils.quiet_failures import swallowed
+from shared.utils.form4 import parse_form4, document_url as form4_document_url
+from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.liveness import declare as _declare, fired as _fired
 
@@ -211,11 +212,33 @@ CORE_EQUITY_SYMBOLS = [
 # crypto is 51.7% of the event stream. The attention loop fed itself.
 #
 # A relationship needs both legs present at the same time. These are the legs.
+# Three of these legs are quoted by nothing.
+#
+# TNX, VIX and DXY return 200 with an empty body from the equity endpoint --
+# noted a few lines below as "they cost nothing and are left in" -- and the
+# consequence is that they have never produced a single bar. Measured
+# 2026-09-21: of the correlation engine's 27 watchlist tickers, TNX, DXY,
+# EURUSD, BTC-USD and ETH-USD have no rows in `tradfi_bars` under any spelling.
+# So equities-against-rates, against-volatility and against-the-dollar cannot
+# be tested at all, on a platform whose stated purpose is cross-asset
+# correlation.
+#
+# UUP, VIXY and IEF are exchange-traded, liquid, priced by the same endpoint
+# that already prices TLT and HYG, and track the same three things. They are
+# added rather than swapped in: the index symbols cost nothing, and
+# macro_intelligence_engine names TNX explicitly, so removing it would break a
+# reference to fix a feed.
 CORE_MACRO_SYMBOLS = [
     t.strip().upper()
     for t in os.getenv(
         "CORE_MACRO_SYMBOLS",
-        "TLT,TNX,CL=F,GC=F,VIX,DXY,ZB=F,HYG",
+        # Declared order is spend order -- `CORE_MACRO_SYMBOLS[:macro_budget]`
+        # takes the first ten and the eleventh is never subscribed. With the
+        # dead index symbols listed early, they consumed three of the ten slots
+        # and IEF fell off the end, so the list would have been reordered by
+        # nothing and the fix would have shipped without taking effect.
+        # Priceable legs first, the three empty ones last.
+        "TLT,HYG,UUP,VIXY,IEF,CL=F,GC=F,ZB=F,TNX,VIX,DXY",
     ).split(",")
     if t.strip()
 ]
@@ -357,6 +380,62 @@ def _is_form4(title: str) -> bool:
     return bool(_FORM4_TITLE.match(str(title).strip()))
 
 
+# How many filing documents one cycle may fetch.
+#
+# SEC fair access allows ten requests a second and this loop already spends one
+# on the feed. Bounded so a burst of filings cannot turn a poll into a crawl.
+FORM4_DOC_TIMEOUT_SEC = float(os.getenv("FORM4_DOC_TIMEOUT_SEC", "10"))
+
+
+def _primary_role(owners) -> str:
+    """The most senior relationship the filing states, in plain words."""
+    if not owners:
+        return ""
+    for owner in owners:
+        if owner.get("title"):
+            return str(owner["title"]).upper()
+    for flag, label in (
+        ("is_officer", "OFFICER"),
+        ("is_director", "DIRECTOR"),
+        ("is_ten_percent_owner", "10% OWNER"),
+    ):
+        if any(o.get(flag) for o in owners):
+            return label
+    return ""
+
+
+async def _fetch_form4_document(session, index_link: str):
+    """The parsed filing behind an RSS entry, or None.
+
+    None on any failure: a filing that cannot be fetched is published with the
+    stub fields it always had rather than dropped, because a missing document
+    is a reason to know less about an event, not to pretend it did not happen.
+    """
+    url = form4_document_url(index_link)
+    if not url:
+        return None
+    try:
+        async with session.get(
+            url,
+            timeout=FORM4_DOC_TIMEOUT_SEC,
+            headers={"User-Agent": SEC_USER_AGENT},
+        ) as resp:
+            if resp.status != 200:
+                dropped(
+                    "collector_tradfi.form4_document",
+                    "the filing document could not be fetched",
+                    logger,
+                    detail=f"HTTP {resp.status}",
+                    variant=str(resp.status),
+                )
+                return None
+            body = await resp.read()
+    except Exception as e:
+        swallowed("collector_tradfi.form4_document", e, logger, detail=url)
+        return None
+    return parse_form4(body)
+
+
 async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer, redis_client):
     """
     Polls the SEC's EDGAR database for Form 4 filings (Insider Trading).
@@ -426,14 +505,46 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
 
             await redis_client.raw.set(redis_key, "1", ex=604800)
 
+            # The filing, not the headline about it.
+            #
+            # This published link/title/summary and nothing else, so the
+            # enricher regexed intelligence out of an RSS title: role came out
+            # as "4" (the form number), notional as $0.0M, insider_name never
+            # at all, and the ticker as a parenthetical from the *filer's*
+            # name -- "SLTA V (GP), L.L.C." became ticker GP, which is "General
+            # Partner". The insider-cluster gate wants two distinct insiders
+            # and $250,000 of net buying, and has therefore never fired once.
+            #
+            # `primary_doc.xml` sits in the same accession directory and states
+            # all of it. A fetch that fails leaves the stub fields exactly as
+            # they were, so this degrades to the old behaviour rather than
+            # dropping the event.
+            parsed = await _fetch_form4_document(session, link)
+            payload = {
+                "link": link,
+                "title": entry.get("title", ""),
+                "summary": entry.get("summary", ""),
+            }
+            if parsed:
+                payload.update({
+                    "ticker": parsed["ticker"],
+                    "issuer_name": parsed["issuer_name"],
+                    "insider_names": parsed["insider_names"],
+                    # The gate reads one name per event; the full list travels
+                    # beside it so a cluster can count distinct filers.
+                    "insider_name": (parsed["insider_names"] or [""])[0],
+                    "transaction_value_usd": parsed["net_buy_usd"] or None,
+                    "open_market_buy_usd": parsed["open_market_buy_usd"],
+                    "open_market_sell_usd": parsed["open_market_sell_usd"],
+                    "has_open_market_activity": parsed["has_open_market_activity"],
+                    "role": _primary_role(parsed["owners"]),
+                    "transactions": parsed["transactions"],
+                })
+
             event = RawEvent(
                 source="sec_form4",
                 occurred_at=datetime.now(timezone.utc),
-                raw_payload={
-                    "link": link,
-                    "title": entry.get("title", ""),
-                    "summary": entry.get("summary", "")
-                }
+                raw_payload=payload,
             )
             await producer.send(Topics.RAW_TRADFI, event.model_dump(), key="form4")
             _collector_metrics("collector-tradfi").ingested()

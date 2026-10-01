@@ -47,6 +47,20 @@ _FIRST_SEEN: Dict[str, float] = {}
 _LAST_SEEN: Dict[str, float] = {}
 _LAST_REPORTED: Dict[str, float] = {}
 
+# Per-variant escalation ladders. A site that fires for two unrelated reasons
+# shares one counter, so the frequent reason decides when the site escalates
+# and the rare one is only ever seen by luck: the rule synthesiser correctly
+# refuses ~150 rule-firings an hour, and the single genuinely unroutable shape
+# underneath them appeared in the log once, as the 135th call. Keying the
+# ladder by variant gives each shape its own count of one, which is the
+# occurrence this module exists to make visible.
+_VARIANT_COUNTS: Dict[str, int] = {}
+
+# An unbounded key space would make this a leak. Past the cap, new variants
+# fall back to the site ladder -- degraded to the old behaviour rather than
+# growing without limit.
+MAX_VARIANTS = int(os.getenv("QUIET_FAILURE_MAX_VARIANTS", "256"))
+
 # How often one site may escalate to WARNING, however often it fires. A broken
 # subsystem should say so; it should not say so four hundred times an hour.
 ESCALATION_INTERVAL_SEC = float(os.getenv("QUIET_FAILURE_REPORT_SEC", "300"))
@@ -61,6 +75,7 @@ def swallowed(
     exc: BaseException,
     logger: Optional[logging.Logger] = None,
     detail: str = "",
+    variant: str = "",
 ) -> int:
     """Record a deliberately-not-raised failure. Returns the count for this site.
 
@@ -70,9 +85,11 @@ def swallowed(
     becomes impossible to miss without anyone having to predict which it would
     be.
     """
-    count, escalate = _record(site)
+    count, escalate, ladder = _record(site, variant)
     log = logger or logging.getLogger("sentinel.quiet")
     suffix = f" ({detail})" if detail else ""
+    if variant and ladder != count:
+        suffix = f" [{variant} x{ladder} of {count}]" + suffix
     if escalate:
         log.warning(
             "Suppressed failure at %s has now fired %s time(s): %s: %s%s",
@@ -83,19 +100,32 @@ def swallowed(
     return count
 
 
-def _record(site: str) -> tuple:
-    """Bump the counter for a site and decide whether this firing escalates."""
+def _record(site: str, variant: str = "") -> tuple:
+    """Bump the counter for a site and decide whether this firing escalates.
+
+    Returns the site total, whether to escalate, and the ladder count that the
+    decision was made on -- equal to the site total when no variant is given.
+    """
     now = time.time()
     with _LOCK:
         count = _COUNTS.get(site, 0) + 1
         _COUNTS[site] = count
         _FIRST_SEEN.setdefault(site, now)
         _LAST_SEEN[site] = now
-        last_reported = _LAST_REPORTED.get(site, 0.0)
-        escalate = count in ESCALATION_COUNTS or (now - last_reported) >= ESCALATION_INTERVAL_SEC
+
+        key = site
+        ladder = count
+        if variant:
+            vkey = f"{site}#{variant}"
+            if vkey in _VARIANT_COUNTS or len(_VARIANT_COUNTS) < MAX_VARIANTS:
+                _VARIANT_COUNTS[vkey] = ladder = _VARIANT_COUNTS.get(vkey, 0) + 1
+                key = vkey
+
+        last_reported = _LAST_REPORTED.get(key, 0.0)
+        escalate = ladder in ESCALATION_COUNTS or (now - last_reported) >= ESCALATION_INTERVAL_SEC
         if escalate:
-            _LAST_REPORTED[site] = now
-    return count, escalate
+            _LAST_REPORTED[key] = now
+    return count, escalate, ladder
 
 
 def dropped(
@@ -103,6 +133,7 @@ def dropped(
     reason: str,
     logger: Optional[logging.Logger] = None,
     detail: str = "",
+    variant: str = "",
 ) -> int:
     """Record an input discarded on purpose, where no exception was raised.
 
@@ -120,9 +151,11 @@ def dropped(
     counting and escalation are shared with `swallowed` for exactly that
     reason.
     """
-    count, escalate = _record(site)
+    count, escalate, ladder = _record(site, variant)
     log = logger or logging.getLogger("sentinel.quiet")
     suffix = f" ({detail})" if detail else ""
+    if variant and ladder != count:
+        suffix = f" [{variant} x{ladder} of {count}]" + suffix
     if escalate:
         log.warning(
             "Dropped input at %s, now %s time(s): %s%s", site, count, reason, suffix,
@@ -172,3 +205,4 @@ def reset() -> None:
         _FIRST_SEEN.clear()
         _LAST_SEEN.clear()
         _LAST_REPORTED.clear()
+        _VARIANT_COUNTS.clear()

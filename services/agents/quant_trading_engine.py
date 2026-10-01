@@ -395,7 +395,7 @@ class QuantTradingEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
         if not await self.flags.is_enabled("peer_discovery", ticker=ticker):
             return None
@@ -645,7 +645,7 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
         closes, highs, lows = await self._fetch_prices(ticker)
         if len(closes) < MIN_ADVISORY_BARS:

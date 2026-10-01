@@ -87,6 +87,37 @@ REACTION_THRESHOLD = 0.5            # anomaly score that counts as a reaction
 # left where they are instead.
 MAX_TESTABLE_BASE_RATE = 0.95
 
+# How many edges one sweep grades.
+#
+# The query below had never returned a row, so the cost of this loop had never
+# been paid. It is real: each edge costs one source-event query, one base-rate
+# fit and up to 50 reaction queries, and there are 1,090 edges on the listed
+# predicates. Ungated that is ~55,000 queries every five minutes against the
+# same Timescale the enrichment path is using.
+#
+# Least-recently-validated first, so the whole set cycles rather than the same
+# head of it being re-graded: 1,090 edges at 50 a sweep is a full pass roughly
+# every two hours, against a 30-day evidence window that does not move faster
+# than that.
+#
+# Ten, not fifty. Fifty was the first guess and the first sweep ran past twelve
+# minutes against a five-minute cadence. The queries underneath have since been
+# repaired -- see `_base_rate` -- so ten is now conservative rather than
+# necessary, and it stays there until a completed sweep has been measured at
+# this size. A full cycle of 1,090 edges takes about nine hours, against a
+# thirty-day evidence window that does not move faster than that.
+EDGES_PER_SWEEP = int(os.getenv("EDGE_VALIDATOR_BATCH", "10"))
+
+# The Cypher alternation, built from the list above rather than written out.
+#
+# These two had drifted: the list was widened from four predicates to nine --
+# with a comment recording that the original four matched three edges in the
+# entire graph -- and the query kept matching only the original four. Measured
+# 2026-09-20: 713 of 1,090 edges on the listed predicates were unreachable,
+# including all 242 GRANGER_CAUSES, the only predicate that asserts direction.
+# Deriving one from the other is what stops that recurring.
+_PREDICATE_ALTERNATION = "|".join(EXPOSURE_PREDICATES)
+
 
 def _word_pattern(symbol: str) -> str:
     """A Postgres regex matching `symbol` as a whole word.
@@ -99,6 +130,26 @@ def _word_pattern(symbol: str) -> str:
     return r"\m" + re.escape(symbol) + r"\M"
 
 
+# Why the reaction side matches on the entity id alone.
+#
+# `primary_entity_id = $1 OR headline ~* $2` cannot use an index: the equality
+# is served by events_entity_time_idx and the regex is not, and an OR across
+# the two lets Postgres use neither. Over thirty days of a 10.2M-row table that
+# is a sequential scan, and it runs once for the base rate plus once per source
+# event -- 51 times per edge.
+#
+# Measured 2026-09-20, what the regex branch actually adds:
+#
+#     GOOGL    entity id only 2,795   with regex 2,797   (+0.07%)
+#     BTCUSD   entity id only     0   with regex     0   (+0)
+#
+# Against that, BTCUSD timed out outright and no sweep completed at all in the
+# first fifteen minutes after this validator was repaired. Two rows in 2,797 is
+# not worth a mechanism that never finishes.
+#
+# The source-event query below keeps the regex: it runs once per edge rather
+# than fifty-one times, and finding the events that *mention* an entity is the
+# looser question where a headline match earns its cost.
 async def _base_rate(timescale_client: Any, ticker: str) -> Optional[float]:
     """P(at least one reaction from `ticker` in a 24h window), from its own history.
 
@@ -122,26 +173,33 @@ async def _base_rate(timescale_client: Any, ticker: str) -> Optional[float]:
     # `observed_sec` is how long this ticker has been observable at all, which
     # is the honest denominator for a name the platform only started seeing
     # recently, capped at the lookback.
-    query = """
-        SELECT count(*)::float AS n,
-               LEAST(
-                   EXTRACT(EPOCH FROM (NOW() - COALESCE(
-                       (SELECT min(occurred_at) FROM events
-                         WHERE (primary_entity_id = $1 OR headline ~* $2)
-                           AND occurred_at > NOW() - INTERVAL '%s days'),
-                       NOW() - INTERVAL '%s days'
-                   ))),
-                   %s * 86400.0
-               ) AS span_sec
+    # Two queries, because the expensive half is only needed half the time.
+    #
+    # This was one statement with an uncorrelated subquery computing
+    # `min(occurred_at)` over the ticker's whole history. Measured 2026-09-20:
+    #
+    #     GOOGL   (has qualifying rows)   1,415ms
+    #     BTCUSD  (has none)             40,000ms+, hit the statement timeout
+    #
+    # An entity with no matching rows is the pathological case for `min()`:
+    # proving there is no minimum means visiting every chunk, including the
+    # compressed ones. And the result is discarded in exactly that case -- the
+    # `n <= 0` branch below overwrites `span` with the full lookback. So the
+    # query spent forty seconds computing a number it then threw away, and the
+    # sweep never finished.
+    #
+    # Counting first is cheap and indexed (events_entity_time_idx). The span is
+    # computed only for a ticker already known to have qualifying events, where
+    # `min()` finds a row and stops.
+    count_query = """
+        SELECT count(*)::float AS n
         FROM events
         WHERE occurred_at > NOW() - INTERVAL '%s days'
-          AND (primary_entity_id = $1 OR headline ~* $2)
-          AND anomaly_score >= $3
-    """ % (LOOKBACK_DAYS, LOOKBACK_DAYS, LOOKBACK_DAYS, LOOKBACK_DAYS)
+          AND primary_entity_id = $1
+          AND anomaly_score >= $2
+    """ % LOOKBACK_DAYS
     try:
-        rows = await timescale_client.query(
-            query, ticker, _word_pattern(ticker), REACTION_THRESHOLD
-        )
+        rows = await timescale_client.query(count_query, ticker, REACTION_THRESHOLD)
     except Exception as e:
         swallowed("edge_validator.base_rate_query", e, logger, detail=ticker)
         return None
@@ -149,14 +207,73 @@ async def _base_rate(timescale_client: Any, ticker: str) -> Optional[float]:
     if not rows:
         return None
     n = float(rows[0].get("n") or 0.0)
-    span = float(rows[0].get("span_sec") or 0.0)
-    if n <= 0 or span <= 0:
-        # No reaction in the whole lookback. The edge cannot be confirmed, but
-        # neither is the null degenerate: use the smallest rate the window can
+
+    if n <= 0:
+        # Nothing qualifying. Two very different reasons, and the difference
+        # decides whether this edge can be graded at all.
+        #
+        # Measured on the first sweep that ever completed: all seven edges
+        # decayed on "0/50 hits vs base 1.7%", and 1.7% is this floor. Their
+        # targets -- US10Y, GC=F, BTCUSD, VOLATILE_1M_CANDLE -- have *zero*
+        # rows in the events table, not zero qualifying rows. The platform
+        # quotes those instruments but never writes an event keyed to them, so
+        # a reaction cannot be observed whether or not one occurred. Grading
+        # them produced a decay on every sweep, and a decayed confidence reads
+        # as earned, so the mechanism built to make confidence evidential would
+        # have ground every macro-target edge to zero on no evidence.
+        #
+        # This function's docstring already draws the distinction -- "returns
+        # None when there is no history to fit, which is not the same as a rate
+        # of zero" -- and the caller already skips on None. It was the check
+        # that was missing, not the contract.
+        try:
+            observed = await timescale_client.query(
+                """
+                SELECT count(*)::float AS n FROM events
+                WHERE occurred_at > NOW() - INTERVAL '%s days'
+                  AND primary_entity_id = $1
+                """ % LOOKBACK_DAYS,
+                ticker,
+            )
+        except Exception as e:
+            swallowed("edge_validator.base_rate_observed", e, logger, detail=ticker)
+            return None
+        if float((observed or [{}])[0].get("n") or 0.0) <= 0:
+            # The platform has never recorded this entity. Untestable, which
+            # is not the same as refuted.
+            return None
+
+        # It is observed and simply reacts rarely. That is a real signal, and
+        # the null must not be degenerate: use the smallest rate the window can
         # resolve rather than zero, which would make any single hit infinitely
         # significant.
         span = LOOKBACK_DAYS * 86400.0
         n = 0.5
+    else:
+        # How long this ticker has been observable at all, capped at the
+        # lookback -- deliberately NOT conditioned on the first *qualifying*
+        # event, which is length-biased and once ruled 2,108 tickers untestable
+        # for being too busy.
+        span_query = """
+            SELECT LEAST(
+                       EXTRACT(EPOCH FROM (NOW() - COALESCE(
+                           min(occurred_at), NOW() - INTERVAL '%s days'
+                       ))),
+                       %s * 86400.0
+                   ) AS span_sec
+            FROM events
+            WHERE occurred_at > NOW() - INTERVAL '%s days'
+              AND primary_entity_id = $1
+        """ % (LOOKBACK_DAYS, LOOKBACK_DAYS, LOOKBACK_DAYS)
+        try:
+            span_rows = await timescale_client.query(span_query, ticker)
+        except Exception as e:
+            swallowed("edge_validator.base_rate_span", e, logger, detail=ticker)
+            return None
+        span = float((span_rows or [{}])[0].get("span_sec") or 0.0)
+        if span <= 0:
+            span = LOOKBACK_DAYS * 86400.0
+
     lam = n / span
     p0 = 1.0 - math.exp(-lam * REACTION_WINDOW_HOURS * 3600.0)
     return min(max(p0, 1e-6), 1.0 - 1e-6)
@@ -192,16 +309,35 @@ async def validate_edges(
         logger.warning("Neo4j or TimescaleDB client uninitialized. Skipping edge validation.")
         return {"validated": 0, "promoted": 0, "decayed": 0}
 
-    # Match all exposure edges connecting entities to instruments
-    query = """
-    MATCH (a:Entity)-[r:SUPPLIES|COMMODITY_EXPOSURE|POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO]->(b:Entity {type: 'instrument'})
+    # Every edge on a graded predicate, oldest-validated first.
+    #
+    # Three constraints were removed because each matched nothing. `(a:Entity)`
+    # required the generic label, and the sources are :Company, :Commodity,
+    # :MacroFactor and :Region. `(b:Entity {type: 'instrument'})` required a
+    # type value that does not occur in this graph at all -- the targets carry
+    # Commodity, Company, MacroFactor, Index and CryptoAsset. Together with the
+    # four-of-nine predicate list, the query returned zero rows, and had
+    # returned zero rows for the life of the deployment: no edge in the graph
+    # has ever carried a `validation_samples` property.
+    #
+    # An edge is identified by its endpoints' ids, so an id is the one thing
+    # that is actually required.
+    query = f"""
+    MATCH (a)-[r:{_PREDICATE_ALTERNATION}]->(b)
+    WHERE a.id IS NOT NULL AND b.id IS NOT NULL
     RETURN a.id AS source_id, type(r) AS predicate, b.id AS ticker,
            coalesce(r.confidence, $unrated) AS confidence,
-           coalesce(r.validation_samples, 0) AS samples
+           coalesce(r.validation_samples, 0) AS samples,
+           coalesce(r.last_validated, 0) AS last_validated,
+           elementId(r) AS rid
+    ORDER BY last_validated ASC
+    LIMIT $batch
     """
 
     try:
-        edges = await neo4j_client.query(query, {"unrated": UNRATED_EDGE_CONFIDENCE})
+        edges = await neo4j_client.query(
+            query, {"unrated": UNRATED_EDGE_CONFIDENCE, "batch": EDGES_PER_SWEEP}
+        )
     except Exception as e:
         logger.error(f"Failed querying Neo4j exposure edges: {e}")
         return {"validated": 0, "promoted": 0, "decayed": 0}
@@ -213,6 +349,16 @@ async def validate_edges(
     validated_count = 0
     promoted_count = 0
     decayed_count = 0
+    # Why the rest were not graded.
+    #
+    # The first working sweep read "2 edge(s) evaluated" out of ten, and the
+    # other eight were invisible: an unobserved target returns None with no
+    # log, and the too-busy branch logs at DEBUG, which this deployment does
+    # not emit. "Evaluated 2" and "evaluated 2, skipped 8 for want of a
+    # measurable target" are different reports, and only the second says
+    # whether the validator is working.
+    skipped = {"unobserved_or_unfittable": 0, "reacts_too_often": 0,
+               "no_source_events": 0, "too_few_trials": 0}
 
     for edge in edges:
         source_id = str(edge.get("source_id", "")).strip().upper()
@@ -220,8 +366,29 @@ async def validate_edges(
         ticker = str(edge.get("ticker", "")).strip().upper()
         old_conf = float(edge.get("confidence", 0.5))
         prev_samples = int(edge.get("samples", 0))
+        rid = edge.get("rid")
 
         if not source_id or not ticker or predicate not in EXPOSURE_PREDICATES:
+            continue
+
+        # The null this edge has to beat, fitted once per ticker rather than
+        # once per event.
+        #
+        # Checked before the source-event scan below, not after. That scan
+        # still carries a headline regex and cannot use an index, and it timed
+        # out on META and SNDK -- both of which are then skipped here anyway
+        # for reacting too often to be testable. Paying for a sequential scan
+        # to reach a verdict of "no power" is the wrong order.
+        base_rate = await _base_rate(timescale_client, ticker)
+        if base_rate is None:
+            skipped["unobserved_or_unfittable"] += 1
+            continue
+        if base_rate > MAX_TESTABLE_BASE_RATE:
+            skipped["reacts_too_often"] += 1
+            logger.debug(
+                "Skipping %s -[%s]-> %s: base reaction rate %.3f leaves the test no power.",
+                source_id, predicate, ticker, base_rate,
+            )
             continue
 
         # 1. Pull historical events tagged to source_id from TimescaleDB
@@ -250,18 +417,7 @@ async def validate_edges(
             rows = []
 
         if not rows:
-            continue
-
-        # The null this edge has to beat, fitted once per ticker rather than
-        # once per event.
-        base_rate = await _base_rate(timescale_client, ticker)
-        if base_rate is None:
-            continue
-        if base_rate > MAX_TESTABLE_BASE_RATE:
-            logger.debug(
-                "Skipping %s -[%s]-> %s: base reaction rate %.3f leaves the test no power.",
-                source_id, predicate, ticker, base_rate,
-            )
+            skipped["no_source_events"] += 1
             continue
 
         hits = 0
@@ -272,20 +428,36 @@ async def validate_edges(
             event_ts = event.get("occurred_at")
             if not event_ts:
                 continue
+            # asyncpg wants a datetime for a timestamptz parameter and this
+            # client hands back ISO strings. Every reaction query raised
+            # `DataError: invalid input for query argument $2 ... got 'str'`
+            # -- 300 of them in one sweep -- and the handler counts a failed
+            # query as "not a trial", so `trials` stayed 0 and every edge was
+            # skipped with nothing written. The query had never run before the
+            # repair above, so this had never been reachable.
+            if isinstance(event_ts, str):
+                try:
+                    event_ts = datetime.fromisoformat(event_ts)
+                except ValueError:
+                    swallowed(
+                        "edge_validator.event_ts_parse", ValueError(event_ts),
+                        logger, detail=f"{source_id}->{ticker}",
+                    )
+                    continue
 
             # Query TimescaleDB for ticker events in the [event_ts, event_ts + 24h] reaction window
             reaction_query = """
                 SELECT event_id, type, anomaly_score
                 FROM events
-                WHERE (primary_entity_id = $1 OR headline ~* $2)
-                  AND occurred_at >= $3
-                  AND occurred_at <= $3 + INTERVAL '%s hours'
-                  AND anomaly_score >= $4
+                WHERE primary_entity_id = $1
+                  AND occurred_at >= $2
+                  AND occurred_at <= $2 + INTERVAL '%s hours'
+                  AND anomaly_score >= $3
                 LIMIT 1
             """ % REACTION_WINDOW_HOURS
             try:
                 rx_rows = await timescale_client.query(
-                    reaction_query, ticker, _word_pattern(ticker), event_ts, REACTION_THRESHOLD
+                    reaction_query, ticker, event_ts, REACTION_THRESHOLD
                 )
             except Exception as e:
                 # A failed query is not a miss. Counting it as one biased every
@@ -298,6 +470,7 @@ async def validate_edges(
                 hits += 1
 
         if trials <= 0:
+            skipped["too_few_trials"] += 1
             continue
 
         # `validation_samples` is the size of the evidence, not a running total.
@@ -318,18 +491,24 @@ async def validate_edges(
 
             if abs(new_conf - old_conf) >= 0.001:
                 # 4. Write back via fully parameterized Cypher
+                # By the relationship's own identity.
+                #
+                # This re-matched the endpoints, and carried the same
+                # `(a:Entity)` / `type: 'instrument'` constraints as the read --
+                # so even had the read returned rows, every write-back would
+                # have matched nothing. Re-deriving an edge from properties
+                # also means a full relationship scan; elementId is exact and
+                # was already in hand from the read.
                 update_query = """
-                MATCH (a:Entity {id: $source_id})-[r]->(b:Entity {id: $ticker, type: 'instrument'})
-                WHERE type(r) = $predicate
+                MATCH ()-[r]->()
+                WHERE elementId(r) = $rid
                 SET r.confidence = $new_confidence,
                     r.validation_samples = $samples,
                     r.last_validated = timestamp()
                 """
                 try:
                     await neo4j_client.query(update_query, {
-                        "source_id": source_id,
-                        "ticker": ticker,
-                        "predicate": predicate,
+                        "rid": rid,
                         "new_confidence": new_conf,
                         "samples": new_total_samples,
                     })
@@ -391,6 +570,8 @@ async def validate_edges(
         "validated": validated_count,
         "promoted": promoted_count,
         "decayed": decayed_count,
+        "considered": len(edges),
+        "skipped": skipped,
     }
 
 
@@ -421,8 +602,22 @@ class EdgeValidatorAgent(SentinelAgent):
                     redis_client=self.redis,
                     producer=self._producer,
                 )
-                if res.get("validated", 0) > 0:
-                    logger.info(f"⚡ Edge Validation Sweep: {res['validated']} edges evaluated ({res['promoted']} promoted, {res['decayed']} decayed)")
+                # Logged even at zero, on the first sweep and then each
+                # hundredth. Gating this on `> 0` is why a validator that had
+                # never graded an edge in the platform's lifetime was silent
+                # about it: a sweep that does nothing looked exactly like a
+                # sweep that found nothing to do.
+                self._sweeps = getattr(self, "_sweeps", 0) + 1
+                if res.get("validated", 0) > 0 or self._sweeps % 100 == 1:
+                    sk = res.get("skipped") or {}
+                    logger.info(
+                        "⚡ Edge Validation Sweep #%s: %s of %s edge(s) evaluated "
+                        "(%s promoted, %s decayed); skipped %s",
+                        self._sweeps, res.get("validated", 0),
+                        res.get("considered", 0),
+                        res.get("promoted", 0), res.get("decayed", 0),
+                        ", ".join(f"{k}={v}" for k, v in sk.items() if v) or "none",
+                    )
             except Exception as e:
                 logger.error(f"Edge validation loop failed: {e}", exc_info=True)
             await asyncio.sleep(300)  # 5-minute cadence

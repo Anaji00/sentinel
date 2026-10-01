@@ -346,7 +346,7 @@ class KnowledgeGraphEngine(SentinelAgent):
         # It also has to come before mark_processed: marking a message as seen
         # and then shedding it burns its dedup key for an hour, so the same
         # headline is suppressed later when capacity is actually available.
-        if not await self._inference_budget.is_available():
+        if not await self.capacity_or_defer(message):
             return None
 
         dedup_key = f"news_intel:{hash(headline)}:{int(time.time() // 3600)}"
@@ -433,8 +433,17 @@ class KnowledgeGraphEngine(SentinelAgent):
                 )
 
             # Direct single-transaction Neo4j MERGE for extracted triples
+            # What the model called each entity, keyed for the triple lookup.
+            entity_types = {
+                str(e.name).strip().lower(): str(e.entity_type).strip()
+                for e in (brief.entities or [])
+                if getattr(e, "name", None) and getattr(e, "entity_type", None)
+            }
+
             if valid_triples:
-                task = safe_create_task(self._merge_graph_triples(valid_triples))
+                task = safe_create_task(
+                    self._merge_graph_triples(valid_triples, entity_types)
+                )
                 if not hasattr(self, "_background_tasks"):
                     self._background_tasks = set()
                 self._background_tasks.add(task)
@@ -466,12 +475,13 @@ class KnowledgeGraphEngine(SentinelAgent):
             # Cache latest brief for swarm & dashboard
             await self.redis.raw.set("sentinel:intel:briefs:latest", json.dumps(res_payload["brief"]), ex=86400)
 
-            # Emit to agents.ontology.updates for backwards compatibility
-            if valid_triples:
-                await self._producer.send(Topics.ONTOLOGY_UPDATES, {
-                    "triples": [t.model_dump() for t in valid_triples],
-                    "source_headline": headline,
-                }, key=str(time.time()))
+            # The emit to agents.ontology.updates is gone. It was labelled
+            # "for backwards compatibility" and the only thing it was
+            # compatible with was this same agent's own subscription, which was
+            # removed once it was established that no branch had ever applied
+            # an update. The triples it echoed are already merged into Neo4j a
+            # few lines above, so the topic carried a second copy of a write
+            # that had already happened, to no reader.
 
             # The subject this bulletin is about, from whichever source knows it.
             #
@@ -577,8 +587,16 @@ class KnowledgeGraphEngine(SentinelAgent):
 
     # ── GRAPH TRIPLE MERGING ───────────────────────────────────────────────────
 
-    async def _merge_graph_triples(self, triples: List[GraphTriple]) -> None:
-        """Emits governed relationship proposals to Topics.ONTOLOGY_PROPOSALS (§3.3)."""
+    async def _merge_graph_triples(
+        self, triples: List[GraphTriple], entity_types: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Emits governed relationship proposals to Topics.ONTOLOGY_PROPOSALS (§3.3).
+
+        `entity_types` maps a lower-cased entity name to the label the model
+        gave it in the same brief. Absent, every node falls back to `Entity`,
+        which is what this method did for every triple it ever emitted.
+        """
+        entity_types = entity_types or {}
         if not self._producer or not triples:
             return
 
@@ -591,15 +609,31 @@ class KnowledgeGraphEngine(SentinelAgent):
                 if len(t.subject) > 80 or len(t.object) > 80:
                     continue
 
-                subject_label = getattr(t, 'subject_type', 'Entity')
-                object_label = getattr(t, 'object_type', 'Entity')
+                # The type the model already gave for this entity.
+                #
+                # These four reads were `getattr(t, 'subject_type', 'Entity')`
+                # against a GraphTriple that has no such field -- so every one
+                # resolved to the default and every node this engine proposed
+                # was labelled `Entity`, unconditionally. That is the single
+                # largest producer of the untyped mass this audit recorded at
+                # 84% of nodes, and it was a default standing in for a lookup.
+                #
+                # The lookup exists: the same brief carries `entities`, each
+                # with an `entity_type` the model chose -- Company, Vessel,
+                # Aircraft, Organization, Location, Person -- and the triples
+                # name those entities by name. `resolve_node_label` in the
+                # supervisor still has the final say, so a wrong label from the
+                # model is corrected rather than trusted; what it cannot do is
+                # recover a type nobody ever sent.
+                subject_label = entity_types.get(t.subject.strip().lower(), "Entity")
+                object_label = entity_types.get(t.object.strip().lower(), "Entity")
                 proposal = {
                     "entity_id": graph_node_id(t.subject, subject_label),
                     "action": "LINK_ENTITY",
                     "data": {
                         "target_id": graph_node_id(t.object, object_label),
-                        "source_label": getattr(t, 'subject_type', 'Entity'),
-                        "target_label": getattr(t, 'object_type', 'Entity'),
+                        "source_label": subject_label,
+                        "target_label": object_label,
                         "relation_type": t.predicate,
                         "weight": 1.0,
                         "confidence": t.confidence,
@@ -608,32 +642,3 @@ class KnowledgeGraphEngine(SentinelAgent):
                 await self._producer.send(Topics.ONTOLOGY_PROPOSALS, proposal, key=proposal["entity_id"])
         except Exception as e:
             logger.error(f"Failed to emit graph triples to ONTOLOGY_PROPOSALS: {e}")
-
-    async def get_entity_centrality(self, entity_id: str, label: str = "Entity") -> float:
-        """
-        Fetches degree centrality for an entity in Neo4j graph.
-        Weights anomaly correlation-cluster severity by node centrality.
-
-        The severity weighting this describes is applied by the correlation
-        tiering, which had its own inline copy of the query spelled `.upper()`
-        -- so it missed every wallet it was asked about and returned a degree of
-        zero, a centrality of exactly 1.0, on the boundary between ALERT and
-        INTELLIGENCE. Both now resolve through `graph_node_id`, so the readers
-        and the writers agree about how an identifier is spelled.
-        """
-        try:
-            from shared.db import get_neo4j
-            import math
-            neo4j_client = await get_neo4j()
-            query = """
-            MATCH (e:Entity {id: $id})
-            OPTIONAL MATCH (e)-[r]-(neighbor)
-            RETURN count(r) as degree
-            """
-            res = await neo4j_client.query(query, {"id": graph_node_id(entity_id, label)})
-            if res and res[0].get("degree"):
-                degree = float(res[0]["degree"])
-                return 1.0 + math.log(1.0 + degree)
-        except Exception as e:
-            logger.debug(f"Centrality query fallback for {entity_id}: {e}")
-        return 1.0

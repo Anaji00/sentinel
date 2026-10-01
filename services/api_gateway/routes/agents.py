@@ -271,6 +271,14 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
             # how one opinion acquires the authority of the swarm.
             "corroborated_signals": [s for s in signals if (s.get("contributing_agents") or 0) > 1][:12],
             "single_agent_signals": [s for s in signals if (s.get("contributing_agents") or 0) <= 1][:12],
+            # Instruments and everything else counted apart, for the same
+            # reason. Measured live, five of eleven subjects were flight
+            # callsigns and vessel names -- ETD8MY, FDX10, JAL8664, SAMANYOLU,
+            # RAGNAR -- each carrying `direction: "bearish"` and a
+            # consensus_score in the same shape as TSLA. A reader cannot act on
+            # "bearish ETD8MY", and nothing on this response said it was an
+            # aircraft.
+            "non_instrument_signals": [s for s in signals if not s.get("asset_class")][:12],
         },
         "bulletins": sorted(
             bulletins, key=lambda b: b.get("created_at") or "", reverse=True

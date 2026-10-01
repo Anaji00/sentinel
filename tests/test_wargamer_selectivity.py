@@ -92,7 +92,7 @@ def test_both_gates_run_before_any_expensive_context_fetch():
     """Ordering is the whole point: the cost was in the setup, not the model."""
     src = (ROOT / "services/agents/adversarial_wargamer.py").read_text(encoding="utf-8")
     worth = src.index("_is_worth_simulating(message)")
-    budget = src.index("_inference_budget.is_available()")
+    budget = src.index("capacity_or_defer(message)")
     subgraph = src.index("_fetch_subgraph_context(entity_ids)")
     cross = src.index("get_cross_agent_context(")
     assert worth < budget < subgraph, "context is fetched before the gates decide"

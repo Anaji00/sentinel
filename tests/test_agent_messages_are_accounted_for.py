@@ -43,7 +43,13 @@ HANDLER_NAMES = {"process", "process_message", "handle", "handle_message", "on_m
 # What the number does is stop the population growing silently: new code either
 # records why it discarded a message, or moves this figure and says so in a
 # commit. Each dispatch fall-through that gets a `dropped(...)` takes it down.
-MAX_SILENT_AGENT_DROPS = 36
+#
+# 36 -> 27. Ten of the thirty-six were never silent: they log at INFO before
+# returning, and the detector only recognised `dropped`/`swallowed`, so a
+# reported outcome was counted as an unreported one. The ceiling has to come
+# down with the detector, or the ten seats they vacate become room for ten
+# genuinely silent returns to be added without the ratchet moving.
+MAX_SILENT_AGENT_DROPS = 27
 
 pytestmark = pytest.mark.anyio
 
@@ -55,14 +61,32 @@ def anyio_backend():
 
 RECORDERS = {"dropped", "swallowed"}
 
+# A return that logs at INFO or above is accounted for too. What this file
+# protects is that the outcome is observable, and the supervisor's commit path
+# is the case that made the distinction matter: it stopped publishing a receipt
+# nothing read and now logs the commit instead, which is a success being
+# reported, not a message being dropped in silence.
+#
+# `debug` is deliberately absent. The deployment runs at LOG_LEVEL=INFO and the
+# running containers emit no DEBUG lines at all -- that measurement is why
+# `quiet_failures` exists, so counting a DEBUG line as accounting would put the
+# original defect back inside its own regression test.
+VISIBLE_LOG_LEVELS = {"info", "warning", "error", "exception", "critical"}
+
 
 def _records_a_drop(stmt) -> bool:
-    """Is this statement a call to the quiet-failure recorder?"""
+    """Does this statement make the outcome observable?"""
     if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
         return False
     func = stmt.value.func
     name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-    return name in RECORDERS
+    if name in RECORDERS:
+        return True
+    if isinstance(func, ast.Attribute) and name in VISIBLE_LOG_LEVELS:
+        target = func.value
+        base = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        return base in ("logger", "log", "_logger")
+    return False
 
 
 class _Handlers(ast.NodeVisitor):

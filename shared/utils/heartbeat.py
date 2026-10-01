@@ -76,7 +76,11 @@ async def touch_heartbeat(redis_client: Any, component: str, ttl: int = 120, met
         payload = {
             "component": component,
             "ts": now_iso,
-            "metadata": metadata or {}
+            "metadata": metadata or {},
+            # Beside `metadata` rather than inside it: metadata is
+            # caller-supplied and a service publishing its own "suppressed" key
+            # would silently lose one of the two.
+            "suppressed": _suppressed_digest(),
         }
         await raw_redis.set(f"sentinel:heartbeat:{component}", json.dumps(payload), ex=ttl)
         return True
@@ -143,7 +147,44 @@ ALL_KNOWN_COMPONENTS = [
 # deployment mode, not a fault, so health scoring must not count them as failed.
 OPTIONAL_COMPONENTS = frozenset({"agents-heavy", "agents-fast"})
 
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import snapshot as quiet_snapshot, swallowed
+
+# How many suppressed sites a heartbeat carries.
+#
+# Bounded because the payload is a Redis value read on every health poll, and
+# a service with a hundred distinct sites would put a hundred of them on every
+# beat. Sites are ordered by count, so the cap drops the quietest; `sites` in
+# the digest reports the true total, so a reader can tell it was truncated.
+HEARTBEAT_SUPPRESSED_LIMIT = 20
+
+
+def _suppressed_digest() -> dict:
+    """Every quiet-failure counter this process holds, for the heartbeat.
+
+    73 files call `swallowed` or `dropped`. Two import `heartbeat_line`, which
+    is the only surface any of them had -- so in 14 of the 16 services that
+    count, the counters went into a process-local dict that nothing read. That
+    is this module's founding defect, reproduced at fourteen times the scale,
+    and its own docstring names it: "`snapshot()` existed from the day this
+    module was written and nothing ever called it."
+
+    It rides the heartbeat for the same reason `liveness_flush` does: every
+    service already runs this loop, and a surface each service had to remember
+    to wire is one more mechanism nobody wires.
+    """
+    try:
+        snap = quiet_snapshot()
+    except Exception:
+        # Never take a service's health reporting down to report a counter.
+        return {}
+    if not snap:
+        return {}
+    top = list(snap.items())[:HEARTBEAT_SUPPRESSED_LIMIT]
+    return {
+        "sites": len(snap),
+        "total": int(sum(d["count"] for d in snap.values())),
+        "counts": {site: int(d["count"]) for site, d in top},
+    }
 
 SCAN_SUPPRESSION_PREFIX = "sentinel:health:scan_suppressed:"
 SCAN_SUPPRESSION_TTL_SEC = 900
@@ -254,6 +295,7 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
             data = json.loads(val) if isinstance(val, (str, bytes)) else val
             ts_str = data.get("ts") if isinstance(data, dict) else None
             meta = data.get("metadata", {}) if isinstance(data, dict) else {}
+            suppressed = data.get("suppressed", {}) if isinstance(data, dict) else {}
 
             if not ts_str:
                 results[comp] = {"status": "INVALID", "age_seconds": None, "last_seen": None, "metadata": meta}
@@ -305,6 +347,11 @@ async def get_all_heartbeats_status(redis_client: Any, custom_components: Option
                 # Named so an operator reading the endpoint learns why, rather
                 # than seeing a status change with no stated cause.
                 "impediment": impediment,
+                # A component can be OK on every liveness measure and still be
+                # discarding its input. Forwarded explicitly because this sits
+                # beside `metadata` in the payload, so passing metadata through
+                # would drop it.
+                "suppressed": suppressed,
             }
         except Exception as e:
             results[comp] = {

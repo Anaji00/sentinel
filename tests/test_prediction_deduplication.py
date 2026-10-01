@@ -24,6 +24,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+NL = chr(10)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -112,14 +113,28 @@ def test_different_tickers_are_independent():
 def test_the_claim_expires_with_the_prediction():
     """A claim outliving its horizon would block the ticker permanently; one
     expiring early would let the duplicate back in."""
-    source = (ROOT / "services" / "agents" / "base.py").read_text(encoding="utf-8")
+    source = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     assert "claim_ttl = max(int(time_horizon_hours) * 3600, 3600)" in source
 
 
 def test_a_redis_failure_does_not_lose_the_prediction():
     """Recording a duplicate is a smaller harm than dropping a forecast on a
     host that affords roughly twenty inferences an hour."""
-    source = (ROOT / "services" / "agents" / "base.py").read_text(encoding="utf-8")
+    source = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     claim_block = source.split("claim_key = (")[1].split("pred = AgentPrediction")[0]
     assert "except Exception" in claim_block
     assert claim_block.count("return \"\"") == 1, "only the duplicate path returns early"

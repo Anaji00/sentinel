@@ -11,6 +11,7 @@ import time
 import numpy as np
 import pytest
 
+NL = chr(10)
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -408,7 +409,14 @@ def test_a_persisted_correlation_links_back_to_its_events():
 
 # ── 254: predictions, and therefore scorecards ──────────────────────────────
 
-BASE = (ROOT / "services" / "agents" / "base.py").read_text(encoding="utf-8")
+BASE = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
 
 
 def test_a_directional_bulletin_is_recorded_as_a_prediction():

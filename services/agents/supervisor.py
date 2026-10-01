@@ -24,7 +24,7 @@ from shared.models.ontology import (
     is_valid_node_label,
     resolve_node_label,
 )
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.supervisor")
 
@@ -157,6 +157,32 @@ UNDIRECTED = "undirected"
 LOCK_TTL_SEC: int = 15
 
 
+def _proposed_predicate(action: str, data: dict) -> str:
+    """The relationship `execute_proposal` will write for this proposal.
+
+    One function because there were two, disagreeing. The describer read
+    `predicate` or `relationship` and fell back to "RELATED_TO"; the executor
+    reads `relation_type`, which is neither of those -- so a proposal carrying
+    `relation_type: "TRANSACTED_WITH"` was written as TRANSACTED_WITH and
+    described as RELATED_TO. Every relationship the supervisor has ever
+    announced carried that default unless a caller happened to set one of the
+    two keys the writer ignores.
+
+    Verified on the running graph: the supervisor logged
+    `0xbbbb... -[RELATED_TO]-> 0xbeef...`, and the edge between those two
+    wallets is TRANSACTED_WITH, written two minutes earlier. Separately, no
+    RELATED_TO edge in the graph has been created or updated in 4.4 days.
+    """
+    if action == "ADD_SYMPATHY_EDGE":
+        return "SYMPATHY_MOVER"
+    return str(
+        data.get("relation_type")
+        or data.get("predicate")
+        or data.get("relationship")
+        or "RELATED_TO"
+    ).upper()
+
+
 def _describe_proposals(proposals: List[dict]) -> str:
     """What these proposals changed in the graph, in words.
 
@@ -194,8 +220,7 @@ def _describe_proposals(proposals: List[dict]) -> str:
         if action == "MERGE_ONTOLOGY_NODE":
             nodes.append(f"{entity_id} ({data.get('label', 'Entity')})")
         elif target:
-            predicate = data.get("predicate") or data.get("relationship") or "RELATED_TO"
-            links.append(f"{entity_id} -[{predicate}]-> {target}")
+            links.append(f"{entity_id} -[{_proposed_predicate(action, data)}]-> {target}")
         elif data.get("tags"):
             tagged.append(entity_id)
         else:
@@ -232,7 +257,17 @@ class GraphSupervisor(SentinelAgent):
 
     @property
     def output_topic(self) -> str:
-        return Topics.ONTOLOGY_UPDATES
+        """This agent's output is the graph, not a topic.
+
+        The base class publishes any non-None `handle()` return here, and this
+        agent returned a commit receipt, so ONTOLOGY_UPDATES carried 3.1M
+        bookkeeping messages. Its only consumer was removed once it was
+        established that no branch had ever applied one, which left the topic
+        written by two producers and read by nobody. `handle()` now returns
+        None on every path, so this is never read; it is deliberately not a
+        Topics constant, because naming one would re-create the orphan.
+        """
+        return ""
 
     async def handle(self, message: Any) -> Optional[Dict[str, Any]]:
         """Commits a graph proposal and reports what was committed.
@@ -246,21 +281,58 @@ class GraphSupervisor(SentinelAgent):
         now, so the symptom is gone; this is the cause.
         """
         if isinstance(message, list):
-            await self.execute_batch_proposals(message)
-            return {
-                "agent": self.name,
-                "action": "batch_commit",
-                "proposals_processed": len(message),
-                "summary": _describe_proposals(message),
-            }
+            committed = await self.execute_batch_proposals(message)
+            if not committed:
+                # Counted, not merely skipped. A batch in which every proposal
+                # was refused is a producer emitting graph changes with no
+                # subject, and the count is the only thing that separates one
+                # of those from ten thousand.
+                dropped(
+                    "agents.supervisor.batch_refused",
+                    "every proposal in the batch was refused; nothing reached the graph",
+                    logger,
+                    detail=f"{len(message)} proposal(s)",
+                )
+                return None
+            logger.info(
+                "%s committed %s of %s proposal(s) to the graph: %s",
+                self.name, committed, len(message), _describe_proposals(message),
+            )
+            return None
         elif isinstance(message, dict):
-            await self.execute_proposal(message)
-            return {
-                "agent": self.name,
-                "action": "single_commit",
-                "entity_id": message.get("entity_id"),
-                "summary": _describe_proposals([message]),
-            }
+            if not await self.execute_proposal(message):
+                # Nothing reached the graph, so there is no ontology update to
+                # announce. The base class publishes any non-None return to
+                # `output_topic`, so returning a receipt here put one message on
+                # ONTOLOGY_UPDATES for every message this agent ever saw --
+                # including the refusals, which were a quarter of them.
+                #
+                # Recorded rather than returned silently: replacing a receipt
+                # nobody reads with a discard nobody counts would trade one
+                # invisible outcome for another.
+                dropped(
+                    "agents.supervisor.proposal_refused",
+                    "the proposal was refused; nothing reached the graph",
+                    logger,
+                    detail=str(message.get("action") or "no action"),
+                    variant=str(message.get("action") or "no action"),
+                )
+                return None
+            logger.info(
+                "%s committed %s to the graph: %s",
+                self.name, message.get("entity_id"), _describe_proposals([message]),
+            )
+            return None
+        # Neither a proposal nor a batch of them. The supervisor now reads one
+        # topic, so anything arriving in a third shape is a producer writing to
+        # ONTOLOGY_PROPOSALS that nobody has told this agent about.
+        dropped(
+            "agents.supervisor.unroutable_shape",
+            "neither a proposal nor a batch of them",
+            logger,
+            detail=f"type={type(message).__name__}",
+            variant=type(message).__name__,
+        )
         return None
 
     async def acquire_lock(self, entity_id: str, timeout: int = 10) -> Optional[str]:
@@ -315,13 +387,15 @@ class GraphSupervisor(SentinelAgent):
             logger.warning("Lock release failed for %s: %s", entity_id, e)
             return False
 
-    async def execute_batch_proposals(self, proposals: List[dict]):
-        """
-        Executes Cypher UNWIND $batch AS row queries to commit graph updates in high-throughput ACID batches.
-        Acquires Redis locks for involved entities to prevent race conditions.
+    async def execute_batch_proposals(self, proposals: List[dict]) -> int:
+        """Commits a batch of proposals. Returns how many rows were written.
+
+        The count is what lets `handle` stay quiet about a batch in which every
+        proposal was refused -- see execute_proposal for the same change on the
+        single path.
         """
         if not proposals:
-            return
+            return 0
 
         # Extract entity IDs for batch locking
         entity_ids = set()
@@ -370,7 +444,10 @@ class GraphSupervisor(SentinelAgent):
                     })
 
                 elif action in ("LINK_ENTITY", "ADD_SYMPATHY_EDGE"):
-                    relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
+                    # Shared with the describer so the two cannot disagree about
+                    # what this proposal writes -- which they did, silently, for
+                    # every relationship the supervisor committed.
+                    relation = _proposed_predicate(action, data)
                     if is_valid_predicate(relation):
                         target_id = data.get("target_id") or data.get("sympathy_ticker")
                         if not target_id:
@@ -496,7 +573,12 @@ class GraphSupervisor(SentinelAgent):
                 """
                 await self.neo4j.execute(cypher, {"batch": batch})
 
-            logger.info(f"✅ UNWIND Batch Cypher committed {len(proposals)} graph proposals.")
+            written = sum(len(b) for b in nodes_by_label.values()) +                       sum(len(b) for b in links_by_relation.values())
+            # What was written, not what was offered. `len(proposals)` counted
+            # the ones refused above for having no entity_id or an unauthorised
+            # predicate, so the receipt overstated every batch containing one.
+            logger.info(f"✅ UNWIND Batch Cypher committed {written} graph write(s) from {len(proposals)} proposal(s).")
+            return written
 
         except Exception as e:
             logger.error(f"UNWIND batch commit failed: {e}")
@@ -505,19 +587,24 @@ class GraphSupervisor(SentinelAgent):
             for eid, token in acquired_locks.items():
                 await self.release_lock(eid, token)
 
-    async def execute_proposal(self, payload: dict):
-        """Maps trusted JSON structs to Cypher queries with centralized validation."""
+    async def execute_proposal(self, payload: dict) -> bool:
+        """Commits one graph proposal. True when something reached the graph.
+
+        The boolean is what lets `handle` stay quiet about a proposal it
+        refused: every early return below is a decision not to write, and each
+        one used to be reported as a commit.
+        """
         entity_id = payload.get("entity_id")
         action = payload.get("action") 
         data = payload.get("data", {})
         
         if not entity_id or not action:
-            return
+            return False
 
         lock_token = await self.acquire_lock(entity_id)
         if not lock_token:
             logger.warning(f"Lock timeout for entity {entity_id}. Dropping proposal.")
-            return
+            return False
 
         try:
             if action == "MERGE_ONTOLOGY_NODE":
@@ -549,11 +636,12 @@ class GraphSupervisor(SentinelAgent):
                     "confidence": float(data.get("confidence", 1.0))
                 })
                 logger.debug(f"✅ Created/Updated Node: {entity_id} ({label})")
+                return True
 
             elif action in ("LINK_ENTITY", "ADD_SYMPATHY_EDGE"):
                 target_id = data.get("target_id") or data.get("sympathy_ticker")
                 if not target_id:
-                    return
+                    return False
 
                 source_label = resolve_node_label(
                     data.get("source_label"), entity_id, source=f"supervisor.{action}",
@@ -562,11 +650,14 @@ class GraphSupervisor(SentinelAgent):
                     data.get("target_label"), target_id, source=f"supervisor.{action}",
                 )
 
-                relation = "SYMPATHY_MOVER" if action == "ADD_SYMPATHY_EDGE" else data.get("relation_type", "RELATED_TO").upper()
+                # Shared with the describer so the two cannot disagree about
+                # what this proposal writes -- which they did, silently, for
+                # every relationship the supervisor committed.
+                relation = _proposed_predicate(action, data)
                 
                 if not is_valid_predicate(relation):
                     logger.warning(f"Rejected unauthorized graph predicate: {relation}")
-                    return
+                    return False
 
                 props = data.get("properties", {})
                 cypher = f"""
@@ -610,6 +701,7 @@ class GraphSupervisor(SentinelAgent):
                     **_edge_stats(props),
                 })
                 logger.debug(f"✅ Created/Updated Edge: {entity_id} -[{relation}]-> {target_id}")
+                return True
 
             elif action == "ADD_TAGS":
                 tags = data.get("tags", [])
@@ -617,7 +709,7 @@ class GraphSupervisor(SentinelAgent):
                     data.get("label"), entity_id, source="supervisor.ADD_TAGS",
                 )
                 if not tags:
-                    return
+                    return False
 
                 cypher = f"""
                 MERGE (e:{label} {{name: $id}})
@@ -638,9 +730,11 @@ class GraphSupervisor(SentinelAgent):
                 # handler that reported it as a Neo4j commit failure.
                 await self.neo4j.execute(cypher, {"id": graph_node_id(entity_id, label), "new_tags": tags})
                 logger.debug(f"✅ Added {len(tags)} tags to {entity_id}")
+                return True
 
             else:
                 logger.warning(f"Unknown proposal action: {action}")
+                return False
 
         except Exception as e:
             logger.error(f"Neo4j commit failed for {entity_id}: {e}")

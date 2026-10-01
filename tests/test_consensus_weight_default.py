@@ -17,6 +17,7 @@ Every agent in the swarm is weighted through this default today.
 import sys
 from pathlib import Path
 
+NL = chr(10)
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -56,7 +57,14 @@ def test_a_reliably_wrong_agent_is_not_silenced():
 
 def test_the_calibration_path_uses_the_same_function():
     """Otherwise the default and the written value drift apart again."""
-    source = (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+    source = (
+        (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
+        # A terminator, so a test that slices from one "async def" to the
+        # next stops at the file boundary instead of running on into the
+        # other module and capturing an unrelated method.
+        + (NL + "    async def _end_of_module(self):" + NL + "        pass" + NL)
+        + (ROOT / "services/agents/prediction_scoring.py").read_text(encoding="utf-8")
+    )
     # Assignments only. A log line that formats the value is not one, and
     # matching it made this test fail on the correct code.
     import re
