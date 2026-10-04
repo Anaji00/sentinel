@@ -76,3 +76,24 @@ def test_none_is_empty_not_an_error():
 def test_a_decorated_and_a_bare_ticker_group_together():
     """The property consensus needs: one subject, not two."""
     assert canonical_key("CPB ($21.53)") == canonical_key("CPB")
+
+
+# ── futures and FX symbols are symbols ───────────────────────────────────────
+
+
+def test_a_futures_symbol_keeps_its_shape():
+    """Folded as a name, ZW=F became "ZW F": the live consensus report carried
+    wheat futures under that subject, classified as an equity."""
+    from shared.utils.equities import asset_class
+    for sym in ("ZW=F", "CL=F", "GC=F", "EURUSD=X"):
+        assert canonical_key(sym) == sym
+        assert asset_class(canonical_key(sym)) != "equity"
+
+
+def test_a_lowercase_futures_symbol_folds_to_the_same_subject():
+    assert canonical_key("cl=f") == canonical_key("CL=F")
+
+
+def test_ordinary_names_still_fold_as_names():
+    assert canonical_key("Apple Inc.") == "APPLE"
+    assert canonical_key("A=B=F") == "A B F"

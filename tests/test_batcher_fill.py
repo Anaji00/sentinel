@@ -46,7 +46,7 @@ def test_the_counters_reach_the_heartbeat():
 
 def test_counting_happens_after_the_inflight_guard():
     """Counting a batch that was never drained would inflate the fill rate."""
-    drain = SRC.index("batch, self._pending = self._pending, []")
+    drain = SRC.index("batch = self._pending[: self.max_items]")
     guard = SRC.index("if self._inflight or not self._pending:")
     count = SRC.index("self.flushes += 1")
     assert guard < drain < count

@@ -18,6 +18,7 @@ from typing import Optional, List
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, FlightData
 from shared.utils.regions import classify_region
 from shared.utils.sanctions import check_sanctions
+from shared.utils.airlines import operator_designator, operator_ticker
 from shared.utils.regions import routine_band_score
 from shared.kafka import Topics
 from shared.utils.source_scorecard import baseline_reliability
@@ -214,6 +215,16 @@ class AviationEnricher:
             tags = []
             if region:
                 tags.append(region.lower().replace(" ", "_"))
+            # The listed company flying this aircraft, from its callsign. The
+            # bridge from an aircraft to a stock: 24,778 aircraft had edges only
+            # to a region and a flag. See shared/utils/airlines.py.
+            operator = operator_ticker(callsign)
+            if operator:
+                tags += [f"exposes:{operator}", f"operator:{operator_designator(callsign)}"]
+            # No region exposure for aircraft. A tanker in Hormuz bears on
+            # crude; an airliner overhead does not, and tagging it so let 109
+            # single-flight "surges" a day reach the reasoning gate as crude and
+            # grain signals. An aircraft reaches a stock through its operator.
             if is_emerg:
                 tags += [f"squawk_{squawk}", "aviation_emergency", SQUAWK_LABELS.get(squawk, "emergency")]
             if is_sanctioned:
@@ -277,6 +288,7 @@ class AviationEnricher:
                     "callsign": callsign,
                     "origin_country": country,
                     "region": region,
+                    "operator_ticker": operator,
                 }))
 
         if graph_tasks:

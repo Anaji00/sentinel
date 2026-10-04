@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Set
 
 from shared.models import CorrelationCluster, AlertTier, NormalizedEvent
 from shared.models.events import resolve_event_domain
+from shared.utils.instrument_reach import exposure_tags
 
 logger = logging.getLogger("correlation.cascade")
 
@@ -107,6 +108,7 @@ def _extract_event_context(event: NormalizedEvent) -> dict:
         "coverage": _coverage_of(event),
         "region": getattr(event, "region", None),
         "summary": str(getattr(event, "summary", "") or "")[:200],
+        "exposes": exposure_tags(getattr(event, "tags", None)),
     }
 
 
@@ -219,7 +221,13 @@ class GeopoliticalCascadeEngine:
     Financial Markets, and News Headlines.
     """
 
-    def __init__(self, window_seconds: int = 3600, cooldown_seconds: int = 900, hawkes_tracker=None):
+    def __init__(
+        self,
+        window_seconds: int = 3600,
+        cooldown_seconds: int = 900,
+        hawkes_tracker=None,
+        storm_baseline_hours: int = 0,
+    ):
         self.window_seconds = window_seconds
         self.cooldown_seconds = cooldown_seconds
         self.hawkes_tracker = hawkes_tracker
@@ -227,6 +235,66 @@ class GeopoliticalCascadeEngine:
         self._sliding_window: Dict[str, List[tuple]] = {}
         # Cooldown map: {region_key: last_triggered_timestamp}
         self._last_trigger: Dict[str, float] = {}
+        # Hours of a key's own history a single-domain storm is judged against.
+        # 0 keeps the fixed bar; production sets it (see storm_threshold).
+        self.storm_baseline_hours = storm_baseline_hours
+        # {key: {hour_index: events}} and the first hour each key was seen.
+        self._hourly: Dict[str, Dict[int, int]] = {}
+        self._first_hour: Dict[str, int] = {}
+
+    def _count_hour(self, key: str, now: float) -> None:
+        hour = int(now // 3600)
+        self._first_hour.setdefault(key, hour)
+        counts = self._hourly.setdefault(key, {})
+        counts[hour] = counts.get(hour, 0) + 1
+        horizon = hour - max(self.storm_baseline_hours, 1) - 1
+        for h in [h for h in counts if h < horizon]:
+            del counts[h]
+
+    def seed_history(self, counts: Dict[str, Dict[int, int]], start_hour: int, now: float) -> int:
+        """Fill completed hours from the durable record, so a restart is not blind.
+
+        The hourly counts live in memory, and the correlation service restarts
+        on every deploy -- so without this a region could not storm for twelve
+        hours after each one. Only hours before the current one are written,
+        which leaves anything counted live since startup untouched. An hour in
+        the seeded range that a key does not appear in is a measured zero, so
+        the key's history starts at `start_hour`, not at its first event.
+        """
+        current = int(now // 3600)
+        seeded = 0
+        for key, hours in counts.items():
+            mine = self._hourly.setdefault(key, {})
+            for hour, n in hours.items():
+                if start_hour <= hour < current:
+                    mine[hour] = int(n)
+            self._first_hour[key] = min(self._first_hour.get(key, start_hour), start_hour)
+            seeded += 1
+        return seeded
+
+    def storm_threshold(self, key: str, now: float) -> float:
+        """Events in the window a single-domain storm needs, from the key's own past.
+
+        A fixed bar of four events an hour is what a busy strait does on an
+        ordinary day. Measured in the thirty days to 4 October: 2,293 maritime
+        activity clusters, one at Taiwan Territorial holding 38 events, and 3 of
+        12 resolved scenarios confirmed -- the same shape as the aviation
+        surges, where Hormuz averaged 63 dark aircraft every 12 hours. A storm
+        is this key busier than it usually is: the mean of its completed hours
+        plus three standard deviations. Until the key has the hours to judge
+        against, it cannot storm at all -- unmeasured is not unusual.
+        """
+        if self.storm_baseline_hours <= 0:
+            return 0.0
+        hour = int(now // 3600)
+        first = self._first_hour.get(key, hour)
+        start = max(first, hour - self.storm_baseline_hours)
+        history = [self._hourly.get(key, {}).get(h, 0) for h in range(start, hour)]
+        if len(history) < self.storm_baseline_hours:
+            return float("inf")
+        mean = sum(history) / len(history)
+        var = sum((c - mean) ** 2 for c in history) / len(history)
+        return mean + 3.0 * var ** 0.5
 
     def ingest_event(self, event: NormalizedEvent) -> Optional[CorrelationCluster]:
         """
@@ -239,10 +307,23 @@ class GeopoliticalCascadeEngine:
         score = float(getattr(event, "anomaly_score", 0.0) or 0.0)
         if domain in ("vessel_position", "flight_position") and score < 0.30:
             return None
+        # On-chain transfers carry no region, so their window is keyed on the
+        # wallet and can only ever cluster with that wallet's own transfers.
+        # Measured to 3 October: 183 wallet clusters a week, every one a
+        # stablecoin wallet that moves money all day, and their scenarios
+        # "confirmed" 21 times by watching for further transfers -- which a busy
+        # wallet satisfies by being busy -- with no deny signal on any of them.
+        # Nothing in them reaches a stock, BTC or ETH.
+        if domain == "crypto_transfer":
+            return None
 
         now = time.time()
         ctx = _extract_event_context(event)
         key = (getattr(event, "region", None) or ctx["entity_id"] or "global").lower()
+
+        # Counted before the cooldown, so a key's baseline sees every event it
+        # had -- the busy hours are the ones the cooldown would hide.
+        self._count_hour(key, now)
 
         # Deduplication Cooldown check: prevent duplicate cascades for the same key within cooldown window
         last_fired = self._last_trigger.get(key, 0)
@@ -289,7 +370,11 @@ class GeopoliticalCascadeEngine:
         max_score = max((e[1]["score"] for e in current_entries), default=0.0)
         
         is_multi_domain_cascade = (len(domains_present) >= 2 and flashpoint_index >= 35.0 and len(current_entries) >= 2)
-        is_single_domain_storm = (len(domains_present) == 1 and len(current_entries) >= 4 and avg_score >= 0.45 and max_score >= 0.60)
+        is_single_domain_storm = (
+            len(domains_present) == 1 and len(current_entries) >= 4
+            and avg_score >= 0.45 and max_score >= 0.60
+            and len(current_entries) >= self.storm_threshold(key, now)
+        )
 
         if is_multi_domain_cascade or is_single_domain_storm:
             # Mark cooldown timestamp for this key
@@ -409,6 +494,7 @@ class GeopoliticalCascadeEngine:
                 tags=[kind_slug, key.lower().replace(" ", "_")]
                     + [f"entity:{n}" for n in unique_entities[:3]]
                     + [f"domain:{d}" for d in domain_list]
+                    + exposure_tags(*(e[1].get("exposes") for e in current_entries))
             )
             return cluster
 

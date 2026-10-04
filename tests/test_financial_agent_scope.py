@@ -68,10 +68,17 @@ def test_nothing_else_slips_through(junk):
     assert is_supported_asset(junk) is False
 
 
-def test_the_quant_gate_admits_crypto_majors():
+def test_the_quant_gate_admits_the_collected_crypto():
+    """Still a union with equities, now over the crypto actually collected.
+
+    The crypto universe was narrowed to BTC and ETH. Admitting every coin
+    `asset_class` recognises sent a headline about Trump to the quant engine as
+    the TRUMP coin, three times on 20-21 September, and AVAXUSDT five times on
+    an asset nothing polls.
+    """
     src = (ROOT / "services/agents/quant_trading_engine.py").read_text(encoding="utf-8")
     gate = src[src.index("SUPPORTED ASSET GATE"):][:1200]
-    assert "is_major_crypto(ticker)" in gate
+    assert "is_collected_crypto(ticker)" in gate
     assert "or" in gate, "the gate must be a union, not a replacement"
 
 

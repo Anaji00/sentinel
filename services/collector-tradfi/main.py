@@ -56,7 +56,13 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
-from shared.utils.form4 import parse_form4, document_url as form4_document_url
+from shared.utils.form4 import (
+    parse_form4,
+    document_url as form4_document_url,
+    index_json_url as form4_index_json_url,
+    primary_document_name as form4_primary_document_name,
+    accession_of as form4_accession_of,
+)
 from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.liveness import declare as _declare, fired as _fired
@@ -404,6 +410,51 @@ def _primary_role(owners) -> str:
     return ""
 
 
+# Graph writer for insider links, made on first use: Form 4 is the one place a
+# person is named as a director or officer of a listed company, and every filing
+# was parsed down to its owners and then used only for an event.
+_INSIDER_GRAPH = None
+_ENTITY_OWNER = re.compile(
+    r"\b(LP|L\.P|LLC|L\.L\.C|INC|CORP|FUND|TRUST|PARTNERS|CAPITAL|HOLDINGS|MANAGEMENT|LTD|PLC|GROUP)\b", re.I,
+)
+
+
+async def _link_insiders(producer, parsed) -> int:
+    """Person -[INSIDER_OF {role}]-> Company for each reporting owner.
+
+    The same director across several companies is a board interlock, which is
+    who-knows-whom rather than who-owns-whom, and the graph had neither.
+    """
+    global _INSIDER_GRAPH
+    if _INSIDER_GRAPH is None:
+        try:
+            from services.enrichment.graph_writer import GraphWriter
+            _INSIDER_GRAPH = GraphWriter(producer)
+        except Exception as e:
+            swallowed("collector_tradfi.insider_graph", e, logger)
+            return 0
+    linked = 0
+    for owner in parsed.get("owners") or []:
+        name = str(owner.get("name") or "").strip()
+        role = str(owner.get("title") or "").upper() or (
+            "DIRECTOR" if owner.get("is_director") else
+            "OFFICER" if owner.get("is_officer") else
+            "10% OWNER" if owner.get("is_ten_percent_owner") else "")
+        if not name or not role:
+            continue
+        await _INSIDER_GRAPH.link_entities(
+            name.upper()[:80], "INSIDER_OF", parsed["ticker"],
+            properties={"role": role, "is_director": bool(owner.get("is_director")),
+                        "is_officer": bool(owner.get("is_officer")),
+                        "is_ten_percent_owner": bool(owner.get("is_ten_percent_owner")),
+                        "source": "form4", "confidence": 0.99},
+            source_label="InstitutionalFiler" if _ENTITY_OWNER.search(name) else "Person",
+            target_label="Company",
+        )
+        linked += 1
+    return linked
+
+
 async def _fetch_form4_document(session, index_link: str):
     """The parsed filing behind an RSS entry, or None.
 
@@ -411,7 +462,43 @@ async def _fetch_form4_document(session, index_link: str):
     stub fields it always had rather than dropped, because a missing document
     is a reason to know less about an event, not to pretend it did not happen.
     """
-    url = form4_document_url(index_link)
+    # The document's name comes from the filing's own directory listing. It
+    # was assumed to be `primary_doc.xml`, and on the live feed two filings in
+    # three use another name and returned 404.
+    index_url = form4_index_json_url(index_link)
+    if not index_url:
+        return None
+    try:
+        async with session.get(
+            index_url,
+            timeout=FORM4_DOC_TIMEOUT_SEC,
+            headers={"User-Agent": SEC_USER_AGENT},
+        ) as resp:
+            if resp.status != 200:
+                dropped(
+                    "collector_tradfi.form4_document",
+                    "the filing index could not be fetched",
+                    logger,
+                    detail=f"HTTP {resp.status}",
+                    variant=f"index_{resp.status}",
+                )
+                return None
+            listing = await resp.json(content_type=None)
+    except Exception as e:
+        swallowed("collector_tradfi.form4_document", e, logger, detail=index_url, variant="index")
+        return None
+    name = form4_primary_document_name(listing)
+    if not name:
+        dropped(
+            "collector_tradfi.form4_document",
+            "the filing index lists no XML document",
+            logger,
+            detail=index_url,
+            variant="no_xml",
+        )
+        return None
+
+    url = form4_document_url(index_link, name)
     if not url:
         return None
     try:
@@ -498,7 +585,10 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                 continue
 
             link = entry.get("link", "")
-            redis_key = f"sentinel:seen:form4:{link}"
+            # By accession, not link: the feed lists each filing under the
+            # owner's CIK and again under the issuer's, so a link key published
+            # every filing twice.
+            redis_key = f"sentinel:seen:form4:{form4_accession_of(link)}"
 
             if await redis_client.raw.exists(redis_key):
                 continue
@@ -525,6 +615,17 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                 "title": entry.get("title", ""),
                 "summary": entry.get("summary", ""),
             }
+            if parsed and not parsed["ticker"]:
+                # The document was read and the issuer has no listing. On an
+                # equities platform there is nothing to attach it to, and
+                # publishing it let a placeholder symbol become a cluster key.
+                dropped(
+                    "collector_tradfi.form4_unlisted_issuer",
+                    "the filing's issuer has no trading symbol",
+                    logger,
+                    detail=parsed.get("issuer_name", "")[:80],
+                )
+                continue
             if parsed:
                 payload.update({
                     "ticker": parsed["ticker"],
@@ -540,6 +641,10 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     "role": _primary_role(parsed["owners"]),
                     "transactions": parsed["transactions"],
                 })
+                try:
+                    await _link_insiders(producer, parsed)
+                except Exception as e:
+                    swallowed("collector_tradfi.insider_link", e, logger)
 
             event = RawEvent(
                 source="sec_form4",
@@ -648,8 +753,21 @@ class OHLCVAggregator:
         session_name, _ = get_market_session()
         count = 0
 
+        # Taken whole before the first await, and replaced with an empty one.
+        #
+        # This iterated `self.buffer` across `await producer.send(...)`, while
+        # the websocket loop kept calling add_trade(). A trade for a ticker new
+        # this minute raised "dictionary changed size during iteration" -- three
+        # times in seventeen minutes of a regular session on 1 October -- and
+        # the exception skipped both the Redis pipeline and the clear() below.
+        # Bars already sent stayed in the buffer and went out again the next
+        # minute merged with a second minute of trades: double volume, a
+        # two-minute range, stamped as one bar. Without a crash, trades that
+        # arrived during the awaits were wiped by the clear() unflushed.
+        buffer, self.buffer = self.buffer, {}
+
         async with self.redis_client.raw.pipeline() as pipe:
-            for ticker, data in self.buffer.items():
+            for ticker, data in buffer.items():
                 if data["V"] > 0:
                     vwap = round(data["pv_sum"] / data["V"], 4) if data["V"] > 0 else data["C"]
                     vwap_dev = round((data["C"] - vwap) / vwap, 6) if vwap > 0 else 0.0
@@ -723,7 +841,6 @@ class OHLCVAggregator:
             except Exception as e:
                 logger.error(f"Failed to execute Redis pipeline for candles: {e}")
 
-        self.buffer.clear()
         if count > 0:
             logger.info(f"📊 Flushed {count} minute bars [{session_name}] to Kafka and Redis.")
         else:
@@ -1672,6 +1789,25 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                         )
                     except Exception as re:
                         logger.debug(f"Redis earnings cache write for {symbol}: {re}")
+
+                    # Published only for an instrument the platform prices. The
+                    # calendar lists every filer reporting this week, and of 173
+                    # tickers with earnings events in the thirty days to 4
+                    # October, 5 had a quote -- NKE, COST, DAL, AZO, FDX. The
+                    # context above is still cached for every symbol, because the
+                    # block-trade enricher reads it for earnings proximity.
+                    try:
+                        priced = bool(await redis_client.raw.exists(quote_key(symbol)))
+                    except Exception as _exc:
+                        swallowed("collector_tradfi.earnings_quote_check", _exc)
+                        priced = True
+                    if not priced:
+                        dropped(
+                            "collector_tradfi.earnings_unpriced",
+                            "earnings for a ticker the platform does not quote",
+                            logger, variant=trade_type,
+                        )
+                        continue
 
                     event = RawEvent(
                         source="finnhub_earnings",

@@ -1,6 +1,7 @@
 import React from 'react';
 import Institutional13FPanel from '@/components/Institutional13FPanel';
 import FilingsStream from '@/components/FilingsStream';
+import OwnershipPanel from '@/components/OwnershipPanel';
 import { IconDocument } from '@/components/ui/icons';
 
 export const metadata = {
@@ -34,6 +35,8 @@ export default function FilingsPage() {
       </div>
 
       <Institutional13FPanel />
+
+      <OwnershipPanel />
     </div>
   );
 }

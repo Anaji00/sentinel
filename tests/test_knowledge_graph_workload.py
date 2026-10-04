@@ -73,3 +73,25 @@ def test_the_action_list_matches_what_the_supervisor_branches_on():
     assert handled, "could not read the supervisor's action vocabulary"
     missing = handled - _SUPERVISOR_GRAPH_ACTIONS
     assert not missing, f"supervisor handles {missing}, which would still reach inference"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("message", [
+    {"type": "crypto_transfer", "headline": "🚨 Whale Transfer: $31.39M WETH", "anomaly_score": 0.9},
+    {"type": "macro_release", "headline": "🚢 FREIGHT FALLING: Baltic Dry Index 4,067 (-0.8%)",
+     "anomaly_score": 0.6},
+    {"raw_payload": {"type": "equity_block", "headline": "Block: 2.1M NVDA", "anomaly_score": 0.7}},
+    {"rule_id": "HAWKES_EXCITATION", "anomaly_score": 0.8,
+     "description": "Given current elevated crypto-domain intensity (42.1x baseline), ..."},
+])
+async def test_structured_records_and_forecasts_are_not_sent_to_the_model(message):
+    """A templated headline over an API record, or arithmetic about domains,
+    names nothing that extraction could add to the graph."""
+    assert await _engine().handle(message) is None
+
+
+def test_prose_is_still_extracted():
+    from services.agents.knowledge_graph_engine import _no_prose_to_extract
+    assert not _no_prose_to_extract({"type": "headline", "headline": "Exxon halts Guyana output"})
+    assert not _no_prose_to_extract({"type": "filing", "headline": "8-K: officer departure"})
+    assert not _no_prose_to_extract({"rule_id": "CHOKEPOINT_DARK", "description": "Tanker dark"})

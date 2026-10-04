@@ -75,6 +75,8 @@ from shared.utils.tasks import safe_create_task
 from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.backpressure import declare_pressure, clear_pressure
 from shared.utils.rule_feedback import conversion_rates, conversion_weight
+from shared.utils.instrument_reach import cluster_reaches_instrument
+from shared.utils.quiet_failures import dropped
 from shared.utils.heartbeat import start_heartbeat_task
 
 def _jsonable(value):
@@ -514,6 +516,24 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
                                         "already changed.",
                                         _stale, REASONING_MAX_CLUSTER_AGE_SEC,
                                     )
+                                continue
+
+                            # Only clusters that reach something that trades.
+                            #
+                            # 58% of the scenarios this service wrote in thirty
+                            # days were maritime or aviation clusters naming no
+                            # instrument, and no vessel or aircraft has an edge to
+                            # a company -- minutes of a model slot each, about
+                            # nothing a position could follow. A cluster passes by
+                            # naming an instrument or carrying an `exposes:` tag a
+                            # bridge attached to its events.
+                            if not await cluster_reaches_instrument(cluster, redis_client):
+                                dropped(
+                                    "reasoning.cluster_reaches_no_instrument",
+                                    "cluster names and exposes no instrument",
+                                    logger,
+                                    variant=str(cluster.primary_domain or "unknown")[:30],
+                                )
                                 continue
 
                             # Held for ranking rather than admitted on arrival.

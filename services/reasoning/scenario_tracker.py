@@ -19,6 +19,8 @@ and named_entities. Not perfect — Phase 3 will use embedding similarity.
  
 import json
 import logging
+import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
  
@@ -78,6 +80,46 @@ EXPIRY_DECAY_PER_HORIZON = 12
 # Decay never starts before the horizon the scenario itself claimed. A 1-month
 # forecast is not wrong on day two.
 EXPIRY_GRACE_HORIZONS = 1.0
+
+# An hour counts toward a horizon only if the platform was collecting in it.
+#
+# Decay measured wall-clock time, so an outage read as a forecast failing. On
+# 1 October the platform came back after nine days down; the first sweeps
+# denied 64 scenarios "with no predicted signal in 330-390h against a stated
+# 72h horizon", each published as a rule_failure verdict -- and those verdicts
+# retired three rules. Over the preceding thirty days only 239 of 720 hours had
+# the platform collecting at all. Silence while nothing listened is not evidence.
+OBSERVED_HOUR_MIN_EVENTS = 100
+# The observed-hours query scans the events hypertable (~10s over 30 days), so
+# one read serves a whole sweep.
+OBSERVED_HOURS_CACHE_SEC = 600
+
+# Decay already applied, read from the notes it left. Each sweep wrote the
+# total overdue decay and subtracted it again, so a scenario that survived one
+# decay lost the whole amount again thirty minutes later. Summing the notes
+# gives what was actually taken; only the increase beyond it is applied now.
+_DECAY_NOTE = re.compile(r"-(\d+) for an unfulfilled forecast")
+# Decay handed back by a repair, so it is not counted as taken. Written when a
+# denial measured across an outage was reversed on 1 October.
+_RETURNED_NOTE = re.compile(r"\+(\d+) returned to an unobserved horizon")
+
+
+def _applied_decay(history) -> int:
+    """Total decay points this scenario's history records as already applied."""
+    total = 0
+    for entry in history or []:
+        if isinstance(entry, str):
+            try:
+                entry = json.loads(entry)
+            except ValueError:
+                continue
+        note = entry.get("notes") if isinstance(entry, dict) else None
+        for m in _DECAY_NOTE.finditer(str(note or "")):
+            total += int(m.group(1))
+        for m in _RETURNED_NOTE.finditer(str(note or "")):
+            total -= int(m.group(1))
+    return max(0, total)
+
 
 def _signal_parts(signal) -> tuple:
     """(entity, text) from either shape a signal can arrive in.
@@ -170,29 +212,48 @@ def _horizon_hours(hypotheses) -> int:
     return hours or DEFAULT_HORIZON_HOURS
 
 
-def _expiry_decay(scenario: Dict, hypotheses, now: datetime) -> Tuple[int, str]:
+def _expiry_decay(
+    scenario: Dict,
+    hypotheses,
+    now: datetime,
+    observed_hours: Optional[List[datetime]] = None,
+    already_applied: int = 0,
+) -> Tuple[int, str]:
     """Confidence lost to a horizon that passed without the predicted signals.
 
-    Returns (points, note). Zero and an empty note while the scenario is still
-    within the time it gave itself.
+    Returns (points to apply now, note). Zero and an empty note while the
+    scenario is still within the time it gave itself, or when the decay it has
+    accrued has already been applied.
+
+    `observed_hours` are the hours in which the platform was collecting; when
+    given, only those count toward the horizon. `already_applied` is the decay
+    previous sweeps took, so the same overdue time is never charged twice.
     """
     created = _as_datetime(scenario.get("created_at"))
     if created is None:
         return 0, ""
 
     horizon = _horizon_hours(hypotheses)
-    elapsed_hours = (now - created).total_seconds() / 3600.0
+    wall_hours = (now - created).total_seconds() / 3600.0
+    if observed_hours is not None:
+        start = created.replace(minute=0, second=0, microsecond=0)
+        elapsed_hours = float(sum(1 for h in observed_hours if h >= start))
+    else:
+        elapsed_hours = wall_hours
     horizons_elapsed = elapsed_hours / max(1.0, float(horizon))
 
     overdue = horizons_elapsed - EXPIRY_GRACE_HORIZONS
     if overdue <= 0:
         return 0, ""
 
-    points = int(round(overdue * EXPIRY_DECAY_PER_HORIZON))
+    points = int(round(overdue * EXPIRY_DECAY_PER_HORIZON)) - int(already_applied or 0)
     if points <= 0:
         return 0, ""
+    observed = (
+        f" of collection ({wall_hours:.0f}h elapsed)" if observed_hours is not None else ""
+    )
     return points, (
-        f"No predicted signal in {elapsed_hours:.0f}h against a stated "
+        f"No predicted signal in {elapsed_hours:.0f}h{observed} against a stated "
         f"{horizon}h horizon ({horizons_elapsed:.1f} horizons); "
         f"-{points} for an unfulfilled forecast"
     )
@@ -327,9 +388,12 @@ class ScenarioTracker:
         # Applied only when no watch signal hit on this pass: a scenario that is
         # still producing confirming evidence is not overdue, it is running late.
         decay_note = ""
-        if not watch_hits_by_index:
+        observed_hours = None if watch_hits_by_index else await self._observed_hours()
+        if not watch_hits_by_index and observed_hours is not None:
             decay, decay_note = _expiry_decay(
-                scenario, hypotheses, datetime.now(timezone.utc)
+                scenario, hypotheses, datetime.now(timezone.utc),
+                observed_hours=observed_hours,
+                already_applied=_applied_decay(scenario.get("confidence_history")),
             )
             if decay:
                 confidence = max(0, confidence - decay)
@@ -606,6 +670,35 @@ class ScenarioTracker:
             logger.warning("Entity signal match failed for %r: %s", entity[:40], e)
             return []
 
+    async def _observed_hours(self) -> Optional[List[datetime]]:
+        """Hours in the last 30 days in which the platform was collecting.
+
+        None when it cannot be read, and the caller then skips decay for that
+        sweep: falling back to wall-clock time would reintroduce the outage
+        defect exactly when the database is struggling. A failure is not cached,
+        so the next sweep asks again.
+        """
+        cached = getattr(self, "_observed_cache", None)
+        if cached is not None and time.monotonic() - cached[0] < OBSERVED_HOURS_CACHE_SEC:
+            return cached[1]
+        try:
+            rows = await self._db.query("""
+                SELECT date_trunc('hour', occurred_at) AS h
+                FROM events
+                WHERE occurred_at > $1
+                GROUP BY 1
+                HAVING count(*) >= $2
+            """, datetime.now(timezone.utc) - timedelta(days=30), OBSERVED_HOUR_MIN_EVENTS)
+            hours = sorted(
+                d for d in (_as_datetime(r["h"] if not isinstance(r, (list, tuple)) else r[0]) for r in (rows or []))
+                if d is not None
+            )
+        except Exception as exc:
+            swallowed("reasoning.scenario_tracker.observed_hours", exc, logger)
+            return None
+        self._observed_cache = (time.monotonic(), hours)
+        return hours
+
     async def _fetch_active_scenarios(self) -> List[Dict]:
         """The open scenarios due for evaluation, least recently touched first.
 
@@ -625,7 +718,7 @@ class ScenarioTracker:
         try:
             return await self._db.query("""
                 SELECT scenario_id, headline, status, confidence_overall,
-                       hypotheses, created_at, updated_at
+                       hypotheses, created_at, updated_at, confidence_history
                 FROM scenarios
                 WHERE status IN ('hypothesis', 'developing')
                   AND created_at > NOW() - INTERVAL '30 days'
@@ -828,22 +921,39 @@ class ScenarioTracker:
     async def _get_scenario_event_sources(self, scenario_id: str) -> List[str]:
         """
         Finds distinct event sources originating/supporting a scenario.
+
+        Two indexed steps rather than one join. The join matched events on a
+        three-way OR across the trigger and both supporting-id arrays, which
+        the planner can only answer by scanning the 5.8 GB events hypertable
+        -- once per resolved scenario, inside a sweep this module already
+        records as not finishing in its interval.
         """
         try:
             rows = await self._db.query("""
-                SELECT DISTINCT e.source
+                SELECT c.trigger_event_id, c.supporting_event_ids AS c_ids,
+                       s.supporting_event_ids AS s_ids
                 FROM scenarios s
                 LEFT JOIN correlations c ON s.correlation_id = c.correlation_id
-                JOIN events e ON (
-                    (c.trigger_event_id IS NOT NULL AND e.event_id = c.trigger_event_id)
-                    OR (c.supporting_event_ids IS NOT NULL AND e.event_id = ANY(c.supporting_event_ids))
-                    OR (s.supporting_event_ids IS NOT NULL AND e.event_id = ANY(s.supporting_event_ids))
-                )
-                WHERE s.scenario_id::text = $1::text AND e.source IS NOT NULL AND e.source != ''
+                WHERE s.scenario_id = $1::uuid
             """, scenario_id)
+            ids = set()
+            for r in rows or []:
+                if r.get("trigger_event_id"):
+                    ids.add(r["trigger_event_id"])
+                for key in ("c_ids", "s_ids"):
+                    ids.update(i for i in (r.get(key) or []) if i)
+            if not ids:
+                return []
+            rows = await self._db.query("""
+                SELECT DISTINCT source FROM events
+                WHERE event_id = ANY($1::uuid[]) AND source IS NOT NULL AND source != ''
+            """, list(ids))
             return [r["source"] for r in rows if r.get("source")]
         except Exception as e:
-            logger.error(f"Failed to query scenario event sources ({scenario_id}): {e}")
+            logger.error(
+                f"Failed to query scenario event sources ({scenario_id}): "
+                f"{type(e).__name__}: {e}"
+            )
             return []
 
 

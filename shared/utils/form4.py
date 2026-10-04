@@ -51,6 +51,49 @@ OPEN_MARKET_CODES = frozenset({"P", "S"})
 ACQUIRED = "A"
 
 
+# What filers write in issuerTradingSymbol when the issuer has no listing.
+#
+# The field is free text. Read live on 1 October, an hour after the document
+# fetch was fixed, three of eight filings carried "N/A" or "NONE" -- funds and
+# private companies -- and each was published with that string as its ticker.
+# The insider-cluster rule then keyed a cluster on it: one correlation that
+# hour was `rule_insider_activity_cluster_n/a`, grouping unrelated issuers
+# because they shared a placeholder.
+_UNLISTED_SYMBOLS = frozenset({"", "N/A", "NA", "NONE", "NULL", "-", "--", "NOT APPLICABLE"})
+
+
+def listed_symbol(raw: str) -> str:
+    """The issuer's trading symbol, or "" when the filing names none."""
+    symbol = (raw or "").strip().upper()
+    return "" if symbol in _UNLISTED_SYMBOLS else symbol
+
+
+def accession_of(index_link: str) -> str:
+    """The filing's accession number, from its index link.
+
+    The current-filings feed lists each Form 4 twice -- once under the
+    reporting owner's CIK, once under the issuer's -- so the two entries have
+    different links and one accession. Keyed by link, every filing was
+    published twice, and a cluster counting net buying counted it twice.
+    Falls back to the link itself when the shape is not recognised.
+    """
+    tail = (index_link or "").rsplit("/", 1)[-1]
+    if tail.endswith("-index.htm") or tail.endswith("-index.html"):
+        return tail.split("-index.", 1)[0]
+    return index_link or ""
+
+
+def _flag(node: Optional[ET.Element]) -> bool:
+    """An ownership-schema boolean, which filers write as 1 or as true.
+
+    Only "1" was accepted. Read live, SPG's filings write isDirector as
+    "true", so every director was parsed as no relationship at all, the role
+    came out empty, and the enricher fell back to the RSS title: the role
+    published was "4 - AEPPEL GLYN (0001340262) (REPORTING)".
+    """
+    return _text(node).strip().lower() in ("1", "true")
+
+
 def _text(node: Optional[ET.Element]) -> str:
     """The text of an element, or of its <value> child, or empty."""
     if node is None:
@@ -104,10 +147,10 @@ def parse_form4(payload: bytes | str) -> Optional[Dict[str, Any]]:
             continue
         owners.append({
             "name": name,
-            "is_officer": _text(rel.find("isOfficer")) == "1" if rel is not None else False,
-            "is_director": _text(rel.find("isDirector")) == "1" if rel is not None else False,
+            "is_officer": _flag(rel.find("isOfficer")) if rel is not None else False,
+            "is_director": _flag(rel.find("isDirector")) if rel is not None else False,
             "is_ten_percent_owner": (
-                _text(rel.find("isTenPercentOwner")) == "1" if rel is not None else False
+                _flag(rel.find("isTenPercentOwner")) if rel is not None else False
             ),
             "title": _text(rel.find("officerTitle")) if rel is not None else "",
         })
@@ -142,7 +185,7 @@ def parse_form4(payload: bytes | str) -> Optional[Dict[str, Any]]:
             })
 
     return {
-        "ticker": ticker.upper(),
+        "ticker": listed_symbol(ticker),
         "issuer_name": issuer_name,
         "owners": owners,
         "transactions": transactions,
@@ -171,13 +214,96 @@ def _aggregate(transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def document_url(index_link: str) -> Optional[str]:
+def document_url(index_link: str, name: str = "primary_doc.xml") -> Optional[str]:
     """The filing's primary document, from the RSS entry's index link.
 
     The feed gives `.../data/{cik}/{accession}/{accession}-index.htm`, and the
-    document sits beside it in the same directory.
+    document sits beside it in the same directory. Its name is not fixed --
+    see `primary_document_name` -- so callers pass the one the index lists.
     """
     if not index_link or "/Archives/edgar/data/" not in index_link:
         return None
+    if not name or "/" in name:
+        return None
     base = index_link.rsplit("/", 1)[0]
-    return f"{base}/primary_doc.xml"
+    return f"{base}/{name}"
+
+
+def index_json_url(index_link: str) -> Optional[str]:
+    """The machine-readable file list for the filing's directory."""
+    if not index_link or "/Archives/edgar/data/" not in index_link:
+        return None
+    return index_link.rsplit("/", 1)[0] + "/index.json"
+
+
+def primary_document_name(index_json: Any) -> Optional[str]:
+    """The filing's XML document, as the directory listing names it.
+
+    The name was assumed to be `primary_doc.xml`. It is whatever the filing
+    agent chose: probed against the live feed on 1 October, four of six
+    current Form 4s used `form4.xml` or `doc4.xml`, and every one of those
+    returned 404 -- 70 failed fetches in the hour after a restart, each
+    published as the RSS stub with no ticker, insider or transactions. The
+    filing that was used to verify this parser happened to use the default.
+
+    A Form 4 directory holds one ownership XML. Rendered views live in an
+    `xslF345X..` subdirectory and are listed as a directory, not a file.
+    """
+    if not isinstance(index_json, dict):
+        return None
+    directory = index_json.get("directory")
+    items = directory.get("item") if isinstance(directory, dict) else None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if name.lower().endswith(".xml") and "/" not in name and item.get("type") != "dir":
+            return name
+    return None
+
+
+def dominant_code(payload: Dict[str, Any]) -> Optional[str]:
+    """The transaction code a filing is about, from the parsed document.
+
+    The collector publishes every transaction and the open-market totals, and
+    no reader turned them into a code: the enricher looked for a
+    `transaction_code` nobody writes, then regexed the RSS summary and fell
+    back to "J". All 1,160 insider events in the fourteen days to 3 October
+    were "Insider Other" -- including the open-market purchases the cluster
+    gate exists to count.
+
+    Open-market activity decides first, because it is the decision the signal
+    is about; the larger side wins when a filing has both. Otherwise the code
+    of the largest transaction, or the first when none is sized.
+    """
+    if not isinstance(payload, dict):
+        return None
+    buy = float(payload.get("open_market_buy_usd") or 0.0)
+    sell = float(payload.get("open_market_sell_usd") or 0.0)
+    if buy or sell:
+        return "P" if buy >= sell else "S"
+    txns = [t for t in (payload.get("transactions") or []) if isinstance(t, dict) and t.get("code")]
+    if not txns:
+        return None
+    sized = [t for t in txns if t.get("value_usd")]
+    pick = max(sized, key=lambda t: float(t["value_usd"])) if sized else txns[0]
+    return str(pick["code"]).upper()
+
+
+def code_value_usd(payload: Dict[str, Any], code: Optional[str]) -> Optional[float]:
+    """Dollars behind that code: the open-market side for P and S, otherwise
+    the sized transactions carrying it. None when the filing states no price."""
+    if not isinstance(payload, dict) or not code:
+        return None
+    if code == "P":
+        value = float(payload.get("open_market_buy_usd") or 0.0)
+    elif code == "S":
+        value = float(payload.get("open_market_sell_usd") or 0.0)
+    else:
+        value = sum(
+            float(t["value_usd"]) for t in (payload.get("transactions") or [])
+            if isinstance(t, dict) and str(t.get("code") or "").upper() == code and t.get("value_usd")
+        )
+    return value if value > 0 else None

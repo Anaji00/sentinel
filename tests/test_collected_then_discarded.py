@@ -363,12 +363,20 @@ def test_a_macro_release_is_published_once_to_the_topic_that_keeps_it():
     calendar = (ROOT / "services" / "collector-macro" / "economic_calendar.py").read_text(
         encoding="utf-8"
     )
-    publish = calendar[calendar.index("if self.producer:"):]
-    publish = publish[: publish.index("events_published.append")]
-    assert "Topics.ENRICHED_EVENTS" in publish
-    assert "Topics.RAW_TRADFI" not in publish, (
-        "the macro release is still being sent to a raw topic that drops it"
-    )
+    # Now through the raw topic -- but wrapped, which is the whole difference.
+    #
+    # Sent only to ENRICHED_EVENTS, the release reached the agents and no
+    # writer persisted it, so no macro release ever reached the events table.
+    # `_publish` wraps the finished event in a RawEvent whose payload carries
+    # it, the tradfi enricher passes it through, and enrichment stores and
+    # publishes it. What must never return is the bare NormalizedEvent on a
+    # raw topic, which is the empty-payload drop this test was written for.
+    publish = calendar[calendar.index("    async def _publish("):]
+    publish = publish[: publish.index("    async def poll_fred(")]
+    assert "RawEvent(" in publish and '"normalized_event": event.model_dump(' in publish
+    assert "Topics.RAW_TRADFI, raw.model_dump()" in publish
+    assert "Topics.RAW_TRADFI, event.model_dump()" not in calendar
+    assert "Topics.ENRICHED_EVENTS" not in calendar.split("async def poll_and_publish")[1]
 
 
 def test_a_normalized_event_on_a_raw_topic_really_does_arrive_empty():
@@ -392,3 +400,14 @@ def test_a_normalized_event_on_a_raw_topic_really_does_arrive_empty():
         "a NormalizedEvent on a raw topic no longer parses to an empty payload; "
         "the drop this test describes would now look different"
     )
+
+
+async def test_a_radar_reading_reaches_the_commodity_its_chokepoint_exposes():
+    """Without an exposes tag a Bab-el-Mandeb reading could reach no
+    instrument, and the reasoning gate turns away a cluster that reaches none."""
+    enricher = _maritime_enricher()
+    raw = RawEvent(source="copernicus_sentinel1",
+                   occurred_at=datetime.now(timezone.utc),
+                   raw_payload=_sar_payload())
+    event = await enricher._chokepoint_reading(raw, raw.raw_payload)
+    assert "exposes:BZ=F" in event.tags

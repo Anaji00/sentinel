@@ -292,7 +292,7 @@ def test_the_json_example_stays_valid_json():
     import re
 
     source = (ROOT / "services/reasoning/scenario_generator.py").read_text(encoding="utf-8")
-    block = source[_example_start(source):source.index('"time_horizon": "immediate')]
+    block = source[_example_start(source):source.index('"time_horizon": "<')]
     assert "//" not in block, "a comment is inside the JSON the model copies"
     assert "_note" not in block, "a pseudo-field is inside the JSON the model copies"
 
@@ -303,3 +303,42 @@ def test_the_watch_signal_requirement_is_stated_in_the_rules():
     rules = source[source.index("1. Return ONLY valid JSON"):_example_start(source)]
     assert "at least one watch_signal" in rules
     assert "Never a category" in rules
+
+
+def test_time_horizon_is_an_enum_the_decoder_enforces():
+    """34 of 35 scenarios in the week to 3 October returned the template's list
+    of choices as the horizon. An enum reaches Ollama as a grammar."""
+    from services.reasoning.scenario_generator import HypothesisOutput
+
+    schema = HypothesisOutput.model_json_schema()
+    assert set(schema["properties"]["time_horizon"]["enum"]) == {
+        "immediate", "24h", "72h", "1week", "1month", "unknown"}
+    h = HypothesisOutput(label="x", probability=50, mechanism="y",
+                         time_horizon="immediate | 24h | 72h | 1week | 1month")
+    assert h.time_horizon == "unknown"
+    assert HypothesisOutput(label="x", probability=50, mechanism="y", time_horizon="72H").time_horizon == "72h"
+
+
+def test_the_copied_worked_example_is_rejected():
+    """The rules' worked example became the label and mechanism of 31 of 35
+    scenarios. It is gone from the prompt, and a copy is still caught."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from services.reasoning.scenario_generator import (
+        SCENARIO_SYSTEM_PROMPT, ScenarioGenerator, _echoes_the_template,
+    )
+
+    gen = ScenarioGenerator.__new__(ScenarioGenerator)
+    gen.model = "qwen3:0.6b"
+    cluster = SimpleNamespace(
+        rule_name="R", alert_tier=SimpleNamespace(name="WATCH", value="watch"), description="d",
+        tags=[], detected_at=datetime(2026, 10, 3, tzinfo=timezone.utc), entity_ids=["X"],
+        entity_names=["X"], primary_entity_id="X", primary_entity_name="X", primary_domain="maritime",
+    )
+    prompt = gen._build_user_prompt(cluster, {}, [], [])
+    assert "=== TASK ===" in prompt
+    assert "6-hour AIS gap" not in prompt and "6-hour AIS gap" not in SCENARIO_SYSTEM_PROMPT
+    copied = SimpleNamespace(headline="Tanker dark", significance="s", hypotheses=[SimpleNamespace(
+        label="A 6-hour AIS gap preceded a 4x spike in call volume", mechanism="m",
+        beneficiaries=[], watch_signals=[], deny_signals=[])])
+    assert _echoes_the_template(copied)

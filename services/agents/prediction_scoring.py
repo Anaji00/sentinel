@@ -174,6 +174,32 @@ def consensus_weight_for(brier_score: float) -> float:
     return max(MIN_CONSENSUS_WEIGHT, 1.0 - float(brier_score))
 
 
+# Resolved predictions before an agent's record caps what it may claim.
+CALIBRATION_MIN_RESOLVED = 20
+
+
+def calibrated_conviction(stated: float, card: "AgentScorecard") -> float:
+    """Stated conviction, capped at the hit rate the agent's record supports.
+
+    Measured over the thirty days to 4 October: the wargamer stated 0.89 on
+    average and was right 54% of the time; quant stated 1.00 on calls that went
+    0 for 8 on the downside. Both scored a Brier worse than a coin flip (0.346
+    and 0.463 against 0.25), and that stated number is what bulletins, alerts
+    and the consensus engine read. The cap is the Laplace-smoothed hit rate, so
+    a short record moves it gently; below CALIBRATION_MIN_RESOLVED it does not
+    apply. An agent whose record is below 0.5 says so.
+    """
+    try:
+        stated = float(stated)
+    except (TypeError, ValueError):
+        return stated
+    made = int(getattr(card, "predictions_made", 0) or 0)
+    if made < CALIBRATION_MIN_RESOLVED:
+        return stated
+    supported = (int(getattr(card, "predictions_correct", 0) or 0) + 1) / (made + 2)
+    return round(min(stated, supported), 4)
+
+
 class AgentScorecard(BaseModel):
     """Performance tracking for agent self-calibration."""
     agent_name: str
@@ -220,6 +246,39 @@ def _is_resolvable(pred) -> bool:
     except (TypeError, ValueError):
         return False
     return entry > 0
+
+
+# How long a scorecard survives without a new outcome.
+#
+# Seven days, and the platform was then down for nine: every scorecard in Redis
+# expired, the API returned an empty list, and every agent's consensus weight
+# fell back to the unproven default -- the platform forgot which of its agents
+# had been right. A track record is the long-run asset here; it also has a
+# durable copy in agent_predictions, which `rebuild_scorecard_if_missing` reads.
+SCORECARD_TTL_SEC = 90 * 86400
+
+
+def fold_outcome(card: "AgentScorecard", prediction_correct: bool, conviction: float) -> "AgentScorecard":
+    """Apply one resolved outcome to a scorecard. Pure; the caller persists it.
+
+    One function for the live update and the rebuild from history, so the two
+    cannot compute a track record differently.
+    """
+    card.predictions_made += 1
+    if prediction_correct:
+        card.predictions_correct += 1
+        n = card.predictions_correct
+        card.mean_conviction_on_correct = (card.mean_conviction_on_correct * (n - 1) + conviction) / n
+    else:
+        card.predictions_wrong += 1
+        n = card.predictions_wrong
+        card.mean_conviction_on_wrong = (card.mean_conviction_on_wrong * (n - 1) + conviction) / n
+    outcome = 1.0 if prediction_correct else 0.0
+    total = card.predictions_made
+    card.brier_score = (card.brier_score * (total - 1) + (conviction - outcome) ** 2) / total
+    card.consensus_weight = consensus_weight_for(card.brier_score)
+    card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
+    return card
 
 
 class PredictionScoringMixin:
@@ -272,6 +331,12 @@ class PredictionScoringMixin:
                 # A failed claim must not lose the prediction. Recording a
                 # duplicate is a smaller harm than dropping a forecast.
                 self.logger.debug(f"Prediction dedupe claim failed for {ticker}: {e}")
+
+            # Claimed at what this agent's record supports, not what it said.
+            try:
+                conviction = calibrated_conviction(conviction, await self.get_scorecard())
+            except Exception as e:
+                swallowed(f"agents.{self.name}.calibrate_conviction", e, self.logger)
 
             pred = AgentPrediction(
                 agent_name=self.name,
@@ -401,6 +466,46 @@ class PredictionScoringMixin:
                     prediction_correct, conviction,
                 )
 
+    async def rebuild_scorecard_if_missing(self) -> Optional[int]:
+        """Rebuilds this agent's scorecard from agent_predictions when Redis lost it.
+
+        Returns how many resolved predictions were folded in, or None when a
+        scorecard already exists or there is no database to read. Also folds in
+        outcomes that were graded straight into the table and never reached the
+        scorecard -- the wargamer's next-target predictions are resolved by the
+        telemetry worker, so 91 graded rows had never moved its record.
+
+        A stored confidence of 0.0 is read as no stated confidence, at 0.5, the
+        same rule the entity resolver applies: 29 early wargamer rows carry 0.0
+        because the field was not filled, not because the agent was certain it
+        was wrong.
+        """
+        key = self._scorecard_key()
+        if not getattr(self, "db", None) or await self.redis.raw.exists(key):
+            return None
+        rows = await self.db.query(
+            """
+            SELECT confidence, outcome_correct
+            FROM agent_predictions
+            WHERE agent_name = $1 AND resolved_at IS NOT NULL AND outcome_correct IS NOT NULL
+            ORDER BY resolved_at
+            """,
+            self.name,
+        )
+        if not rows:
+            return 0
+        card = AgentScorecard(agent_name=self.name)
+        for r in rows:
+            conf = r["confidence"]
+            conviction = float(conf) if conf is not None and float(conf) > 0 else 0.5
+            fold_outcome(card, bool(r["outcome_correct"]), max(0.0, min(1.0, conviction)))
+        await self.redis.raw.set(key, card.model_dump_json(), ex=SCORECARD_TTL_SEC)
+        self.logger.info(
+            "Rebuilt %s's scorecard from %d resolved prediction(s): Brier %.3f, weight %.2f.",
+            self.name, len(rows), card.brier_score, card.consensus_weight,
+        )
+        return len(rows)
+
     async def _apply_outcome(
         self,
         key: str,
@@ -412,35 +517,9 @@ class PredictionScoringMixin:
             raw = await self.redis.raw.get(key)
             card = (AgentScorecard(**json.loads(raw if isinstance(raw, str) else raw.decode("utf-8")))
                     if raw else AgentScorecard(agent_name=self.name))
-            card.predictions_made += 1
+            fold_outcome(card, prediction_correct, conviction)
 
-            if prediction_correct:
-                card.predictions_correct += 1
-                # Running average of conviction on correct predictions
-                n = card.predictions_correct
-                card.mean_conviction_on_correct = (
-                    card.mean_conviction_on_correct * (n - 1) + conviction
-                ) / n
-            else:
-                card.predictions_wrong += 1
-                n = card.predictions_wrong
-                card.mean_conviction_on_wrong = (
-                    card.mean_conviction_on_wrong * (n - 1) + conviction
-                ) / n
-
-            # Brier score update: BS = (1/N) Σ (forecast - outcome)²
-            outcome = 1.0 if prediction_correct else 0.0
-            total = card.predictions_made
-            card.brier_score = (
-                card.brier_score * (total - 1) + (conviction - outcome) ** 2
-            ) / total
-
-            # Adjust consensus weight based on calibration
-            # Well-calibrated agents (low Brier) get higher weight
-            card.consensus_weight = consensus_weight_for(card.brier_score)
-            card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
-
-            await self.redis.raw.set(key, card.model_dump_json(), ex=604800)  # 7 day TTL
+            await self.redis.raw.set(key, card.model_dump_json(), ex=SCORECARD_TTL_SEC)
 
             if card.predictions_made % 10 == 0:
                 accuracy = card.predictions_correct / max(1, card.predictions_made)

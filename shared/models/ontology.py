@@ -22,6 +22,7 @@ VALID_PREDICATES: Set[str] = {
     # 1. Geopolitical & Corporate Narrative
     "OPERATES_IN",
     "OWNED_BY",
+    "OPERATED_BY",            # Aircraft / vessel -> the listed company flying or running it
     "AFFILIATED_WITH",
     "SANCTIONED_BY",
     "TARGETS",
@@ -37,6 +38,12 @@ VALID_PREDICATES: Set[str] = {
     "CONTROLS",
     "ALLIED_WITH",
     "OWNS",
+    # From 13F, not extraction: an institution's reported position in a
+    # company (properties: shares, value_usd, pct_outstanding, period).
+    "HOLDS_STAKE_IN",
+    "LISTED_AS",              # InstitutionalFiler -> its own (or its parent's) listed Company
+    "CONTRACTED_BY",          # Company -> the federal agency obligating money to it (USAspending)
+    "INSIDER_OF",             # Person / fund -> Company, from Form 4 (properties: role)
 
     # 2. Equity, Supply Chain & Industrial Structure (§3.5)
     "MEMBER_OF",              # Ticker -> Index / Benchmark (e.g. NVDA -> SPX)

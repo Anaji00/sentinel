@@ -28,7 +28,7 @@ from shared.utils.metrics import MetricsCollector
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.tasks import safe_create_task
 from shared.utils.entity_prediction_resolver import resolve_entity_predictions
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 try:
     from drift_scheduler import ModelDriftScheduler
@@ -78,7 +78,18 @@ async def process_telemetry(consumer, db):
                 for message in messages:
                     try:
                         data = json.loads(message.value.decode('utf-8'))
-                        if message.topic == Topics.AGENTS_PREDICTIONS:
+                        if message.topic == Topics.AGENTS_PREDICTIONS and data.get("prediction_recordable") is False:
+                            # The producer says its target is not an entity --
+                            # a cluster title or a category slug. Stored, it was
+                            # graded and folded into the agent's scorecard as a
+                            # forecast about a named thing.
+                            dropped(
+                                "telemetry.prediction_not_recordable",
+                                "prediction target is not a named entity",
+                                logger,
+                                detail=str(data.get("predicted_next_target_entity_id") or "")[:80],
+                            )
+                        elif message.topic == Topics.AGENTS_PREDICTIONS:
                             await db.execute("""
                                 INSERT INTO agent_predictions (
                                     prediction_id, correlation_id, predicted_target,

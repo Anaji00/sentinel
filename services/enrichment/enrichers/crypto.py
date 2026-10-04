@@ -21,6 +21,7 @@ import math
 from shared.utils.metrics import MetricsCollector
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.utils.tasks import safe_create_task
+from shared.utils.osint_bridges import crypto_exposure_tags
 from shared.utils.counterparty import (
     choose_primary, is_infrastructure, is_null_address, note_counterparty,
 )
@@ -164,6 +165,16 @@ def _money(usd: float) -> str:
 MICRO_BUFFER_SIZE = int(os.getenv("CRYPTO_MICRO_BUFFER_SIZE", "100"))
 
 
+
+# Wallet-to-wallet edges in the knowledge graph. Off by default.
+#
+# Measured on 3 October: 270,387 Wallet nodes were 85% of the graph, for a
+# crypto scope narrowed to BTC and ETH on an equities platform, and no wallet
+# connected to anything that trades. The transfer events themselves still flow
+# and still feed the on-chain cluster rules, which read event windows rather
+# than the graph. Set WALLET_GRAPH=1 to resume writing the edges.
+WALLET_GRAPH_ENABLED = os.getenv("WALLET_GRAPH", "0") == "1"
+
 class CryptoEnricher:
     """
     Standardizes cryptocurrency events. It uses a routing mechanism to handle 
@@ -211,7 +222,9 @@ class CryptoEnricher:
             # wallets, asset and notional and is chain-agnostic already.
             if source.endswith("_rpc"):
                 other_tasks.append(self._enrich_whale_transfer(raw, p))
-            elif source == "binance_futures" and trade_type == "LIQUIDATION":
+            # On trade_type, like funding below. Binance answers 451 from this
+            # host, so the venue-pinned branch had no producer; OKX does.
+            elif trade_type == "LIQUIDATION":
                 other_tasks.append(self._enrich_liquidation(raw, p))
             # Matched on trade_type, not venue. Funding is funding whoever
             # reports it, and pinning these to "binance_futures" meant the OKX
@@ -611,7 +624,7 @@ class CryptoEnricher:
             f"Basis: {basis_bps:.2f}bps"
         )
 
-        tags = ["crypto", "funding_rate", asset.lower(), direction]
+        tags = ["crypto", "funding_rate", asset.lower(), direction] + crypto_exposure_tags(asset)
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 
         await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
@@ -804,7 +817,7 @@ class CryptoEnricher:
             f"OI: {oi_value:,.0f} | Z-Score: {oi_z:.2f}"
         )
 
-        tags = ["crypto", "open_interest", asset.lower(), direction]
+        tags = ["crypto", "open_interest", asset.lower(), direction] + crypto_exposure_tags(asset)
         entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
 
         return NormalizedEvent(
@@ -880,7 +893,7 @@ class CryptoEnricher:
             anomaly = lift_score(anomaly, w_boost)
             anomaly = lift_score(anomaly, f_boost, w_boost)
             
-            tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()]
+            tags = ["crypto", "market_structure", f"volatile_{tf}m_candle", asset.lower()] + crypto_exposure_tags(asset)
 
             # The asset node, once a day, not once a bar.
             #
@@ -1093,7 +1106,7 @@ class CryptoEnricher:
                 # being new, or the weight having risen materially since the last
                 # time it was proposed -- which keeps the informative
                 # re-assertions and drops the ones that say nothing.
-                if await self._edge_is_worth_proposing(sender, wallet, anomaly):
+                if WALLET_GRAPH_ENABLED and await self._edge_is_worth_proposing(sender, wallet, anomaly):
                     await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
                         "entity_id": sender,
                         "action": "LINK_ENTITY",
@@ -1194,14 +1207,28 @@ class CryptoEnricher:
             return None
 
         is_baseline = notional < 500_000
+        multiple = p.get("baseline_multiple")
 
-        if is_baseline:
+        if multiple is not None:
+            # A five-minute burst already judged against its own asset and
+            # side (shared/utils/liquidations.py). Scored on that, not on a
+            # dollar scale written for Binance-wide single orders, under which
+            # a $3M OKX burst at six times normal scored 0.12.
+            from shared.utils.liquidations import burst_score
+            anomaly = burst_score(float(multiple))
+            tags = ["crypto", "liquidation", "liquidation_burst", asset.lower(), side.lower()] + crypto_exposure_tags(asset)
+            headline = (
+                f"Liquidation burst ({side}): ${notional/1e6:.2f}M {asset} in "
+                f"{p.get('window_minutes', 5)}m, {float(multiple):.1f}x normal"
+            )
+            self.scorer.record_hawkes_event("crypto")
+        elif is_baseline:
             anomaly = 0.1
             tags = ["crypto", "liquidation", "baseline_data"]
             headline = f"Standard Liquidation: ${notional:,.2f} {asset}"
         else:
             anomaly = min(1.0, notional / 10_000_000 * 0.4)
-            tags = ["crypto", "liquidation", asset.lower(), side.lower()]
+            tags = ["crypto", "liquidation", asset.lower(), side.lower()] + crypto_exposure_tags(asset)
             headline = f"Massive Liquidation ({side}): ${notional/1e6:.1f}M {asset}"
             
             # Liquidation events are the strongest Hawkes excitation source:

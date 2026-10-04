@@ -9,7 +9,7 @@ leveraged funds, synthetic option yield ETFs, volatility ETNs, and derivatives.
 """
 
 import re
-from typing import Dict, Set, Tuple, Any, Optional
+from typing import Dict, List, Set, Tuple, Any, Optional
 from shared.utils.quiet_failures import swallowed
 
 # ── ALLOWED CRYPTO EXCEPTION ──────────────────────────────────────────────────
@@ -101,6 +101,60 @@ def is_major_crypto(ticker: str) -> bool:
             sym = sym[: -len(suffix)]
             break
     return sym in MAJOR_CRYPTO_ASSETS
+
+
+# The crypto assets the collectors actually poll, now that the crypto universe
+# is BTC and ETH only (collector-crypto: COINBASE_PRODUCTS, ASSETS, OKX_TOP_N).
+#
+# Separate from MAJOR_CRYPTO_ASSETS, which stays wide on purpose: it is what
+# `asset_class` uses to recognise SOL as crypto at all, and narrowing it would
+# make every unlisted coin fall through to the plain-ticker rule and be
+# classified as an equity. Recognising a coin and holding data on it are
+# different questions. An agent deciding whether it has anything to reason
+# about needs this one -- otherwise a headline whose primary entity is Trump
+# reaches the quant engine as the TRUMP coin, which it did three times on
+# 20-21 September, alongside five AVAXUSDT runs on an asset nothing collects.
+COLLECTED_CRYPTO_ASSETS: Set[str] = {"BTC", "ETH"}
+
+
+_CRYPTO_VENUE_SUFFIXES = ("-USDT-SWAP", "-USD-SWAP", "-USDT", "-USD", "USDT", "USD")
+
+
+def instrument_identity(ticker: str) -> str:
+    """One name per instrument, whichever venue spelled it.
+
+    Coinbase candles name the asset BTCUSDT and OKX funding names it BTC, so a
+    rule joining a BTC funding print to BTC's own price moves by subject found
+    nothing: two spellings of one asset compared as two assets. Crypto collapses
+    to its base symbol; everything else is the upper-cased ticker unchanged.
+    """
+    sym = str(ticker or "").strip().upper()
+    if not is_major_crypto(sym):
+        return sym
+    for suffix in _CRYPTO_VENUE_SUFFIXES:
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            return sym[: -len(suffix)]
+    return sym
+
+
+def instrument_aliases(ticker: str) -> List[str]:
+    """Every venue spelling of an instrument, for a store filtered by exact id."""
+    base = instrument_identity(ticker)
+    if not is_major_crypto(base):
+        return [base]
+    return [base] + [base + s for s in _CRYPTO_VENUE_SUFFIXES]
+
+
+def is_collected_crypto(ticker: str) -> bool:
+    """True for a crypto asset the collectors currently poll."""
+    if not is_major_crypto(ticker):
+        return False
+    sym = ticker.strip().upper()
+    for suffix in ("-USDT-SWAP", "-USD-SWAP", "-USDT", "-USD", "USDT", "USD"):
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            sym = sym[: -len(suffix)]
+            break
+    return sym in COLLECTED_CRYPTO_ASSETS
 
 
 def is_supported_asset(ticker: str) -> bool:

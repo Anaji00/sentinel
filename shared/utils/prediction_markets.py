@@ -39,7 +39,8 @@ RELEVANT_MARKET_TERMS = frozenset({
     # reached for the asset class and Polymarket writes the ticker. Measured on
     # the live set, `will-avax-reach-16-by-december-31-2026` is a crypto price
     # market that matched none of the crypto words above.
-    "solana", "sol", "avax", "xrp", "doge", "dogecoin", "bnb", "cardano", "ada",
+    # (Altcoin names removed on 3 October: the crypto scope is BTC and ETH, and
+    # a SOL or AVAX price market has no instrument here to move.)
     "oil", "opec", "gas", "gold", "commodity", "commodities", "dollar",
     "yuan", "euro", "yen", "currency",
     # The instruments those commodity words are actually traded as. "oil" was
@@ -53,8 +54,10 @@ RELEVANT_MARKET_TERMS = frozenset({
     "nato", "ukraine", "russia", "china", "taiwan", "iran", "israel",
     "gaza", "korea", "strait", "blockade", "military", "strike", "missile",
     "nuclear", "treaty", "tariff", "tariffs", "trade", "embargo",
-    # Government, insofar as it moves the above
-    "election", "president", "presidential", "congress", "senate",
+    # Government, insofar as it moves the above. US election-cycle words --
+    # election, president, presidential, congress, senate -- were removed on
+    # 3 October: the live feed was 2028 nominee markets and "Xi out before
+    # 2027" at 97.5% NO, moving nothing an equity desk prices this year.
     "impeach", "cabinet", "resign", "coup", "referendum",
     # A head of government leaving is a rates and currency event before it is a
     # political one. `will-emmanuel-macron-be-the-next-leader-out-before-2027`

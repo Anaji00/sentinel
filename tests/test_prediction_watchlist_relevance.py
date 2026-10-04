@@ -126,3 +126,22 @@ def test_dynamic_slugs_is_bound_before_the_cap_reads_it():
     )
     src = ast.unparse(fn)
     assert src.index("dynamic_slugs = []") < src.index("for x in dynamic_slugs")
+
+
+NARROWED_OUT = [
+    "democratic-presidential-nominee-2028",
+    "will-avax-reach-16-by-december-31-2026",
+    "xi-jinping-out-before-2027",
+]
+
+
+@pytest.mark.parametrize("slug", NARROWED_OUT)
+def test_election_cycle_and_altcoin_markets_are_out(slug):
+    """Narrowed on 3 October to what an equities platform prices: the live feed
+    was 2028 nominee markets, and the crypto scope is BTC and ETH."""
+    assert not slug_is_relevant(slug)
+
+
+@pytest.mark.parametrize("slug", ["will-bitcoin-reach-150k-in-2026", "fed-decision-in-october"])
+def test_the_collected_crypto_and_rates_stay_in(slug):
+    assert slug_is_relevant(slug)

@@ -154,7 +154,7 @@ SERVER_EXTRAS = {
     ("NormalizedEvent", "domain"): (EVENTS_ROUTE, "END AS domain"),
     ("NormalizedEvent", "domain_data"): (EVENTS_ROUTE, "AS domain_data"),
     ("NormalizedEvent", "raw_payload"): (EVENTS_ROUTE, "SELECT * FROM events WHERE event_id = $1"),
-    ("EvidenceItem", "score"): (SCENARIOS_ROUTE, '"score": ass.get("conviction"'),
+    ("EvidenceItem", "score"): (SCENARIOS_ROUTE, '"score": conviction,'),
     ("SessionIdentity", "email"): (SESSION_ROUTE, "email"),
     ("SessionIdentity", "role"): (SESSION_ROUTE, "role"),
 }

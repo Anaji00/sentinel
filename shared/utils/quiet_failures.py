@@ -165,6 +165,33 @@ def dropped(
     return count
 
 
+def noted(
+    site: str,
+    reason: str,
+    logger: Optional[logging.Logger] = None,
+    detail: str = "",
+    variant: str = "",
+) -> int:
+    """Record something worth counting that is neither a failure nor a drop.
+
+    Same counting and escalation as `dropped`, worded as what it is. The agent
+    tier counted slow dispatches with `dropped` for the rate limiting, so every
+    macro brief that took more than the threshold and was then published
+    successfully logged "Dropped input at ...slow_dispatch" -- telling an
+    operator the brief was thrown away when it had just gone out.
+    """
+    count, escalate, ladder = _record(site, variant)
+    log = logger or logging.getLogger("sentinel.quiet")
+    suffix = f" ({detail})" if detail else ""
+    if variant and ladder != count:
+        suffix = f" [{variant} x{ladder} of {count}]" + suffix
+    if escalate:
+        log.info("Noted at %s, now %s time(s): %s%s", site, count, reason, suffix)
+    else:
+        log.debug("Noted at %s (%s): %s%s", site, count, reason, suffix)
+    return count
+
+
 def snapshot() -> Dict[str, Dict[str, float]]:
     """Every site that has swallowed a failure, with counts and timings."""
     with _LOCK:

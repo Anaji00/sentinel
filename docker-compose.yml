@@ -899,10 +899,12 @@ services:
       resources:
         limits:
           cpus: '0.25'
-          # Polls SEC EDGAR's submissions JSON on a 90 second cycle and keeps a
-          # small watchlist of CIKs. The documents are not downloaded, only the
-          # filing index, so this stays modest.
-          memory: 256M
+          # Polls SEC EDGAR's submissions JSON on a 90 second cycle, and since
+          # 4 October also streams full 13F information tables for the
+          # ownership graph (BlackRock's is 23 MB). The parse is incremental,
+          # but the service already ran at ~200 MB of 256, and an OOM here
+          # takes every filings feed down with it.
+          memory: 384M
 
   collector-sar:
     profiles: ["collectors"]

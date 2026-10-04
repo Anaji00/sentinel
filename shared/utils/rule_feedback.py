@@ -43,9 +43,6 @@ NEGATIVE_SHARE_FOR_REVIEW = 0.6
 # How long a rule's record survives without new verdicts.
 RULE_FEEDBACK_TTL_SEC = 30 * 24 * 3600
 
-# How long a rule's record survives without new verdicts.
-RULE_FEEDBACK_TTL_SEC = 30 * 24 * 3600
-
 # When a rule is bad enough to delete, as opposed to bad enough to look at.
 #
 # needs_review above is the bar for spending an inference on a prune pass. It is
@@ -151,37 +148,27 @@ async def record_rule_verdict(
     return await feedback_for_rule(redis, rule_id)
 
 
-async def record_rule_verdict(
-    redis: Any, rule_id: str, negative: bool, source: str = "auto"
-) -> Dict[str, Any]:
-    """Add one verdict to a rule's record and return the record.
+async def deprecated_by_evidence(redis: Any, rule_id: str) -> bool:
+    """Whether a rule's verdict record says it should no longer fire.
 
-    The gateway's /feedback route has always written these counters for analyst
-    verdicts. The automated path -- a scenario the tracker resolved as denied --
-    did not write them at all; it went straight to deprecating the rule, so a
-    rule's entire record was the single verdict that killed it.
+    The rule synthesiser deprecates by deleting a rule from the store, which
+    only works for a rule that lives there. Two cases escaped it:
 
-    Same keys as the route, because a counter written under two conventions is
-    how this platform came to read `sentinel:watched:equities` under a name
-    nothing wrote.
+      * a shipped rule is reinstalled by the correlation engine's
+        reconciliation on every restart, so a rule denied 33 times in 34 was
+        back after the next deploy; and
+      * SEMANTIC_001 is emitted by code, not read from the store, so deleting
+        it did nothing. On 1 October it was "deprecated" nine times in twenty
+        minutes, at 28 negative of 29 verdicts, and fired 52 times in the
+        same window.
+
+    Reading the record itself is what makes the decision hold wherever the
+    rule comes from. The record carries a TTL that each verdict refreshes, so
+    a rule that stops firing stops being judged and returns once its record
+    ages out -- deprecation by evidence, not for ever.
     """
-    out = {"total": 0, "negative": 0, "negative_share": 0.0, "needs_review": False}
-    if redis is None or not rule_id:
-        return out
-    try:
-        raw = getattr(redis, "raw", redis)
-        key = f"{RULE_FEEDBACK_KEY}:{rule_id}"
-        pipe = raw.pipeline()
-        pipe.hincrby(key, "total", 1)
-        pipe.hincrby(key, "negative" if negative else "positive", 1)
-        # Same TTL the route applies, so an automated verdict ages out the way
-        # an analyst's does rather than accumulating forever.
-        pipe.expire(key, RULE_FEEDBACK_TTL_SEC)
-        await pipe.execute()
-    except Exception as exc:
-        swallowed("shared.rule_feedback.record_rule_verdict", exc, logger, detail=rule_id)
-        return out
-    return await feedback_for_rule(redis, rule_id)
+    record = await feedback_for_rule(redis, rule_id)
+    return should_deprecate(int(record.get("total") or 0), int(record.get("negative") or 0))
 
 
 async def firing_counts(redis: Any) -> Dict[str, int]:

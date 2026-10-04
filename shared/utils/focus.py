@@ -100,6 +100,11 @@ FOCUS_MAX_PER_DOMAIN = 4
 # consumer can ask for the subjects it could actually act on.
 FOCUS_DOMAIN_KEY = "sentinel:focus:domains"
 
+# Who offered each subject. `offer_focus` has always taken `offered_by` and
+# dropped it, so a reader could not tell a subject another agent found from one
+# it found itself -- and preferring your own subject is not a second opinion.
+FOCUS_OFFERER_KEY = "sentinel:focus:offered_by"
+
 # Below this conviction an agent's interest is not worth redirecting others.
 # A radar escalation at 0.015 conviction, which the live system produced, should
 # not pull four agents onto a ticker.
@@ -137,6 +142,8 @@ async def offer_focus(
 
         await raw.zadd(FOCUS_KEY, {subject: now})
         await raw.hset(FOCUS_DOMAIN_KEY, subject, dom)
+        if offered_by:
+            await raw.hset(FOCUS_OFFERER_KEY, subject, str(offered_by))
         await raw.zremrangebyscore(FOCUS_KEY, "-inf", now - FOCUS_TTL_SEC)
 
         # Evict within the domain first, so a burst in one cannot crowd out the
@@ -178,6 +185,7 @@ async def offer_focus(
         # The keys themselves live as long as the longest thing in them.
         await raw.expire(FOCUS_KEY, FOCUS_FLOOR_TTL_SEC)
         await raw.expire(FOCUS_DOMAIN_KEY, FOCUS_FLOOR_TTL_SEC)
+        await raw.expire(FOCUS_OFFERER_KEY, FOCUS_FLOOR_TTL_SEC)
         if offered_by:
             logger.debug("%s offered %s for a second opinion.", offered_by, subject)
         return True
@@ -231,6 +239,30 @@ async def current_focus(
     except Exception as e:
         logger.debug("Could not read the focus set: %s", e)
         return []
+
+
+async def focus_offers(
+    redis_client: Any,
+    domains: Optional[Iterable[str]] = None,
+) -> dict:
+    """{subject: offering agent} for the current focus set.
+
+    A subject offered before offerers were recorded maps to "".
+    """
+    subjects = await current_focus(redis_client, domains=domains)
+    if not subjects:
+        return {}
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        who = await raw.hmget(FOCUS_OFFERER_KEY, subjects)
+    except Exception as exc:
+        swallowed("shared.focus.offerers", exc, logger)
+        who = []
+    who = list(who or []) + [None] * (len(subjects) - len(who or []))
+    return {
+        s: ((w.decode() if isinstance(w, bytes) else w) or "")
+        for s, w in zip(subjects, who)
+    }
 
 
 async def prioritise(

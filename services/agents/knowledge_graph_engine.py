@@ -14,16 +14,18 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_SLOW_SEC
 from shared.kafka import Topics
 from shared.models.ontology import VALID_PREDICATES, is_valid_predicate, normalize_predicate
 from shared.models.events import graph_node_id, UNRATED_EDGE_CONFIDENCE
+from shared.utils.quiet_failures import dropped
 from shared.utils.tasks import safe_create_task
 from shared.utils.text import clip
 
@@ -168,7 +170,68 @@ class IntelBrief(BaseModel):
         return data
 
 
+class ReferencedIntelBrief(IntelBrief):
+    """One brief inside a batch, carrying the id of the item it describes."""
+    ref: str = Field(..., min_length=1)
+
+
+class IntelBriefBatch(BaseModel):
+    """Several briefs from one inference.
+
+    A malformed brief is dropped on its own rather than failing the batch:
+    IntelBrief's validator raises when a brief has no usable headline, and one
+    such brief would otherwise cost the other items their answers.
+    """
+    briefs: List[ReferencedIntelBrief]
+
+    @field_validator("briefs", mode="before")
+    @classmethod
+    def _keep_usable(cls, value: Any) -> List[Any]:
+        if not isinstance(value, list):
+            return []
+        kept: List[Any] = []
+        for item in value:
+            try:
+                kept.append(ReferencedIntelBrief.model_validate(item))
+            except ValidationError:
+                continue
+        return kept
+
+
+def _significant_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]{4,}", str(text or "").lower())}
+
+
+def _describes(item_headline: str, brief: IntelBrief) -> bool:
+    """Whether a brief is plausibly about the item it was filed under.
+
+    In a batch, a brief tagged with one item's ref can describe another's
+    report, and nothing in the schema can prevent that. Requiring one shared
+    significant word is a weak test and deliberately so: it catches a brief
+    that was filed under the wrong item without second-guessing a model that
+    paraphrased the right one. A headline with no word long enough to test
+    is accepted.
+    """
+    wanted = _significant_words(item_headline)
+    if not wanted:
+        return True
+    return bool(wanted & _significant_words(f"{brief.headline} {brief.summary}"))
+
+
 logger = logging.getLogger("agent.knowledge_graph")
+
+# How many headlines one extraction inference answers.
+#
+# Measured over 19 September to 1 October: a brief averages ~930 characters of
+# JSON, roughly 280 tokens, p90 ~385, and a single extraction took 144s. The
+# shared part of the prompt -- global context, cross-agent block, predicate
+# rules -- is ~1,100 tokens and the per-headline part ~80, so a batch pays the
+# expensive part once. Three, because a truncated batch is retried at twice
+# its token budget, and three briefs at that ceiling still finish inside the
+# model timeout on this host.
+KG_EXTRACTION_BATCH_SIZE = int(os.getenv("KG_EXTRACTION_BATCH_SIZE", "3"))
+KG_EXTRACTION_BATCH_WAIT_SEC = float(os.getenv("KG_EXTRACTION_BATCH_WAIT_SEC", "20"))
+KG_EXTRACTION_TOKENS_PER_BRIEF = 400
 
 
 class EntityClassification(BaseModel):
@@ -202,6 +265,37 @@ _SUPERVISOR_GRAPH_ACTIONS = frozenset({
     "ADD_TAGS",
 })
 
+# Event types whose entities arrive as fields, written by a collector from an
+# API record. Their headline is a template over those fields ("Whale Transfer:
+# $31.39M WETH", "FREIGHT FALLING: Baltic Dry Index 4,067"), so extraction can
+# only restate what the record already says -- or invent around it.
+#
+# Measured on 3 October: whale transfers, freight indices and Hawkes forecasts
+# were most of what this agent sent to the model, at 90 to 220 seconds an
+# inference, while news and filings waited.
+_STRUCTURED_TYPES = frozenset({
+    "crypto_transfer",
+    "crypto_perp_funding",
+    "crypto_candle",
+    "macro_release",
+    "equity_block",
+    "vessel_position",
+    "vessel_static",
+    "flight_position",
+})
+
+# Correlation rules whose description is generated arithmetic about domains
+# ("Given current elevated crypto-domain intensity ..."), naming no entity.
+_FORECAST_RULES = frozenset({"HAWKES_EXCITATION"})
+
+
+def _no_prose_to_extract(message: Dict[str, Any]) -> bool:
+    """True for a structured record or a statistical forecast."""
+    raw = message.get("raw_payload") if isinstance(message.get("raw_payload"), dict) else {}
+    event_type = str(message.get("type") or raw.get("type") or "").lower()
+    rule_id = str(message.get("rule_id") or "").upper()
+    return event_type in _STRUCTURED_TYPES or rule_id in _FORECAST_RULES
+
 
 class KnowledgeGraphEngine(SentinelAgent):
     """
@@ -222,6 +316,95 @@ class KnowledgeGraphEngine(SentinelAgent):
             logger=logger,
             max_waiters=self.dispatch_concurrency,
         )
+        self._extraction_batcher = InferenceBatcher(
+            name="intel_extraction",
+            flush_fn=self._extract_batch,
+            max_items=KG_EXTRACTION_BATCH_SIZE,
+            max_wait_sec=KG_EXTRACTION_BATCH_WAIT_SEC,
+            logger=logger,
+            max_waiters=self.dispatch_concurrency,
+        )
+
+    async def _extract_batch(self, items: List[tuple]) -> Dict[str, IntelBrief]:
+        """Extracts a brief for every queued headline in one inference.
+
+        Returns {key: brief}. A headline the model does not answer for, or
+        answers with a brief about a different item, is absent, and the batcher
+        resolves it to None -- the same "no brief" a failed single call gave.
+        """
+        if not items:
+            return {}
+
+        global_context, cross_context = await asyncio.gather(
+            self.fetch_global_context(),
+            self.get_cross_agent_context(limit=3),
+        )
+        cross_block = f"\nCROSS-AGENT INTELLIGENCE:\n{cross_context}\n" if cross_context else ""
+
+        refs: Dict[str, tuple] = {}
+        listed = []
+        for i, (key, it) in enumerate(items, 1):
+            ref = f"H{i}"
+            refs[ref] = (key, it)
+            listed.append(
+                f"[{ref}]\n"
+                f"- Headline: {it['headline']}\n"
+                f"- Summary: {it['summary']}\n"
+                f"- Anomaly Score: {it['anomaly_score']:.2f}\n"
+                f"- Source: {it['source']}"
+            )
+        allowed_preds_str = ", ".join(sorted(VALID_PREDICATES))
+        user_prompt = (
+            f"Extract one structured intelligence brief and its Neo4j relationship "
+            f"triples for EACH of these {len(items)} items. They are unrelated reports: "
+            f"a brief describes only its own item, and appearing together implies no "
+            f"relationship between them.\n\n"
+            f"ITEMS\n" + "\n\n".join(listed) + "\n\n"
+            f"GLOBAL CONTEXT:\n{global_context}\n{cross_block}\n"
+            f"PREDICATE CONSTRAINTS & TRIPLE RULES:\n"
+            f"- Allowed predicates for graph_triples: {allowed_preds_str}\n"
+            f"- Omit a triple rather than inventing a predicate if none of the allowed predicates fit.\n"
+            f"- FORBIDDEN: Do NOT use provenance, reporting, or sourcing (e.g., \"Source\", "
+            f"\"SOURCED_FROM\", \"REPORTED_BY\") as relationship predicates.\n"
+            f"- FORBIDDEN: Do NOT create self-loop triples where subject == object.\n\n"
+            f"Return raw JSON: {{\"briefs\": [...]}} with exactly one IntelBrief per item, "
+            f"each with ref set to that item's id ({', '.join(refs)})."
+        )
+
+        # The batch competes for the slot at its best candidate's score, not
+        # whichever happened to arrive first.
+        lead = max(items, key=lambda kv: kv[1]["anomaly_score"])[1]["message"]
+        batch = await self._execute_with_telemetry(
+            message=lead,
+            system_prompt=(
+                "You are SENTINEL Chief Intelligence Officer & Knowledge Architect. "
+                "Extract structured intelligence briefs and entity relationship triples. "
+                "Return ONLY raw JSON."
+            ),
+            user_prompt=user_prompt,
+            schema=IntelBriefBatch,
+            temperature=0.1,
+            num_predict=min(1536, 128 + KG_EXTRACTION_TOKENS_PER_BRIEF * len(items)),
+        )
+
+        out: Dict[str, IntelBrief] = {}
+        for b in (getattr(batch, "briefs", None) or []):
+            ref = str(getattr(b, "ref", "")).strip().strip("[]").upper()
+            if ref not in refs:
+                continue
+            key, it = refs[ref]
+            if key in out:
+                continue
+            if not _describes(it["headline"], b):
+                dropped(
+                    "agents.knowledge_graph_engine.brief_misfiled",
+                    "brief filed under an item it does not describe",
+                    logger,
+                    detail=f"ref={ref} headline={clip(it['headline'], 60)!r} brief={clip(b.headline, 60)!r}",
+                )
+                continue
+            out[key] = IntelBrief.model_validate(b.model_dump(exclude={"ref"}))
+        return out
 
     async def _classify_batch(self, items: List[tuple]) -> Dict[str, "EntityClassification"]:
         """Classifies every queued entity in one inference.
@@ -313,6 +496,16 @@ class KnowledgeGraphEngine(SentinelAgent):
         if str(message.get("action", "")).upper() in _SUPERVISOR_GRAPH_ACTIONS:
             return None
 
+        # ── 1c. STRUCTURED RECORDS AND FORECASTS HAVE NO PROSE TO READ ────────
+        if _no_prose_to_extract(message):
+            dropped(
+                "agents.knowledge_graph_engine.structured_input",
+                "a structured record or a statistical forecast, not prose",
+                logger,
+                variant=str(message.get("type") or message.get("rule_id") or ""),
+            )
+            return None
+
         # ── 2. NEWS INTEL & GRAPH TRIPLE EXTRACTION HANDLER ───────────────────
         headline = (
             message.get("headline")
@@ -357,40 +550,31 @@ class KnowledgeGraphEngine(SentinelAgent):
 
         logger.info(f"🌐 KNOWLEDGE GRAPH | Processing Graph Triples & Intel | Headline: '{headline[:60]}...'")
 
-        global_context, cross_context = await asyncio.gather(
-            self.fetch_global_context(),
-            self.get_cross_agent_context(limit=3),
-        )
-        cross_block = f"\nCROSS-AGENT INTELLIGENCE:\n{cross_context}\n" if cross_context else ""
-
-        allowed_preds_str = ", ".join(sorted(VALID_PREDICATES))
-        user_prompt = f"""
-        Extract structured intelligence brief and Neo4j relationship triples:
-        - Headline: {headline}
-        - Summary: {message.get("summary", "")}
-        - Anomaly Score: {anomaly_score:.2f}
-        - Source: {source}
-
-        GLOBAL CONTEXT:
-        {global_context}
-        {cross_block}
-        PREDICATE CONSTRAINTS & TRIPLE RULES:
-        - Allowed predicates for graph_triples: {allowed_preds_str}
-        - Omit a triple rather than inventing a predicate if none of the allowed predicates fit.
-        - FORBIDDEN: Do NOT use provenance, reporting, or sourcing (e.g., "Source", "SOURCED_FROM", "REPORTED_BY") as relationship predicates.
-        - FORBIDDEN: Do NOT create self-loop triples where subject == object.
-
-        Return raw JSON matching IntelBrief schema exactly.
-        """
-
         try:
-            brief: IntelBrief = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Chief Intelligence Officer & Knowledge Architect. Extract structured intelligence brief and entity relationship triples. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=IntelBrief,
-                temperature=0.1,
+            # Batched: one inference answers up to KG_EXTRACTION_BATCH_SIZE
+            # headlines, paying the ~1,100-token shared prompt once. The
+            # caller reads exactly as the direct call did; None is "no brief".
+            brief: Optional[IntelBrief] = await self._extraction_batcher.submit(
+                dedup_key,
+                {
+                    "message": message,
+                    "headline": headline,
+                    "summary": message.get("summary", ""),
+                    "anomaly_score": anomaly_score,
+                    "source": source,
+                },
             )
+            if brief is None:
+                # Shed past the stall ceiling, failed, or not answered by the
+                # batch. Counted per headline, because the batch log names only
+                # the batch -- and the unanswered share is the number that says
+                # whether three to an inference is the right size.
+                dropped(
+                    "agents.knowledge_graph_engine.no_brief",
+                    "the extraction batch returned no brief for this headline",
+                    logger,
+                )
+                return None
 
             # Filter graph triples using whitelist, self-loop guard, and length limit.
             #

@@ -49,7 +49,6 @@ UNPRODUCED: Dict[str, str] = {
     "MARKET_CANDLE": "candles are written to tradfi_bars, not published as events",
     "PREDICTION_MARKET": "the collector emits PREDICTION_MARKET_TRADE",
     "DARK_POOL": "dark-pool prints arrive as EQUITY_BLOCK, tagged dark_pool_print",
-    "PRICE_ANOMALY": "price moves arrive as MARKET_ANOMALY",
     "INFRASTRUCTURE": "superseded by INFRA_EXPOSED and INFRASTRUCTURE_DEGRADED",
     "VULNERABILITY": "CVEs arrive as INFRA_EXPOSED from the KEV path",
 
@@ -57,7 +56,6 @@ UNPRODUCED: Dict[str, str] = {
     "CLIMATE_STRESS": "no climate feed",
     "CUSTOM": "escape hatch for user-defined events; no producer by design",
     "FUTURES_COT": "no CFTC Commitments of Traders collector",
-    "REGULATORY_EVENT": "no regulatory-action feed",
     "SPORTS_LINE_MOVEMENT": "no sportsbook collector",
     "INSIDER_CLUSTER": "clustering of INSIDER_TRADE is not implemented",
     "NARRATIVE_CLUSTER": "first-story detection scores novelty; it does not emit cluster events",
@@ -73,7 +71,6 @@ UNPRODUCED: Dict[str, str] = {
 # edit the rule or build the producer.
 ARRIVES_AS: Dict[str, str] = {
     "DARK_POOL": "EQUITY_BLOCK",
-    "PRICE_ANOMALY": "MARKET_ANOMALY",
     "PREDICTION_MARKET": "PREDICTION_MARKET_TRADE",
     "VULNERABILITY": "INFRA_EXPOSED",
 }

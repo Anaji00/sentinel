@@ -21,9 +21,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
-from shared.utils.equities import split_macro_and_equities
+from shared.utils.equities import asset_class, split_macro_and_equities
 from shared.kafka import Topics
 from shared.utils.focus import prioritise
+from shared.utils.quote_cache import quote_key
 
 
 def _as_unit_conviction(value) -> float:
@@ -43,7 +44,7 @@ def _as_unit_conviction(value) -> float:
         number /= 100.0
     return min(1.0, max(0.0, number))
 from shared.models import NormalizedEvent
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.stock_correlation")
 
@@ -156,6 +157,38 @@ def _clean_symbol(value: str) -> str:
     return cleaned or value
 
 
+def _message_equity(message: Dict[str, Any]) -> Optional[str]:
+    """The US equity a message is about, or None when it names none.
+
+    Read from the same fields this agent always read, in the same order. A
+    multi-word value is a name, not a symbol, and is not truncated to its first
+    word the way a model's output is: "Bank of America" is not BANK. Crypto,
+    futures, rates and funds are refused here because this agent's comparison
+    is macro-versus-equity, and putting any of them on the equity side is how
+    136 of its assessments became crypto pairs.
+    """
+    primary_entity = message.get("primary_entity")
+    primary_entity_id = ""
+    if isinstance(primary_entity, dict):
+        primary_entity_id = primary_entity.get("id", "") or primary_entity.get("name", "")
+    elif isinstance(primary_entity, str):
+        primary_entity_id = primary_entity
+
+    ticker = message.get("ticker") or message.get("primary_entity_id") or primary_entity_id or ""
+    fd = message.get("financial_data")
+    if isinstance(fd, dict):
+        ticker = ticker or fd.get("ticker", "")
+    if not isinstance(ticker, str):
+        return None
+    undecorated = _TICKER_DECORATION.sub("", ticker).strip()
+    if not undecorated or " " in undecorated:
+        return None
+    symbol = _clean_symbol(undecorated)
+    if asset_class(symbol) != "equity":
+        return None
+    return symbol
+
+
 class SympathyMover(BaseModel):
     ticker: str
 
@@ -256,31 +289,47 @@ class StockCorrelationAgent(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self.capacity_or_defer(message):
-            return None
         if not isinstance(message, dict):
+            return None
+
+        # The message must name a quoted US equity, and that is checked before
+        # admission so that a message which cannot be worked never occupies the
+        # candidate buffer.
+        #
+        # A message without one used to fall back to `equities[0]` -- the
+        # first, focus-boosted entry of the quote scan -- with the headline
+        # still pasted into the prompt as the "Recent Market Event". Measured
+        # over 20-21 September, this agent held more inference slots than any
+        # other (282) and spent them on 19 instruments: GOOGL 78 times, and
+        # AVAXUSDT, LINKUSDT, ETHUSDT, BTCUSDT, SOLUSDT and XRPUSDT 136 times
+        # between them, because the macro/equity split puts crypto on the
+        # equity side. Its buffer was full of al-Jazeera and BBC World
+        # headlines, each one winning a slot to produce another GOOGL-versus-
+        # wheat assessment the headline had nothing to do with.
+        ticker = _message_equity(message)
+        if ticker is None:
+            dropped(
+                "agents.stock_correlation_agent.no_equity",
+                "message names no US equity; an assessment of some other "
+                "instrument would not be about this event",
+                logger,
+                variant=str(message.get("source") or "unknown")[:40],
+            )
+            return None
+        if not await self.redis.raw.exists(quote_key(ticker)):
+            dropped(
+                "agents.stock_correlation_agent.unquoted",
+                "equity has no live quote to anchor the comparison",
+                logger,
+                variant="unquoted",
+            )
+            return None
+
+        if not await self.capacity_or_defer(message):
             return None
 
         event_type = message.get("type", "")
         source = message.get("source", "")
-
-        # Safely extract primary entity or ticker
-        primary_entity = message.get("primary_entity")
-        primary_entity_id = ""
-        if isinstance(primary_entity, dict):
-            primary_entity_id = primary_entity.get("id", "") or primary_entity.get("name", "")
-        elif isinstance(primary_entity, str):
-            primary_entity_id = primary_entity
-
-        ticker = message.get("ticker") or message.get("primary_entity_id") or primary_entity_id or ""
-
-        # Extract underlying financial or headline payload safely
-        fd = message.get("financial_data")
-        if isinstance(fd, dict):
-            ticker = ticker or fd.get("ticker", "")
-
-        if not ticker:
-            return None
 
         # Fetch recent live quotes from Redis for dynamic cross-asset returns calculation
         try:
@@ -329,7 +378,7 @@ class StockCorrelationAgent(SentinelAgent):
             # on the equity side of a cross-asset comparison.
             macro_assets, equities = split_macro_and_equities(list(price_map))
 
-            if not macro_assets or not equities:
+            if not macro_assets:
                 return None
 
             # Pick target macro asset and target equity, preferring whatever
@@ -348,14 +397,25 @@ class StockCorrelationAgent(SentinelAgent):
             # relative order, and a focused one rises. This agent takes the
             # first of each list, so the ordering is exactly what decides
             # whether a second opinion is ever formed.
+            #
+            # The equity side is now the message's own ticker, so only the
+            # macro side is ordered here.
             try:
-                equities = await prioritise(self.redis, equities, domains=self.FOCUS_DOMAINS)
                 macro_assets = await prioritise(self.redis, macro_assets, domains=self.FOCUS_DOMAINS)
             except Exception as _exc:
                 swallowed("agents.stock_correlation_agent.focus", _exc, logger)
 
             target_macro = await _next_macro_asset(self.redis, macro_assets)
-            target_equity = ticker if ticker in equities else equities[0]
+            target_equity = ticker
+            if target_equity not in price_map:
+                # The scan is bounded, so a quoted equity can sit outside it.
+                try:
+                    price_map[target_equity] = float(
+                        await self.redis.raw.get(quote_key(target_equity))
+                    )
+                except (TypeError, ValueError) as _exc:
+                    swallowed("agents.stock_correlation_agent.target_quote", _exc, logger)
+                    return None
 
             dedup_key = f"stock_corr_task:{target_macro}:{target_equity}:{int(time.time() // 600)}"
             if await self.is_recently_processed(dedup_key, window_seconds=600):

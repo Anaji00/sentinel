@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from shared.db import get_timescale
 from shared.utils.metrics import MetricsCollector
 from shared.utils.tasks import safe_create_task
+from shared.utils.equities import instrument_aliases, instrument_identity
 from shared.models.events import event_domain as canonical_domain
 from shared.models.events import resolve_event_domain
 
@@ -433,7 +434,7 @@ class EventStore:
                         if before_epoch is not None and float(ts) > before_epoch:
                             continue
 
-                    if entity_id and str(e.get("entity_id") or "").upper() != entity_id:
+                    if entity_id and instrument_identity(e.get("entity_id") or "") != instrument_identity(entity_id):
                         continue
                     if region and e.get("region") != region:
                         continue
@@ -564,7 +565,17 @@ class EventStore:
         if exclude_types:
             where.append(f"NOT (type = ANY({_bind(list(exclude_types))}))")
         if entity_id:
-            where.append(f"UPPER(primary_entity_id) = {_bind(str(entity_id).upper())}")
+            # Every venue spelling of a coin: BTC, BTCUSDT, BTC-USDT-SWAP. An
+            # equity has one, and keeps the plain equality.
+            aliases = instrument_aliases(entity_id)
+            if len(aliases) == 1:
+                where.append(f"UPPER(primary_entity_id) = {_bind(aliases[0])}")
+            else:
+                where.append(
+                    "UPPER(primary_entity_id) IN ("
+                    + ", ".join(_bind(a) for a in aliases)
+                    + ")"
+                )
         if region:
             where.append(f"region = {_bind(region)}")
         if tags:

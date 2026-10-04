@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, InferenceShed
 from shared.kafka import Topics
+from shared.models.events import Domain, EventType
 from shared.utils.tasks import safe_create_task
 from shared.utils.text import clip
 from shared.utils.quiet_failures import swallowed
@@ -122,6 +123,41 @@ def _is_routine_telemetry(message: Dict[str, Any]) -> bool:
         if token.startswith(_ROUTINE_TELEMETRY_PREFIXES):
             return True
     return False
+
+
+_CATEGORY_WORDS = frozenset(
+    {d.value for d in Domain} | {e.value for e in EventType} | {"GLOBAL_SYS"}
+)
+
+
+def _names_an_entity(target: str) -> bool:
+    """Whether a predicted target is shaped like an identifier at all.
+
+    The target is checked against the entities the wargame was given, and
+    that list is only as good as the cluster that supplied it: live on
+    1 October, predictions were stored against "Market Anomaly Cluster
+    (Flashpoint: 66.2/100)" -- a cluster title that arrived in entity_names --
+    and "financial_market", a category slug. Identifiers on this platform are
+    tickers, callsigns, vessel names and wallet ids; none carries parentheses,
+    a colon or a slash, and none is an all-lowercase slug.
+    """
+    t = (target or "").strip()
+    if not t or t.upper() == "NONE":
+        return False
+    if any(ch in t for ch in "()/"):
+        return False
+    # A colon is part of a typed identifier -- MMSI:564743000 -- only when the
+    # whole thing is one token with an uppercase prefix. "AVIATION ALERT:
+    # SHI7340" is a headline and "aviation_alert:SHI7340" a slug around one.
+    if ":" in t:
+        prefix, _, ident = t.partition(":")
+        if " " in t or not prefix.isupper() or not prefix.isalpha() or not ident:
+            return False
+    if t in _CATEGORY_WORDS or t.lower() in _CATEGORY_WORDS:
+        return False
+    if t == t.lower() and "_" in t:
+        return False
+    return True
 
 
 def _is_worth_simulating(message: Dict[str, Any]) -> bool:
@@ -298,13 +334,17 @@ class AdversarialWargamerAgent(SentinelAgent):
         # do is enter the scorecard as a forecast about a named thing.
         known = {str(e).strip().upper() for e in entity_ids}
         target = str(synthesis.predicted_next_target_entity_id or "").strip()
-        target_is_named = bool(target) and target.upper() in known
+        target_is_named = bool(target) and target.upper() in known and _names_an_entity(target)
 
         try:
             output = synthesis.model_dump()
             output["agent"] = self.name
             output["agent_run_id"] = f"wargame_{int(datetime.now(timezone.utc).timestamp())}"
             output["source_correlation_id"] = message.get("correlation_id", "unknown")
+            # Read by the telemetry worker, which stores this payload as a
+            # prediction. It stored every wargame regardless, so the check above
+            # was bypassed by the path that actually writes agent_predictions.
+            output["prediction_recordable"] = target_is_named
 
             self.logger.info(
                 f"⚔️ WARGAME COMPLETED | Target: {synthesis.predicted_next_target_entity_id} | "

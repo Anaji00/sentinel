@@ -129,6 +129,14 @@ class RRCFDetector:
         else:
             self._forest = None
 
+        # The raw points behind the current state, so it can outlive a restart.
+        #
+        # Everything that makes a detector warm -- the forest, the shingle
+        # buffer, the percentile history -- is a function of the last window of
+        # points it was shown. Holding those points, and replaying them on
+        # start, rebuilds all three at once with no pickled forest internals.
+        self._recent_points: deque = deque(maxlen=window_size + shingle_size)
+
     def insert(self, point: np.ndarray) -> float:
         """
         Insert a point and return an anomaly score in [0, 1].
@@ -140,6 +148,7 @@ class RRCFDetector:
             Anomaly score ∈ [0, 1]. Higher = more anomalous.
         """
         point = np.asarray(point, dtype=np.float64)
+        self._recent_points.append(point)
 
         # Shingling: concatenate recent points into one vector
         self._shingle_buffer.append(point)
@@ -358,6 +367,38 @@ class RRCFDetector:
     def insert_batch(self, points: List[np.ndarray]) -> List[float]:
         """Insert multiple points sequentially, return list of scores."""
         return [self.insert(p) for p in points]
+
+    def export_points(self) -> List[List[float]]:
+        """The recent raw points, oldest first, as plain floats."""
+        return [[float(v) for v in p] for p in self._recent_points]
+
+    def warm(self, points: List[List[float]]) -> int:
+        """Replays saved points so a restarted detector does not start cold.
+
+        Measured on 1 October: twenty minutes after a restart a $1.31M QQQ
+        block trade scored 0.000, marked unmeasured, because the shingle and
+        percentile windows were still filling -- and three deploys in one
+        session meant three such windows. Replaying the last window rebuilds
+        the forest, the shingle buffer and the history together.
+
+        CPU-bound; callers run it off the event loop. Returns how many points
+        were replayed. A point whose width does not match what this detector
+        has already seen stops the replay rather than corrupting the forest,
+        which is the case after a feature set changes between deploys.
+        """
+        replayed = 0
+        width = None
+        for raw in points or []:
+            point = np.asarray(raw, dtype=np.float64)
+            if point.ndim != 1 or not np.all(np.isfinite(point)):
+                continue
+            if width is None:
+                width = point.shape[0]
+            elif point.shape[0] != width:
+                break
+            self.insert(point)
+            replayed += 1
+        return replayed
 
 
 # ════════════════════════════════════════════════════════════════════════════════

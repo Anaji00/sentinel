@@ -47,14 +47,6 @@ compute_portfolio_differential = thirteen_f_mod.compute_portfolio_differential
 fetch_live_13f_from_edgar = thirteen_f_mod.fetch_live_13f_from_edgar
 generate_curated_seed_13f = thirteen_f_mod.generate_curated_seed_13f
 
-freight_path = Path(__file__).resolve().parents[1] / "services" / "collector-macro" / "freight.py"
-spec_fr = importlib.util.spec_from_file_location("freight", freight_path)
-freight_mod = importlib.util.module_from_spec(spec_fr)
-spec_fr.loader.exec_module(freight_mod)
-
-poll_freight_indices = freight_mod.poll_freight_indices
-FREIGHT_BENCHMARKS = freight_mod.FREIGHT_BENCHMARKS
-
 reg_path = Path(__file__).resolve().parents[1] / "services" / "collector-macro" / "regulatory.py"
 spec_reg = importlib.util.spec_from_file_location("regulatory", reg_path)
 reg_mod = importlib.util.module_from_spec(spec_reg)
@@ -309,25 +301,17 @@ def test_filings_api_gateway_routes():
 
 # ── 4. SUPPLY CHAIN & FREIGHT INDEX POLLER TESTS (§2.3) ───────────────────────
 
-def test_freight_shipping_index_poller():
-    async def _test():
-        redis = MockRedis()
-        mock_producer = MagicMock()
-        mock_producer.send = AsyncMock()
-
-        session = MagicMock()
-        count = await poll_freight_indices(session, mock_producer, redis)
-        assert count == len(FREIGHT_BENCHMARKS)
-        assert mock_producer.send.call_count == len(FREIGHT_BENCHMARKS)
-
-        # Verify emitted topic and structure
-        call_args = mock_producer.send.call_args_list[0]
-        assert call_args[0][0] == Topics.RAW_TRADFI
-        payload = call_args[0][1]["raw_payload"]
-        assert "current_rate" in payload
-        assert "index_symbol" in payload
-
-    asyncio.run(_test())
+def test_no_simulated_freight_index_is_published():
+    """freight.py fetched nothing. It applied a random drift of -1.5% to +2%
+    to its last value every three minutes and published the result as
+    "live_measurement": 10,690 Baltic Dry, Freightos and HARPEX prints from 4
+    September, weekends included, with BDI drifting from 1,850 to 4,517. This
+    test asserted the simulator published, which is what kept it alive."""
+    root = Path(__file__).resolve().parents[1] / "services" / "collector-macro"
+    assert not (root / "freight.py").exists()
+    main = (root / "main.py").read_text(encoding="utf-8")
+    assert "poll_freight_indices" not in main
+    assert "random.uniform" not in "".join(p.read_text(encoding="utf-8") for p in root.glob("*.py"))
 
 
 # ── 5. REGULATORY POLICY TRACKER TESTS (§2.4) ─────────────────────────────────

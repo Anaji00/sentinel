@@ -109,8 +109,12 @@ async def test_economic_calendar_collector_surprise_computation():
 
 
 @pytest.mark.anyio
-async def test_economic_calendar_collector_poll_and_publish():
+async def test_economic_calendar_collector_poll_and_publish(monkeypatch):
     """Tests building and publishing macro release events via MockProducer."""
+    # The Finnhub path runs only when no FRED key is configured. Pinned here
+    # because another test loads .env, and with FRED_API_KEY set this exercised
+    # the FRED path instead -- against the network.
+    monkeypatch.setattr(macro_cal_module.fred, "FRED_API_KEY", None)
     producer = MockProducer()
     collector = EconomicCalendarCollector(producer=producer)
 
@@ -149,9 +153,15 @@ async def test_economic_calendar_collector_poll_and_publish():
     # empty `raw_payload`, matched no source branch, and incremented
     # `enrichment.tradfi.unrouted_source` -- the counter that exists to find
     # feeds being thrown away, being fed by a deliberate duplicate.
+    #
+    # Then ENRICHED_EVENTS only -- which no writer persists, so no macro release
+    # ever reached the events table. Now once each to RAW_TRADFI, wrapped as a
+    # RawEvent carrying the finished event, which the tradfi enricher passes
+    # through unchanged and the enrichment service stores and publishes.
     assert len(producer.sent) == 2
     from shared.kafka import Topics
-    assert {topic for topic, *_ in producer.sent} == {Topics.ENRICHED_EVENTS}
+    assert {topic for topic, *_ in producer.sent} == {Topics.RAW_TRADFI}
+    assert all("normalized_event" in payload["raw_payload"] for _, payload, *_ in producer.sent)
 
     cpi_event = events[0]
     assert cpi_event.macro_data.indicator == "CPI"

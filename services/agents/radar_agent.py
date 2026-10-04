@@ -88,7 +88,11 @@ def _earnings_surprise_pct(message: Dict[str, Any]) -> float:
 # for company. Twenty seconds is negligible against a 600s budget slot and a
 # multi-minute inference, so batching costs a candidate almost no latency and
 # buys the agent an order of magnitude of coverage.
-RADAR_BATCH_SIZE = int(os.getenv("RADAR_BATCH_SIZE", "10"))
+# Twenty, measured rather than chosen. The batcher used to take its whole queue
+# whatever this said, and radar answered 23 candidates in one inference on
+# 1 October with no truncation at the 1,024-token ceiling below. Now that the
+# ceiling is enforced, ten would halve what that same call already managed.
+RADAR_BATCH_SIZE = int(os.getenv("RADAR_BATCH_SIZE", "20"))
 RADAR_BATCH_WAIT_SEC = float(os.getenv("RADAR_BATCH_WAIT_SEC", "20"))
 
 

@@ -206,3 +206,22 @@ def test_a_reason_is_what_the_log_line_actually_prints():
     log = _Log()
     qf.dropped("site", "the reason it was discarded", log)
     assert "the reason it was discarded" in log.warnings[-1]
+
+
+def test_a_slow_success_is_noted_not_dropped(caplog):
+    """slow_dispatch counted completed, published work as "Dropped input"."""
+    import logging
+    from shared.utils import quiet_failures as qf
+    caplog.set_level(logging.DEBUG)
+    qf.noted("test.noted_site_unique", "completed slowly", detail="150s")
+    text = caplog.text
+    assert "Noted at test.noted_site_unique" in text
+    assert "Dropped" not in text
+    assert qf.snapshot()["test.noted_site_unique"]["count"] == 1
+
+
+def test_the_slow_dispatch_site_uses_noted():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "services" / "agents" / "base.py").read_text(encoding="utf-8")
+    block = src.split('f"agents.{self.name}.slow_dispatch"')[0][-40:]
+    assert "noted(" in block

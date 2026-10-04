@@ -27,6 +27,9 @@ logger = logging.getLogger("shared.rates")
 # Written by the tradfi enricher on every nyfed_sofr event.
 RISK_FREE_RATE_KEY = "sentinel:macro:risk_free_rate"
 SOFR_RATE_KEY = "sentinel:macro:sofr_rate"
+# Credit spreads, curve and financial conditions from FRED: written by the macro
+# collector, read into every agent's prompt.
+FRED_CONTEXT_KEY = "sentinel:macro:fred_context"
 
 # Used only when the live rate is unavailable. Not zero: a Sharpe ratio
 # computed against 0% overstates every strategy, in the same direction, by the

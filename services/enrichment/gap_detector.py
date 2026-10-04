@@ -22,6 +22,7 @@ from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
 from shared.utils.heartbeat import record_scan_suppression,  is_component_healthy
 from shared.utils.quiet_failures import swallowed
+from shared.utils.osint_bridges import vessel_exposure_tags
  
 logger = logging.getLogger("enrichment.gap_detector")
  
@@ -249,7 +250,7 @@ class VesselGapDetector:
                     "dark_vessel",
                     "ais_gap", 
                     reg.lower().replace(" ", "_") if reg else None,
-                ])),
+                ])) + vessel_exposure_tags(reg, vtype),
                 anomaly_score=score,
             )
 

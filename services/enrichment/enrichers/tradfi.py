@@ -20,8 +20,12 @@ from shared.models import (
     AnomalyBreakdown, MarketMicrostructure, ScoreAdjustment
 )
 from shared.utils import quant_calc
-from shared.utils.equities import is_valid_primary_equity
+from shared.utils.equities import asset_class, is_valid_primary_equity
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
+from shared.utils.form4 import code_value_usd as form4_code_value_usd, dominant_code as form4_dominant_code
+from shared.utils.price_moves import (
+    MOVE_KEY_TTL_SEC, band_crossed, band_key, day_move_pct, is_futures_move_subject, move_score,
+)
 from shared.utils.market_session import session_liquidity_factor
 import re 
 
@@ -121,6 +125,20 @@ _EIGHT_K_ITEM_SCORES = {
     "5.03": 0.62,  # Amendments to Articles or Bylaws
     "7.01": 0.60,  # Regulation FD Disclosure
     "8.01": 0.55,  # Other Events
+    # Items the table did not name, which fell to the 0.70 default -- below
+    # routine results for a restatement, above them for an exhibit list.
+    "4.02": 0.96,  # Non-Reliance on Previously Issued Financial Statements (restatement)
+    "2.04": 0.92,  # Triggering Events Accelerating a Direct Financial Obligation
+    "1.05": 0.90,  # Material Cybersecurity Incident
+    "2.06": 0.86,  # Material Impairments
+    "2.05": 0.82,  # Costs Associated with Exit or Disposal (restructuring)
+    "3.03": 0.72,  # Material Modification to Rights of Security Holders
+    "5.05": 0.45,  # Amendments to the Code of Ethics
+    "5.07": 0.40,  # Submission of Matters to a Vote (meeting results)
+    "5.08": 0.40,  # Shareholder Director Nominations
+    # Attached to most 8-Ks, and never the event itself. At the default it
+    # lifted every Regulation FD filing to 0.70 through the max() below.
+    "9.01": 0.30,  # Financial Statements and Exhibits
 }
 
 # An item code this table does not name is unclassified, not routine: the middle
@@ -516,6 +534,13 @@ async def _read_day_move(redis_client, ticker: str) -> dict:
     return out
 
 
+# Sources whose collector sends a finished NormalizedEvent under
+# raw_payload["normalized_event"]: they measured it against its own history
+# (a release against its prior, a short ratio against its 20-day norm) and
+# enrichment stores and publishes it unchanged.
+PASSTHROUGH_SOURCES = frozenset({"fred", "finnhub_calendar", "finra_short_volume", "openfda", "sec_13d", "usaspending"})
+
+
 class TradFiEnricher:
     # Requires redis_client to push dynamic watchlists and train EMA
     def __init__(self, scorer, redis_client, graph_writer, db=None):
@@ -604,6 +629,19 @@ class TradFiEnricher:
             return await self._enrich_13f_filing(raw, p)
         elif source == "macro_freight":
             return await self._enrich_freight_rate(raw, p)
+        elif source in PASSTHROUGH_SOURCES:
+            # A scheduled release the collector has already measured.
+            #
+            # The macro calendar builds a complete NormalizedEvent -- actual,
+            # prior, change, bias, score -- because it understands a release
+            # better than a generic scorer does. It used to publish that
+            # straight to ENRICHED_EVENTS, which the agents read and nothing
+            # persists: no macro release ever reached the events table, so the
+            # scenario tracker, which matches watch signals against that table,
+            # could never see a CPI print confirm a scenario that predicted one.
+            # Passed through unchanged here, it is written and published by the
+            # same path as every other event.
+            return NormalizedEvent.model_validate(p.get("normalized_event") or {})
 
         # Nothing claimed this source. Counted rather than logged per event,
         # because one unmatched source is a probe and ten thousand is a feed
@@ -1218,6 +1256,51 @@ class TradFiEnricher:
             correlation_ids=stat_corr_ids,
         )
 
+    async def _futures_move_event(
+        self, raw, p, ticker: str, open_p: float, close_p: float,
+    ) -> Optional[NormalizedEvent]:
+        """A commodity or index future crossing a move band, once per band a day."""
+        move = day_move_pct(open_p, close_p)
+        band = band_crossed(move)
+        if band is None or move is None or self.redis_client is None:
+            return None
+        ts = raw.occurred_at or datetime.now(timezone.utc)
+        try:
+            first = await self.redis_client.raw.set(
+                band_key(ticker, open_p, band, move), "1",
+                nx=True, ex=MOVE_KEY_TTL_SEC,
+            )
+        except Exception as e:
+            swallowed("enrichment.tradfi.futures_move_dedup", e, logger, detail=ticker)
+            return None
+        if not first:
+            return None
+        name = p.get("name") or ticker
+        proxy = p.get("proxy_symbol") if p.get("is_proxy") else None
+        return NormalizedEvent(
+            event_id=raw.event_id,
+            trace_id=raw.trace_id,
+            type=EventType.PRICE_ANOMALY,
+            occurred_at=ts,
+            source=raw.source,
+            source_reliability=baseline_reliability(raw.source),
+            primary_entity=Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker),
+            headline=(
+                f"{name} {move:+.1f}% on the session ({ticker}"
+                + (f", priced via {proxy}" if proxy else "") + f"), past the {band:g}% band"
+            ),
+            anomaly_score=move_score(move),
+            financial_data=FinancialData(
+                ticker=ticker,
+                instrument_type=asset_class(ticker),
+                change_pct_day=move,
+                open_price=open_p,
+                close_price=close_p,
+            ),
+            tags=["tradfi", "price_move", f"move_band_{band:g}", ticker.lower()],
+            named_entities=[ticker],
+        )
+
     async def _enrich_equity_candle(self, raw, p) -> Optional[NormalizedEvent]:
         # 1 minute ohcvl bars for volume spike detection
         ticker = (p.get("ticker") or "").upper()
@@ -1305,6 +1388,14 @@ class TradFiEnricher:
             # Counted, not only whispered. This handler is why bar persistence
             # could fail indefinitely while the enricher reported success.
             swallowed("enrichment.tradfi_bars_persist", bar_err, logger, detail=ticker)
+
+        # A futures move needs a price and nothing else, so it is judged before
+        # the volume guard below -- which every proxy-served commodity bar
+        # failed, so crude, Brent and grain never produced an event.
+        if is_futures_move_subject(ticker):
+            moved = await self._futures_move_event(raw, p, ticker, open_p, close_p)
+            if moved is not None:
+                return moved
 
         # Everything below is volume work -- spike detection and multi-timeframe
         # candle evaluation -- and none of it can run on a bar whose volume is
@@ -1645,7 +1736,9 @@ class TradFiEnricher:
         # Robustly parse code, value, and role from summary HTML if absent from raw_payload
         summary_html = p.get("summary") or ""
         
-        code = p.get("transaction_code")
+        # From the parsed filing first: the collector publishes every
+        # transaction, and nothing read them, so every Form 4 became "Other".
+        code = p.get("transaction_code") or form4_dominant_code(p)
         if not code:
             code_match = re.search(r'(?:<b>Code:</b>|Code:)\s*([A-Z])', summary_html, re.IGNORECASE)
             code = code_match.group(1).upper() if code_match else "J"
@@ -1659,16 +1752,15 @@ class TradFiEnricher:
         # daily maximum of 0.20 against a correlation-window floor of 0.15 --
         # 679 events in twenty-four hours and exactly one cleared it. Two rules
         # written for this signal have never fired.
-        value = p.get("transaction_value_usd")
+        # `Size:` in the EDGAR summary is the filing's size in kilobytes, not a
+        # dollar amount. It was read as one, so a 4 KB filing became a $4 trade.
+        value = form4_code_value_usd(p, code) or p.get("transaction_value_usd")
         value_known = False
         if value:
             value = float(value)
             value_known = True
         else:
             val_match = re.search(r'(?:<b>Value:</b>|Value:)\s*\$([0-9,]+(?:\.[0-9]+)?)', summary_html, re.IGNORECASE)
-            if not val_match:
-                # EDGAR's own field name for the same quantity.
-                val_match = re.search(r'(?:<b>Size:</b>|Size:)\s*\$?([0-9,]+(?:\.[0-9]+)?)', summary_html, re.IGNORECASE)
             if val_match:
                 try:
                     value = float(val_match.group(1).replace(",", ""))

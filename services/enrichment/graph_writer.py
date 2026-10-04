@@ -170,6 +170,16 @@ class GraphWriter:
                     source_label="Aircraft", target_label="Flag",
                 )
 
+            operator = (data.get("operator_ticker") or "").strip().upper()
+            if operator:
+                # Proposed once per aircraft and callsign, inside the guard
+                # above, so a flight's thousand position fixes are one edge.
+                await self.link_entities(
+                    icao24, "OPERATED_BY", operator,
+                    properties={"confidence": 0.95, "source": "callsign_designator"},
+                    source_label="Aircraft", target_label="Company",
+                )
+
             await self._link_region(icao24, "Aircraft", data.get("region"))
         except Exception as e:
             logger.error(f"Failed to route aircraft {icao24} to Supervisor: {e}")

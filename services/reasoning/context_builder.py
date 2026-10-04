@@ -14,15 +14,20 @@ Output is a structured dict that scenario_generator.py passes to Claude.
 
 import json
 import time
+import uuid
 import math
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
  
-from shared.db import get_timescale, get_neo4j
+from shared.db import get_timescale, get_neo4j, get_redis
 from shared.models import CorrelationCluster
 from shared.models.events import UNRATED_EDGE_CONFIDENCE
+from shared.utils.instrument_reach import (
+    exposed_commodities, exposed_equities, exposure_chain, exposure_lines,
+)
+from shared.utils.ownership import holders_line, read_holders
 from shared.utils.quiet_failures import swallowed
  
 logger = logging.getLogger("reasoning.context")
@@ -105,6 +110,7 @@ class ContextBuilder:
         agent_intel = await self._fetch_agent_intel(cluster)
         active_bulletins = await self._fetch_active_bulletins(cluster.entity_ids)
         consensus_report = await self._fetch_consensus_report()
+        instrument_exposure, exposed_tickers = await self._fetch_instrument_exposure(cluster)
         
         
         all_events = ([trigger] if trigger else []) + (supporting or [])
@@ -137,6 +143,8 @@ class ContextBuilder:
             "agent_intel_briefs": agent_intel,
             "active_bulletins": active_bulletins,
             "consensus_analysis": consensus_report,
+            "instrument_exposure": instrument_exposure,
+            "exposed_tickers": exposed_tickers,
         }
 
     def _compress_event_sequence(self, events: List[Dict]) -> str:
@@ -225,6 +233,23 @@ class ContextBuilder:
     async def _fetch_events(self, event_ids: List[str]) -> List[Dict]:
         if not event_ids:
             return []
+        # Typed as uuid, not compared as text.
+        #
+        # `event_id::text = ANY($1::text[])` cast the indexed column, so every
+        # lookup scanned all of a 5.8 GB hypertable: 34.9s for three ids against
+        # 2.2s uncast, past the client's timeout. The error carried no message
+        # ("Error fetching events [...]: "), every scenario was built without
+        # its supporting events, and the entity pruning that reads them then
+        # stripped the hypotheses bare -- 7 of 8 drafts discarded after a
+        # 7-minute generation on 1 October, 0 saved.
+        ids = []
+        for raw in event_ids:
+            try:
+                ids.append(uuid.UUID(str(raw)))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return []
         try:
             # CRITICAL THINKING: Batch DB Queries.
             # Instead of looping and running `_fetch_event` N times (which creates an N+1 
@@ -236,13 +261,14 @@ class ContextBuilder:
                           headline, summary, anomaly_score,
                           vessel_data, flight_data, financial_data, prediction_market_data, crypto_data, cyber_data, tags
                    FROM events
-                   WHERE event_id::text = ANY($1::text[])
+                   WHERE event_id = ANY($1::uuid[])
                    ORDER BY occurred_at DESC""",
-                event_ids
+                ids
             )
             return [self._serialize_row(r) for r in rows]
         except Exception as e:
-            logger.error(f"Error fetching events {event_ids}: {e}")
+            # The type as well as the text: a timeout's str() is empty.
+            logger.error(f"Error fetching events {event_ids}: {type(e).__name__}: {e}")
             return []
 
     async def _fetch_entity_graph(self, entity_ids: List[str]) -> List[Dict]:
@@ -334,6 +360,68 @@ class ContextBuilder:
             logger.debug(f"Error fetching batch graph for entities {targets}: {e}")
             return []
     
+    async def _fetch_instrument_exposure(self, cluster: CorrelationCluster) -> Tuple[str, List[str]]:
+        """The companies a cluster's commodity exposure reaches: prompt lines,
+        and every ticker those lines name.
+
+        A bridge tags a tanker in Hormuz `exposes:CL=F`; the graph already
+        holds which companies rise and fall with crude. Nothing joined the two,
+        so a scenario about that tanker could name the commodity but no stock.
+        """
+        commodities = exposed_commodities(cluster.tags)[:4]
+        direct = exposed_equities(cluster.tags)[:8]
+        if not commodities:
+            lines = exposure_lines([], direct)
+            return await self._with_holders(lines, direct), direct
+        try:
+            neo4j_client = await get_neo4j()
+            rows = await neo4j_client.query("""
+                MATCH (c:Company)-[r:POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO]->(m:Commodity)
+                WHERE m.id IN $ids
+                RETURN m.id AS commodity, type(r) AS rel, coalesce(c.id, c.name) AS ticker
+            """, {"ids": commodities})
+            tickers = sorted({str(r["ticker"]).upper() for r in rows if r.get("ticker")})
+            volume: Dict[str, float] = {}
+            if tickers:
+                bars = await self._db.query(
+                    """SELECT ticker, sum(close * volume) AS dv
+                       FROM tradfi_bars
+                       WHERE ticker = ANY($1::text[]) AND time > NOW() - INTERVAL '7 days'
+                       GROUP BY ticker""",
+                    tickers,
+                )
+                volume = {str(b["ticker"]).upper(): float(b["dv"] or 0.0) for b in bars}
+            chain = exposure_chain(rows, volume)
+            named = [t for c in chain for t in c["rises"] + c["falls"]]
+            tickers = list(dict.fromkeys(named + direct))
+            return await self._with_holders(exposure_lines(chain, direct), direct + named), tickers
+        except Exception as e:
+            swallowed("reasoning.context.instrument_exposure", e, logger)
+            return exposure_lines([], direct), direct
+
+    async def _with_holders(self, lines: str, tickers: List[str]) -> str:
+        """Who holds the exposed companies, from 13F: following the money one
+        step past the instrument. The first four that have reported holders."""
+        if not lines or not tickers:
+            return lines
+        try:
+            redis_client = await get_redis()
+            raw = getattr(redis_client, "raw", redis_client)
+            held = []
+            for t in dict.fromkeys(tickers):
+                line = holders_line(t, await read_holders(raw, t))
+                if line:
+                    held.append(f"  {line}")
+                if len(held) == 4:
+                    break
+        except Exception as e:
+            swallowed("reasoning.context.holders", e, logger)
+            return lines
+        if not held:
+            return lines
+        nl = chr(10)
+        return lines + nl + "• Largest reported holders (13F, % of shares):" + nl + nl.join(held)
+
     async def _fetch_recent_news(self, cluster: CorrelationCluster) -> List[str]:
         """Fetch recent high-anomaly headlines related to the correlation."""
         try:

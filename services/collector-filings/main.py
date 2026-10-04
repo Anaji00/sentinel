@@ -83,6 +83,64 @@ except (ImportError, ModuleNotFoundError):
     _fh_spec.loader.exec_module(_fh_mod)
     poll_edgar_firehose = _fh_mod.poll_edgar_firehose
 
+try:
+    import catalysts
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _cat_spec = _ilu.spec_from_file_location(
+        "catalysts", Path(__file__).resolve().parent / "catalysts.py"
+    )
+    catalysts = _ilu.module_from_spec(_cat_spec)
+    _sys.modules["catalysts"] = catalysts
+    _cat_spec.loader.exec_module(catalysts)
+
+try:
+    import ownership
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _own_spec = _ilu.spec_from_file_location(
+        "ownership", Path(__file__).resolve().parent / "ownership.py"
+    )
+    ownership = _ilu.module_from_spec(_own_spec)
+    _sys.modules["ownership"] = ownership
+    _own_spec.loader.exec_module(ownership)
+
+try:
+    import beneficial
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _ben_spec = _ilu.spec_from_file_location(
+        "beneficial", Path(__file__).resolve().parent / "beneficial.py"
+    )
+    beneficial = _ilu.module_from_spec(_ben_spec)
+    _sys.modules["beneficial"] = beneficial
+    _ben_spec.loader.exec_module(beneficial)
+
+try:
+    import contracts
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _con_spec = _ilu.spec_from_file_location(
+        "contracts", Path(__file__).resolve().parent / "contracts.py"
+    )
+    contracts = _ilu.module_from_spec(_con_spec)
+    _sys.modules["contracts"] = contracts
+    _con_spec.loader.exec_module(contracts)
+
+
+def _cik_ticker(cik: str) -> Optional[str]:
+    """A CIK to its ticker through the full SEC registry the 13F path loads --
+    the Redis map holds only the watchlist's forty."""
+    registry = resolve_ticker_dynamically.__globals__.get("_DYNAMIC_CIK_TO_TICKER") or {}
+    try:
+        return registry.get(str(int(cik)))
+    except (TypeError, ValueError):
+        return None
+
 # SEC fair-access requires a User-Agent that identifies the requester with a
 # contact address they actually read. research@sentinel.local is not
 # deliverable, and EDGAR blocks by IP for repeated anonymous traffic -- so this
@@ -168,6 +226,14 @@ ITEM_DESCRIPTIONS = {
     "5.03": "Amendments to Articles of Incorporation or Bylaws",
     "7.01": "Regulation FD Disclosure",
     "8.01": "Other Events (Material Corporate Disclosure)",
+    "1.05": "Material Cybersecurity Incident",
+    "2.04": "Triggering Events Accelerating a Direct Financial Obligation",
+    "2.05": "Costs Associated with Exit or Disposal Activities",
+    "2.06": "Material Impairments",
+    "3.03": "Material Modification to Rights of Security Holders",
+    "4.02": "Non-Reliance on Previously Issued Financial Statements",
+    "5.07": "Submission of Matters to a Vote of Security Holders",
+    "9.01": "Financial Statements and Exhibits",
 }
 
 
@@ -277,14 +343,29 @@ async def poll_company_filings(
         items_list = recent.get("items", [])
 
         # Evaluate last 15 filings
-        count = min(15, len(forms))
-        for i in range(count):
+        # The latest fifteen filings that are not 424B2, rather than the latest
+        # fifteen. GS and MS file dozens of structured-note supplements a day,
+        # so a raw window of fifteen could hold nothing else and push an 8-K
+        # out unread.
+        considered = 0
+        for i in range(len(forms)):
+            if considered >= 15:
+                break
             form = forms[i]
+            if str(form).startswith("424B2"):
+                continue
+            considered += 1
             acc_num = accessions[i]
             if not acc_num or await dedup.is_seen(acc_num):
                 continue
 
             # We focus on 8-K, 10-K, 10-Q, S-1, S-3, 424B, 13F
+            # 424B2 is out: pricing supplements, overwhelmingly banks'
+            # structured notes -- 765 of 1,189 filings in a measured week, every
+            # one scored a flat 0.2. 424B3 (merger prospectuses), 424B4 (IPOs)
+            # and 424B5 (shelf takedowns, often equity) stay.
+            if form.startswith("424B2"):
+                continue
             if not (form.startswith("8-K") or form.startswith("10-") or form.startswith("S-") or "424B" in form or "13F" in form):
                 continue
 
@@ -505,6 +586,29 @@ async def main():
                 logger.info(f"Entity alias seed from SEC registry: {seeded} new aliases.")
             except Exception as _exc:
                 swallowed("collector_filings.main.seed_aliases", _exc)
+
+            # FINRA short volume and FDA approvals, on their own schedule. Started
+            # after the registry loads, because FDA sponsors resolve through it.
+            safe_create_task(
+                catalysts.run_forever(producer, redis_client, resolve_ticker_dynamically),
+                name="catalysts",
+            )
+            # Who owns what: full 13F holdings for the asset managers, banks and
+            # funds in shared.utils.ownership, into the graph and the API.
+            safe_create_task(
+                ownership.run_forever(producer, redis_client, resolve_ticker_dynamically),
+                name="ownership",
+            )
+            # 5%+ holders and activists, as they file (Schedule 13D/13G).
+            safe_create_task(
+                beneficial.run_forever(producer, redis_client, _cik_ticker),
+                name="beneficial",
+            )
+            # Federal contract obligations to listed companies (USAspending).
+            safe_create_task(
+                contracts.run_forever(producer, redis_client, lambda name: resolve_ticker_dynamically(name)),
+                name="contracts",
+            )
 
             # Fetch live 13F filings from SEC EDGAR on startup
             await seed_prominent_13f_reports(session, producer, redis_client)

@@ -6,11 +6,10 @@ from typing import List, Dict, Optional, Any, Union
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, Field
-from services.agents.base import SentinelAgent
+from services.agents.base import SentinelAgent, _message_score
 from shared.kafka import Topics
 from shared.utils.text import clip
 from shared.utils.quiet_failures import swallowed
-from shared.utils.entity_resolution import is_plausible_entity_name
 from shared.utils.rule_feedback import (
     firing_counts,
     firing_counts_from_history,
@@ -632,6 +631,31 @@ class RuleSynthesizerAgent(SentinelAgent):
             self.logger.debug(f"Synthesizing rules based on macro shift: {summary}")
             prompt_context = f"A new macro intelligence brief has been issued:\nSUMMARY: {summary}\nENTITIES: {entities}"
 
+        # Wait for a slot instead of asking once and being shed.
+        #
+        # Every other inferring agent defers through its candidate buffer when
+        # the shared slot is held; this one went straight to
+        # `_execute_with_telemetry`, whose claim fails whenever anyone else is
+        # mid-inference -- which, at ~38 calls an hour of ~2-3 minutes each,
+        # is most of the time. The shed is a BaseException counted quietly as
+        # the budget working. Measured: 127 messages processed, buffer
+        # offered 0, and zero completed inferences across 20-21 September
+        # while the other agents completed 655. RULE_CANDIDATES moved from 24
+        # to 30 messages in that time and none of them was ever synthesised.
+        #
+        # Placed after the dispatch above so that only a message that matched
+        # a branch can occupy the buffer. A rule candidate is the input this
+        # agent exists for -- an observed pattern no rule covers -- so within
+        # this agent's own buffer it is held ahead of the narrative inputs.
+        if message.get("type") == "rule_candidate":
+            buffer_score = 1.0
+        elif isinstance(message.get("assessment"), dict):
+            buffer_score = _message_score(message.get("assessment") or {})
+        else:
+            buffer_score = None
+        if not await self.capacity_or_defer(message, score=buffer_score):
+            return
+
         observed_types, existing_rules = await _observed_vocabulary(self)
         vocabulary = ", ".join(observed_types) if observed_types else "none measured"
         _nl = chr(10)
@@ -765,45 +789,21 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
 
-                        # 3. Route discovered entity correlations through governed ONTOLOGY_PROPOSALS (§3.7)
-                        # A tag is not an entity.
+                        # No graph edges from a rule's tags.
                         #
                         # This chained a synthesised rule's tags pairwise into
-                        # MACRO_CORRELATED edges, both endpoints labelled
-                        # `Company`, with no check that either string names a
-                        # company. That is how "0.80" -- a confidence score the
-                        # model printed into its own tag list -- became a node in
-                        # the live graph with ten correlation edges to real
-                        # issuers, and how "GLOBAL CONTEXT", a prompt heading,
-                        # became another. Both then carried degree, and
-                        # centrality is degree.
-                        #
-                        # The length ceiling was the only filter and it is the
-                        # wrong axis: "0.80" is four characters.
-                        rule_tags = [
-                            t.upper() for t in (rule.tags or [])
-                            if len(t) <= 10 and is_plausible_entity_name(t)
-                        ]
-                        if len(rule_tags) >= 2:
-                            for i in range(len(rule_tags) - 1):
-                                prop = {
-                                    "entity_id": rule_tags[i],
-                                    "action": "LINK_ENTITY",
-                                    "data": {
-                                        "target_id": rule_tags[i+1],
-                                        "source_label": "Company",
-                                        "target_label": "Company",
-                                        "relation_type": "MACRO_CORRELATED",
-                                        "weight": 0.85,
-                                        "confidence": 0.80,
-                                        "properties": {
-                                            "rule_id": rule.rule_id,
-                                            "rule_name": rule.rule_name,
-                                            "alert_tier": rule.alert_tier,
-                                        }
-                                    }
-                                }
-                                await self._producer.send(Topics.ONTOLOGY_PROPOSALS, prop, key=rule_tags[i])
+                        # MACRO_CORRELATED edges between two `Company` nodes at
+                        # a fixed weight of 0.85 and confidence of 0.80. An
+                        # earlier fix filtered out tags that could not be names
+                        # -- "0.80", "GLOBAL CONTEXT" -- but a rule's tags are
+                        # its themes, not entities, and no filter turns one into
+                        # the other. Live on 1 October the supervisor committed
+                        # EQUITY -[MACRO_CORRELATED]-> INSIDER every ten minutes,
+                        # and MARITIME -> SUSPICIOUS sat beside it: two category
+                        # words labelled as companies, asserted correlated by a
+                        # constant. A relationship between instruments comes
+                        # from statistical discovery or the edge validator,
+                        # where it is measured.
             # Prune after creating, so the rule set can shrink as well as grow.
             #
             # _evaluate_and_prune_rules is a complete engine for retiring

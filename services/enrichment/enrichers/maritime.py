@@ -38,6 +38,7 @@ from shared.utils.maritime_behaviour import (
     sts_pair,
 )
 from shared.utils.regions import classify_region, routine_band_score
+from shared.utils.osint_bridges import region_exposure_tags, vessel_exposure_tags
 from services.enrichment.anomaly_scorer import breakdown_from_score, lift_score
  
 logger = logging.getLogger("enrichment.maritime")
@@ -591,6 +592,15 @@ class MaritimeEnricher:
             lat = lon = None
         region = classify_region(lat, lon) if lat is not None else None
 
+        # What the chokepoint exposes, so a radar change reaches an instrument.
+        # The four imaged are tanker chokepoints; where the water carries no
+        # exposure of its own -- the Gulf of Guinea classifies as Nigerian
+        # Territorial -- the tanker reading of it stands in.
+        tags += (
+            region_exposure_tags(region or str(name))
+            or vessel_exposure_tags(region or str(name), "tanker")
+        )
+
         observed = payload.get("observed_on")
         headline = (
             f"{name}: radar target density {payload.get('target_density')} "
@@ -1096,6 +1106,9 @@ class MaritimeEnricher:
             tags.append(vtype.lower())
         if any("sanctioned" in f for f in flags):
             tags.append("sanctions_risk")
+        # What this vessel bears on, in instruments: the bridge from a ship to
+        # a stock. See shared/utils/osint_bridges.py.
+        tags += vessel_exposure_tags(region, vtype)
         return tags
 
     async def _watch_vessel(self, mmsi, name) -> None:

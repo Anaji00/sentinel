@@ -721,7 +721,9 @@ async def main():
         await metrics.start(redis_client)
         hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-macro"))
 
-    calendar_collector = EconomicCalendarCollector(producer=producer, poll_interval_sec=120)
+    calendar_collector = EconomicCalendarCollector(
+        producer=producer, poll_interval_sec=120, redis_client=redis_client,
+    )
 
     # Loaded by file path: this package directory is `collector-macro`, and a
     # hyphen cannot appear in a Python module path, so `services.collector_macro`
@@ -736,9 +738,12 @@ async def main():
         spec.loader.exec_module(module)
         return module
 
-    _freight = _load_sibling("freight")
+    # No freight loop. freight.py fetched nothing: it multiplied the last value
+    # by a random drift of -1.5% to +2% every three minutes and published the
+    # result as "live_measurement" -- 324 Baltic Dry, Freightos and HARPEX
+    # prints a day, on weekends too, drifting from a 1,850 seed to 4,517. Cut on
+    # 4 October; a real source goes here, not a simulated one.
     _regulatory = _load_sibling("regulatory")
-    poll_freight_indices = _freight.poll_freight_indices
     poll_federal_register = _regulatory.poll_federal_register
     RegulatoryDeduplicator = _regulatory.RegulatoryDeduplicator
     reg_dedup = RegulatoryDeduplicator(redis_client)
@@ -753,18 +758,6 @@ async def main():
             except Exception as ce:
                 logger.error(f"Economic calendar poll error: {ce}")
             await asyncio.sleep(calendar_collector.poll_interval_sec)
-
-    async def _freight_polling_loop():
-        logger.info("🚢 Supply Chain & Freight Shipping Rate loop initialized.")
-        connector = aiohttp.TCPConnector(limit=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            while True:
-                try:
-                    count = await poll_freight_indices(session, producer, redis_client)
-                    logger.info(f"🚢 Freight Index Poll: Refreshed {count} benchmarks (BDI, FBX, Harpex).")
-                except Exception as fe:
-                    logger.debug(f"Freight poll notice: {fe}")
-                await asyncio.sleep(180)
 
     async def _regulatory_polling_loop():
         logger.info("🏛️ Federal Register & Regulatory Policy loop initialized.")
@@ -809,7 +802,6 @@ async def main():
 
     treasury_task = safe_create_task(_treasury_polling_loop())
     calendar_task = safe_create_task(_calendar_polling_loop())
-    freight_task = safe_create_task(_freight_polling_loop())
     reg_task = safe_create_task(_regulatory_polling_loop())
 
     try:
@@ -825,7 +817,6 @@ async def main():
             hb_task.cancel()
         treasury_task.cancel()
         calendar_task.cancel()
-        freight_task.cancel()
         reg_task.cancel()
         await calendar_collector.close()
         await producer.flush()

@@ -52,6 +52,14 @@ POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
 
 
+# Probed on 4 October from this container: ten feeds that had returned 403, 404,
+# 500 or an empty channel for days were removed (AP, TankerTrackers, Seatrade,
+# Lloyd's List, RFE/RL, Unusual Whales, State Department, CISA, Chatham House,
+# Cyber Defense Magazine), and three that had moved were repointed (Maritime
+# Executive, Nikkei Asia, OFAC). The additions at the end were chosen by running
+# their live items through the news-to-instrument bridge: the share that named
+# a quoted company or a commodity is noted beside each, against 20% for
+# cnbc_world and 4% for aljazeera.
 FEEDS = [
     # ─── WIRE SERVICES ───
 # ─── WIRE SERVICES (Reuters Replacements) ───
@@ -60,20 +68,17 @@ FEEDS = [
     ("france24",        "https://www.france24.com/en/rss",                    "wire",       0.92),
     ("npr_world",       "https://feeds.npr.org/1004/rss.xml",                 "wire",       0.95),
     ("guardian_world",  "https://www.theguardian.com/world/rss",              "wire",       0.92),
-    ("ap_world",        "https://apnews.com/rss",                             "wire",       0.95),
     ("aljazeera",       "https://www.aljazeera.com/xml/rss/all.xml",          "wire",       0.95),
     ("nyt_world",       "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "wire",   0.90),
 
     # ─── MARITIME & LOGISTICS ───
-    ("maritime_exec",   "https://maritime-executive.com/rss-feed",            "maritime",   0.90),
-    ("tanker_trackers", "https://tankertrackers.com/feed",                    "maritime",   0.88),
-    ("seatrade",        "https://www.seatrade-maritime.com/rss/all",          "maritime",   0.85),
-    ("lloyds_list",     "https://lloydslist.com/rss",                         "maritime",   0.92),
+    ("maritime_exec",   "https://maritime-executive.com/articles.rss",            "maritime",   0.90),
     ("gcaptain",        "https://gcaptain.com/feed",                          "maritime",   0.85),
+    ("splash247",       "https://splash247.com/feed/",                        "maritime",   0.85),  # 20%
+    ("hellenic_shipping", "https://www.hellenicshippingnews.com/feed/",       "maritime",   0.80),  # 20%
 
     # ─── GEOPOLITICS & DEFENSE ───
     ("bellingcat",      "https://www.bellingcat.com/feed",                    "osint",      0.88),
-    ("rferl",           "https://www.rferl.org/api/zpqopmjpoe",               "geopolitic", 0.82),
     ("al_monitor",      "https://www.al-monitor.com/rss",                     "geopolitic", 0.82),
     ("war_on_rocks",    "https://warontherocks.com/feed",                     "defense",    0.85),
     ("defense_news",    "https://www.defensenews.com/arc/outboundfeeds/rss/", "defense",    0.88),
@@ -84,11 +89,20 @@ FEEDS = [
     ("cnbc_world",      "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "financial", 0.85),
     ("cnbc_finance",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "financial", 0.88),
     ("yahoo_finance",   "https://finance.yahoo.com/news/rssindex",            "financial",  0.85),
-    ("unusual_whales",  "https://unusualwhales.com/feed/",                    "financial",  0.80),
     ("zerohedge",       "https://feeds.feedburner.com/zerohedge/feed",        "financial",  0.60),
 
+    ("seekingalpha_currents", "https://seekingalpha.com/market_currents.xml", "financial", 0.80),   # 86%
+    ("cnbc_tech",       "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910", "financial", 0.88),  # 50%
+    ("cnbc_earnings",   "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135", "financial", 0.88),  # 40%
+    ("cnbc_energy",     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19836768", "financial", 0.88),  # 40%
+    ("marketwatch_pulse", "https://feeds.content.dowjones.io/public/rss/mw_marketpulse", "financial", 0.85),  # 13%
+
+    # ─── ENERGY & COMMODITIES ───
+    ("eia_today",       "https://www.eia.gov/rss/todayinenergy.xml",          "official",   0.97),  # 64%
+    ("oilprice",        "https://oilprice.com/rss/main",                      "financial",  0.75),  # 40%
+
     # ─── APAC FINANCIAL WIRES ───
-    ("nikkei_asia",     "https://asia.nikkei.com/rss/feed/category/53",       "financial",  0.95),
+    ("nikkei_asia",     "https://asia.nikkei.com/rss/feed/nar",       "financial",  0.95),
     ("scmp_markets",    "https://www.scmp.com/rss/91/feed",                   "financial",  0.90),
 
     # ─── CYBERSECURITY & INFRASTRUCTURE ───
@@ -102,22 +116,20 @@ FEEDS = [
     ("decrypt",         "https://decrypt.co/feed",                            "crypto",     0.80),
 
     # ─── OFFICIAL GOVERNMENT / REGULATORY ───
-    ("us_state_dept",   "https://www.state.gov/rss-feeds/press-releases/",    "official",   0.98),
     ("un_news",         "https://news.un.org/feed/subscribe/en/news/all/rss.xml", "official", 0.95),
-    ("ofac_news",       "https://home.treasury.gov/system/files/126/ofac.xml","official",   0.99),
-    ("cisa_alerts",     "https://www.cisa.gov/uscert/ncas/current-activity.xml", "official", 0.99),
+    # 0% to a ticker, kept anyway: an FOMC statement moves every instrument at once.
+    ("fed_press",       "https://www.federalreserve.gov/feeds/press_all.xml", "official",   0.99),
+    ("ofac_news",       "https://ofac.treasury.gov/rss.xml","official",   0.99),
 
     # ─── EXPANDED GEOPOLITICS & DEFENSE ───
     ("geopolitical_futures", "https://geopoliticalfutures.com/feed/", "geopolitic", 0.90),
     ("long_war_journal", "https://www.longwarjournal.org/feed", "defense", 0.88),
     ("crisis_group",    "https://www.crisisgroup.org/rss",                     "geopolitic", 0.92),
-    ("chatham_house",   "https://www.chathamhouse.org/rss.xml",                "geopolitic", 0.90),
     ("realclear_defense", "https://www.realcleardefense.com/index.xml",        "defense",    0.88),
 
     # ─── EXPANDED CYBERSECURITY ───
     ("dark_reading",    "https://www.darkreading.com/rss.xml",                 "cyber",      0.90),
     ("schneier",        "https://www.schneier.com/feed/atom/",                 "cyber",      0.95),
-    ("cyber_defense_mag", "https://www.cyberdefensemagazine.com/feed/",        "cyber",      0.85),
 
     # ─── EXPANDED OFFICIAL ───
     ("euro_parliament", "https://www.europarl.europa.eu/rss/doc/top-stories/en.xml", "official", 0.98),

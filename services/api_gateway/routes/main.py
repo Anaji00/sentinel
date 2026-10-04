@@ -28,6 +28,7 @@ logger = logging.getLogger("api-gateway-main")
 from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
+    ownership,
     auth,
     oidc,
     billing,
@@ -190,6 +191,7 @@ app.include_router(cases.router)
 app.include_router(portfolio.router)
 app.include_router(reports.router)
 app.include_router(filings.router)
+app.include_router(ownership.router)
 app.include_router(methodology.router)
 app.include_router(sovereignty.router)
 app.include_router(search.router)

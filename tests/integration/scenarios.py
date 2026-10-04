@@ -145,28 +145,36 @@ LIQUIDATION_CASCADE = Scenario(
         "miners) tracking it within the hour. It is also the clearest "
         "cross-asset contagion path this platform can observe directly."
     ),
+    # The burst carries the equities priced on the coin, as the enricher tags
+    # every BTC event (shared/utils/osint_bridges.CRYPTO_EQUITIES).
     trigger=Beat("crypto_liquidation", "BTC", 0, 0.79,
                  entity_type=EntityType.INSTRUMENT,
-                 headline="BTC perp liquidations $840m in 40 minutes",
+                 headline="Liquidation burst (LONG): $8.40M BTC in 5m, 7.0x normal",
+                 tags=["crypto", "liquidation", "liquidation_burst", "btc", "long",
+                       "exposes:COIN", "exposes:MSTR", "exposes:MARA", "exposes:RIOT",
+                       "exposes:CLSK", "exposes:HOOD"],
              source="okx_swap"),
     evidence=[
         Beat("crypto_perp_funding", "BTC", 6 * HOUR, 0.56,
              entity_type=EntityType.INSTRUMENT,
              headline="BTC funding at 0.09%, 97th percentile",
-             source="binance_futures"),
-        Beat("crypto_trade", "BTC", 30, 0.52,
+             source="okx_swap"),
+        # Spelled as the Coinbase candles spell it. The join is on the asset,
+        # and BTCUSDT and BTC are one asset.
+        Beat("market_anomaly", "BTCUSDT", 30, 0.52,
              entity_type=EntityType.INSTRUMENT,
-             headline="BTC spot -7% on 4x volume",
-             source="coinbase_spot"),
-        # After the cascade, not before it. Crypto trades overnight and the
-        # proxies gap at the open, which is the direction the word "spillover"
-        # is claiming.
-        Beat("price_anomaly", "COIN", -45, 0.58,
-             headline="COIN -9%, tracking crypto complex",
-             source="alpaca"),
+             headline="BTCUSDT 5-min candle -3.1% on 4x volume",
+             source="coinbase_candles"),
+        # Inside the window, not after the trigger. Rules are evaluated when
+        # the trigger arrives, so a proxy that moves later is never seen; the
+        # earlier version of this scenario placed COIN 45 minutes after and
+        # passed only because the harness stores the future before evaluating.
+        Beat("price_anomaly", "COIN", 20, 0.58,
+             headline="COIN -6% as the crypto complex sells off",
+             source="finnhub_equities"),
     ],
     expect_rule="rule_crypto_equity_contagion",
-    expect_evidence_types=("crypto_trade", "price_anomaly"),
+    expect_evidence_types=("market_anomaly", "price_anomaly"),
     expect_min_domains=2,
 )
 
@@ -482,12 +490,17 @@ CHOKEPOINT_TO_FREIGHT = Scenario(
 MILITARY_AIRLIFT = Scenario(
     name="Transport aircraft surge into a theatre",
     domain="aviation",
+    # Silence, asserted -- and kept, so the criterion is still written down.
     why=(
-        "Open-source flight tracking of military transports is one of the most "
-        "reliable early indicators of escalation -- it preceded both the 2021 "
-        "Kabul evacuation and the 2022 build-up. The platform collects "
-        "ADS-B; a surge that produces no finding is a collector, not an "
-        "intelligence system."
+        "Three aircraft dark or deviating in one region across sixteen hours is "
+        "the shape the platform's coverage produces on its own: measured over a "
+        "week to 3 October, Hormuz averaged 63 distinct dark aircraft every 12 "
+        "hours and the Black Sea 62, almost all of them airliners leaving ADS-B "
+        "coverage over water. Firing on it was 231 findings a day, 4 of 22 "
+        "resolved scenarios confirmed. Military transports are the real "
+        "indicator and this platform cannot yet tell one from an airliner: 7 RCH "
+        "sightings in a week, none dark. Until callsigns are classified, this "
+        "must stay silent."
     ),
     trigger=Beat(
         "flight_anomaly", "RCH512", 0, 0.76,
@@ -507,8 +520,7 @@ MILITARY_AIRLIFT = Scenario(
              headline="Second transport, same corridor, no filed plan",
              source="opensky"),
     ],
-    expect_rule="rule_aviation_activity_surge",
-    expect_evidence_types=("flight_dark",),
+    expect_rule=None,
 )
 
 
@@ -1013,19 +1025,46 @@ CORRIDOR_CLOSURE = Scenario(
         headline="Sharp deviation, no filed reroute",
     ),
     evidence=[
-        Beat("flight_dark", "QRS202", 2 * HOUR, 0.70,
+        # Inside the hour, as the scenario's own description says. The beats
+        # were two and five hours apart, which is the 48-hour shape that fired
+        # on coverage gaps.
+        Beat("flight_anomaly", "QRS202", 20.0, 0.70,
              entity_type=EntityType.AIRCRAFT, region="Black Sea",
              latitude=44.6, longitude=33.4, source="opensky",
-             headline="Transponder off over the same waters"),
-        Beat("flight_anomaly", "QRS303", 5 * HOUR, 0.66,
+             headline="Emergency squawk over the same waters"),
+        Beat("flight_anomaly", "QRS303", 40.0, 0.66,
              entity_type=EntityType.AIRCRAFT, region="Black Sea",
              latitude=43.9, longitude=34.2, source="opensky",
              headline="Third aircraft, same corridor, same hour"),
     ],
     expect_rule="rule_aviation_activity_surge",
-    expect_evidence_types=("flight_dark", "flight_anomaly"),
+    expect_evidence_types=("flight_anomaly",),
 )
 
+
+ONE_AIRCRAFT_TWICE = Scenario(
+    name="One aircraft, two anomalies, no one else",
+    domain="aviation",
+    why=(
+        "A disruption is several aircraft. Before 3 October the rule found its "
+        "own trigger in the store -- events are saved before rules run -- and "
+        "published one airliner as an 'Aviation Activity Surge' 231 times a "
+        "day. The same aircraft reporting twice is still one aircraft."
+    ),
+    trigger=Beat(
+        "flight_anomaly", "PGT895", 0, 0.82,
+        entity_type=EntityType.AIRCRAFT, region="Black Sea",
+        latitude=44.0, longitude=33.6, source="opensky",
+        headline="Emergency squawk",
+    ),
+    evidence=[
+        Beat("flight_anomaly", "PGT895", 25.0, 0.78,
+             entity_type=EntityType.AIRCRAFT, region="Black Sea",
+             latitude=44.1, longitude=33.5, source="opensky",
+             headline="Same aircraft, earlier in the hour"),
+    ],
+    expect_rule=None,
+)
 
 # ── MACRO ───────────────────────────────────────────────────────────────────
 
@@ -1159,6 +1198,7 @@ ALL_SCENARIOS = [
     TWO_TANKERS_DARK,
     DARK_IN_DIFFERENT_STRAITS,
     CORRIDOR_CLOSURE,
+    ONE_AIRCRAFT_TWICE,
     PAYROLLS_SURPRISE,
     MACRO_UNRELATED_TICKERS,
     ELECTION_CONTRACT,

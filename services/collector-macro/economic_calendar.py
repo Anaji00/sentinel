@@ -22,15 +22,35 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import uuid
 import aiohttp
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any
 
-from shared.models import NormalizedEvent, EventType, EntityType, Entity, MacroReleaseData, AnomalyBreakdown
+from shared.models import NormalizedEvent, EventType, EntityType, Entity, MacroReleaseData, AnomalyBreakdown, RawEvent
 from shared.kafka import SentinelProducer, Topics
 
 from shared.utils.quiet_failures import dropped, swallowed
+
+import importlib.util as _ilu
+import time as _time
+from pathlib import Path as _Path
+
+
+def _load_fred():
+    """The sibling module, by path: `collector-macro` is not importable by name."""
+    spec = _ilu.spec_from_file_location(
+        "collector_macro_fred_releases", str(_Path(__file__).parent / "fred_releases.py")
+    )
+    module = _ilu.module_from_spec(spec)
+    # Registered first: @dataclass resolves its module through sys.modules.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+fred = _load_fred()
 
 logger = logging.getLogger("feed.macro_calendar")
 
@@ -63,7 +83,7 @@ INDICATOR_PROFILES = {
         "aliases": ["UNEMPLOYMENT", "JOBLESS RATE"],
     },
     "FOMC_RATE_DECISION": {
-        "unit": "bps",
+        "unit": "%",
         "description": "Federal Reserve Target Fed Funds Rate Upper Bound",
         "higher_is": "HAWKISH_TIGHTENING",
         "aliases": ["FOMC", "FED FUNDS", "RATE DECISION", "INTEREST RATE"],
@@ -92,6 +112,17 @@ INDICATOR_PROFILES = {
         "higher_is": "INFLATIONARY_HAWKISH",
         "aliases": ["CORE PCE", "PCE CORE"],
     },
+    # Market conditions from FRED, announced on a large weekly move.
+    "HY_OAS": {"unit": "%", "description": "US High Yield Option-Adjusted Spread",
+               "higher_is": "CREDIT_STRESS", "aliases": []},
+    "IG_OAS": {"unit": "%", "description": "US Investment Grade Option-Adjusted Spread",
+               "higher_is": "CREDIT_STRESS", "aliases": []},
+    "CURVE_10Y2Y": {"unit": "%", "description": "10-Year minus 2-Year Treasury Spread",
+                    "higher_is": "STEEPENING", "aliases": []},
+    "CURVE_10Y3M": {"unit": "%", "description": "10-Year minus 3-Month Treasury Spread",
+                    "higher_is": "STEEPENING", "aliases": []},
+    "NFCI": {"unit": "", "description": "Chicago Fed National Financial Conditions Index",
+             "higher_is": "TIGHTENING", "aliases": []},
 }
 
 
@@ -101,11 +132,18 @@ class EconomicCalendarCollector:
     EventType.MACRO_RELEASE events with quantified surprise metrics.
     """
 
-    def __init__(self, producer: Optional[SentinelProducer] = None, poll_interval_sec: int = 120):
+    def __init__(
+        self,
+        producer: Optional[SentinelProducer] = None,
+        poll_interval_sec: int = 120,
+        redis_client: Any = None,
+    ):
         self.producer = producer
         self.poll_interval_sec = poll_interval_sec
+        self.redis = redis_client
         self._session: Optional[aiohttp.ClientSession] = None
         self._seen_releases: set = set()
+        self._fred_polled_at: float = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -199,6 +237,8 @@ class EconomicCalendarCollector:
         country: str = "US",
         period: Optional[str] = None,
         source: str = "economic_calendar",
+        occurred_at: Optional[datetime] = None,
+        detail: str = "",
     ) -> NormalizedEvent:
         """Constructs a validated NormalizedEvent for a macroeconomic release."""
         surprise, surprise_pct, bias, anomaly_score = self.compute_surprise(
@@ -224,10 +264,39 @@ class EconomicCalendarCollector:
             raw_source=source,
         )
 
+        # Measured against the prior reading when no consensus was supplied,
+        # and worded that way. FRED publishes values, not forecasts, and a
+        # change from last month called a "surprise" claims an expectation
+        # nobody gave.
+        has_consensus = forecast is not None
+        extra = f" ({detail})" if detail else ""
+        prior_text = f"{previous}{unit}" if previous is not None else "N/A"
+        if has_consensus:
+            headline = (
+                f"📊 Macro Release: {indicator} Actual {actual}{unit} vs Forecast {forecast}{unit} "
+                f"(Surprise: {surprise:+0.2f}{unit}, Bias: {bias})"
+            )
+            summary = (
+                f"Official {desc} release for {country}{period_str}. Actual: {actual}{unit}, "
+                f"Consensus: {forecast}{unit}, Prior: {prior_text}. "
+                f"Surprise magnitude: {surprise_pct:+.1f}%. Directional bias: {bias}."
+            )
+        else:
+            headline = (
+                f"📊 Macro Release: {indicator} {actual}{unit} vs prior {prior_text} "
+                f"(change {surprise:+0.2f}{unit}){extra}"
+            )
+            summary = (
+                f"Official {desc} release for {country}{period_str}. Actual: {actual}{unit}, "
+                f"Prior: {prior_text}{extra}. No consensus forecast is available from this "
+                f"source, so the change is measured against the prior reading. Directional "
+                f"reading of the change: {bias}."
+            )
+
         event = NormalizedEvent(
             event_id=f"macro_{indicator.lower()}_{uuid.uuid4().hex[:8]}",
             type=EventType.MACRO_RELEASE,
-            occurred_at=datetime.now(timezone.utc),
+            occurred_at=occurred_at or datetime.now(timezone.utc),
             collected_at=datetime.now(timezone.utc),
             source=source,
             source_reliability=0.98,
@@ -237,8 +306,8 @@ class EconomicCalendarCollector:
                 type=EntityType.INSTRUMENT,
                 flags=["macro_economic_release"],
             ),
-            headline=f"📊 Macro Release: {indicator} Actual {actual}{unit} vs Forecast {forecast or 'N/A'}{unit} (Surprise: {surprise:+0.2f}{unit}, Bias: {bias})",
-            summary=f"Official {desc} release for {country}{period_str}. Actual: {actual}{unit}, Consensus: {forecast or 'N/A'}{unit}, Prior: {previous or 'N/A'}{unit}. Surprise magnitude: {surprise_pct:+.1f}%. Directional bias: {bias}.",
+            headline=headline,
+            summary=summary,
             region="US",
             country_code=country,
             anomaly_score=anomaly_score,
@@ -249,12 +318,18 @@ class EconomicCalendarCollector:
                 domain="financial",
             ),
             macro_data=macro_data,
-            tags=["macro_release", f"indicator:{indicator.lower()}", f"bias:{bias.lower()}"],
+            tags=["macro_release", f"indicator:{indicator.lower()}", f"bias:{bias.lower()}"]
+                 + ([] if has_consensus else ["no_consensus"]),
         )
         return event
 
     async def poll_and_publish(self) -> List[NormalizedEvent]:
         """Polls economic calendar releases and publishes new events to Kafka."""
+        # FRED when it is configured, and not Finnhub as well: the Finnhub
+        # calendar is premium on this key and can only ever answer 403.
+        if fred.FRED_API_KEY:
+            return await self.poll_fred()
+
         events_published = []
         raw_calendar = await self.fetch_finnhub_calendar()
 
@@ -305,12 +380,135 @@ class EconomicCalendarCollector:
                 # macro release was adding to it, which is how a signal becomes
                 # unreadable -- the one instrument for this class of defect,
                 # reporting a deliberate duplicate as a lost feed.
-                await self.producer.send(Topics.ENRICHED_EVENTS, event.model_dump(), key=event.primary_entity.id)
+                await self._publish(event)
                 logger.info(f"📊 Emitted Macro Release Event: {event.headline}")
 
             events_published.append(event)
 
         return events_published
+
+    async def _publish(self, event: NormalizedEvent) -> None:
+        """Through enrichment, so the release is persisted as well as read.
+
+        Sent straight to ENRICHED_EVENTS it reached the agents and nothing
+        wrote it to the events table. Wrapped as a RawEvent whose payload
+        carries the finished event, the tradfi enricher passes it through
+        unchanged -- it does not re-score it -- and the enrichment service
+        stores and publishes it like any other.
+        """
+        raw = RawEvent(
+            source=event.source,
+            occurred_at=event.occurred_at,
+            raw_payload={"normalized_event": event.model_dump(mode="json")},
+        )
+        await self.producer.send(Topics.RAW_TRADFI, raw.model_dump(), key=event.primary_entity.id)
+
+    async def poll_fred(self) -> List[NormalizedEvent]:
+        """New releases from FRED, at most once per FRED_POLL_INTERVAL_SEC."""
+        now_mono = _time.monotonic()
+        if self._fred_polled_at and now_mono - self._fred_polled_at < fred.FRED_POLL_INTERVAL_SEC:
+            return []
+        self._fred_polled_at = now_mono
+
+        published: List[NormalizedEvent] = []
+        session = await self._get_session()
+        raw = getattr(self.redis, "raw", self.redis) if self.redis is not None else None
+        now = datetime.now(timezone.utc)
+        for series in fred.FRED_SERIES:
+            try:
+                observations, last_updated = await fred.fetch_series(session, series)
+            except Exception as e:
+                swallowed("collector_macro.fred_fetch", e, logger, variant=series.series_id)
+                continue
+            release = fred.release_from_observations(series, observations)
+            if release is None:
+                dropped(
+                    "collector_macro.fred_insufficient_history",
+                    "not enough observations to compute the release",
+                    logger, variant=series.series_id,
+                )
+                continue
+            last_seen = None
+            if raw is not None:
+                try:
+                    stored = await raw.hget(fred.FRED_STATE_KEY, series.series_id)
+                    last_seen = stored.decode() if isinstance(stored, bytes) else stored
+                except Exception as e:
+                    # Without the record a restart would re-announce; skip
+                    # this series until it can be read.
+                    swallowed("collector_macro.fred_state_read", e, logger)
+                    continue
+            new = fred.is_new_release(series, release, last_seen, last_updated, now)
+            if raw is not None:
+                await raw.hset(fred.FRED_STATE_KEY, series.series_id, fred.state_marker(series, release))
+            if not new:
+                continue
+            event = self.build_macro_release_event(
+                indicator=series.indicator,
+                actual=release["actual"],
+                forecast=None,
+                previous=release["previous"],
+                period=release["period"],
+                source="fred",
+                occurred_at=last_updated,
+                detail=release.get("detail", ""),
+            )
+            if self.producer:
+                await self._publish(event)
+            logger.info("📊 Emitted FRED release: %s", event.headline)
+            published.append(event)
+        published += await self._poll_fred_context(session, raw)
+        return published
+
+    async def _poll_fred_context(self, session, raw) -> List[NormalizedEvent]:
+        """Spreads, curve and conditions: stored as context, announced on a big move."""
+        readings: Dict[str, Dict[str, Any]] = {}
+        announced: List[NormalizedEvent] = []
+        for series in fred.FRED_CONTEXT_SERIES:
+            try:
+                observations, last_updated = await fred.fetch_series(session, series)
+            except Exception as e:
+                swallowed("collector_macro.fred_context_fetch", e, logger, variant=series.series_id)
+                continue
+            reading = fred.context_reading(series, observations)
+            if reading is None:
+                continue
+            readings[series.indicator] = reading
+            if not reading["notable"] or raw is None:
+                continue
+            marker = f"move:{reading['date']}"
+            try:
+                if await raw.hget(fred.FRED_STATE_KEY, series.series_id) in (marker, marker.encode()):
+                    continue
+                await raw.hset(fred.FRED_STATE_KEY, series.series_id, marker)
+            except Exception as e:
+                swallowed("collector_macro.fred_context_state", e, logger)
+                continue
+            event = self.build_macro_release_event(
+                indicator=series.indicator,
+                actual=reading["value"],
+                forecast=None,
+                previous=reading["week_ago"],
+                period=reading["date"],
+                source="fred",
+                occurred_at=last_updated,
+                detail="1-week change" + (", crossed zero" if reading["crossed_zero"] else ""),
+            )
+            if self.producer:
+                await self._publish(event)
+            logger.info("📊 Emitted FRED market move: %s", event.headline)
+            announced.append(event)
+        if readings and raw is not None:
+            try:
+                await raw.set(
+                    fred.FRED_CONTEXT_KEY,
+                    json.dumps({"line": fred.context_line(readings), "readings": readings,
+                                "as_of": datetime.now(timezone.utc).isoformat()}),
+                    ex=3 * 86400,
+                )
+            except Exception as e:
+                swallowed("collector_macro.fred_context_store", e, logger)
+        return announced
 
     async def close(self):
         if self._session and not self._session.closed:

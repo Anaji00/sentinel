@@ -19,6 +19,7 @@ from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.models.events import FlightData
 from shared.utils.heartbeat import record_scan_suppression,  is_component_healthy
 from shared.utils.quiet_failures import swallowed
+from shared.utils.airlines import operator_ticker
 
 logger = logging.getLogger("enrichment.aviation_gap_detector")
 
@@ -361,6 +362,8 @@ class AviationGapDetector:
                         "dark_aircraft",
                         "adsb_gap",
                         region.lower().replace(" ", "_") if region else None,
+                        # The listed operator, so a gap reaches a stock.
+                        f"exposes:{operator_ticker(callsign)}" if operator_ticker(callsign) else None,
                     ])),
                 )
                 

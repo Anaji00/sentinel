@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_MEDIUM_SEC
 from shared.kafka import Topics
 from shared.utils import quant_calc
+from shared.utils.form4 import code_value_usd as form4_code_value_usd, dominant_code as form4_dominant_code
 from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.tasks import safe_create_task
 from shared.utils.focus import prioritise
@@ -34,7 +35,7 @@ from shared.utils.regime import current_regime
 import numpy as np
 from shared.models.events import entity_cache_key, UNRATED_EDGE_CONFIDENCE
 from shared.models.events import AlertTier, CorrelationCluster
-from shared.utils.equities import is_major_crypto, is_valid_primary_equity_async
+from shared.utils.equities import is_collected_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.candles import candle_cache_key
@@ -246,7 +247,7 @@ class FinancialAdviceBrief(BaseModel):
 
 from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.rates import risk_free_rate
 
 
@@ -302,6 +303,18 @@ class QuantTradingEngine(SentinelAgent):
 
         # ── 1. SEC FORM 4 INSIDER TRADE HANDLER ────────────────────────────────
         if source == "sec_form4" or "insider" in event_type:
+            # Each filing arrives twice: raw from RAW_TRADFI, carrying the parsed
+            # document, and enriched from ENRICHED_EVENTS, which keeps none of
+            # it. Recording both put every filing in the 14-day window twice,
+            # the second time as an unnamed "Corporate Insider" -- only the raw
+            # copy can say who traded and how much.
+            if not isinstance(message.get("raw_payload"), dict):
+                dropped(
+                    "agents.quant_trading_engine.form4_enriched_copy",
+                    "the enriched copy of a Form 4 already counted from its raw message",
+                    logger,
+                )
+                return None
             return await self._process_insider_form4(message, raw)
 
         trig = message.get("trigger") or {}
@@ -357,7 +370,7 @@ class QuantTradingEngine(SentinelAgent):
         # stored, and then refused one step before anything could use it.
         if not (
             await is_valid_primary_equity_async(ticker, redis_client=self.redis)
-            or is_major_crypto(ticker)
+            or is_collected_crypto(ticker)
         ):
             return None
 
@@ -1904,7 +1917,11 @@ Return raw JSON matching schema:"""
         #
         # OTHER trades are recorded and excluded from the buy/sell arithmetic:
         # the filing happened, and what it was is unknown.
-        tx_code = str(raw.get("transaction_code") or raw.get("trade_type") or "").upper()
+        # The parsed filing states the code; nothing wrote `transaction_code`,
+        # so every trade was OTHER and no cluster could ever have a buyer.
+        tx_code = str(
+            raw.get("transaction_code") or form4_dominant_code(raw) or raw.get("trade_type") or ""
+        ).upper()
         if tx_code in ("P", "PURCHASE", "BUY", "ACQUISITION"):
             tx_type = "BUY"
         elif tx_code in ("S", "SALE", "SELL", "D", "DISPOSITION"):
@@ -1931,7 +1948,10 @@ Return raw JSON matching schema:"""
         price = _positive_or_none(
             raw.get("price"), raw.get("price_per_share"), raw.get("transaction_price")
         )
-        stated_total = _positive_or_none(raw.get("total_value_usd"), raw.get("notional_usd"))
+        stated_total = _positive_or_none(
+            form4_code_value_usd(raw, tx_code if tx_code in ("P", "S") else None),
+            raw.get("total_value_usd"), raw.get("notional_usd"),
+        )
         total_usd = stated_total if stated_total is not None else (
             shares * price if (shares is not None and price is not None) else None
         )

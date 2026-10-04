@@ -231,6 +231,21 @@ def apply_display_text(e) -> None:
             e.summary = f"Sentinel Multi-Domain Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}. Provenance tags: {', '.join(e.tags or [])}."
 
 
+# How often the detectors' recent points are saved. A restart loses at most
+# this much history, against the whole warm-up window it lost before.
+DETECTOR_SAVE_INTERVAL_SEC = 300
+
+
+async def _detector_state_loop(scorer):
+    """Saves the detectors' recent points so a restart does not start them cold."""
+    while True:
+        await asyncio.sleep(DETECTOR_SAVE_INTERVAL_SEC)
+        try:
+            await scorer.save_detector_state()
+        except Exception as exc:
+            swallowed("enrichment.detector_state_save", exc, logger)
+
+
 async def _heartbeat_loop(state: dict):
     """Periodic heartbeat for operational visibility."""
     while True:
@@ -688,6 +703,36 @@ FANOUT_EXEMPT_TAGS = frozenset({
 })
 
 
+# Position fixes that carry no finding.
+#
+# Measured on 3 October: vessel and aircraft positions were 82% of every event
+# the platform stored and fanned out, at a mean anomaly of 0.05, and no vessel or
+# aircraft node has ever had an edge to a company. The cascade engine already
+# discards positions under 0.30 on arrival. They still run through the enrichers,
+# which keep `vessel:last_seen` / `aircraft:last_seen` (what the gap detectors
+# read) and the vessel position tables current; what they no longer do is take a
+# row in `events` and a seat in ten agent inboxes. A position that scores, or
+# carries a categorical tag, still does both.
+ROUTINE_POSITION_TYPES = frozenset({"vessel_position", "flight_position", "vessel_static"})
+ROUTINE_POSITION_FLOOR = 0.30
+ROUTINE_POSITION_EXEMPT_TAGS = frozenset({"sanctions_risk"})
+
+
+def _is_routine_position(event) -> bool:
+    """A position fix with nothing to say: below the floor and untagged."""
+    etype = getattr(getattr(event, "type", None), "value", getattr(event, "type", None))
+    if etype not in ROUTINE_POSITION_TYPES:
+        return False
+    try:
+        score = float(getattr(event, "anomaly_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if score >= ROUTINE_POSITION_FLOOR:
+        return False
+    tags = set(getattr(event, "tags", None) or [])
+    return not (tags & (FANOUT_EXEMPT_TAGS | ROUTINE_POSITION_EXEMPT_TAGS))
+
+
 def _is_below_fanout_floor(event) -> bool:
     """Whether an event is one the scorer already judged to carry nothing."""
     try:
@@ -737,6 +782,19 @@ async def main():
     await dlq.start()
     neo4j = await get_neo4j()
     scorer = DynamicAnomalyScorer(redis, neo4j_client=neo4j)
+    # Before the consumer starts, so nothing inserts while the replay runs.
+    try:
+        restored = await scorer.restore_detector_state()
+        if restored:
+            logger.info(
+                "Warmed %d detector(s) from saved state: %d points replayed.",
+                len(restored), sum(restored.values()),
+            )
+    except Exception as exc:
+        swallowed("enrichment.detector_state_restore", exc, logger)
+    detector_state_task = safe_create_task(
+        _detector_state_loop(scorer), name="detector-state-save"
+    )
     db = DBWriter(timescale)
     graph = GraphWriter(producer)
     safe_create_task(
@@ -784,6 +842,7 @@ async def main():
     processed = 0
     errors = 0
     _fanout_skipped = 0
+    _routine_positions_held = 0
     heartbeat_state = {
         "processed": 0,
         "errors": 0,
@@ -948,6 +1007,22 @@ async def main():
                         if isinstance(r, Exception):
                             logger.error(f"DLQ delivery / aux dispatch failed: {r}", exc_info=r)
                             batch_success = False  # Gate offset commit on DLQ delivery success
+
+                # Routine positions stop here, after the enrichers ran and the
+                # vessel tables were written above. See ROUTINE_POSITION_TYPES.
+                if batch_to_write:
+                    kept = [e for e in batch_to_write if not _is_routine_position(e)]
+                    held = len(batch_to_write) - len(kept)
+                    if held:
+                        before = _routine_positions_held
+                        _routine_positions_held += held
+                        batch_to_write = kept
+                        if before // 20000 != _routine_positions_held // 20000 or before == 0:
+                            logger.info(
+                                "Held %s routine position fix(es) out of events and the "
+                                "agent fan-out; last_seen and the vessel tables are current.",
+                                _routine_positions_held,
+                            )
 
                 # Pre-computed cross-domain signal injection pass & payload summary enrichment
                 if batch_to_write:
@@ -1169,6 +1244,11 @@ async def main():
         heartbeat_task.cancel()
         hb_shared_task.cancel()
         gap_task.cancel()
+        detector_state_task.cancel()
+        try:
+            await scorer.save_detector_state()
+        except Exception as exc:
+            swallowed("enrichment.detector_state_save", exc, logger, variant="shutdown")
         try:
             await asyncio.gather(gap_task, heartbeat_task, return_exceptions=True)
         except asyncio.CancelledError:

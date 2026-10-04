@@ -15,7 +15,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 import inspect
 import time
 
@@ -91,7 +91,9 @@ from shared.utils.freshness import is_stale as _shared_is_stale
 from shared.utils.tasks import safe_create_task
 from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.backpressure import is_under_pressure
+from shared.utils.instrument_reach import exposure_tags
 from shared.utils.metrics import MetricsCollector
+from shared.utils.rule_feedback import deprecated_by_evidence
 from shared.utils.counterparty import is_null_address
 from shared.models.events import event_domain
 
@@ -186,7 +188,7 @@ def _assert_rules_can_see_their_evidence(rules) -> None:
         )
 
 
-RULE_DEFINITION_VERSION = 7
+RULE_DEFINITION_VERSION = 9
 
 # What each tier is allowed to claim, per hour, before it stops being that tier.
 #
@@ -413,17 +415,23 @@ SHIPPED_RULES = [
         # sequence: after the liquidation, inside the session.
         "correlations": [
             {
-                "event_types": ["crypto_trade", "crypto_transfer"],
+                "event_types": ["crypto_liquidation", "market_anomaly", "crypto_trade", "crypto_transfer"],
                 "hours": 24,
                 "min_anomaly": 0.25,
                 "same_entity": True,
             },
+            # The equity leg, joined to the coin through the equities priced on
+            # it (COIN, MSTR, the miners, HOOD), which crypto events now carry as
+            # exposes: tags. It was "follows the trigger within 240 minutes" --
+            # evidence from after an event that rules evaluate on arrival, so it
+            # could never be present -- with no join, so any equity would have
+            # done. Co-movement within four hours either side is the claim the
+            # data can support; which moved first is not.
             {
                 "event_types": ["equity_block", "market_anomaly", "price_anomaly", "options_flow"],
-                "hours": 24,
+                "hours": 4,
                 "min_anomaly": 0.25,
-                "follows_trigger": True,
-                "within_minutes": 240,
+                "shared_tags": True,
             },
         ],
         "alert_tier": "ELEVATED",
@@ -504,16 +512,24 @@ SHIPPED_RULES = [
     },
     {
         "rule_id": "rule_aviation_activity_surge",
-        "rule_name": "Aviation Activity Surge",
-        "trigger_event_type": ["flight_dark", "flight_anomaly"],
-        "conditions": {"min_anomaly": 0.25},
-        # Transponders going dark and flight profiles that do not match a filed
-        # plan, clustered in one theatre. This is the open-source indicator that
-        # preceded both the 2021 Kabul evacuation and the 2022 build-up, and the
-        # platform has been collecting ADS-B for it the whole time.
+        "rule_name": "Airspace Disruption",
+        "trigger_event_type": ["flight_anomaly"],
+        "conditions": {"min_anomaly": 0.60},
+        # Several aircraft in trouble in one airspace inside the hour: the
+        # signature of jamming, a closure or an incident. Redefined on 3
+        # October from "any dark or anomalous flight in the region within 48
+        # hours", which fired 231 times a day, mostly on one airliner matching
+        # itself, and confirmed 4 of 22 scenarios that resolved.
+        #
+        # Dark aircraft are not evidence here. Measured over a week, Hormuz
+        # averaged 63 distinct dark aircraft per 12 hours and the Black Sea 62:
+        # coverage gaps over water, which no fixed count separates from a
+        # build-up. Two or more distinct aircraft with an anomaly of 0.60 or
+        # more in one region within an hour occurred in about nine hours a
+        # week each over the Black Sea and the Turkish Straits.
         "correlations": [{
-            "event_types": ["flight_dark", "flight_anomaly", "vessel_dark"],
-            "hours": 48, "min_anomaly": 0.25, "region": True,
+            "event_types": ["flight_anomaly"],
+            "hours": 1, "min_anomaly": 0.60, "region": True, "other_entity": True,
         }],
         "alert_tier": "ELEVATED",
         "expires_at": int(time.time()) + 315360000,
@@ -551,8 +567,14 @@ SHIPPED_RULES = [
         # the crypto domain: reserves move off the exchange, redemption volume
         # spikes, forced unwinds follow. Joined by the asset, because that is
         # genuinely what connects them.
+        # Liquidations and the asset's own price anomalies added on 4 October.
+        # Its evidence was trades and transfers, neither of which had a live
+        # producer, so the rule could fire only on a trigger matching itself.
+        # same_entity now compares instrument identity, so BTCUSDT candles and
+        # a BTC funding print are one asset.
         "correlations": [{
-            "event_types": ["crypto_trade", "crypto_transfer", "crypto_perp_funding"],
+            "event_types": ["crypto_liquidation", "market_anomaly", "crypto_perp_funding",
+                            "crypto_trade", "crypto_transfer"],
             "hours": 24, "min_anomaly": 0.25, "same_entity": True,
         }],
         "alert_tier": "ELEVATED",
@@ -594,6 +616,44 @@ for _shipped in SHIPPED_RULES:
 
 # What this build ships, by rule_id.
 _shipped_rules_cache: dict = {r["rule_id"]: r for r in SHIPPED_RULES}
+
+
+# Re-read at most this often. The semantic path runs per event; the verdict
+# record changes a few times an hour.
+SEMANTIC_DEPRECATION_CHECK_SEC = 60.0
+SEMANTIC_RULE_ID = "SEMANTIC_001"
+_semantic_deprecation = {"checked_at": 0.0, "deprecated": False}
+
+
+async def _semantic_rule_deprecated(redis_client) -> bool:
+    """Whether SEMANTIC_001's own verdict record has retired it.
+
+    The rule synthesiser deprecates by deleting a rule from the store, and
+    SEMANTIC_001 is not in the store -- it is emitted by the code below -- so
+    the deletion was a no-op that logged as a success. On 1 October it was
+    "deprecated" nine times in twenty minutes at 28 negative of 29 verdicts,
+    and produced 52 of the 60 correlations in the same window.
+
+    Cached, and fail-open: a Redis error keeps the path running, because
+    silencing the platform's main correlation path on a transient read error
+    is a worse failure than one more cluster an analyst would deny.
+    """
+    now = time.monotonic()
+    if now - _semantic_deprecation["checked_at"] < SEMANTIC_DEPRECATION_CHECK_SEC:
+        return _semantic_deprecation["deprecated"]
+    _semantic_deprecation["checked_at"] = now
+    try:
+        retired = await deprecated_by_evidence(redis_client, SEMANTIC_RULE_ID)
+    except Exception as exc:
+        swallowed("correlation.semantic_deprecation_check", exc, logger)
+        retired = False
+    if retired and not _semantic_deprecation["deprecated"]:
+        logger.warning(
+            "SEMANTIC_001 is retired by its verdict record; semantic clusters "
+            "are suppressed until the record ages out."
+        )
+    _semantic_deprecation["deprecated"] = retired
+    return retired
 
 
 async def _reconcile_shipped_rules(redis_client) -> None:
@@ -648,6 +708,18 @@ async def _reconcile_shipped_rules(redis_client) -> None:
         if stored is not None and int(stored.get("definition_version", 0)) >= int(
             shipped.get("definition_version", 0)
         ):
+            continue
+        if stored is None and await deprecated_by_evidence(redis_client, rule_id):
+            # Absent because its record retired it, not because it was never
+            # installed. Reinstalling here undid the verdict on every restart:
+            # rule_maritime_chokepoint_evasion was deprecated at 33 negative
+            # of 34 and would have been back after the next deploy. The
+            # record ages out 30 days after its last verdict, and the rule
+            # returns then.
+            logger.info(
+                "Not reinstalling shipped rule %s: its verdict record deprecated it.",
+                rule_id,
+            )
             continue
         (updated if stored is not None else installed).append(rule_id)
         try:
@@ -788,6 +860,12 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     # related by the strait rather than by identity.
                     hits = await store.get_recent(
                         corr.get("event_types"),
+                        # Never the trigger as its own evidence. Events are
+                        # stored before rules run, so a clause listing the
+                        # trigger's own type and region found the trigger: one
+                        # airliner losing ADS-B over the Gulf was published as
+                        # an "Aviation Activity Surge" of one, 231 times a day.
+                        exclude_event_id=str(event.event_id),
                         hours=corr.get("hours", 48),
                         min_anomaly=corr.get("min_anomaly", 0.0),
                         min_abs_move_pct=corr.get("min_abs_move_pct"),
@@ -846,6 +924,14 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     # Opt-in, so every existing rule behaves exactly as before.
                     hits = _apply_temporal_constraint(hits, corr, trigger_epoch)
                     hits = _apply_join_requirement(hits, corr, rule, event)
+                    # Evidence from a different subject, for rules whose claim
+                    # is "several of them" -- several aircraft, several vessels.
+                    # Opt-in: the same name twice is the point of same_entity.
+                    if corr.get("other_entity") and entity_id not in (None, "UNKNOWN"):
+                        hits = [
+                            h for h in hits
+                            if str(h.get("entity_id") or "").upper() != str(entity_id).upper()
+                        ]
 
                     if hits:
                         matched_clauses += 1
@@ -1128,6 +1214,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         tags=["dynamic_rule", "ai_generated", f"entity:{entity_name}", f"trigger_anomaly_{event.anomaly_score:.2f}"]
                             + [f"domain:{d}" for d in sorted(domains_triggered)]
                             + rule.get("tags", [])
+                            + exposure_tags(event.tags, *(e.get("tags") for e in supporting_events))
                     )
                     clusters.append(cluster)
             except Exception as e:
@@ -1525,6 +1612,13 @@ def _fold(raw) -> set:
             and text != "unknown"
         ):
             tokens.add(text)
+            # An exposure names its instrument. `exposes:cl=f` stayed a single
+            # opaque token, so a tanker going dark in Hormuz, a radar reading
+            # or an oil headline could never join a crude price move under
+            # `shared_tags` -- every bridge reached the reasoning gate and none
+            # reached a rule.
+            if text.startswith("exposes:") and len(text) > len("exposes:"):
+                tokens.add(text[len("exposes:"):])
     return tokens
 
 
@@ -2115,7 +2209,44 @@ async def main():
     # Track active story cluster IDs to deduplicate correlation attempts
     _story_correlation_seen = set()
 
-    cascade_engine = GeopoliticalCascadeEngine(window_seconds=3600, hawkes_tracker=hawkes_correlator._tracker)
+    cascade_engine = GeopoliticalCascadeEngine(
+        window_seconds=3600, hawkes_tracker=hawkes_correlator._tracker,
+        # A single-domain storm is a region busier than its own last 12 hours.
+        storm_baseline_hours=12,
+    )
+
+    async def _seed_cascade_baseline() -> None:
+        """The last 12 hours of per-key counts, from the events table.
+
+        Keyed and filtered as ingest_event keys and filters, so the seeded
+        history is the history the engine would have counted had it been up.
+        """
+        hours = cascade_engine.storm_baseline_hours
+        now = time.time()
+        start_hour = int(now // 3600) - hours
+        try:
+            async with db_client._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT lower(coalesce(nullif(region, ''), primary_entity_id, 'unknown')) AS key,
+                              floor(extract(epoch from collected_at) / 3600)::bigint AS hour,
+                              count(*) AS n
+                       FROM events
+                       WHERE collected_at >= to_timestamp($1 * 3600)
+                         AND type <> 'crypto_transfer'
+                         AND NOT (type IN ('vessel_position', 'flight_position') AND anomaly_score < 0.30)
+                       GROUP BY 1, 2""",
+                    start_hour, timeout=300,
+                )
+        except Exception as e:
+            swallowed("correlation.cascade_baseline_seed", e, logger)
+            return
+        counts: Dict[str, Dict[int, int]] = {}
+        for r in rows:
+            counts.setdefault(r["key"], {})[int(r["hour"])] = int(r["n"])
+        seeded = cascade_engine.seed_history(counts, start_hour, now)
+        logger.info("Cascade storm baseline seeded for %d key(s) from the last %d hours.", seeded, hours)
+
+    safe_create_task(_seed_cascade_baseline())
 
     async def _stream_live_correlation(c: CorrelationCluster):
         # Offer this cluster's subject to the swarm's focus set.
@@ -2380,6 +2511,7 @@ async def main():
                             ["hawkes_excitation"]
                             + (["cross_domain"] if top_forecast["source_domain"] != top_forecast["target_domain"] else ["self_excitation"])
                             + [f"src:{top_forecast['source_domain']}", f"tgt:{top_forecast['target_domain']}"]
+                            + exposure_tags(event.tags)
                         )
                     )
                     await store.save_correlation(forecast_cluster)
@@ -2567,7 +2699,19 @@ async def main():
                     # compile-time SyntaxError that crash-looped the service.
                     # ast.parse builds an AST without checking loop context and
                     # reported the file clean; compile() is what catches it.
-                    skip_semantic = is_null_address(e_id) or e_id in ("UNKNOWN", "")
+                    # Nor around one subject resembling itself. "Semantic
+                    # Resemblance: BTCUSDT across 1 subject(s) in 1 domain(s)"
+                    # is BTC's candles worded like BTC's candles: 18,045 of them
+                    # in the thirty days to 4 October, 112 scenarios, 1
+                    # confirmed against 9 denied -- stories about maritime
+                    # security behind an altcoin. A convergence needs two of
+                    # something.
+                    skip_semantic = (
+                        is_null_address(e_id)
+                        or e_id in ("UNKNOWN", "")
+                        or (distinct_subjects < 2 and semantic_domain_count < 2)
+                        or await _semantic_rule_deprecated(redis_client)
+                    )
                     if skip_semantic:
                         logger.debug(
                             "Skipped semantic cluster on %s: not an actor.", e_id
@@ -2759,6 +2903,7 @@ async def main():
                             + (["cross_domain"] if semantic_domain_count > 1 else ["single_domain"])
                             + [f"domain:{d}" for d in sorted(semantic_domains)]
                             + [f"entity:{e_name}", f"trigger_anomaly_{event.anomaly_score:.2f}", f"centrality_{centrality_mult:.2f}"]
+                            + exposure_tags(event.tags, *(h.get("tags") for h in kept if isinstance(h, dict)))
                         )
                     )
                     
@@ -3109,9 +3254,9 @@ async def main():
                     # yesterday's events into a one-hour sliding window is what
                     # makes a backlog look like a burst.
                     fresh_events = [e for e in all_events if not _is_stale(e)]
-                    dropped = len(all_events) - len(fresh_events)
-                    if dropped:
-                        stale_dropped += dropped
+                    stale_count = len(all_events) - len(fresh_events)
+                    if stale_count:
+                        stale_dropped += stale_count
                         if stale_dropped - last_logged_stale >= 5000:
                             logger.warning(
                                 "Skipped %s events older than %ss while catching up; "

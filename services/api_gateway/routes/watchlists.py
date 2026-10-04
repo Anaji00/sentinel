@@ -9,6 +9,7 @@ via Redis Pub/Sub, and records hash-chained audit trails for all mutations.
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -35,6 +36,10 @@ router = APIRouter(prefix="/api/v1/watchlists", tags=["Watchlist Governance"])
 REDIS_EQUITIES_KEY = WATCHED_EQUITIES_KEY
 WATCHLIST_SYNC_CHANNEL = "sentinel:collector:watchlist_sync"
 MAX_WATCHLIST_LIMIT = 50
+
+
+# Any score above this is a Unix time (2001-09-09), not a hand-set priority.
+PROMOTION_TIME_FLOOR = 1_000_000_000
 
 
 class TickerAddRequest(BaseModel):
@@ -107,6 +112,15 @@ async def get_equities_watchlist(redis = Depends(get_redis_client)):
             # the radar's eviction order. Named for what it is rather than
             # overloaded, so the percentages can join beside it.
             "priority_score": score,
+            # The comment above promised the name would say what the number
+            # is; the field still read `priority_score: 1790898445.6`, a Unix
+            # time shown as a score. Kept for callers that set a custom score
+            # through the POST route, and stated plainly beside it when the
+            # value is the promotion time.
+            "promoted_at": (
+                datetime.fromtimestamp(float(score), tz=timezone.utc).isoformat()
+                if score is not None and float(score) > PROMOTION_TIME_FLOOR else None
+            ),
             "is_valid_equity": is_valid_primary_equity(ticker),
         }
         items.append(row)

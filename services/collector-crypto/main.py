@@ -56,6 +56,29 @@ RPC_FALLBACKS = {
 
 WHALE_THRESHOLD_USD = 250_000
 
+# The smallest movement by a watched wallet worth an event.
+#
+# A watched wallet bypassed the whale threshold entirely, at any size. Wallets
+# join the watchlist by being the counterparty to one transfer over $5M, and the
+# counterparties that do that are mostly routers and bots that then move dust
+# all day. Measured on 1 October over one hour: 5,131 on-chain events, 5,096 of
+# them under the whale threshold, median $271 -- one address alone produced
+# 1,455 transfers averaging $326. That was 37.5% of every event on the platform
+# during a US session, against 2.9% for equities.
+#
+# Sized from the same hour: no floor 4,912 events, $1k 1,011, $10k 199, $250k
+# 36. At $10k a watched wallet still reports any move worth reading, and the
+# whale threshold itself is unchanged.
+WATCHED_WALLET_MIN_USD = float(os.getenv("WATCHED_WALLET_MIN_USD", "10000"))
+
+# Off by default. Measured over the week to 4 October, ethereum_rpc transfers
+# reached two things: 183 wallet clusters, now cut, and 8 Hawkes forecasts. Every
+# transfer's subject is a wallet address, so the two crypto rules that accept
+# transfers -- joined on the BTC or ETH asset -- can never match one. With the
+# wallet graph off as well, ~7,000 events a day went nowhere. Set ONCHAIN_WHALES=1
+# to restore the stream, which is where exchange-flow labelling would start.
+ONCHAIN_WHALES_ENABLED = os.getenv("ONCHAIN_WHALES", "0") == "1"
+
 # Coinbase Advanced Trade WebSocket URI
 COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 # Narrowed to the two assets this platform actually reasons about.
@@ -627,6 +650,98 @@ async def poll_binance_open_interest(producer: SentinelProducer, redis_client):
 
 # ── 5. MULTI-CHAIN ON-CHAIN WHALE TRACKING (§1.2) ───────────────────────────
 
+async def poll_okx_liquidations(producer: SentinelProducer, redis_client):
+    """BTC and ETH liquidations from OKX, published as five-minute bursts.
+
+    The Binance stream answers 451 from this host, so no liquidation had ever
+    reached the platform and both crypto rules lost their main trigger. Fills
+    are summed per asset and side into five-minute buckets; a closed bucket is
+    published only when it is several times that asset-and-side's median over
+    the last day (shared/utils/liquidations.py). Each fill is counted once: the
+    newest timestamp seen per asset is kept in Redis.
+    """
+    from shared.utils import liquidations as liq
+
+    contract_value = dict(liq.DEFAULT_CONTRACT_VALUE)
+    open_buckets: dict = {}
+    raw = getattr(redis_client, "raw", redis_client)
+    async with aiohttp.ClientSession() as session:
+        for asset in contract_value:
+            try:
+                rows = await _okx_get(session, "/public/instruments", f"?instType=SWAP&uly={asset}-USDT")
+                for r in rows:
+                    if r.get("instId") == f"{asset}-USDT-SWAP" and _f(r.get("ctVal")) > 0:
+                        contract_value[asset] = _f(r.get("ctVal"))
+            except Exception as e:
+                swallowed("collector_crypto.okx_liquidations.instruments", e, logger, variant=asset)
+        while True:
+            now_bucket = int(time.time() // liq.BUCKET_SEC)
+            for asset, ct_val in contract_value.items():
+                last_key = f"sentinel:crypto:okx_liq:last_ts:{asset}"
+                try:
+                    last_raw = await raw.get(last_key)
+                    last_ts = int(last_raw) if last_raw else int(time.time() * 1000) - 60_000
+                    rows = await _okx_get(
+                        session, "/public/liquidation-orders",
+                        f"?instType=SWAP&uly={asset}-USDT&state=filled&limit=100",
+                    )
+                    details = [d for row in rows for d in (row.get("details") or [])]
+                    fresh = liq.aggregate(details, ct_val, last_ts)
+                    for (bucket, side), agg in fresh.items():
+                        slot = open_buckets.setdefault((asset, bucket, side),
+                                                       {"notional": 0.0, "coins": 0.0, "px_weight": 0.0, "fills": 0})
+                        for k in ("notional", "coins", "px_weight", "fills"):
+                            slot[k] += agg[k]
+                        last_ts = max(last_ts, int(agg["last_ts"]))
+                    await raw.set(last_key, str(last_ts), ex=86400)
+                except Exception as e:
+                    swallowed("collector_crypto.okx_liquidations.poll", e, logger, variant=asset)
+                    continue
+                # Close every bucket for this asset that has ended, quiet ones included:
+                # a quiet bucket is part of the baseline a burst is measured against.
+                for side in ("LONG", "SHORT"):
+                    hist_key = f"sentinel:crypto:liq_hist:{asset}:{side}"
+                    closed = sorted(b for (a, b, s) in open_buckets if a == asset and s == side and b < now_bucket)
+                    marker_key = f"sentinel:crypto:okx_liq:closed:{asset}:{side}"
+                    try:
+                        prev = await raw.get(marker_key)
+                        prev_bucket = int(prev) if prev else now_bucket - 1
+                        prev_bucket = max(prev_bucket, now_bucket - liq.HISTORY_BUCKETS)
+                        for b in range(prev_bucket + 1, now_bucket):
+                            slot = open_buckets.pop((asset, b, side), None) if b in closed else None
+                            total = slot["notional"] if slot else 0.0
+                            history = [float(x) for x in (await raw.lrange(hist_key, 0, liq.HISTORY_BUCKETS - 1) or [])]
+                            multiple = liq.burst_multiple(total, history)
+                            await raw.lpush(hist_key, str(round(total, 2)))
+                            await raw.ltrim(hist_key, 0, liq.HISTORY_BUCKETS - 1)
+                            await raw.expire(hist_key, 3 * 86400)
+                            if multiple is None or not slot:
+                                continue
+                            event = RawEvent(
+                                source="okx_swap",
+                                occurred_at=datetime.fromtimestamp((b + 1) * liq.BUCKET_SEC, tz=timezone.utc),
+                                raw_payload={
+                                    "asset": asset, "trade_type": "LIQUIDATION", "side": side,
+                                    "price": round(slot["px_weight"] / slot["notional"], 2) if slot["notional"] else 0.0,
+                                    "size_tokens": round(slot["coins"], 6),
+                                    "notional_usd": round(total, 2),
+                                    "fills": int(slot["fills"]),
+                                    "window_minutes": liq.BUCKET_SEC // 60,
+                                    "baseline_multiple": multiple,
+                                    "venue": "okx",
+                                },
+                            )
+                            await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=asset)
+                            _collector_metrics("collector-crypto").ingested()
+                            logger.info("Liquidation burst: %s %s $%.0f in 5m, %.1fx baseline", asset, side, total, multiple)
+                        await raw.set(marker_key, str(now_bucket - 1), ex=3 * 86400)
+                        for b in closed:
+                            open_buckets.pop((asset, b, side), None)
+                    except Exception as e:
+                        swallowed("collector_crypto.okx_liquidations.close", e, logger, variant=f"{asset}:{side}")
+            await asyncio.sleep(60)
+
+
 async def _pick_reachable_rpc(chain_name: str, candidates: list) -> Optional[str]:
     """First RPC endpoint that completes a handshake and answers eth_blockNumber.
 
@@ -714,7 +829,7 @@ async def _stream_chain_whales(chain_name: str, wss_url: str, contracts_map: dic
                 if msg_count % 250 == 0:
                     logger.info(f"💓 {chain_name.upper()} Heartbeat: Evaluated {msg_count} transfers.")
 
-                if amount_usd >= WHALE_THRESHOLD_USD or is_suspect:
+                if amount_usd >= WHALE_THRESHOLD_USD or (is_suspect and amount_usd >= WATCHED_WALLET_MIN_USD):
                     event = RawEvent(
                         source=f"{chain_name}_rpc",
                         occurred_at=datetime.now(timezone.utc),
@@ -902,7 +1017,8 @@ async def main():
             # The two above answer 451 from this host; OKX carries the same
             # surface and is what actually populates funding/OI/basis.
             poll_okx_perpetuals(producer, redis_client),
-            stream_onchain_whales(producer, redis_client),
+            poll_okx_liquidations(producer, redis_client),
+            *([stream_onchain_whales(producer, redis_client)] if ONCHAIN_WHALES_ENABLED else []),
             stream_cross_exchange_divergence(producer, redis_client),
         )
     except KeyboardInterrupt:

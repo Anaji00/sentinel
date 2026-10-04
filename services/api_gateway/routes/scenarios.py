@@ -129,19 +129,42 @@ async def get_correlations(
                                 sym_str_list = [f"{sm.get('ticker')} ({sm.get('relationship', 'SYMPATHY')})" for sm in sym_movers]
                                 sym_text = f" | Sympathy Movers: {', '.join(sym_str_list)}"
 
+                            # Whether any relationship was measured, carried
+                            # through rather than dropped.
+                            #
+                            # The agent stamps `covariance_measured` on every
+                            # assessment so that "a reader, a consumer and the
+                            # graph writer all see the same thing". This route
+                            # dropped it, so a model's hypothesis about NQ=F and
+                            # MSFT -- written when the graph held no measured
+                            # link between them -- was listed here as a
+                            # correlation beside the measured ones, in the same
+                            # shape. It also invented a conviction of 0.8 when
+                            # none was given, and ignored `min_tier`.
+                            measured = bool(ass.get("covariance_measured"))
+                            tier = 2 if ass.get("impact_severity") in ("MODERATE", "SEVERE") else 1
+                            if tier < min_tier:
+                                continue
+                            conviction = ass.get("conviction")
                             results.append({
                                 "correlation_id": f"corr_stock_{macro}_{equity}",
-                                "rule_name": f"StockCorrelationAgent: {macro} / {equity} ({ctype})",
-                                "alert_tier": 2 if ass.get("impact_severity") in ("MODERATE", "SEVERE") else 1,
+                                "rule_name": (
+                                    f"StockCorrelationAgent: {macro} / {equity} ({ctype})"
+                                    + ("" if measured else " -- hypothesis, no measured relationship")
+                                ),
+                                "covariance_measured": measured,
+                                "detected_covariance": ass.get("detected_covariance") if measured else None,
+                                "alert_tier": tier,
                                 "detected_at": c_item.get("created_at") or ass.get("detected_at"),
                                 "description": f"{rat} Transmitting via {chan}.{sym_text}",
-                                "tags": ["STOCK_CORRELATION", macro, equity, "LLM_AGENTIC"],
+                                "tags": ["STOCK_CORRELATION", macro, equity, "LLM_AGENTIC"]
+                                        + ([] if measured else ["UNMEASURED"]),
                                 "evidence_trail": [
                                     {
                                         "agent_name": "StockCorrelationAgent",
                                         "direction": ctype,
-                                        "conviction": ass.get("conviction", 0.8),
-                                        "score": ass.get("conviction", 0.8),
+                                        "conviction": conviction,
+                                        "score": conviction,
                                         "weight": 1.5,
                                     }
                                 ]

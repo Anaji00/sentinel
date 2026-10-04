@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Literal
 
 import aiohttp
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from shared.utils.untrusted_text import quote_untrusted_block
 from shared.models.events import ResolutionSignal
 
@@ -100,7 +100,7 @@ One hypothesis, shown in full. Produce exactly 3 in the "hypotheses" array.
       "beneficiaries": ["<who gains if this is true>"],
       "watch_signals": [{"entity": "<the ticker/wallet/vessel this is about>", "observable": "<what would be seen>", "comparator": "above|below|occurs|absent", "threshold": 5.0, "unit": "%"}],
       "deny_signals": [{"entity": "<name it>", "observable": "<what would refute this>", "comparator": "occurs", "threshold": null, "unit": null}],
-      "time_horizon": "immediate | 24h | 72h | 1week | 1month"
+      "time_horizon": "<immediate, 24h, 72h, 1week or 1month>"
     }
   ],
   "recommended_monitoring": ["<specific track, ticker, wallet, or sensor feed>"],
@@ -138,6 +138,9 @@ class GeneratedSignal(ResolutionSignal):
     comparator: Literal["above", "below", "occurs", "absent"] = "occurs"
 
 
+_HORIZONS = frozenset({"immediate", "24h", "72h", "1week", "1month", "unknown"})
+
+
 class HypothesisOutput(BaseModel):
     label:          str
     probability:    int
@@ -164,7 +167,16 @@ class HypothesisOutput(BaseModel):
     # Raising this needs the same A/B, not an argument about richer output.
     watch_signals:  List[GeneratedSignal] = Field(default_factory=list, max_length=2)
     deny_signals:   List[GeneratedSignal] = Field(default_factory=list, max_length=2)
-    time_horizon:   str                 = "unknown"
+    # An enum, so it reaches the decoder as a grammar. As a free string with
+    # the choices listed in the template, 34 of 35 scenarios in the week to 3
+    # October returned the list itself: "immediate | 24h | 72h | 1week | 1month".
+    time_horizon:   Literal["immediate", "24h", "72h", "1week", "1month", "unknown"] = "unknown"
+
+    @field_validator("time_horizon", mode="before")
+    @classmethod
+    def _horizon_or_unknown(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in _HORIZONS else "unknown"
 
 
 class ScenarioOutput(BaseModel):
@@ -328,6 +340,10 @@ _TEMPLATE_ECHOES = (
     "third hypothesis title",
     "intelligence judgment (max",
     "sentences on strategic",
+    # The worked example the rules used to carry. The model copied it as its
+    # own label and mechanism into 31 of 35 scenarios in the week to 3
+    # October; the example is gone from the prompt and a copy is still caught.
+    "6-hour ais gap preceded a 4x spike",
 )
 
 
@@ -361,8 +377,11 @@ def _cluster_entities(cluster) -> List[str]:
 # headlines and agent commentary are corroboration and go first when space is
 # short.
 _SECTION_SHARES = {
-    "events": 0.40,
-    "graph": 0.15,
+    "events": 0.35,
+    "graph": 0.10,
+    # Which stocks the cluster's commodity exposure reaches. Short -- five
+    # names a side -- and the only section that names what would trade.
+    "exposure": 0.10,
     "patterns": 0.15,
     "headlines": 0.10,
     "agent": 0.10,
@@ -1048,9 +1067,13 @@ class ScenarioGenerator:
 
         # Signals naming entities this cluster never contained are dropped
         # before anything downstream is asked to resolve them.
-        pruned = _prune_unresolvable_signals(
-            output, _known_entity_tokens(cluster, raw_events)
-        )
+        # The companies the exposure section named count as known: a scenario
+        # about a tanker in Hormuz that watches XOM is resolvable through XOM.
+        known = _known_entity_tokens(cluster, raw_events) | {
+            str(t).lower() for t in (context.get("exposed_tickers") or [])
+            if len(str(t)) >= _MIN_MATCHABLE_ENTITY
+        }
+        pruned = _prune_unresolvable_signals(output, known)
         if pruned:
             logger.info(
                 "Dropped %s unresolvable signal(s) from %s: named entities the "
@@ -1310,6 +1333,8 @@ Pre-analyzed intelligence from the SENTINEL Intel Agent:
 {json.dumps(agent_intel[:2], separators=(',', ':'), default=str)}
 """
 
+        exposure_section = context.get("instrument_exposure") or "None identified"
+
         bulletins = context.get("active_bulletins", [])
         consensus = context.get("consensus_analysis", {})
         consensus_section = ""
@@ -1348,6 +1373,7 @@ Pre-computed swarm consensus and agent bulletins:
             return {
                 "events": _clip(events_section, int(allowance * _SECTION_SHARES["events"]), "signal data"),
                 "graph": _clip(graph_section, int(allowance * _SECTION_SHARES["graph"]), "graph context"),
+                "exposure": _clip(exposure_section, int(allowance * _SECTION_SHARES["exposure"]), "exposed instruments"),
                 "patterns": _clip(patterns_section, int(allowance * _SECTION_SHARES["patterns"]), "precedents"),
                 "headlines": _clip(headlines_section, int(allowance * _SECTION_SHARES["headlines"]), "news"),
                 "agent": _clip(agent_section, int(allowance * _SECTION_SHARES["agent"]), "agent briefs"),
@@ -1357,6 +1383,7 @@ Pre-computed swarm consensus and agent bulletins:
         sized = _apply(dynamic)
         events_section = sized["events"]
         graph_section = sized["graph"]
+        exposure_section = sized["exposure"]
         patterns_section = sized["patterns"]
         headlines_section = sized["headlines"]
         agent_section = sized["agent"]
@@ -1365,6 +1392,7 @@ Pre-computed swarm consensus and agent bulletins:
         def _render(sections: dict) -> str:
             events_section = sections["events"]
             graph_section = sections["graph"]
+            exposure_section = sections["exposure"]
             patterns_section = sections["patterns"]
             headlines_section = sections["headlines"]
             agent_section = sections["agent"]
@@ -1391,6 +1419,10 @@ Pre-computed swarm consensus and agent bulletins:
     Known relationships for involved entities:
     {graph_section}
     
+    === INSTRUMENTS EXPOSED ===
+    Listed companies the graph links to what this signal touches, most traded first:
+    {exposure_section}
+    
     === RECENT NEWS CONTEXT ===
     (Background only. Do not assume the subject above is connected to these unless
      an entity is named in both.)
@@ -1410,10 +1442,10 @@ Pre-computed swarm consensus and agent bulletins:
       ADAUSDT, BTC-USDT-SWAP or 0x28c6c062 is an instrument or an address. It is
       not a place, a country, or an organisation, and no geography may be inferred
       from it.
-    - Every mechanism must quote a number or a name that appears above. Write what
-      connects the signals, not what a mechanism is. "A 6-hour AIS gap preceded a
-      4x spike in call volume" is a mechanism; "causal mechanism explaining signal
-      convergence" is a description of the field and will be rejected.
+    - Every mechanism must quote a number or a name that appears above, in the
+      SIGNAL DATA, and say what connects those signals. A sentence that would fit
+      any cluster, or that says what a mechanism is,
+      is a description of the field and will be rejected.
     - If the evidence does not support three distinct explanations, make the weaker
       ones explicitly low-probability rather than inventing detail.
     - beneficiaries are PARTIES who would gain: a named company, state, exchange,
@@ -1421,6 +1453,10 @@ Pre-computed swarm consensus and agent bulletins:
       never the subject of the threat itself -- a vessel does not benefit from an
       attack on that vessel. If no party can be identified from the evidence, return
       an empty list.
+    - When INSTRUMENTS EXPOSED lists companies, say in each mechanism which of them
+      would move and in which direction if the hypothesis is right, and use those
+      names in beneficiaries only where they gain. Name only companies listed there
+      or in the signal data.
     - watch_signals and deny_signals must be observations that separate THIS
       hypothesis from the others. If a signal would confirm or refute every
       hypothesis equally, it belongs in none of them: an indicator that cannot
@@ -1459,6 +1495,19 @@ Pre-computed swarm consensus and agent bulletins:
         """Fetch raw event details from TimescaleDB for the prompt."""
         if not event_ids:
             return []
+        # By uuid, for the reason given in context_builder._fetch_events: the
+        # text cast scanned the whole hypertable (34.9s against 2.2s) and timed
+        # out silently. These events are also what `_known_entity_tokens`
+        # reads, so with none of them the pruning below removed every signal
+        # naming a real entity and the draft was discarded as indiscriminable.
+        ids = []
+        for raw in event_ids:
+            try:
+                ids.append(uuid.UUID(str(raw)))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return []
         try:
             rows = await self.db.query(
                 """
@@ -1466,10 +1515,10 @@ Pre-computed swarm consensus and agent bulletins:
                        financial_data, vessel_data, flight_data,
                        crypto_data, cyber_data, headline
                 FROM events
-                WHERE event_id::text = ANY($1::text[])
+                WHERE event_id = ANY($1::uuid[])
                 ORDER BY anomaly_score DESC
                 """,
-                event_ids
+                ids
             )
             
             # Datetime objects break `json.dumps()` later on.
@@ -1485,7 +1534,7 @@ Pre-computed swarm consensus and agent bulletins:
                 cleaned.append(cleaned_row)
             return cleaned
         except Exception as e:
-            logger.error("Failed to hydrate events: %s", e)
+            logger.error("Failed to hydrate events: %s: %s", type(e).__name__, e)
             return []
 
     def _grounded(self, scenario, cluster) -> bool:

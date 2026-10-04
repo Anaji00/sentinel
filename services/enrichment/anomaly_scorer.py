@@ -48,6 +48,12 @@ from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 
 logger = logging.getLogger("enrichment.anomaly_scorer")
 
+# Where each detector's recent input points are kept between restarts.
+DETECTOR_POINTS_KEY = "sentinel:detectors:points"
+# A week: long enough to span a weekend closure, short enough that a window
+# from a different market regime is not replayed into a fresh deploy.
+DETECTOR_POINTS_TTL_SEC = 7 * 86400
+
 DYNAMIC_NORMALIZE_LUA = """
 local key_base = KEYS[1]
 local raw_val = tonumber(ARGV[1])
@@ -377,6 +383,58 @@ class DynamicAnomalyScorer:
                 ),
             }
         return out
+
+    async def save_detector_state(self) -> int:
+        """Writes every detector's recent points to Redis. Returns detectors saved.
+
+        The detectors live in memory, so every deploy started them cold: a
+        $1.31M QQQ block scored 0.000, marked unmeasured, twenty minutes after
+        a restart on 1 October, during a session that saw three deploys.
+        """
+        snapshot = {
+            name: json.dumps(det.export_points())
+            for name, det in list(self._rrcf_detectors.items())
+            if getattr(det, "_recent_points", None)
+        }
+        if not snapshot or self.redis is None:
+            return 0
+        raw = getattr(self.redis, "raw", self.redis)
+        async with raw.pipeline(transaction=True) as pipe:
+            pipe.hset(DETECTOR_POINTS_KEY, mapping=snapshot)
+            pipe.expire(DETECTOR_POINTS_KEY, DETECTOR_POINTS_TTL_SEC)
+            await pipe.execute()
+        return len(snapshot)
+
+    async def restore_detector_state(self) -> Dict[str, int]:
+        """Replays saved points into the detectors, off the event loop.
+
+        Returns {detector: points replayed}. A detector created at runtime for
+        its own event type is recreated by name; a name that no longer maps to
+        one, or saved points that do not parse, are skipped and counted rather
+        than allowed to stop the service starting.
+        """
+        if self.redis is None:
+            return {}
+        raw = getattr(self.redis, "raw", self.redis)
+        stored = await raw.hgetall(DETECTOR_POINTS_KEY)
+        restored: Dict[str, int] = {}
+        loop = asyncio.get_running_loop()
+        for key, value in (stored or {}).items():
+            name = key.decode() if isinstance(key, bytes) else str(key)
+            detector = self._rrcf_detectors.get(name) or self._detector_for(name)
+            if detector is None or detector.name != name:
+                swallowed(
+                    "enrichment.anomaly_scorer.restore_unknown_detector",
+                    LookupError(name), logger, variant="unknown_detector",
+                )
+                continue
+            try:
+                points = json.loads(value)
+            except (TypeError, ValueError) as exc:
+                swallowed("enrichment.anomaly_scorer.restore_unparseable", exc, logger, detail=name)
+                continue
+            restored[name] = await loop.run_in_executor(None, detector.warm, points)
+        return restored
 
     async def load_thresholds(self):
         """Loads dynamic ML thresholds from Redis cache."""

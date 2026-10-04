@@ -467,13 +467,15 @@ def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
         assert len(rule_synth_calls) == 1
         assert rule_synth_calls[0][1]["rule_id"] == "syn_energy_defense_01"
 
-        # 3. Discovered relationship routed through Topics.ONTOLOGY_PROPOSALS (§3.7)
+        # 3. No graph edge from a rule's tags.
+        #
+        # This asserted that XOM and LMT, tagged together on a model-written
+        # rule, became a MACRO_CORRELATED edge at a constant confidence of 0.80.
+        # A rule's tags are its themes; live, the same path committed
+        # EQUITY -> INSIDER and MARITIME -> SUSPICIOUS as correlated companies.
+        # Relationships between instruments come from measurement.
         onto_calls = [c for c in prod_calls if c[0] == Topics.ONTOLOGY_PROPOSALS]
-        assert len(onto_calls) == 1
-        assert onto_calls[0][1]["action"] == "LINK_ENTITY"
-        assert onto_calls[0][1]["entity_id"] == "XOM"
-        assert onto_calls[0][1]["data"]["target_id"] == "LMT"
-        assert onto_calls[0][1]["data"]["relation_type"] == "MACRO_CORRELATED"
+        assert onto_calls == []
 
     asyncio.run(_test())
 

@@ -31,9 +31,10 @@ from services.agents.prediction_scoring import (
     _QuoteCacheMiss,
     _is_resolvable,
     canonical_direction,
+    calibrated_conviction,
     consensus_weight_for,
 )
-from shared.utils.quiet_failures import dropped, swallowed, heartbeat_line as quiet_heartbeat_line
+from shared.utils.quiet_failures import dropped, noted, swallowed, heartbeat_line as quiet_heartbeat_line
 from shared.utils.metrics import MetricsCollector
 from shared.utils.freshness import is_stale
 from shared.utils.live_feed import agent_narrative
@@ -55,6 +56,29 @@ MAX_INFLIGHT_DISPATCHES = 64
 # of checking too eagerly is putting this loop back on the hot path the
 # buffer exists to keep it off.
 CANDIDATE_DRAIN_INTERVAL_SEC = float(os.getenv("AGENT_CANDIDATE_DRAIN_SEC", "5"))
+
+# How far a candidate is lifted when another agent has already put its subject
+# in focus. Anomaly scores sit in [0, 1], so a lift of 1.0 ranks every such
+# candidate above every unfocused one in its domain while keeping their order
+# among themselves. Domain fairness still applies across domains.
+FOCUS_CANDIDATE_LIFT = 1.0
+# How long an agent reuses its read of the focus set. Candidates are offered
+# hundreds of times a minute; the set changes a few times an hour.
+FOCUS_CACHE_SEC = 30.0
+
+
+def _message_subject(message: Dict[str, Any]) -> str:
+    """The instrument or entity a message is about, upper-cased, or ""."""
+    pe = message.get("primary_entity")
+    pe_id = ""
+    if isinstance(pe, dict):
+        pe_id = pe.get("id") or pe.get("name") or ""
+    elif isinstance(pe, str):
+        pe_id = pe
+    fd = message.get("financial_data")
+    fd_ticker = fd.get("ticker") if isinstance(fd, dict) else ""
+    raw = message.get("ticker") or message.get("primary_entity_id") or pe_id or fd_ticker or ""
+    return str(raw).strip().upper() if isinstance(raw, (str, int)) else ""
 
 
 def _message_score(message: Dict[str, Any]) -> Optional[float]:
@@ -108,7 +132,7 @@ from shared.utils.candidate_buffer import (
     CandidateBuffer,
     strip_deferred,
 )
-from shared.utils.focus import offer_focus, prioritise
+from shared.utils.focus import focus_offers, offer_focus, prioritise
 from shared.utils.quote_cache import quote_key
 # The same set the correlation layer refuses to treat as corroboration. One
 # definition of "this is a position report, not a claim", used by both.
@@ -405,6 +429,8 @@ class InferenceBatcher:
         self.items_batched = 0
         self.largest_batch = 0
         self.singleton_flushes = 0
+        # Flushes the budget declined, each retried rather than lost.
+        self.shed_retries = 0
         # Ceiling on how long any one caller waits.
         #
         # This defaulted to 420 seconds, and the work it waits on can run far
@@ -511,6 +537,7 @@ class InferenceBatcher:
             "largest": self.largest_batch,
             # The number that decides whether batching this agent was worth it.
             "singletons": self.singleton_flushes,
+            "shed_retries": self.shed_retries,
             "max_items": self.max_items,
         }
 
@@ -555,7 +582,17 @@ class InferenceBatcher:
             # above describes, reintroduced one line lower down.
             if self._inflight or not self._pending:
                 return
-            batch, self._pending = self._pending, []
+            # At most max_items, the rest left queued for the re-arm below.
+            #
+            # This took the whole queue. While a call is in flight the queue
+            # keeps filling -- and since a shed batch is now put back at the
+            # front, it can reach every dispatch slot the agent has (24) --
+            # so live batches ran past their own ceiling: 23 for radar against
+            # 10, 4 for headline extraction against 3. Extraction's token
+            # budget is sized for three briefs; twenty-four would truncate and
+            # be retried at double a budget that already cannot finish.
+            batch = self._pending[: self.max_items]
+            self._pending = self._pending[self.max_items:]
             self._inflight = True
 
         # How full the batches actually run.
@@ -593,6 +630,39 @@ class InferenceBatcher:
                 "%s: one inference answered %s candidate(s) -- %s",
                 self.name, len(batch), ", ".join(keys[:8]) + ("..." if len(keys) > 8 else ""),
             )
+        except InferenceShed:
+            # The budget declined the slot: put the batch back and try again.
+            #
+            # InferenceShed is a BaseException, deliberately, so the
+            # `except Exception` below never saw it. It escaped this method with
+            # every future unresolved and `_inflight` still True -- and since
+            # `_flush()` returns early while `_inflight` is set, no batch could
+            # ever start again. Every later caller parked a dispatch slot on a
+            # future nothing would resolve, until all of them were held and the
+            # consumer stopped reading. `safe_create_task` counts a shed as the
+            # budget working and logs nothing, so the wedge was silent.
+            #
+            # Live, 1 October: radar answered ten candidates at 17:30:37, the
+            # re-armed flush for what arrived meanwhile was shed in the same
+            # second, and radar then sat at processed=87, STALLED 789s, lag
+            # climbing past the retention edge. It completed 10 inferences in
+            # the whole of 20-21 September.
+            #
+            # A shed means "not now", not "no": nothing was asked, so the
+            # candidates are still worth asking about. Callers that gave up in
+            # the meantime are left out; the rest go back to the front of the
+            # queue, and the timer retries after one batch window.
+            self.flushes -= 1
+            self.items_batched -= len(batch)
+            if len(batch) == 1:
+                self.singleton_flushes -= 1
+            self.shed_retries += 1
+            async with self._lock:
+                self._pending = [b for b in batch if not b[2].done()] + self._pending
+                self._inflight = False
+                if self._pending and self._timer is None:
+                    self._timer = safe_create_task(self._flush_after_wait())
+            return
         except asyncio.TimeoutError:
             self.logger.warning(
                 "%s: batch of %s exceeded %.0fs and was abandoned so the next "
@@ -743,6 +813,11 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         await self._consumer.start()
         await self._producer.start()
         await self._dlq.start()
+        # Before anything can resolve a prediction against an empty card.
+        try:
+            await self.rebuild_scorecard_if_missing()
+        except Exception as exc:
+            swallowed(f"agents.{self.name}.scorecard_rebuild", exc, self.logger)
         heartbeat_task = safe_create_task(self._heartbeat_loop())
         # Without this, predictions expire unscored and every scorecard
         # stays at its default -- see _resolve_predictions_loop.
@@ -1137,9 +1212,9 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                     # first, then powers of ten, so a genuine change in dispatch
                     # latency is still visible without a batch flush looking
                     # like a fault.
-                    dropped(
+                    noted(
                         f"agents.{self.name}.slow_dispatch",
-                        "dispatch took longer than the slow-dispatch threshold",
+                        "dispatch completed, slower than the slow-dispatch threshold",
                         self.logger,
                         detail=f"{elapsed:.1f}s",
                     )
@@ -1191,10 +1266,38 @@ class SentinelAgent(PredictionScoringMixin, ABC):
             return True
         if await self._inference_budget.is_available():
             return True
-        self._candidates.offer(
-            message, score if score is not None else _candidate_score(message)
-        )
+        value = score if score is not None else _candidate_score(message)
+        # A subject another agent is already examining goes first.
+        #
+        # The focus module's contract is that agents "consult the focus set
+        # first", and the candidate buffers -- where each agent actually picks
+        # its next inference -- never did. Measured on 1 October: 18 consensus
+        # signals, every one from a single agent, because each agent ranked
+        # purely by anomaly score and so rarely chose a subject a second agent
+        # had an opinion on. Only another agent's offer counts: preferring a
+        # subject you put there yourself is not a second opinion.
+        subject = _message_subject(message)
+        if subject and subject in await self._focused_by_others():
+            value = float(value) + FOCUS_CANDIDATE_LIFT
+            self._focus_lifted = getattr(self, "_focus_lifted", 0) + 1
+        self._candidates.offer(message, value)
         return False
+
+    async def _focused_by_others(self) -> set:
+        """Focused subjects offered by an agent other than this one, cached."""
+        now = time.monotonic()
+        if now - getattr(self, "_focus_cache_at", -FOCUS_CACHE_SEC) < FOCUS_CACHE_SEC:
+            return getattr(self, "_focus_cache", set())
+        self._focus_cache_at = now
+        try:
+            offers = await focus_offers(
+                self.redis, domains=getattr(self, "FOCUS_DOMAINS", None)
+            )
+            self._focus_cache = {s for s, who in offers.items() if who != self.name}
+        except Exception as exc:
+            swallowed("agents.focus_lift", exc, self.logger)
+            self._focus_cache = getattr(self, "_focus_cache", set())
+        return self._focus_cache
 
     async def _candidate_drain_loop(self):
         """Hands the best held candidate to the agent when a slot frees.
@@ -1344,6 +1447,9 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                         # reached nothing -- the shape this audit has recorded
                         # more than any other, in code added to fix it.
                         "candidates": self._candidates.snapshot(),
+                        # Candidates lifted because another agent had focused
+                        # their subject -- the input consensus needs.
+                        "focus_lifted": getattr(self, "_focus_lifted", 0),
                         # Whichever batchers this agent declares. A mechanism
                         # whose output nothing reads is the shape this audit
                         # has recorded more than any other, and the batcher had
@@ -1592,6 +1698,12 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         Publishes a structured AgentBulletin to Redis.
         Other agents can query this via read_bulletins() or subscribe_bulletins().
         """
+        # Published at what this agent's record supports. The consensus engine,
+        # alerts and every reader of this bulletin take the number as stated.
+        try:
+            conviction = calibrated_conviction(conviction, await self.get_scorecard())
+        except Exception as _exc:
+            swallowed(f"agents.{self.name}.calibrate_bulletin", _exc, self.logger)
 
         # Offer this subject to the rest of the swarm.
         #
@@ -2103,6 +2215,19 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                     context += f"- Credit Risk: {rates_data.get('credit_spread_widening_signal', 'Stable')} | Macro Risk: {rates_data.get('macro_risk_level', 'LOW')}\n"
             except Exception as rx:
                 self.logger.debug(f"Rates regime cache miss in global context: {rx}")
+
+            # Credit spreads, the curve and financial conditions, from FRED.
+            # One line: the measured levels and their weekly change, where the
+            # block above carries only a derived "widening" signal.
+            try:
+                from shared.utils.rates import FRED_CONTEXT_KEY
+                ctx_raw = await self.redis.raw.get(FRED_CONTEXT_KEY)
+                if ctx_raw:
+                    line = json.loads(ctx_raw.decode("utf-8") if isinstance(ctx_raw, bytes) else ctx_raw).get("line")
+                    if line:
+                        context += f"- Market conditions (FRED): {sanitize_untrusted(line, max_chars=200)}\n"
+            except Exception as fx:
+                self.logger.debug(f"FRED context cache miss in global context: {fx}")
 
             # The macro engine's latest synthesis, as ambient context.
             #

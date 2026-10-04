@@ -48,9 +48,12 @@ from check_constructor_arity import scan  # noqa: E402
 # `on_connect`, for the same accepted reason. Worth knowing that the cost of
 # this key is a failing suite on unrelated edits -- keying on the enclosing
 # function would survive the drift.
+# Moved by fifteen on 1 October, when the watched-wallet floor was documented
+# above them. Re-read: Binance_Liquidations and Binance_FundingRates, both
+# subscribed through the stream URL, so neither sends a post-connect frame.
 ALLOWED = {
-    ("services", "collector-crypto", "main.py", 205),
-    ("services", "collector-crypto", "main.py", 340),
+    ("services", "collector-crypto", "main.py", 228),
+    ("services", "collector-crypto", "main.py", 363),
 }
 
 

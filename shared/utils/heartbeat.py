@@ -145,7 +145,11 @@ ALL_KNOWN_COMPONENTS = [
 
 # Components that only run under an opt-in compose profile. Absence is a
 # deployment mode, not a fault, so health scoring must not count them as failed.
-OPTIONAL_COMPONENTS = frozenset({"agents-heavy", "agents-fast"})
+# collector-cyber sits behind the `cyber` compose profile since the domain was
+# retired. Missing from this set, it was scored OFFLINE whenever the profile is
+# off -- which is always -- so the health endpoint reported 18 of 19 healthy
+# and a 0.947 ratio on a stack with nothing wrong.
+OPTIONAL_COMPONENTS = frozenset({"agents-heavy", "agents-fast", "collector-cyber"})
 
 from shared.utils.quiet_failures import snapshot as quiet_snapshot, swallowed
 

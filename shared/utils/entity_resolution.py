@@ -95,6 +95,8 @@ _LEGAL_FORMS = [
 _NOISE_TOKENS = {"THE", "AND", "OF"}
 
 _PUNCT = re.compile(r"[^A-Z0-9 ]+")
+# Yahoo-style futures (CL=F) and FX (EURUSD=X) symbols.
+_CONTRACT_SYMBOL = re.compile(r"^[A-Z0-9]{1,8}=[FX]$")
 # Trailing possessive, in the straight and typographic forms news feeds
 # actually emit. Anchored to a word boundary so "IT'S" style contractions
 # inside a longer token are untouched.
@@ -292,6 +294,12 @@ def canonical_key(raw: Any) -> str:
         return ""
     text = _strip_decoration(str(raw).strip())
     if looks_like_ticker(text):
+        return text.upper()
+    # A futures or FX symbol is a symbol, not a name to fold. Folded as a
+    # name, punctuation is stripped and ZW=F became "ZW F": live on 1 October
+    # the consensus report carried wheat futures as subject "ZW F", classified
+    # as an equity, where no agent publishing ZW=F could ever meet it.
+    if _CONTRACT_SYMBOL.match(text.upper()):
         return text.upper()
     normalised = normalize_name(text)
     return normalised or text.upper()

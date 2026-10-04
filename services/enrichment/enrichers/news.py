@@ -24,6 +24,8 @@ from shared.utils.corroboration import CorroborationTracker
 from shared.utils.source_scorecard import get_source_scorecard
 from services.enrichment.anomaly_scorer import lift_score
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
+from shared.utils.instrument_reach import EXPOSES_PREFIX, quoted_company_tickers
+from shared.utils.osint_bridges import text_exposure_tags
 
 logger = logging.getLogger("enrichment.news")
 
@@ -352,14 +354,27 @@ class NewsEnricher:
 
         # 3. spaCy Named Entity Recognition
         named_entities = list(dict.fromkeys(extracted_tickers))
+        org_names: List[str] = []
         if nlp:
             try:
                 doc = nlp(combined_text[:500])
                 for ent in doc.ents:
                     if ent.label_ in ("ORG", "GPE", "PERSON", "LOC", "PRODUCT"):
                         named_entities.append(ent.text)
+                    if ent.label_ == "ORG":
+                        org_names.append(ent.text)
             except Exception as e:
                 logger.debug(f"spaCy NER extraction failed: {e}")
+
+        # Company names, to the tickers this platform quotes. Ahead of spaCy's
+        # spellings, because a ticker is the identity the rest of the platform
+        # joins on: "Nvidia Hits Record High" had the primary entity "AI".
+        company_tickers = await quoted_company_tickers(org_names, self.redis)
+        if company_tickers:
+            named_entities = company_tickers + [n for n in named_entities if n not in company_tickers]
+            tags.append("named_company")
+        tags.extend(f"{EXPOSES_PREFIX}{t}" for t in company_tickers)
+        tags.extend(text_exposure_tags(combined_text))
         
         # Subjects the collector already resolved, ahead of anything spaCy can
         # infer from a title.
@@ -464,22 +479,17 @@ class NewsEnricher:
             f"{title[:65]}..."
         )
 
-        if anomaly >=0.5 and self.graph:
-            topic_str = "High_Impact_News"
-
-            try:
-                await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
-                    "entity_id": topic_str,
-                    "action": "MERGE_ONTOLOGY_NODE",
-                    "data": {
-                        "label": "NewsEvent",
-                        "primary_domain": "global",
-                        "confidence": anomaly,
-                        "sentiment": sentiment
-                    }
-                }, key=topic_str)
-            except Exception as e:
-                logger.debug(f"Failed to push to ontology proposals: {e}")
+        # No graph proposal from here.
+        #
+        # Every headline scoring 0.5 or more merged one constant node,
+        # "High_Impact_News", with no edge to the headline or to anything it
+        # named -- so each write overwrote the last headline's confidence on a
+        # node nothing could reach. NewsEvent is not a canonical label either,
+        # so the live graph held two of them, one NewsEvent and one Entity,
+        # both at degree 0, rewritten about five times an hour through the
+        # supervisor. The entities a headline names reach the graph through the
+        # knowledge graph engine's extraction, which is where relationships
+        # come from.
 
         primary_name = unique_entities[0] if unique_entities else raw.source
         entity_type = resolve_news_entity_type(primary_name, raw.source)
