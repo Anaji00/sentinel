@@ -19,6 +19,7 @@ import logging
 from shared.utils.agent_conclusions import (
     AGENT_CORRELATION_ANALYSIS_PREFIX,
     HAWKES_BRANCHING_RATIOS_KEY,
+    MACRO_CREDIT_RATIO_KEY,
     MACRO_INVERSE_CORRELATION_PREFIX,
     MACRO_RATES_REGIME_KEY,
     MACRO_SPREAD_2Y10Y_KEY,
@@ -28,6 +29,7 @@ import os
 import sys
 import time
 import numpy as np
+from shared.utils.deterministic_briefs import rates_brief_fields, vol_surface_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
@@ -408,8 +410,9 @@ class MacroIntelligenceEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self.capacity_or_defer(message):
-            return None
+        #
+        # No longer gated: the brief below is computed, not inferred, so there
+        # is no inference slot to wait for.
 
         # Single atomic Redis mget for all macro quote dependencies
         keys = [
@@ -505,48 +508,27 @@ class MacroIntelligenceEngine(SentinelAgent):
 
         logger.info(f"📊 Macro Rates Evaluation | 2Y: {y2:.2f}% | 10Y: {y10:.2f}% | Spread: {spread_2y10y_bps:+.1f} bps")
 
-        # "not measured" is a fact the analyst needs; a number implies it was.
-        tips_str = f"{tips_yield:.3f}%" if tips_yield is not None else "not measured"
-        breakeven_str = (
-            f"{breakeven_inflation_bps:.1f} bps" if breakeven_inflation_bps is not None
-            else "not measured"
-        )
-        # Guarded like the two above it, which it was not.
-        #
-        # credit_ratio is None whenever HYG or LQD is missing, and it went into
-        # the prompt as {credit_ratio:.4f} with no check, so the whole rates
-        # path died on:
-        #
-        #   unsupported format string passed to NoneType.__format__
-        #
-        # It had never run. The function returns early unless both US2Y and
-        # US10Y are present, and nothing wrote those keys until this session, so
-        # this line was unreachable for the life of the deployment -- and the
-        # first evaluation that got past the yield guard hit it two seconds
-        # later, losing the brief, both Redis keys and the bulletin.
-        credit_str = f"{credit_ratio:.4f}" if credit_ratio is not None else "not measured"
-
-        cross_context = await self.get_cross_agent_context(ticker="US10Y", limit=2)
-        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
-
-        user_prompt = f"""
-        Analyze Treasury yield curve and inflation metrics:
-        - 2Y Yield: {y2:.3f}% | 10Y Yield: {y10:.3f}%
-        - 2Y-10Y Spread: {spread_2y10y_bps:+.1f} bps
-        - 10Y TIPS Real Yield: {tips_str}
-        - Breakeven Inflation: {breakeven_str}
-        - HYG/LQD Credit Ratio: {credit_str}
-        {cross_block}
-        """
 
         try:
-            brief: RatesRegimeBrief = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Rates Analyst. Analyze fixed-income rates, yield curves, TIPS real yields, and credit spreads. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=RatesRegimeBrief,
-                temperature=0.1,
-            )
+            # Computed from the measurements above; see shared.utils.deterministic_briefs.
+            history_raw = await self.redis.raw.lrange(MACRO_SPREAD_2Y10Y_KEY, 0, -1)
+            history = []
+            for h in history_raw or []:
+                try:
+                    history.append(float(h))
+                except (TypeError, ValueError):
+                    continue
+            prev_raw = await self.redis.raw.get(MACRO_CREDIT_RATIO_KEY)
+            try:
+                previous_credit = float(prev_raw) if prev_raw is not None else None
+            except (TypeError, ValueError):
+                previous_credit = None
+            if credit_ratio is not None:
+                await self.redis.raw.set(MACRO_CREDIT_RATIO_KEY, str(credit_ratio), ex=7 * 86400)
+            brief = RatesRegimeBrief(**rates_brief_fields(
+                spread_2y10y_bps, history, breakeven_inflation_bps, tips_yield,
+                credit_ratio, previous_credit,
+            ))
 
             res_payload = {
                 "agent": self.name,
@@ -740,8 +722,8 @@ class MacroIntelligenceEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self.capacity_or_defer(message):
-            return None
+        #
+        # No longer gated: the brief below is computed, not inferred.
         fd = message.get("financial_data") or {}
         option_type = str(raw.get("option_type") or fd.get("side") or "CALL").upper()
         size = int(raw.get("size") or raw.get("volume") or fd.get("volume") or 1)
@@ -821,8 +803,6 @@ class MacroIntelligenceEngine(SentinelAgent):
             if (call_iv is not None and put_iv is not None) else None
         )
         skew_str = f"{iv_skew_bps:+.1f} bps" if iv_skew_bps is not None else "not measured"
-        call_iv_str = f"{call_iv:.2%}" if call_iv is not None else "not measured"
-        put_iv_str = f"{put_iv:.2%}" if put_iv is not None else "not measured"
 
         dedup_key = f"vol_surface_eval:{ticker}:{int(time.time() // 1800)}"
         if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC):
@@ -834,32 +814,9 @@ class MacroIntelligenceEngine(SentinelAgent):
             ticker, pc_ratio_str, skew_str,
         )
 
-        global_context, cross_context = await asyncio.gather(
-            self.fetch_global_context(),
-            self.get_cross_agent_context(ticker=ticker, limit=2),
-        )
-        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
-
-        user_prompt = f"""
-        Evaluate options surface metrics:
-        - Symbol: {ticker}
-        - P/C Ratio: {pc_ratio_str}
-        - 25D IV Skew: {skew_str}
-        - Call IV: {call_iv_str} | Put IV: {put_iv_str}
-
-        GLOBAL CONTEXT:
-        {global_context}
-        {cross_block}
-        """
-
         try:
-            brief: VolatilitySurfaceBrief = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Volatility Desk Analyst. Evaluate options surface metrics and tail-risk pricing. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=VolatilitySurfaceBrief,
-                temperature=0.1,
-            )
+            # Computed from the measured ratio and skew; see shared.utils.deterministic_briefs.
+            brief = VolatilitySurfaceBrief(**vol_surface_fields(ticker, pc_ratio, iv_skew_bps))
 
             # The measured value wins over whatever the model wrote, including
             # None when neither leg of the surface was observed.

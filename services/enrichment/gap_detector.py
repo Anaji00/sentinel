@@ -22,6 +22,7 @@ from shared.kafka import Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
 from shared.utils.heartbeat import record_scan_suppression,  is_component_healthy
 from shared.utils.quiet_failures import swallowed
+from shared.utils.maritime_behaviour import could_have_left_coverage
 from shared.utils.osint_bridges import vessel_exposure_tags
  
 logger = logging.getLogger("enrichment.gap_detector")
@@ -182,6 +183,12 @@ class VesselGapDetector:
                         swallowed("enrichment.gap_detector._process_batch", _exc, logger)
                     continue
                     
+                # Out of coverage is not dark. AIS is received only inside the
+                # subscribed boxes, so a hull under way near an edge that falls
+                # silent has most likely sailed out of them.
+                if could_have_left_coverage(val.get("lat"), val.get("lon"), val.get("speed"), gap_hours):
+                    continue
+
                 try:
                     if await self.redis.raw.hexists(self._seen_key, dedup_key):
                         continue  # Ship is STILL dark; not a new alert.

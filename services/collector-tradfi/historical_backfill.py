@@ -309,6 +309,100 @@ async def backfill_bars(
     return report
 
 
+_DAILY_INSERT_SQL = """
+    INSERT INTO daily_bars (ticker, day, open, high, low, close, volume, source)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'alpaca_adjusted')
+    ON CONFLICT (ticker, day) DO UPDATE
+    SET open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+        close = EXCLUDED.close, volume = EXCLUDED.volume, source = EXCLUDED.source;
+"""
+
+# How deep a ticker's first daily load goes, and how much a top-up rewrites.
+DAILY_DEEP_YEARS = int(os.getenv("DAILY_BARS_DEEP_YEARS", "5"))
+DAILY_TOPUP_DAYS = 10
+
+
+async def backfill_daily_bars(
+    db_client,
+    tickers: List[str],
+    lookback_days: int,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Dict[str, Any]:
+    """Adjusted daily bars into the permanent daily_bars table.
+
+    Separate from tradfi_bars on purpose: that is the one-minute base every
+    continuous aggregate rolls up from, retained 400 days. Daily history is
+    small, kept forever, and is what anything measured over months or years
+    reads. Idempotent: upserts on (ticker, day), so a top-up also repairs."""
+    report: Dict[str, Any] = {"requested_tickers": len(tickers), "lookback_days": lookback_days,
+                              "bars_written": 0, "tickers_with_data": 0, "pages": 0, "errors": []}
+    headers = _credentials()
+    if headers is None or not tickers:
+        if headers is None:
+            report["errors"].append("no Alpaca credentials; daily backfill skipped")
+        return report
+    end = datetime.now(timezone.utc) - timedelta(minutes=SEAM_GUARD_MINUTES)
+    start = end - timedelta(days=lookback_days)
+    owns_session = session is None
+    session = session or aiohttp.ClientSession()
+    seen: set = set()
+    try:
+        for batch in _chunk([t.upper() for t in tickers], SYMBOLS_PER_REQUEST):
+            page_token: Optional[str] = None
+            while True:
+                try:
+                    bars_by_symbol, page_token = await _fetch_page(
+                        session, headers, batch, "1Day", start.isoformat(), end.isoformat(), page_token
+                    )
+                except Exception as e:
+                    report["errors"].append(f"{batch[0]}..{batch[-1]}: {e}")
+                    logger.warning("Daily backfill page failed for %s symbols: %s", len(batch), e)
+                    break
+                report["pages"] += 1
+                rows: List[tuple] = []
+                for symbol, bars in bars_by_symbol.items():
+                    for b in bars or []:
+                        ts = _parse_bar_time(b.get("t"))
+                        if ts is None:
+                            continue
+                        try:
+                            close = float(b.get("c"))
+                        except (TypeError, ValueError):
+                            continue
+                        if close <= 0:
+                            continue
+                        seen.add(symbol)
+                        rows.append((
+                            symbol, ts.date(),
+                            float(b.get("o") or close), float(b.get("h") or close),
+                            float(b.get("l") or close), close, float(b.get("v") or 0.0),
+                        ))
+                if rows:
+                    try:
+                        executemany = getattr(db_client, "execute_many", None) or getattr(db_client, "executemany", None)
+                        if callable(executemany):
+                            await executemany(_DAILY_INSERT_SQL, rows)
+                        else:
+                            for row in rows:
+                                await db_client.execute(_DAILY_INSERT_SQL, *row)
+                        report["bars_written"] += len(rows)
+                    except Exception as e:
+                        report["errors"].append(f"write {batch[0]}..: {e}")
+                        logger.error("Daily bar write failed: %s", e)
+                if not page_token:
+                    break
+                await asyncio.sleep(INTER_REQUEST_SLEEP_SEC)
+            await asyncio.sleep(INTER_REQUEST_SLEEP_SEC)
+    finally:
+        if owns_session:
+            await session.close()
+    report["tickers_with_data"] = len(seen)
+    logger.info("Daily backfill: %s bars for %s/%s tickers over %s days (%s pages, %s errors)",
+                report["bars_written"], len(seen), len(tickers), lookback_days,
+                report["pages"], len(report["errors"]))
+    return report
+
+
 async def _write_rows(db_client, rows: List[tuple]) -> int:
     """Upsert bars, preferring a batched executemany where the client offers one."""
     if not rows:

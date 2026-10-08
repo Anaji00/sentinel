@@ -85,11 +85,3 @@ def test_a_store_failure_does_not_suppress_a_real_alert():
     """If Redis is unreachable, reporting a duplicate is the safer error."""
     block = SOURCE.split("hexists(self._seen_key")[1][:300]
     assert "except Exception" in block
-
-
-def test_the_aviation_twin_has_the_same_shape():
-    """These two detectors are copies of one another. A fix applied to one and
-    not the other is how this defect survived in the first place."""
-    aviation = (ROOT / "services" / "enrichment" / "aviation_gap_detector.py").read_text(encoding="utf-8")
-    assert "_seen_gaps" not in aviation
-    assert "seen_gaps" in aviation  # the redis key, not the set

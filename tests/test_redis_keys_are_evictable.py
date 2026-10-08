@@ -115,13 +115,3 @@ def test_the_radar_ttl_outlives_an_active_ticker():
     m = re.search(r"BASELINE_TTL_SEC\s*=\s*(\d+)\s*\*\s*(\d+)", radar)
     assert m, "BASELINE_TTL_SEC not found"
     assert int(m.group(1)) * int(m.group(2)) >= 7 * 86400
-
-
-def test_last_seen_keys_still_carry_their_own_ttl():
-    """These are the keys the gap detectors scan, and the ones the refusals
-    were landing on."""
-    aviation = (ROOT / "services" / "enrichment" / "enrichers" / "aviation.py").read_text(encoding="utf-8")
-    assert "aircraft:last_seen" in aviation
-    # The write, not the docstring that mentions it.
-    write = aviation.split('f"aircraft:last_seen:{icao24}"')[1][:400]
-    assert "86400" in write

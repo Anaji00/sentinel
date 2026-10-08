@@ -70,7 +70,7 @@ def _row(c):
 
 
 def test_a_full_cache_is_used_without_touching_the_database():
-    e = _engine([_bar(i) for i in range(10)], [])
+    e = _engine([_bar(i) for i in range(1, 11)], [])
     closes, _h, _l = asyncio.run(e._fetch_prices("AAPL"))
     assert len(closes) == 10
     assert e.db.queries == [], "the database was queried despite a sufficient cache"
@@ -114,7 +114,7 @@ def test_the_ticker_is_matched_uppercase():
 
 def test_a_database_failure_leaves_the_cache_result_intact():
     """Degrade to what the cache had; never raise into the message loop."""
-    e = _engine([_bar(i) for i in range(3)], [], db_fail=True)
+    e = _engine([_bar(i) for i in range(1, 4)], [], db_fail=True)
     closes, _h, _l = asyncio.run(e._fetch_prices("AAPL"))
     assert len(closes) == 3
 
@@ -134,3 +134,18 @@ def test_high_and_low_default_to_close_when_absent():
 def test_the_advisory_uses_the_same_minimum_constant():
     source = (ROOT / "services/agents/quant_trading_engine.py").read_text(encoding="utf-8")
     assert "if len(closes) < MIN_ADVISORY_BARS:" in source
+
+
+def test_the_cache_is_read_oldest_first_and_closed_market_bars_are_dropped():
+    """The aggregator LPUSHes: newest first. closes[-1] must be the latest price."""
+    newest_first = [
+        {"ts": "2026-10-05T15:00:00+00:00", "o": 236, "h": 237, "l": 235, "c": 236.5, "v": 9},
+        {"ts": "2026-10-05T14:00:00+00:00", "o": 235, "h": 236, "l": 234, "c": 235.5, "v": 9},
+        {"ts": "2026-10-04T12:00:00+00:00", "o": 234, "h": 234, "l": 234, "c": 234.0, "v": 71905},
+        {"ts": "2026-10-02T19:00:00+00:00", "o": 233, "h": 234, "l": 232, "c": 233.5, "v": 9},
+        {"ts": "2026-10-02T18:00:00+00:00", "o": 232, "h": 233, "l": 231, "c": 232.5, "v": 9},
+        {"ts": "2026-10-02T17:00:00+00:00", "o": 231, "h": 232, "l": 230, "c": 231.5, "v": 9},
+    ]
+    e = _engine(newest_first, [])
+    closes, _h, _l = asyncio.run(e._fetch_prices("NVDA"))
+    assert closes == [231.5, 232.5, 233.5, 235.5, 236.5]

@@ -105,3 +105,15 @@ def test_catalyst_events_pass_through_enrichment_unchanged():
                    raw_payload={"normalized_event": e.model_dump(mode="json")})
     out = asyncio.run(TradFiEnricher.__new__(TradFiEnricher).enrich(raw))
     assert out.event_id == e.event_id and out.headline == e.headline
+
+
+def test_a_spike_is_measured_in_the_names_own_standard_deviations():
+    steady = [0.40, 0.41, 0.39, 0.40, 0.41, 0.40, 0.39, 0.40, 0.41, 0.40, 0.40, 0.39]
+    noisy = [0.30, 0.55, 0.35, 0.60, 0.32, 0.58, 0.31, 0.57, 0.36, 0.59, 0.33, 0.56]
+    assert cat.short_spike(0.56, steady)      # far outside a steady name's range
+    assert not cat.short_spike(0.62, noisy)   # inside a noisy name's normal swing
+
+
+def test_fractional_finra_volume_still_builds_an_event():
+    e = cat.short_spike_event("AA", "20261002", 0.62, [0.40] * 12, 600165.526789)
+    assert e.financial_data.volume == 600166

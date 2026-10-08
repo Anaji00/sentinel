@@ -34,7 +34,10 @@ from pydantic import BaseModel, Field, field_validator
 
 from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.quiet_failures import dropped, swallowed
-from shared.utils.quote_cache import quote_key
+from shared.utils.quote_cache import parse_quote, quote_key
+
+# How far an entry may sit from the ticker's live quote and still be its price.
+MAX_ENTRY_DEVIATION = 0.15
 
 logger = logging.getLogger("agent.predictions")
 
@@ -129,6 +132,11 @@ class AgentPrediction(BaseModel):
     time_horizon_hours: int = 24
     entry_price: float = 0.0
     target_price: float = 0.0
+    # What was known when the call was made, kept with its outcome. This is the
+    # training set meta-labeling needs (Lopez de Prado): a classifier over these
+    # features, fitted on scored predictions, estimates which computed plays are
+    # worth taking. Empty for predictions that carry none.
+    features: Dict[str, Any] = Field(default_factory=dict)
     # Categorical predictions. Not every question the platform reasons about is a
     # two-sided price bet: a nomination race prices one leg per candidate, and
     # "up or down on candidate X" is not the claim an analyst is making. When
@@ -297,6 +305,7 @@ class PredictionScoringMixin:
         outcome_space: Optional[List[str]] = None,
         predicted_outcome: Optional[str] = None,
         market_key: Optional[str] = None,
+        features: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Records a prediction for later verification.
@@ -309,6 +318,27 @@ class PredictionScoringMixin:
         count, and it double-weights the scorecard that the consensus engine
         reads -- an agent repeating itself would outrank one that was right.
         """
+        # An entry price that is not this ticker's price is not a prediction.
+        #
+        # Under the model-written advisory a play could name a peer while its
+        # entry was the triggering ticker's price: BP, GE and EWZ all recorded at
+        # 38.41, AAPL at 11.02 against 334. Each resolved against its own
+        # ticker's moves and polluted the scorecard Kelly reads. Refused here,
+        # whoever the caller is, when a live quote says the entry is far off.
+        if prediction_kind == "price" and entry_price and entry_price > 0:
+            try:
+                quoted = parse_quote(await self.redis.raw.get(quote_key(ticker)))
+            except Exception as e:
+                quoted = None
+                swallowed(f"agents.{self.name}.entry_sanity_quote", e, self.logger)
+            if quoted and abs(entry_price / quoted - 1.0) > MAX_ENTRY_DEVIATION:
+                dropped(
+                    f"agents.{self.name}.entry_not_this_ticker",
+                    "entry price far from the ticker's own quote; not recorded",
+                    self.logger,
+                    detail=f"{ticker} entry {entry_price} vs quote {quoted}",
+                )
+                return ""
         try:
             # One standing call per agent, ticker and direction. A genuine
             # change of view -- a reversal, or a new entry after the last
@@ -358,6 +388,7 @@ class PredictionScoringMixin:
                 outcome_space=list(outcome_space or []),
                 predicted_outcome=predicted_outcome,
                 market_key=market_key,
+                features=dict(features or {}),
             )
             key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
             # Horizon plus a generous window to be resolved in.

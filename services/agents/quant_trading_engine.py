@@ -19,7 +19,8 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
@@ -35,10 +36,24 @@ from shared.utils.regime import current_regime
 import numpy as np
 from shared.models.events import entity_cache_key, UNRATED_EDGE_CONFIDENCE
 from shared.models.events import AlertTier, CorrelationCluster
+from shared.models import NormalizedEvent, RawEvent
+from shared.models.events import EventType
 from shared.utils.equities import is_collected_crypto, is_valid_primary_equity_async
 from shared.db import get_neo4j
 from shared.utils.feature_flags import FeatureFlagManager
-from shared.utils.candles import candle_cache_key
+from shared.utils.candles import candle_cache_key, normalize_candle
+from shared.utils.market_session import instrument_closed_at
+from shared.utils.inference_budget import InferenceShed
+from shared.utils.signal_families import observations
+from shared.utils.signal_store import FACTOR_REPORT_KEY, FACTOR_SCORES_KEY, factor_scores_key, STUDY_KEY
+from shared.utils.bayes import posterior_hit_rate
+from shared.utils.evidence_fusion import (
+    EVIDENCE_EVENT_TYPES, EVIDENCE_EVENTS_SQL, build_dossiers, family_record,
+)
+from shared.utils.options_positioning import positioning_key
+from shared.utils.trade_plan import (
+    deterministic_play, hedging_note, market_regime_label, thesis_warranted,
+)
 from shared.utils.market_cap import cached_market_cap
 
 logger = logging.getLogger("agent.quant_trading")
@@ -47,6 +62,18 @@ logger = logging.getLogger("agent.quant_trading")
 # Kelly is a ceiling derived from two estimated quantities, not a target. These
 # bounds keep a short lucky streak or a thin backtest from producing a
 # concentration that no risk desk would sign off on.
+# Which horizon's cross-sectional ranks vote on a play. Plays resolve in a day.
+# "primary": the horizon the nightly run found strongest out of sample. On
+# 8 October that moved from monthly to weekly once funds were excluded -- the
+# monthly edge had come from leveraged ETFs -- so the engine follows the
+# report rather than a pinned horizon.
+QUANT_MODEL_HORIZON = os.getenv("QUANT_MODEL_HORIZON", "primary")
+# A model-backed call is graded over the model's own horizon, not a day.
+MODEL_HORIZON_HOURS = {"daily": 24, "weekly": 7 * 24, "monthly": 30 * 24}
+# No play from moving averages and unstudied triggers alone: 92 such calls on
+# 7 October carried a 46% record. A proven family or a validated or supported
+# model must agree. QUANT_REQUIRE_EVIDENCE=0 restores the old behaviour.
+QUANT_REQUIRE_EVIDENCE = os.getenv("QUANT_REQUIRE_EVIDENCE", "1").strip().lower() not in ("0", "false", "no")
 MIN_KELLY_SAMPLES = 30          # Predictions required before a win rate is trusted
 MIN_TRADES_FOR_PAYOFF = 20      # Closed trades required before a payoff ratio is trusted
 MAX_SINGLE_POSITION_PCT = 0.10  # Hard cap on any single position, independent of Kelly
@@ -98,6 +125,12 @@ MIN_ADVISORY_BARS = 5
 # How much durable history to pull when the cache is short. Enough for the
 # indicators the advisory computes without dragging a year of bars per message.
 DURABLE_BAR_LIMIT = 200
+# Fewer than this many hourly returns and a percentile VaR is a single sample.
+MIN_VAR_RETURNS = 20
+# An annualized Sharpe from 1h bars scales the mean by ~1,638/yr. From ten
+# returns -- the old floor -- one good afternoon read as a Sharpe of 6.
+# About eighteen sessions of hourly returns before it is published.
+MIN_SHARPE_RETURNS = 120
 
 
 def _positive_or_none(*candidates):
@@ -120,6 +153,14 @@ def _positive_or_none(*candidates):
     return None
 
 
+def _uuid_or_new(value: Any) -> str:
+    """value if it is a UUID, else a fresh one."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return str(uuid.uuid4())
+
+
 class PeerTicker(BaseModel):
     ticker: str
     relation: str
@@ -129,6 +170,11 @@ class PeerTicker(BaseModel):
     # is never mistaken for one that passed it. The model does not fill this --
     # it is set below from the test's own outcome.
     verification: str = "untested"
+
+    @property
+    def rationale(self) -> str:
+        """Why this peer was proposed: the graph edge it came from, and its weight."""
+        return f"graph edge {self.relation} (weight {self.discovery_confidence:.2f}), {self.verification}"
 
 class MacroInstrument(BaseModel):
     symbol: str
@@ -176,6 +222,9 @@ class PortfolioMetrics(BaseModel):
     # can never present them bare.
     risk_horizon: Optional[str] = None
     annualization_basis: Optional[str] = None
+    # Whose price series these figures describe. They are the triggering
+    # ticker's, not a portfolio's, and the brief is overwritten per ticker.
+    subject_ticker: Optional[str] = None
 
 # Upper bound on plays turned into predictions and bulletins from one brief.
 #
@@ -235,6 +284,15 @@ class TradingSignal(BaseModel):
     technical_indicators: Dict[str, Any] = Field(default_factory=dict)
     fib_levels: Dict[str, float] = Field(default_factory=dict)
     quantitative_rationale: str
+    # "proven" only when the trigger's family passed the reaction study.
+    evidence_status: Optional[str] = None
+
+
+class TradeThesis(BaseModel):
+    """The only thing the model writes on an advisory: prose about a play
+    whose direction, size and levels were already computed."""
+    thesis: str
+    key_risks: List[str] = Field(default_factory=list)
 
 class FinancialAdviceBrief(BaseModel):
     market_regime: str
@@ -408,8 +466,7 @@ class QuantTradingEngine(SentinelAgent):
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self.capacity_or_defer(message):
-            return None
+        # Not gated on inference capacity: candidates now come from the graph.
         if not await self.flags.is_enabled("peer_discovery", ticker=ticker):
             return None
 
@@ -418,56 +475,27 @@ class QuantTradingEngine(SentinelAgent):
             return None
         await self.mark_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC)
 
-        # Concurrent context hydration
-        news_context, graph_context, global_context, cross_context, earnings_ctx, funding_ctx = await asyncio.gather(
-            self._fetch_news_context(ticker),
-            self._fetch_graph_context(ticker),
-            self.fetch_global_context(),
-            self.get_cross_agent_context(ticker=ticker, limit=3),
-            self._fetch_earnings_context(ticker),
-            self._fetch_funding_context(ticker),
-        )
-        cross_block = f"\n- Cross-Agent Intelligence:\n{cross_context}" if cross_context else ""
-        earnings_block = f"\n- Earnings Context: {earnings_ctx}" if earnings_ctx else ""
-        funding_block = f"\n- Derivatives Context: {funding_ctx}" if funding_ctx else ""
-
-        user_prompt = f"""=== ANOMALOUS INSTRUMENT RESEARCH ===
-Target Symbol: {ticker} | Anomaly Score: {anomaly_score:.2f}
-Global Context: {global_context}
-{cross_block}{earnings_block}{funding_block}
-Recent News: {json.dumps(news_context[:3], default=str)}
-Entity Graph: {json.dumps(graph_context[:3], default=str)}
-
-INSTRUCTIONS:
-Discover correlated equity/macro peers, macro instruments, and structural catalysts. Return raw JSON matching schema:"""
-
+        # Candidates come from the graph, not the model.
+        #
+        # This asked a model for "correlated peers and structural catalysts",
+        # and every peer it named at 0.65 or more went onto the watchlist --
+        # which spends one of fifty stream subscriptions. The graph already
+        # holds what it was guessing at: sector and supply-chain edges, the
+        # statistical PEER_OF and GRANGER_CAUSES edges this platform measured,
+        # each with a weight. Those are the candidates; the Granger test below
+        # is still what can lift or refute them.
+        graph_rows = await self._fetch_graph_context(ticker)
         try:
-            discovery: PeerDiscovery = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Quant Researcher. Discover correlated equity/macro peers and structural catalysts. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=PeerDiscovery,
-                temperature=0.15,
-            )
+            discovery = await self._graph_peer_discovery(ticker, message, graph_rows)
+            if discovery is None:
+                return None
 
-            # Test Granger causality on discovered peers if historical prices exist
             verified_peers = []
-            x_prices, _, _ = await self._fetch_prices(ticker)
-            # Verification that can fail, not only confirm.
-            #
-            # This raised confidence by 0.15 when Granger causality held and did
-            # nothing when it did not, so a peer that had ample data and failed
-            # the test kept whatever confidence the model had assigned it and was
-            # published beside one the statistics had actually supported. Live:
-            # CMF -- the iShares California Muni Bond ETF -- was given CAT and
-            # BRK.B as peers at 0.6, and nothing in the payload distinguished
-            # that from a measured relationship.
-            #
-            # A test that can only confirm is not a test. Three outcomes are now
-            # distinguished and travel with the peer: supported, tested and not
-            # supported, and untested for want of data.
             for peer in discovery.peer_tickers:
-                y_prices, _, _ = await self._fetch_prices(peer.ticker)
+                # Aligned on the hour both traded. The two series were fetched
+                # separately and compared index by index, so a gap in either
+                # paired one ticker's 14:00 with the other's 11:00.
+                x_prices, y_prices = await self._aligned_hourly_pair(ticker, peer.ticker)
                 if len(x_prices) >= 20 and len(y_prices) >= 20:
                     causality = quant_calc.granger_causality(x_prices, y_prices, max_lag=3)
                     if causality.get("x_granger_causes_y"):
@@ -485,9 +513,13 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                 verified_peers.append(peer)
             discovery.peer_tickers = verified_peers
 
-            # Inject top verified primary equity peers into watched equities ZSET
+            # Inject top verified primary equity peers into watched equities ZSET.
+            # Verified means the Granger test supported it: a watchlist seat is
+            # one of fifty stream subscriptions, and an edge weight alone is a
+            # claim, not a measurement of this pair's lead-lag.
             for p in discovery.peer_tickers[:4]:
-                if p.discovery_confidence >= 0.65 and await is_valid_primary_equity_async(p.ticker):
+                if (p.verification == "granger_supported" and p.discovery_confidence >= 0.65
+                        and await is_valid_primary_equity_async(p.ticker)):
                     await self.redis.raw.zadd(WATCHED_EQUITIES_KEY, mapping={p.ticker: time.time()})
 
             closes, _, _ = await self._fetch_prices(ticker)
@@ -575,7 +607,10 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
                         "max_drawdown": mdd,
                         "peer_count": len(peer_ids),
                     },
-                    trigger_event_id=f"quant_{ticker}_{int(time.time())}",
+                    # The event that triggered discovery, when it carries a
+                    # UUID; correlations and scenarios store these as uuid, and
+                    # "quant_{ticker}_{ts}" failed every insert downstream.
+                    trigger_event_id=_uuid_or_new(message.get("event_id")),
                     supporting_event_ids=[],
                     entity_ids=[ticker] + peer_ids,
                     entity_names=[ticker] + peer_ids,
@@ -658,8 +693,14 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         # admission, so this is wasted preparation rather than unfairness -- but
         # on a host that affords about thirty-five inferences an hour, the
         # preparation is most of what a shed request costs.
-        if not await self.capacity_or_defer(message):
+        # One advisory per ticker per half hour. The model used to be the rate
+        # limit -- about four advisories an hour -- and the plays are now
+        # computed, so without this every event above 0.60 would record a
+        # prediction and publish a bulletin.
+        advisory_key = f"quant_advisory:{ticker}:{int(time.time() // 1800)}"
+        if await self.is_recently_processed(advisory_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC):
             return None
+        await self.mark_processed(advisory_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC)
         closes, highs, lows = await self._fetch_prices(ticker)
         if len(closes) < MIN_ADVISORY_BARS:
             return None
@@ -700,10 +741,11 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         )
         risk_horizon = "1-day"
         risk_free, risk_free_is_live = await risk_free_rate(self.redis)
-        sharpe_ratio_val = round(
-            float(quant_calc.sharpe_ratio(
+        sharpe_ratio_val = (
+            round(float(quant_calc.sharpe_ratio(
                 returns, risk_free_rate=risk_free, annualize=True, trading_days=bars_per_year
-            )), 2
+            )), 2)
+            if len(returns) >= MIN_SHARPE_RETURNS else None
         )
 
         # ── EMPIRICAL KELLY INPUTS ──────────────────────────────────────────────
@@ -731,16 +773,23 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
         card, card_source = await self.get_conditional_scorecard(
             strategy=f"trading_advisory:{ticker.upper()}", min_samples=MIN_KELLY_SAMPLES
         )
+        strategy_card, _ = await self.get_conditional_scorecard(
+            strategy="trading_advisory", min_samples=MIN_KELLY_SAMPLES
+        )
+        # The ticker's record shrunk toward the strategy's (shared.utils.bayes):
+        # a prior worth twenty trades, centred on the strategy-wide hit rate when
+        # it is measured and on a coin flip when it is not. Five lucky wins move
+        # it a little; a long record moves it to the record. Replaces a raw rate
+        # above a sample floor and a flat 0.55 below it.
+        prior_mean = (
+            strategy_card.predictions_correct / strategy_card.predictions_made
+            if strategy_card.predictions_made >= MIN_KELLY_SAMPLES else 0.5
+        )
         if card.predictions_made < MIN_KELLY_SAMPLES:
-            card, card_source = await self.get_conditional_scorecard(
-                strategy="trading_advisory", min_samples=MIN_KELLY_SAMPLES
-            )
-        if card.predictions_made >= MIN_KELLY_SAMPLES:
-            win_prob = min(0.85, max(0.35, card.predictions_correct / max(1, card.predictions_made)))
-        else:
-            # Below the sample floor the win rate is not yet measurable. Use the
-            # baseline prior and sit at the conservative allocation cap.
-            win_prob = 0.55
+            card, card_source = strategy_card, "trading_advisory"
+        win_prob = min(0.85, max(0.35, posterior_hit_rate(
+            card.predictions_correct, card.predictions_made, prior_mean=prior_mean,
+        )))
 
         # Realized payoff ratio from the backtester, not the 2:1 aspiration.
         win_loss_ratio = await self._fetch_realized_payoff_ratio(ticker)
@@ -995,11 +1044,9 @@ Discover correlated equity/macro peers, macro instruments, and structural cataly
 Target Instrument: {ticker} | Macro Regime: {rates_regime}
 Risk Indicators: {json.dumps(indicators_data, separators=(',', ':'), default=str)}
 {graph_topo_block}{graph_block}{cross_block}{earnings_block}{funding_block}
-HARD RISK CONSTRAINTS (MANDATORY):
+MEASURED SIZING INPUTS:
 - Empirical Win Probability (W): {win_prob:.1%} | Payoff Ratio (R): {win_loss_ratio:.1f}
-- Max Half-Kelly Allocation: {kelly_pct * 100:.1f}% (Set kelly_allocation_pct <= {kelly_pct * 100:.1f}%)
-- Specify action (BUY/SELL/HOLD), trade_type, entry_level, target_price, and stop_loss targets.
-Return raw JSON matching schema:"""
+- Half-Kelly Allocation Cap: {kelly_pct * 100:.1f}%"""
 
         # An advisory without a price is not an advisory, and this is decided
         # before the inference rather than after it.
@@ -1024,13 +1071,49 @@ Return raw JSON matching schema:"""
             return None
 
         try:
-            brief: FinancialAdviceBrief = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Chief Quant Risk Strategist. Formulate high-conviction quantitative trade recommendations with strict risk limits. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=FinancialAdviceBrief,
-                temperature=0.1,
+            # The trade is computed (shared.utils.trade_plan); the model, when it
+            # is asked at all, writes the thesis for a play that already exists.
+            trigger_obs = [
+                o for o in observations({
+                    **message,
+                    "created_at": message.get("created_at") or datetime.now(timezone.utc),
+                })
+                if o.instrument.upper() == ticker.upper()
+            ]
+            trigger_families = {o.family for o in trigger_obs}
+            proven_families = await self._proven_signal_families()
+            # A family measured and found empty does not vote on direction.
+            noise = await self._noise_signal_families()
+            voting_obs = [o for o in trigger_obs if o.family not in noise]
+            raw_watch = await self.redis.raw.zrange(WATCHED_EQUITIES_KEY, 0, -1)
+            watched_now = {w.decode() if isinstance(w, bytes) else str(w) for w in (raw_watch or [])}
+
+            model_entry = await self._model_rank(ticker)
+            play_fields = deterministic_play(
+                ticker.upper(),
+                indicators_data[ticker],
+                [o.direction for o in voting_obs],
+                trigger_families,
+                proven_families,
+                kelly_pct * 100.0,
+                model=model_entry,
+                require_evidence=QUANT_REQUIRE_EVIDENCE,
             )
+            brief = FinancialAdviceBrief(
+                market_regime=market_regime_label(rates_regime),
+                highest_conviction_plays=[TradingSignal(**play_fields)] if play_fields else [],
+                general_hedging_strategy=hedging_note(is_stress),
+            )
+
+            if play_fields and thesis_warranted(ticker, anomaly_score, watched_now, trigger_families):
+                thesis = await self._write_thesis(message, play_fields, user_prompt)
+                if thesis is not None:
+                    play = brief.highest_conviction_plays[0]
+                    risks = "; ".join(r for r in thesis.key_risks[:3] if r)
+                    play.quantitative_rationale = (
+                        f"{play.quantitative_rationale} Thesis: {thesis.thesis.strip()}"
+                        + (f" Risks: {risks}." if risks else "")
+                    )
 
             # Post-hoc deterministic trade signal construction and risk limits enforcement
             max_kelly_pct = round(kelly_pct * 100.0, 2)
@@ -1151,7 +1234,8 @@ Return raw JSON matching schema:"""
             if not brief.portfolio_metrics:
                 brief.portfolio_metrics = PortfolioMetrics()
 
-            if has_history:
+            if has_history and len(returns) >= MIN_VAR_RETURNS:
+                brief.portfolio_metrics.subject_ticker = ticker.upper()
                 brief.portfolio_metrics.var_95_pct = var_95_pct
                 brief.portfolio_metrics.cvar_99_pct = cvar_99_pct
                 brief.portfolio_metrics.sharpe_ratio = sharpe_ratio_val
@@ -1169,6 +1253,7 @@ Return raw JSON matching schema:"""
                 brief.portfolio_metrics.sharpe_ratio = None
                 brief.portfolio_metrics.hawkes_risk_factor = None
                 brief.portfolio_metrics.metrics_source = "insufficient_history"
+                brief.portfolio_metrics.subject_ticker = None
                 brief.portfolio_metrics.risk_horizon = None
                 brief.portfolio_metrics.annualization_basis = None
 
@@ -1207,13 +1292,29 @@ Return raw JSON matching schema:"""
                         conviction=play.conviction_score,
                         entry_price=play.entry_level,
                         target_price=play.target_price,
-                        time_horizon_hours=24,
+                        time_horizon_hours=(
+                            MODEL_HORIZON_HOURS.get(str((model_entry or {}).get("horizon")), 24)
+                            if play.evidence_status == "model_supported" else 24
+                        ),
                         # The partition this claim is made under, and the one
                         # `get_conditional_scorecard` asks for when sizing the
                         # next position in the same name. Without it the
                         # per-ticker and strategy cards stayed empty forever and
                         # every Kelly fraction used the 0.55 prior.
                         strategy=f"trading_advisory:{play.ticker.upper()}",
+                        features={
+                            "conviction": play.conviction_score,
+                            "evidence_status": play.evidence_status,
+                            "trigger_families": sorted(trigger_families),
+                            "anomaly_score": anomaly_score,
+                            "rsi": indicators.get("rsi"),
+                            "atr_pct": round(atr / current_price * 100.0, 4) if current_price else None,
+                            "ewma_vol": ewma_vol,
+                            "ma_alignment": indicators.get("ma_alignment"),
+                            "regime": rates_regime,
+                            "kelly_cap_pct": round(kelly_pct * 100.0, 3),
+                            "win_prob": round(win_prob, 4),
+                        },
                     ),
                     name=f"record-prediction-{play.ticker}"
                 )
@@ -1221,7 +1322,10 @@ Return raw JSON matching schema:"""
                 safe_create_task(
                     self.publish_bulletin(
                         bulletin_type="signal",
-                        summary=f"{play.action} {play.ticker} @ ${play.entry_level:.2f} -> ${play.target_price:.2f} (Kelly {play.kelly_allocation_pct:.1f}%)",
+                        summary=(
+                            f"{play.action} {play.ticker} @ ${play.entry_level:.2f} -> ${play.target_price:.2f} "
+                            f"(Kelly {play.kelly_allocation_pct:.1f}%, {(play.evidence_status or 'unproven').upper()})"
+                        ),
                         ticker=play.ticker,
                         conviction=play.conviction_score,
                         expected_direction=direction,
@@ -1234,7 +1338,244 @@ Return raw JSON matching schema:"""
             return res_payload
 
         except (SchemaViolationError, InferenceError, Exception) as e:
-            logger.error(f"Trading advisory LLM error for {ticker}: {e}")
+            logger.error(f"Trading advisory failed for {ticker}: {e}")
+            return None
+
+    # Graph edges that make a peer, and those that make a macro instrument.
+    _PEER_EDGES = frozenset({
+        "PEER_OF", "GRANGER_CAUSES", "STATISTICALLY_CORRELATED_WITH", "SYMPATHY_MOVER",
+        "COMPETES_WITH", "SUPPLIER_TO", "CUSTOMER_OF", "SUPPLIES", "PURCHASES_FROM",
+    })
+    _CATALYSTS = {
+        "options_flow": "Options Flow", "equity_block": "Block Trade",
+        "market_anomaly": "Volume Anomaly", "insider_trade": "Insider Trade",
+        "insider_cluster": "Insider Cluster", "filing": "SEC Filing", "headline": "News",
+        "earnings": "Earnings", "thirteen_f": "Institutional Flow",
+    }
+
+    async def _graph_peer_discovery(
+        self, ticker: str, message: Dict[str, Any], rows: List[Dict]
+    ) -> Optional["PeerDiscovery"]:
+        """Peers and macro links from measured graph edges; None when there are none."""
+        peers: List[PeerTicker] = []
+        macros: List[MacroInstrument] = []
+        seen: set = set()
+        for r in rows or []:
+            try:
+                rid = str(r["related_id"]).upper().strip()
+                rel = str(r["rel_type"])
+                conf = float(r.get("confidence") if hasattr(r, "get") else r["confidence"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not rid or rid == ticker.upper() or rid in seen:
+                continue
+            seen.add(rid)
+            if rid.endswith("=F") or rid in ("US2Y", "US10Y", "US30Y", "DXY", "VIX"):
+                macros.append(MacroInstrument(
+                    symbol=rid,
+                    instrument_type="commodity" if rid.endswith("=F") else "treasury" if rid.startswith("US") else "volatility" if rid == "VIX" else "forex",
+                    correlation_reasoning=f"graph edge {rel} (weight {conf:.2f})",
+                ))
+            elif rel in self._PEER_EDGES and await is_valid_primary_equity_async(rid, redis_client=self.redis):
+                peers.append(PeerTicker(
+                    ticker=rid, relation=rel, discovery_confidence=max(0.0, min(1.0, conf)),
+                ))
+        if not peers and not macros:
+            return None
+        etype = str(message.get("type") or "").lower()
+        return PeerDiscovery(
+            primary_ticker=ticker.upper(),
+            peer_tickers=peers[:6],
+            macro_instruments=macros[:4],
+            catalyst_category=self._CATALYSTS.get(etype, etype.replace("_", " ").title() or "Market Event"),
+            # Not measured here; the macro engine's cointegration tracker is
+            # what detects decoupling.
+            structural_decoupling=False,
+        )
+
+    async def _aligned_hourly_pair(self, a: str, b: str) -> Tuple[List[float], List[float]]:
+        """Hourly closes for two tickers on the hours both traded, market open."""
+        if not self.db:
+            return [], []
+        try:
+            rows = await self.db.query(
+                """
+                SELECT ticker, bucket_time, close FROM tradfi_bars_1h
+                WHERE ticker = ANY($1::text[]) AND close IS NOT NULL AND close > 0
+                  AND bucket_time > NOW() - INTERVAL '30 days'
+                """,
+                [a.upper(), b.upper()],
+            )
+        except Exception as e:
+            self.logger.debug("Aligned pair lookup failed for %s/%s: %s", a, b, e)
+            return [], []
+        by: Dict[str, Dict[Any, float]] = {a.upper(): {}, b.upper(): {}}
+        for row in rows or []:
+            try:
+                t = str(row["ticker"]).upper()
+                ts = row["bucket_time"]
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if instrument_closed_at(t, ts):
+                    continue
+                by.setdefault(t, {})[ts] = float(row["close"])
+            except (TypeError, ValueError, KeyError):
+                continue
+        shared = sorted(set(by[a.upper()]) & set(by[b.upper()]))
+        return [by[a.upper()][t] for t in shared], [by[b.upper()][t] for t in shared]
+
+    async def _model_rank(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """This ticker's entry in the cross-sectional ranking at QUANT_MODEL_HORIZON,
+        with that horizon's chosen model and its out-of-sample record, so the
+        play can weigh it (shared.utils.trade_plan.model_support); None when
+        the ticker is not ranked."""
+        try:
+            raw_rep = await self.redis.raw.get(FACTOR_REPORT_KEY)
+            if not raw_rep:
+                return None
+            rep = json.loads(raw_rep if isinstance(raw_rep, str) else raw_rep.decode("utf-8"))
+            horizons = rep.get("horizons") or {}
+            want = rep.get("primary_horizon") if QUANT_MODEL_HORIZON == "primary" else QUANT_MODEL_HORIZON
+            meta = horizons.get(want)
+            key = factor_scores_key(want) if meta else FACTOR_SCORES_KEY
+            meta = meta or rep
+            raw_scores = await self.redis.raw.get(key)
+            if not raw_scores:
+                return None
+            scores = json.loads(raw_scores if isinstance(raw_scores, str) else raw_scores.decode("utf-8"))
+            entry = scores.get(ticker.upper())
+            if not entry:
+                return None
+            chosen = next((m for m in meta.get("models", []) if m.get("model") == meta.get("chosen")), {})
+            return {**entry, "validated": bool(meta.get("validated")), "model": meta.get("chosen"),
+                    "horizon": want if horizons.get(want) else None,
+                    "ic_t": chosen.get("ic_t"), "net_sharpe": chosen.get("net_sharpe"),
+                    "positive_fold_share": chosen.get("positive_fold_share")}
+        except Exception as e:
+            swallowed("agents.quant_trading_engine.model_rank", e, logger)
+            return None
+
+    async def _proven_signal_families(self) -> set:
+        """Families with at least one horizon the reaction study marked proven."""
+        try:
+            blob = await self.redis.raw.get(STUDY_KEY)
+            if not blob:
+                return set()
+            cells = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")).get("cells", [])
+            return {c.get("family") for c in cells if c.get("verdict") == "proven" and c.get("family")}
+        except Exception as e:
+            swallowed("agents.quant_trading_engine.proven_families", e, logger)
+            return set()
+
+    async def _noise_signal_families(self) -> set:
+        """Families the reaction study measured and found nothing in at every
+        horizon it could measure: their direction is not a vote."""
+        try:
+            blob = await self.redis.raw.get(STUDY_KEY)
+            if not blob:
+                return set()
+            cells = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")).get("cells", [])
+            verdicts: Dict[str, set] = {}
+            for c in cells:
+                if c.get("family"):
+                    verdicts.setdefault(c["family"], set()).add(c.get("verdict"))
+            return {f for f, v in verdicts.items()
+                    if "no_edge" in v and not v & {"proven", "unconfirmed"}}
+        except Exception as e:
+            swallowed("agents.quant_trading_engine.noise_families", e, logger)
+            return set()
+
+    async def _thesis_evidence_block(self, ticker: str) -> str:
+        """What the measured layers say about this name, compactly, for the thesis.
+
+        Every factor the evidence layer sees for the ticker with its study
+        record, the day's options positioning, and the newest mapped headlines.
+        Numbers only; the model is told to cite them and nothing else."""
+        t = ticker.upper()
+        lines: List[str] = []
+        try:
+            now = datetime.now(timezone.utc)
+            rows = await self.db.query(
+                EVIDENCE_EVENTS_SQL.replace(
+                    "AND type = ANY($3::text[])",
+                    "AND type = ANY($3::text[]) AND (primary_entity_id = $4 "
+                    "OR financial_data->>'ticker' = $4 OR $5 = ANY(tags))",
+                ),
+                now - timedelta(hours=72), now, EVIDENCE_EVENT_TYPES, t, f"exposes:{t}",
+            )
+            cells: List[Dict[str, Any]] = []
+            blob = await self.redis.raw.get(STUDY_KEY)
+            if blob:
+                cells = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")).get("cells", [])
+            obs = [o for r in rows or [] for o in observations(dict(r)) if o.instrument.upper() == t]
+            dossier = build_dossiers(obs, family_record(cells)).get(t)
+            if dossier:
+                lines.append(f"EVIDENCE (72h): {dossier.summary}")
+                for f in dossier.factors[:6]:
+                    rec = f.study
+                    rec_txt = (
+                        f"{rec.get('verdict')}, {rec.get('units')} units, hit {rec.get('hit_rate')}, "
+                        f"{rec.get('mean_bps')} bps"
+                        if rec else "not yet studied"
+                    )
+                    lines.append(f"- {f.family} [{f.source}] dir {f.direction:+d} x{f.events}: {rec_txt}")
+        except Exception as e:
+            swallowed("agents.quant_trading_engine.thesis_evidence", e, logger)
+        try:
+            raw_pos = await self.redis.raw.get(positioning_key(t))
+            if raw_pos:
+                pos = json.loads(raw_pos if isinstance(raw_pos, str) else raw_pos.decode("utf-8"))
+                lines.append(
+                    f"OPTIONS TODAY: calls {pos.get('call_volume')}, puts {pos.get('put_volume')}, "
+                    f"put/call {pos.get('put_call_ratio')} ({pos.get('measure')})"
+                )
+                if pos.get("iv_skew") is not None or pos.get("cp_iv_spread") is not None:
+                    lines.append(
+                        f"OPTION IV: skew (OTM put minus ATM call, {pos.get('skew_expiry_days')}d) "
+                        f"{pos.get('iv_skew')}, ATM IV {pos.get('atm_iv')}, call-minus-put IV spread "
+                        f"{pos.get('cp_iv_spread')} over {pos.get('cp_pairs')} pairs. Published record: steep "
+                        "skew preceded underperformance (Xing-Zhang-Zhao 2010); a positive call-put spread "
+                        "preceded outperformance (Cremers-Weinbaum 2010). Not yet measured on this system."
+                    )
+        except Exception as e:
+            swallowed("agents.quant_trading_engine.thesis_positioning", e, logger)
+        for n in (await self._fetch_news_context(t))[:3]:
+            lines.append(f"HEADLINE: {str(n.get('headline'))[:160]}")
+        return "\n".join(lines)
+
+    async def _write_thesis(self, message: Dict[str, Any], play: Dict[str, Any], context_prompt: str) -> Optional["TradeThesis"]:
+        """Prose for a computed play, or None. Never changes the play.
+
+        A shed or failed call leaves the rule's own rationale standing: the
+        trade does not wait on, or depend on, the model."""
+        evidence = await self._thesis_evidence_block(str(play.get("ticker") or ""))
+        prompt = (
+            f"{context_prompt}\n\n{evidence}\n\nTHE PLAY IS ALREADY DECIDED -- do not change it:\n"
+            f"{play['action']} {play['ticker']} | conviction {play['conviction_score']} | "
+            f"{play['evidence_status']} | basis: {play['quantitative_rationale']}\n\n"
+            "Write a two-sentence thesis explaining why the measured evidence above points this way, "
+            "and up to three concrete risks that would invalidate it, each naming the observable that would show it. "
+            "Use ONLY facts and numbers present above; if the evidence is thin or unproven, say so plainly. "
+            "Factors marked no_edge were measured and found no edge -- do not lean on them. "
+            "Do not propose prices, sizes or a different direction. Return ONLY raw JSON."
+        )
+        try:
+            return await self._execute_with_telemetry(
+                message=message,
+                system_prompt=(
+                    "You are SENTINEL's equity analyst. You explain trades a rule already computed; you do not make "
+                    "them. You cite only the numbers you are given, distinguish proven from unproven evidence, and "
+                    "never invent catalysts, prices or events."
+                ),
+                user_prompt=prompt,
+                schema=TradeThesis,
+                temperature=0.2,
+                num_predict=320,
+            )
+        except InferenceShed:
+            return None
+        except (SchemaViolationError, InferenceError) as e:
+            logger.info("Thesis unavailable for %s: %s", play.get("ticker"), e)
             return None
 
     async def run_scheduled_review(self) -> Optional[Dict[str, Any]]:
@@ -1410,14 +1751,42 @@ Return raw JSON matching schema:"""
         try:
             key = candle_cache_key(ticker, self.PRICE_TIMEFRAME)
             raw = await self.redis.raw.lrange(key, 0, -1)
+            # The aggregator LPUSHes, so the list is newest first. Read in that
+            # order, closes[-1] -- the "current price" every entry, target and
+            # stop is built from -- was the oldest bar, and every return was
+            # reversed: a falling stock carried a positive Sharpe. Sorted by
+            # the bar's own timestamp, oldest first, like the durable path.
+            # Bars stamped while the market was shut are replays and dropped.
+            parsed = []
             for item in raw:
                 try:
-                    bar = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
-                    closes.append(float(bar.get("close", 0)))
-                    highs.append(float(bar.get("high", bar.get("close", 0))))
-                    lows.append(float(bar.get("low", bar.get("close", 0))))
+                    bar = normalize_candle(
+                        json.loads(item if isinstance(item, str) else item.decode("utf-8")), ticker
+                    )
+                    ts = None
+                    if bar.get("ts"):
+                        ts = datetime.fromisoformat(str(bar["ts"]).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                    if ts is not None and instrument_closed_at(ticker, ts):
+                        continue
+                    close = float(bar.get("close") or 0)
+                    if close <= 0:
+                        continue
+                    parsed.append((
+                        ts, close,
+                        float(bar.get("high") or close),
+                        float(bar.get("low") or close),
+                    ))
                 except Exception as _exc:
                     swallowed("agents.quant_trading_engine._fetch_prices", _exc, logger)
+            if parsed and all(b[0] is not None for b in parsed):
+                parsed.sort(key=lambda b: b[0])
+            else:
+                parsed.reverse()   # undated: the list's own newest-first order
+            closes = [b[1] for b in parsed]
+            highs = [b[2] for b in parsed]
+            lows = [b[3] for b in parsed]
         except Exception as e:
             self.logger.debug("Candle cache read failed for %s: %s", ticker, e)
 
@@ -1697,7 +2066,11 @@ Return raw JSON matching schema:"""
                   )
                 ORDER BY anomaly_score DESC
                 LIMIT 8
-            """, f"%{ticker.lower()}%", ticker.lower())
+            """, f"%{ticker.lower()}%", f"exposes:{ticker.upper()}")
+            # Mapped headlines are tagged exposes:<TICKER>; matching the bare
+            # lower-case ticker against tags found nothing, so a headline the
+            # enricher had tied to this name reached the prompt only if it
+            # happened to spell the ticker out.
             return [{"headline": r["headline"], "score": r["anomaly_score"]} for r in rows]
         except Exception as e:
             logger.debug(f"News context fetch error for {ticker}: {e}")
@@ -1862,6 +2235,34 @@ Return raw JSON matching schema:"""
 
     # ── 7. STATISTICAL INSIDER CLUSTER ENGINE (§1.4) ──────────────────────────
 
+    async def _publish_cluster_event(self, cluster: Dict[str, Any]) -> None:
+        """An insider cluster as a stored `insider_cluster` event."""
+        ticker = cluster["ticker"]
+        event_type = EventType.INSIDER_CLUSTER
+        event = NormalizedEvent.model_validate({
+            "type": event_type,
+            "occurred_at": cluster["detected_at"],
+            "source": "insider_cluster",
+            "primary_entity": {"id": ticker, "type": "company", "name": ticker},
+            "headline": (
+                f"Insider buying cluster: {cluster['insider_count']} insiders net bought "
+                f"${cluster['net_buy_usd'] / 1e6:.2f}M of {ticker} within {cluster['window_days']} days"
+            ),
+            "summary": "Open-market purchases (Form 4 code P) by distinct insiders: " + ", ".join(cluster["unique_buyers"]),
+            "financial_data": {"ticker": ticker, "side": "BUY"},
+            "tags": ["insider_cluster", f"exposes:{ticker}"],
+            "anomaly_score": cluster["anomaly_score"],
+        })
+        try:
+            await self.producer.send(
+                Topics.RAW_TRADFI,
+                RawEvent(source="insider_cluster", occurred_at=event.occurred_at,
+                         raw_payload={"normalized_event": event.model_dump(mode="json")}).model_dump(mode="json"),
+                key=ticker,
+            )
+        except Exception as exc:
+            swallowed("agents.quant_trading_engine.publish_cluster_event", exc, logger)
+
     async def _process_insider_form4(self, message: Dict[str, Any], raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Processes SEC Form 4 insider transactions, records them in a rolling 14-day
@@ -1922,11 +2323,19 @@ Return raw JSON matching schema:"""
         tx_code = str(
             raw.get("transaction_code") or form4_dominant_code(raw) or raw.get("trade_type") or ""
         ).upper()
-        if tx_code in ("P", "PURCHASE", "BUY", "ACQUISITION"):
+        # Open-market purchases only. "ACQUISITION" was here and would count a
+        # stock award (Form 4 code A) as buying if anything ever emitted it.
+        if tx_code in ("P", "PURCHASE", "BUY"):
             tx_type = "BUY"
         elif tx_code in ("S", "SALE", "SELL", "D", "DISPOSITION"):
             tx_type = "SELL"
         else:
+            tx_type = "OTHER"
+        # A trade made under a Rule 10b5-1 plan was scheduled in advance; it is
+        # routine, not a decision on current information, and the literature
+        # finds no return in routine insider trades (Cohen, Malloy & Pomorski
+        # 2012). Recorded, but kept out of the cluster's buy/sell arithmetic.
+        if raw.get("planned_10b5_1") and tx_type in ("BUY", "SELL"):
             tx_type = "OTHER"
 
         # A filing that does not state a quantity is not a thousand shares.
@@ -2028,6 +2437,22 @@ Return raw JSON matching schema:"""
 
                 # Store active cluster in Redis
                 await raw_redis.set(f"sentinel:insider:clusters:{ticker}", json.dumps(cluster_payload), ex=86400 * 7)
+
+                # One cluster per ticker per window. Every Form 4 that arrived
+                # after the gate was first met re-published the same cluster,
+                # so one cluster read as several -- noise the signal study
+                # would have counted as independent evidence.
+                first = await raw_redis.set(
+                    f"sentinel:insider:cluster_emitted:{ticker}", cluster_id,
+                    ex=14 * 86400, nx=True,
+                )
+                if not first:
+                    return None
+
+                # Stored as an event, so the reaction study can measure what
+                # insider clusters are actually followed by. A cluster that
+                # only reached a Kafka topic and a bulletin left no record.
+                await self._publish_cluster_event(cluster_payload)
 
                 # Publish to Topics.INSIDER_CLUSTERS
                 if hasattr(self, "producer") and self.producer:

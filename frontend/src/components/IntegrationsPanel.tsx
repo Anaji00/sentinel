@@ -172,7 +172,7 @@ export default function IntegrationsPanel() {
                   </p>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <KeyRound className="w-3 h-3 text-ink-mute" />
-                    {item.missing_env_vars.map((v) => (
+                    {(item.missing_env_vars ?? []).map((v) => (
                       <code
                         key={v}
                         className="px-1.5 py-0.5 bg-raised border border-line-strong rounded text-micro text-amber-300"

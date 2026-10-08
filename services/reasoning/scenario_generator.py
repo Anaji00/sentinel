@@ -261,6 +261,17 @@ def _subject_line(cluster, raw_events) -> str:
     return f"Entities: {entity_text}" + chr(10) + f"These are {kind_text}.{caution}"
 
 
+def critique_enabled() -> bool:
+    """The second, devil's-advocate pass. Off unless REASONING_CRITIQUE=1.
+
+    Measured on 7 October: one CPU-bound model serves the platform, scenario
+    passes took four to seven minutes each, and the stock tier -- the model's
+    priority here -- waited ten minutes an answer behind them. The critique
+    doubles a scenario's cost to polish a draft that is already grounded and
+    probability-normalised; the draft is kept."""
+    return os.getenv("REASONING_CRITIQUE", "0").strip().lower() in ("1", "true", "yes")
+
+
 SCENARIO_TOKEN_BUDGET = 1800
 
 # Room set aside for the prose statement of the JSON schema.
@@ -1112,10 +1123,12 @@ class ScenarioGenerator:
             )
             return None
 
-        if not _draft_needs_critique(output):
+        if not critique_enabled() or not _draft_needs_critique(output):
             logger.info(
-                "Pass 2 skipped for %s: draft is confident and internally consistent",
+                "Pass 2 skipped for %s: %s",
                 cluster.correlation_id[:8],
+                "critique pass off (REASONING_CRITIQUE)" if not critique_enabled()
+                else "draft is confident and internally consistent",
             )
             output = self._normalize_probabilities(output)
             scenario = self._to_scenario(cluster, output)

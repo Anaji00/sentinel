@@ -13,6 +13,12 @@ import { ClockTime } from './ui/ClockTime';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
 
+// Scores arrive null on some rows; one null took the whole Macro page down.
+function fixed(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+
 export default function CyberIntelligencePanel() {
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -175,7 +181,7 @@ export default function CyberIntelligencePanel() {
                       <span className="text-rose-400 font-bold text-xs uppercase flex items-center gap-1">
                         {sd.cve_id || sd.affected_org || e.primary_entity_name || 'Cyber Target'}
                       </span>
-                      {sd.cvss_score !== undefined && (
+                      {sd.cvss_score != null && (
                         <span
                           className={`text-micro font-extrabold px-1.5 py-0.5 rounded border ${
                             sd.cvss_score >= 9.0
@@ -183,7 +189,7 @@ export default function CyberIntelligencePanel() {
                               : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
                           }`}
                         >
-                          CVSS {sd.cvss_score.toFixed(1)}
+                          CVSS {fixed(sd.cvss_score, 1)}
                         </span>
                       )}
                       {sd.cisa_kev && (
@@ -204,7 +210,7 @@ export default function CyberIntelligencePanel() {
                           : 'bg-purple-500/20 text-purple-300 border-purple-500/40'
                       }`}
                     >
-                      SCORE: {e.anomaly_score.toFixed(2)}
+                      SCORE: {fixed(e.anomaly_score, 2)}
                     </span>
                   </div>
 
@@ -283,7 +289,7 @@ export default function CyberIntelligencePanel() {
                 <div>
                   <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
                   <span className="text-rose-400 font-bold block">
-                    {selectedEvent.anomaly_score.toFixed(2)}
+                    {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
                 <div>
@@ -310,7 +316,7 @@ export default function CyberIntelligencePanel() {
                       <span className="text-ink-dim block">CVSS Score:</span>{' '}
                       <span className="text-white font-bold">
                         {selectedEvent.security_data.cvss_score
-                          ? selectedEvent.security_data.cvss_score.toFixed(1)
+                          ? fixed(selectedEvent.security_data.cvss_score, 1)
                           : 'N/A'}
                       </span>
                     </div>

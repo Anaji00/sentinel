@@ -235,6 +235,12 @@ async def test_statistical_discovery_caches_active_ids_in_redis():
         return []
 
     engine.fetch_price_series = mock_series
+
+    # Pairs are read aligned on shared buckets now, not paired by position.
+    async def mock_aligned(a, b, limit=120):
+        return await mock_series(a), await mock_series(b)
+
+    engine.fetch_aligned_pair = mock_aligned
     engine.build_candidate_pairs = AsyncMock(return_value=[("NVDA", "TSM")])
 
     discoveries = await engine.discover_pairwise_correlations()
@@ -316,3 +322,18 @@ async def test_api_gateway_1hop_and_2hop_graph_expansion():
     hop_levels = {c["hop_level"] for c in res_2hop["connections"]}
     assert 1 in hop_levels
     assert 2 in hop_levels
+
+
+def test_event_ids_that_reach_uuid_columns_are_uuids() -> None:
+    import importlib.util
+    import pathlib
+    import uuid as _uuid
+    from services.agents.quant_trading_engine import _uuid_or_new
+
+    good = str(_uuid.uuid4())
+    assert _uuid_or_new(good) == good
+    _uuid.UUID(_uuid_or_new("quant_TSLA_1791392226"))
+    _uuid.UUID(_uuid_or_new(None))
+    root = pathlib.Path(__file__).resolve().parents[1]
+    src = (root / "services/collector-filings/beneficial.py").read_text(encoding="utf-8")
+    assert 'event_id=f"sched13_' not in src and "uuid.uuid5(uuid.NAMESPACE_URL" in src

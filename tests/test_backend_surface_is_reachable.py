@@ -29,6 +29,9 @@ FRONTEND = ROOT / "frontend" / "src"
 
 # Reached by something other than a browser, each with the reason.
 NOT_A_UI_SURFACE = {
+    # Single-interaction write for API clients; the console batches through
+    # /feedback/interaction/batch instead of one POST per row.
+    "/api/v1/feedback/interaction",
     # Stripe posts here. A browser never does.
     "/api/v1/billing/webhook",
     # Container probes. A credential-free liveness check is the point.

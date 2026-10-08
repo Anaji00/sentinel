@@ -25,7 +25,7 @@ rather than against a mock.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 EARTH_RADIUS_NM = 3440.065
 
@@ -226,7 +226,114 @@ def sts_pair(
     }
 
 
+# -- AIS coverage -------------------------------------------------------------
+#
+# The AISStream subscription boxes, [[min_lat, min_lon], [max_lat, max_lon]],
+# in the order collector-ais names them. Positions outside these are never
+# received, so the edge of a box is the edge of what this platform can see.
+AIS_COVERAGE_BOXES: List[List[List[float]]] = [
+    # Strait of Hormuz, drawn around where reception happens rather than around
+    # the water of interest.
+    #
+    # The previous box, 24-27N / 56-60E, contained the strait itself and then
+    # ran east into the open Gulf of Oman. It excluded every port on the
+    # approach: Bandar Abbas sits at 27.18N, a fifth of a degree above the old
+    # northern edge, and Jebel Ali at 55.30E, two thirds of a degree west of the
+    # old western one. Terrestrial AIS is line-of-sight to a shore receiver and
+    # those receivers cluster at ports, so the box was aimed at the one part of
+    # the region with no chance of coverage. It returned zero messages for the
+    # entire life of the system.
+    #
+    # Now 24-27.5N / 54-58E: Abu Dhabi, Jebel Ali, the strait, Bandar Abbas and
+    # Fujairah, and less of the open water that was never going to report.
+    [[24.0, 54.0], [27.5, 58.0]],   # Strait of Hormuz + Persian Gulf approaches
+    [[1.0,  103.0], [6.0,  105.0]], # Strait of Malacca
+    [[11.5, 43.0],  [13.5, 45.5]],  # Bab-el-Mandeb
+    [[29.8, 32.2],  [31.5, 32.8]],  # Suez Canal
+    [[12.0, 32.0],  [30.0, 44.0]],  # Red Sea
+    [[40.5, 27.5],  [46.5, 41.5]],  # Black Sea
+    [[22.0, 119.0], [26.0, 122.5]], # Taiwan Strait
+    [[5.0,  109.0], [22.0, 121.0]], # South China Sea
+    [[-2.0, 1.0],   [6.0,  9.0]],   # Gulf of Guinea
+]
+
+
+def nm_to_coverage_edge(lat: float, lon: float) -> Optional[float]:
+    """Nautical miles from a position to the nearest edge of its AIS box.
+
+    The largest such distance when boxes overlap, since a hull inside two boxes
+    is still covered until it leaves both. None when the position is in none.
+    """
+    best: Optional[float] = None
+    for (min_lat, min_lon), (max_lat, max_lon) in AIS_COVERAGE_BOXES:
+        if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+            continue
+        cos_lat = max(0.05, math.cos(math.radians(lat)))
+        d = min(
+            (lat - min_lat) * 60.0,
+            (max_lat - lat) * 60.0,
+            (lon - min_lon) * 60.0 * cos_lat,
+            (max_lon - lon) * 60.0 * cos_lat,
+        )
+        best = d if best is None else max(best, d)
+    return best
+
+
+def could_have_left_coverage(
+    lat: Optional[float], lon: Optional[float], speed_knots: Optional[float], gap_hours: float,
+) -> bool:
+    """Whether a silent hull may simply have sailed out of AIS coverage.
+
+    Measured on 4 October: 336 of 656 vessels marked dark with a known speed
+    were making 5 knots or more at their last report, most of them in the
+    Singapore and Taiwan boxes, whose edges are a few hours' steaming from the
+    lanes. At its last speed, a hull that could have reached the nearest edge
+    within the gap has left coverage, not gone dark. An unknown position or a
+    position outside every box is treated as able to leave.
+    """
+    if lat is None or lon is None:
+        return True
+    edge = nm_to_coverage_edge(float(lat), float(lon))
+    if edge is None:
+        return True
+    speed = float(speed_knots or 0.0)
+    if speed <= STS_MAX_SPEED_KNOTS:
+        return False
+    return speed * gap_hours >= edge
+
+
+# Hull names that mark a tanker when AIS static data gives no type code.
+_TANKER_NAME_MARKERS = ("TANKER", "OIL", "CRUDE", "PETRO", "LNG", "LPG", "CHEM")
+
+
+def is_tanker(vessel_type: Optional[str], name: Optional[str] = None) -> bool:
+    """A tanker by AIS type, or by its name where the type is unknown."""
+    if (vessel_type or "").strip().lower() == "tanker":
+        return True
+    upper = (name or "").upper()
+    return any(marker in upper for marker in _TANKER_NAME_MARKERS)
+
+
+def sts_is_reportable(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Whether a co-located pair is worth reporting as a transfer.
+
+    The geometry in `sts_pair` cannot tell a transfer from an anchorage: 221 of
+    287 STS events in 24 hours to 4 October sat in Taiwan's territorial waters
+    and the Singapore approach, between fishing boats and hulls with no type at
+    all. The transfers this platform cares about move oil, or involve a hull
+    already on a sanctions list, so one of the two has to be a tanker or
+    flagged. Each side is {"vessel_type", "name", "flags"}.
+    """
+    for side in (a, b):
+        if side.get("flags"):
+            return True
+        if is_tanker(side.get("vessel_type"), side.get("name")):
+            return True
+    return False
+
+
 __all__ = [
+    "AIS_COVERAGE_BOXES",
     "MAX_PLAUSIBLE_SPEED_KNOTS",
     "STS_MAX_SEPARATION_NM",
     "STS_MAX_SPEED_KNOTS",
@@ -235,5 +342,9 @@ __all__ = [
     "implied_speed_knots",
     "implausible_position",
     "impossible_transit",
+    "could_have_left_coverage",
+    "is_tanker",
+    "nm_to_coverage_edge",
+    "sts_is_reportable",
     "sts_pair",
 ]

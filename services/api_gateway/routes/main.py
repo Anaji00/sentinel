@@ -38,6 +38,9 @@ from services.api_gateway.routes import (
     scenarios,
     events,
     chokepoints,
+    conflict_zones,
+    signals,
+    predictions,
     graph,
     radar,
     agents,
@@ -171,6 +174,9 @@ app.include_router(events.router)
 # preserves is "quiet" versus "not observed": AIS is silent over Hormuz and
 # Bab-el-Mandeb, and Sentinel-1 is not.
 app.include_router(chokepoints.router)
+app.include_router(conflict_zones.router)
+app.include_router(signals.router)
+app.include_router(predictions.router)
 app.include_router(graph.router)
 app.include_router(radar.router)
 app.include_router(agents.router)

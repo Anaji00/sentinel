@@ -8,7 +8,10 @@ export default function TickerPage() {
           so this is for the document outline and for anyone navigating
           by heading rather than by eye. */}
       <h1 className="sr-only">Ticker inspector</h1>
-      <TickerInspector />
+      {/* useSearchParams needs a Suspense boundary under the app router. */}
+      <React.Suspense fallback={null}>
+        <TickerInspector />
+      </React.Suspense>
     </div>
   );
 }

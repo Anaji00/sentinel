@@ -40,12 +40,12 @@ OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://sentinel-ollama:11434")
 # The fallback when AGENT_MODEL is unset. Kept in step with what compose and
 # .env actually name, because a default that disagrees with the deployment is a
 # second configuration nobody is reading.
-DEFAULT_MODEL_NAME = "qwen3:0.6b"
+DEFAULT_MODEL_NAME = "qwen2.5:3b"
 # Default is what the tiers actually run. "qwen2.5:7b" was a 4.7 GB image
 # against a 4.5 GB container limit -- unloadable, so any caller that reached
 # this default timed out rather than answering.
 OLLAMA_MODEL   = os.getenv("AGENT_MODEL", DEFAULT_MODEL_NAME)
-OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen3:0.6b")
+OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:3b")
 
 # Models this deployment is permitted to load, whatever `ollama list` returns.
 #
@@ -92,7 +92,10 @@ OLLAMA_ALLOWED_MODELS = frozenset(
         # pulled in local Ollama. Retrying on 'qwen3:0.6b'".
         #
         # Widen this only alongside OLLAMA_MAX_LOADED_MODELS.
-        "qwen3:0.6b",
+        #
+        # qwen2.5:3b since 8 October: the fleet moved to it together (see the
+        # agent tiers in docker-compose.yml).
+        "qwen2.5:3b",
     ).split(",")
     if m.strip()
 )
@@ -514,7 +517,7 @@ OLLAMA_NUM_PARALLEL  = int(os.getenv("OLLAMA_NUM_PARALLEL", str(DEFAULT_PARALLEL
 # and llama3 advertises 11,760 characters against qwen2.5:1.5b's 7,664. A
 # service defaulting here would build prompts half again too large and have
 # their middles cut on arrival.
-DEFAULT_MODEL = "qwen3:0.6b"
+DEFAULT_MODEL = "qwen2.5:3b"
 
 # Model Tier Preference Lists
 #
@@ -526,8 +529,8 @@ DEFAULT_MODEL = "qwen3:0.6b"
 # them by name. They named gemma:2b first for the lightweight tier, which is
 # neither what runs nor what should be reached for: see OLLAMA_ALLOWED_MODELS
 # above for why a second family is an eviction rather than a fallback.
-MODEL_TIER_LIGHTWEIGHT = ["qwen3:0.6b", "qwen3:1.7b"]
-MODEL_TIER_HEAVY       = ["qwen3:1.7b", "qwen3:0.6b"]
+MODEL_TIER_LIGHTWEIGHT = ["qwen2.5:3b"]
+MODEL_TIER_HEAVY       = ["qwen2.5:3b"]
 
 _GLOBAL_OLLAMA_SEMAPHORE: Optional[asyncio.Semaphore] = None
 _GLOBAL_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None

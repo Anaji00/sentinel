@@ -71,6 +71,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
     let isMounted = true;
     let reconnectTimer: NodeJS.Timeout | null = null;
+    useTelemetryStore.getState().addStreamSubscriber(1);
 
     function connect() {
       if (!isMounted) return;
@@ -172,6 +173,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
 
     return () => {
       isMounted = false;
+      useTelemetryStore.getState().addStreamSubscriber(-1);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
       if (wsRef.current) {

@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,15 +40,18 @@ load_dotenv(ROOT / ".env")
 from shared.kafka import SentinelProducer, Topics           # noqa: E402
 from shared.models import RawEvent                          # noqa: E402
 from shared.db import get_redis                             # noqa: E402
-from shared.utils.chokepoints import (
-    grid_key,                      # noqa: E402
-    TrafficReading, record_and_assess,
+from shared.utils.chokepoints import (  # noqa: E402
+    AIS_CELL_INDEX_SINCE_KEY, AIS_CELL_KEY, SAR_AIS_CHECK_AREAS,
+    SAR_CELL_HISTORY_KEY, SAR_CELL_HISTORY_LEN, SAR_TERMINALS,
+    TrafficReading, ais_cells_in_box, grid_key, likely_fixed_structure,
+    record_and_assess,
 )
 from shared.utils.heartbeat import start_heartbeat_task     # noqa: E402
 from shared.utils.collector_metrics import CollectorMetrics, for_service as _collector_metrics  # noqa: E402
 
 from shared.utils.tasks import safe_create_task            # noqa: E402
 from shared.utils.logging import setup_sentinel_logging
+from feeds import run_vessel_feeds                         # noqa: E402
 from sar_detection import (                                 # noqa: E402
     BLIND_CHOKEPOINTS, OPENEO_URL, VV_TARGET_THRESHOLD_DB,
     VV_TARGET_THRESHOLD_LINEAR, ChokepointReading,
@@ -343,10 +346,79 @@ async def _measure_grid(connection, bbox: dict) -> list:
     return out
 
 
+# Every area imaged: the AIS-blind chokepoints, the oil terminals and STS
+# anchorages, and the areas where radar is checked against AIS.
+SAR_AREAS = {**BLIND_CHOKEPOINTS, **SAR_TERMINALS, **SAR_AIS_CHECK_AREAS}
+
+
+async def _cross_check_ais(redis_client, name: str, bbox: dict, grid: list, observed_on: str) -> dict:
+    """Mark radar returns with no AIS vessel in the same cell over the window.
+
+    A return in a cell where AIS, which receives well here, saw no hull on any
+    day of the radar window is a vessel not transmitting -- unless the cell
+    returns on nearly every pass, which is a platform, buoy or pier. Mutates
+    the grid cells in place (`ais_vessels`, `no_ais`, `fixed_structure`).
+    """
+    raw = redis_client.raw
+    window = observation_window()
+    start, end = date.fromisoformat(window[0]), date.fromisoformat(window[1])
+    since = await raw.get(AIS_CELL_INDEX_SINCE_KEY)
+    window_start_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp()
+    if not since or float(since) > window_start_ts:
+        # The index does not yet cover the radar window; absence of AIS there
+        # would be absence of records, not of transmissions.
+        return {"status": "warming_up"}
+
+    steps = SAR_GRID_STEPS
+    dlat = (float(bbox["north"]) - float(bbox["south"])) / steps
+    dlon = (float(bbox["east"]) - float(bbox["west"])) / steps
+    days = [(start + timedelta(days=d)).isoformat() for d in range((end - start).days + 1)]
+
+    hist_key = SAR_CELL_HISTORY_KEY.format(area=grid_key(name).rsplit(":", 1)[1])
+    blob = await raw.get(hist_key)
+    stored = json.loads(blob) if blob else {}
+    history = stored.get("cells", {})
+    same_pass = stored.get("observed_on") == observed_on
+
+    unidentified = fixed = with_returns = 0
+    for c in grid:
+        ck = "%.4f,%.4f" % (c["latitude"], c["longitude"])
+        past = history.get(ck, [])
+        if same_pass and past:
+            # The same acquisition read again: judge it against the passes before.
+            past = past[1:]
+        present = (c.get("target_pixels") or 0) > 0
+        if present:
+            with_returns += 1
+            lat, lon = c["latitude"], c["longitude"]
+            keys = [
+                AIS_CELL_KEY.format(day=d, i=i, j=j)
+                for d in days
+                for (i, j) in ais_cells_in_box(lat - dlat / 2, lon - dlon / 2, lat + dlat / 2, lon + dlon / 2)
+            ]
+            members = await raw.sunion(keys) if keys else set()
+            c["ais_vessels"] = len(members or ())
+            if likely_fixed_structure(past):
+                c["fixed_structure"] = True
+                fixed += 1
+            elif c["ais_vessels"] == 0:
+                c["no_ais"] = True
+                unidentified += 1
+        history[ck] = ([1 if present else 0] + past)[:SAR_CELL_HISTORY_LEN]
+
+    await raw.set(hist_key, json.dumps({"observed_on": observed_on, "cells": history}), ex=90 * 86400)
+    return {
+        "status": "checked",
+        "cells_with_returns": with_returns,
+        "unidentified_contacts": unidentified,
+        "fixed_structures": fixed,
+    }
+
+
 async def sweep(connection, producer: SentinelProducer, redis_client) -> int:
-    """One pass over every AIS-blind chokepoint."""
+    """One pass over every imaged area."""
     published = 0
-    for name, bbox in BLIND_CHOKEPOINTS.items():
+    for name, bbox in SAR_AREAS.items():
         # The grid first, because the whole-box numbers are its column sums.
         #
         # Two executions either way: this asks for per-cell counts and adds
@@ -404,6 +476,14 @@ async def sweep(connection, producer: SentinelProducer, redis_client) -> int:
             logger.info("%s: no Sentinel-1 acquisition in the window.", name)
             continue
 
+        ais_check = None
+        if name in SAR_AIS_CHECK_AREAS and grid:
+            try:
+                ais_check = await _cross_check_ais(redis_client, name, bbox, grid, reading.observed_on)
+                logger.info("%s: AIS cross-check %s", name, ais_check)
+            except Exception as e:
+                logger.warning("AIS cross-check failed for %s: %s", name, e)
+
         assessment = await record_and_assess(
             redis_client,
             TrafficReading(
@@ -421,6 +501,8 @@ async def sweep(connection, producer: SentinelProducer, redis_client) -> int:
         payload = reading.as_event_payload()
         payload["grid"] = grid
         payload["grid_steps"] = SAR_GRID_STEPS if grid else 0
+        if ais_check is not None:
+            payload["ais_cross_check"] = ais_check
         if grid:
             occupied = [c for c in grid if c["target_pixels"] > 0]
             logger.info(
@@ -499,13 +581,16 @@ async def main():
     # running at all".
     await _collector_metrics("collector-sar").start(redis_client)
     safe_create_task(start_heartbeat_task(redis_client, "collector-sar"))
+    # Global Fishing Watch and VIIRS boat detection, each idle until its
+    # credentials are set in .env; see feeds.py.
+    safe_create_task(run_vessel_feeds(producer, redis_client), name="vessel-feeds")
 
     while True:
         try:
             n = await sweep(connection, producer, redis_client)
             logger.info(
                 "Radar sweep complete: %s of %s chokepoints reported.",
-                n, len(BLIND_CHOKEPOINTS),
+                n, len(SAR_AREAS),
             )
         except Exception as e:
             logger.error(f"Radar sweep failed: {e}", exc_info=True)

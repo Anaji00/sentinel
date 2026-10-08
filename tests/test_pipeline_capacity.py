@@ -51,10 +51,3 @@ def test_enrichment_has_headroom_above_a_single_core():
     cpus = float(limits.get("cpus", 0))
     assert cpus >= 2.0, f"enrichment capped at {cpus} CPUs remains the pipeline bottleneck"
     assert enr.get("restart"), "enrichment must restart on failure"
-
-
-def test_dark_flight_detection_survives_the_slower_sweep():
-    """Gap detection reads a Redis key held for 24h, so a 5-minute sweep does
-    not blind it -- worth pinning, because shortening that TTL would."""
-    assert "aircraft:last_seen" in (ROOT / "services/enrichment/enrichers/aviation.py").read_text(encoding="utf-8")
-    assert "ex=86400" in (ROOT / "services/enrichment/enrichers/aviation.py").read_text(encoding="utf-8")

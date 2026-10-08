@@ -177,6 +177,7 @@ def test_every_type_a_scenario_uses_is_one_the_platform_emits():
         "supply_chain_metric": "freight rates are enriched onto other events",
         "price_anomaly": "price moves arrive as market_anomaly",
         "dark_pool": "dark-pool prints arrive as equity_block",
+        "flight_dark": "retired: the gap detector measured airline schedules",
     }
 
     used = set()

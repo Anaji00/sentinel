@@ -211,9 +211,28 @@ async def apply_autonomous_feedback(scenario, redis_client):
             await redis_client.raw.expire("sentinel:watched:wallets", 2592000)
             logger.warning("🤖 AUTONOMOUS PIVOT: Instructing Crypto collector to track wallet %s", wallet)
 
+_TIER_ORDER = ["WATCH", "ALERT", "ELEVATED", "INTELLIGENCE", "CRITICAL"]
+
+
+def tier_warrants_synthesis(tier) -> bool:
+    """Only clusters at REASONING_MIN_TIER or above get a model-written scenario.
+
+    Measured 8 October: scenarios for every cluster from ALERT up took ten of
+    the fourteen completions the shared model managed in an hour, about four
+    and a half minutes each, ahead of the stock tier. On 5 October the alert
+    tiers measured miscalibrated -- tier-5 alerts moved prices less than an
+    ordinary window -- so the lower tiers bought little for that cost."""
+    floor = os.getenv("REASONING_MIN_TIER", "INTELLIGENCE").strip().upper()
+    name = str(getattr(tier, "value", tier)).upper()
+    try:
+        return _TIER_ORDER.index(name) >= _TIER_ORDER.index(floor)
+    except ValueError:
+        return name != "WATCH"
+
+
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
     """The core synthesis pipeline."""
-    if cluster.alert_tier == AlertTier.WATCH:
+    if not tier_warrants_synthesis(cluster.alert_tier):
         return
         
     logger.info("🧠 Synthesizing [%s] %s via Ollama...", cluster.alert_tier.name, cluster.rule_name)
@@ -317,7 +336,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     # output; the lane bounds concurrency to one reasoning inference at a time.
     _budget = InferenceBudget(
         redis_client,
-        os.getenv("AGENT_MODEL", "qwen3:0.6b"),
+        os.getenv("AGENT_MODEL", "qwen2.5:3b"),
         cooldown_sec=int(os.getenv("REASONING_COOLDOWN_SEC", "60")),
         lane="reasoning",
     )

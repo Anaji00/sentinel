@@ -1127,6 +1127,200 @@ MIGRATIONS = [
             ALTER TABLE tradfi_bars ALTER COLUMN volume DROP NOT NULL;
         """,
         "transactional": True
+    },
+    {
+        "version": "0030_signal_event_archive",
+        "sql": """
+            -- The signal history, kept permanently.
+            --
+            -- `events` drops chunks after 90 days, and it is the only record of
+            -- every headline, filing, sweep, block and cluster the reaction study
+            -- learns from -- so the study could never see past 90 days, and a
+            -- family that fires a few times a month could never reach the twenty
+            -- independent units it needs to be judged at all. Raising the events
+            -- retention would keep two gigabytes of vessel pings and telemetry
+            -- with it. This keeps only what the study reads, in the columns it
+            -- reads, with no retention policy: it only grows.
+            CREATE TABLE IF NOT EXISTS signal_event_archive (
+                event_id          TEXT NOT NULL,
+                type              TEXT NOT NULL,
+                source            TEXT,
+                created_at        TIMESTAMPTZ NOT NULL,
+                occurred_at       TIMESTAMPTZ,
+                headline          TEXT,
+                summary           TEXT,
+                tags              TEXT[],
+                sentiment         DOUBLE PRECISION,
+                primary_entity_id TEXT,
+                financial_data    JSONB,
+                region            TEXT,
+                PRIMARY KEY (event_id, created_at)
+            );
+            SELECT create_hypertable('signal_event_archive', 'created_at',
+                chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
+            CREATE INDEX IF NOT EXISTS signal_event_archive_type_time
+                ON signal_event_archive (type, created_at DESC);
+            ALTER TABLE signal_event_archive SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'type',
+                timescaledb.compress_orderby = 'created_at DESC'
+            );
+            SELECT add_compression_policy('signal_event_archive', INTERVAL '30 days', if_not_exists => TRUE);
+
+            -- Everything still held in events, so nothing more is lost from now.
+            INSERT INTO signal_event_archive
+            SELECT event_id::text, type, source, created_at, occurred_at, headline, summary,
+                   tags, sentiment, primary_entity_id, financial_data, region
+            FROM events
+            WHERE type IN ('headline', 'social_signal', 'vessel_dark', 'vessel_sts', 'supply_chain_metric',
+                           'filing', 'regulatory_event', 'insider_cluster', 'earnings_surprise', 'options_flow',
+                           'market_anomaly', 'equity_block', 'thirteen_f')
+              AND NOT (type = 'market_anomaly' AND source NOT IN ('alpaca_quant_radar', 'finra_short_volume'))
+              AND NOT (type = 'options_flow' AND COALESCE((financial_data->>'premium_usd')::float, 0) < 50000)
+            ON CONFLICT DO NOTHING;
+        """,
+        # Idempotent throughout (IF NOT EXISTS, ON CONFLICT), and the seed reads
+        # ninety days of compressed chunks: longer than the pool's 60 seconds.
+        "transactional": False,
+        "timeout": 1800,
+    },
+    {
+        "version": "0031_daily_bars",
+        "sql": """
+            -- Adjusted daily bars, kept permanently, years deep.
+            --
+            -- tradfi_bars holds one-minute bars for 400 days and began on
+            -- 2026-07-13, so nothing could be measured over more than a few
+            -- months: not a 200-day average from vendor history, not a daily
+            -- correlation over a year, not a five-day reaction with enough
+            -- episodes. Daily bars are small -- five years of 2,000 names is ten
+            -- million rows at most -- and split- and dividend-adjusted from the
+            -- vendor, so a split is not read as a crash.
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                ticker  TEXT NOT NULL,
+                day     DATE NOT NULL,
+                open    DOUBLE PRECISION,
+                high    DOUBLE PRECISION,
+                low     DOUBLE PRECISION,
+                close   DOUBLE PRECISION NOT NULL,
+                volume  DOUBLE PRECISION,
+                source  TEXT NOT NULL DEFAULT 'alpaca_adjusted',
+                PRIMARY KEY (ticker, day)
+            );
+            CREATE INDEX IF NOT EXISTS daily_bars_day ON daily_bars (day DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0032_aggregates_cover_backfilled_history",
+        "sql": """
+            -- Roll every backfilled minute into the intraday aggregates.
+            --
+            -- Their refresh policies rewrite only a trailing window (1h: 7 days,
+            -- 4h: 30), so 1.47M minute bars backfilled for older weeks never
+            -- reached them: the median ticker had 28 hourly bars in 60 days
+            -- while its minute bars held enough for 300+. 0026 did this once for
+            -- the daily view; the backfill loop now refreshes what it writes.
+            CALL refresh_continuous_aggregate('tradfi_bars_5m', NULL, NOW() - INTERVAL '1 hour');
+            CALL refresh_continuous_aggregate('tradfi_bars_15m', NULL, NOW() - INTERVAL '1 hour');
+            CALL refresh_continuous_aggregate('tradfi_bars_30m', NULL, NOW() - INTERVAL '1 hour');
+            CALL refresh_continuous_aggregate('tradfi_bars_1h', NULL, NOW() - INTERVAL '2 hours');
+            CALL refresh_continuous_aggregate('tradfi_bars_4h', NULL, NOW() - INTERVAL '4 hours');
+            CALL refresh_continuous_aggregate('tradfi_bars_1d', NULL, NOW() - INTERVAL '1 day');
+        """,
+        "transactional": False,
+        "timeout": 3600,
+    },
+    {
+        "version": "0033_option_daily",
+        "sql": """
+            -- One row per ticker per session of option-implied measures, kept
+            -- permanently (shared/utils/options_positioning.py).
+            --
+            -- Put/call volume, IV skew and the call-put IV spread were read
+            -- live and held for 36 hours in Redis, and this feed sells no
+            -- history of them: every day not written down was a day that could
+            -- never be studied. Upserted through the session; the last write is
+            -- the close.
+            CREATE TABLE IF NOT EXISTS option_daily (
+                ticker            TEXT NOT NULL,
+                day               DATE NOT NULL,
+                call_volume       DOUBLE PRECISION,
+                put_volume        DOUBLE PRECISION,
+                put_call_ratio    DOUBLE PRECISION,
+                iv_skew           DOUBLE PRECISION,
+                atm_iv            DOUBLE PRECISION,
+                skew_expiry_days  INTEGER,
+                cp_iv_spread      DOUBLE PRECISION,
+                cp_pairs          INTEGER,
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ticker, day)
+            );
+            CREATE INDEX IF NOT EXISTS option_daily_day ON option_daily (day DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0034_short_interest",
+        "sql": """
+            -- FINRA consolidated short interest, one row per ticker per
+            -- settlement, since 2020 (services/collector-filings/short_interest.py).
+            -- Days-to-cover is recomputed from the parts: FINRA's own figure is
+            -- rounded to whole days.
+            CREATE TABLE IF NOT EXISTS short_interest (
+                ticker            TEXT NOT NULL,
+                settlement_date   DATE NOT NULL,
+                short_qty         DOUBLE PRECISION NOT NULL,
+                prev_short_qty    DOUBLE PRECISION,
+                avg_daily_volume  DOUBLE PRECISION,
+                days_to_cover     DOUBLE PRECISION,
+                change_pct        DOUBLE PRECISION,
+                PRIMARY KEY (ticker, settlement_date)
+            );
+            CREATE INDEX IF NOT EXISTS short_interest_date ON short_interest (settlement_date DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0035_company_profile",
+        "sql": """
+            -- Each listed company's SEC industry code, from its EDGAR
+            -- submissions file, for industry features in the cross-sectional
+            -- model (services/collector-filings/history.py).
+            CREATE TABLE IF NOT EXISTS company_profile (
+                ticker           TEXT PRIMARY KEY,
+                cik              TEXT,
+                sic              INTEGER,
+                sic_description  TEXT,
+                updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0036_recommendation_log",
+        "sql": """
+            -- Every trade idea, once per day per horizon, ticker and direction,
+            -- with the price it was given at (services/agents/recommendation_engine.py),
+            -- so the ideas can be graded against what prices did.
+            CREATE TABLE IF NOT EXISTS recommendation_log (
+                day                  DATE NOT NULL,
+                horizon              TEXT NOT NULL,
+                ticker               TEXT NOT NULL,
+                direction            SMALLINT NOT NULL,
+                validated            BOOLEAN NOT NULL,
+                entry_price          DOUBLE PRECISION,
+                stop_price           DOUBLE PRECISION,
+                expected_excess_bps  DOUBLE PRECISION,
+                model                TEXT,
+                structure            TEXT,
+                option_idea          JSONB,
+                as_of                DATE,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (day, horizon, ticker, direction)
+            );
+        """,
+        "transactional": True
     }
 ]
 

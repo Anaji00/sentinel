@@ -35,9 +35,11 @@ def _module():
     return module
 
 
-def _aggregator(on_send=None):
+def _aggregator(on_send=None, session="REGULAR"):
     m = _module()
     m._collector_metrics = MagicMock()
+    # Pinned, so these do not depend on the hour the suite happens to run.
+    m.get_market_session = MagicMock(return_value=(session, ""))
     producer = MagicMock()
     sent = []
 
@@ -88,3 +90,13 @@ def test_a_sent_bar_is_not_sent_again():
     asyncio.run(agg.flush())
     asyncio.run(agg.flush())
     assert sent == ["AAPL"]
+
+
+def test_prints_while_the_market_is_closed_never_become_bars():
+    """The weekend replay of a last trade is not a bar, in the cache or downstream."""
+    agg, sent, pipe = _aggregator(session="CLOSED")
+    agg.add_trade("NVDA", 234.0, 71905)
+    asyncio.run(agg.flush())
+    assert sent == []
+    pipe.execute.assert_not_awaited()
+    assert agg.buffer == {}

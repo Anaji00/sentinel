@@ -10,6 +10,12 @@ interface TelemetryState {
    */
   authRequired: boolean;
   lastUpdate: number | null;
+  /**
+   * How many mounted components hold the live socket open. Pages without a
+   * live feed open none, and the header said "connecting" there forever.
+   */
+  streamSubscribers: number;
+  addStreamSubscriber: (delta: 1 | -1) => void;
   setConnected: (status: boolean) => void;
   setAuthRequired: (status: boolean) => void;
   updateTelemetry: () => void;
@@ -19,7 +25,10 @@ export const useTelemetryStore = create<TelemetryState>((set) => ({
   isConnected: false,
   authRequired: false,
   lastUpdate: null,
+  streamSubscribers: 0,
   setConnected: (status) => set({ isConnected: status }),
   setAuthRequired: (status) => set({ authRequired: status }),
   updateTelemetry: () => set({ lastUpdate: Date.now() }),
+  addStreamSubscriber: (delta) =>
+    set((s) => ({ streamSubscribers: Math.max(0, s.streamSubscribers + delta) })),
 }));

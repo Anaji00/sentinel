@@ -8,16 +8,20 @@ export default function ForgotPasswordPage() {
   const [email, setEmail] = useState('');
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
+  // False when the deployment has no SMTP configured: no email will arrive.
+  const [emailDelivery, setEmailDelivery] = useState(true);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     try {
-      await fetch('/api/proxy/api/v1/auth/forgot-password', {
+      const res = await fetch('/api/proxy/api/v1/auth/forgot-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
       });
+      const body: { email_delivery?: boolean } = await res.json().catch(() => ({}));
+      setEmailDelivery(body.email_delivery !== false);
     } finally {
       // Always the same outcome. Reporting "no such account" here would let
       // anyone test which addresses are registered.
@@ -37,6 +41,13 @@ export default function ForgotPasswordPage() {
           <p className="text-ink-mute text-xs">
             The link works for 30 minutes and can be used once.
           </p>
+          {!emailDelivery && (
+            <p className="text-amber-300 text-xs">
+              This deployment has no email server configured, so no email will arrive. The
+              operator can find the link in the API gateway log, or set a new password with{' '}
+              <code>scripts/reset_password.py</code>.
+            </p>
+          )}
           <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
             Back to sign in
           </Link>

@@ -20,11 +20,15 @@
 
 import React from 'react';
 import useSWR from 'swr';
+import { useSearchParams } from 'next/navigation';
 import { describeApiError, fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { EmptyState } from './ui/EmptyState';
 import { ExportButton } from './ui/ExportButton';
 import { ClockTime } from './ui/ClockTime';
+import { TickerEvidence } from './ConvergingEvidence';
+import { TickerModelCard } from './ModelRanking';
+import { PositioningCard } from './PositioningCard';
 import { POLL } from './ui/DataProvider';
 import { IconBlocked, IconCheck, IconDown, IconSignal, IconUp } from './ui/icons';
 import { ABSENT, formatCurrency, formatNumber, isPresent } from '../lib/format';
@@ -94,8 +98,19 @@ function Direction({ open, close }: { open: number; close: number }) {
 }
 
 export default function TickerInspector() {
-  const [input, setInput] = React.useState('');
-  const [ticker, setTicker] = React.useState('');
+  // ?symbol=NVDA opens the inspector on that name, so every ticker on the
+  // stock pages links straight here instead of being retyped.
+  const searchParams = useSearchParams();
+  const linked = (searchParams?.get('symbol') || '').trim().toUpperCase().slice(0, 10);
+  const [input, setInput] = React.useState(linked);
+  const [ticker, setTicker] = React.useState(linked);
+  const [lastLinked, setLastLinked] = React.useState(linked);
+  if (linked && linked !== lastLinked) {
+    // A new link while mounted: adopt it during render, not in an effect.
+    setLastLinked(linked);
+    setInput(linked);
+    setTicker(linked);
+  }
   const [timeframe, setTimeframe] = React.useState<string>('1h');
 
   const q = ticker ? encodeURIComponent(ticker) : null;
@@ -187,6 +202,11 @@ export default function TickerInspector() {
           />
         ) : (
           <div className="space-y-3 px-3.5 py-3">
+            {/* ── evidence: every signal family that has seen this name ── */}
+            <TickerEvidence ticker={ticker} />
+            <TickerModelCard ticker={ticker} />
+            <PositioningCard ticker={ticker} />
+
             {/* ── holdings ───────────────────────────────────────────── */}
             <div className="space-y-1.5 rounded-lg border border-line bg-inset p-3">
               <span className="stat-label">Institutional consensus</span>
@@ -315,7 +335,7 @@ export default function TickerInspector() {
                       {rows.map((c) => (
                         <tr key={c.ts} className="border-b border-line/60">
                           <td className="whitespace-nowrap px-2 py-1 font-mono text-ink-mute">
-                            <ClockTime value={c.ts} seconds={false} />
+                            <ClockTime value={c.ts} seconds={false} withDate />
                           </td>
                           <td className="px-2 py-1 text-right font-mono text-ink-dim">
                             {formatNumber(c.open)}

@@ -6,10 +6,9 @@ Translates raw ADS-B telemetry state vectors into NormalizedEvent instances.
 Features:
   - Batching via Redis pipelining & asyncio.gather parallel scoring.
   - Routine telemetry guard: Sub-threshold events write calm baselines (capped at score 0.15) instead of dropping.
-  - Ontology proposals & aircraft:last_seen updates in Redis for dark flight gap detection.
+  - Ontology proposals for operators and aircraft.
 """
 
-import json
 import logging
 import asyncio
 from datetime import datetime, timezone
@@ -158,8 +157,6 @@ class AviationEnricher:
 
         results = []
         graph_tasks = []
-        pipe = self.redis.raw.pipeline()
-        now_iso = datetime.now(timezone.utc).isoformat()
 
         # kinematic_results joins the loop so the breakdown can carry what the
         # detector measured. The failure branch above builds one empty dict per
@@ -193,22 +190,6 @@ class AviationEnricher:
                 anomaly = routine_band_score(score, region)
             else:
                 anomaly = min(1.0, score)
-
-            alt_ft = int(p.get("baro_altitude", 0) * 3.28084) if p.get("baro_altitude") else 0
-
-            # Store last seen in Redis pipeline for gap detector
-            pipe.set(
-                f"aircraft:last_seen:{icao24}",
-                json.dumps({
-                    "lat": lat,
-                    "lon": lon,
-                    "alt": alt_ft,
-                    "callsign": callsign,
-                    "region": region,
-                    "ts": now_iso
-                }),
-                ex=86400  # 24 hours
-            )
 
             event_type = EventType.FLIGHT_ANOMALY if (is_emerg or anomaly >= 0.60) else EventType.FLIGHT_POSITION
 
@@ -294,7 +275,6 @@ class AviationEnricher:
         if graph_tasks:
             await asyncio.gather(*graph_tasks, return_exceptions=True)
 
-        await pipe.execute()
         return results
 
     async def _score_flight(self, icao24: str, callsign: Optional[str], squawk: str,

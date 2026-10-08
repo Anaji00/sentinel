@@ -43,6 +43,7 @@ from shared.utils.inference_budget import (
     InferenceBudget,
     InferenceShed,
 )
+from shared.utils.llm_policy import llm_disabled_for
 
 # Ceiling on detached dispatches. Most finish in milliseconds; only the few
 # the inference budget admits run long, so this is rarely approached. It
@@ -1253,6 +1254,11 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         is not a way round either -- it only stops a drained candidate being
         offered straight back into the buffer it came from.
         """
+        # An agent whose model calls are switched off has no inference to wait
+        # for: it is told "not now" without the message being buffered for a
+        # retry that could never be admitted.
+        if llm_disabled_for(getattr(self, "name", "")):
+            return False
         # A message that is not a dict still gets an honest capacity answer.
         #
         # `stock_correlation_agent.handle_message(None)` is a supported path --
@@ -2618,6 +2624,12 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         # first-come-first-served into a selection: the parameter existed and no
         # caller had ever filled it, so "which twenty events of a hundred and
         # fifty thousand get analysed" was answered by arrival timing alone.
+        # Agents whose model calls are switched off answer "no verdict" at once,
+        # before the budget is touched, so they never queue ahead of the stock
+        # tier. None is the same answer every caller already handles for an
+        # inference that reached no decision -- unlike a shed, it is not retried.
+        if llm_disabled_for(getattr(self, "name", "")):
+            return None
         if not await self._inference_budget.try_acquire(
             score=_message_score(message),
             domain=_message_domain(message),

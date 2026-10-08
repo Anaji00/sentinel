@@ -2995,6 +2995,17 @@ async def main():
                 logger.error(f"Statistical discovery loop error: {e}")
             await asyncio.sleep(300)
 
+    # Background task: the partial-correlation network, hourly.
+    async def _partial_network_loop():
+        await asyncio.sleep(120)
+        while True:
+            try:
+                res = await discovery_engine.discover_partial_network()
+                logger.info("Partial network job: %s", res)
+            except Exception as e:
+                logger.error(f"Partial network loop error: {e}")
+            await asyncio.sleep(3600)
+
     # Background task: Peer derivation, so contagion has an edge to travel along
     async def _peer_graph_loop():
         """Derives PEER_OF from realised co-movement and publishes the proposals.
@@ -3175,6 +3186,7 @@ async def main():
     safe_create_task(_rule_candidate_loop())
     safe_create_task(_hawkes_refit_loop())
     safe_create_task(_statistical_discovery_loop())
+    safe_create_task(_partial_network_loop())
     safe_create_task(_edge_retest_loop())
     safe_create_task(_sector_hawkes_loop())
     safe_create_task(_peer_graph_loop())

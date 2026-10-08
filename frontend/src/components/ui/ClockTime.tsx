@@ -25,10 +25,22 @@ interface ClockTimeProps {
   withZone?: boolean;
   /** Drop the seconds, for places where the minute is the resolution. */
   seconds?: boolean;
+  /** Prefix the day ("Oct 3"), for lists that span more than one day. */
+  withDate?: boolean;
   className?: string;
 }
 
-export function ClockTime({ value, withZone = false, seconds = true, className }: ClockTimeProps) {
+function dayLabel(value: string | number | Date, zone: string): string {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  try {
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: zone });
+  } catch {
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  }
+}
+
+export function ClockTime({ value, withZone = false, seconds = true, withDate = false, className }: ClockTimeProps) {
   const { zone } = useTimeZone();
   return (
     <time
@@ -36,6 +48,7 @@ export function ClockTime({ value, withZone = false, seconds = true, className }
       title={formatTimestamp(value)}
       className={className}
     >
+      {withDate && value ? `${dayLabel(value, zone)} ` : ''}
       {formatClock(value, zone, { seconds, withZone })}
     </time>
   );

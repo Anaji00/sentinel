@@ -39,6 +39,7 @@ import {
   BookOpen,
   PanelLeftClose,
   PanelLeftOpen,
+  Zap,
 } from 'lucide-react';
 
 import { useNav } from './NavContext';
@@ -65,6 +66,10 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Markets',
     items: [
+      // Signals only from families the reaction study has proven.
+      { href: '/signals', label: 'Trading Signals', icon: Zap },
+      // Every agent call on a stock, open and resolved, with its record.
+      { href: '/predictions', label: 'Stock Predictions', icon: Crosshair },
       { href: '/charts', label: 'Market Charts', icon: LineChart },
       { href: '/options', label: 'Options Flow', icon: TrendingUp },
       { href: '/flow', label: 'Dark Pool & Sweeps', icon: Layers },

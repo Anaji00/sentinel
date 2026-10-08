@@ -172,14 +172,19 @@ def test_the_peek_sites_defer_rather_than_discard():
     """Every `is_available()` peek that used to end in a bare return."""
     agents = ROOT / "services" / "agents"
     for name in (
+        # quant_trading_engine is absent: its trade plans and peers are now
+        # computed, and its one model call -- the thesis -- is best-effort and
+        # never holds back the work, so it has no peek site left to defer at.
         "knowledge_graph_engine", "adversarial_wargamer", "macro_intelligence_engine",
-        "quant_trading_engine", "stock_correlation_agent",
+        "stock_correlation_agent",
     ):
         src = (agents / f"{name}.py").read_text(encoding="utf-8")
         assert "self._inference_budget.is_available()" not in src, (
             f"{name} still discards the candidate it cannot run"
         )
-        assert "capacity_or_defer(message)" in src, name
+        # The macro engine's message paths no longer infer (their briefs are
+        # computed); its one remaining gate is the scheduled review's.
+        assert "capacity_or_defer(" in src, name
 
 
 def test_the_drain_goes_through_the_normal_dispatch_path():

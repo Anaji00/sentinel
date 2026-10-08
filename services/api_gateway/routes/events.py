@@ -67,6 +67,11 @@ async def get_domain_events(
     min_anomaly: float = Query(0.0, ge=0.0, le=1.0),
     start_time: Optional[str] = Query(None, description="Optional ISO start timestamp"),
     end_time: Optional[str] = Query(None, description="Optional ISO end timestamp"),
+    types: Optional[str] = Query(
+        None,
+        max_length=200,
+        description="Comma-separated event types to keep, e.g. equity_block,options_flow",
+    ),
     db = Depends(get_db)
 ):
     """Dynamic endpoint to fetch events for a specific domain or all domains with time-window filtering."""
@@ -86,6 +91,16 @@ async def get_domain_events(
             where_clauses.append(f"occurred_at <= ${param_idx}")
             params.append(datetime.fromisoformat(end_time.replace("Z", "+00:00")))
             param_idx += 1
+
+        if types:
+            # A panel about one kind of event asks for that kind. The block-trade
+            # panel read every tradfi event and labelled each non-option one a
+            # block: volume anomalies and futures moves as "0 shares block, $0.00".
+            wanted = [t.strip().lower() for t in types.split(",") if t.strip()]
+            if wanted:
+                where_clauses.append(f"type = ANY(${param_idx})")
+                params.append(wanted)
+                param_idx += 1
 
         where_sql = " AND ".join(where_clauses)
         limit_idx = f"${param_idx}"

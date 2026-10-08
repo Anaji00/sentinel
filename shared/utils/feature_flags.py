@@ -27,6 +27,18 @@ def rollout_bucket(flag_name: str, subject: str) -> int:
     return int.from_bytes(digest[:8], "big") % 100
 
 DEFAULT_SIGNAL_FLAGS = {
+    "trade_signals": {
+        "description": "Trading signals from reaction-study-proven signal families "
+                       "(services/agents/signal_engine.py). Halting this stops new "
+                       "signals; the study itself keeps running.",
+        "enabled": True,
+        "rollout_pct": 100.0,
+        "enabled_tickers": [],
+        "kill_switched": False,
+        "reason": "Default active",
+        "updated_at": "2026-10-05T00:00:00Z",
+        "updated_by": "system",
+    },
     "order_execution": {
         "description": "Broker order submission. Halting this stops trade execution "
                        "at the gateway, independently of signal generation.",

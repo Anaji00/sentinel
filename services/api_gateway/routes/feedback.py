@@ -292,6 +292,43 @@ class InteractionRequest(BaseModel):
         return value
 
 
+class InteractionBatch(BaseModel):
+    """Several interactions in one request; the console sends one per page, not one per row."""
+
+    items: List[InteractionRequest] = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/interaction/batch", dependencies=[Depends(require_role(Role.VIEWER))])
+async def record_interactions(req: InteractionBatch, redis=Depends(get_redis_optional)) -> Dict[str, Any]:
+    """Records many interactions in one pipeline round trip."""
+    if not redis:
+        raise HTTPException(status_code=503, detail="interaction store unavailable")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        raw = getattr(redis, "raw", redis)
+        pipe = raw.pipeline()
+        bands = set()
+        for item in req.items:
+            band = _score_band(item.score)
+            bands.add(band)
+            pipe.hincrby(f"{INTERACTION_KEY}:{band}", item.action, 1)
+            pipe.lpush(INTERACTION_LOG_KEY, json.dumps({
+                "action": item.action, "score": round(float(item.score), 4), "band": band,
+                "correlation_id": item.correlation_id, "rule_id": item.rule_id, "created_at": now,
+            }))
+        for band in bands:
+            pipe.expire(f"{INTERACTION_KEY}:{band}", INTERACTION_TTL_SEC)
+        pipe.sadd(f"{INTERACTION_KEY}:index", *bands)
+        pipe.expire(f"{INTERACTION_KEY}:index", INTERACTION_TTL_SEC)
+        pipe.ltrim(INTERACTION_LOG_KEY, 0, INTERACTION_LOG_MAX - 1)
+        pipe.expire(INTERACTION_LOG_KEY, INTERACTION_TTL_SEC)
+        await pipe.execute()
+    except Exception as e:
+        logger.error("Could not record interactions: %s", e)
+        raise HTTPException(status_code=503, detail="interactions not recorded")
+    return {"recorded": len(req.items)}
+
+
 @router.post("/interaction", dependencies=[Depends(require_role(Role.VIEWER))])
 async def record_interaction(req: InteractionRequest, redis=Depends(get_redis_optional)):
     """Records that a reader saw, opened, dismissed or acted on an alert.

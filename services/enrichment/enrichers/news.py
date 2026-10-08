@@ -14,6 +14,7 @@ from shared.utils.quiet_failures import swallowed
 from datetime import datetime, timezone
 from typing import Optional, List
 import re
+import time
 import spacy
 
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
@@ -26,6 +27,12 @@ from services.enrichment.anomaly_scorer import lift_score
 from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 from shared.utils.instrument_reach import EXPOSES_PREFIX, quoted_company_tickers
 from shared.utils.osint_bridges import text_exposure_tags
+from shared.utils.headline_mapping import equities, map_headline, mapping_tags, zone_tags
+from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+
+# A second, independent source must name a mapped equity within this window
+# before it is promoted onto the streamed watchlist.
+MAPPED_CORROBORATION_SEC = 6 * 3600
 
 logger = logging.getLogger("enrichment.news")
 
@@ -375,6 +382,14 @@ class NewsEnricher:
             tags.append("named_company")
         tags.extend(f"{EXPOSES_PREFIX}{t}" for t in company_tickers)
         tags.extend(text_exposure_tags(combined_text))
+
+        # Sectors, country markets and conflict zones the title is about, each
+        # an `exposes:` tag plus a `sector:` / `country:` / `zone:` tag naming
+        # why. The title only: summaries mention far more than they are about.
+        affected = map_headline(title)
+        tags.extend(mapping_tags(affected))
+        tags.extend(zone_tags(title))
+        await self._promote_corroborated(equities(affected), source_name)
         
         # Subjects the collector already resolved, ahead of anything spaCy can
         # infer from a title.
@@ -554,6 +569,27 @@ class NewsEnricher:
                 ),
             ).to_dict(),
         )
+
+    async def _promote_corroborated(self, symbols: List[str], source: str) -> None:
+        """Track a mapped equity once two different sources have named it.
+
+        A mapping only joins to a price move if the market collector streams
+        the ticker, and its subscription slots are scarce. Requiring a second,
+        independent source within six hours keeps one noisy feed from filling
+        them, and puts the slot where the news is converging.
+        """
+        if not self.redis or not symbols or not source:
+            return
+        raw = getattr(self.redis, "raw", self.redis)
+        try:
+            for sym in symbols[:6]:
+                key = f"sentinel:news:mapped_sources:{sym}"
+                await raw.sadd(key, source)
+                await raw.expire(key, MAPPED_CORROBORATION_SEC)
+                if await raw.scard(key) >= 2:
+                    await raw.zadd(WATCHED_EQUITIES_KEY, {sym: time.time()})
+        except Exception as exc:
+            swallowed("enrichment.news.promote_corroborated", exc, logger)
 
     async def _record_entity_sentiment(self, entities: list, sentiment: float) -> None:
         """Fold this headline's sentiment into each named entity's running mean.

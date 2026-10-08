@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from services.agents.base import InferenceBatcher, SentinelAgent
 from shared.kafka import Topics
 from shared.utils.focus import prioritise
+from shared.utils.llm_policy import llm_disabled_for
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import swallowed
 from shared.utils.equities import BROAD_MARKET_ETFS, is_valid_primary_equity
@@ -20,6 +21,27 @@ class RadarCandidateDecision(BaseModel):
     ticker: str
     investigate: bool
     rationale: str
+
+
+# The radar's escalation rule: a volume z-score this large on at least this
+# much one-minute flow.
+RADAR_ESCALATE_Z = 3.5
+RADAR_ESCALATE_NOTIONAL_USD = 50_000.0
+
+
+def deterministic_radar_decision(ticker: str, z_score: float, notional_usd: float) -> RadarCandidateDecision:
+    """The escalation verdict from the numbers alone, with them in the rationale."""
+    z_ok = z_score >= RADAR_ESCALATE_Z
+    flow_ok = notional_usd >= RADAR_ESCALATE_NOTIONAL_USD
+    return RadarCandidateDecision(
+        ticker=ticker,
+        investigate=z_ok and flow_ok,
+        rationale=(
+            f"Rule: volume z {z_score:.2f} {'>=' if z_ok else '<'} {RADAR_ESCALATE_Z}, "
+            f"flow ${notional_usd / 1e6:.2f}M {'>=' if flow_ok else '<'} "
+            f"${RADAR_ESCALATE_NOTIONAL_USD / 1e6:.2f}M."
+        ),
+    )
 
 
 class RadarBatchDecision(BaseModel):
@@ -122,6 +144,16 @@ class RadarAgent(SentinelAgent):
         """
         if not items:
             return {}
+
+        # With the model switched off the batch is decided by the radar's own
+        # threshold -- the rule that was already its fallback, now its primary.
+        if llm_disabled_for(self.name):
+            return {
+                str(c["ticker"]).upper(): deterministic_radar_decision(
+                    str(c["ticker"]).upper(), float(c["z_score"]), float(c["notional_usd"])
+                )
+                for _, c in items
+            }
 
         # Subjects another agent is already looking at go to the front.
         #
@@ -660,10 +692,10 @@ class RadarAgent(SentinelAgent):
                 self.logger.info(f"🧠 AGENT BYPASS: {ticker} not escalated. Rationale: {decision.rationale}")
         except Exception as e:
             self.logger.warning(f"Agent LLM reasoning unavailable for {ticker}: {e}. Engaging Deterministic Quant Rules.")
-            if z_score >= 3.5 and notional_usd >= 50_000:
+            if z_score >= RADAR_ESCALATE_Z and notional_usd >= RADAR_ESCALATE_NOTIONAL_USD:
                 decision = RadarDecision(
                     investigate=True, 
-                    rationale=f"Deterministic Quant Fallback: Volume Z-score {z_score:.2f} >= 3.5 with ${notional_usd/1e6:.2f}M flow."
+                    rationale=f"Deterministic Quant Fallback: Volume Z-score {z_score:.2f} >= {RADAR_ESCALATE_Z} with ${notional_usd/1e6:.2f}M flow."
                 )
                 self.logger.info(f"⚡ DETERMINISTIC ESCALATION: {ticker} -> Primary Surveillance.")
                 

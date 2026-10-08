@@ -14,6 +14,12 @@ import { ClockTime } from './ui/ClockTime';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
 
+// Scores arrive null on some rows; a null here crashed the whole view.
+function fixed(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+
 export default function CryptoAnalytics() {
   const [activeChain, setActiveChain] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -187,7 +193,7 @@ export default function CryptoAnalytics() {
                           : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
                       }`}
                     >
-                      SCORE: {e.anomaly_score.toFixed(2)}
+                      SCORE: {fixed(e.anomaly_score, 2)}
                     </span>
                   </div>
 
@@ -326,7 +332,7 @@ export default function CryptoAnalytics() {
                 <div>
                   <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
                   <span className="text-rose-400 font-bold block">
-                    {selectedEvent.anomaly_score.toFixed(2)}
+                    {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
                 <div>

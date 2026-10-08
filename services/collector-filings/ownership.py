@@ -26,6 +26,7 @@ from collections import Counter
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -39,7 +40,10 @@ if str(ROOT) not in sys.path:
 from shared.utils.ownership import (  # noqa: E402
     FILER_KEY, HOLDERS_KEY, MCAP_KEY, OWNERSHIP_FILERS, aggregate_by_cusip, iter_infotable,
     DEFENSE_PRIMES, OSINT_SECTORS, stake_pct, value_scale,
+    CHANGES_KEY, aggregate_changes, holding_changes,
 )
+from shared.kafka import Topics  # noqa: E402
+from shared.models import NormalizedEvent, RawEvent  # noqa: E402
 from shared.utils.quiet_failures import dropped, swallowed  # noqa: E402
 from shared.utils.quote_cache import quote_key  # noqa: E402
 
@@ -73,6 +77,21 @@ async def _latest_13f(session: aiohttp.ClientSession, cik: str) -> Optional[Dict
     rec = data.get("filings", {}).get("recent", {})
     for i, form in enumerate(rec.get("form", [])):
         if form in ("13F-HR", "13F-HR/A"):
+            return {"accession": rec["accessionNumber"][i], "period": rec["reportDate"][i],
+                    "filed": rec["filingDate"][i]}
+    return None
+
+
+async def _previous_13f(session: aiohttp.ClientSession, cik: str, before_period: str) -> Optional[Dict[str, str]]:
+    """The newest original 13F-HR for a period earlier than `before_period`."""
+    async with session.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                           timeout=aiohttp.ClientTimeout(total=60)) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+    rec = data.get("filings", {}).get("recent", {})
+    for i, form in enumerate(rec.get("form", [])):
+        if form == "13F-HR" and rec["reportDate"][i] < before_period:
             return {"accession": rec["accessionNumber"][i], "period": rec["reportDate"][i],
                     "filed": rec["filingDate"][i]}
     return None
@@ -230,25 +249,18 @@ async def _universe(raw: Any) -> set:
     return {t for t in tickers if t}
 
 
-async def refresh_filer(
-    session: aiohttp.ClientSession, sec: aiohttp.ClientSession, raw: Any, graph: Any,
-    cik: str, resolve: Callable[[str, Optional[str]], Optional[str]],
-    universe: set, cusip_cache: Dict[str, Optional[str]],
-) -> int:
+async def _load_holdings(
+    session: aiohttp.ClientSession, sec: aiohttp.ClientSession, raw: Any, cik: str, accession: str,
+    resolve: Callable[[str, Optional[str]], Optional[str]], universe: set,
+    cusip_cache: Dict[str, Optional[str]],
+):
+    """One 13F's information table: (positions, kept holdings, total value, bytes), or None."""
     filer = OWNERSHIP_FILERS[cik]
-    latest = await _latest_13f(sec, cik)
-    await asyncio.sleep(SEC_PAUSE_SEC)
-    if not latest:
-        return 0
-    seen = await raw.get(ACCESSION_KEY.format(cik=cik))
-    seen = seen.decode() if isinstance(seen, bytes) else seen
-    if seen == latest["accession"]:
-        return 0
-    url = await _infotable_url(sec, cik, latest["accession"])
+    url = await _infotable_url(sec, cik, accession)
     await asyncio.sleep(SEC_PAUSE_SEC)
     if not url:
         dropped("collector_filings.ownership.no_infotable", "13F with no information table", logger, variant=filer.filer_id)
-        return 0
+        return None
 
     fd, path = tempfile.mkstemp(suffix=".xml")
     os.close(fd)
@@ -297,7 +309,110 @@ async def refresh_filer(
     total_value = sum(float(p["value"]) for p in positions.values()) or 1.0
     for k in kept:
         k["pct_of_portfolio"] = round(100.0 * float(k["value_usd"]) / total_value, 4)
+    return positions, kept, total_value, size
+
+
+async def _record_changes(raw: Any, filer_name: str, period: str, previous: list, current: list) -> None:
+    """One filer's quarter-on-quarter changes, filed under the new period."""
+    changes = holding_changes(previous, current)
+    await raw.hset(CHANGES_KEY.format(period=period), filer_name, json.dumps(changes))
+    await raw.expire(CHANGES_KEY.format(period=period), 200 * 86400)
+
+
+async def ensure_baseline(
+    session: aiohttp.ClientSession, sec: aiohttp.ClientSession, raw: Any, cik: str,
+    resolve: Callable[[str, Optional[str]], Optional[str]], universe: set,
+    cusip_cache: Dict[str, Optional[str]],
+) -> bool:
+    """For a filer already on its latest period with no comparison yet, fetch the
+    previous quarter once and record the changes. True when it did."""
+    filer = OWNERSHIP_FILERS[cik]
+    blob = await raw.get(FILER_KEY.format(filer_id=filer.filer_id))
+    if not blob:
+        return False
+    current = json.loads(blob)
+    period = current.get("period")
+    if not period or await raw.hexists(CHANGES_KEY.format(period=period), filer.name):
+        return False
+    prev = await _previous_13f(sec, cik, period)
+    await asyncio.sleep(SEC_PAUSE_SEC)
+    if not prev:
+        return False
+    loaded = await _load_holdings(session, sec, raw, cik, prev["accession"], resolve, universe, cusip_cache)
+    if loaded is None:
+        return False
+    await _record_changes(raw, filer.name, period, loaded[1], current.get("holdings") or [])
+    logger.info("Ownership: %s compared %s against %s", filer.name, period, prev["period"])
+    return True
+
+
+async def publish_flows(producer: Any, raw: Any) -> int:
+    """Accumulation and distribution across filers, once per ticker per period."""
+    published = 0
+    async for key in raw.scan_iter(CHANGES_KEY.format(period="*")):
+        key = key.decode() if isinstance(key, bytes) else key
+        period = key.rsplit(":", 1)[1]
+        per_filer = {
+            (f.decode() if isinstance(f, bytes) else f): json.loads(v)
+            for f, v in (await raw.hgetall(key) or {}).items()
+        }
+        for ticker, row in aggregate_changes(per_filer).items():
+            if not row["flow"]:
+                continue
+            marker = f"sentinel:ownership:flow_published:{period}:{ticker}"
+            if not await raw.set(marker, "1", ex=200 * 86400, nx=True):
+                continue
+            kind = "institutional_accumulation" if row["flow"] > 0 else "institutional_distribution"
+            names = row["buyers"] if row["flow"] > 0 else row["sellers"]
+            verb = "added to or opened" if row["flow"] > 0 else "cut or exited"
+            event = NormalizedEvent.model_validate({
+                "type": "thirteen_f",
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "source": "ownership_changes",
+                "primary_entity": {"id": ticker, "type": "company", "name": ticker},
+                "headline": f"{len(names)} tracked institutions {verb} {ticker} in the quarter to {period}",
+                "summary": ", ".join(names) + ". 13F long positions as filed, 45 days after quarter end.",
+                "financial_data": {"ticker": ticker},
+                "tags": [kind, f"exposes:{ticker}", f"period:{period}"],
+                "anomaly_score": min(0.9, 0.4 + 0.1 * len(names)),
+            })
+            await producer.send(
+                Topics.RAW_TRADFI,
+                RawEvent(source="ownership_changes", occurred_at=event.occurred_at,
+                         raw_payload={"normalized_event": event.model_dump(mode="json")}).model_dump(mode="json"),
+                key=ticker,
+            )
+            published += 1
+    return published
+
+
+async def refresh_filer(
+    session: aiohttp.ClientSession, sec: aiohttp.ClientSession, raw: Any, graph: Any,
+    cik: str, resolve: Callable[[str, Optional[str]], Optional[str]],
+    universe: set, cusip_cache: Dict[str, Optional[str]],
+) -> int:
+    filer = OWNERSHIP_FILERS[cik]
+    latest = await _latest_13f(sec, cik)
+    await asyncio.sleep(SEC_PAUSE_SEC)
+    if not latest:
+        return 0
+    seen = await raw.get(ACCESSION_KEY.format(cik=cik))
+    seen = seen.decode() if isinstance(seen, bytes) else seen
+    if seen == latest["accession"]:
+        return 0
+    loaded = await _load_holdings(session, sec, raw, cik, latest["accession"], resolve, universe, cusip_cache)
+    if loaded is None:
+        return 0
+    positions, kept, total_value, size = loaded
+    for k in kept:
         k["period"] = latest["period"]
+
+    # The previous quarter's holdings, before they are overwritten, for the
+    # quarter-on-quarter comparison.
+    prior_blob = await raw.get(FILER_KEY.format(filer_id=filer.filer_id))
+    prior = json.loads(prior_blob) if prior_blob else None
+    if prior and prior.get("period") and prior["period"] < latest["period"]:
+        await _record_changes(raw, filer.name, latest["period"], prior.get("holdings") or [], kept)
 
     await raw.set(FILER_KEY.format(filer_id=filer.filer_id), json.dumps({
         "filer_id": filer.filer_id, "name": filer.name, "cik": cik,
@@ -350,9 +465,16 @@ async def run_forever(producer: Any, redis_client: Any,
                 for cik in OWNERSHIP_FILERS:
                     try:
                         await refresh_filer(session, sec, raw, graph, cik, resolve, universe, cusip_cache)
+                        await ensure_baseline(session, sec, raw, cik, resolve, universe, cusip_cache)
                     except Exception as e:
                         swallowed("collector_filings.ownership.refresh", e, logger,
                                   variant=OWNERSHIP_FILERS[cik].filer_id)
+            try:
+                n = await publish_flows(producer, raw)
+                if n:
+                    logger.info("Ownership: published %d institutional flow event(s)", n)
+            except Exception as e:
+                swallowed("collector_filings.ownership.flows", e, logger)
         except Exception as e:
             swallowed("collector_filings.ownership.cycle", e, logger)
         await asyncio.sleep(REFRESH_SEC)

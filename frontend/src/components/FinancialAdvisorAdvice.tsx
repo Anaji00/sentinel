@@ -47,6 +47,8 @@ interface SmartMoneyConvergence {
 interface TradingSignal {
   ticker: string;
   action: 'BUY' | 'SELL' | 'HOLD';
+  /** 'proven' only when the trigger's family passed the reaction study. */
+  evidence_status?: 'proven' | 'unproven';
   trade_type?: string;
   entry_level: number;
   target_price: number;
@@ -84,6 +86,8 @@ interface PortfolioMetrics {
   metrics_source?: string;
   risk_horizon?: string;
   annualization_basis?: string;
+  /** The ticker whose price series these figures describe -- not a portfolio. */
+  subject_ticker?: string;
 }
 
 interface AdviceBrief {
@@ -286,7 +290,7 @@ export default function FinancialAdvisorAdvice() {
                 className="text-ink-mute block text-micro"
                 title={metrics?.annualization_basis || undefined}
               >
-                PORTFOLIO VaR (95%, {metrics?.risk_horizon || '—'})
+                {metrics?.subject_ticker ? `${metrics.subject_ticker} VaR` : 'VaR'} (95%, {metrics?.risk_horizon || '—'})
               </span>
               <ProvenanceBadge
                 sourceType={
@@ -311,7 +315,9 @@ export default function FinancialAdvisorAdvice() {
           </div>
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-ink-mute block text-micro">SHARPE RATIO</span>
+              <span className="text-ink-mute block text-micro">
+                {metrics?.subject_ticker ? `${metrics.subject_ticker} SHARPE` : 'SHARPE RATIO'}
+              </span>
               <ProvenanceBadge
                 sourceType={
                   metrics?.metrics_source === 'computed' && metrics?.sharpe_ratio !== undefined
@@ -501,6 +507,20 @@ export default function FinancialAdvisorAdvice() {
                       }`}
                     >
                       {p.trade_type || p.action}
+                    </span>
+                    <span
+                      title={
+                        p.evidence_status === 'proven'
+                          ? 'The trigger family passed the reaction study'
+                          : 'No trigger family has passed the reaction study; size is capped'
+                      }
+                      className={`px-1.5 py-0.5 rounded text-micro font-bold border ${
+                        p.evidence_status === 'proven'
+                          ? 'border-emerald-500/40 text-emerald-300'
+                          : 'border-line text-ink-mute'
+                      }`}
+                    >
+                      {p.evidence_status === 'proven' ? 'PROVEN' : 'UNPROVEN'}
                     </span>
                     {p.smart_money?.is_aligned && (
                       <span className="px-1.5 py-0.5 rounded text-micro font-extrabold bg-purple-500/20 text-purple-300 border border-purple-500/40">

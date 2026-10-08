@@ -113,9 +113,17 @@ const CSV_COLUMNS: CsvColumn<BacktestResult>[] = [
 
 type SortKey = 'alpha' | 'sharpe' | 'trades' | 'drawdown';
 
+// Alpha is return over buy-and-hold, so a strategy that never traded "beat" a
+// stock that fell 22% by 22% -- and sorting by alpha ranked crashed tickers
+// first. Below the backtester's own validation floor neither alpha nor Sharpe
+// says anything about the strategy; they are not shown or ranked.
+const MIN_TRADES_FOR_METRICS = 20;
+const measured = (r: BacktestResult, v: number | null): number | null =>
+  r.performance_metrics.total_trades >= MIN_TRADES_FOR_METRICS ? v : null;
+
 const SORTS: { key: SortKey; label: string; of: (r: BacktestResult) => number | null }[] = [
-  { key: 'alpha', label: 'Alpha', of: (r) => r.performance_metrics.alpha_pct },
-  { key: 'sharpe', label: 'Sharpe', of: (r) => r.risk_metrics.realized_sharpe_ratio },
+  { key: 'alpha', label: 'Alpha', of: (r) => measured(r, r.performance_metrics.alpha_pct) },
+  { key: 'sharpe', label: 'Sharpe', of: (r) => measured(r, r.risk_metrics.realized_sharpe_ratio) },
   { key: 'trades', label: 'Trades', of: (r) => r.performance_metrics.total_trades },
   { key: 'drawdown', label: 'Drawdown', of: (r) => r.risk_metrics.max_drawdown_pct },
 ];
@@ -320,10 +328,16 @@ export default function StrategyPerformance() {
                     <td className="px-3 py-2 text-ink">{r.strategy_name}</td>
                     <td className="px-3 py-2 font-mono font-semibold text-accent">{r.ticker}</td>
                     <td className="px-3 py-2 text-right">
-                      <Signed value={perf.alpha_pct} />
+                      {perf.total_trades >= MIN_TRADES_FOR_METRICS ? (
+                        <Signed value={perf.alpha_pct} />
+                      ) : (
+                        <span className="text-ink-mute" title={`${perf.total_trades} trades; needs ${MIN_TRADES_FOR_METRICS}`}>
+                          {ABSENT}
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-2 text-right font-mono text-ink-dim">
-                      {formatNumber(r.risk_metrics.realized_sharpe_ratio, { decimals: 2 })}
+                      {formatNumber(measured(r, r.risk_metrics.realized_sharpe_ratio), { decimals: 2 })}
                     </td>
                     <td className="px-3 py-2 text-right font-mono text-ink-dim">
                       {isPresent(perf.hit_rate_pct) ? (

@@ -260,3 +260,86 @@ async def record_and_assess(redis_client, reading: TrafficReading) -> Optional[T
         logger.debug(f"Chokepoint baseline write failed for {key}: {e}")
 
     return assessment
+
+
+# -- Radar beyond the blind chokepoints ----------------------------------------
+#
+# Small boxes, because every area is one openEO job a day against the CDSE
+# credit allowance. Each is a place where tankers load, wait or meet, so a
+# change in radar returns there bears on crude.
+#
+# Bounding boxes in openEO's spelling: west, south, east, north.
+SAR_TERMINALS: Dict[str, Dict[str, float]] = {
+    # Iran's main crude export terminal.
+    "Kharg Island":       {"west": 50.20, "south": 29.15, "east": 50.40, "north": 29.35},
+    # Saudi Aramco's largest export terminal.
+    "Ras Tanura":         {"west": 50.05, "south": 26.55, "east": 50.30, "north": 26.80},
+    # The bunkering and ship-to-ship anchorage outside Hormuz.
+    "Fujairah Anchorage": {"west": 56.35, "south": 25.00, "east": 56.65, "north": 25.40},
+    # Russia's largest Black Sea crude port (Sheskharis).
+    "Novorossiysk":       {"west": 37.70, "south": 44.60, "east": 38.00, "north": 44.80},
+    # Russia's largest Baltic crude port, a shadow-fleet loading point.
+    "Primorsk":           {"west": 28.50, "south": 60.25, "east": 28.80, "north": 60.45},
+    # The Greek anchorage where Russian cargoes are moved between tankers.
+    "Laconian Gulf":      {"west": 22.60, "south": 36.45, "east": 22.95, "north": 36.75},
+    # The Houthi-held Red Sea oil terminal.
+    "Ras Isa":            {"west": 42.80, "south": 14.75, "east": 43.00, "north": 15.05},
+}
+
+# Areas where AIS reception is good, so a radar return with no AIS vessel in
+# the same cell over the same days is a hull not transmitting. Inside the
+# AISStream boxes by construction; the Kerch box is the southern anchorage,
+# clear of the Crimean Bridge, which would otherwise return on every pass.
+SAR_AIS_CHECK_AREAS: Dict[str, Dict[str, float]] = {
+    "Singapore Strait":  {"west": 103.60, "south": 1.10,  "east": 104.30, "north": 1.45},
+    "Taiwan Strait Mid": {"west": 119.70, "south": 24.05, "east": 120.20, "north": 24.55},
+    "Kerch Anchorage":   {"west": 36.35,  "south": 44.95, "east": 36.75,  "north": 45.20},
+}
+
+# The AIS cell index: which hulls AIS saw in each ~3 nm cell on each day,
+# written by the maritime enricher inside the check areas only.
+AIS_CELL_DEG = 0.05
+AIS_CELL_KEY = "sentinel:ais:cell:{day}:{i}:{j}"
+AIS_CELL_TTL_SEC = 10 * 86400
+# When the index started, so a radar window older than the index is not read
+# as "no AIS" for days nothing was recorded.
+AIS_CELL_INDEX_SINCE_KEY = "sentinel:ais:cell_index_since"
+
+# How a cell's radar presence is remembered across passes, to tell a fixed
+# structure (platform, buoy, bridge pier) from a hull.
+SAR_CELL_HISTORY_KEY = "sentinel:sar:cell_history:{area}"
+SAR_CELL_HISTORY_LEN = 10
+FIXED_STRUCTURE_SHARE = 0.8
+FIXED_STRUCTURE_MIN_PASSES = 4
+
+
+def ais_cell(lat: float, lon: float) -> tuple:
+    """The (i, j) index of the AIS cell containing a position."""
+    return (math.floor(lat / AIS_CELL_DEG), math.floor(lon / AIS_CELL_DEG))
+
+
+def in_ais_check_area(lat: Optional[float], lon: Optional[float]) -> bool:
+    if lat is None or lon is None:
+        return False
+    for b in SAR_AIS_CHECK_AREAS.values():
+        if b["south"] <= lat <= b["north"] and b["west"] <= lon <= b["east"]:
+            return True
+    return False
+
+
+def ais_cells_in_box(south: float, west: float, north: float, east: float) -> List[tuple]:
+    """Every AIS cell index that overlaps a box."""
+    i0, j0 = ais_cell(south, west)
+    i1, j1 = ais_cell(north, east)
+    return [(i, j) for i in range(i0, i1 + 1) for j in range(j0, j1 + 1)]
+
+
+def likely_fixed_structure(history: Sequence[int]) -> bool:
+    """A cell that returns on nearly every pass is a structure, not a ship.
+
+    `history` is 1 for a pass with a radar return in the cell and 0 without,
+    newest first, not counting the current pass.
+    """
+    if len(history) < FIXED_STRUCTURE_MIN_PASSES:
+        return False
+    return sum(1 for h in history if h) / len(history) >= FIXED_STRUCTURE_SHARE

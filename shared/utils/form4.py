@@ -184,11 +184,26 @@ def parse_form4(payload: bytes | str) -> Optional[Dict[str, Any]]:
                 "is_derivative": table == "derivativeTable",
             })
 
+    # Traded under a Rule 10b5-1 plan: scheduled in advance, so not a decision
+    # made on what the insider knows now. Cohen, Malloy & Pomorski (2012) found
+    # such routine trades carry essentially no return information while the
+    # opportunistic remainder carries all of it. Since April 2023 the form has
+    # an explicit checkbox (aff10b5One); before that, plans were disclosed only
+    # in footnotes, so both are read.
+    footnotes = " ".join(_text(f) for f in root.iter("footnote")).lower()
+    mentions_plan = "10b5-1" in footnotes or "10b5 1" in footnotes
+    denies_plan = any(n in footnotes for n in (
+        "not pursuant to a rule 10b5-1", "not made pursuant to a rule 10b5-1",
+        "not pursuant to a 10b5-1", "not effected pursuant to a rule 10b5-1",
+    ))
+    planned = _flag(root.find("aff10b5One")) or (mentions_plan and not denies_plan)
+
     return {
         "ticker": listed_symbol(ticker),
         "issuer_name": issuer_name,
         "owners": owners,
         "transactions": transactions,
+        "planned_10b5_1": planned,
         "insider_names": [o["name"] for o in owners],
         **_aggregate(transactions),
     }

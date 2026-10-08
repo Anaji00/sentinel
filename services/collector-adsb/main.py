@@ -282,7 +282,14 @@ async def poll_zone(
                     #
                     # OpenSky serves a bounding box and cannot filter by squawk,
                     # so the fetch is unchanged. Everything after it is not.
-                    if not (is_emergency or precise_zone):
+                    #
+                    # Emergency squawks only. Watch-zone positions fed the
+                    # dark-flight gap detector, and because positions are kept
+                    # only inside these small boxes, an airliner that flew out
+                    # of one read as "silent" until its next scheduled pass:
+                    # 459 of 482 flight_dark events in 24 hours were airline
+                    # callsigns. The detector is gone, and positions with it.
+                    if not is_emergency:
                         continue
 
                     event = RawEvent(

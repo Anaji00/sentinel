@@ -22,6 +22,36 @@ export type InteractionAction = 'surfaced' | 'opened' | 'dismissed' | 'acted_on'
 // count of React renders rather than of alerts a person could have read.
 const emitted = new Set<string>();
 
+// A page surfaces dozens of rows at once; one request per row was ~90 POSTs per
+// load. Interactions are buffered briefly and sent as one batch.
+const FLUSH_DELAY_MS = 1500;
+const MAX_BATCH = 500;
+
+interface InteractionBody {
+  action: InteractionAction;
+  score: number;
+  correlation_id: string | null;
+  rule_id: string | null;
+}
+
+let pending: { key: string; body: InteractionBody }[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flush(): void {
+  flushTimer = null;
+  const batch = pending.slice(0, MAX_BATCH);
+  pending = pending.slice(MAX_BATCH);
+  if (pending.length > 0) flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
+  if (batch.length === 0) return;
+  void apiClient
+    .post('/feedback/interaction/batch', { items: batch.map((p) => p.body) })
+    .catch(() => {
+      // Instrumentation never surfaces. Allow a retry on the next render
+      // rather than silently recording nothing for the rest of the session.
+      for (const p of batch) emitted.delete(p.key);
+    });
+}
+
 export function recordInteraction(
   action: InteractionAction,
   score: number | null | undefined,
@@ -34,16 +64,14 @@ export function recordInteraction(
   if (emitted.has(key)) return;
   emitted.add(key);
 
-  void apiClient
-    .post('/feedback/interaction', {
+  pending.push({
+    key,
+    body: {
       action,
       score: Math.max(0, Math.min(1, numeric)),
       correlation_id: ids.correlationId || null,
       rule_id: ids.ruleId || null,
-    })
-    .catch(() => {
-      // Instrumentation never surfaces. Allow a retry on the next render
-      // rather than silently recording nothing for the rest of the session.
-      emitted.delete(key);
-    });
+    },
+  });
+  if (flushTimer === null) flushTimer = setTimeout(flush, FLUSH_DELAY_MS);
 }

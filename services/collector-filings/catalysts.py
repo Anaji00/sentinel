@@ -42,7 +42,17 @@ SHORT_MIN_HISTORY = 10
 SHORT_MIN_TOTAL_VOLUME = 500_000
 # A spike: at least this share short, and this far above the name's own mean.
 SHORT_SPIKE_FLOOR = 0.55
-SHORT_SPIKE_JUMP = 0.15
+SHORT_SPIKE_JUMP = 0.10
+# Standard deviations above the name's own norm. A fixed jump alone is easy for
+# a name whose ratio swings and nearly impossible for a steady one; scaling by
+# the name's own dispersion is what makes "unusual for this stock" mean the same
+# thing everywhere. The floor stops a flat history producing infinite scores.
+SHORT_SPIKE_Z = 2.0
+SHORT_MIN_SD = 0.03
+# Files read once to seed every name's history, so spikes are measurable from
+# the first day rather than ten trading days after deploy.
+SHORT_SEED_CALENDAR_DAYS = 32
+FINRA_SEEDED_KEY = "sentinel:catalysts:finra:seeded"
 
 
 def parse_short_volume(text: str) -> Dict[str, Tuple[float, float]]:
@@ -63,10 +73,19 @@ def parse_short_volume(text: str) -> Dict[str, Tuple[float, float]]:
 
 
 def short_spike(ratio: float, history: List[float]) -> bool:
-    """Whether today's short share is a spike against the name's own history."""
+    """Whether today's short share is a spike against the name's own history:
+    above the floor, a real jump, and at least SHORT_SPIKE_Z of its own
+    standard deviations above its mean (Diether, Lee & Werner 2009: rising
+    short selling predicts negative abnormal returns)."""
     if len(history) < SHORT_MIN_HISTORY:
         return False
-    return ratio >= SHORT_SPIKE_FLOOR and ratio >= mean(history) + SHORT_SPIKE_JUMP
+    mu = mean(history)
+    sd = max(SHORT_MIN_SD, (sum((h - mu) ** 2 for h in history) / len(history)) ** 0.5)
+    return (
+        ratio >= SHORT_SPIKE_FLOOR
+        and ratio >= mu + SHORT_SPIKE_JUMP
+        and (ratio - mu) / sd >= SHORT_SPIKE_Z
+    )
 
 
 def short_spike_event(symbol: str, day: str, ratio: float, history: List[float],
@@ -90,34 +109,64 @@ def short_spike_event(symbol: str, day: str, ratio: float, history: List[float],
             f"{base:.1%} (+{jump:.1%})."
         ),
         anomaly_score=score,
-        financial_data=FinancialData(ticker=symbol, volume=total, trade_type="SHORT_VOLUME"),
+        # FINRA's files carry fractional shares (600165.526789); the
+        # model's volume is whole shares, and a float failed validation, so
+        # no spike event could be built.
+        financial_data=FinancialData(ticker=symbol, volume=int(round(total)), trade_type="SHORT_VOLUME"),
         tags=["short_volume_spike", "tradfi", f"exposes:{symbol}"],
         region="US",
     )
 
 
+async def _fetch_day(session, day: str) -> Dict[str, Tuple[float, float]]:
+    async with session.get(FINRA_URL.format(day=day), headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        if resp.status != 200:
+            return {}
+        return parse_short_volume(await resp.text())
+
+
 async def poll_short_volume(session, producer: Optional[SentinelProducer], redis_client: Any) -> int:
-    """Process the newest FINRA file not yet seen. Returns spikes emitted."""
+    """Process every FINRA file not yet seen, oldest first. Returns spikes emitted.
+
+    This read only the newest unseen file and never looked back, so every name
+    started with one day of history and could not be judged for ten trading
+    days -- 273 names, each holding a single day, when this was measured. The
+    first run now seeds a month of history without publishing it, and any day
+    missed between runs is processed in order rather than skipped."""
     raw = getattr(redis_client, "raw", redis_client)
+    today = datetime.now(timezone.utc).date()
+    seeding = not await raw.get(FINRA_SEEDED_KEY)
     last = await raw.get(FINRA_STATE_KEY)
     last = last.decode() if isinstance(last, bytes) else last
-    today = datetime.now(timezone.utc).date()
-    for back in range(0, 5):
-        day = (today - timedelta(days=back)).strftime("%Y%m%d")
+    span = SHORT_SEED_CALENDAR_DAYS if seeding else 7
+    days = [(today - timedelta(days=b)).strftime("%Y%m%d") for b in range(span, -1, -1)]
+    if seeding:
+        # History is rebuilt from the files, so earlier partial lists are cleared
+        # rather than doubled.
+        last = None
+        async for k in raw.scan_iter(match=SHORT_HISTORY_KEY.format(symbol="*"), count=1000):
+            await raw.delete(k)
+    emitted = 0
+    newest_seen = last
+    yesterday = (today - timedelta(days=1)).strftime("%Y%m%d")
+    for day in days:
         if last and day <= last:
-            return 0
-        async with session.get(FINRA_URL.format(day=day), headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            if resp.status != 200:
-                continue
-            text = await resp.text()
-        rows = parse_short_volume(text)
+            continue
+        rows = await _fetch_day(session, day)
         if not rows:
             continue
-        emitted = await _process_short_day(day, rows, producer, raw)
-        await raw.set(FINRA_STATE_KEY, day)
-        logger.info("FINRA short volume %s: %s symbols, %s spike(s).", day, len(rows), emitted)
-        return emitted
-    return 0
+        # Seeding writes history only; a spike in a file weeks old is not news.
+        emit = (not seeding) or day >= yesterday
+        n = await _process_short_day(day, rows, producer if emit else None, raw)
+        emitted += n
+        newest_seen = day
+        logger.info("FINRA short volume %s: %s symbols, %s spike(s)%s.",
+                    day, len(rows), n, "" if emit else " (seeding)")
+    if newest_seen:
+        await raw.set(FINRA_STATE_KEY, newest_seen)
+    if seeding:
+        await raw.set(FINRA_SEEDED_KEY, today.isoformat())
+    return emitted
 
 
 async def _process_short_day(day, rows, producer, raw) -> int:
@@ -134,7 +183,7 @@ async def _process_short_day(day, rows, producer, raw) -> int:
         ratio = short / total
         key = SHORT_HISTORY_KEY.format(symbol=s)
         history = [float(v) for v in await raw.lrange(key, 0, SHORT_HISTORY_DAYS - 1)]
-        if short_spike(ratio, history):
+        if producer is not None and short_spike(ratio, history):
             await _publish(producer, short_spike_event(s, day, ratio, history, total))
             emitted += 1
         await raw.lpush(key, f"{ratio:.4f}")

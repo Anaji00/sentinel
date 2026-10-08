@@ -713,8 +713,13 @@ def test_tradfi_enricher_unconditional_bars_write():
 
     enricher = TradFiEnricher(mock_scorer, mock_redis, mock_graph, db=mock_db)
 
+    from datetime import datetime, timezone
+
+    # A regular-session time: bars stamped while the market is shut are dropped
+    # (instrument_closed_at), so a bar dated "now" failed this test at night.
     raw_event = RawEvent(
         source="finnhub_equities",
+        occurred_at=datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc),
         raw_payload={
             "ticker": "UNWATCHED_CORP",
             "trade_type": "OHLCV_MINUTE_BAR",

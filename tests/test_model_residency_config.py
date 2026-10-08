@@ -114,11 +114,12 @@ def test_fallback_selection_honours_the_allowlist():
     primary, which the client already logs as the correct outcome: "No secondary
     fallback model pulled in local Ollama. Retrying on 'qwen3:0.6b'".
     """
-    from shared.utils.ollama import _permitted
+    from shared.utils.ollama import DEFAULT_MODEL_NAME, _permitted
 
     pulled = ["llama3:latest", "qwen2.5:7b", "qwen2.5:3b", "gemma:2b",
               "qwen2.5:1.5b", "qwen3:0.6b"]
-    assert _permitted(pulled) == ["qwen3:0.6b"]
+    # Exactly the fleet model (qwen2.5:3b since 8 October), whatever else is pulled.
+    assert _permitted(pulled) == [DEFAULT_MODEL_NAME]
 
     # The original guard, unchanged: a model this host cannot serve must never
     # be reachable however the list is edited.

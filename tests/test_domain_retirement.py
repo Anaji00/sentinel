@@ -273,12 +273,22 @@ async def test_an_emergency_squawk_is_published_from_anywhere_in_the_sweep():
     assert payload["zone_name"] == "Middle East & Red Sea"
 
 
-async def test_traffic_inside_a_watch_zone_is_published_and_tagged_precisely():
-    """`flight_dark` needs the continuous stream, and this is where it is kept."""
+async def test_routine_traffic_inside_a_watch_zone_is_not_published():
+    """Zone positions fed only the dark-flight detector, which is retired."""
     adsb = _adsb()
     producer = _Producer()
     await adsb.poll_zone(
         _Session({"states": [_state("abc123", 25.5, 58.0, "1000")], "time": 0}),
+        _Auth(), producer, "Middle East & Red Sea", 11.5, 47.0, 32.0, 63.0,
+    )
+    assert producer.sent == []
+
+
+async def test_an_emergency_inside_a_watch_zone_is_tagged_precisely():
+    adsb = _adsb()
+    producer = _Producer()
+    await adsb.poll_zone(
+        _Session({"states": [_state("abc123", 25.5, 58.0, "7700")], "time": 0}),
         _Auth(), producer, "Middle East & Red Sea", 11.5, 47.0, 32.0, 63.0,
     )
     assert len(producer.sent) == 1
@@ -321,7 +331,7 @@ async def test_a_sweep_that_published_something_is_not_marked_filtered():
     adsb.mark_source_filtered = _mark
     producer = _Producer()
     await adsb.poll_zone(
-        _Session({"states": [_state("abc123", 25.5, 58.0, "1000")], "time": 0}),
+        _Session({"states": [_state("abc123", 25.5, 58.0, "7700")], "time": 0}),
         _Auth(), producer, "Middle East & Red Sea", 11.5, 47.0, 32.0, 63.0,
         redis_client=object(),
     )

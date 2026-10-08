@@ -57,6 +57,8 @@ export const Header: React.FC = () => {
   const isConnected = useTelemetryStore((state) => state.isConnected);
   // Distinct from "connecting": the feed was refused for lack of a session.
   const authRequired = useTelemetryStore((state) => state.authRequired);
+  // No component on this page holds the live socket open: nothing is connecting.
+  const streamIdle = useTelemetryStore((state) => state.streamSubscribers === 0);
 
   // One shared session, rather than this component, the account modal and
   // the live-events hook each asking separately and disagreeing.
@@ -125,10 +127,18 @@ export const Header: React.FC = () => {
 
   const streamTone = isConnected
     ? 'tone-positive'
-    : authRequired
+    : streamIdle
+      ? 'text-ink-mute'
+      : authRequired
       ? 'tone-negative'
       : 'tone-caution';
-  const streamDot = isConnected ? 'bg-emerald-400' : authRequired ? 'bg-rose-400' : 'bg-amber-400';
+  const streamDot = isConnected
+    ? 'bg-emerald-400'
+    : streamIdle
+      ? 'bg-ink-mute'
+      : authRequired
+        ? 'bg-rose-400'
+        : 'bg-amber-400';
 
   return (
     <header
@@ -184,7 +194,7 @@ export const Header: React.FC = () => {
               sign in
             </Link>
           ) : (
-            <span className={streamTone}>{isConnected ? 'live' : 'connecting'}</span>
+            <span className={streamTone}>{isConnected ? 'live' : streamIdle ? 'idle' : 'connecting'}</span>
           )}
         </span>
 

@@ -34,6 +34,8 @@ from shared.utils.regime import current_regime
 from shared.utils.entity_resolution import looks_like_ticker
 from shared.utils.equities import asset_class
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.market_session import instrument_closed_at
+from shared.utils.partial_correlation import partial_network
 
 logger = logging.getLogger("correlation.statistical_discovery")
 
@@ -397,6 +399,37 @@ class StatisticalDiscoveryEngine:
 
         return []
 
+    async def fetch_aligned_pair(self, a: str, b: str, limit: int = 120) -> Tuple[List[float], List[float]]:
+        """The most recent `limit` 5-minute buckets both names traded, oldest first."""
+        if not self.db:
+            return [], []
+        try:
+            rows = await self.db.query(
+                """
+                SELECT ticker, bucket_time, close FROM tradfi_bars_5m
+                WHERE ticker = ANY($1::text[]) AND close IS NOT NULL AND close > 0
+                  AND bucket_time > NOW() - INTERVAL '30 days'
+                """,
+                [a.upper(), b.upper()],
+            )
+        except Exception as e:
+            swallowed("correlation.statistical_discovery.aligned_pair", e, logger)
+            return [], []
+        by: Dict[str, Dict[Any, float]] = {a.upper(): {}, b.upper(): {}}
+        for r in rows or []:
+            try:
+                t = str(r["ticker"]).upper()
+                ts = r["bucket_time"]
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if instrument_closed_at(t, ts):
+                    continue
+                by.setdefault(t, {})[ts] = float(r["close"])
+            except (TypeError, ValueError, KeyError) as e:
+                swallowed("correlation.statistical_discovery.aligned_pair_row", e, logger)
+        shared = sorted(set(by[a.upper()]) & set(by[b.upper()]))[-limit:]
+        return [by[a.upper()][t] for t in shared], [by[b.upper()][t] for t in shared]
+
     # ── 3. SIGNIFICANCE THRESHOLD RETRIEVAL (§4.4) ─────────────────────────────
 
     async def get_calibrated_thresholds(self) -> Dict[str, float]:
@@ -435,15 +468,22 @@ class StatisticalDiscoveryEngine:
 
         for ticker_a, ticker_b in pairs:
             try:
-                prices_a = await self.fetch_price_series(ticker_a, limit=120)
-                prices_b = await self.fetch_price_series(ticker_b, limit=120)
-
-                min_len = min(len(prices_a), len(prices_b))
+                # Aligned on the buckets both traded. The last 120 bars of each,
+                # paired by position, compared different hours whenever either
+                # name had a gap -- which every thinly traded name does.
+                if ticker_a.startswith("MACRO:") or ticker_b.startswith("MACRO:"):
+                    prices_a = await self.fetch_price_series(ticker_a, limit=120)
+                    prices_b = await self.fetch_price_series(ticker_b, limit=120)
+                    min_len = min(len(prices_a), len(prices_b))
+                    prices_a, prices_b = prices_a[-min_len:], prices_b[-min_len:]
+                else:
+                    prices_a, prices_b = await self.fetch_aligned_pair(ticker_a, ticker_b, limit=120)
+                    min_len = len(prices_a)
                 if min_len < 20:
                     continue
 
-                x = np.array(prices_a[-min_len:], dtype=np.float64)
-                y = np.array(prices_b[-min_len:], dtype=np.float64)
+                x = np.array(prices_a, dtype=np.float64)
+                y = np.array(prices_b, dtype=np.float64)
 
                 # Returns series
                 ret_x = np.diff(x) / (x[:-1] + 1e-8)
@@ -715,6 +755,100 @@ class StatisticalDiscoveryEngine:
                 logger.debug(f"Pairwise statistical discovery error for {ticker_a}:{ticker_b}: {e}")
 
         return discoveries
+
+    # ── 4b. PARTIAL-CORRELATION NETWORK, NET OF THE MARKET ───────────────────
+    #
+    # Pairwise Pearson on raw returns mostly rediscovers the market factor, and
+    # the pairwise path pairs separately-fetched series by position. This
+    # estimates direct links on aligned hourly returns, net of SPY, conditioned
+    # on every other name and the sector ETFs (shared.utils.partial_correlation).
+
+    PARTIAL_LOOKBACK_DAYS = 60
+    PARTIAL_MAX_NAMES = 80
+    SECTOR_ETFS = ("XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC")
+
+    async def discover_partial_network(self) -> Dict[str, Any]:
+        if not self.db or not self.producer:
+            return {"skipped": "no db or producer"}
+        pairs = await self.build_candidate_pairs()
+        names: List[str] = []
+        for a, b in pairs:
+            for t in (a, b):
+                t = str(t).upper()
+                if t.startswith("MACRO:") or t in names:
+                    continue
+                names.append(t)
+        universe = ["SPY", *self.SECTOR_ETFS] + [n for n in names if n != "SPY" and n not in self.SECTOR_ETFS]
+        universe = universe[: self.PARTIAL_MAX_NAMES]
+        try:
+            rows = await self.db.query(
+                """
+                SELECT ticker, time_bucket('1 hour', time) AS bucket_time,
+                       last(close, time) AS close
+                FROM tradfi_bars
+                WHERE ticker = ANY($1::text[]) AND close IS NOT NULL AND close > 0
+                  AND time > NOW() - ($2 || ' days')::INTERVAL
+                GROUP BY 1, 2
+                """,
+                universe, str(self.PARTIAL_LOOKBACK_DAYS),
+            )
+        except Exception as e:
+            swallowed("correlation.partial_network.query", e, logger)
+            return {"skipped": "query failed"}
+
+        closes: Dict[str, Dict[Any, float]] = {}
+        for r in rows or []:
+            try:
+                t = str(r["ticker"]).upper()
+                ts = r["bucket_time"]
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if instrument_closed_at(t, ts):
+                    continue
+                closes.setdefault(t, {})[ts] = float(r["close"])
+            except (TypeError, ValueError, KeyError) as e:
+                swallowed("correlation.partial_network.row", e, logger)
+
+        thresholds = await self.get_calibrated_thresholds()
+        alpha = float(thresholds.get("max_p_value", 0.05))
+        edges, stats = await asyncio.to_thread(
+            partial_network, closes, "SPY", alpha, 0.15, set(self.SECTOR_ETFS),
+        )
+        regime = await current_regime(self.redis)
+        for e in edges:
+            await self.producer.send(
+                Topics.ONTOLOGY_PROPOSALS,
+                {
+                    "entity_id": e.a,
+                    "action": "LINK_ENTITY",
+                    "data": {
+                        "target_id": e.b,
+                        "source_label": "Company",
+                        "target_label": "Company",
+                        "relation_type": "STATISTICALLY_CORRELATED_WITH",
+                        "weight": round(abs(e.partial), 4),
+                        "confidence": round(max(0.5, 1.0 - e.q_value), 4),
+                        "properties": {
+                            "coefficient": e.partial,
+                            "residual_correlation": e.raw,
+                            "p_value": e.p_value,
+                            "q_value": e.q_value,
+                            "correction": "benjamini_hochberg",
+                            "method": "partial_correlation_ledoit_wolf",
+                            "net_of": "SPY",
+                            "conditioned_on": e.n_conditioned,
+                            "window": f"{e.n_obs}_1h_bars",
+                            "regime": regime,
+                        },
+                    },
+                },
+                key=e.a,
+            )
+        logger.info(
+            "Partial-correlation network: %s names, %s aligned hours, %s pairs tested, %s direct links",
+            stats.get("names"), stats.get("observations"), stats.get("tested"), stats.get("edges"),
+        )
+        return {**stats, "top": [(e.a, e.b, e.partial) for e in edges[:10]]}
 
     # ── 5. INTRA-TRADFI SECTOR HAWKES CONTAGION (§4.3) ─────────────────────────
 

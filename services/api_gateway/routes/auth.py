@@ -50,6 +50,7 @@ from shared.utils.auth_tokens import (
     hash_token,
     is_expired,
 )
+from shared.utils.session_revocation import revoke_sessions
 from shared.utils.mailer import (
     is_configured as mailer_configured,
     reset_email,
@@ -508,7 +509,14 @@ async def forgot_password(
         if not allowed:
             raise HTTPException(status_code=429, detail="Try again in a few minutes.")
 
-    generic = {"success": True, "message": "If that address has an account, a reset link is on its way."}
+    generic = {
+        "success": True,
+        "message": "If that address has an account, a reset link is on its way.",
+        # Whether this deployment can send email at all. It says nothing about
+        # the address, so it reveals no account; without it a deployment with no
+        # SMTP told every locked-out user a link was coming that never would.
+        "email_delivery": mailer_configured(),
+    }
     if db is None:
         return generic
 
@@ -523,7 +531,11 @@ async def forgot_password(
 
 
 @router.post("/reset-password")
-async def reset_password(body: ResetRequest, db=Depends(get_db_optional)):
+async def reset_password(
+    body: ResetRequest,
+    db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
+):
     """Sets a new password from a reset link."""
     if db is None:
         raise HTTPException(status_code=503, detail="Password reset is temporarily unavailable.")
@@ -551,5 +563,13 @@ async def reset_password(body: ResetRequest, db=Depends(get_db_optional)):
         """,
         user_id, TokenPurpose.RESET_PASSWORD.value,
     )
+    # And every session signed in before now ends: a reset is the moment a
+    # stolen session most needs to stop working.
+    email_row = await db.query_one("SELECT email FROM users WHERE id = $1", user_id)
+    if redis is not None and email_row:
+        try:
+            await revoke_sessions(redis, email_row["email"])
+        except Exception as exc:
+            logger.error("Could not end existing sessions for account %s: %s", user_id, exc)
     logger.info("Password reset completed for account %s", user_id)
     return {"success": True, "message": "Your password has been changed. Sign in with it now."}

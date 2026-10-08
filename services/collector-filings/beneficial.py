@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -73,7 +74,11 @@ def schedule_event(acc: str, group: Dict[str, Any], parsed: Dict[str, Any], tick
                + (f", previously {previous_pct}%" if previous_pct is not None else "") + ". "
                + (f"Purpose: {parsed['purpose'][:300]}" if parsed.get("purpose") else ""))
     return NormalizedEvent(
-        event_id=f"sched13_{acc}",
+        # A UUID, derived from the accession so a re-poll is still one event.
+        # "sched13_{acc}" could not be stored -- events.event_id is uuid -- so
+        # no live 13D/13G ever reached the events table, the study or the
+        # correlations that cite it.
+        event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"sec-schedule-13:{acc}")),
         type=EventType.FILING,
         occurred_at=datetime.now(timezone.utc),
         collected_at=datetime.now(timezone.utc),

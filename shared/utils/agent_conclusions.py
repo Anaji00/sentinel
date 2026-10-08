@@ -13,7 +13,12 @@ from __future__ import annotations
 
 # The macro engine's persisted conclusions.
 MACRO_RATES_REGIME_KEY = "sentinel:macro:latest_rates_regime"
+
+# Every agent's recorded predictions, as a scan pattern.
+PREDICTIONS_KEY_PATTERN = "sentinel:predictions:*"
 MACRO_SPREAD_2Y10Y_KEY = "sentinel:macro:spread_2y10y"
+# The last HYG/LQD ratio, so credit widening is judged by its change.
+MACRO_CREDIT_RATIO_KEY = "sentinel:macro:credit_ratio:last"
 MACRO_INVERSE_CORRELATION_PREFIX = "sentinel:macro:inverse_correlation:"
 
 # The cross-domain excitation matrix the correlation service learns.
@@ -26,6 +31,8 @@ TRADFI_BACKFILL_REPORT_KEY = "sentinel:backfill:tradfi:last"
 AGENT_CORRELATION_ANALYSIS_PREFIX = "sentinel:agents:correlation_analysis:"
 
 __all__ = [
+    "PREDICTIONS_KEY_PATTERN",
+    "MACRO_CREDIT_RATIO_KEY",
     "MACRO_RATES_REGIME_KEY",
     "MACRO_SPREAD_2Y10Y_KEY",
     "MACRO_INVERSE_CORRELATION_PREFIX",

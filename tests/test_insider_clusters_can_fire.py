@@ -115,8 +115,12 @@ class _Redis:
     async def zrange(self, key, start, stop):
         return list(self.z.get(key, {}))
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=False):
+        # nx: set only when absent, as Redis does; True when it was set.
+        if nx and key in self.kv:
+            return None
         self.kv[key] = value
+        return True
 
 
 def _agent():

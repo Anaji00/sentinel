@@ -35,9 +35,14 @@ from shared.utils.maritime_behaviour import (
     STS_MAX_SEPARATION_NM,
     implausible_position,
     impossible_transit,
+    is_tanker,
+    sts_is_reportable,
     sts_pair,
 )
 from shared.utils.regions import classify_region, routine_band_score
+from shared.utils.chokepoints import (
+    AIS_CELL_INDEX_SINCE_KEY, AIS_CELL_KEY, AIS_CELL_TTL_SEC, ais_cell, in_ais_check_area,
+)
 from shared.utils.osint_bridges import region_exposure_tags, vessel_exposure_tags
 from services.enrichment.anomaly_scorer import breakdown_from_score, lift_score
  
@@ -282,6 +287,21 @@ async def _previous_positions(redis_client, mmsis: list) -> dict:
     return out
 
 
+async def _vessel_info(redis_client, mmsi: str) -> dict:
+    """The cached static identity of a hull: type, name and flags, or {}."""
+    if redis_client is None:
+        return {}
+    try:
+        blob = await getattr(redis_client, "raw", redis_client).get(f"vessel:info:{mmsi}")
+        if not blob:
+            return {}
+        info = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
+        return info if isinstance(info, dict) else {}
+    except Exception as _exc:
+        swallowed("enrichment.maritime.vessel_info", _exc, logger)
+        return {}
+
+
 async def _stopped_neighbour(redis_client, mmsi: str, lat: float, lon: float):
     """The nearest other stopped hull that satisfies `sts_pair`, or None."""
     if redis_client is None:
@@ -417,7 +437,7 @@ def _inland_event(raw, mmsi, vessel, lat, lon, region, flags, vtype, evidence):
     )
 
 
-def _sts_event(raw, mmsi, vessel, lat, lon, region, partner, vtype=None):
+def _sts_event(raw, mmsi, vessel, lat, lon, region, partner, vtype=None, extra_tags=None):
     """Two hulls stopped alongside each other for long enough to move cargo."""
     name = (vessel or {}).get("name") or mmsi
     flags = (vessel or {}).get("flags") or []
@@ -450,7 +470,8 @@ def _sts_event(raw, mmsi, vessel, lat, lon, region, partner, vtype=None):
             mmsi=mmsi, latitude=lat, longitude=lon,
             vessel_type=vtype, last_seen_region=region,
         ),
-        tags=["maritime", "vessel_sts", "co_location"] + (["sanctioned"] if flags else []),
+        tags=["maritime", "vessel_sts", "co_location"] + (["sanctioned"] if flags else [])
+             + list(extra_tags or []),
         named_entities=[str(name), str(partner["mmsi"])],
         anomaly_score=0.78,
     )
@@ -601,11 +622,20 @@ class MaritimeEnricher:
             or vessel_exposure_tags(region or str(name), "tanker")
         )
 
+        # Radar returns where AIS, which receives well in this area, saw no
+        # hull in the same cell over the same days.
+        check = payload.get("ais_cross_check") or {}
+        no_ais = int(check.get("unidentified_contacts") or 0) if check.get("status") == "checked" else 0
+        if no_ais:
+            tags.append("radar_no_ais")
+            anomaly = max(anomaly, min(0.8, 0.45 + 0.05 * no_ais))
+
         observed = payload.get("observed_on")
         headline = (
             f"{name}: radar target density {payload.get('target_density')} "
             + (f"({direction}, z={z_score:+.2f})" if z_score is not None
                else "(no baseline yet)")
+            + (f"; {no_ais} radar contact(s) with no AIS" if no_ais else "")
         )
 
         return NormalizedEvent(
@@ -846,6 +876,17 @@ class MaritimeEnricher:
                 ex = 172800
             )
 
+            # Which hulls AIS saw in each small cell per day, inside the areas
+            # where radar is checked against AIS (collector-sar). A radar return
+            # in a cell with no hull here over the radar window is a vessel
+            # not transmitting.
+            if in_ais_check_area(lat, lon):
+                ci, cj = ais_cell(float(lat), float(lon))
+                cell_key = AIS_CELL_KEY.format(day=observed_at.date().isoformat(), i=ci, j=cj)
+                pipe.sadd(cell_key, mmsi)
+                pipe.expire(cell_key, AIS_CELL_TTL_SEC)
+                pipe.set(AIS_CELL_INDEX_SINCE_KEY, observed_at.timestamp(), nx=True)
+
             # A geo index of vessels currently stopped, so co-location is a
             # bounded radius query rather than a scan of every hull afloat.
             # Redis GEO was available and unused; the alternative is O(N) over
@@ -911,6 +952,7 @@ class MaritimeEnricher:
         # so a pair missed in this batch is seen in the next one; spending the
         # whole batch budget on one crowded anchorage is the worse trade.
         checked = 0
+        own_types = {row[2]: row[12] for row in results}
         for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel in zip(parsed, vessels):
             if checked >= STS_CHECKS_PER_BATCH:
                 break
@@ -920,10 +962,27 @@ class MaritimeEnricher:
                 continue
             checked += 1
             partner = await _stopped_neighbour(self.redis, mmsi, lat, lon)
-            if partner:
-                sts_events.append(_sts_event(
-                    raw, mmsi, vessel, lat, lon, region, partner, vtype=None
-                ))
+            if not partner:
+                continue
+            # Geometry alone matches every anchorage and fishing raft-up; see
+            # `sts_is_reportable`. One side must be a tanker or flagged.
+            mine = {
+                "vessel_type": own_types.get(mmsi),
+                "name": (vessel or {}).get("name"),
+                "flags": (vessel or {}).get("flags"),
+            }
+            theirs = await _vessel_info(self.redis, partner["mmsi"])
+            if not sts_is_reportable(mine, theirs):
+                continue
+            tanker = (
+                is_tanker(mine["vessel_type"], mine["name"])
+                or is_tanker(theirs.get("vessel_type"), theirs.get("name"))
+            )
+            sts_events.append(_sts_event(
+                raw, mmsi, vessel, lat, lon, region, partner,
+                vtype=own_types.get(mmsi),
+                extra_tags=vessel_exposure_tags(region, "Tanker") if tanker else None,
+            ))
 
         behaviour_events = [e for e in (spoof_events + sts_events) if e]
         

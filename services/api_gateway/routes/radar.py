@@ -164,6 +164,7 @@ async def get_radar_anomalies(
 
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from shared.utils.market_session import instrument_closed_at
 import math
 import time
 
@@ -1077,6 +1078,18 @@ async def get_candles(
                 "Market-series DB query failed for %s %s: %s",
                 ticker, timeframe, db_err, exc_info=True,
             )
+
+    # Intraday buckets stamped while the market was shut are replays of the
+    # last print (NVDA showed six flat 234.00 x 71,905 bars over a weekend).
+    # Daily and longer buckets start at midnight by construction and are kept.
+    if timeframe not in ("1d", "1w", "1M"):
+        def _open_at(c: Dict[str, Any]) -> bool:
+            try:
+                ts = datetime.fromisoformat(str(c.get("ts")).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return True
+            return not instrument_closed_at(ticker, ts)
+        candles = [c for c in candles if _open_at(c)]
 
     # Which path served this, recorded on the response. A chart that comes back
     # empty is otherwise indistinguishable from a ticker with no data, and the

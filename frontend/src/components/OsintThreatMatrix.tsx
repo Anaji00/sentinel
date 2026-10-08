@@ -40,7 +40,30 @@ export default function OsintThreatMatrix() {
   // and an anomaly score, is indistinguishable from a live detection.
   //
   // An empty list is the honest answer when there is nothing to show.
-  const events = Array.isArray(data) ? data : [];
+  //
+  // The endpoint serves NormalizedEvent rows, not OsintItem rows: there is no
+  // `id`, and `tags` is absent on many of them -- `item.tags.map` on such a row
+  // took the whole page down. Mapped explicitly, with the flags derived from
+  // what the row actually carries.
+  const events: OsintItem[] = (Array.isArray(data) ? (data as unknown[]) : []).map((raw) => {
+    const e = raw as Record<string, unknown>;
+    const tags = Array.isArray(e.tags) ? (e.tags as unknown[]).map(String) : [];
+    const score = typeof e.anomaly_score === 'number' ? e.anomaly_score : 0;
+    return {
+      id: String(e.event_id ?? e.id ?? ''),
+      headline: String(e.headline ?? e.title ?? ''),
+      source: String(e.source ?? ''),
+      occurred_at: String(e.occurred_at ?? ''),
+      anomaly_score: score,
+      sentiment: typeof e.sentiment === 'number' ? e.sentiment : 0,
+      reliability: typeof e.reliability === 'number' ? e.reliability : 0,
+      is_threat: Boolean(e.is_threat) || score >= 0.7,
+      is_ofac_hit:
+        Boolean(e.is_ofac_hit) || tags.some((t) => /ofac|sanction/i.test(t)),
+      region: String(e.region ?? 'GLOBAL'),
+      tags,
+    };
+  });
 
   const filteredEvents = events.filter((e) => {
     if (onlySanctions && !e.is_ofac_hit) return false;

@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from services.enrichment.enrichers.cyber import CyberEnricher, CyberThreatScorer
 from services.enrichment.enrichers.aviation import AviationEnricher
 from services.enrichment.enrichers.news import NewsEnricher
-from services.enrichment.aviation_gap_detector import AviationGapDetector
 from services.enrichment.ofac_sync import fetch_ofac_keywords
 from services.agents.knowledge_graph_engine import VALID_PREDICATES
 from shared.models import RawEvent, NormalizedEvent, EventType, EntityType
@@ -250,92 +249,10 @@ def test_aviation_enricher_batching_and_routine_telemetry_retention():
         assert results[0].anomaly_score <= 0.15
         assert results[1].anomaly_score >= 0.80
 
-        val1 = await redis.raw.get("aircraft:last_seen:4b1234")
-        val2 = await redis.raw.get("aircraft:last_seen:4b5678")
-        assert val1 is not None
-        assert val2 is not None
+        # No reader is left for last-seen positions, so none are written.
+        assert await redis.raw.get("aircraft:last_seen:4b1234") is None
 
     asyncio.run(run_test())
-
-def _seed_gap_history(redis, region: str, gaps: list) -> None:
-    """Gives a region an observed gap distribution to be judged against."""
-    from services.enrichment.aviation_gap_detector import _GAP_SAMPLES_KEY
-
-    redis.raw.lists[_GAP_SAMPLES_KEY.format(region=region)] = [str(g) for g in gaps]
-
-
-def test_aviation_gap_detector_fires_flight_dark():
-    """Three hours of silence over monitored airspace that normally reports
-    every few minutes sits in the far tail of its own distribution."""
-    async def run_test():
-        redis = MockRedis()
-        producer = AsyncMock()
-        scorer = AsyncMock()
-        db_writer = AsyncMock()
-
-        now = datetime.now(timezone.utc)
-        await redis.raw.set("sentinel:heartbeat:collector-adsb", json.dumps({"ts": now.isoformat()}))
-
-        # Iranian Airspace is well covered: gaps there run to minutes, not hours.
-        _seed_gap_history(redis, "Iranian Airspace", [0.05 + (i % 20) * 0.01 for i in range(200)])
-
-        old_ts = (now - timedelta(hours=3)).isoformat()
-        await redis.raw.set("aircraft:last_seen:a4b5c6", json.dumps({"ts": old_ts, "region": "Iranian Airspace", "callsign": "IRAN01"}))
-
-        detector = AviationGapDetector(producer, scorer, db_writer, redis)
-        await detector._check()
-
-        db_writer.write_events_batch.assert_called_once()
-        events = db_writer.write_events_batch.call_args[0][0]
-        assert events[0].type == EventType.FLIGHT_DARK
-        assert events[0].primary_entity.name == "IRAN01"
-        assert events[0].anomaly_score < 1.0, "1.00 should not be routine"
-
-    asyncio.run(run_test())
-
-
-def test_aviation_gap_detector_is_silent_without_regional_history():
-    """Refusal is the honest output. The previous absolute threshold asserted an
-    anomaly from a number nobody measured, and pinned 8,064 of 9,056 events at
-    exactly 1.00 in six hours."""
-    async def run_test():
-        redis = MockRedis()
-        producer, scorer, db_writer = AsyncMock(), AsyncMock(), AsyncMock()
-
-        now = datetime.now(timezone.utc)
-        await redis.raw.set("sentinel:heartbeat:collector-adsb", json.dumps({"ts": now.isoformat()}))
-        old_ts = (now - timedelta(hours=6)).isoformat()
-        await redis.raw.set("aircraft:last_seen:ffffff", json.dumps({"ts": old_ts, "region": "Iranian Airspace", "callsign": "NOHIST"}))
-
-        detector = AviationGapDetector(producer, scorer, db_writer, redis)
-        await detector._check()
-
-        db_writer.write_events_batch.assert_not_called()
-
-    asyncio.run(run_test())
-
-
-def test_a_routine_oceanic_gap_does_not_fire():
-    """The 8,064 ceilings. Four hours of ADS-B silence over open water is what
-    every flight on the route does -- there are no ground stations to hear it."""
-    async def run_test():
-        redis = MockRedis()
-        producer, scorer, db_writer = AsyncMock(), AsyncMock(), AsyncMock()
-
-        now = datetime.now(timezone.utc)
-        await redis.raw.set("sentinel:heartbeat:collector-adsb", json.dumps({"ts": now.isoformat()}))
-        _seed_gap_history(redis, "Default", [3.0 + (i % 40) * 0.1 for i in range(200)])
-
-        old_ts = (now - timedelta(hours=4)).isoformat()
-        await redis.raw.set("aircraft:last_seen:oce001", json.dumps({"ts": old_ts, "region": "Default", "callsign": "OCEANIC"}))
-
-        detector = AviationGapDetector(producer, scorer, db_writer, redis)
-        await detector._check()
-
-        db_writer.write_events_batch.assert_not_called()
-
-    asyncio.run(run_test())
-
 
 # ── 3. MARITIME HEADLINE & KNOWLEDGE GRAPH PREDICATES ────────────────────────
 

@@ -416,8 +416,14 @@ async def get_timescale() -> TimescaleClient:
         return _timescale
     async with _timescale_lock:
         if _timescale is None:
-            _timescale = TimescaleClient()
-            await _timescale._connect()
+            # Published only once connected, as get_neo4j does. Assigned before
+            # _connect, a second caller took the unlocked fast path above during
+            # the connect and got a client whose pool was None -- "'NoneType'
+            # object has no attribute 'acquire'" in tradfi, whose backfill and
+            # pollers start together.
+            client = TimescaleClient()
+            await client._connect()
+            _timescale = client
     return _timescale
 
 

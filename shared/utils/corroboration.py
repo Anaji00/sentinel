@@ -80,7 +80,7 @@ _ATTRIBUTION_RE = re.compile(
 )
 
 # Wire datelines and credit lines: "(Reuters)", "- Bloomberg", "[AP]".
-_DATELINE_RE = re.compile(r"[\(\[\-—]\s*(Reuters|Bloomberg|AP|Associated Press|AFP|Dow Jones|PA Media|Kyodo|Xinhua|TASS)", re.IGNORECASE)
+_DATELINE_RE = re.compile(r"[\(\[\-—]\s*(Reuters|Bloomberg|AP|Associated Press|AFP|Dow Jones|PA Media|Kyodo|Xinhua|TASS)\b", re.IGNORECASE)
 
 
 def cited_source(text: str) -> Optional[str]:

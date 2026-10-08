@@ -2,7 +2,8 @@
 
 import { ABSENT, formatNumber } from '../lib/format';
 import React, { useEffect, useMemo, useState } from 'react';
-import { ComposableMap, Geographies, Geography, Marker } from 'react-simple-maps';
+import { ComposableMap, Geographies, Geography, Marker as MapMarker, useZoomPanContext } from 'react-simple-maps';
+import { PanZoomGroup } from './map/PanZoomGroup';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { NormalizedEvent } from '../lib/types';
@@ -10,6 +11,24 @@ import { useLiveEvents } from '../lib/useLiveEvents';
 import { PALETTE } from '../lib/palette';
 import { IconClose } from './ui/icons';
 import { POLL } from './ui/DataProvider';
+import {
+  ConflictExposureResponse,
+  ConflictZonesResponse,
+  LiveVessel,
+  LiveVesselsResponse,
+  NavWarning,
+} from '../lib/conflict';
+import {
+  ConflictZonesLayer,
+  LightDetectionsLayer,
+  NavWarningsLayer,
+  VesselDotsLayer,
+} from './map/ConflictLayers';
+import {
+  ConflictExposureList,
+  ConflictZoneDetail,
+  ConflictZoneList,
+} from './map/ConflictZonePanel';
 
 // Max vessel & flight markers rendered to prevent SVG DOM overhead
 const MAX_RENDERED_VESSELS = 60;
@@ -201,6 +220,18 @@ interface RadarCell {
   target_pixels: number;
   water_pixels: number;
   target_density: number;
+  // Set only in the areas where radar is checked against AIS.
+  ais_vessels?: number;
+  no_ais?: boolean;
+  fixed_structure?: boolean;
+}
+
+interface RadarArea {
+  name: string;
+  ais_checked: boolean;
+  observed_on: string | null;
+  cells_imaged: number;
+  cells: RadarCell[];
 }
 
 interface RadarGrid {
@@ -214,6 +245,19 @@ interface ChokepointStatus {
   chokepoints: ChokepointEntry[];
   ais_silent: string[];
   unobserved_by_any_instrument: string[];
+  radar_areas?: RadarArea[];
+}
+
+// A marker whose glyph and label keep their on-screen size at any zoom; the
+// position still follows the map. Without this, zooming in scaled every label
+// and ring with the countries until they covered each other.
+function Marker({ children, ...props }: React.ComponentProps<typeof MapMarker>) {
+  const { k } = useZoomPanContext();
+  return (
+    <MapMarker {...props}>
+      <g transform={`scale(${1 / k})`}>{children}</g>
+    </MapMarker>
+  );
 }
 
 const StaticWorldBase = React.memo(function StaticWorldBase() {
@@ -290,7 +334,7 @@ export default function GlobalMap() {
   // where, in a strait where nothing is transmitting.
   const radarContacts = useMemo(() => {
     if (!chokepointStatus) return [];
-    return chokepointStatus.chokepoints.flatMap((c) =>
+    const fromChokepoints = chokepointStatus.chokepoints.flatMap((c) =>
       (c.radar_grid?.cells ?? []).map((cell) => ({
         region: c.region,
         observedOn: c.radar_grid?.observed_on ?? null,
@@ -298,9 +342,50 @@ export default function GlobalMap() {
         lon: cell.longitude,
         density: cell.target_density,
         targetPixels: cell.target_pixels,
+        aisChecked: false,
+        aisVessels: null as number | null,
+        noAis: false,
+        fixedStructure: false,
       })),
     );
+    // Terminals, STS anchorages and the AIS cross-check areas.
+    const fromAreas = (chokepointStatus.radar_areas ?? []).flatMap((a) =>
+      a.cells.map((cell) => ({
+        region: a.name,
+        observedOn: a.observed_on,
+        lat: cell.latitude,
+        lon: cell.longitude,
+        density: cell.target_density,
+        targetPixels: cell.target_pixels,
+        aisChecked: a.ais_checked,
+        aisVessels: cell.ais_vessels ?? null,
+        noAis: Boolean(cell.no_ais),
+        fixedStructure: Boolean(cell.fixed_structure),
+      })),
+    );
+    return [...fromChokepoints, ...fromAreas];
   }, [chokepointStatus]);
+
+  // Every hull in the AIS cache, not the newest few hundred events: the event
+  // feed could only ever place the sixty most anomalous vessels.
+  const { data: liveVessels } = useSWR<LiveVesselsResponse>('/vessels/live', fetcher, {
+    refreshInterval: POLL.standard,
+  });
+  // Active and potential combat zones, with their news, warnings and ripple.
+  const { data: conflict } = useSWR<ConflictZonesResponse>('/conflict-zones', fetcher, {
+    refreshInterval: POLL.slow,
+  });
+  // Instruments ranked by conflict exposure, for the panel's second tab.
+  const { data: exposure } = useSWR<ConflictExposureResponse>('/conflict-zones/exposure', fetcher, {
+    refreshInterval: POLL.slow,
+  });
+  const allWarnings = useMemo<NavWarning[]>(() => {
+    if (!conflict) return [];
+    return [
+      ...conflict.zones.flatMap((z) => z.nav_warnings),
+      ...conflict.military_warnings_outside_zones,
+    ];
+  }, [conflict]);
 
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>('/events/tradfi?limit=40', fetcher, {
     refreshInterval: POLL.live,
@@ -313,11 +398,22 @@ export default function GlobalMap() {
   const [showExchanges, setShowExchanges] = useState(true);
   const [showChokepoints, setShowChokepoints] = useState(true);
   const [showRadar, setShowRadar] = useState(true);
+  const [darkOnly, setDarkOnly] = useState(false);
+  const [showZones, setShowZones] = useState(true);
+  const [showWarnings, setShowWarnings] = useState(true);
+  const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
+  const [zonePanelOpen, setZonePanelOpen] = useState(true);
+  const [zonePanelTab, setZonePanelTab] = useState<'zones' | 'exposed'>('zones');
+  const selectedZone = conflict?.zones.find((z) => z.zone_id === selectedZoneId) ?? null;
 
   const [selectedObject, setSelectedObject] = useState<{
-    type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'radar';
+    type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'radar' | 'liveVessel' | 'warning';
     data: any;
   } | null>(null);
+  const selectedLiveVessel: LiveVessel | null =
+    selectedObject?.type === 'liveVessel' ? (selectedObject.data as LiveVessel) : null;
+  const selectedWarning: NavWarning | null =
+    selectedObject?.type === 'warning' ? (selectedObject.data as NavWarning) : null;
 
   // 1. MARITIME TELEMETRY COMPUTATION (WITH SPATIAL ANTI-COLLISION)
   const rawMaritime = useMemo(() => {
@@ -629,7 +725,7 @@ export default function GlobalMap() {
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
-            VESSELS ({vessels.length})
+            VESSELS ({liveVessels?.count ?? vessels.length})
           </button>
           <button
             onClick={() => {
@@ -642,7 +738,40 @@ export default function GlobalMap() {
                 : 'bg-raised text-amber-400/70 border-line'
             }`}
           >
-            TANKERS ({tankersCount})
+            TANKERS ({liveVessels?.tankers ?? tankersCount})
+          </button>
+          <button
+            onClick={() => {
+              setShowVessels(true);
+              setDarkOnly(!darkOnly);
+            }}
+            className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
+              darkOnly
+                ? 'bg-fuchsia-500/30 text-fuchsia-300 border-fuchsia-500/60'
+                : 'bg-raised text-fuchsia-300/70 border-line'
+            }`}
+          >
+            DARK ({liveVessels?.dark ?? 0})
+          </button>
+          <button
+            onClick={() => setShowZones(!showZones)}
+            className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
+              showZones
+                ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                : 'bg-raised text-ink-mute border-line'
+            }`}
+          >
+            CONFLICT ZONES ({conflict?.zones.length ?? 0})
+          </button>
+          <button
+            onClick={() => setShowWarnings(!showWarnings)}
+            className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
+              showWarnings
+                ? 'bg-orange-500/20 text-orange-300 border-orange-500/50'
+                : 'bg-raised text-ink-mute border-line'
+            }`}
+          >
+            NAV WARNINGS ({allWarnings.length})
           </button>
           <button
             onClick={() => setShowFlights(!showFlights)}
@@ -698,6 +827,13 @@ export default function GlobalMap() {
               {selectedObject.type === 'exchange' && 'FINANCIAL EXCHANGE HUB'}
               {selectedObject.type === 'chokepoint' && 'MARITIME CHOKEPOINT'}
               {selectedObject.type === 'radar' && 'RADAR RETURN (NO TRANSPONDER)'}
+              {selectedLiveVessel &&
+                (selectedLiveVessel.dark
+                  ? 'DARK VESSEL (LAST KNOWN POSITION)'
+                  : selectedLiveVessel.tanker
+                    ? 'TANKER INSPECTOR'
+                    : 'VESSEL INSPECTOR')}
+              {selectedWarning && 'NAVIGATIONAL WARNING'}
             </span>
             <button
               onClick={() => setSelectedObject(null)}
@@ -747,6 +883,74 @@ export default function GlobalMap() {
                   {(selectedObject.data.anomaly || 0).toFixed(2)}
                 </span>
               </div>
+            </div>
+          )}
+
+          {selectedLiveVessel && (
+            <div className="space-y-1 text-micro text-ink-dim">
+              <div>
+                NAME: <span className="text-white font-bold">{selectedLiveVessel.name ?? ABSENT}</span>
+              </div>
+              <div>
+                TYPE:{' '}
+                <span className="text-amber-300 font-bold">{selectedLiveVessel.vessel_type ?? ABSENT}</span>
+              </div>
+              <div>
+                MMSI: <span className="text-cyan-400 font-mono">{selectedLiveVessel.mmsi}</span>
+              </div>
+              <div>
+                POSITION:{' '}
+                <span className="text-white font-bold">
+                  {selectedLiveVessel.lat.toFixed(4)}, {selectedLiveVessel.lon.toFixed(4)}
+                </span>
+              </div>
+              <div>
+                REGION: <span className="text-emerald-400">{selectedLiveVessel.region ?? ABSENT}</span>
+              </div>
+              <div>
+                SPEED:{' '}
+                <span className="text-emerald-400 font-bold">
+                  {selectedLiveVessel.speed != null ? `${selectedLiveVessel.speed} knots` : ABSENT}
+                </span>
+              </div>
+              <div>
+                LAST REPORT:{' '}
+                <span className="text-white">
+                  {selectedLiveVessel.age_seconds != null
+                    ? `${formatNumber(selectedLiveVessel.age_seconds / 3600, { decimals: 1 })}h ago`
+                    : ABSENT}
+                </span>
+              </div>
+              {selectedLiveVessel.sanctioned && (
+                <div className="text-rose-400 font-bold">On a sanctions list.</div>
+              )}
+              {selectedLiveVessel.dark && (
+                <div className="text-fuchsia-300">
+                  Transponder silent longer than is normal for this area. Drawn at its last
+                  reported position.
+                </div>
+              )}
+            </div>
+          )}
+
+          {selectedWarning && (
+            <div className="space-y-1 text-micro text-ink-dim">
+              <div>
+                ID: <span className="text-white font-bold font-mono">{selectedWarning.id}</span>
+              </div>
+              <div>
+                AREA: <span className="text-amber-300 font-bold">{selectedWarning.area}</span>
+              </div>
+              <div>
+                KIND:{' '}
+                <span className={selectedWarning.military ? 'text-rose-400 font-bold' : 'text-ink'}>
+                  {selectedWarning.military ? 'Military or hazardous operations' : 'General'}
+                </span>
+              </div>
+              <div className="text-ink whitespace-pre-line max-h-48 overflow-y-auto font-mono">
+                {selectedWarning.text}
+              </div>
+              <div className="text-ink-mute">US NGA broadcast navigational warning.</div>
             </div>
           )}
 
@@ -859,6 +1063,25 @@ export default function GlobalMap() {
                   {selectedObject.data.observedOn ?? ABSENT}
                 </span>
               </div>
+              {selectedObject.data.aisChecked && (
+                <div>
+                  AIS HULLS IN CELL, SAME DAYS:{' '}
+                  <span className="text-white font-bold">
+                    {selectedObject.data.aisVessels ?? ABSENT}
+                  </span>
+                </div>
+              )}
+              {selectedObject.data.noAis && (
+                <div className="text-fuchsia-300 font-bold">
+                  Radar return with no AIS vessel in this cell over the same days: a
+                  likely hull not transmitting.
+                </div>
+              )}
+              {selectedObject.data.fixedStructure && (
+                <div className="text-ink-mute">
+                  Returns on nearly every pass: probably a platform, buoy or pier.
+                </div>
+              )}
               {/* Said on every one of these, because a reader who takes a radar
                   cell for a vessel count will draw conclusions it cannot carry. */}
               <div className="text-amber-400 pt-1">
@@ -964,6 +1187,49 @@ export default function GlobalMap() {
         </div>
       )}
 
+      {/* Conflict zones: the list, or one zone's detail. */}
+      {showZones && conflict && conflict.zones.length > 0 && (
+        <div className="absolute top-14 right-3 z-20 bg-page/95 border border-rose-500/40 p-3 rounded-xl w-80 max-h-[calc(100%-8rem)] overflow-y-auto text-xs shadow-2xl">
+          {selectedZone ? (
+            <ConflictZoneDetail zone={selectedZone} onBack={() => setSelectedZoneId(null)} />
+          ) : (
+            <>
+              <button
+                onClick={() => setZonePanelOpen(!zonePanelOpen)}
+                className="w-full flex items-center justify-between font-bold text-rose-300 uppercase tracking-wide text-micro cursor-pointer"
+              >
+                <span>Conflict zones &middot; news 24h</span>
+                <span>{zonePanelOpen ? '−' : '+'}</span>
+              </button>
+              {zonePanelOpen && (
+                <div className="pt-2 text-micro">
+                  <div className="flex gap-1 pb-2">
+                    {(['zones', 'exposed'] as const).map((tab) => (
+                      <button
+                        key={tab}
+                        onClick={() => setZonePanelTab(tab)}
+                        className={`px-2 py-0.5 rounded border cursor-pointer font-bold uppercase ${
+                          zonePanelTab === tab
+                            ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                            : 'bg-raised text-ink-mute border-line'
+                        }`}
+                      >
+                        {tab === 'zones' ? 'Zones' : 'Exposed tickers'}
+                      </button>
+                    ))}
+                  </div>
+                  {zonePanelTab === 'zones' ? (
+                    <ConflictZoneList zones={conflict.zones} onSelect={setSelectedZoneId} />
+                  ) : (
+                    <ConflictExposureList instruments={exposure?.instruments ?? []} />
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
       {/* Chokepoint coverage: reporting, AIS-silent, or unobserved. */}
       {chokepointStatus && chokepointStatus.chokepoints.length > 0 && (
         <div className="absolute bottom-3 left-3 z-10 bg-page/85 px-3 py-2 rounded-lg border border-accent/30 text-micro space-y-1 shadow-lg max-w-xs">
@@ -1009,7 +1275,15 @@ export default function GlobalMap() {
         </div>
         <div className="flex items-center gap-2">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span>Total Vessels ({vessels.length})</span>
+          <span>Total Vessels ({liveVessels?.count ?? vessels.length})</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="h-1.5 w-1.5 rounded-full border border-fuchsia-400" />
+          <span className="text-fuchsia-300 font-bold"> Dark ({liveVessels?.dark ?? 0})</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+          <span className="text-rose-300 font-bold"> Sanctioned</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
@@ -1030,7 +1304,40 @@ export default function GlobalMap() {
         projectionConfig={{ scale: 110 }}
         className="w-full h-full"
       >
+        <PanZoomGroup center={[20, 20]} minZoom={1} maxZoom={12}>
         <StaticWorldBase />
+
+        {/* 0. Conflict zones, beneath everything else. */}
+        {showZones && conflict && (
+          <ConflictZonesLayer
+            zones={conflict.zones}
+            selectedId={selectedZoneId}
+            onSelect={(z) => setSelectedZoneId(z.zone_id)}
+          />
+        )}
+
+        {/* 0b. Every tracked vessel, dark hulls ringed at their last position. */}
+        {showVessels && liveVessels && (
+          <VesselDotsLayer
+            vessels={liveVessels.vessels}
+            tankersOnly={tankersOnly}
+            darkOnly={darkOnly}
+            onSelect={(v) => setSelectedObject({ type: 'liveVessel', data: v })}
+          />
+        )}
+
+        {/* 0b'. Lit vessels seen from orbit at night (VIIRS), when configured. */}
+        {showVessels && liveVessels && liveVessels.light_detections.length > 0 && (
+          <LightDetectionsLayer detections={liveVessels.light_detections} />
+        )}
+
+        {/* 0c. Navigational warnings: military in red. */}
+        {showWarnings && (
+          <NavWarningsLayer
+            warnings={allWarnings}
+            onSelect={(w) => setSelectedObject({ type: 'warning', data: w })}
+          />
+        )}
 
         {/* 1. Maritime Chokepoints Layer */}
         {showChokepoints &&
@@ -1080,8 +1387,8 @@ export default function GlobalMap() {
                 y={-3}
                 width={6}
                 height={6}
-                fill="rgba(56, 189, 248, 0.18)"
-                stroke={PALETTE.info}
+                fill={rc.noAis ? 'rgba(232, 121, 249, 0.45)' : 'rgba(56, 189, 248, 0.18)'}
+                stroke={rc.noAis ? '#e879f9' : PALETTE.info}
                 strokeWidth={1}
                 className="cursor-pointer"
               />
@@ -1280,6 +1587,7 @@ export default function GlobalMap() {
               )}
             </Marker>
           ))}
+        </PanZoomGroup>
       </ComposableMap>
     </div>
   );

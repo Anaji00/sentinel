@@ -179,6 +179,38 @@ def current_session(utc_now: Optional[datetime] = None, asset_class: str = "equi
     return Session.CLOSED
 
 
+_CRYPTO_BASES = frozenset({"BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LTC", "BNB"})
+
+
+def instrument_closed_at(ticker: str, utc_ts: Optional[datetime] = None) -> bool:
+    """Was this instrument's market shut at `utc_ts`, so no bar can be real?
+
+    A price stamped while the market is shut is the feed repeating its last
+    print or a quote endpoint returning Friday's close with today's time. Both
+    were stored as bars: 446 of them over three weekends, NVDA six times at an
+    identical 234.00 x 71,905 shares, and every futures contract at volume 0.
+
+    Equities and ETFs: closed whenever the equity session is CLOSED (weekends,
+    holidays, 20:00-04:00 ET). CME futures: closed Friday 17:00 ET to Sunday
+    18:00 ET and in the daily 17:00-18:00 ET halt. Crypto never closes.
+    """
+    t = str(ticker or "").strip().upper()
+    base = t.replace("-USD", "").replace("USDT", "").replace("USD", "") if t else t
+    if base in _CRYPTO_BASES or t.endswith("-USD"):
+        return False
+    if t.endswith("=F"):
+        et = eastern_now(utc_ts)
+        wd, hour = et.weekday(), et.hour
+        if wd == 5:                      # Saturday
+            return True
+        if wd == 6:                      # Sunday: reopens at 18:00
+            return hour < 18
+        if wd == 4 and hour >= 17:       # Friday from the close
+            return True
+        return hour == 17                # daily maintenance halt
+    return current_session(utc_ts, asset_class="equities") == Session.CLOSED
+
+
 # How much to stretch a poll interval in each session.
 #
 # A multiplier rather than a table of intervals, so each collector keeps its own

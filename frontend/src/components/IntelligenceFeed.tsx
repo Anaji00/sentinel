@@ -19,6 +19,12 @@ import { useDialog } from './ui/useDialog';
 import { SimilarEvents } from './SimilarEvents';
 import { RuleVerdict } from './RuleVerdict';
 
+// Scores arrive null on some rows; a null here crashed the whole view.
+function fixed(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+
 interface EvidenceContributor {
   agent_name: string;
   direction?: string;
@@ -842,7 +848,7 @@ export default function IntelligenceFeed() {
                 <div>
                   <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
                   <span className="text-amber-400 font-bold block">
-                    {selectedEvent.anomaly_score.toFixed(2)}
+                    {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
                 <div>

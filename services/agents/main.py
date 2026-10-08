@@ -30,11 +30,13 @@ from services.agents.supervisor import GraphSupervisor
 from services.agents.consensus_engine import ConsensusEngine
 from services.agents.adversarial_wargamer import AdversarialWargamerAgent
 from services.agents.edge_validator import EdgeValidatorAgent
+from services.agents.signal_engine import SignalEngine
 from services.agents.stock_correlation_agent import StockCorrelationAgent
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 from shared.utils.quiet_failures import swallowed
+from shared.utils.llm_policy import agent_disabled
 # ── TOPIC CONSTANTS ───────────────────────────────────────────────────────────
 # All topics are now centrally managed in shared/kafka/__init__.py
 
@@ -108,7 +110,7 @@ async def run_task_queue_worker(redis_client, agents: dict):
 # This comment previously claimed compose set qwen2.5:3b for agents-heavy. It
 # did not, and had not for as long as the comment existed -- the tiering it
 # described was gone and the sentence describing it was not.
-HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen3:0.6b")
+HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
 
 # The same value under a name the fast-tier call sites can use.
 #
@@ -118,7 +120,7 @@ HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen3:0.6b")
 # for six, which is the arrangement the comment above says this file does not
 # have. Changing the tier's model in compose would have moved half the swarm and
 # left the rest on the old one, with nothing reporting the split.
-FAST_MODEL = os.getenv("AGENT_MODEL", "qwen3:0.6b")
+FAST_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
 
 # What a fast-tier agent falls back to when its first choice fails.
 #
@@ -494,16 +496,30 @@ async def main():
         ("stock_correlation_agent", stock_correlation_agent, "fast"),
     ]
 
+    # Agents cut by policy are not launched; see shared.utils.llm_policy.
     active_agents = {
         name: agent_inst
         for name, agent_inst, tier in agent_tier_map
-        if tier_filter in ("all", tier)
+        if tier_filter in ("all", tier) and not agent_disabled(name)
     }
+    for name, _inst, tier in agent_tier_map:
+        if tier_filter in ("all", tier) and agent_disabled(name):
+            logger.info("Agent %s not launched (AGENTS_DISABLED).", name)
 
     tasks = [
         safe_create_task(agent_inst.run(), name=name)
         for name, agent_inst in active_agents.items()
     ]
+    # The reaction study and live trading signals (services/agents/signal_engine.py).
+    # Scheduled rather than subscribed, so it is started here rather than wired
+    # as an agent: it acts on no Kafka message.
+    if tier_filter in ("all", "heavy"):
+        tasks.append(safe_create_task(
+            SignalEngine(shared_infra["db"], shared_infra["redis"]).run(), name="signal_engine",
+        ))
+        # The nightly cross-sectional ranking model runs as its own service
+        # (factor-model in docker-compose.yml): its panel does not fit in this
+        # container's memory budget beside the agents.
     # The task-queue worker is not started.
     #
     # It ran a BLPOP across sentinel:tasks:high/normal/low on a one-second

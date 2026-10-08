@@ -75,8 +75,7 @@ def test_the_enrichers_attach_the_bridges():
 def test_aircraft_reach_a_stock_through_their_operator_not_the_region():
     """Region exposure on aircraft made 109 single-flight surges a day look like
     crude and grain signals: an airliner over the Gulf says nothing about oil."""
-    for rel in ("services/enrichment/enrichers/aviation.py",
-                "services/enrichment/aviation_gap_detector.py"):
+    for rel in ("services/enrichment/enrichers/aviation.py",):
         src = (ROOT / rel).read_text(encoding="utf-8")
         assert "region_exposure_tags(" not in src, rel
         assert "operator_ticker(" in src, rel

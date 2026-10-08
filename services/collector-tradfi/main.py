@@ -33,7 +33,9 @@ import feedparser
 import time
 import websockets
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +43,10 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.utils.candles import candle_cache_key
+from shared.utils.options_positioning import (
+    IV_MAX_DAYS, IV_MIN_DAYS, POSITIONING_TTL_SEC, iv_measures, positioning_key,
+    summarize as summarize_positioning,
+)
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
 from shared.kafka import SentinelProducer, Topics
 from shared.utils.source_freshness import mark_source_filtered
@@ -147,6 +153,36 @@ async def persist_typical_notional(redis_client) -> None:
         # cold-start floor on the next restart, which is the defect this
         # persistence was added for.
         swallowed("collector.tradfi.persist_typical_notional", e, logger)
+
+
+# An option print older than this is not news: the poller sees each contract's
+# last trade, and before this check yesterday's fills went out at the open.
+#
+# The indicative options feed is itself delayed 15 minutes -- measured: across
+# 5,000 contracts the youngest latestTrade was 899s old. A 15-minute limit
+# therefore rejected every fill, and options_flow went from 324 events to none.
+# The feed's delay plus two five-minute poll cycles.
+OPTION_FEED_DELAY_SEC = 15 * 60
+OPTION_TRADE_MAX_AGE_SEC = OPTION_FEED_DELAY_SEC + 10 * 60
+
+
+def _option_trade_time(latest_trade: dict) -> Optional[datetime]:
+    """The fill's own timestamp from an Alpaca latestTrade, or None."""
+    raw = latest_trade.get("t") or latest_trade.get("timestamp")
+    if not raw:
+        return None
+    try:
+        text = str(raw).replace("Z", "+00:00")
+        # Alpaca sends nanoseconds; fromisoformat takes at most microseconds.
+        if "." in text:
+            head, rest = text.split(".", 1)
+            frac = "".join(ch for ch in rest if ch.isdigit())
+            tz = rest[len(frac):]
+            text = f"{head}.{frac[:6]}{tz}"
+        ts = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
 def _is_block_trade(ticker: str, notional: float) -> bool:
@@ -640,6 +676,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     "has_open_market_activity": parsed["has_open_market_activity"],
                     "role": _primary_role(parsed["owners"]),
                     "transactions": parsed["transactions"],
+                    "planned_10b5_1": parsed.get("planned_10b5_1", False),
                 })
                 try:
                     await _link_insiders(producer, parsed)
@@ -765,6 +802,15 @@ class OHLCVAggregator:
         # two-minute range, stamped as one bar. Without a crash, trades that
         # arrived during the awaits were wiped by the clear() unflushed.
         buffer, self.buffer = self.buffer, {}
+
+        # Nothing trades while the session is closed. Prints that arrive then are
+        # the feed replaying its last trade: NVDA carried six identical flat
+        # 234.00 bars of exactly 71,905 shares across 3-5 October, a weekend,
+        # and each went to the hot cache and downstream as a real bar.
+        if session_name == "CLOSED":
+            if buffer:
+                logger.debug("Dropped %d bars built while the market was closed", len(buffer))
+            return
 
         async with self.redis_client.raw.pipeline() as pipe:
             for ticker, data in buffer.items():
@@ -1059,6 +1105,56 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
 
 # ── ALPACA EXTENDED-HOURS EQUITIES (PRE-MARKET & AFTER-HOURS REST POLLER) ───
 
+# Watched names beyond the socket's fifty, polled by snapshot in regular hours.
+OVERFLOW_SNAPSHOT_LIMIT = int(os.getenv("ALPACA_OVERFLOW_SYMBOLS", "150"))
+
+
+def overflow_symbols(watched_newest_first, limit: int = OVERFLOW_SNAPSHOT_LIMIT, extra=()) -> list:
+    """Watched equities the Finnhub socket is not carrying, newest first.
+
+    The socket streams fifty symbols: core anchors plus the newest discoveries.
+    Everything older lost its live price the moment it was displaced -- on
+    7 October MU, carrying the day's largest call sweeps, had no bar for two
+    hours after a restart reshuffled the fifty. One snapshot request covers the
+    rest at a minute's resolution.
+
+    `extra` (names with fresh events) are polled too, but only the watchlist
+    decides what the socket carries -- as sync_subscriptions does."""
+    streamed = set(select_subscription_symbols(watched_newest_first))
+    out, seen = [], set()
+    for t in list(watched_newest_first) + list(extra):
+        t = str(t).upper().strip()
+        if t in streamed or t in seen or not _ALPACA_EQUITY_SYMBOL.match(t):
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+ATTENTION_REFRESH_SEC = 300
+_attention_cache: dict = {"at": 0.0, "tickers": []}
+_ATTENTION_SQL = """
+    SELECT primary_entity_id AS ticker, max(anomaly_score) AS score FROM events
+    WHERE created_at > NOW() - INTERVAL '2 hours' AND anomaly_score >= 0.6
+      AND type IN ('options_flow', 'equity_block', 'filing', 'insider_trade', 'market_anomaly')
+      AND primary_entity_id IS NOT NULL
+    GROUP BY 1 ORDER BY 2 DESC LIMIT 150
+"""
+
+
+async def _attention_tickers() -> list:
+    """Tickers with a scored market event in the last two hours, strongest first."""
+    try:
+        from shared.db import get_timescale
+        db = await get_timescale()
+        return [str(r["ticker"]).upper() for r in await db.query(_ATTENTION_SQL) or [] if r["ticker"]]
+    except Exception as e:
+        swallowed("collector.tradfi.attention_tickers", e, logger)
+        return []
+
+
 async def poll_extended_hours_equities(producer: SentinelProducer, redis_client, aggregator: OHLCVAggregator):
     """
     Polls Alpaca's Stock Snapshot API during Pre-Market (04:00-09:30 ET) and After-Hours (16:00-20:00 ET).
@@ -1114,8 +1210,29 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                 snapshot_symbols = [
                     s for s in symbols[:50] if _ALPACA_EQUITY_SYMBOL.match(s)
                 ]
-                if is_extended and snapshot_symbols:
-                    _rejected = [s for s in symbols[:50] if s not in snapshot_symbols]
+                if not is_extended:
+                    # Regular hours: the socket carries fifty; the rest of the
+                    # watchlist is read here. Volume on this feed is IEX-only,
+                    # as the historical backfill's is.
+                    raw_watch = await redis_client.raw.zrevrange(
+                        REDIS_EQUITIES_KEY, 0, FINNHUB_SUBSCRIPTION_LIMIT * 2 + OVERFLOW_SNAPSHOT_LIMIT
+                    )
+                    watched = [
+                        (t.decode() if isinstance(t, bytes) else str(t)).upper()
+                        for t in raw_watch or []
+                    ]
+                    # And names with a scored event in the last two hours: the
+                    # watchlist keeps fifty, so a name carrying the day's flow
+                    # can have dropped off it while the flow is still news.
+                    if time.time() - _attention_cache["at"] > ATTENTION_REFRESH_SEC:
+                        _attention_cache["tickers"] = await _attention_tickers()
+                        _attention_cache["at"] = time.time()
+                    snapshot_symbols = overflow_symbols(
+                        [t for t in watched if is_valid_primary_equity(t)],
+                        extra=[t for t in _attention_cache["tickers"] if is_valid_primary_equity(t)],
+                    )
+                if snapshot_symbols:
+                    _rejected = [s for s in symbols[:50] if s not in snapshot_symbols] if is_extended else []
                     if _rejected and _rejected != _last_rejected_symbols:
                         _last_rejected_symbols[:] = _rejected
                         logger.info(
@@ -1161,7 +1278,10 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                                 aggregator.add_trade(ticker, price, volume)
                                 ingested_count += 1
 
-                                if _is_block_trade(ticker, notional):
+                                # A minute bar is not a print: in regular hours its
+                                # volume is a minute of trading, so it is never
+                                # read as a block.
+                                if is_extended and _is_block_trade(ticker, notional):
                                     tag = "🔴 SELL BLOCK" if tick_dir == "DownTick" else ("🟢 BUY BLOCK" if tick_dir == "UpTick" else "⚪ NEUTRAL BLOCK")
                                     logger.warning("%s [%s]: %s $%.2fM at $%.2f", tag, session_name, ticker, notional / 1e6, price)
 
@@ -1186,7 +1306,7 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                                 )
 
                             if ingested_count > 0:
-                                logger.info(f"📈 Extended-Hours Poller [{session_name}]: Ingested {ingested_count} updates across {len(symbols)} watched symbols.")
+                                logger.info(f"📈 Extended-Hours Poller [{session_name}]: Ingested {ingested_count} updates across {len(snapshot_symbols)} watched symbols.")
                             else:
                                 logger.info(f"⏱️ Extended-Hours Poller [{session_name}]: Checked {len(symbols)} symbols | 0 new bars (waiting for new trade tick).")
                         else:
@@ -1383,6 +1503,67 @@ MIN_EPS_SURPRISE_DENOMINATOR = 0.05
 
 # ── ALPACA OPTIONS FLOW (REST POLLING) ────────────────────────────────────────
 
+_OPTION_DAILY_UPSERT = """
+    INSERT INTO option_daily (ticker, day, call_volume, put_volume, put_call_ratio, iv_skew,
+                              atm_iv, skew_expiry_days, cp_iv_spread, cp_pairs, updated_at)
+    VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+    ON CONFLICT (ticker, day) DO UPDATE SET
+        call_volume = COALESCE(EXCLUDED.call_volume, option_daily.call_volume),
+        put_volume = COALESCE(EXCLUDED.put_volume, option_daily.put_volume),
+        put_call_ratio = COALESCE(EXCLUDED.put_call_ratio, option_daily.put_call_ratio),
+        iv_skew = COALESCE(EXCLUDED.iv_skew, option_daily.iv_skew),
+        atm_iv = COALESCE(EXCLUDED.atm_iv, option_daily.atm_iv),
+        skew_expiry_days = COALESCE(EXCLUDED.skew_expiry_days, option_daily.skew_expiry_days),
+        cp_iv_spread = COALESCE(EXCLUDED.cp_iv_spread, option_daily.cp_iv_spread),
+        cp_pairs = COALESCE(EXCLUDED.cp_pairs, option_daily.cp_pairs),
+        updated_at = NOW()
+"""
+
+
+async def _record_option_positioning(session, redis_client, ticker: str, snapshots: dict) -> None:
+    """Put/call volume for today's session plus IV skew and call-put IV spread,
+    to Redis for the live thesis and to option_daily for good.
+
+    The poller's page is the nearest ~1,000 contracts, which for an active name
+    ends within two weeks; the skew wants a month out, so the 7-60 day window
+    is asked for separately."""
+    now_ny = datetime.now(ZoneInfo("America/New_York"))
+    today = now_ny.date()
+    parsed = {c: parse_occ_option_symbol(c) or {} for c in snapshots}
+    pos = summarize_positioning(
+        ((parsed[c].get("option_type", "CALL"), s) for c, s in snapshots.items()),
+        day=today.isoformat(),
+    ) or {}
+
+    chain = dict(snapshots)
+    url = (
+        f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}?limit=1000"
+        f"&expiration_date_gte={(today + timedelta(days=IV_MIN_DAYS)).isoformat()}"
+        f"&expiration_date_lte={(today + timedelta(days=IV_MAX_DAYS)).isoformat()}"
+    )
+    async with session.get(url) as resp:
+        if resp.status == 200:
+            chain.update((await resp.json()).get("snapshots") or {})
+    for c in chain:
+        if c not in parsed:
+            parsed[c] = parse_occ_option_symbol(c) or {}
+    iv = iv_measures(((parsed[c], s) for c, s in chain.items()), today) or {}
+    pos.update(iv)
+    if not pos:
+        return
+    pos["as_of"] = datetime.now(timezone.utc).isoformat()
+    await redis_client.raw.set(positioning_key(ticker), json.dumps(pos), ex=POSITIONING_TTL_SEC)
+
+    from shared.db import get_timescale
+    db = await get_timescale()
+    await db.execute(
+        _OPTION_DAILY_UPSERT, ticker.upper(), today,
+        pos.get("call_volume"), pos.get("put_volume"), pos.get("put_call_ratio"),
+        iv.get("iv_skew"), iv.get("atm_iv"), iv.get("skew_expiry_days"),
+        iv.get("cp_iv_spread"), iv.get("cp_pairs"),
+    )
+
+
 async def poll_options(producer: SentinelProducer, redis_client):
     """
     Polls Alpaca's options snapshot API for the watched symbols.
@@ -1419,13 +1600,26 @@ async def poll_options(producer: SentinelProducer, redis_client):
                     symbols = ["AAPL", "TSLA", "MSFT", "NVDA", "AMZN"]
 
                 for ticker in symbols[:50]:
-                    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
+                    # 1000 per page: the default first page is ~100 contracts,
+                    # a sliver of the chain. The near-dated chain is where the
+                    # day's volume is, and it fits in one page for most names.
+                    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}?limit=1000"
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             snapshots = data.get("snapshots", {})
                             if not snapshots:
                                 continue
+
+                            # The day's call and put volume across the chain, for
+                            # the put/call positioning the evidence layer reads,
+                            # and the chain's IV skew and call-put IV spread.
+                            try:
+                                await _record_option_positioning(
+                                    session, redis_client, ticker, snapshots,
+                                )
+                            except Exception as e:
+                                swallowed("collector.tradfi.options_positioning", e, logger)
 
                             count = 0
                             for contract, snapshot in snapshots.items():
@@ -1462,7 +1656,10 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 )
                                 premium = price * size * 100.0
 
-                                if premium >= 50000.0 or size >= 100.0:
+                                # Money spent, not contract count. `or size >= 100`
+                                # let 100 contracts at $0.05 -- $500 of premium --
+                                # through as a sweep, and most of the panel was that.
+                                if premium >= 50000.0:
                                     # One fill, published once.
                                     #
                                     # latestTrade is the contract's last trade,
@@ -1509,6 +1706,16 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                     if not await _option_trade_is_new(redis_client, contract, trade_fp):
                                         continue
 
+                                    # When the fill happened, not when this poll saw it.
+                                    # latestTrade is the contract's last print, which at
+                                    # the open is often yesterday's: stamped now(), it was
+                                    # published as this morning's sweep.
+                                    trade_at = _option_trade_time(latest_trade)
+                                    if trade_at is not None and (
+                                        datetime.now(timezone.utc) - trade_at
+                                    ).total_seconds() > OPTION_TRADE_MAX_AGE_SEC:
+                                        continue
+
                                     parsed = parse_occ_option_symbol(contract) or {}
                                     opt_type = parsed.get("option_type", "CALL")
                                     strike_val = parsed.get("strike")
@@ -1529,7 +1736,7 @@ async def poll_options(producer: SentinelProducer, redis_client):
 
                                     event = RawEvent(
                                         source="alpaca_options",
-                                        occurred_at=datetime.now(timezone.utc),
+                                        occurred_at=trade_at or datetime.now(timezone.utc),
                                         raw_payload={
                                             "ticker": ticker,
                                             "option_symbol": contract,
@@ -2156,6 +2363,14 @@ async def _run_historical_backfill(redis_client) -> None:
     except Exception as e:
         logger.warning("Historical backfill: could not read the watchlist (%s).", e)
 
+    # The instruments signal families point at, so the reaction study can
+    # measure them whether or not they are streamed.
+    try:
+        from shared.utils.signal_families import backfill_universe
+        tickers = sorted(set(tickers) | set(backfill_universe()))
+    except Exception as e:
+        swallowed("collector.tradfi.signal_universe", e, logger)
+
     if not tickers:
         # A cold platform has no watchlist yet. Seed from the core symbols this
         # collector already reserves capacity for, so the first run produces
@@ -2178,6 +2393,180 @@ async def _run_historical_backfill(redis_client) -> None:
         await raw.set(TRADFI_BACKFILL_REPORT_KEY, json.dumps(report, default=str), ex=86400 * 7)
     except Exception as e:
         logger.debug("Could not record backfill report: %s", e)
+
+
+SIGNAL_BACKFILL_INTERVAL_SEC = 12 * 3600
+SIGNAL_BACKFILL_DAYS = 5
+# After the start-up backfill, and long enough for a first study to say what it needs.
+SIGNAL_BACKFILL_FIRST_DELAY_SEC = 15 * 60
+
+
+# Every listed, tradable US name, screened for liquidity before it is loaded deep.
+VALID_EQUITIES_KEY = "sentinel:equities:valid_set"      # written by collector-radar from Alpaca assets
+DAILY_ILLIQUID_KEY = "sentinel:daily_bars:illiquid"
+ILLIQUID_RECHECK_SEC = 30 * 86400
+BREADTH_SCREEN_DAYS = 35
+BREADTH_DEEP_CHUNK = 300
+
+_LIQUIDITY_SQL = """
+    SELECT ticker, avg(close * volume) AS dv, last(close, day) AS px, count(*) AS n
+    FROM daily_bars WHERE ticker = ANY($1::text[]) AND day > CURRENT_DATE - 40
+    GROUP BY ticker
+"""
+_HAVE_DEEP_SQL = """
+    SELECT ticker FROM daily_bars WHERE ticker = ANY($1::text[])
+    GROUP BY ticker HAVING min(day) < CURRENT_DATE - 300 OR count(*) >= 200
+"""
+
+
+def _clean_equity(t: str) -> bool:
+    return bool(t) and "=" not in t and "-" not in t and not t.endswith("USDT") \
+        and t.replace(".", "").isalpha() and len(t) <= 6
+
+
+def liquid_names(rows, min_price: float, min_dollar_volume: float) -> list:
+    """Tickers whose last close and 35-day mean dollar volume clear the floors."""
+    out = []
+    for r in rows or []:
+        try:
+            if float(r["px"]) >= min_price and float(r["dv"]) >= min_dollar_volume:
+                out.append(str(r["ticker"]).upper())
+        except (TypeError, ValueError, KeyError):
+            continue
+    return sorted(out)
+
+
+async def _breadth_backfill(db, raw, backfill_daily_bars, deep_years: int) -> dict:
+    """Five years of daily bars for every listed name liquid enough to trade.
+
+    The cross-sectional model ranked the ~1,900 names the platform happened to
+    collect. Alpaca lists ~12,000; most are warrants, units and names nobody
+    can trade in size. So: 35 days for every unscreened name, keep those
+    clearing the model's own price and dollar-volume floors, and only those go
+    five years deep. The rest are rescreened monthly."""
+    from shared.utils.factor_model import MIN_FEED_DOLLAR_VOLUME, MIN_PRICE
+    from shared.utils.signal_store import DAILY_DEEP_KEY
+
+    dec = lambda m: (m.decode() if isinstance(m, bytes) else str(m)).upper()  # noqa: E731
+    listed = {dec(m) for m in (await raw.smembers(VALID_EQUITIES_KEY) or [])}
+    deep = {dec(m) for m in (await raw.smembers(DAILY_DEEP_KEY) or [])}
+    illiquid = {dec(m) for m in (await raw.smembers(DAILY_ILLIQUID_KEY) or [])}
+    probe = sorted(t for t in listed if _clean_equity(t) and t not in deep and t not in illiquid)
+    stats = {"listed": len(listed), "screened": len(probe), "liquid": 0, "loaded_deep": 0}
+    if not probe:
+        return stats
+    await backfill_daily_bars(db, probe, lookback_days=BREADTH_SCREEN_DAYS)
+    liquid = liquid_names(await db.query(_LIQUIDITY_SQL, probe), MIN_PRICE, MIN_FEED_DOLLAR_VOLUME)
+    stats["liquid"] = len(liquid)
+    below = sorted(set(probe) - set(liquid))
+    if below:
+        await raw.sadd(DAILY_ILLIQUID_KEY, *below)
+        if await raw.ttl(DAILY_ILLIQUID_KEY) < 0:
+            await raw.expire(DAILY_ILLIQUID_KEY, ILLIQUID_RECHECK_SEC)
+    for k in range(0, len(liquid), BREADTH_DEEP_CHUNK):
+        chunk = liquid[k:k + BREADTH_DEEP_CHUNK]
+        await backfill_daily_bars(db, chunk, lookback_days=365 * deep_years + 7)
+        landed = [str(r["ticker"]).upper() for r in await db.query(_HAVE_DEEP_SQL, chunk) or []]
+        if landed:
+            await raw.sadd(DAILY_DEEP_KEY, *landed)
+            stats["loaded_deep"] += len(landed)
+    logger.info("Daily breadth: %s listed, %s screened, %s liquid, %s loaded five years deep.",
+                stats["listed"], stats["screened"], stats["liquid"], stats["loaded_deep"])
+    return stats
+
+
+async def _signal_backfill_loop(redis_client) -> None:
+    """Keep the signal instruments' history current between restarts.
+
+    The start-up backfill runs once per process; without this, an instrument
+    that is not streamed stops accruing bars the day after a deploy, and every
+    signal on it becomes unmeasurable. Five days per pass, idempotent upserts.
+    """
+    try:
+        from historical_backfill import (
+            backfill_bars, backfill_daily_bars, DAILY_DEEP_YEARS, DAILY_TOPUP_DAYS, DEFAULT_LOOKBACK_DAYS,
+        )
+    except ImportError:
+        return
+    from shared.db import get_timescale
+    from shared.utils.signal_families import backfill_universe
+    from shared.utils.signal_store import BARS_BACKFILLED_KEY, DAILY_DEEP_KEY, NEEDS_BARS_KEY
+
+    raw = getattr(redis_client, "raw", redis_client)
+    await asyncio.sleep(SIGNAL_BACKFILL_FIRST_DELAY_SEC)
+    while True:
+        try:
+            db = await get_timescale()
+            # Instruments the reaction study could not measure: their full
+            # history, once each.
+            needed = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                      for m in (await raw.smembers(NEEDS_BARS_KEY) or [])}
+            done = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                    for m in (await raw.smembers(BARS_BACKFILLED_KEY) or [])}
+            fresh = sorted(needed - done)
+            if fresh:
+                report = await backfill_bars(db, fresh, timeframe="1Min",
+                                             lookback_days=DEFAULT_LOOKBACK_DAYS)
+                await raw.sadd(BARS_BACKFILLED_KEY, *fresh)
+                await raw.expire(BARS_BACKFILLED_KEY, 30 * 86400)
+                logger.info("Study-requested backfill: %s bars for %s of %s tickers",
+                            report.get("bars_written"), report.get("tickers_with_data"), len(fresh))
+            # Everything the signals point at, topped up.
+            report = await backfill_bars(db, sorted(set(backfill_universe()) | done),
+                                         timeframe="1Min", lookback_days=SIGNAL_BACKFILL_DAYS)
+            logger.info("Signal-universe backfill: %s bars for %s tickers",
+                        report.get("bars_written"), report.get("tickers_with_data"))
+
+            # Roll what was just written into the hourly and daily views. Their
+            # policies refresh only a trailing window, so backfilled weeks never
+            # reached them; refreshing the window written is what does.
+            lookback = DEFAULT_LOOKBACK_DAYS if fresh else SIGNAL_BACKFILL_DAYS
+            now_ts = datetime.now(timezone.utc)
+            for view, end_lag in (("tradfi_bars_1h", timedelta(hours=2)), ("tradfi_bars_1d", timedelta(days=1))):
+                try:
+                    await db.execute_without_transaction(
+                        f"CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)",
+                        (now_ts - timedelta(days=lookback + 1), now_ts - end_lag),
+                        timeout=1800,
+                    )
+                except Exception as e:
+                    swallowed("collector.tradfi.refresh_aggregate", e, logger, detail=view)
+
+            # Daily history, kept permanently: years deep for any ticker not yet
+            # loaded, then a short top-up for all of them.
+            watched = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                       for m in (await raw.zrange(REDIS_EQUITIES_KEY, 0, -1) or [])}
+            # Every equity the platform has bars for: a cross-sectional model
+            # needs breadth, and five years of daily bars for ~1,900 names is
+            # a few million rows.
+            seen_rows = await db.query(
+                "SELECT DISTINCT ticker FROM tradfi_bars WHERE time > NOW() - INTERVAL '60 days'"
+            )
+            seen = {str(r["ticker"]).upper() for r in seen_rows or []}
+            daily_universe = sorted(
+                t for t in (set(backfill_universe()) | done | watched | seen)
+                if t and "=" not in t and "-" not in t and not t.endswith("USDT")
+                and t.replace(".", "").isalpha() and len(t) <= 6
+            )
+            deep = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                    for m in (await raw.smembers(DAILY_DEEP_KEY) or [])}
+            shallow = [t for t in daily_universe if t not in deep]
+            if shallow:
+                rep_deep = await backfill_daily_bars(db, shallow, lookback_days=365 * DAILY_DEEP_YEARS + 7)
+                if not rep_deep.get("errors"):
+                    await raw.sadd(DAILY_DEEP_KEY, *shallow)
+            # Every name already loaded deep is kept current, not only the ones
+            # the platform happens to stream.
+            deep_now = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                        for m in (await raw.smembers(DAILY_DEEP_KEY) or [])}
+            await backfill_daily_bars(db, sorted(set(daily_universe) | deep_now), lookback_days=DAILY_TOPUP_DAYS)
+        except Exception as e:
+            swallowed("collector.tradfi.signal_backfill", e, logger)
+        try:
+            await _breadth_backfill(await get_timescale(), raw, backfill_daily_bars, DAILY_DEEP_YEARS)
+        except Exception as e:
+            swallowed("collector.tradfi.breadth_backfill", e, logger)
+        await asyncio.sleep(SIGNAL_BACKFILL_INTERVAL_SEC)
 
 
 async def _persist_baselines_loop(redis_client, interval_sec: int = 300) -> None:
@@ -2233,6 +2622,7 @@ async def main():
     # rate-limit problem, and the names the platform reasons about are the ones
     # whose history it needs.
     backfill_task = safe_create_task(_run_historical_backfill(redis_client))
+    signal_backfill_task = safe_create_task(_signal_backfill_loop(redis_client), name="signal-backfill")
 
     # Flush the baselines periodically, so a crash loses minutes of learning
     # rather than all of it.
@@ -2251,6 +2641,7 @@ async def main():
         hb_task.cancel()
         pubsub_task.cancel()
         backfill_task.cancel()
+        signal_backfill_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

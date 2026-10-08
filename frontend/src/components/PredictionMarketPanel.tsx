@@ -13,6 +13,12 @@ import { ClockTime } from './ui/ClockTime';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
 
+// Scores arrive null on some rows; one null took the whole Macro page down.
+function fixed(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+
 export default function PredictionMarketPanel() {
   const [activeCategory, setActiveCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -258,7 +264,7 @@ export default function PredictionMarketPanel() {
                 <div>
                   <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
                   <span className="text-purple-400 font-bold block">
-                    {selectedEvent.anomaly_score.toFixed(2)}
+                    {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
                 <div>

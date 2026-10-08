@@ -66,3 +66,16 @@ def test_the_news_feeds_are_the_ones_that_answered():
                   "eia_today", "oilprice", "splash247", "hellenic_shipping", "fed_press"):
         assert added in feeds
     assert len(feeds) == len(mod.FEEDS)
+
+
+def test_aviation_publishes_emergency_squawks_only():
+    """Watch-zone positions fed a dark-flight detector that measured airline
+    schedules: positions were kept only inside small boxes, so an airliner that
+    flew out of one read as silent until its next pass -- 459 of 482
+    flight_dark events in 24 hours were airline callsigns."""
+    src = (ROOT / "services/collector-adsb/main.py").read_text(encoding="utf-8")
+    assert "if not is_emergency:\n                        continue" in src
+    assert "if not (is_emergency or precise_zone):" not in src
+    assert not (ROOT / "services/enrichment/aviation_gap_detector.py").exists()
+    enrichment = (ROOT / "services/enrichment/main.py").read_text(encoding="utf-8")
+    assert "AviationGapDetector" not in enrichment

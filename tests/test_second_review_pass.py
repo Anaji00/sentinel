@@ -238,31 +238,6 @@ def test_the_world_domains_are_domains():
     assert {"news", "maritime", "aviation", "cyber"} <= _WORLD_DOMAINS
 
 
-# ── 246: a dark aircraft carries no aircraft data and no position ────────────
-
-
-def test_a_dark_aircraft_carries_its_last_position_and_payload():
-    """vessel_dark 199/199 with payload and position; flight_dark 0/530."""
-    src = (ROOT / "services" / "enrichment" / "aviation_gap_detector.py").read_text(encoding="utf-8")
-    assert 'latitude=val.get("lat")' in src, (
-        "the coordinates were in the dict the detector was already reading -- "
-        "the vessel detector, on the identical record shape, carries them"
-    )
-    assert 'longitude=val.get("lon")' in src
-    assert "flight_data=FlightData(" in src, (
-        "/events/aviation filters on `flight_data IS NOT NULL`, so without this "
-        "the aviation panel cannot return a single dark aircraft"
-    )
-
-
-def test_both_gap_detectors_read_the_same_record_the_same_way():
-    aviation = (ROOT / "services" / "enrichment" / "aviation_gap_detector.py").read_text(encoding="utf-8")
-    vessel = (ROOT / "services" / "enrichment" / "gap_detector.py").read_text(encoding="utf-8")
-    for src in (aviation, vessel):
-        assert 'val.get("lat")' in src
-        assert 'val.get("lon")' in src
-
-
 # ── 247: the news feed returns no news ───────────────────────────────────────
 
 EVENTS = (ROOT / "services" / "api_gateway" / "routes" / "events.py").read_text(encoding="utf-8")

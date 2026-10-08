@@ -4,6 +4,8 @@ passes database connections from the main app state
 down into isolated routes"""
 
 import hmac
+
+from shared.utils.session_revocation import is_revoked as is_session_revoked
 import ipaddress
 import hashlib
 import base64
@@ -52,6 +54,17 @@ _OPEN_HEALTH_PATHS = frozenset({
     "/api/v1/health/liveness",
     "/api/v1/health/readiness",
 })
+
+
+async def _session_revoked(conn, identity: Optional[str], token: str) -> bool:
+    """Whether a verified session predates its account's last password change.
+
+    `conn` is the Request or WebSocket; Redis is read from its app state.
+    """
+    scope = getattr(conn, "scope", None)
+    app = scope.get("app") if isinstance(scope, dict) else None
+    redis = getattr(getattr(app, "state", None), "redis", None)
+    return await is_session_revoked(redis, identity or "", token)
 
 
 def create_jwt_token(payload: dict, secret: Optional[str] = None, expires_in_seconds: int = 86400, role: str = "ANALYST") -> str:
@@ -417,7 +430,12 @@ async def verify_api_key(request: Request = None):
                 supplied.encode("utf-8"), METRICS_TOKEN.encode("utf-8")
             ):
                 return None
-            raise HTTPException(status_code=401, detail="Metrics require a scrape token.")
+            # A wrong token is refused outright. No token at all falls through
+            # to the session/API-key check below: the console's health HUD polls
+            # this as a signed-in operator, and refusing it there left the HUD
+            # permanently on 401 while the scraper path stayed closed anyway.
+            if supplied:
+                raise HTTPException(status_code=401, detail="Metrics require a scrape token.")
     if path in _OPEN_HEALTH_PATHS:
         return None
     # Login must be reachable without credentials -- it is where credentials are
@@ -497,6 +515,10 @@ async def verify_api_key(request: Request = None):
         is_token_valid = res[0]
         user_ident = res[1]
         token_role = res[2] if len(res) > 2 else "ANALYST"
+        if is_token_valid and await _session_revoked(request, user_ident, session_cookie):
+            # Issued before this account's password was last changed.
+            is_token_valid = False
+            logger.warning("Rejected a session issued before the last password change for %s", user_ident)
         if is_token_valid:
             is_valid = True
             identity = f"session:{user_ident}"
@@ -648,6 +670,8 @@ async def verify_websocket_api_key(websocket: WebSocket) -> bool:
             is_valid = True
     elif session_cookie and isinstance(session_cookie, str):
         is_token_valid, *rest = verify_session_token(session_cookie)
+        if is_token_valid and rest and await _session_revoked(websocket, rest[0], session_cookie):
+            is_token_valid = False
         if is_token_valid:
             is_valid = True
         else:

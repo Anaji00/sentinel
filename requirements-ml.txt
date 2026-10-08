@@ -3,6 +3,8 @@ scipy==1.12.0
 pandas==2.2.2
 spacy==3.7.1
 scikit-learn==1.3.2
+# Learning-to-rank (LambdaRank) for the cross-sectional stock model; scikit-learn has no ranking objective.
+lightgbm==4.5.0
 # onnxruntime / skl2onnx intentionally omitted. Sentinel scores anomalies with
 # streaming RRCF (shared/utils/streaming_detectors.py); no ONNX model is loaded
 # at runtime anywhere in the codebase. The only consumer was the deprecated

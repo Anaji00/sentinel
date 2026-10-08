@@ -39,6 +39,9 @@ class MockRedis:
     async def set(self, key, val, ex=None):
         self.data[key] = val
 
+    async def exists(self, key):
+        return int(key in self.data)
+
     async def keys(self, pattern):
         return [b"sentinel:quotes:latest:NVDA", b"sentinel:quotes:latest:CL=F"]
 
@@ -141,27 +144,10 @@ async def test_quant_trading_engine_graph_context_precheck():
         producer=mock_producer,
     )
 
-    # Mock LLM execution to return a deterministic FinancialAdviceBrief
-    from services.agents.quant_trading_engine import FinancialAdviceBrief, TradingSignal
+    # The model now writes only the thesis for a computed play.
+    from services.agents.quant_trading_engine import TradeThesis
     async def mock_execute(*args, **kwargs):
-        return FinancialAdviceBrief(
-            market_regime="Normal",
-            general_hedging_strategy="Standard protective collars",
-            highest_conviction_plays=[
-                TradingSignal(
-                    ticker="NVDA",
-                    action="BUY",
-                    trade_type="Long/Buy",
-                    entry_level=120.0,
-                    target_price=135.0,
-                    stop_loss=112.0,
-                    risk_reward_ratio=2.0,
-                    conviction_score=0.85,
-                    kelly_allocation_pct=5.0,
-                    quantitative_rationale="Bullish momentum supported by supplier strength.",
-                )
-            ]
-        )
+        return TradeThesis(thesis="Supplier strength supports the measured trend.", key_risks=["TSM guidance"])
 
     engine._execute_with_telemetry = mock_execute
 

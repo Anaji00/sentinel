@@ -88,8 +88,11 @@ def test_nginx_ingress_configuration():
     # 4. Proxy Destinations & BFF routing.
     #    Browser /api/auth/* and /api/proxy/* are Next.js route handlers and MUST be
     #    routed to the frontend, not the gateway, or login and all data calls break.
-    assert "proxy_pass http://api_gateway_backend;" in conf_content
-    assert "proxy_pass http://frontend_backend;" in conf_content
+    assert "proxy_pass $api_gateway_upstream;" in conf_content
+    assert "proxy_pass $frontend_upstream;" in conf_content
+    # Resolved per request, so a recreated container is found at its new address.
+    assert "resolver 127.0.0.11" in conf_content
+    assert "upstream frontend_backend" not in conf_content
     assert "location /api/auth/" in conf_content
     assert "location /api/proxy/" in conf_content
 

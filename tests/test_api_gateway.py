@@ -43,8 +43,9 @@ def test_api_gateway_metrics_endpoints_require_a_credential(monkeypatch):
     monkeypatch.setattr(deps, "METRICS_TOKEN", "scrape-secret")
     client = TestClient(app)
 
-    assert client.get("/metrics").status_code == 401
-    assert client.get("/metrics/json").status_code == 401
+    # No token and no session: refused by the ordinary credential check.
+    assert client.get("/metrics").status_code in (401, 403)
+    assert client.get("/metrics/json").status_code in (401, 403)
 
     ok = client.get("/metrics", headers={"X-Metrics-Token": "scrape-secret"})
     assert ok.status_code == 200
@@ -63,7 +64,7 @@ def test_api_gateway_metrics_endpoints_require_a_credential(monkeypatch):
     # somebody had remembered to name it. This test asserted 200 and called it
     # liveness -- it is not a probe, it is the operational map. It now takes the
     # same scrape token as `/metrics`, and liveness proper stays open below.
-    assert client.get("/api/v1/health/metrics").status_code == 401
+    assert client.get("/api/v1/health/metrics").status_code in (401, 403)
     assert client.get(
         "/api/v1/health/metrics", headers={"X-Metrics-Token": "scrape-secret"}
     ).status_code == 200
@@ -294,7 +295,7 @@ def test_candles_multi_timeframe_and_cagg_fallback():
 
     mock_db = MagicMock()
     mock_db.query = AsyncMock(return_value=[
-        {"ts": datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc), "open": 130.0, "high": 132.0, "low": 129.5, "close": 131.5, "volume": 50000.0}
+        {"ts": datetime(2026, 8, 14, 14, 0, 0, tzinfo=timezone.utc), "open": 130.0, "high": 132.0, "low": 129.5, "close": 131.5, "volume": 50000.0}
     ])
 
     app.dependency_overrides[get_redis_optional] = lambda: mock_redis

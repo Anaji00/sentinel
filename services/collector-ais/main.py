@@ -64,6 +64,8 @@ if not AISSTREAM_API_KEY:
 # The WebSocket endpoint provided by AISStream.io
 AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
 
+from shared.utils.maritime_behaviour import AIS_COVERAGE_BOXES  # noqa: E402
+
 # GEOGRAPHIC FILTERS (Bounding Boxes)
 # Format: [[min_lat, min_lon], [max_lat, max_lon]]
 # High-interest global maritime chokepoints and economic zones.
@@ -75,31 +77,10 @@ ZONE_NAMES = [
     "Gulf of Guinea",
 ]
 
-WATCH_ZONES = [
-    # Strait of Hormuz, drawn around where reception happens rather than around
-    # the water of interest.
-    #
-    # The previous box, 24-27N / 56-60E, contained the strait itself and then
-    # ran east into the open Gulf of Oman. It excluded every port on the
-    # approach: Bandar Abbas sits at 27.18N, a fifth of a degree above the old
-    # northern edge, and Jebel Ali at 55.30E, two thirds of a degree west of the
-    # old western one. Terrestrial AIS is line-of-sight to a shore receiver and
-    # those receivers cluster at ports, so the box was aimed at the one part of
-    # the region with no chance of coverage. It returned zero messages for the
-    # entire life of the system.
-    #
-    # Now 24-27.5N / 54-58E: Abu Dhabi, Jebel Ali, the strait, Bandar Abbas and
-    # Fujairah, and less of the open water that was never going to report.
-    [[24.0, 54.0], [27.5, 58.0]],   # Strait of Hormuz + Persian Gulf approaches
-    [[1.0,  103.0], [6.0,  105.0]], # Strait of Malacca
-    [[11.5, 43.0],  [13.5, 45.5]],  # Bab-el-Mandeb
-    [[29.8, 32.2],  [31.5, 32.8]],  # Suez Canal
-    [[12.0, 32.0],  [30.0, 44.0]],  # Red Sea
-    [[40.5, 27.5],  [46.5, 41.5]],  # Black Sea
-    [[22.0, 119.0], [26.0, 122.5]], # Taiwan Strait
-    [[5.0,  109.0], [22.0, 121.0]], # South China Sea
-    [[-2.0, 1.0],   [6.0,  9.0]],   # Gulf of Guinea
-]
+# The boxes live in shared/utils/maritime_behaviour.py, with the reasoning
+# for each, because the dark-vessel detector needs the same edges: a hull
+# that sails out of a box is not a hull that switched its transponder off.
+WATCH_ZONES = AIS_COVERAGE_BOXES
  
 # What to ask AISStream for.
 #

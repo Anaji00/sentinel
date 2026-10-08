@@ -57,8 +57,10 @@ UNPRODUCED: Dict[str, str] = {
     "CUSTOM": "escape hatch for user-defined events; no producer by design",
     "FUTURES_COT": "no CFTC Commitments of Traders collector",
     "SPORTS_LINE_MOVEMENT": "no sportsbook collector",
-    "INSIDER_CLUSTER": "clustering of INSIDER_TRADE is not implemented",
     "NARRATIVE_CLUSTER": "first-story detection scores novelty; it does not emit cluster events",
+
+    # Retired: produced once, and measured as noise.
+    "FLIGHT_DARK": "gap detector retired; zone-only coverage made airline schedules read as silence",
 }
 
 # Where the evidence actually arrives, for the entries that have somewhere.

@@ -1,4 +1,6 @@
 import asyncio
+
+from shared.utils.conflict_zones import region_zone_tags
 import logging
 import os
 import sys
@@ -830,12 +832,8 @@ async def main():
     )
     await consumer.start()
 
-    from services.enrichment.aviation_gap_detector import AviationGapDetector
     gap = VesselGapDetector(producer, scorer, db, redis)
     gap_task = safe_create_task(gap.run(), name="vessel-gap-detector")
-
-    av_gap = AviationGapDetector(producer, scorer, db, redis)
-    av_gap_task = safe_create_task(av_gap.run(), name="aviation-gap-detector")
 
     import time as _time
     _start_time = _time.monotonic()
@@ -1030,6 +1028,12 @@ async def main():
 
                     # Ensure 100% of payloads carry rich human-readable headlines & executive summaries
                     for e in batch_to_write:
+                        # Observations inside a conflict zone carry its tag, so
+                        # a dark tanker in the Persian Gulf and a headline about
+                        # Hormuz share `zone:gulf_hormuz` and can be joined.
+                        for ztag in region_zone_tags(getattr(e, "region", None)):
+                            if ztag not in e.tags:
+                                e.tags.append(ztag)
                         try:
                             apply_display_text(e)
                         except Exception as exc:  # cosmetics must not stop the pipeline

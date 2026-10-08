@@ -21,10 +21,9 @@ import { describeApiError, fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { EmptyState } from './ui/EmptyState';
 import { ExportButton } from './ui/ExportButton';
-import { ClockTime } from './ui/ClockTime';
 import { POLL } from './ui/DataProvider';
 import { IconAlert, IconDocument } from './ui/icons';
-import { formatNumber } from '../lib/format';
+import { formatDate, formatNumber } from '../lib/format';
 import type { CsvColumn } from '../lib/csv';
 
 interface Filing {
@@ -137,7 +136,10 @@ export default function FilingsStream() {
                   className="border-b border-line/60 hover:bg-overlay"
                 >
                   <td className="whitespace-nowrap px-3 py-2 font-mono text-ink-mute">
-                    <ClockTime value={f.filing_date} seconds={false} />
+                    {/* A filing date is a calendar day, sent as midnight UTC. As a
+                        clock time it read "20:00" on every row -- the evening
+                        before, in Eastern time. */}
+                    {formatDate(f.filing_date)}
                   </td>
                   <td className="px-3 py-2">
                     <span className="symbol text-accent">{f.ticker ?? '—'}</span>

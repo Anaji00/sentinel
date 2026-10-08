@@ -66,6 +66,9 @@ class EventType(str, Enum):
     EARNINGS_REPORT = "earnings_report"
     EARNINGS_SURPRISE = "earnings_surprise"
     MACRO_RELEASE = "macro_release"
+    # A trading signal from a family the reaction study has proven
+    # (services/agents/signal_engine.py), never from an unmeasured one.
+    TRADE_SIGNAL = "trade_signal"
     CUSTOM = "custom"
     CRYPTO_TRANSFER = "crypto_transfer"
     PREDICTION_MARKET = "prediction_market"
@@ -1049,7 +1052,7 @@ class NormalizedEvent(BaseModel):
             EventType.CRYPTO_TRADE, EventType.MARKET_CANDLE, EventType.MARKET_ANOMALY,           
             EventType.CRYPTO_LIQUIDATION, EventType.PREDICTION_MARKET_TRADE, EventType.CRYPTO_TRANSFER,
             EventType.CRYPTO_PERP_FUNDING, EventType.EARNINGS_REPORT, EventType.EARNINGS_SURPRISE,
-            EventType.MACRO_RELEASE,
+            EventType.MACRO_RELEASE, EventType.TRADE_SIGNAL,
         ]
     
     def to_summary(self) -> str:
@@ -1393,6 +1396,7 @@ def _build_domain_map() -> None:
         "OPTIONS_FLOW": Domain.TRADFI, "MARKET_ANOMALY": Domain.TRADFI,
         "MARKET_CANDLE": Domain.TRADFI, "PRICE_ANOMALY": Domain.TRADFI,
         "INSIDER_TRADE": Domain.TRADFI, "INSIDER_CLUSTER": Domain.TRADFI,
+        "TRADE_SIGNAL": Domain.TRADFI,
         "EARNINGS_REPORT": Domain.TRADFI, "EARNINGS_SURPRISE": Domain.TRADFI,
         "FILING": Domain.TRADFI, "THIRTEEN_F": Domain.TRADFI,
         "FUTURES_COT": Domain.TRADFI, "REGULATORY_EVENT": Domain.TRADFI,

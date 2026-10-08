@@ -65,7 +65,7 @@ def test_no_fabricated_price_default():
     old expression where it explains why it was removed.
     """
     code = _code()
-    assert not re.search(r"price\s*=.*or\s+100\.0", code)
+    assert not re.search(r"price\s*=.*\bor\s+100\.0", code)
 
 
 def test_no_fabricated_volume_default():

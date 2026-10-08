@@ -96,6 +96,30 @@ except (ImportError, ModuleNotFoundError):
     _cat_spec.loader.exec_module(catalysts)
 
 try:
+    import history
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _hist_spec = _ilu.spec_from_file_location(
+        "history", Path(__file__).resolve().parent / "history.py"
+    )
+    history = _ilu.module_from_spec(_hist_spec)
+    _sys.modules["history"] = history
+    _hist_spec.loader.exec_module(history)
+
+try:
+    import short_interest
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _si_spec = _ilu.spec_from_file_location(
+        "short_interest", Path(__file__).resolve().parent / "short_interest.py"
+    )
+    short_interest = _ilu.module_from_spec(_si_spec)
+    _sys.modules["short_interest"] = short_interest
+    _si_spec.loader.exec_module(short_interest)
+
+try:
     import ownership
 except (ImportError, ModuleNotFoundError):
     import importlib.util as _ilu
@@ -515,6 +539,34 @@ async def seed_prominent_13f_reports(session: aiohttp.ClientSession, producer: S
             logger.warning(f"Error fetching live 13F for {meta['name']}: {e}")
 
 
+async def _edgar_history_loop(session, redis_client) -> None:
+    """Rebuild 8-K history from EDGAR for tickers not yet done; daily."""
+    from shared.db import get_timescale
+    from shared.utils.signal_families import backfill_universe
+    from shared.utils.signal_store import EDGAR_8K_HISTORY_DONE_KEY
+    from shared.utils.watchlists import WATCHED_EQUITIES_KEY
+
+    await asyncio.sleep(300)
+    raw = getattr(redis_client, "raw", redis_client)
+    while True:
+        try:
+            db = await get_timescale()
+            tickers = set(backfill_universe())
+            tickers |= {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                        for m in (await raw.zrange(WATCHED_EQUITIES_KEY, 0, -1) or [])}
+            rows = await db.query("SELECT DISTINCT ticker FROM daily_bars")
+            tickers |= {str(r["ticker"]).upper() for r in rows or []}
+            cik_to_ticker = resolve_ticker_dynamically.__globals__.get("_DYNAMIC_CIK_TO_TICKER") or {}
+            mapping = history.universe_ciks(cik_to_ticker, tickers)
+            await history.backfill_8k_history(
+                session, SEC_HEADERS, db, redis_client, mapping, ITEM_DESCRIPTIONS, EDGAR_8K_HISTORY_DONE_KEY,
+            )
+            await history.backfill_profiles(session, SEC_HEADERS, db, mapping)
+        except Exception as e:
+            swallowed("collector_filings.edgar_history", e, logger)
+        await asyncio.sleep(86400)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL SEC EDGAR CORPORATE FILINGS & 13F COLLECTOR")
@@ -609,6 +661,13 @@ async def main():
                 contracts.run_forever(producer, redis_client, lambda name: resolve_ticker_dynamically(name)),
                 name="contracts",
             )
+
+            # Years of 8-K history into the permanent signal archive, once per
+            # company, for every name the platform holds prices for.
+            safe_create_task(_edgar_history_loop(session, redis_client), name="edgar-history")
+            # FINRA short interest, every settlement since 2020, for the
+            # cross-sectional model's days-to-cover feature.
+            safe_create_task(short_interest.run_forever(), name="short-interest")
 
             # Fetch live 13F filings from SEC EDGAR on startup
             await seed_prominent_13f_reports(session, producer, redis_client)

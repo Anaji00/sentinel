@@ -53,5 +53,3 @@ def test_the_enricher_tags_and_links_the_operator():
     assert 'f"exposes:{operator}"' in av and '"operator_ticker": operator' in av
     gw = (ROOT / "services" / "enrichment" / "graph_writer.py").read_text(encoding="utf-8")
     assert 'icao24, "OPERATED_BY", operator' in gw
-    gap = (ROOT / "services" / "enrichment" / "aviation_gap_detector.py").read_text(encoding="utf-8")
-    assert 'f"exposes:{operator_ticker(callsign)}"' in gap

@@ -14,6 +14,7 @@ from shared.utils.agent_conclusions import (
 from shared.utils.filings_keys import PROMINENT_CIKS_KEY
 from fastapi import APIRouter, Depends, HTTPException, Query
 from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
+from shared.utils.agent_conclusions import PREDICTIONS_KEY_PATTERN
 from shared.utils.heartbeat import get_all_heartbeats_status
 from shared.utils.quiet_failures import swallowed
 
@@ -193,7 +194,7 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
 
     open_predictions = 0
     try:
-        open_predictions = len(await _scan("sentinel:predictions:*", 500))
+        open_predictions = len(await _scan(PREDICTIONS_KEY_PATTERN, 500))
     except Exception as _exc:
         swallowed("api_gateway.routes.agents.get_swarm_intelligence", _exc, logger)
 

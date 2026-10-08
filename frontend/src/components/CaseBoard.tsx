@@ -315,7 +315,7 @@ function CaseDetail({ c }: { c: InvestigationCase }) {
 
       {c.notes.length > 0 && (
         <ul className="space-y-1.5">
-          {c.notes.map((n) => (
+          {(c.notes ?? []).map((n) => (
             <li key={n.note_id} className="rounded border border-line bg-page px-2.5 py-1.5">
               <div className="flex items-baseline justify-between gap-2 text-micro text-ink-mute">
                 <span>{n.author}</span>
@@ -474,7 +474,7 @@ export default function CaseBoard() {
                           {c.notes.length} {c.notes.length === 1 ? 'note' : 'notes'}
                         </span>
                       )}
-                      {c.tags.map((t) => (
+                      {(c.tags ?? []).map((t) => (
                         <span key={t} className="text-micro text-ink-mute">
                           #{t}
                         </span>

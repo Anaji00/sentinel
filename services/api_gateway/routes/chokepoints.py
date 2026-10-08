@@ -28,12 +28,12 @@ at, so an empty Hormuz reads as "not observed by AIS" rather than "no traffic".
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 
 from services.api_gateway.dependencies import get_db, get_redis_client
-from shared.utils.chokepoints import grid_key
+from shared.utils.chokepoints import SAR_AIS_CHECK_AREAS, SAR_TERMINALS, grid_key
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("api.chokepoints")
@@ -63,9 +63,15 @@ WATCHED: List[str] = [
 FRESH_WINDOW_HOURS = 24
 
 
-def _age_seconds(ts: Optional[datetime]) -> Optional[float]:
+def _age_seconds(ts: Optional[Union[datetime, str]]) -> Optional[float]:
     if ts is None:
         return None
+    # The pooled client hands timestamps back as ISO strings on some paths.
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - ts).total_seconds()
@@ -175,6 +181,25 @@ async def get_chokepoint_status(
         entry["observed"] = entry["ais"] is not None or entry["sar"] is not None
         results.append(entry)
 
+    # Radar over the oil terminals and STS anchorages, and over the areas where
+    # it is checked against AIS. These are places rather than regions, so they
+    # carry a grid and no AIS/SAR event join. A cell marked `no_ais` returned
+    # like a hull where AIS saw none over the same days.
+    radar_areas = []
+    for name, bbox in {**SAR_TERMINALS, **SAR_AIS_CHECK_AREAS}.items():
+        grid = await _radar_grid(redis_client, name)
+        if not grid:
+            continue
+        cells = grid.get("cells") or []
+        radar_areas.append({
+            "name": name,
+            "bbox": bbox,
+            "ais_checked": name in SAR_AIS_CHECK_AREAS,
+            "observed_on": grid.get("observed_on"),
+            "cells_imaged": len(cells),
+            "cells": [c for c in cells if (c.get("target_pixels") or 0) > 0],
+        })
+
     silent = [r["region"] for r in results if r["ais_silent"]]
     unobserved = [r["region"] for r in results if not r["observed"]]
 
@@ -185,4 +210,5 @@ async def get_chokepoint_status(
         # point of this endpoint is that the two are not the same list.
         "ais_silent": silent,
         "unobserved_by_any_instrument": unobserved,
+        "radar_areas": radar_areas,
     }

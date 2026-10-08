@@ -47,6 +47,15 @@ from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
+
+try:
+    from conflict import run_conflict_monitor
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    _cf_spec = _ilu.spec_from_file_location("conflict", Path(__file__).resolve().parent / "conflict.py")
+    _cf_mod = _ilu.module_from_spec(_cf_spec)
+    _cf_spec.loader.exec_module(_cf_mod)
+    run_conflict_monitor = _cf_mod.run_conflict_monitor
  
 POLL_INTERVAL      = 120   # seconds between full feed cycles
 DEDUP_WINDOW_DAYS  = 30    # URLs older than this are forgotten and re-ingestible
@@ -351,12 +360,16 @@ async def main():
     metrics = _collector_metrics("collector-news")
     await metrics.start(redis_client)
     hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-news"))
+    # Per-zone headlines, news volume and navigational warnings for the
+    # conflict-zone monitor; see conflict.py.
+    conflict_task = safe_create_task(run_conflict_monitor(redis_client), name="conflict-monitor")
 
     try:
         await collect(producer, redis_client)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        conflict_task.cancel()
         hb_task.cancel()
         await producer.close()
         

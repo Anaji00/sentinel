@@ -22,6 +22,7 @@ from shared.models import (
 from shared.utils import quant_calc
 from shared.utils.equities import asset_class, is_valid_primary_equity
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
+from shared.utils.market_session import instrument_closed_at
 from shared.utils.form4 import code_value_usd as form4_code_value_usd, dominant_code as form4_dominant_code
 from shared.utils.price_moves import (
     MOVE_KEY_TTL_SEC, band_crossed, band_key, day_move_pct, is_futures_move_subject, move_score,
@@ -538,7 +539,7 @@ async def _read_day_move(redis_client, ticker: str) -> dict:
 # raw_payload["normalized_event"]: they measured it against its own history
 # (a release against its prior, a short ratio against its 20-day norm) and
 # enrichment stores and publishes it unchanged.
-PASSTHROUGH_SOURCES = frozenset({"fred", "finnhub_calendar", "finra_short_volume", "openfda", "sec_13d", "usaspending"})
+PASSTHROUGH_SOURCES = frozenset({"fred", "finnhub_calendar", "finra_short_volume", "openfda", "sec_13d", "usaspending", "gfw", "signal_engine", "insider_cluster", "ownership_changes"})
 
 
 class TradFiEnricher:
@@ -1356,8 +1357,13 @@ class TradFiEnricher:
         # column, so a fabricated zero propagates.
         volume_db = None if p.get("volume") is None else volume
 
-        # Unconditionally persist closed bar to durable TimescaleDB tradfi_bars hypertable (§2.1, §2.4)
         ts = raw.occurred_at or datetime.now(timezone.utc)
+        # A price stamped while this instrument's market is shut is a replayed
+        # print or a stale quote, not a bar. Not stored, and not judged as a move.
+        if instrument_closed_at(ticker, ts):
+            return None
+
+        # Persist closed bar to durable TimescaleDB tradfi_bars hypertable (§2.1, §2.4)
         session_tag = p.get("session", "REGULAR")
         try:
             db_conn = self.db

@@ -249,3 +249,84 @@ def holders_line(ticker: str, holders: Dict[str, Dict[str, object]], n: int = 3)
     top = ", ".join(f"{names[f]} {p:.1f}%" for f, p in top_holders(pcts, n))
     b3 = big_three_share(pcts)
     return f"{ticker}: {top}" + (f" (BlackRock+Vanguard+State Street {b3:.1f}%)" if b3 else "")
+
+
+# -- quarter-on-quarter changes ----------------------------------------------
+#
+# Which tracked institutions opened, exited, added to or cut a position between
+# two 13F periods, and where several moved the same way. A single manager
+# trimming 3% is rebalancing; three managers each adding 10% or more in one
+# quarter is a flow worth naming.
+
+CHANGES_KEY = "sentinel:ownership:changes:{period}"
+CHANGE_THRESHOLD = 0.10      # a 10% change in shares held, or a new / exited line
+MIN_FILERS_AGREEING = 3
+# Buyers must outnumber sellers at least this many times over for a flow.
+MIN_AGREEMENT_RATIO = 2.0
+
+# Whose changes count toward a flow: active, fundamental managers, whose
+# position changes are decisions. Index managers (including Invesco, whose book
+# is dominated by QQQ) follow index flows; dealer and quant books (Citadel, the
+# bank broker-dealers, Renaissance) and Bridgewater's systematic equity book
+# churn with hedging and rebalancing. Measured on the June 2026 quarter:
+# counting everyone flagged 442 of 550 changed tickers; these six, with the
+# 25% floor below, flag 28 of 388.
+FLOW_FILERS = frozenset({
+    "FMR LLC", "T. Rowe Price Associates", "Capital International Investors",
+    "Wellington Management Group", "Berkshire Hathaway Inc",
+    "Pershing Square Capital Management",
+})
+# An add or cut must be at least this large to count toward a flow; new and
+# exited positions always count.
+FLOW_MIN_CHANGE = 0.25
+
+
+def holding_changes(previous, current):
+    """Per-ticker change for one filer between two periods.
+
+    `previous` and `current` are lists of {"ticker", "shares"}; returns
+    {ticker: {"kind": "new"|"exit"|"add"|"cut", "change": fraction or None}},
+    leaving out changes smaller than CHANGE_THRESHOLD.
+    """
+    prev = {str(h["ticker"]): float(h.get("shares") or 0) for h in previous or []}
+    curr = {str(h["ticker"]): float(h.get("shares") or 0) for h in current or []}
+    out = {}
+    for t in set(prev) | set(curr):
+        p, c = prev.get(t, 0.0), curr.get(t, 0.0)
+        if p <= 0 and c > 0:
+            out[t] = {"kind": "new", "change": None}
+        elif p > 0 and c <= 0:
+            out[t] = {"kind": "exit", "change": None}
+        elif p > 0:
+            ch = (c - p) / p
+            if ch >= CHANGE_THRESHOLD:
+                out[t] = {"kind": "add", "change": round(ch, 4)}
+            elif ch <= -CHANGE_THRESHOLD:
+                out[t] = {"kind": "cut", "change": round(ch, 4)}
+    return out
+
+
+def aggregate_changes(per_filer, filers=FLOW_FILERS):
+    """Across filers: {ticker: {"buyers": [...], "sellers": [...], "flow": +1|-1|0}}.
+
+    `per_filer` maps a filer name to its `holding_changes`; only names in
+    `filers` count (None counts all). `flow` is +1 (accumulation) or -1
+    (distribution) only when at least MIN_FILERS_AGREEING filers moved that way
+    and they outnumber the other side at least MIN_AGREEMENT_RATIO times over.
+    """
+    out = {}
+    for filer, changes in per_filer.items():
+        if filers is not None and filer not in filers:
+            continue
+        for t, ch in changes.items():
+            if ch["kind"] in ("add", "cut") and abs(ch.get("change") or 0.0) < FLOW_MIN_CHANGE:
+                continue
+            row = out.setdefault(t, {"buyers": [], "sellers": [], "flow": 0})
+            (row["buyers"] if ch["kind"] in ("new", "add") else row["sellers"]).append(filer)
+    for row in out.values():
+        b, s = len(row["buyers"]), len(row["sellers"])
+        if b >= MIN_FILERS_AGREEING and b >= MIN_AGREEMENT_RATIO * s:
+            row["flow"] = 1
+        elif s >= MIN_FILERS_AGREEING and s >= MIN_AGREEMENT_RATIO * b:
+            row["flow"] = -1
+    return out

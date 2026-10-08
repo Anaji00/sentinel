@@ -35,6 +35,9 @@ interface Command {
 const PAGES: Command[] = [
   { id: 'p:/', label: 'Command Center', kind: 'page', href: '/' },
   { id: 'p:/map', label: 'Global Map', kind: 'page', href: '/map' },
+  { id: 'p:/signals', label: 'Trading Signals', kind: 'page', href: '/signals' },
+  { id: 'p:/predictions', label: 'Stock Predictions', kind: 'page', href: '/predictions' },
+  { id: 'p:/ticker', label: 'Ticker Inspector', kind: 'page', href: '/ticker' },
   { id: 'p:/charts', label: 'Market Charts', kind: 'page', href: '/charts' },
   { id: 'p:/options', label: 'Options Flow', kind: 'page', href: '/options' },
   { id: 'p:/flow', label: 'Dark Pool & Sweeps', kind: 'page', href: '/flow' },

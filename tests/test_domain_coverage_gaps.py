@@ -43,8 +43,12 @@ class MockRedis:
     async def get(self, key):
         return self.store.get(key)
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=False):
+        # nx: set only when absent, as Redis does; True when it was set.
+        if nx and key in self.store:
+            return None
         self.store[key] = value
+        return True
 
     async def delete(self, key):
         self.store.pop(key, None)

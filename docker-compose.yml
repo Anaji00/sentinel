@@ -95,7 +95,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 384M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 75 MiB in use.
+          memory: 320M
     healthcheck:
       test: echo ruok | nc localhost 2181 | grep imok
       interval: 10s
@@ -174,7 +176,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 190 MiB in use.
+          memory: 384M
 
   timescaledb:
     build:
@@ -354,7 +358,8 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 256M
+          # Trimmed 7 Oct 2026: a one-shot migration client; the work runs in the server.
+          memory: 128M
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -955,7 +960,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 384M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 127 MiB in use.
+          memory: 256M
     depends_on:
       kafka:
         condition: service_healthy
@@ -984,7 +991,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 384M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 126 MiB in use.
+          memory: 256M
     depends_on:
       kafka:
         condition: service_healthy
@@ -1049,7 +1058,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 384M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 131 MiB in use.
+          memory: 256M
     depends_on:
       kafka:
         condition: service_healthy
@@ -1163,12 +1174,13 @@ services:
       # none at all.
       - SENTINEL_SERVICE=agents-fast
       - AGENT_TIER_FILTER=fast
-      - AGENT_MODEL=qwen3:0.6b
+      - AGENT_MODEL=qwen2.5:3b
       # Was gemma3:1b: a different model, so falling back to it evicted the
       # resident one and paid an 89 s reload on the next request that wanted
       # it back. Both tiers name the same model for the same reason the
       # ollama service runs one slot.
-      - OLLAMA_FALLBACK_MODEL=qwen3:0.6b
+      - OLLAMA_FALLBACK_MODEL=qwen2.5:3b
+      - OLLAMA_ALLOWED_MODELS=qwen2.5:3b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
@@ -1222,10 +1234,19 @@ services:
       # the CPU quota, and both tiers then timed out at 600s having produced
       # nothing. A 1.5b that answers is worth more than a 3b that does not.
       #
+      # qwen2.5:3b, from qwen3:0.6b, on 8 October, for every tier and the
+      # reasoning service alike (one model resident). What changed is demand:
+      # trade plans are computed, the quant engine records a call only on
+      # evidence, and reasoning writes scenarios only from INTELLIGENCE up, so
+      # the model went from ~26 completions an hour to well under that. Measured
+      # on a stock-correlation prompt, idle: 0.6b 11s and a one-word rationale
+      # ("short-term"); 3b 66s at 13 tok/s with a causal mechanism, schema valid.
+      #
       # Revisit if this deployment gets a GPU or a larger CPU allocation, where
       # the two runners would no longer contend.
-      - AGENT_MODEL=qwen3:0.6b
-      - OLLAMA_FALLBACK_MODEL=qwen3:0.6b
+      - AGENT_MODEL=qwen2.5:3b
+      - OLLAMA_FALLBACK_MODEL=qwen2.5:3b
+      - OLLAMA_ALLOWED_MODELS=qwen2.5:3b
       - OLLAMA_TIMEOUT=600.0
       - OLLAMA_KEEP_ALIVE=-1
       - PYTHONWARNINGS=ignore::UserWarning
@@ -1240,8 +1261,11 @@ services:
           # No in-process model weights: agents call ollama over HTTP.
           # Measured 705MiB running alongside collectors. Agents hold no
           # model weights -- those live in ollama -- so this is a Kafka
-          # consumer footprint. 1.25G retains ~1.8x headroom.
-          memory: 1.25G
+          # consumer footprint. 1.25G retained ~1.8x headroom.
+          #
+          # 1G since the factor model moved to its own service (factor-model):
+          # measured 480MiB on 7 October without it, so ~2x headroom remains.
+          memory: 1G
     depends_on:
       kafka:
         condition: service_healthy
@@ -1252,6 +1276,39 @@ services:
       neo4j:
         condition: service_healthy
       ollama:
+        condition: service_healthy
+
+  # The nightly cross-sectional ranking model (services/agents/factor_engine.py).
+  # Its own container because the walk-forward holds a five-year panel and its
+  # feature matrices: run inside agents-heavy it crossed that container's 1.25G
+  # limit and the kernel killed every agent with it, twenty minutes after each
+  # start. Idle between nightly runs at 22:00 UTC.
+  factor-model:
+    profiles: ["agents"]
+    build:
+      context: .
+      dockerfile: ml.Dockerfile
+    image: sentinel-agents-heavy
+    container_name: sentinel-factor-model
+    command: python -m services.agents.factor_engine
+    env_file: .env
+    environment:
+      - SENTINEL_SERVICE=factor-model
+      - OMP_NUM_THREADS=2
+    volumes:
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          # Measured peak 1.29GiB on 1,943 names x 1,259 days with every feature.
+          memory: 1.75G
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   # The consumer agents.alerts never had.
@@ -1374,7 +1431,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 320M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 119 MiB in use.
+          memory: 192M
     depends_on:
       kafka:
         condition: service_healthy
@@ -1404,7 +1463,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 320M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 112 MiB in use.
+          memory: 192M
     depends_on:
       kafka:
         condition: service_healthy
@@ -1443,7 +1504,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 37 MiB in use.
+          memory: 192M
     depends_on:
       api-gateway:
         condition: service_healthy
@@ -1469,7 +1532,9 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
+          # factor-model; measured 137 MiB in use.
+          memory: 256M
     depends_on:
       - prometheus
 

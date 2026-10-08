@@ -18,13 +18,15 @@ interface FlowItem {
   price: number;
   size_shares: number;
   occ_symbol?: string;
+  /** Option sweeps only: "$400 C 2026-11-20". */
+  contract?: string;
   occurred_at: string;
 }
 
 export default function DarkPoolFlowPanel() {
   const [filterType, setFilterType] = useState<string>('ALL');
 
-  const { data } = useSWR<FlowItem[]>('/api/v1/events/tradfi?limit=25', fetcher, {
+  const { data } = useSWR<FlowItem[]>('/api/v1/events/tradfi?limit=40&types=equity_block,options_flow', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -45,25 +47,40 @@ export default function DarkPoolFlowPanel() {
   // that type has ever been produced -- the enum declares it, the scorer
   // handles it, and nothing emits it -- so the filter could only ever have
   // matched the fabricated rows above it.
+  // The same print can arrive twice (two feeds, one trade); show it once.
+  const seen = new Set<string>();
   const flows: FlowItem[] = (Array.isArray(data) ? data : []).map((e: any) => {
     const fd = e.financial_data || {};
-    const notional = Number(fd.notional_usd ?? fd.premium_usd ?? 0) || 0;
+    const isOption = e.type === 'options_flow';
+    // For an option, notional_usd is exposure (strike x 100 x contracts) -- a
+    // $120K sweep read as $10M. The premium is the money that changed hands.
+    const notional = Number(isOption ? (fd.premium_usd ?? 0) : (fd.notional_usd ?? fd.premium_usd ?? 0)) || 0;
+    const strike = Number(fd.strike);
+    const right = String(fd.option_type || '').toUpperCase().startsWith('P') ? 'P' : 'C';
     const price = Number(fd.close_price ?? fd.price ?? 0) || 0;
     const volume = Number(fd.volume ?? 0) || 0;
     return {
       id: e.event_id,
       ticker: fd.ticker || e.primary_entity_name || e.primary_entity_id || '—',
       type: e.type === 'options_flow' ? 'SWEEP' : 'BLOCK',
-      side: String(fd.side || fd.direction || 'NEUTRAL').toUpperCase(),
+      // No feed here reports the aggressor, so an unknown side says so.
+      side: String(fd.side || fd.direction || '—').toUpperCase(),
       notional_usd: notional,
       price,
       size_shares: volume,
       occ_symbol: fd.occ_symbol || undefined,
+      contract:
+        isOption && Number.isFinite(strike) && strike > 0
+          ? `$${strike} ${right}${fd.expiry ? ` ${fd.expiry}` : ''}`
+          : undefined,
       occurred_at: e.occurred_at,
     };
   });
 
   const filteredFlows = flows.filter((f) => {
+    const key = `${f.ticker}|${f.occurred_at}|${f.size_shares}|${f.notional_usd}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
     if (filterType !== 'ALL' && f.type !== filterType) return false;
     return true;
   });
@@ -84,7 +101,7 @@ export default function DarkPoolFlowPanel() {
               </span>
             </h2>
             <p className="text-micro text-ink-dim">
-              Large single prints and option sweeps above $500K
+              Prints large for their instrument (at least $200K and well above its usual size) and option sweeps
             </p>
           </div>
         </div>
@@ -118,7 +135,7 @@ export default function DarkPoolFlowPanel() {
               <th className="pb-2">TICKER</th>
               <th className="pb-2">TYPE</th>
               <th className="pb-2">SIDE</th>
-              <th className="pb-2">NOTIONAL ($)</th>
+              <th className="pb-2" title="Shares x price for blocks; premium paid for option sweeps">$ TRADED</th>
               <th className="pb-2">PRICE</th>
               <th className="pb-2">OCC CONTRACT / DETAILS</th>
               <th className="pb-2 text-right">TIME</th>
@@ -144,19 +161,25 @@ export default function DarkPoolFlowPanel() {
                     className={`px-2 py-0.5 rounded text-micro font-black ${
                       item.side === 'BUY'
                         ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
-                        : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
+                        : item.side === 'SELL'
+                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
+                          : 'border border-line text-ink-mute'
                     }`}
                   >
                     {item.side}
                   </span>
                 </td>
                 <td className="font-extrabold text-ink">
-                  ${(item.notional_usd / 1e6).toFixed(2)}M
+                  {item.notional_usd >= 1e6
+                    ? `$${(item.notional_usd / 1e6).toFixed(2)}M`
+                    : `$${Math.round(item.notional_usd / 1e3)}K`}
                 </td>
                 <td className="text-ink-dim">${item.price.toFixed(2)}</td>
                 <td className="text-micro text-cyan-300/90 font-mono">
-                  {item.occ_symbol ||
-                    `${formatNumber(item.size_shares, { decimals: 0 })} shares block`}
+                  {item.type === 'SWEEP'
+                    ? `${formatNumber(item.size_shares, { decimals: 0 })} contracts${item.contract ? ` · ${item.contract}` : ''}`
+                    : item.occ_symbol ||
+                      `${formatNumber(item.size_shares, { decimals: 0 })} shares block`}
                 </td>
                 <td className="text-right text-micro text-ink-dim">
                   <ClockTime value={item.occurred_at} />

@@ -78,11 +78,15 @@ def test_tips_is_validated_as_a_yield_not_swapped_for_a_constant():
     assert "-5.0 < tips_yield < 15.0" in code
 
 
-def test_an_unmeasured_field_says_so_in_the_prompt():
-    """The model cannot discount a number it is told is a measurement."""
-    code = _code()
-    assert '"not measured"' in code
-    assert "tips_str" in code and "breakeven_str" in code
+def test_an_unmeasured_field_says_so_in_the_brief():
+    """No prompt any more: the brief is computed. An input that was not
+    measured must not be presented as one -- credit with no prior reading is
+    Unclassified, and a missing breakeven is left out of the summary."""
+    from shared.utils.deterministic_briefs import rates_brief_fields
+
+    f = rates_brief_fields(47.0, [], None, None, 0.7, None)
+    assert f["credit_spread_widening_signal"] == "Unclassified"
+    assert "breakeven" not in f["regime_summary"]
 
 
 def test_the_credit_ratio_needs_both_legs():

@@ -24,25 +24,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 SOURCE = (ROOT / "services/agents/macro_intelligence_engine.py").read_text(encoding="utf-8")
-PROMPT = SOURCE[SOURCE.index("Analyze Treasury yield curve"):]
-PROMPT = PROMPT[:PROMPT.index('"""')]
 
 
-def test_the_prompt_formats_no_optional_value_directly():
-    """y2, y10 and the spread are guaranteed by the early return. Everything
-    else in this prompt is optional and must arrive pre-rendered."""
-    formatted = set(re.findall(r"\{([a-z_0-9]+):", PROMPT))
-    assert formatted <= {"y2", "y10", "spread_2y10y_bps"}, formatted
+def test_the_brief_is_built_without_any_optional_input():
+    """The brief is now computed (shared.utils.deterministic_briefs), not
+    prompted. Missing TIPS, breakeven or credit must still degrade rather than
+    raise, and say they were not measured."""
+    from shared.utils.deterministic_briefs import rates_brief_fields
 
-
-def test_every_optional_input_says_when_it_is_missing():
-    for name in ("tips_str", "breakeven_str", "credit_str"):
-        assert "{" + name + "}" in PROMPT, name
-        definition = next(
-            line for line in SOURCE.splitlines() if line.strip().startswith(f"{name} =")
-        ) if f"{name} =" in SOURCE else ""
-        block = SOURCE[SOURCE.index(f"{name} ="):SOURCE.index(f"{name} =") + 400]
-        assert "not measured" in block, f"{name} does not report its own absence"
+    f = rates_brief_fields(47.0, [], None, None, None, None)
+    assert f["credit_spread_widening_signal"] == "Unclassified"
+    assert "breakeven" not in f["regime_summary"]
+    assert "rates_brief_fields(" in SOURCE, "the engine no longer builds the brief from measurements"
 
 
 def test_a_missing_credit_ratio_renders_rather_than_raises():

@@ -11,6 +11,12 @@ import { formatNumber } from '../lib/format';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
 
+// Scores arrive null on some rows; a null here crashed the whole view.
+function fixed(value: number | null | undefined, digits: number): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+
 // The server sends `z_score`, computed as the inverse of the curve the
 // enricher used to build `anomaly_score`: `-5 * ln(1 - score)`.
 //
@@ -329,7 +335,7 @@ export default function QuantRadarPanel() {
               <div>
                 <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
                 <span className="text-amber-400 font-bold">
-                  {selectedAnomaly.anomaly_score.toFixed(3)}
+                  {fixed(selectedAnomaly.anomaly_score, 3)}
                 </span>
               </div>
               <div>

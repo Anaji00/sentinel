@@ -124,6 +124,12 @@ def test_discover_pairwise_correlations_emits_governed_proposals():
             return []
 
         engine.fetch_price_series = mock_fetch_price
+
+        # Pairs are read aligned on shared buckets now, not paired by position.
+        async def mock_aligned(a, b, limit=120):
+            return await mock_fetch_price(a), await mock_fetch_price(b)
+
+        engine.fetch_aligned_pair = mock_aligned
         engine.build_candidate_pairs = AsyncMock(return_value=[("NVDA", "TSM")])
 
         discoveries = await engine.discover_pairwise_correlations()

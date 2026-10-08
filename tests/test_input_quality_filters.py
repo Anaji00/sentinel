@@ -32,10 +32,6 @@ from services.enrichment.anomaly_scorer import lift_score  # noqa: E402
 from services.enrichment.enrichers.crypto import (  # noqa: E402
     _ALERT_FLOOR_USD, _NOTIONAL_FLOOR_USD, _SUSPECT_LIFT_WEIGHT, _notional_score,
 )
-from services.enrichment.aviation_gap_detector import (  # noqa: E402
-    _MIN_GAP_SAMPLES, _NOTABLE_PERCENTILE, _SCORE_CEILING, _SCORE_FLOOR,
-    _percentile_rank,
-)
 
 
 def _suspect_score(notional: float) -> float:
@@ -86,40 +82,3 @@ def test_dust_contributes_no_size_signal():
 
 def test_a_transfer_above_the_floor_does_carry_signal():
     assert _notional_score(_ALERT_FLOOR_USD * 10) > 0.0
-
-
-# -- aviation: the null model --------------------------------------------------
-
-def test_a_gap_at_its_regions_median_is_not_notable():
-    """The whole point. Four hours of silence over the ocean is what the ocean
-    does, and an absolute cutoff called it maximal 8,064 times."""
-    oceanic = [3.0 + (i % 40) * 0.1 for i in range(200)]
-    assert _percentile_rank(oceanic, 4.0) < _NOTABLE_PERCENTILE
-
-
-def test_a_gap_in_the_tail_of_its_region_is_notable():
-    oceanic = [3.0 + (i % 40) * 0.1 for i in range(200)]
-    assert _percentile_rank(oceanic, 12.0) >= _NOTABLE_PERCENTILE
-
-
-def test_the_same_gap_means_different_things_in_different_regions():
-    """A four-hour silence is unremarkable oceanic traffic and extraordinary
-    over a monitored strait. One number cannot express both."""
-    oceanic = [3.0 + (i % 40) * 0.1 for i in range(200)]
-    monitored = [0.05 + (i % 20) * 0.01 for i in range(200)]
-    assert _percentile_rank(oceanic, 4.0) < _NOTABLE_PERCENTILE
-    assert _percentile_rank(monitored, 4.0) >= _NOTABLE_PERCENTILE
-
-
-def test_an_empty_distribution_ranks_nothing():
-    assert _percentile_rank([], 9.0) == 0.0
-
-
-def test_the_score_band_leaves_the_ceiling_reachable_by_something_else():
-    """An aircraft losing ADS-B is a prompt to look, not a certainty, and 1.00
-    should mean more than 'it is over water'."""
-    assert 0.0 < _SCORE_FLOOR < _SCORE_CEILING < 1.0
-
-
-def test_the_sample_bar_is_high_enough_to_mean_something():
-    assert _MIN_GAP_SAMPLES >= 30

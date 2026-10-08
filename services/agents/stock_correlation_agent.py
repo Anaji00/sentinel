@@ -242,8 +242,8 @@ class StockCorrelationAgent(SentinelAgent):
         producer=None,
         consumer=None,
         dlq=None,
-        model: str = "qwen3:0.6b",
-        fallback_model: Optional[str] = "qwen3:0.6b",
+        model: str = "qwen2.5:3b",
+        fallback_model: Optional[str] = "qwen2.5:3b",
     ):
         super().__init__(
             agent_name=agent_name,
@@ -463,6 +463,19 @@ class StockCorrelationAgent(SentinelAgent):
                 except Exception as ne:
                     logger.debug(f"Neo4j empirical correlation lookup bypass: {ne}")
 
+            # No measured relationship, no inference. The prompt for this case
+            # told the model to say that no correlation was measured, and every
+            # sympathy edge it then proposed was withheld below as a hypothesis
+            # -- a whole slot, on a host that affords about twenty-five an hour,
+            # spent restating the absence of data.
+            if not empirical_links:
+                dropped(
+                    "agents.stock_correlation_agent.unmeasured_pair",
+                    "no measured relationship for the pair, so no inference",
+                    logger,
+                    variant="unmeasured_pair",
+                )
+                return None
             _nl = chr(10)
             # Says what is there, including when nothing is. The empty case
             # read "Live continuous correlation matrix active" -- asserting
