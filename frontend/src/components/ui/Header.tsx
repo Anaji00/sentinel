@@ -18,7 +18,7 @@
  * is interactive.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useSyncExternalStore } from 'react';
 import useSWR from 'swr';
 import { Command, Menu } from 'lucide-react';
 import Link from 'next/link';
@@ -42,6 +42,9 @@ function initialsFor(email?: string | null): string {
   return local.slice(0, 2).toUpperCase() || '··';
 }
 
+/** The platform never changes under a page, so there is nothing to subscribe to. */
+const noSubscription = () => () => {};
+
 export const Header: React.FC = () => {
   const { drawerOpen, toggleDrawer } = useNav();
   const pathname = usePathname();
@@ -52,7 +55,11 @@ export const Header: React.FC = () => {
   const { zone: timezone, setZone: setTimezone } = useTimeZone();
   const [latency, setLatency] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
-  const [isMac, setIsMac] = useState<boolean>(false);
+  const isMac = useSyncExternalStore(
+    noSubscription,
+    () => /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent),
+    () => false,
+  );
 
   const isConnected = useTelemetryStore((state) => state.isConnected);
   // Distinct from "connecting": the feed was refused for lack of a session.
@@ -69,10 +76,6 @@ export const Header: React.FC = () => {
     fetcher,
     { refreshInterval: POLL.standard },
   );
-
-  useEffect(() => {
-    setIsMac(/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent));
-  }, []);
 
   useEffect(() => {
     const updateClock = () => {
@@ -176,16 +179,23 @@ export const Header: React.FC = () => {
             Sentinel
           </span>
           <p className="text-micro text-ink-mute leading-tight truncate hidden sm:block">
-            Multi-domain intelligence
+            Markets &amp; civic watch
           </p>
         </div>
       </div>
 
       {/* Measured state */}
       <div className="hidden lg:flex items-center gap-4 text-micro min-w-0">
-        <span className="flex items-center gap-1.5 whitespace-nowrap">
+        <span
+          className="flex items-center gap-1.5 whitespace-nowrap"
+          title={
+            streamIdle && !isConnected
+              ? 'This page does not stream live events, so the connection rests. It switches on by itself on pages that do: Home, News & intel, the world map and the charts.'
+              : 'Events arriving as they happen'
+          }
+        >
           <span className={`h-1.5 w-1.5 rounded-full ${streamDot}`} />
-          <span className="text-ink-mute">Stream</span>
+          <span className="text-ink-mute">Live updates</span>
           {authRequired ? (
             <Link
               href={signInHref}
@@ -194,14 +204,14 @@ export const Header: React.FC = () => {
               sign in
             </Link>
           ) : (
-            <span className={streamTone}>{isConnected ? 'live' : streamIdle ? 'idle' : 'connecting'}</span>
+            <span className={streamTone}>{isConnected ? 'on' : streamIdle ? 'resting' : 'connecting…'}</span>
           )}
         </span>
 
         <span className="text-ink-mute">·</span>
 
         <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-ink-mute">Agents</span>
+          <span className="text-ink-mute">AI analysts</span>
           <span className="text-ink-dim tabular">
             {typeof agentCount === 'number' ? agentCount : '—'}
           </span>
@@ -210,9 +220,9 @@ export const Header: React.FC = () => {
         <span className="text-ink-mute">·</span>
 
         <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-ink-mute">Gateway</span>
+          <span className="text-ink-mute">Response</span>
           <span className={latency === null ? 'tone-negative' : 'text-ink-dim tabular'}>
-            {latency === null ? 'unreachable' : `${latency}ms`}
+            {latency === null ? 'unreachable' : `${latency} ms`}
           </span>
         </span>
       </div>

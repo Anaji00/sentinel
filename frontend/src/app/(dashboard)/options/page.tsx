@@ -1,25 +1,50 @@
 import React from 'react';
+import DarkPoolFlowPanel from '@/components/DarkPoolFlowPanel';
 import { EquitiesFlowIsland, QuantRadarIsland } from './islands';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { pickView, ViewTabs, type View } from '@/components/ui/ViewTabs';
 
-/** Server Component. Only the two visualizers hydrate on the client. */
-export default function OptionsPage() {
+/**
+ * Options activity and big-money flow, one page: both answer "where is large,
+ * unusual money going?", and sweeps appeared on each. It opens on the prints,
+ * which always have data; the radar can rightly be empty for hours.
+ */
+const VIEWS: View[] = [
+  { key: 'flow', label: 'Big-money trades', hint: 'Block trades of $200k or more and multi-exchange options sweeps' },
+  { key: 'radar', label: 'Unusual volume radar', hint: 'Over 11,000 stocks swept for unusual volume and options orders' },
+  { key: 'indices', label: 'Index flow', hint: 'How the S&P 500 and Nasdaq 100 are moving today' },
+];
+
+export default async function OptionsPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const view = pickView(VIEWS, (await searchParams).view);
   return (
-    <div className="flex h-full w-full flex-col p-4 gap-4 overflow-y-auto">
-      <div className="flex items-center justify-between mb-1">
-        <h1 className="text-lg font-semibold text-ink">Options flow</h1>
-      </div>
-
-      <div className="grid grid-cols-12 gap-4">
-        <div className="col-span-12">
-          <EquitiesFlowIsland />
+    <div className="flex h-full w-full flex-col p-2 gap-4 overflow-y-auto">
+      <PageHeader
+        title="Options & big-money flow"
+        description="Unusually large trades as they print, a radar sweeping over 11,000 stocks for unusual volume and options orders, and how the major indices are moving."
+        related={[
+          { href: '/board', label: 'Signal board' },
+          { href: '/filings', label: 'Fund holdings' },
+          { href: '/ticker', label: 'Look up a stock' },
+        ]}
+      >
+        <ViewTabs base="/options" views={VIEWS} active={view.key} />
+      </PageHeader>
+      {view.key === 'flow' && (
+        <div className="h-[75vh] min-h-[520px]">
+          <DarkPoolFlowPanel />
         </div>
-      </div>
-
-      <div className="grid grid-cols-12 gap-4 flex-1 min-h-0">
-        <div className="col-span-12 flex flex-col bg-[#0f1115] rounded-xl border border-line overflow-hidden relative min-h-[450px]">
+      )}
+      {view.key === 'radar' && (
+        <div className="flex flex-col rounded-2xl border border-line bg-raised overflow-hidden min-h-[450px]">
           <QuantRadarIsland />
         </div>
-      </div>
+      )}
+      {view.key === 'indices' && <EquitiesFlowIsland />}
     </div>
   );
 }

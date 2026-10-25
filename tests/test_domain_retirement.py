@@ -152,23 +152,16 @@ def test_the_one_cyber_signal_worth_keeping_is_kept():
     assert map_cve_to_equity("CVE-2026-0002", vendor_name="a private co")[0] is None
 
 
-def test_the_cyber_panel_does_not_claim_to_be_live():
-    """The moment the collector left the default profile, "REAL-TIME" became a
-    false claim in the one place a viewer looks to decide whether a threat is
-    current."""
-    import re
-
-    raw = (
-        ROOT / "frontend" / "src" / "components" / "CyberIntelligencePanel.tsx"
-    ).read_text(encoding="utf-8")
-    # Comments stripped: the file quotes the old badge text in the note that
-    # records why it is gone, and a claim in a comment is not a claim to a user.
-    panel = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
-    panel = re.sub(r"^\s*//.*$", "", panel, flags=re.M)
-    assert "CISA & BGP REAL-TIME" not in panel
-    assert 'variant="live"' not in panel
-    assert "RETIRED FEED" in panel
-    assert "refreshInterval: 5000" not in raw, "polling an archive every 5s"
+def test_cyber_is_gone_from_the_interface():
+    """Retired in full: no cyber panel, no cyber tab, no cyber entry in the
+    navigation or the command palette. The stored history and its read path
+    stay (see below); nothing in the interface claims a cyber view exists."""
+    src = ROOT / "frontend" / "src"
+    assert not (src / "components" / "CyberIntelligencePanel.tsx").exists()
+    for rel in ("components/ui/Sidebar.tsx", "components/ui/CommandPalette.tsx",
+                "app/(dashboard)/intelligence/page.tsx", "app/(dashboard)/intelligence/islands.tsx"):
+        text = (src / rel).read_text(encoding="utf-8")
+        assert "Cyber" not in text and "view=cyber" not in text, rel
 
 
 def test_the_history_stays_readable():

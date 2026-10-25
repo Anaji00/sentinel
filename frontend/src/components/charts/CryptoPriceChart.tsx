@@ -7,7 +7,7 @@ import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
-import { Bitcoin, TrendingUp, Zap, Radio } from 'lucide-react';
+import { Bitcoin, Zap, Radio } from 'lucide-react';
 import { formatCompact, formatCurrency, formatPercent } from '../../lib/format';
 import { PALETTE } from '../../lib/palette';
 import { POLL } from '../ui/DataProvider';
@@ -44,8 +44,10 @@ export default function CryptoPriceChart() {
     { refreshInterval: POLL.live },
   );
 
-  const basePoints =
-    data?.series?.['BTCUSD'] || data?.series?.['BTC'] || data?.series?.['BTCUSDT'] || [];
+  const basePoints = useMemo(
+    () => data?.series?.['BTCUSD'] || data?.series?.['BTC'] || data?.series?.['BTCUSDT'] || [],
+    [data],
+  );
 
   // Merge live ticks from WebSocket stream if available
   const mergedSeries = useMemo(() => {
@@ -115,11 +117,11 @@ export default function CryptoPriceChart() {
 
   return (
     <Card
-      title="BTC / USD REAL-TIME MARKET TELEMETRY & VOLATILITY"
+      title="Bitcoin price, live"
       badge={
         hasData ? (
           <Badge variant="live" pulse>
-            LIVE WS SYNC
+            Live
           </Badge>
         ) : (
           <Badge variant="warning" pulse>
@@ -131,18 +133,18 @@ export default function CryptoPriceChart() {
     >
       <div className="p-4 space-y-3">
         {/* Metric Summary Ribbon */}
-        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-amber-500/20 text-xs">
+        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-caution/30 text-xs">
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold flex items-center gap-1">
-              <Bitcoin className="w-3.5 h-3.5 text-amber-400" /> BTC / USD PRICE
+              <Bitcoin className="w-3.5 h-3.5 text-caution" /> BTC / USD PRICE
             </span>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="text-amber-400 font-extrabold text-base">
+              <span className="text-caution font-extrabold text-base">
                 {latestPrice !== null
                   ? formatCurrency(latestPrice, { decimals: 2 })
                   : 'AWAITING FEED...'}
               </span>
-              {hasData && <Zap className="w-3.5 h-3.5 text-amber-400 animate-pulse" />}
+              {hasData && <Zap className="w-3.5 h-3.5 text-caution animate-pulse" />}
             </div>
           </div>
 
@@ -150,7 +152,7 @@ export default function CryptoPriceChart() {
             <span className="text-ink-dim block text-micro uppercase font-bold">24H CHANGE</span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span
-                className={`font-extrabold text-base ${priceChangePct !== null ? (isPositive ? 'text-emerald-400' : 'text-rose-400') : 'text-ink-dim'}`}
+                className={`font-extrabold text-base ${priceChangePct !== null ? (isPositive ? 'text-positive' : 'text-negative') : 'text-ink-dim'}`}
               >
                 {priceChangePct !== null
                   ? formatPercent(priceChangePct, { decimals: 2, signed: true })
@@ -161,7 +163,7 @@ export default function CryptoPriceChart() {
 
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold">
-              INTRADAY RANGE
+              Intraday range
             </span>
             <div className="text-ink font-bold text-xs mt-1">
               {hasData
@@ -175,7 +177,7 @@ export default function CryptoPriceChart() {
         {hasData ? (
           <div className="relative bg-page p-3 rounded-lg border border-line overflow-hidden">
             <div className="flex items-center justify-between text-micro text-ink-dim mb-2 font-bold uppercase">
-              <span className="text-amber-300 font-bold">BTC / USD</span>
+              <span className="text-caution font-bold">BTC / USD</span>
               <span>
                 {activeHoverPoint
                   ? `${formatCurrency(activeHoverPoint.price)} · vol ${formatCompact(activeHoverPoint.volume)}`
@@ -256,9 +258,9 @@ export default function CryptoPriceChart() {
             </svg>
           </div>
         ) : (
-          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
-            <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
-            <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
+          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-caution/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
+            <Radio className="w-6 h-6 text-caution animate-pulse" />
+            <span className="text-xs font-bold text-caution uppercase tracking-widest">
               Waiting for the BTC / USD stream
             </span>
             <p className="text-micro text-ink-mute max-w-sm">

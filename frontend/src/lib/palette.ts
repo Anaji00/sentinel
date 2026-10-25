@@ -18,23 +18,24 @@
  */
 
 export const PALETTE = {
-  accent: '#22d3ee',
+  accent: '#8b9dff',
   positive: '#34d399',
   caution: '#fbbf24',
   negative: '#f87171',
-  info: '#a78bfa',
+  info: '#38bdf8',
+  civic: '#e879f9',
 
-  bgBase: '#07090e',
-  bgRaised: '#0c1018',
-  bgOverlay: '#11161f',
-  bgInset: '#090c12',
+  bgBase: '#0b0f17',
+  bgRaised: '#111722',
+  bgOverlay: '#182030',
+  bgInset: '#0d121b',
 
-  textPrimary: '#e8edf5',
-  textSecondary: '#94a3b8',
-  textMuted: '#64748b',
+  textPrimary: '#eef2f8',
+  textSecondary: '#a6b3c6',
+  textMuted: '#74829a',
 
-  borderSubtle: 'rgba(148, 163, 184, 0.12)',
-  borderStrong: 'rgba(148, 163, 184, 0.22)',
+  borderSubtle: 'rgba(160, 174, 200, 0.13)',
+  borderStrong: 'rgba(160, 174, 200, 0.24)',
 } as const;
 
 export type PaletteKey = keyof typeof PALETTE;
@@ -45,6 +46,7 @@ const CSS_VAR: Record<PaletteKey, string> = {
   caution: '--caution',
   negative: '--negative',
   info: '--info',
+  civic: '--civic',
   bgBase: '--bg-base',
   bgRaised: '--bg-raised',
   bgOverlay: '--bg-overlay',

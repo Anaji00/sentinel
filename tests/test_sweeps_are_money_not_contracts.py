@@ -6,5 +6,9 @@ SRC = (pathlib.Path(__file__).resolve().parents[1] / "services" / "collector-tra
 
 
 def test_the_sweep_filter_is_premium_only() -> None:
-    assert "if premium >= 50000.0:" in SRC
+    # Money spent, never contract count; since 16 Oct 2026 the money paid above
+    # intrinsic value where the spot is known (shared/utils/options_flow.py).
+    from shared.utils import options_flow as ofl
+    assert "if (extrinsic if extrinsic is not None else premium) >= ofl.MIN_EXTRINSIC_USD:" in SRC
+    assert ofl.MIN_EXTRINSIC_USD == 50000.0
     assert "or size >= 100.0" not in SRC

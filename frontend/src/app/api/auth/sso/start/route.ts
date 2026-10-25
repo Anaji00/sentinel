@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { SSO_STATE_COOKIE } from '@/lib/session';
 
 const API_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
@@ -34,7 +34,7 @@ export async function GET() {
   }
 }
 
-export async function POST(req: NextRequest) {
+export async function POST() {
   try {
     const upstream = await fetch(`${API_GATEWAY_URL}/api/v1/auth/oidc/start`, {
       method: 'POST',

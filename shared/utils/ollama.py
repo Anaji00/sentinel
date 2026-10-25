@@ -529,8 +529,8 @@ DEFAULT_MODEL = "qwen2.5:3b"
 # them by name. They named gemma:2b first for the lightweight tier, which is
 # neither what runs nor what should be reached for: see OLLAMA_ALLOWED_MODELS
 # above for why a second family is an eviction rather than a fallback.
-MODEL_TIER_LIGHTWEIGHT = ["qwen2.5:3b"]
-MODEL_TIER_HEAVY       = ["qwen2.5:3b"]
+MODEL_TIER_LIGHTWEIGHT = ["qwen2.5:3b", "qwen3:1.7b"]
+MODEL_TIER_HEAVY       = ["qwen2.5:3b", "qwen3:1.7b"]
 
 _GLOBAL_OLLAMA_SEMAPHORE: Optional[asyncio.Semaphore] = None
 _GLOBAL_SEMAPHORE_LOOP: Optional[asyncio.AbstractEventLoop] = None

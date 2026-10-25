@@ -178,7 +178,7 @@ export default function SignalAttribution() {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {isLoading && !data ? (
-          <EmptyState kind="loading" title="Measuring against resolved outcomes" />
+          <EmptyState kind="loading" title="Measuring every signal against what actually happened" detail="This takes about ten seconds." />
         ) : !data?.available ? (
           <EmptyState
             kind="empty"

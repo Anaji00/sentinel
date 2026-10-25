@@ -147,6 +147,7 @@ def parse_form4(payload: bytes | str) -> Optional[Dict[str, Any]]:
             continue
         owners.append({
             "name": name,
+            "cik": _text(ident.find("rptOwnerCik")).lstrip("0") if ident is not None else "",
             "is_officer": _flag(rel.find("isOfficer")) if rel is not None else False,
             "is_director": _flag(rel.find("isDirector")) if rel is not None else False,
             "is_ten_percent_owner": (

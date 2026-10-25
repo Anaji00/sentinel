@@ -206,8 +206,14 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
                         if t_base:
                             _STRIPPED_TITLE_TO_TICKER.setdefault(f"{t_base}|{t_class}", ticker)
                     if ticker and cik:
-                        _DYNAMIC_CIK_TO_TICKER[cik] = ticker
-                        _DYNAMIC_CIK_TO_TICKER[cik.zfill(10)] = ticker
+                        # First writer wins here too: the registry lists a
+                        # company's common stock first and its preferreds and
+                        # notes after it. Last-writer-wins filed JPM under
+                        # JPM-PM, and 229 issuers -- most large banks among
+                        # them -- had their filings and financials keyed to a
+                        # preferred series instead of the common stock.
+                        _DYNAMIC_CIK_TO_TICKER.setdefault(cik, ticker)
+                        _DYNAMIC_CIK_TO_TICKER.setdefault(cik.zfill(10), ticker)
 
                 if redis_client and _DYNAMIC_TITLE_TO_TICKER:
                     try:
@@ -235,7 +241,8 @@ async def load_sec_company_tickers(session: aiohttp.ClientSession, redis_client:
 # listing is gone and cannot be recovered from it. The loader returns early when
 # that cache is warm, so without a new key the fix would sit inert behind a
 # seven-day TTL on every deployment that already has one.
-_REGISTRY_CACHE_KEY = "sentinel:sec:company_tickers:map:v2"
+# v3: the CIK map keeps the first-listed (common) ticker; v2 kept the last.
+_REGISTRY_CACHE_KEY = "sentinel:sec:company_tickers:map:v3"
 
 
 _STATE_SUFFIX = re.compile(r"/[A-Z]{2,3}(?![A-Z])")

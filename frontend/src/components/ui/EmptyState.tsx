@@ -24,7 +24,7 @@ type Kind = 'loading' | 'empty' | 'error';
 const TONE: Record<Kind, string> = {
   loading: 'text-ink-mute',
   empty: 'text-ink-mute',
-  error: 'text-amber-400/90',
+  error: 'text-caution/90',
 };
 
 export function EmptyState({

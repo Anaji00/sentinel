@@ -72,6 +72,18 @@ def pearson_on_returns(prices_a, prices_b):
     return r, p
 
 
+def retest_statistic(method: str, a: List[float], b: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """(statistic, p-value) for re-testing an edge with the method that found it:
+    the F statistic of A Granger-causing B for a Granger edge, the return
+    correlation otherwise."""
+    if method == "granger":
+        gc = quant_calc.granger_causality(list(a), list(b), max_lag=3)
+        if not gc:
+            return None, None
+        return float(gc.get("f_statistic", 0.0)), _granger_p(gc)
+    return pearson_on_returns(a, b)
+
+
 def _granger_p(gc_result: Dict[str, Any]) -> float:
     """Extracts a Granger p-value, defaulting to 1.0 when absent.
 
@@ -608,7 +620,8 @@ class StatisticalDiscoveryEngine:
                     # A. Statistical Correlation Edge
                     if abs(r_pearson) >= thresholds["min_correlation_coef"] and pearson_significant:
                         rel_type = "STATISTICALLY_CORRELATED_WITH"
-                        await self.producer.send(
+                        published = await self._gate_edge(
+                            EdgeSurvivalTracker.edge_id(ticker_a, ticker_b, "pearson"),
                             Topics.ONTOLOGY_PROPOSALS,
                             {
                                 "entity_id": ticker_a,
@@ -652,7 +665,7 @@ class StatisticalDiscoveryEngine:
                         ))
                         
                         # Cache active correlation IDs in Redis for event enrichment linking (§8.2)
-                        if self.redis:
+                        if self.redis and published:
                             try:
                                 corr_id = f"corr:stat:{ticker_a}:{ticker_b}"
                                 await self.redis.raw.sadd(f"sentinel:correlation:active_ids:{ticker_a}", corr_id)
@@ -667,7 +680,8 @@ class StatisticalDiscoveryEngine:
                         f_stat = float(gc_ab.get("f_statistic", 0.0))
                         p_val = _granger_p(gc_ab)
                         lag = int(gc_ab.get("optimal_lag", 1))
-                        await self.producer.send(
+                        published = await self._gate_edge(
+                            EdgeSurvivalTracker.edge_id(ticker_a, ticker_b, "granger"),
                             Topics.ONTOLOGY_PROPOSALS,
                             {
                                 "entity_id": ticker_a,
@@ -700,7 +714,7 @@ class StatisticalDiscoveryEngine:
                             q_value=gc_ab_q, window_bars=min_len,
                         ))
                         
-                        if self.redis:
+                        if self.redis and published:
                             try:
                                 granger_id = f"granger:{ticker_a}:{ticker_b}:lag{lag}"
                                 await self.redis.raw.sadd(f"sentinel:correlation:active_ids:{ticker_a}", granger_id)
@@ -715,7 +729,8 @@ class StatisticalDiscoveryEngine:
                         f_stat = float(gc_ba.get("f_statistic", 0.0))
                         p_val = _granger_p(gc_ba)
                         lag = int(gc_ba.get("optimal_lag", 1))
-                        await self.producer.send(
+                        published = await self._gate_edge(
+                            EdgeSurvivalTracker.edge_id(ticker_b, ticker_a, "granger"),
                             Topics.ONTOLOGY_PROPOSALS,
                             {
                                 "entity_id": ticker_b,
@@ -740,8 +755,15 @@ class StatisticalDiscoveryEngine:
                             key=ticker_b,
                         )
                         logger.info(f"🎯 Granger Causality Link: {ticker_b} -[GRANGER_CAUSES (lag={lag})]-> {ticker_a}")
+                        await self.survival.register(EdgeRegistration(
+                            edge_id=EdgeSurvivalTracker.edge_id(ticker_b, ticker_a, "granger"),
+                            source=ticker_b, target=ticker_a,
+                            relation="GRANGER_CAUSES", method="granger",
+                            coefficient=round(f_stat, 4), p_value=round(p_val, 6),
+                            q_value=gc_ba_q, window_bars=min_len,
+                        ))
 
-                        if self.redis:
+                        if self.redis and published:
                             try:
                                 granger_id = f"granger:{ticker_b}:{ticker_a}:lag{lag}"
                                 await self.redis.raw.sadd(f"sentinel:correlation:active_ids:{ticker_a}", granger_id)
@@ -853,6 +875,20 @@ class StatisticalDiscoveryEngine:
     # ── 5. INTRA-TRADFI SECTOR HAWKES CONTAGION (§4.3) ─────────────────────────
 
 
+    async def _gate_edge(self, edge_id: str, topic: Any, proposal: Dict[str, Any], key: str) -> bool:
+        """Publish a discovered edge to the graph only once it has replicated.
+
+        Only 43 of 553 re-tested edges (8%) held on the next window and 264
+        reversed sign, so publishing at discovery mostly published noise. A new
+        edge's proposal is held with its registration and sent when its re-test
+        survives (retest_due_edges); an edge that already replicated is
+        refreshed at once. True when sent now."""
+        if await self.survival.is_replicated(edge_id):
+            await self.producer.send(topic, proposal, key=key)
+            return True
+        await self.survival.hold(edge_id, proposal, key)
+        return False
+
     async def retest_due_edges(self, limit: int = 50) -> Dict[str, Any]:
         """Re-measures discovered edges once their out-of-sample window elapses.
 
@@ -876,13 +912,15 @@ class StatisticalDiscoveryEngine:
         retested = survived = failed = skipped = 0
         for reg in due:
             try:
-                series_a = await self.fetch_price_series(reg.source)
-                series_b = await self.fetch_price_series(reg.target)
+                # Aligned on shared buckets as discovery reads them, and judged
+                # on the statistic that found the edge: a Granger edge was being
+                # re-tested as a Pearson correlation, a different claim.
+                series_a, series_b = await self.fetch_aligned_pair(reg.source, reg.target)
                 if len(series_a) < 30 or len(series_b) < 30:
                     skipped += 1
                     continue
 
-                coefficient, p_value = pearson_on_returns(series_a, series_b)
+                coefficient, p_value = retest_statistic(reg.method, series_a, series_b)
                 if coefficient is None:
                     skipped += 1
                     continue
@@ -896,8 +934,11 @@ class StatisticalDiscoveryEngine:
                     skipped += 1
                     continue
                 retested += 1
+                held = await self.survival.release(reg.edge_id)
                 if getattr(verdict, "survived", False):
                     survived += 1
+                    if held and self.producer:
+                        await self.producer.send(Topics.ONTOLOGY_PROPOSALS, held["proposal"], key=held.get("key"))
                 else:
                     failed += 1
             except Exception as e:

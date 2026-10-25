@@ -621,3 +621,26 @@ async def test_paper_broker_missing_price_raises_error():
     broker = PaperBroker(initial_cash=10000.0)
     with pytest.raises(ValueError, match="missing limit_price"):
         await broker.submit_order(symbol="NVDA", qty=10, side=OrderSide.BUY)
+
+
+def test_a_gap_through_the_stop_fills_at_the_open_not_the_stop():
+    """A stop is a price to sell at once reached, not a guarantee of that price."""
+    from services.reasoning.strategy_backtester import StrategyBacktester, MIN_BARS_FOR_BACKTEST
+
+    n = max(MIN_BARS_FOR_BACKTEST, 80)
+    bars = []
+    price = 100.0
+    for k in range(n):
+        # A steady climb (the momentum entry), then one bar that opens 20% lower.
+        if k == 40:
+            o, c = price * 0.80, price * 0.79
+        else:
+            o, c = price, price * 1.002
+        bars.append({"timestamp": f"t{k}", "open": o, "high": max(o, c) * 1.001, "low": min(o, c) * 0.999,
+                     "close": c, "volume": 1e6})
+        price = c
+    report = StrategyBacktester().backtest_strategy("TEST", bars, strategy_type="momentum_trend")
+    trades = report.get("recent_trades") or []
+    gapped = [t for t in trades if t["exit_time"] == "t40"]
+    assert gapped, "the gap bar should end an open trade"
+    assert gapped[0]["exit_price"] <= round(bars[40]["open"], 2) + 0.01   # at the open, below any stop

@@ -45,6 +45,64 @@ logger = setup_sentinel_logging("collector.prediction", level=getattr(logging, o
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Kalshi's market schema moved under this poller: "open" became "active",
+# the integer `volume` became the fixed-point string `volume_fp`, and
+# `expiration_ts` became `expiration_time`. Every market failed the old status
+# check, and the feed published nothing for at least thirty days without
+# raising an error. Both spellings are read.
+KALSHI_LIVE_STATUSES = frozenset({"open", "active"})
+# Economic series, polled by name: their prices are the market's consensus for
+# the releases this platform trades around (Fed, CPI, PCE, claims, payrolls,
+# unemployment, GDP, recession, index and crude levels). The first page of all
+# markets is multivariate sports parlays, which is what `limit=1000` returned.
+KALSHI_SERIES = [x.strip() for x in os.getenv(
+    "KALSHI_SERIES",
+    "KXFED,KXFEDDECISION,KXCPI,KXCPIYOY,KXPCEHEAD,KXJOBLESSCLAIMS,KXPAYROLLS,KXU3,"
+    "KXGDP,KXNBERRECESSQ,KXRECSSNBER,KXINXY,KXNASDAQ100Y,KXWTI",
+).split(",") if x.strip()]
+KALSHI_PER_SERIES = 8           # most-traded live markets kept per series
+KALSHI_POLL_SEC = 300
+KALSHI_REQUEST_SPACING_SEC = 0.25
+
+
+def _kalshi_num(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def kalshi_volume(market: dict) -> float:
+    v = market.get("volume_fp")
+    return _kalshi_num(v if v is not None else market.get("volume"))
+
+
+def kalshi_expiry(market: dict):
+    return market.get("expiration_ts") or market.get("expiration_time")
+
+
+def kalshi_live_markets(markets: list, now: datetime) -> list:
+    """Live, traded, unexpired single markets, most-traded first."""
+    out = []
+    for market in markets or []:
+        if market.get("status") not in KALSHI_LIVE_STATUSES:
+            continue
+        if market.get("mve_collection_ticker") or str(market.get("ticker") or "").startswith("KXMVE"):
+            continue
+        exp = kalshi_expiry(market)
+        if exp:
+            try:
+                if datetime.fromisoformat(str(exp).replace("Z", "+00:00")) < now:
+                    continue
+            except ValueError as exc:
+                # An unreadable expiry keeps the market: volume still decides.
+                swallowed("collector_prediction.kalshi_expiry", exc, logger, detail=str(exp)[:40])
+        if kalshi_volume(market) <= 0:
+            continue
+        out.append(market)
+    out.sort(key=kalshi_volume, reverse=True)
+    return out
+
 # Outcome names that mean "this market is a straight yes/no bet". Anything else
 # is a named outcome in a field of several, where forcing a yes/no reading
 # invents a probability for a question nobody asked.
@@ -524,112 +582,111 @@ async def poll_kalshi(producer: SentinelProducer):
     Polls Kalshi REST API for active event volumes.
     STATELESS: Sends raw volume to Kafka for Enrichment to calculate Deltas/Spikes.
     """
-    session_timeout = aiohttp.ClientTimeout(total=10)
-    
+    session_timeout = aiohttp.ClientTimeout(total=30)
+    # Last (price, volume) sent per market: the enricher turns every message
+    # into a stored event, so an unchanged market is not sent again.
+    last_sent: dict = {}
+
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
         while True:
-            try:   
-                # Query up to 1000 markets to ensure we catch most active elections and categories
-                url = f"{KALSHI_BASE_URL}/markets?limit=1000"
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        markets = data.get("markets", [])
-                        
-                        # 1. Filter only open, non-expired markets with trading activity
-                        open_markets = []
-                        for market in markets:
-                            if market.get("status") != "open":
-                                continue
+            for series in KALSHI_SERIES:
+                try:
+                    url = f"{KALSHI_BASE_URL}/markets?series_ticker={series}&status=open&limit=200"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            markets = data.get("markets", [])
+
+                            # 1. Filter only open, non-expired markets with trading activity
+                            open_markets = []
+                            for market in kalshi_live_markets(markets, datetime.now(timezone.utc)):
                                 
-                            # Read once to reject expired markets, and then
-                            # thrown away -- while `PredictionMarketData`
-                            # declares `resolution_date` and the enricher reads
-                            # it by that name, so the field was null on every
-                            # prediction event the platform has ever produced.
-                            #
-                            # A contract at 67% resolving in three weeks is a
-                            # tradeable claim; the same 67% resolving in 2028 is
-                            # noise, and nothing downstream could tell them
-                            # apart. The frontend declares the field too.
-                            exp_ts = market.get("expiration_ts")
-                            if exp_ts:
-                                try:
-                                    exp_dt = datetime.fromisoformat(exp_ts.replace('Z', '+00:00'))
-                                    if exp_dt < datetime.now(timezone.utc):
-                                        continue
-                                except Exception as _exc:
-                                    swallowed("collector_prediction.poll_kalshi", _exc, logger)
+                                # Read once to reject expired markets, and then
+                                # thrown away -- while `PredictionMarketData`
+                                # declares `resolution_date` and the enricher reads
+                                # it by that name, so the field was null on every
+                                # prediction event the platform has ever produced.
+                                #
+                                # A contract at 67% resolving in three weeks is a
+                                # tradeable claim; the same 67% resolving in 2028 is
+                                # noise, and nothing downstream could tell them
+                                # apart. The frontend declares the field too.
+                                exp_ts = kalshi_expiry(market)
+                                if exp_ts:
+                                    try:
+                                        exp_dt = datetime.fromisoformat(exp_ts.replace('Z', '+00:00'))
+                                        if exp_dt < datetime.now(timezone.utc):
+                                            continue
+                                    except Exception as _exc:
+                                        swallowed("collector_prediction.poll_kalshi", _exc, logger)
                             
-                            if market.get("volume", 0) <= 0:
-                                continue
+                                open_markets.append(market)
+
+                            # 2. Publish the most-traded live markets of the series
+                            for market in open_markets[:KALSHI_PER_SERIES]:
+                                ticker = market.get("ticker")
+                                vol = kalshi_volume(market)
                             
-                            open_markets.append(market)
+                                # Support both legacy cent-based integers and modern dollar-based fields
+                                yes_bid = market.get("yes_bid")
+                                no_bid = market.get("no_bid")
+                                yes_bid_dollars = market.get("yes_bid_dollars")
+                                no_bid_dollars = market.get("no_bid_dollars")
                             
-                        # 2. Sort open markets by volume descending to dynamically keep top active bets
-                        open_markets.sort(key=lambda m: m.get("volume", 0), reverse=True)
-                        
-                        # 3. Publish the top 100 most active markets
-                        for market in open_markets[:100]:
-                            ticker = market.get("ticker")
-                            vol = market.get("volume", 0)
-                            
-                            # Support both legacy cent-based integers and modern dollar-based fields
-                            yes_bid = market.get("yes_bid")
-                            no_bid = market.get("no_bid")
-                            yes_bid_dollars = market.get("yes_bid_dollars")
-                            no_bid_dollars = market.get("no_bid_dollars")
-                            
-                            # Standardize probability values (0.0 to 1.0)
-                            if yes_bid_dollars is not None and float(yes_bid_dollars) > 0:
-                                yes_prob = round(float(yes_bid_dollars), 4)
-                            elif yes_bid is not None and yes_bid > 0:
-                                yes_prob = round(yes_bid / 100.0, 4)
-                            elif market.get("last_price_dollars") is not None:
-                                yes_prob = round(float(market.get("last_price_dollars")), 4)
-                            elif market.get("last_price") is not None:
-                                yes_prob = round(market.get("last_price") / 100.0, 4)
-                            else:
-                                yes_prob = 0.50
+                                # Standardize probability values (0.0 to 1.0)
+                                if yes_bid_dollars is not None and float(yes_bid_dollars) > 0:
+                                    yes_prob = round(float(yes_bid_dollars), 4)
+                                elif yes_bid is not None and yes_bid > 0:
+                                    yes_prob = round(yes_bid / 100.0, 4)
+                                elif market.get("last_price_dollars") is not None:
+                                    yes_prob = round(float(market.get("last_price_dollars")), 4)
+                                elif market.get("last_price") is not None:
+                                    yes_prob = round(market.get("last_price") / 100.0, 4)
+                                else:
+                                    yes_prob = 0.50
                                 
-                            if no_bid_dollars is not None and float(no_bid_dollars) > 0:
-                                no_prob = round(float(no_bid_dollars), 4)
-                            elif no_bid is not None and no_bid > 0:
-                                no_prob = round(no_bid / 100.0, 4)
-                            else:
-                                no_prob = round(max(0.0, 1.0 - yes_prob), 4)
+                                if no_bid_dollars is not None and float(no_bid_dollars) > 0:
+                                    no_prob = round(float(no_bid_dollars), 4)
+                                elif no_bid is not None and no_bid > 0:
+                                    no_prob = round(no_bid / 100.0, 4)
+                                else:
+                                    no_prob = round(max(0.0, 1.0 - yes_prob), 4)
                                 
-                            price_usd = yes_prob if yes_prob is not None else 0.50
+                                price_usd = yes_prob if yes_prob is not None else 0.50
+                                if last_sent.get(ticker) == (yes_prob, vol):
+                                    continue
+                                last_sent[ticker] = (yes_prob, vol)
+
+                                event = RawEvent(
+                                    source="kalshi",
+                                    occurred_at=datetime.now(timezone.utc),
+                                    raw_payload={
+                                        "ticker": ticker,
+                                        "title": market.get("title"),
+                                        "total_volume": vol,
+                                        "price": price_usd,
+                                        "yes_bid": yes_bid_dollars if yes_bid_dollars is not None else yes_bid,
+                                        "no_bid": no_bid_dollars if no_bid_dollars is not None else no_bid,
+                                        "yes_probability": yes_prob,
+                                        "no_probability": no_prob,
+                                        # The expiry this poller already read, in
+                                        # the name the enricher and the frontend
+                                        # both ask for. It was fetched, used to
+                                        # reject expired markets, and dropped.
+                                        "resolution_date": kalshi_expiry(market),
+                                    }
+                                )
+                                await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
+                                _collector_metrics("collector-prediction").ingested()
                             
-                            event = RawEvent(
-                                source="kalshi",
-                                occurred_at=datetime.now(timezone.utc),
-                                raw_payload={
-                                    "ticker": ticker,
-                                    "title": market.get("title"),
-                                    "total_volume": vol,
-                                    "price": price_usd,
-                                    "yes_bid": yes_bid_dollars if yes_bid_dollars is not None else yes_bid,
-                                    "no_bid": no_bid_dollars if no_bid_dollars is not None else no_bid,
-                                    "yes_probability": yes_prob,
-                                    "no_probability": no_prob,
-                                    # The expiry this poller already read, in
-                                    # the name the enricher and the frontend
-                                    # both ask for. It was fetched, used to
-                                    # reject expired markets, and dropped.
-                                    "resolution_date": market.get("expiration_ts"),
-                                }
-                            )
-                            await producer.send(Topics.RAW_PREDICTION, event.model_dump(), key=ticker)
-                            _collector_metrics("collector-prediction").ingested()
-                            
-                    else:
-                        text = await resp.text()
-                        logger.error(f"Kalshi API Rejected Connection: HTTP {resp.status} - {text}")    
-            except Exception as e:
-                logger.error(f"Kalshi polling error: {e}", exc_info=True)
-            
-            await asyncio.sleep(60) 
+                        else:
+                            text = await resp.text()
+                            logger.error(f"Kalshi API Rejected Connection: HTTP {resp.status} - {text[:200]}")
+                except Exception as e:
+                    logger.error(f"Kalshi polling error ({series}): {e!r}")
+                await asyncio.sleep(KALSHI_REQUEST_SPACING_SEC)
+
+            await asyncio.sleep(KALSHI_POLL_SEC)
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────
 

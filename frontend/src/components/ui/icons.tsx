@@ -49,6 +49,7 @@ import {
   TrendingDown,
   TrendingUp,
   Waves,
+  Star,
   X,
   Zap,
 } from 'lucide-react';
@@ -103,6 +104,10 @@ export const IconUrgent = (p: IconProps) => <Siren {...base(p)} />;
 export const IconUp = (p: IconProps) => <TrendingUp {...base(p)} />;
 export const IconDown = (p: IconProps) => <TrendingDown {...base(p)} />;
 export const IconVessel = (p: IconProps) => <Ship {...base(p)} />;
+/** Followed / not followed: a filled star when it is yours. */
+export const IconFollow = ({ on, ...p }: IconProps & { on?: boolean }) => (
+  <Star {...base(p)} fill={on ? 'currentColor' : 'none'} />
+);
 export const IconAircraft = (p: IconProps) => <Plane {...base(p)} />;
 export const IconAnchorage = (p: IconProps) => <Anchor {...base(p)} />;
 export const IconSea = (p: IconProps) => <Waves {...base(p)} />;

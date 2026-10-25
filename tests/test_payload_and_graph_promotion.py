@@ -242,6 +242,9 @@ async def test_statistical_discovery_caches_active_ids_in_redis():
 
     engine.fetch_aligned_pair = mock_aligned
     engine.build_candidate_pairs = AsyncMock(return_value=[("NVDA", "TSM")])
+    # Publication waits for replication (StatisticalDiscoveryEngine._gate_edge);
+    # this pair has already replicated, so its proposals go out now.
+    engine.survival.is_replicated = AsyncMock(return_value=True)
 
     discoveries = await engine.discover_pairwise_correlations()
     assert len(discoveries) >= 1

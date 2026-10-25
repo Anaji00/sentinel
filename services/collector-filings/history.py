@@ -18,12 +18,13 @@ is done once (Redis set), so a restart resumes rather than refetches.
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from shared.utils.quiet_failures import swallowed
+from shared.utils.sec_rate import sec_slot
 
 logger = logging.getLogger("collector_filings.history")
 
@@ -87,7 +88,8 @@ def eight_k_rows(
             summary,
             ["filing", "form:8-K", f"ticker:{ticker}", "historical_backfill", f"exposes:{ticker}"],
             ticker,
-            json.dumps({"ticker": ticker, "items": codes, "accession_number": accession}),
+            # A dict, not json.dumps: the pool's jsonb codec encodes it (0052).
+            {"ticker": ticker, "items": codes, "accession_number": accession},
         ))
     return rows
 
@@ -111,6 +113,7 @@ async def backfill_8k_history(
         if ticker in done or not cik:
             continue
         try:
+            await sec_slot()
             async with session.get(SUBMISSIONS_URL.format(cik=str(cik).lstrip("0") or "0"), headers=headers) as resp:
                 if resp.status == 429:
                     logger.warning("SEC throttled the history backfill; pausing a minute.")
@@ -138,20 +141,40 @@ async def backfill_8k_history(
 
 
 _PROFILE_SQL = """
-    INSERT INTO company_profile (ticker, cik, sic, sic_description, updated_at)
-    VALUES ($1, $2, $3, $4, NOW())
+    INSERT INTO company_profile (ticker, cik, sic, sic_description, issuer_kind, state_of_incorporation, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
     ON CONFLICT (ticker) DO UPDATE SET cik = EXCLUDED.cik, sic = EXCLUDED.sic,
-        sic_description = EXCLUDED.sic_description, updated_at = NOW()
+        sic_description = EXCLUDED.sic_description, issuer_kind = EXCLUDED.issuer_kind,
+        state_of_incorporation = EXCLUDED.state_of_incorporation, updated_at = NOW()
 """
+# Annual reports that mark a foreign private issuer, whose shares trade here as
+# ADRs or foreign ordinary shares rather than a domestic company's common stock.
+FOREIGN_ANNUAL_FORMS = frozenset({"20-F", "20-F/A", "40-F", "40-F/A"})
+DOMESTIC_ANNUAL_FORMS = frozenset({"10-K", "10-K/A", "10-KT"})
+_PARTNERSHIP = re.compile(r"(\bL\.?\s?P\.?|\bLimited Partnership)$", re.IGNORECASE)
 
 
-def profile_row(ticker: str, cik: str, payload: Dict[str, Any]) -> Optional[Tuple[str, str, Optional[int], Optional[str]]]:
-    """The company's SIC industry code from an EDGAR submissions payload."""
+def issuer_kind(payload: Dict[str, Any]) -> str:
+    """"domestic", "foreign" or "partnership" from an EDGAR submissions payload:
+    a 20-F or 40-F filer with no 10-K is foreign; a name ending in L.P. a
+    partnership (units, a K-1, not common stock)."""
+    if _PARTNERSHIP.search(str(payload.get("name") or "").strip().rstrip(",")):
+        return "partnership"
+    forms = set(((payload.get("filings") or {}).get("recent") or {}).get("form") or [])
+    if forms & FOREIGN_ANNUAL_FORMS and not forms & DOMESTIC_ANNUAL_FORMS:
+        return "foreign"
+    return "domestic"
+
+
+def profile_row(ticker: str, cik: str, payload: Dict[str, Any]
+                ) -> Optional[Tuple[str, str, Optional[int], Optional[str], str, Optional[str]]]:
+    """The company's SIC industry code and issuer kind from an EDGAR submissions payload."""
     raw_sic = str(payload.get("sic") or "").strip()
     sic = int(raw_sic) if raw_sic.isdigit() else None
     if sic is None:
         return None
-    return (ticker.upper(), str(cik), sic, (payload.get("sicDescription") or None))
+    return (ticker.upper(), str(cik), sic, (payload.get("sicDescription") or None), issuer_kind(payload),
+            (str(payload.get("stateOfIncorporation") or "") or None))
 
 
 async def backfill_profiles(session: Any, headers: Dict[str, str], db: Any,
@@ -159,12 +182,15 @@ async def backfill_profiles(session: Any, headers: Dict[str, str], db: Any,
     """SIC codes for every ticker without one, for industry features in the
     cross-sectional model. One submissions request per company, paced as the
     8-K backfill is."""
-    have = {str(r["ticker"]).upper() for r in await db.query("SELECT ticker FROM company_profile") or []}
+    # Profiles stored before issuer kinds were kept are fetched again once.
+    have = {str(r["ticker"]).upper() for r in
+            await db.query("SELECT ticker FROM company_profile WHERE issuer_kind IS NOT NULL") or []}
     stats = {"profiles": 0, "errors": 0}
     for ticker, cik in sorted(tickers_to_cik.items()):
         if ticker in have or not cik:
             continue
         try:
+            await sec_slot()
             async with session.get(SUBMISSIONS_URL.format(cik=str(cik).lstrip("0") or "0"), headers=headers) as resp:
                 if resp.status == 429:
                     logger.warning("SEC throttled the profile backfill; pausing a minute.")

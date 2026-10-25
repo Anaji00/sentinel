@@ -4,7 +4,7 @@ import React, { useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
-import { formatPercent } from '../lib/format';
+import { decodeEntities, formatPercent } from '../lib/format';
 import { IconShield } from '@/components/ui/icons';
 import { ClockTime } from './ui/ClockTime';
 import { POLL } from './ui/DataProvider';
@@ -21,6 +21,14 @@ interface OsintItem {
   is_ofac_hit: boolean;
   region: string;
   tags: string[];
+}
+
+/** Paperwork, not intelligence: prospectus supplements for structured notes
+ * (424B2 and kin), routine ownership forms and fund holdings reports arrive by
+ * the hundred a day and drowned the stories this view exists to surface. They
+ * stay on the Filings page. */
+export function isRoutineFiling(headline: string): boolean {
+  return /\bfiled Form (424B\d|FWP|13F-HR|N-PORT|497K?|S-8|D)(?![\w-])/i.test(headline);
 }
 
 export default function OsintThreatMatrix() {
@@ -51,7 +59,7 @@ export default function OsintThreatMatrix() {
     const score = typeof e.anomaly_score === 'number' ? e.anomaly_score : 0;
     return {
       id: String(e.event_id ?? e.id ?? ''),
-      headline: String(e.headline ?? e.title ?? ''),
+      headline: decodeEntities(String(e.headline ?? e.title ?? '')),
       source: String(e.source ?? ''),
       occurred_at: String(e.occurred_at ?? ''),
       anomaly_score: score,
@@ -66,29 +74,30 @@ export default function OsintThreatMatrix() {
   });
 
   const filteredEvents = events.filter((e) => {
+    if (isRoutineFiling(e.headline)) return false;
     if (onlySanctions && !e.is_ofac_hit) return false;
     if (selectedTheater !== 'ALL' && e.region !== selectedTheater) return false;
     return true;
   });
 
   return (
-    <Card className="h-full flex flex-col bg-[#080b13]/90 border border-cyan-500/20 shadow-2xl overflow-hidden font-mono">
+    <Card className="h-full flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-cyan-500/20 bg-[#0c101d]/80 shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-line bg-inset/80 shrink-0">
         <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-cyan-950/80 border border-accent/60 flex items-center justify-center">
+          <div className="h-9 w-9 rounded-lg bg-accent-dim border border-accent/60 flex items-center justify-center">
             <span className="text-accent text-lg">
               <IconShield className="inline-block shrink-0" />
             </span>
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-              OSINT matrix
-              <span className="px-2 py-0.5 rounded text-micro bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                LIVE RADAR
+            <h2 className="panel-title flex items-center gap-2">
+              Open-source watch
+              <span className="px-2 py-0.5 rounded text-micro bg-negative/10 text-negative border border-negative/30">
+                Live radar
               </span>
             </h2>
-            <p className="text-micro text-ink-dim">OFAC sanctions, AIS gaps and event novelty</p>
+            <p className="text-micro text-ink-dim">Sanctions hits, ships going dark, and how unusual each story is</p>
           </div>
         </div>
 
@@ -98,8 +107,8 @@ export default function OsintThreatMatrix() {
             onClick={() => setOnlySanctions(!onlySanctions)}
             className={`px-3 py-1 rounded-lg font-bold border transition-all cursor-pointer text-micro ${
               onlySanctions
-                ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-panel'
-                : 'bg-raised text-ink-dim border-line hover:text-white'
+                ? 'bg-negative/10 text-negative border-negative/30 shadow-panel'
+                : 'bg-raised text-ink-dim border-line hover:text-ink'
             }`}
           >
             OFAC sanctions only
@@ -108,14 +117,14 @@ export default function OsintThreatMatrix() {
           <select
             value={selectedTheater}
             onChange={(e) => setSelectedTheater(e.target.value)}
-            className="bg-raised text-cyan-300 border border-cyan-500/30 rounded-lg px-3 py-1 text-micro font-bold outline-none cursor-pointer"
+            className="bg-raised text-accent border border-line rounded-lg px-3 py-1 text-micro font-bold outline-none cursor-pointer"
           >
-            <option value="ALL">ALL THEATERS</option>
-            <option value="MIDDLE_EAST">MIDDLE EAST / HORMUZ</option>
-            <option value="RED_SEA">RED SEA / BAB-EL-MANDEB</option>
-            <option value="EUROPE">EASTERN EUROPE</option>
-            <option value="TAIWAN_STRAIT">TAIWAN STRAIT</option>
-            <option value="GLOBAL">GLOBAL AIRSPACE</option>
+            <option value="ALL">All theaters</option>
+            <option value="MIDDLE_EAST">Middle East / Hormuz</option>
+            <option value="RED_SEA">Red Sea / Bab-el-Mandeb</option>
+            <option value="EUROPE">Eastern Europe</option>
+            <option value="TAIWAN_STRAIT">Taiwan Strait</option>
+            <option value="GLOBAL">Global airspace</option>
           </select>
         </div>
       </div>
@@ -125,36 +134,36 @@ export default function OsintThreatMatrix() {
         {filteredEvents.map((item) => (
           <div
             key={item.id}
-            className="p-3.5 rounded-xl bg-raised/60 border border-cyan-500/15 hover:border-accent/50 transition-all hover:bg-raised/90 glass-panel-hover"
+            className="p-3.5 rounded-xl bg-raised/60 border border-line hover:border-accent/50 transition-all hover:bg-raised/90 glass-panel-hover"
           >
             <div className="flex items-center justify-between gap-2 mb-2">
               <div className="flex items-center gap-2 flex-wrap text-micro">
-                <span className="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 font-bold uppercase">
+                <span className="px-2 py-0.5 rounded bg-accent-dim text-accent border border-line font-bold uppercase">
                   {item.region}
                 </span>
                 {item.is_ofac_hit && (
-                  <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 font-extrabold animate-pulse">
+                  <span className="px-2 py-0.5 rounded bg-negative/10 text-negative border border-negative/30 font-extrabold animate-pulse">
                     OFAC match
                   </span>
                 )}
                 {item.is_threat && (
-                  <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
-                    HIGH THREAT
+                  <span className="px-2 py-0.5 rounded bg-caution/10 text-caution border border-caution/30 font-bold">
+                    High threat
                   </span>
                 )}
                 <span className="text-ink-dim">
-                  via <strong className="text-white">{item.source}</strong>
+                  via <strong className="text-ink">{item.source}</strong>
                 </span>
               </div>
 
               <span
                 className={`px-2 py-0.5 rounded text-micro font-bold ${
                   item.anomaly_score >= 0.8
-                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                    : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                    ? 'bg-negative/10 text-negative border border-negative/30'
+                    : 'bg-caution/10 text-caution border border-caution/30'
                 }`}
               >
-                FSD NOVELTY: {formatPercent(item.anomaly_score, { from: 'ratio', decimals: 0 })}
+                {formatPercent(item.anomaly_score, { from: 'ratio', decimals: 0 })} unusual
               </span>
             </div>
 
@@ -167,7 +176,7 @@ export default function OsintThreatMatrix() {
                 {item.tags.map((t) => (
                   <span
                     key={t}
-                    className="text-cyan-400/80 bg-cyan-950/40 px-1.5 py-0.5 rounded text-micro"
+                    className="text-accent/80 bg-accent-dim px-1.5 py-0.5 rounded text-micro"
                   >
                     #{t}
                   </span>

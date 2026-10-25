@@ -56,7 +56,7 @@ export async function POST(req: NextRequest) {
             { status: 429 },
           );
         }
-      } catch (e) {
+      } catch {
         return NextResponse.json(
           { success: false, error: 'Authentication service unreachable' },
           { status: 503 },
@@ -96,7 +96,7 @@ export async function POST(req: NextRequest) {
     });
 
     return response;
-  } catch (error: any) {
+  } catch {
     return NextResponse.json(
       { success: false, error: 'Authentication service error' },
       { status: 500 },

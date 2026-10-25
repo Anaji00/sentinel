@@ -4,7 +4,7 @@ import React from 'react';
 import useSWR from 'swr';
 import { Database, Zap, Network } from 'lucide-react';
 import { fetcher } from '../../lib/api';
-import { formatAge } from '../../lib/format';
+import { formatDuration } from '../../lib/format';
 import { POLL } from '../ui/DataProvider';
 
 /**
@@ -30,9 +30,9 @@ interface HealthPayload {
 }
 
 const TONE: Record<Health, string> = {
-  healthy: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400',
-  degraded: 'bg-amber-500/15 border-amber-500/30 text-amber-400',
-  down: 'bg-rose-500/15 border-rose-500/30 text-rose-400',
+  healthy: 'bg-positive/10 border-positive/30 text-positive',
+  degraded: 'bg-caution/10 border-caution/30 text-caution',
+  down: 'bg-negative/10 border-negative/30 text-negative',
   unknown: 'bg-slate-700/20 border-line-strong/40 text-ink-dim',
 };
 
@@ -113,7 +113,7 @@ export const ServiceStatusBadges: React.FC<{ components?: string[] }> = ({
 
   const detail =
     typeof freshest === 'number'
-      ? `Last heartbeat ${formatAge(new Date(Date.now() - freshest * 1000).toISOString())} ago`
+      ? `Last heartbeat ${formatDuration(freshest)} ago`
       : null;
 
   return (

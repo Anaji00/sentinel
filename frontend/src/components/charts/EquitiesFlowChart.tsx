@@ -6,7 +6,7 @@ import { describeApiError } from '../../lib/api';
 import { fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
-import { TrendingUp, BarChart2, Radio } from 'lucide-react';
+import { Radio } from 'lucide-react';
 
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { formatPercent } from '../../lib/format';
@@ -41,8 +41,8 @@ export default function EquitiesFlowChart() {
     { refreshInterval: POLL.live },
   );
 
-  const baseSPY = data?.series?.['SPY'] || [];
-  const baseQQQ = data?.series?.['QQQ'] || [];
+  const baseSPY = useMemo(() => data?.series?.['SPY'] || [], [data]);
+  const baseQQQ = useMemo(() => data?.series?.['QQQ'] || [], [data]);
 
   const spySeries = useMemo(() => {
     const list = [...baseSPY];
@@ -167,7 +167,7 @@ export default function EquitiesFlowChart() {
 
   return (
     <Card
-      title="SPY / QQQ EQUITIES RELATIVE PERFORMANCE & VOLUME FLOW"
+      title="S&P 500 vs Nasdaq 100 today"
       badge={
         hasData ? (
           <Badge variant="live" pulse>
@@ -183,18 +183,18 @@ export default function EquitiesFlowChart() {
     >
       <div className="p-4 space-y-3">
         {/* Metric Summary Ribbon */}
-        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-cyan-500/20 text-xs">
+        <div className="grid grid-cols-3 gap-3 bg-inset p-3 rounded-lg border border-line text-xs">
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold">
               SPY (S&P 500 ETF)
             </span>
             <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-cyan-400 font-extrabold text-base">
+              <span className="text-accent font-extrabold text-base">
                 {latestSPY !== null ? `$${latestSPY.toFixed(2)}` : 'AWAITING FEED...'}
               </span>
               {spyPct !== null && (
                 <span
-                  className={`font-bold text-xs ${spyPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                  className={`font-bold text-xs ${spyPct >= 0 ? 'text-positive' : 'text-negative'}`}
                 >
                   {formatPercent(spyPct, { decimals: 2, signed: true })}
                 </span>
@@ -204,15 +204,15 @@ export default function EquitiesFlowChart() {
 
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold">
-              QQQ (NASDAQ 100 ETF)
+              QQQ (Nasdaq 100 ETF)
             </span>
             <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-emerald-400 font-extrabold text-base">
+              <span className="text-positive font-extrabold text-base">
                 {latestQQQ !== null ? `$${latestQQQ.toFixed(2)}` : 'AWAITING FEED...'}
               </span>
               {qqqPct !== null && (
                 <span
-                  className={`font-bold text-xs ${qqqPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                  className={`font-bold text-xs ${qqqPct >= 0 ? 'text-positive' : 'text-negative'}`}
                 >
                   {formatPercent(qqqPct, { decimals: 2, signed: true })}
                 </span>
@@ -222,17 +222,18 @@ export default function EquitiesFlowChart() {
 
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold">
-              SERIES SELECTOR
+              Show
             </span>
             <div className="flex items-center gap-1 mt-1">
               {(['both', 'spy', 'qqq'] as const).map((mode) => (
                 <button
                   key={mode}
                   onClick={() => setActiveSeries(mode)}
+                  aria-pressed={activeSeries === mode}
                   className={`px-2 py-0.5 rounded text-micro uppercase font-bold transition-all cursor-pointer ${
                     activeSeries === mode
-                      ? 'bg-cyan-500/25 text-accent border border-cyan-500/50 glow-cyan'
-                      : 'bg-raised text-ink-dim hover:text-white border border-line'
+                      ? 'bg-accent-dim text-accent border border-line-accent'
+                      : 'bg-raised text-ink-dim hover:text-ink border border-line'
                   }`}
                 >
                   {mode}
@@ -247,10 +248,10 @@ export default function EquitiesFlowChart() {
           <div className="relative bg-page p-3 rounded-lg border border-line overflow-hidden">
             <div className="flex items-center justify-between text-micro text-ink-dim mb-2 font-bold uppercase">
               <span className="flex items-center gap-3">
-                <span className="flex items-center gap-1 text-cyan-400">
+                <span className="flex items-center gap-1 text-accent">
                   <span className="h-2 w-2 rounded-full bg-cyan-400" /> SPY RELATIVE %
                 </span>
-                <span className="flex items-center gap-1 text-emerald-400">
+                <span className="flex items-center gap-1 text-positive">
                   <span className="h-2 w-2 rounded-full bg-emerald-400" /> QQQ RELATIVE %
                 </span>
               </span>
@@ -338,9 +339,9 @@ export default function EquitiesFlowChart() {
             </svg>
           </div>
         ) : (
-          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
-            <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
-            <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
+          <div className="h-44 w-full bg-page rounded-lg border border-dashed border-caution/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
+            <Radio className="w-6 h-6 text-caution animate-pulse" />
+            <span className="text-xs font-bold text-caution uppercase tracking-widest">
               {error
                 ? `SPY / QQQ: ${describeApiError(error)}`
                 : 'AWAITING LIVE DATA STREAM FOR SPY / QQQ EQUITIES'}

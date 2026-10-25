@@ -4,9 +4,17 @@
     {
       "name": "sentinel-frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "cwd": "frontend",
       "port": 3000
+    },
+    {
+      "name": "sentinel-ingress",
+      "url": "http://localhost",
+      "port": 80
     }
   ]
 }

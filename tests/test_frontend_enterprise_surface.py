@@ -173,6 +173,7 @@ NOT_IMPORTED_DIRECTLY = {
     "tailwindcss", "@tailwindcss/postcss",  # build-time, via postcss.config
     "typescript", "eslint", "eslint-config-next", "vitest",
     "@types/node", "@types/react", "@types/react-dom",
+    "@types/leaflet",                       # types only: `import type` from leaflet
 }
 
 

@@ -1,13 +1,16 @@
 """The predictions panel shows the record honestly: shrunk, bounded, calibrated."""
 
+import asyncio
+import datetime as dt
 import pathlib
 import sys
+from typing import Any, List
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from services.api_gateway.routes.predictions import interval, is_stock, summarise  # noqa: E402
+from services.api_gateway.routes.predictions import closes_for, interval, is_stock, summarise  # noqa: E402
 
 
 def test_only_listed_stock_symbols_count() -> None:
@@ -52,3 +55,20 @@ def test_calls_whose_entry_was_not_the_stocks_price_are_excluded() -> None:
     ]
     s = summarise(rows)
     assert s["resolved"] == 1 and s["excluded_invalid"] == 2
+
+
+class _Closes:
+    def __init__(self) -> None:
+        self.args: List[Any] = []
+
+    async def query(self, sql: str, *args: Any) -> List[dict]:
+        self.args = list(args)
+        return [{"day": dt.date(2026, 10, 19), "close": 19.25}, {"day": dt.date(2026, 10, 20), "close": 19.33}]
+
+
+def test_the_stock_page_chart_reads_the_models_daily_closes_oldest_first() -> None:
+    db = _Closes()
+    out = asyncio.run(closes_for("apld", days=90, db=db, user={}))
+    assert db.args == ["APLD", 90]
+    assert out["closes"] == [{"day": "2026-10-19", "close": 19.25}, {"day": "2026-10-20", "close": 19.33}]
+    assert asyncio.run(closes_for("../etc", days=90, db=db, user={}))["closes"] == []

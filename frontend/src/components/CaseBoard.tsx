@@ -161,7 +161,7 @@ function NewCaseDialog({ open, onClose }: { open: boolean; onClose: () => void }
       {...dialog.overlayProps}
     >
       <div
-        className="w-full max-w-lg space-y-4 rounded-2xl border border-line-strong bg-raised p-6 text-ink shadow-2xl"
+        className="w-full max-w-lg space-y-4 rounded-2xl border border-line-strong bg-raised p-6 text-ink"
         {...dialog.panelProps}
       >
         <div className="flex items-center justify-between border-b border-line pb-3">

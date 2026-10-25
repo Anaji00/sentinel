@@ -46,6 +46,8 @@ def test_the_universe_maps_tickers_to_ciks() -> None:
 
 
 def test_the_industry_code_is_read_from_the_submissions_file() -> None:
+    # With the issuer's kind (no annual report on file reads as domestic) and
+    # its state of incorporation, when EDGAR gives one.
     assert history.profile_row("acme", "123", {"sic": "3674", "sicDescription": "Semiconductors"}) == (
-        "ACME", "123", 3674, "Semiconductors")
+        "ACME", "123", 3674, "Semiconductors", "domestic", None)
     assert history.profile_row("acme", "123", {"sic": ""}) is None

@@ -60,8 +60,8 @@ const pct = (v: number | null | undefined, digits = 2): string =>
 
 const toneFor = (v: number | null | undefined): string => {
   if (typeof v !== 'number' || !Number.isFinite(v)) return 'text-ink-mute';
-  if (v > 0) return 'text-emerald-400';
-  if (v < 0) return 'text-rose-400';
+  if (v > 0) return 'text-positive';
+  if (v < 0) return 'text-negative';
   return 'text-ink-dim';
 };
 
@@ -87,8 +87,8 @@ export default function MoversBoard() {
   }, [data?.sector_concentration]);
 
   return (
-    <div className="h-full flex flex-col bg-raised rounded-xl border border-cyan-500/20 overflow-hidden">
-      <div className="flex items-center justify-between px-3.5 py-2 border-b border-cyan-500/15 shrink-0">
+    <div className="h-full flex flex-col bg-raised rounded-xl border border-line overflow-hidden">
+      <div className="flex items-center justify-between px-3.5 py-2 border-b border-line shrink-0">
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-accent animate-pulse" />
           <span className="text-accent font-extrabold tracking-wider uppercase text-micro">
@@ -105,7 +105,7 @@ export default function MoversBoard() {
               onClick={() => setDirection(d)}
               className={`px-2 py-0.5 rounded text-micro uppercase tracking-wide transition-colors ${
                 direction === d
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-400/40'
+                  ? 'bg-accent-dim text-accent border border-line-accent'
                   : 'text-ink-mute border border-transparent hover:text-ink-dim'
               }`}
             >
@@ -116,11 +116,11 @@ export default function MoversBoard() {
       </div>
 
       {sectors.length > 0 && (
-        <div className="px-3.5 py-1.5 border-b border-cyan-500/10 flex flex-wrap gap-2 text-micro shrink-0">
+        <div className="px-3.5 py-1.5 border-b border-line flex flex-wrap gap-2 text-micro shrink-0">
           <span className="text-ink-mute uppercase tracking-wide">Concentration</span>
           {sectors.map(([sector, n]) => (
             <span key={sector} className="text-ink-dim">
-              {sector} <span className="text-cyan-400 font-bold">{n}</span>
+              {sector} <span className="text-accent font-bold">{n}</span>
             </span>
           ))}
         </div>
@@ -129,7 +129,7 @@ export default function MoversBoard() {
       <div className="flex-1 overflow-y-auto">
         {isLoading && <div className="p-4 text-micro text-ink-mute">Reading the sweep…</div>}
         {error && (
-          <div className="p-4 text-micro text-rose-400">
+          <div className="p-4 text-micro text-negative">
             Movers store unavailable. The radar publishes this on each sweep; an empty board before
             the open is a different answer and renders as one.
           </div>
@@ -163,7 +163,7 @@ export default function MoversBoard() {
                 )}
                 {newsJoinRan && unexplained.has(m.ticker) && (
                   <span
-                    className="text-micro uppercase tracking-wider text-amber-400 border border-amber-500/30 rounded px-1"
+                    className="text-micro uppercase tracking-wider text-caution border border-caution/30 rounded px-1"
                     title="No news event named this ticker in the window this platform collected. Not a claim about the world."
                   >
                     no news collected
@@ -205,7 +205,7 @@ export default function MoversBoard() {
         ))}
       </div>
 
-      <div className="px-3.5 py-1.5 border-t border-cyan-500/10 text-micro text-ink-mute shrink-0">
+      <div className="px-3.5 py-1.5 border-t border-line text-micro text-ink-mute shrink-0">
         {newsJoinRan
           ? `News join over ${data?.news_window_hours ?? 24}h of collected events.`
           : 'News join did not run — counts unavailable, which is not the same as no news.'}

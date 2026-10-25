@@ -140,6 +140,17 @@ def _coerce_bar(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         return None
 
+
+# Official consolidated daily bars, newest `limit`, oldest first -- shaped like
+# the continuous aggregates so one row builder reads both.
+DAILY_BARS_SQL = """
+    SELECT * FROM (
+        SELECT day::timestamptz AS bucket_time, open, high, low, close, volume
+        FROM daily_bars WHERE ticker = $1 AND open IS NOT NULL
+        ORDER BY day DESC LIMIT $2
+    ) recent ORDER BY bucket_time ASC
+"""
+
 class _UnsupportedTimeframe(LookupError):
     """A timeframe with no continuous aggregate behind it.
 
@@ -243,14 +254,27 @@ class StrategyBacktester:
                 # from the platform's own store, and fell through to the Redis
                 # cache or an external REST call on every run. 3,464,069 bars
                 # sat unread. The row builder already defaults it from close.
+                # The latest `limit` bars, oldest first. `ORDER BY ... ASC LIMIT`
+                # returned the first bars ever stored, so a 500-bar backtest ran
+                # on history that ended months before today.
                 query = f"""
-                    SELECT bucket_time, open, high, low, close, volume
-                    FROM {target_table}
-                    WHERE ticker = $1
-                    ORDER BY bucket_time ASC
-                    LIMIT $2;
+                    SELECT * FROM (
+                        SELECT bucket_time, open, high, low, close, volume
+                        FROM {target_table}
+                        WHERE ticker = $1
+                        ORDER BY bucket_time DESC
+                        LIMIT $2
+                    ) recent ORDER BY bucket_time ASC;
                 """
-                rows = await self.db.query(query, ticker_upper, limit)
+                rows = []
+                if timeframe == "1d":
+                    # Official consolidated daily bars first. The 1d aggregate
+                    # buckets by UTC day, so its "close" is the last after-hours
+                    # print (NVDA 14 Oct: 217.89 against an official 221.30) and
+                    # its volume is the IEX minute feed's few percent of the tape.
+                    rows = await self.db.query(DAILY_BARS_SQL, ticker_upper, limit) or []
+                if not rows:
+                    rows = await self.db.query(query, ticker_upper, limit)
                 for r in rows:
                     bars.append({
                         "timestamp": r["bucket_time"].isoformat() if hasattr(r["bucket_time"], "isoformat") else str(r["bucket_time"]),
@@ -258,7 +282,9 @@ class StrategyBacktester:
                         "high": float(r["high"]),
                         "low": float(r["low"]),
                         "close": float(r["close"]),
-                        "volume": float(r.get("volume", 0.0)),
+                        # A NULL volume (a quote-sourced bar) raised TypeError
+                        # here and threw away every bar already read.
+                        "volume": float(r.get("volume") or 0.0),
                         "vwap": float(r.get("vwap", r["close"])),
                     })
             except _UnsupportedTimeframe as e:
@@ -494,6 +520,9 @@ class StrategyBacktester:
             )
 
         closes = [b["close"] for b in bars]
+        # Opens, for exits a gap jumps past: a stop the price opens through
+        # fills at the open, not at the stop (nor a target at the target).
+        opens = [b.get("open", b["close"]) for b in bars]
         highs = [b["high"] for b in bars]
         lows = [b["low"] for b in bars]
         timestamps = [b["timestamp"] for b in bars]
@@ -669,12 +698,13 @@ class StrategyBacktester:
                     won = exit_price >= entry_price
                     for k in range(i + 1, exit_idx + 1):
                         if lows[k] <= stop_loss:
-                            exit_price = stop_loss
+                            # min: a bar that opens below the stop fills there.
+                            exit_price = min(opens[k], stop_loss)
                             exit_idx = k
                             won = False
                             break
                         elif highs[k] >= target_price:
-                            exit_price = target_price
+                            exit_price = max(opens[k], target_price)
                             exit_idx = k
                             won = True
                             break
@@ -741,12 +771,13 @@ class StrategyBacktester:
                     won = exit_price >= entry_price
                     for k in range(i + 1, exit_idx + 1):
                         if lows[k] <= stop_loss:
-                            exit_price = stop_loss
+                            # min: a bar that opens below the stop fills there.
+                            exit_price = min(opens[k], stop_loss)
                             exit_idx = k
                             won = False
                             break
                         elif highs[k] >= target_price:
-                            exit_price = target_price
+                            exit_price = max(opens[k], target_price)
                             exit_idx = k
                             won = True
                             break

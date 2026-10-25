@@ -15,7 +15,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import inspect
 import time
 
@@ -1143,6 +1143,9 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     )
 
                     alert_tier = _tier_supported_by(_confidence, alert_tier)
+                    alert_tier = _tier_after_grades(
+                        rule.get("rule_name", "Dynamic AI Rule"), alert_tier,
+                        await _retired_rules(getattr(store, "_redis", None)))
 
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
@@ -1453,6 +1456,45 @@ _TIER_ORDER = [
     AlertTier.CRITICAL, AlertTier.INTELLIGENCE,
     AlertTier.ELEVATED, AlertTier.ALERT, AlertTier.WATCH,
 ]
+
+
+# Rules the producer grades find uninformative against prices
+# (shared/utils/producer_grades.py): over 90 days only the Hawkes rule was
+# followed by bigger moves, while "Geopolitical Cascade" alerts on Microsoft,
+# Nvidia and Apple took the top tier several times a day. Such a rule still
+# fires and is stored, but no higher than ALERT, so the top tiers are kept for
+# rules that have shown they precede something.
+_GRADES_TTL_SEC = 3600
+_GRADES_CACHE: Dict[str, Any] = {"at": 0.0, "retired": set()}
+GRADED_CEILING = "ALERT"
+
+
+async def _retired_rules(redis_client) -> set:
+    if time.time() - _GRADES_CACHE["at"] < _GRADES_TTL_SEC:
+        return _GRADES_CACHE["retired"]
+    retired: set = set()
+    try:
+        from shared.utils.producer_grades import uninformative_rules
+        from shared.utils.signal_store import PRODUCER_GRADES_KEY
+        blob = await redis_client.raw.get(PRODUCER_GRADES_KEY) if redis_client is not None else None
+        if blob:
+            retired = uninformative_rules(json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")))
+    except Exception as e:
+        swallowed("correlation.producer_grades", e, logger)
+    _GRADES_CACHE.update(at=time.time(), retired=retired)
+    return retired
+
+
+def _tier_after_grades(rule_name: str, declared: "AlertTier", retired: set) -> "AlertTier":
+    """The tier, capped at GRADED_CEILING for a rule graded uninformative."""
+    from shared.utils.producer_grades import is_uninformative
+    ceiling = AlertTier[GRADED_CEILING]
+    if not is_uninformative(rule_name, retired):
+        return declared
+    try:
+        return declared if _TIER_ORDER.index(declared) >= _TIER_ORDER.index(ceiling) else ceiling
+    except ValueError:
+        return declared
 
 
 def _tier_supported_by(confidence: float, declared: "AlertTier") -> "AlertTier":
@@ -2378,6 +2420,9 @@ async def main():
                 cascade_cluster.alert_tier = _tier_supported_by(
                     _cas_conf, cascade_cluster.alert_tier
                 )
+                cascade_cluster.alert_tier = _tier_after_grades(
+                    cascade_cluster.rule_name, cascade_cluster.alert_tier,
+                    await _retired_rules(getattr(store, "_redis", None)))
                 if not cascade_cluster.summary_headline:
                     cascade_cluster.summary_headline = f"Cascade Alert: {cascade_cluster.rule_name}"
                 await store.save_correlation(cascade_cluster)
@@ -2559,6 +2604,15 @@ async def main():
                 embedding = await soft_correlator.embed_event(event)
             if embedding and not skip_soft_correlation:
                 await soft_correlator.store(event, embedding)
+                # The news model's live score, once its walk-forward has passed
+                # (services/correlation/news_model_job.py).
+                if getattr(event.type, "value", event.type) == "headline":
+                    try:
+                        from services.correlation import news_model_job
+                        await news_model_job.score_live(getattr(store, "_redis", None), event.headline or "",
+                                                        list(event.tags or []), embedding)
+                    except Exception as _exc:
+                        swallowed("correlation.news_model_live", _exc, logger)
 
                 similar_events = await soft_correlator.find_similar(
                     embedding,
@@ -3183,6 +3237,19 @@ async def main():
             await asyncio.sleep(86400)
 
     safe_create_task(_vector_retention_loop())
+    from services.correlation import news_model_job
+    safe_create_task(news_model_job.run_forever(soft_correlator, redis_client))
+    # FinBERT tone for the stock news feed (services/correlation/stock_news_scorer.py).
+    from services.correlation.stock_news_scorer import StockNewsScorer
+
+    def _embed_headlines(texts):
+        # The soft correlator's sentence model, once it has loaded.
+        model = getattr(soft_correlator, "_model", None)
+        if model is None:
+            return None
+        return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+    safe_create_task(StockNewsScorer(embed=_embed_headlines).run_forever())
     safe_create_task(_rule_candidate_loop())
     safe_create_task(_hawkes_refit_loop())
     safe_create_task(_statistical_discovery_loop())

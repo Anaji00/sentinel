@@ -89,6 +89,18 @@ def test_the_ranker_learns_planted_signal_when_available() -> None:
     assert rep.mean_ic and rep.mean_ic > 0.01
 
 
+def test_the_ranker_is_trained_on_the_whole_day_not_its_top_30() -> None:
+    """LightGBM's LambdaRank defaults weigh only each group's top 30 positions;
+    a quintile book needs the bottom ordered as well as the top."""
+    import pytest
+
+    if not fm.lightgbm_available():
+        pytest.skip("lightgbm not installed here")
+    params = fm._make("lgbm_rank").get_params()
+    assert params["lambdarank_truncation_level"] >= 2000
+    assert params["label_gain"] == list(range(fm.RANK_LABELS))
+
+
 def test_the_service_loads_the_same_panel_in_batches_without_row_tuples() -> None:
     """The engine fills the panel a batch of tickers at a time; it must equal
     the panel built from the full row list, minus names too short to rank."""
@@ -107,7 +119,9 @@ def test_the_service_loads_the_same_panel_in_batches_without_row_tuples() -> Non
                 return [{"ticker": t} for t in sorted(counts) if counts[t] >= args[1]]
             if "DISTINCT day" in sql:
                 return [{"day": d} for d in sorted({r[1] for r in rows})]
-            if "short_interest" in sql or "2.02" in sql or "company_profile" in sql:
+            if ("short_interest" in sql or "2.02" in sql or "company_profile" in sql or "fundamentals" in sql
+                    or "issuer_ticker" in sql or "finra_short_volume" in sql or "vendor_shares" in sql
+                    or "option_iv_history" in sql or "stock_news" in sql):
                 return []
             wanted = set(args[1])
             return [{"ticker": t, "day": d, "close": c, "high": h, "volume": v}
@@ -255,3 +269,214 @@ def test_names_that_are_not_stocks_are_never_ranked() -> None:
     p.extra["not_a_stock"] = mask
     ok = fm._eligible(p, 400)
     assert not ok[p.tickers.index("S010")] and ok[p.tickers.index("S011")]
+
+
+def test_the_book_reports_its_tilts_and_an_industry_neutral_spread() -> None:
+    p = _panel(n=80, T=820, signal=1.0)
+    p.extra["industry"] = np.array([k % 4 for k in range(len(p.tickers))])
+    r = fm.walk_forward(p, "momentum")
+    for k in ("net_beta", "size_tilt_log_dollar_volume", "momentum_tilt", "long_top_industry_share",
+              "industry_neutral_gross_bps", "gross_bps", "size_neutral_gross_bps"):
+        assert k in r.exposures, k
+    assert r.exposures["momentum_tilt"] > 0               # a momentum book is long momentum
+    assert 0 < r.exposures["long_top_industry_share"] <= 1
+
+
+def test_reported_shares_are_scaled_by_later_splits() -> None:
+    from services.agents.factor_engine import split_adjusted_shares
+
+    obs = [(date(2024, 3, 31), 100.0), (date(2024, 6, 30), 101.0), (date(2024, 9, 30), 404.0),
+           (date(2024, 12, 31), 405.0)]
+    adj = dict(split_adjusted_shares(obs))
+    assert adj[date(2024, 3, 31)] == 400.0 and adj[date(2024, 6, 30)] == 404.0     # a 4-for-1 after them
+    assert adj[date(2024, 9, 30)] == 404.0                                          # buyback drift is not a split
+
+
+def test_fundamentals_are_visible_only_after_the_filing_lag_and_feed_the_features() -> None:
+    from services.agents.factor_engine import FUNDAMENTAL_LAG_DAYS, fundamental_arrays
+
+    p = _panel(n=20, T=820)
+    t = p.tickers[3]
+    end = p.dates[300]
+    rows = [{"ticker": t, "concept": "Assets", "period_end": end, "value": 1000.0},
+            {"ticker": t, "concept": "StockholdersEquity", "period_end": end, "value": 400.0},
+            {"ticker": t, "concept": "NetIncomeLoss", "period_end": end, "value": 50.0},
+            {"ticker": t, "concept": "NetCashProvidedByUsedInOperatingActivities", "period_end": end, "value": 80.0},
+            {"ticker": t, "concept": "EntityCommonStockSharesOutstanding", "period_end": end, "value": 10.0}]
+    arrays = fundamental_arrays(p.dates, p.tickers, rows)
+    p.extra.update(arrays)
+    j = p.tickers.index(t)
+    before = p.dates.index(end) + FUNDAMENTAL_LAG_DAYS - 1
+    after = p.dates.index(end) + FUNDAMENTAL_LAG_DAYS
+    assert np.isnan(arrays["assets"][before, j]) and arrays["assets"][after, j] == 1000.0
+    f = fm.features(p)
+    assert abs(f["roa"][after, j] - 0.05) < 1e-6
+    assert abs(f["accruals"][after, j] - (-30 / 1000)) < 1e-6
+    assert abs(f["bm"][after, j] - 400 / (p.close[after, j] * 10)) < 1e-6
+
+
+def test_fundamentals_are_ranked_for_the_board_but_not_trained_on() -> None:
+    """Context features reach the scored output; the model's design never sees them."""
+    assert not set(fm.CONTEXT_FEATURES) & set(fm.FEATURES)
+    assert not set(fm.CONTEXT_FEATURES) & fm.OPTIONAL_FEATURES
+    p = _panel(signal=1.0)
+    feats = fm.features(p)
+    rng = np.random.default_rng(1)
+    feats["bm"] = rng.normal(size=feats["mom_12_1"].shape).astype(feats["mom_12_1"].dtype)
+    scores = fm.score_latest(p, "momentum", feats=feats)
+    ranks = [v["features"].get("bm") for v in scores.values()]
+    assert scores and all(r is not None and -0.5 <= r <= 0.5 for r in ranks)
+    assert all("roa" not in v["features"] for v in scores.values())    # absent stays absent
+
+
+def test_the_primary_horizon_is_the_one_with_evidence_not_the_best_sharpe() -> None:
+    """8 Oct 2026: monthly Sharpe 0.92 at t 1.59 outranked weekly 0.83 at t 2.81."""
+    per_h = {
+        "monthly": {"support": None, "net_sharpe": 0.92},
+        "weekly": {"support": "supported", "net_sharpe": 0.83},
+        "daily": {"support": "supported", "net_sharpe": 0.50},
+    }
+    assert fm.rank_horizons(per_h) == ["weekly", "daily", "monthly"]
+    per_h["daily"]["support"] = "validated"
+    assert fm.rank_horizons(per_h)[0] == "daily"
+
+
+def test_composites_rank_within_industry_and_carry_their_signs() -> None:
+    """Quality counts high accruals against a name; value is industry-relative."""
+    T, N = 3, 8
+    good = np.tile(np.arange(N, dtype=np.float32), (T, 1))
+    comp = fm._composite([good, good], [1, 1])
+    assert np.all(np.diff(comp[0]) > 0)
+    flipped = fm._composite([good], [-1])
+    assert np.all(np.diff(flipped[0]) < 0)
+    ind = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    rel = fm._industry_relative(comp, ind)
+    assert abs(float(np.nanmean(rel[0, :4]))) < 0.2 and abs(float(np.nanmean(rel[0, 4:]))) < 0.2
+    assert set(["gpa", "cfp", "sp", "value_ind", "quality_ind"]) <= set(fm.features(_panel()))
+
+
+def test_overnight_and_intraday_returns_are_split_point_in_time() -> None:
+    """A stock that gains only between the close and the next open has positive
+    overnight momentum and no intraday return; the past never changes."""
+    p = _panel()
+    T, N = p.close.shape
+    up = np.full((T, N), np.nan, dtype=np.float32)
+    up[:] = p.close                                      # opens equal closes: no overnight move...
+    j = 3
+    closes = 100.0 * np.exp(0.002 * np.arange(T))       # ...except name j, which gaps up 0.2% every night
+    p.close[:, j] = closes
+    up[1:, j] = closes[1:]                               # opens at the new level, flat through the day
+    up[1:, :] = np.where(np.arange(N) == j, up[1:, :], p.close[:-1, :])
+    p.extra["open"] = up
+    f = fm.features(p)
+    assert f["mom_on_12_1"][-1, j] > 0.4 and abs(f["id_21"][-1, j]) < 1e-5
+    q = fm.Panel(p.dates[:-5], p.tickers, p.close[:-5], p.high[:-5], p.volume[:-5], {"open": up[:-5]})
+    g = fm.features(q)
+    for name in ("mom_on_12_1", "id_21"):
+        assert np.allclose(f[name][:-5], g[name], equal_nan=True), name
+
+
+def test_the_average_combines_every_candidate_by_rank() -> None:
+    """Each member fitted on the same rows; the prediction is their mean rank."""
+    p = _panel(signal=1.0)
+    rep = fm.walk_forward(p, "avg")
+    assert rep.dates > 0 and rep.mean_ic is not None
+    est = fm._make("avg")
+    names = [n for n, _ in est.members]
+    assert names[-3:] == ["gbm", "ridge", "momentum"]
+    scores = fm.score_latest(p, "avg")
+    assert scores and all(-0.5 <= v["score"] <= 0.5 for v in scores.values())
+
+
+def test_the_universe_is_the_most_liquid_names_and_shorts_must_be_borrowable(monkeypatch) -> None:
+    p = _panel(n=90)
+    monkeypatch.setattr(fm, "TOP_LIQUID_NAMES", 30)
+    p.extra.pop("_tradable", None)
+    mask = fm.tradable(p)
+    assert mask[-1].sum() <= 30 + 1                       # +1: the market, never ranked anyway
+    pred = np.linspace(-1, 1, 10)
+    cols = np.arange(10)
+    p.extra["borrowable"] = np.array([k % 2 == 0 for k in range(p.close.shape[1])])
+    shortable = fm._shortable_pred(p, pred, cols)
+    short = fm._buffered_book(shortable, cols, set(), -1)
+    assert all(cols[k] % 2 == 0 for k in short)            # never a name the broker will not lend
+
+
+def test_context_interactions_are_point_in_time_and_switch_with_the_regime() -> None:
+    """Beta's sign in the score flips with the market's trend; nothing reads ahead."""
+    p = _panel()
+    T = len(p.dates)
+    p.extra["ctx_TLT"] = (100.0 * np.exp(0.0005 * np.arange(T))).astype(np.float32)
+    p.extra["ctx_HYG"] = (80.0 * np.exp(-0.0002 * np.arange(T))).astype(np.float32)
+    f = fm.features(p)
+    for k in ("beta_x_trend", "ratebeta_x_rates", "mom_x_vol", "beta_x_credit"):
+        assert np.isfinite(f[k][-1]).sum() > 10, k
+    q = fm.Panel(p.dates[:-7], p.tickers, p.close[:-7], p.high[:-7], p.volume[:-7],
+                 {"ctx_TLT": p.extra["ctx_TLT"][:-7], "ctx_HYG": p.extra["ctx_HYG"][:-7]})
+    g = fm.features(q)
+    for k in ("beta_x_trend", "ratebeta_x_rates", "mom_x_vol", "beta_x_credit"):
+        assert np.allclose(f[k][:-7], g[k], equal_nan=True), k
+    z = fm._expanding_z(np.array([1.0] * 300 + [5.0]))
+    assert z[-1] > 3 and not np.isfinite(z[0])
+
+
+def test_the_tradable_subset_keeps_every_ranked_column_and_the_market() -> None:
+    panel = _panel(signal=1.0)
+    small = fm.tradable_subset(panel)
+    mask = fm.tradable(panel)
+    kept = {panel.tickers[i] for i in range(len(panel.tickers)) if mask[:, i].any()}
+    assert set(small.tickers) >= kept and small.close.shape[1] == len(small.tickers)
+
+
+def test_training_targets_strip_the_market_then_the_industry() -> None:
+    days = [date(2026, 1, 1) + timedelta(days=k) for k in range(3)]
+    # SPY +10%; A and B (one industry, with C, D) +20% and +10%; E unknown industry.
+    close = np.array([[100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+                      [110.0, 120.0, 110.0, 110.0, 110.0, 110.0],
+                      [110.0, 120.0, 110.0, 110.0, 110.0, 110.0]])
+    p = fm.Panel(days, ["SPY", "A", "B", "C", "D", "E"], close, close, np.ones_like(close),
+                 {"industry": np.array([-1, 0, 0, 0, 0, -1])})
+    beta = np.full(close.shape, 2.0)
+    feats = {"beta_126": beta}
+    m = np.log(1.1)
+    ex = fm.training_target(p, 1, feats, "excess")
+    adj = fm.training_target(p, 1, feats, "beta_adj")
+    ind = fm.training_target(p, 1, feats, "industry")
+    assert abs(ex[0, 1] - (np.log(1.2) - m)) < 1e-12
+    assert abs(adj[0, 1] - (np.log(1.2) - 2 * m)) < 1e-12           # beta 2 owes twice the market's move
+    assert abs(ind[0, 1] - (np.log(1.2) - np.log(1.1))) < 1e-6       # less its peers' (B, C, D) average
+    assert abs(ind[0, 5] - adj[0, 5]) < 1e-6                         # no industry: beta-adjusted only (float32)
+    # Without a beta there is nothing to adjust by: the plain excess return.
+    assert np.allclose(fm.training_target(p, 1, {}, "industry")[0], ex[0], equal_nan=True)
+
+
+def test_share_issuance_is_the_years_log_change_in_shares() -> None:
+    T = 300
+    days = [date(2025, 1, 1) + timedelta(days=k) for k in range(T)]
+    close = np.full((T, 2), 10.0)
+    shares = np.column_stack([np.full(T, 100.0), np.linspace(100.0, 130.0, T)])
+    p = fm.Panel(days, ["AAA", "BBB"], close, close, np.ones_like(close), {"shares_adj": shares})
+    f = fm.features(p)
+    assert np.isnan(f["issuance"][251, 0])                      # not before a year of shares
+    assert abs(f["issuance"][260, 0]) < 1e-9                    # unchanged count
+    assert abs(f["issuance"][299, 1] - np.log(shares[299, 1] / shares[47, 1])) < 1e-5
+    assert "issuance" in fm.CONTEXT_FEATURES and "issuance" not in fm.FEATURES
+
+
+def test_the_two_sided_ranker_and_the_two_model_average_learn_an_order() -> None:
+    if not fm.lightgbm_available():
+        return
+    rng = np.random.default_rng(5)
+    days, per = 30, 200
+    X = rng.normal(size=(days * per, len(fm.FEATURES)))
+    d = np.repeat(np.arange(days), per)
+    signal = X[:, 0] - 0.5 * X[:, 1]
+    y = np.concatenate([fm._rank(signal[d == k] + rng.normal(scale=1.0, size=per)) for k in range(days)])
+    test = rng.normal(size=(per, len(fm.FEATURES)))
+    truth = test[:, 0] - 0.5 * test[:, 1]
+    for name in ("lgbm_rank2", "avg2"):
+        est = fm._make(name)
+        fm._fit(name, est, X, y, d)
+        pred = fm._predict(name, est, test)
+        assert pred.shape == (per,) and np.all(np.isfinite(pred))
+        assert fm._spearman(pred, truth) > 0.5, name

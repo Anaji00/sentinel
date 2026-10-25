@@ -32,10 +32,10 @@ import sys
 import feedparser
 import time
 import websockets
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +47,8 @@ from shared.utils.options_positioning import (
     IV_MAX_DAYS, IV_MIN_DAYS, POSITIONING_TTL_SEC, iv_measures, positioning_key,
     summarize as summarize_positioning,
 )
-from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, quote_key
+from shared.utils import options_flow as ofl
+from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
 from shared.kafka import SentinelProducer, Topics
 from shared.utils.source_freshness import mark_source_filtered
 from shared.utils.market_session import (
@@ -183,6 +184,25 @@ def _option_trade_time(latest_trade: dict) -> Optional[datetime]:
     except ValueError:
         return None
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+_LAST_TICK: Dict[str, str] = {}
+
+
+def classify_tick(ticker: str, price: float, last_prices: Dict[str, float]) -> str:
+    """Tick test with the zero-tick rule (Lee & Ready 1991): a trade at the
+    last price takes the direction of the last price change. Measured 8 Oct
+    2026: 53% of blocks were left neutral without it, so most of the market's
+    block flow had no side."""
+    prev = last_prices.get(ticker)
+    last_prices[ticker] = price
+    if prev is None:
+        return "ZeroTick"
+    if price > prev:
+        _LAST_TICK[ticker] = "UpTick"
+    elif price < prev:
+        _LAST_TICK[ticker] = "DownTick"
+    return _LAST_TICK.get(ticker, "ZeroTick")
 
 
 def _is_block_trade(ticker: str, notional: float) -> bool:
@@ -427,6 +447,28 @@ def _is_form4(title: str) -> bool:
 # SEC fair access allows ten requests a second and this loop already spends one
 # on the feed. Bounded so a burst of filings cannot turn a poll into a crawl.
 FORM4_DOC_TIMEOUT_SEC = float(os.getenv("FORM4_DOC_TIMEOUT_SEC", "10"))
+
+
+_INSIDER_PRIOR_SQL = """
+    SELECT traded FROM insider_transactions WHERE owner_cik = ANY($1::text[]) AND traded >= $2::date AND traded < $3::date
+"""
+
+
+async def _insider_class(parsed) -> Optional[str]:
+    """Routine or opportunistic (shared/utils/insider_history.py) for a live
+    filing's open-market trades, from its insiders' trades in the SEC data set
+    history; None when the filing has none or the insiders lack three years."""
+    from shared.db import get_timescale
+    from shared.utils import insider_history as ih
+
+    if not parsed.get("has_open_market_activity"):
+        return None
+    ciks = [o["cik"] for o in parsed.get("owners") or [] if o.get("cik")]
+    if not ciks:
+        return None
+    today = datetime.now(timezone.utc).date()
+    rows = await (await get_timescale()).query(_INSIDER_PRIOR_SQL, ciks, date(today.year - ih.CLASSIFY_YEARS, 1, 1), today)
+    return ih.classify(today, [r["traded"] for r in rows or []], bool(parsed.get("planned_10b5_1")))
 
 
 def _primary_role(owners) -> str:
@@ -679,6 +721,10 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     "planned_10b5_1": parsed.get("planned_10b5_1", False),
                 })
                 try:
+                    payload["insider_class"] = await _insider_class(parsed)
+                except Exception as e:
+                    swallowed("collector_tradfi.insider_class", e, logger)
+                try:
                     await _link_insiders(producer, parsed)
                 except Exception as e:
                     swallowed("collector_tradfi.insider_link", e, logger)
@@ -695,6 +741,20 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
 
 
 # ── OHLCV MINUTE BAR AGGREGATOR ───────────────────────────────────────────────
+
+# How long after a minute closes the buffer is flushed: late prints for the
+# minute still land in it, and the next minute has barely started.
+FLUSH_GRACE_SEC = 0.5
+
+
+def minute_bar_start(flushed_at: datetime) -> datetime:
+    """The minute a bar flushed just after a clock minute covers."""
+    return flushed_at.replace(second=0, microsecond=0) - timedelta(minutes=1)
+
+
+def seconds_to_next_minute(now: datetime) -> float:
+    return 60.0 - (now.second + now.microsecond / 1e6)
+
 
 class OHLCVAggregator:
     """Builds true Open, High, Low, Close, Volume candles and stores them in Redis and Kafka."""
@@ -785,8 +845,35 @@ class OHLCVAggregator:
             d["pv_sum"] = d["pv_sum"] + price * volume
             d["N"] = d.get("N", 1) + 1
 
-    async def flush(self):
-        now = datetime.now(timezone.utc)
+    def add_bar(self, ticker: str, open_p, high_p, low_p, close_p: float, volume: float):
+        """Fold a vendor bar in with its full range; a bar missing any of open,
+        high or low is only a print at its close."""
+        try:
+            o, h, lo = float(open_p), float(high_p), float(low_p)
+        except (TypeError, ValueError):
+            self.add_trade(ticker, close_p, volume)
+            return
+        if not (o > 0 and h > 0 and lo > 0 and lo <= min(o, close_p) and h >= max(o, close_p)):
+            self.add_trade(ticker, close_p, volume)
+            return
+        d = self.buffer.get(ticker)
+        if d is None:
+            self.buffer[ticker] = {"O": o, "H": h, "L": lo, "C": close_p, "V": volume,
+                                   "pv_sum": close_p * volume, "N": 1}
+            return
+        d["H"] = max(d["H"], h)
+        d["L"] = min(d["L"], lo)
+        d["C"] = close_p
+        d["V"] = d["V"] + volume
+        d["pv_sum"] = d["pv_sum"] + close_p * volume
+        d["N"] = d.get("N", 1) + 1
+
+    async def flush(self, bar_start: Optional[datetime] = None):
+        # Stamped at the start of the minute the trades fell in, not at the
+        # moment of the flush. Flush-time stamps (09:29:14.385) never met the
+        # vendor's 09:29:00 bar for the same minute, so both were kept and every
+        # rollup summed the minute twice; aligned, the two upsert into one row.
+        now = bar_start or minute_bar_start(datetime.now(timezone.utc))
         session_name, _ = get_market_session()
         count = 0
 
@@ -919,7 +1006,9 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                     REDIS_EQUITIES_KEY, 0, FINNHUB_SUBSCRIPTION_LIMIT * 2
                 )
                 decoded_tickers = [t.decode('utf-8') if isinstance(t, bytes) else t for t in raw_tickers]
-                discovered = [t.upper() for t in decoded_tickers if is_valid_primary_equity(t)]
+                # The portfolio's live focus ahead of the radar's discoveries:
+                # after the core anchors, the ticks go where the money is.
+                discovered = [t.upper() for t in list(LIVE_FOCUS) + decoded_tickers if is_valid_primary_equity(t)]
 
                 # Core anchors first, discoveries after -- and the result is
                 # already clamped to the Finnhub limit by construction, so the
@@ -969,6 +1058,8 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
 
                 if to_add or to_remove:
                     current_subs = desired_subs
+                    FINNHUB_SUBSCRIBED.clear()
+                    FINNHUB_SUBSCRIBED.update(current_subs)
                     logger.info(f"📈 Finnhub: Synced subscriptions ({len(current_subs)}/50 limit): {', '.join(sorted(current_subs))}")
 
                 session_name, session_detail = get_market_session()
@@ -991,9 +1082,13 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                 await asyncio.sleep(60)
 
     async def flush_aggregator():
-        """Timer task to flush the minute-bar buffer."""
+        """Timer task to flush the minute-bar buffer, on clock minutes.
+
+        A plain sixty-second sleep drifted from whenever the collector started,
+        so each bar straddled two clock minutes. Waking just after each minute
+        closes makes the buffer hold that minute's trades."""
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(seconds_to_next_minute(datetime.now(timezone.utc)) + FLUSH_GRACE_SEC)
             try:
                 await aggregator.flush()
             except Exception as e:
@@ -1062,14 +1157,7 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
                                 notional = price * volume
                                 msg_counter["trades"] += 1
 
-                                prev_price = last_prices.get(ticker)
-                                if prev_price is None or price == prev_price:
-                                    tick_direction = "ZeroTick"
-                                elif price > prev_price:
-                                    tick_direction = "UpTick"
-                                else:
-                                    tick_direction = "DownTick"
-                                last_prices[ticker] = price
+                                tick_direction = classify_tick(ticker, price, last_prices)
 
                                 aggregator.add_trade(ticker, price, volume)
 
@@ -1106,7 +1194,7 @@ async def stream_equities(producer: SentinelProducer, redis_client, aggregator: 
 # ── ALPACA EXTENDED-HOURS EQUITIES (PRE-MARKET & AFTER-HOURS REST POLLER) ───
 
 # Watched names beyond the socket's fifty, polled by snapshot in regular hours.
-OVERFLOW_SNAPSHOT_LIMIT = int(os.getenv("ALPACA_OVERFLOW_SYMBOLS", "150"))
+OVERFLOW_SNAPSHOT_LIMIT = int(os.getenv("ALPACA_OVERFLOW_SYMBOLS", "300"))
 
 
 def overflow_symbols(watched_newest_first, limit: int = OVERFLOW_SNAPSHOT_LIMIT, extra=()) -> list:
@@ -1144,15 +1232,84 @@ _ATTENTION_SQL = """
 """
 
 
-async def _attention_tickers() -> list:
-    """Tickers with a scored market event in the last two hours, strongest first."""
+async def _attention_tickers(redis_client=None) -> list:
+    """Names the platform is acting on, which must be priced live whatever the
+    watchlist holds: today's trade ideas first, then names with a scored market
+    event in the last two hours, then the top of the signal board.
+
+    On 8 October MU was a long in the weekly ideas and had no bar for hours: it
+    had left the watchlist and drawn no fresh event, so nothing priced it."""
+    out: list = []
+
+    def add(ts) -> None:
+        for t in ts:
+            t = str(t or "").upper()
+            if t and t not in out:
+                out.append(t)
+
+    raw = getattr(redis_client, "raw", redis_client) if redis_client is not None else None
+    if raw is not None:
+        try:
+            from shared.utils.signal_store import RECOMMENDATIONS_KEY
+            rec = json.loads(await raw.get(RECOMMENDATIONS_KEY) or "{}")
+            add(i.get("ticker") for h in (rec.get("horizons") or {}).values() for i in h.get("ideas", []))
+        except Exception as e:
+            swallowed("collector.tradfi.attention_ideas", e, logger)
     try:
         from shared.db import get_timescale
         db = await get_timescale()
-        return [str(r["ticker"]).upper() for r in await db.query(_ATTENTION_SQL) or [] if r["ticker"]]
+        add(r["ticker"] for r in await db.query(_ATTENTION_SQL) or [])
     except Exception as e:
         swallowed("collector.tradfi.attention_tickers", e, logger)
-        return []
+    if raw is not None:
+        try:
+            from shared.utils.signal_store import SIGNAL_MATRIX_INDEX_KEY
+            board = json.loads(await raw.get(SIGNAL_MATRIX_INDEX_KEY) or "{}").get("board", [])
+            add(b.get("ticker") for b in sorted(board, key=lambda b: -abs(b.get("net") or 0))[:100])
+        except Exception as e:
+            swallowed("collector.tradfi.attention_board", e, logger)
+    return out
+
+
+SNAPSHOT_BATCH = 100
+
+
+def _dns_cached_connector() -> aiohttp.TCPConnector:
+    """Resolved addresses kept five minutes, as news, radar and the agents keep
+    them. Docker's resolver on this host has failed in bursts (8 Oct, 18:16-18:26
+    and 18:57 UTC); with aiohttp's ten-second default every poll in a burst failed."""
+    return aiohttp.TCPConnector(ttl_dns_cache=300)
+
+
+class _snapshot_batches:
+    """Snapshots for any number of symbols, a hundred per request, presented as
+    one response (status, json, text) so the caller is unchanged."""
+
+    def __init__(self, session, symbols, feed: str):
+        self.session, self.symbols, self.feed = session, list(symbols), feed
+        self.status, self._data, self._text = 0, {}, ""
+
+    async def __aenter__(self):
+        for k in range(0, len(self.symbols), SNAPSHOT_BATCH):
+            chunk = self.symbols[k:k + SNAPSHOT_BATCH]
+            url = (f"https://data.alpaca.markets/v2/stocks/snapshots?symbols={','.join(chunk)}"
+                   f"&feed={self.feed}")
+            async with self.session.get(url) as resp:
+                if resp.status == 200:
+                    self._data.update(await resp.json() or {})
+                    self.status = 200
+                elif self.status != 200:
+                    self.status, self._text = resp.status, await resp.text()
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self):
+        return self._data
+
+    async def text(self):
+        return self._text
 
 
 async def poll_extended_hours_equities(producer: SentinelProducer, redis_client, aggregator: OHLCVAggregator):
@@ -1180,7 +1337,8 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
     last_prices = {}
 
     session_timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=session_timeout, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=session_timeout, headers=headers,
+                                     connector=_dns_cached_connector()) as session:
         while True:
             try:
                 session_name, session_detail = get_market_session()
@@ -1225,7 +1383,7 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                     # watchlist keeps fifty, so a name carrying the day's flow
                     # can have dropped off it while the flow is still news.
                     if time.time() - _attention_cache["at"] > ATTENTION_REFRESH_SEC:
-                        _attention_cache["tickers"] = await _attention_tickers()
+                        _attention_cache["tickers"] = await _attention_tickers(redis_client)
                         _attention_cache["at"] = time.time()
                     snapshot_symbols = overflow_symbols(
                         [t for t in watched if is_valid_primary_equity(t)],
@@ -1240,8 +1398,7 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
                             "symbology, and one of them 400s the whole batch.",
                             ", ".join(_rejected),
                         )
-                    url = f"https://data.alpaca.markets/v2/stocks/snapshots?symbols={','.join(snapshot_symbols)}&feed={feed}"
-                    async with session.get(url) as resp:
+                    async with _snapshot_batches(session, snapshot_symbols, feed) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             ingested_count = 0
@@ -1266,16 +1423,12 @@ async def poll_extended_hours_equities(producer: SentinelProducer, redis_client,
 
                                 notional = price * volume
 
-                                prev_price = last_prices.get(ticker)
-                                if prev_price is None or price == prev_price:
-                                    tick_dir = "ZeroTick"
-                                elif price > prev_price:
-                                    tick_dir = "UpTick"
-                                else:
-                                    tick_dir = "DownTick"
-                                last_prices[ticker] = price
+                                tick_dir = classify_tick(ticker, price, last_prices)
 
-                                aggregator.add_trade(ticker, price, volume)
+                                # A vendor minute bar keeps its own open, high and
+                                # low; folded in as one trade at the close it
+                                # became a flat bar (202 of AMD's 249 on 14 Oct).
+                                aggregator.add_bar(ticker, bar.get("o"), bar.get("h"), bar.get("l"), price, volume)
                                 ingested_count += 1
 
                                 # A minute bar is not a print: in regular hours its
@@ -1358,6 +1511,10 @@ _declare("options.open_interest.resolved",
 # shape as one nothing ever calls. Separating them makes the difference
 # legible: "asked 400, resolved 0" is a provider problem, "asked 0" is a
 # wiring problem, and finding 570 could not tell which it was.
+# How often a print's side can be read on the delayed feed (options_flow.aggressor):
+# the bought and opening option families have data only for these.
+_declare("options.side.classified", "an option print was read as bought or sold from its quote")
+_declare("options.side.unknown", "an option print's quote was too old, or the print sat inside it")
 _declare("options.open_interest.asked",
          "a contract cleared the size gate and open interest was requested")
 
@@ -1564,6 +1721,44 @@ async def _record_option_positioning(session, redis_client, ticker: str, snapsho
     )
 
 
+async def _options_opening_loop(session, producer: SentinelProducer, redis_client) -> None:
+    """Each session morning: which of yesterday's bought prints opened a
+    position. Open interest is published overnight, so the morning figure
+    includes the print's own day; a rise of at least half its size means the
+    buyer opened rather than closed (shared/utils/options_flow.py). Each
+    confirmation is published as an options_flow event stamped now, tagged
+    opening_confirmed, so the study measures from when it was knowable."""
+    raw = redis_client.raw
+    while True:
+        try:
+            now_ny = datetime.now(ZoneInfo("America/New_York"))
+            if now_ny.weekday() < 5 and (now_ny.hour, now_ny.minute) >= (9, 35) and now_ny.hour < 16:
+                for contract, blob in (await raw.hgetall(ofl.PENDING_OI_KEY) or {}).items():
+                    contract = contract.decode() if isinstance(contract, bytes) else contract
+                    item = json.loads(blob)
+                    traded = datetime.fromisoformat(item["trade_at"]).astimezone(ZoneInfo("America/New_York")).date()
+                    if traded >= now_ny.date():
+                        continue
+                    oi_after = await _contract_open_interest(session, redis_client, contract)
+                    verdict = ofl.opened(item.get("oi_before"), oi_after, float(item.get("size") or 0))
+                    if verdict is None and (now_ny.date() - traded).days <= ofl.PENDING_MAX_AGE_DAYS:
+                        continue
+                    if verdict:
+                        payload = {k: v for k, v in item.items() if k not in ("oi_before", "trade_at")}
+                        payload.update(opening_confirmed=True, open_interest=oi_after, oi_before=item.get("oi_before"),
+                                       traded_at=item["trade_at"])
+                        event = RawEvent(source="alpaca_options", occurred_at=datetime.now(timezone.utc),
+                                         raw_payload=payload)
+                        await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=item.get("ticker"))
+                    await raw.hdel(ofl.PENDING_OI_KEY, contract)
+        except Exception as e:
+            swallowed("collector.tradfi.options_opening", e, logger)
+        await asyncio.sleep(30 * 60)
+
+
+OPTIONS_POLL_SLEEP_SEC = 60
+
+
 async def poll_options(producer: SentinelProducer, redis_client):
     """
     Polls Alpaca's options snapshot API for the watched symbols.
@@ -1582,7 +1777,11 @@ async def poll_options(producer: SentinelProducer, redis_client):
     }
 
     session_timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=session_timeout, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=session_timeout, headers=headers,
+                                     connector=_dns_cached_connector()) as session:
+        safe_create_task(_options_opening_loop(session, producer, redis_client), name="options-opening")
+        # Quotes as polled, so a delayed print meets the quote of its own moment.
+        tape = ofl.QuoteTape()
         while True:
             total_sweeps = 0
             # Contracts this cycle actually looked at, counted here because the
@@ -1622,6 +1821,16 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 swallowed("collector.tradfi.options_positioning", e, logger)
 
                             count = 0
+                            try:
+                                spot = parse_quote(await redis_client.raw.get(quote_key(ticker)))
+                            except Exception as e:
+                                spot = None
+                                swallowed("collector.tradfi.options_spot", e, logger)
+                            polled_at = datetime.now(timezone.utc)
+                            for contract, snapshot in snapshots.items():
+                                lq = snapshot.get("latestQuote") or {}
+                                if lq and ((snapshot.get("dailyBar") or {}).get("v") or 0) > 0:
+                                    tape.record(contract, _option_trade_time(lq) or polled_at, lq.get("bp"), lq.get("ap"))
                             for contract, snapshot in snapshots.items():
                                 contracts_seen += 1
                                 latest_trade = snapshot.get("latestTrade")
@@ -1655,11 +1864,20 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                     latest_trade.get("s", latest_trade.get("size")) or 0.0
                                 )
                                 premium = price * size * 100.0
+                                occ = parse_occ_option_symbol(contract) or {}
+                                # The money paid for direction: premium above
+                                # intrinsic value (shared/utils/options_flow.py).
+                                # Deep in-the-money prints, mostly intrinsic,
+                                # filled the board without saying anything about
+                                # where the buyer thinks the stock goes.
+                                extrinsic = ofl.extrinsic_premium(
+                                    price, size, occ.get("option_type", "CALL"), occ.get("strike"), spot)
 
                                 # Money spent, not contract count. `or size >= 100`
                                 # let 100 contracts at $0.05 -- $500 of premium --
                                 # through as a sweep, and most of the panel was that.
-                                if premium >= 50000.0:
+                                # Extrinsic where the spot is known, total otherwise.
+                                if (extrinsic if extrinsic is not None else premium) >= ofl.MIN_EXTRINSIC_USD:
                                     # One fill, published once.
                                     #
                                     # latestTrade is the contract's last trade,
@@ -1716,10 +1934,20 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                     ).total_seconds() > OPTION_TRADE_MAX_AGE_SEC:
                                         continue
 
-                                    parsed = parse_occ_option_symbol(contract) or {}
+                                    parsed = occ
                                     opt_type = parsed.get("option_type", "CALL")
                                     strike_val = parsed.get("strike")
                                     expiry_val = parsed.get("expiry")
+                                    quote = snapshot.get("latestQuote") or {}
+                                    quote_at = _option_trade_time(quote) if quote else None
+                                    # The quote that stood when the print happened, from the
+                                    # tape; the snapshot's own quote is fifteen minutes newer.
+                                    then = tape.at(contract, trade_at) if trade_at is not None else None
+                                    if then is not None:
+                                        side = ofl.aggressor(price, then[0], then[1], trade_at, then[2])
+                                    else:
+                                        side = ofl.aggressor(price, quote.get("bp"), quote.get("ap"), trade_at, quote_at)
+                                    _fired("options.side.classified" if side else "options.side.unknown")
                                     greeks_val = snapshot.get("greeks") or {}
                                     iv_val = snapshot.get("impliedVolatility") if snapshot.get("impliedVolatility") is not None else snapshot.get("implied_volatility")
                                     oi_val = snapshot.get("openInterest") if snapshot.get("openInterest") is not None else snapshot.get("open_interest")
@@ -1750,9 +1978,22 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                             "implied_volatility": float(iv_val) if iv_val is not None else None,
                                             "open_interest": int(oi_val) if oi_val is not None else None,
                                             "greeks": greeks_val,
+                                            "underlying_price": spot,
+                                            "extrinsic_premium_usd": round(extrinsic, 2) if extrinsic is not None else None,
+                                            "intrinsic_share": ofl.intrinsic_share(price, opt_type, strike_val, spot),
+                                            "aggressor": side,
                                         }
                                     )
                                     await producer.send(Topics.RAW_TRADFI, event.model_dump(), key=ticker)
+                                    # Bought (or side unknown) with open interest
+                                    # on record: checked next morning for an opening.
+                                    if oi_val is not None and side != "sell" and trade_at is not None:
+                                        try:
+                                            await redis_client.raw.hset(ofl.PENDING_OI_KEY, contract, json.dumps(
+                                                {**event.raw_payload, "oi_before": int(oi_val),
+                                                 "trade_at": trade_at.isoformat()}, default=str))
+                                        except Exception as e:
+                                            swallowed("collector.tradfi.options_pending_oi", e, logger)
                                     _collector_metrics("collector-tradfi").ingested()
                                     count += 1
                                     total_sweeps += 1
@@ -1769,6 +2010,7 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                 logger.error(f"Alpaca API options snapshots for {ticker} returned {resp.status}: {text}")
 
                 _prune_option_fingerprints()
+                tape.prune(datetime.now(timezone.utc))
                 # "Contracts tracked" reported `len(_last_option_trade)`, which
                 # is the IN-PROCESS FALLBACK map -- populated only when Redis is
                 # unavailable. With Redis healthy it is empty by design, so the
@@ -1786,7 +2028,10 @@ async def poll_options(producer: SentinelProducer, redis_client):
             except Exception as e:
                 logger.error(f"Error in Options flow collector: {e}", exc_info=True)
 
-            await asyncio.sleep(300)
+            # Every minute, not every five: the tape's quotes must sit close to
+            # the prints they classify. Fifty snapshot calls a minute against the
+            # account's two hundred.
+            await asyncio.sleep(OPTIONS_POLL_SLEEP_SEC)
 
 
 async def run_polling(producer: SentinelProducer, redis_client):
@@ -1832,7 +2077,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
     watchlist_inject_days = int(os.getenv("EARNINGS_WATCHLIST_INJECT_DAYS", "3"))
 
     session_timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+    async with aiohttp.ClientSession(timeout=session_timeout, connector=_dns_cached_connector()) as session:
         while True:
             try:
                 today = datetime.now(timezone.utc).date()
@@ -2404,7 +2649,10 @@ SIGNAL_BACKFILL_FIRST_DELAY_SEC = 15 * 60
 # Every listed, tradable US name, screened for liquidity before it is loaded deep.
 VALID_EQUITIES_KEY = "sentinel:equities:valid_set"      # written by collector-radar from Alpaca assets
 DAILY_ILLIQUID_KEY = "sentinel:daily_bars:illiquid"
-ILLIQUID_RECHECK_SEC = 30 * 86400
+# Weekly. Monthly left a name that turned liquid (a squeeze, a new listing:
+# IQMM traded $443M on 7 Oct) without daily bars for up to thirty days; the
+# rescreen is ~140 small requests, cheap at any cadence.
+ILLIQUID_RECHECK_SEC = 7 * 86400
 BREADTH_SCREEN_DAYS = 35
 BREADTH_DEEP_CHUNK = 300
 
@@ -2475,6 +2723,39 @@ async def _breadth_backfill(db, raw, backfill_daily_bars, deep_years: int) -> di
     return stats
 
 
+DELISTED_DONE_KEY = "sentinel:daily_bars:delisted_done"
+
+
+async def _delisted_backfill(db, raw, backfill_daily_bars, deep_years: int) -> dict:
+    """Five years of daily bars for stocks that have since delisted.
+
+    The cross-section was today's listings, so every name that failed and left
+    was missing from the model's history -- survivorship, the bias that makes
+    any backtest look better than trading would have been. Alpaca still serves
+    history for about four in ten delisted exchange-listed stocks; those are
+    loaded once. Point in time: a delisted name is ranked only on days it
+    traded and cleared the liquidity floor."""
+    import aiohttp
+    from shared.utils.asset_universe import delisted_stocks, fetch_assets
+
+    if await raw.exists(DELISTED_DONE_KEY):
+        return {"skipped": True}
+    key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret} if key and secret else None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+        active = {str(a.get("symbol") or "").upper() for a in await fetch_assets(session, headers, "active")}
+        inactive = await fetch_assets(session, headers, "inactive")
+    if not active or not inactive:
+        return {"skipped": "asset lists unavailable"}
+    names = delisted_stocks(inactive, active)
+    rep = await backfill_daily_bars(db, names, lookback_days=365 * deep_years + 7)
+    await raw.set(DELISTED_DONE_KEY, "1", ex=90 * 86400)
+    logger.info("Delisted history: %s delisted stocks requested, %s with bars, %s bars written.",
+                len(names), rep.get("tickers_with_data"), rep.get("bars_written"))
+    return {"requested": len(names), "with_data": rep.get("tickers_with_data")}
+
+
 async def _signal_backfill_loop(redis_client) -> None:
     """Keep the signal instruments' history current between restarts.
 
@@ -2521,16 +2802,7 @@ async def _signal_backfill_loop(redis_client) -> None:
             # policies refresh only a trailing window, so backfilled weeks never
             # reached them; refreshing the window written is what does.
             lookback = DEFAULT_LOOKBACK_DAYS if fresh else SIGNAL_BACKFILL_DAYS
-            now_ts = datetime.now(timezone.utc)
-            for view, end_lag in (("tradfi_bars_1h", timedelta(hours=2)), ("tradfi_bars_1d", timedelta(days=1))):
-                try:
-                    await db.execute_without_transaction(
-                        f"CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)",
-                        (now_ts - timedelta(days=lookback + 1), now_ts - end_lag),
-                        timeout=1800,
-                    )
-                except Exception as e:
-                    swallowed("collector.tradfi.refresh_aggregate", e, logger, detail=view)
+            await refresh_rollups(db, datetime.now(timezone.utc) - timedelta(days=lookback + 1))
 
             # Daily history, kept permanently: years deep for any ticker not yet
             # loaded, then a short top-up for all of them.
@@ -2566,7 +2838,428 @@ async def _signal_backfill_loop(redis_client) -> None:
             await _breadth_backfill(await get_timescale(), raw, backfill_daily_bars, DAILY_DEEP_YEARS)
         except Exception as e:
             swallowed("collector.tradfi.breadth_backfill", e, logger)
+        try:
+            await _delisted_backfill(await get_timescale(), raw, backfill_daily_bars, DAILY_DEEP_YEARS)
+        except Exception as e:
+            swallowed("collector.tradfi.delisted_backfill", e, logger)
         await asyncio.sleep(SIGNAL_BACKFILL_INTERVAL_SEC)
+
+
+# Settling the day's minute bars. The live stream is one venue's prints (a few
+# percent of the tape); the vendor's consolidated bars arrive once they are
+# fifteen minutes old. Every half hour through the trading day the watched
+# names' recent minutes are replaced by consolidated bars -- same timestamps,
+# so each upsert overwrites the provisional live row rather than adding one.
+SETTLE_INTERVAL_SEC = int(os.getenv("SETTLE_MINUTE_BARS_SEC", str(30 * 60)))
+SETTLE_SESSIONS = {"PRE_MARKET", "REGULAR", "AFTER_HOURS"}
+
+
+async def _settle_minute_bars_loop(redis_client) -> None:
+    from historical_backfill import SEAM_GUARD_MINUTES, backfill_bars
+    from shared.db import get_timescale
+
+    raw = getattr(redis_client, "raw", redis_client)
+    settled_to: Optional[datetime] = None
+    while True:
+        await asyncio.sleep(SETTLE_INTERVAL_SEC)
+        session_name, _ = get_market_session()
+        if session_name not in SETTLE_SESSIONS and settled_to is not None:
+            continue
+        try:
+            watched = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                       for m in (await raw.zrange(REDIS_EQUITIES_KEY, 0, -1) or [])}
+            names = sorted(t for t in (watched | MINUTE_UNIVERSE) if _clean_equity(t))
+            now_ts = datetime.now(timezone.utc)
+            # From where the last pass stopped (or the start of today's
+            # pre-market), a little overlapped; the backfill clamps the end to
+            # what the free plan serves.
+            start = (settled_to - timedelta(minutes=10)) if settled_to else \
+                now_ts.replace(hour=8, minute=0, second=0, microsecond=0)
+            if names:
+                db = await get_timescale()
+                report = await backfill_bars(db, names, timeframe="1Min", start=start, end=now_ts)
+                settled_to = now_ts - timedelta(minutes=SEAM_GUARD_MINUTES)
+                await refresh_rollups(db, start, views=("tradfi_bars_5m", "tradfi_bars_15m", "tradfi_bars_30m",
+                                                        "tradfi_bars_1h"))
+                logger.info("Settled minute bars from %s: %s consolidated bars for %s of %s names.",
+                            start.strftime("%H:%M"), report.get("bars_written"),
+                            report.get("tickers_with_data"), len(names))
+        except Exception as e:
+            swallowed("collector.tradfi.settle_minute_bars", e, logger)
+
+
+# The minute universe: names worth live minute bars from the Alpaca stream and
+# a settle every half hour -- the most liquid by recent consolidated dollar
+# volume, plus the watchlist and whatever the signals point at.
+MINUTE_UNIVERSE_SIZE = int(os.getenv("MINUTE_UNIVERSE_SIZE", "1500"))
+MINUTE_UNIVERSE: set = set()
+FINNHUB_SUBSCRIBED: set = set()
+
+# The live focus (shared/utils/live_focus.py): who gets the free plan's live
+# tick slots, refreshed every LIVE_FOCUS_EVERY_SEC from the book the portfolio
+# holds and trades. Read in place by the Alpaca stream and the Finnhub selector.
+LIVE_FOCUS: list = []
+LIVE_FOCUS_EVERY_SEC = 300
+_FOCUS_TRADING_SQL = "SELECT DISTINCT symbol FROM auto_trade_orders WHERE day = $1::date"
+_FOCUS_BOOK_SQL = "SELECT long_book, short_book, pending FROM model_portfolio_state WHERE portfolio = $1"
+_FOCUS_EARNINGS_SQL = "SELECT DISTINCT ticker FROM earnings_estimates WHERE report_date = $1::date"
+
+
+def _json_list(x) -> list:
+    if x is None:
+        return []
+    if isinstance(x, (str, bytes)):
+        try:
+            x = json.loads(x)
+        except ValueError:
+            return []
+    return list(x) if isinstance(x, (list, tuple)) else []
+
+
+async def _live_focus_loop(redis_client) -> None:
+    """Rank the names that deserve live ticks and publish the list."""
+    from shared.db import get_timescale
+    from shared.utils import live_focus as lf
+    from shared.utils import model_portfolio as mp
+    from shared.utils.signal_store import factor_scores_key
+
+    raw = getattr(redis_client, "raw", redis_client)
+    while True:
+        try:
+            db = await get_timescale()
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            trading = [r["symbol"] for r in await db.query(_FOCUS_TRADING_SQL, today) or []]
+            book = await db.query_one(_FOCUS_BOOK_SQL, mp.HEADLINE_PORTFOLIO) or {}
+            held = _json_list(book.get("long_book")) + _json_list(book.get("short_book"))
+            pending = book.get("pending")
+            if isinstance(pending, (str, bytes)):
+                try:
+                    pending = json.loads(pending)
+                except ValueError:
+                    pending = None
+            changing = []
+            if isinstance(pending, dict):
+                new = set(_json_list(pending.get("long"))) | set(_json_list(pending.get("short")))
+                changing = sorted(new ^ set(held))
+            scores_raw = await raw.get(factor_scores_key(mp.HORIZON))
+            scores = json.loads(scores_raw) if scores_raw else {}
+            pct = {str(t).upper(): float(v.get("percentile")) for t, v in (scores or {}).items()
+                   if isinstance(v, dict) and v.get("percentile") is not None}
+            earnings = [r["ticker"] for r in await db.query(_FOCUS_EARNINGS_SQL, today) or []]
+            watched = [(m.decode() if isinstance(m, bytes) else str(m))
+                       for m in (await raw.zrevrange(REDIS_EQUITIES_KEY, 0, -1) or [])]
+            ranked = [t for t in lf.rank_focus(trading, changing, held, pct, earnings, watched)
+                      if is_valid_primary_equity(t)]
+            LIVE_FOCUS[:] = ranked
+            async with raw.pipeline() as pipe:
+                pipe.delete(lf.LIVE_FOCUS_KEY)
+                if ranked:
+                    pipe.zadd(lf.LIVE_FOCUS_KEY, lf.focus_scores(ranked))
+                    pipe.expire(lf.LIVE_FOCUS_KEY, 3 * LIVE_FOCUS_EVERY_SEC)
+                await pipe.execute()
+            logger.info("Live focus: %s names (%s trading today, %s changing, %s held); top %s",
+                        len(ranked), len(trading), len(changing), len(held), ", ".join(ranked[:8]))
+        except Exception as e:
+            swallowed("collector.tradfi.live_focus", e, logger)
+        await asyncio.sleep(LIVE_FOCUS_EVERY_SEC)
+_MINUTE_UNIVERSE_SQL = """
+    SELECT ticker FROM daily_bars
+    WHERE day > CURRENT_DATE - 30 AND volume > 0
+    GROUP BY ticker HAVING count(*) >= 10
+    ORDER BY avg(close * volume) DESC LIMIT $1
+"""
+
+
+async def _minute_universe_loop(redis_client) -> None:
+    from shared.db import get_timescale
+    from shared.utils.signal_families import backfill_universe
+
+    raw = getattr(redis_client, "raw", redis_client)
+    while True:
+        try:
+            db = await get_timescale()
+            liquid = {str(r["ticker"]).upper() for r in await db.query(_MINUTE_UNIVERSE_SQL, MINUTE_UNIVERSE_SIZE) or []}
+            watched = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                       for m in (await raw.zrange(REDIS_EQUITIES_KEY, 0, -1) or [])}
+            universe = {t for t in liquid | watched | set(backfill_universe()) if _clean_equity(t)}
+            if universe:
+                MINUTE_UNIVERSE.clear()
+                MINUTE_UNIVERSE.update(universe)
+                logger.info("Minute universe: %s names (%s by dollar volume, %s watched).",
+                            len(universe), len(liquid), len(watched))
+                await _load_minute_history(db, raw, sorted(universe))
+        except Exception as e:
+            swallowed("collector.tradfi.minute_universe", e, logger)
+        await asyncio.sleep(1800)
+
+
+async def _bar_quality_loop(redis_client) -> None:
+    """Every two hours: do the minute bars of the last full session add up to
+    the day? The report is served at /api/v1/radar/data-quality."""
+    from shared.db import get_timescale
+    from shared.utils.bar_quality import BAR_QUALITY_KEY, RECONCILE_SQL, reconcile
+
+    raw = getattr(redis_client, "raw", redis_client)
+    await asyncio.sleep(10 * 60)
+    while True:
+        try:
+            names = sorted(MINUTE_UNIVERSE)
+            if names:
+                db = await get_timescale()
+                report = reconcile([dict(r) for r in await db.query(RECONCILE_SQL, names) or []])
+                report["checked_at"] = datetime.now(timezone.utc).isoformat()
+                await raw.set(BAR_QUALITY_KEY, json.dumps(report, default=str), ex=3 * 86400)
+                log = logger.info if report.get("ok") else logger.warning
+                log("Bar check %s: median coverage %s of daily volume across %s stocks; %s below %s, %s with no minutes.",
+                    report.get("day"), report.get("median_coverage"), report.get("stocks"),
+                    report.get("below_floor"), report.get("floor"), report.get("missing"))
+        except Exception as e:
+            swallowed("collector.tradfi.bar_quality", e, logger)
+        await asyncio.sleep(2 * 3600)
+
+
+# A name entering the minute universe gets its recent minutes once, so the
+# daily bar check and anything reading recent bars has history from the start
+# rather than from the day it joined: on 15 Oct, 807 of the 1,504 names had no
+# minute bars at all for the previous session. Recorded per ticker, so a
+# restart resumes rather than repeats.
+MINUTE_HISTORY_KEY = "sentinel:minute_history:loaded"
+MINUTE_HISTORY_DAYS = int(os.getenv("MINUTE_HISTORY_DAYS", "5"))
+MINUTE_HISTORY_CHUNK = 100
+
+
+async def _load_minute_history(db, raw, names: list) -> None:
+    from historical_backfill import backfill_bars
+
+    done = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+            for m in (await raw.smembers(MINUTE_HISTORY_KEY) or [])}
+    todo = [t for t in names if t not in done]
+    if not todo:
+        return
+    loaded = 0
+    for k in range(0, len(todo), MINUTE_HISTORY_CHUNK):
+        chunk = todo[k:k + MINUTE_HISTORY_CHUNK]
+        report = await backfill_bars(db, chunk, timeframe="1Min", lookback_days=MINUTE_HISTORY_DAYS)
+        if report.get("errors"):
+            logger.warning("Minute history: %s errors on %s..%s; retried next pass.",
+                           len(report["errors"]), chunk[0], chunk[-1])
+            continue
+        await raw.sadd(MINUTE_HISTORY_KEY, *chunk)
+        loaded += len(chunk)
+    if loaded:
+        await refresh_rollups(db, datetime.now(timezone.utc) - timedelta(days=MINUTE_HISTORY_DAYS + 1))
+        logger.info("Minute history: %s days of consolidated minutes loaded for %s new names (%s queued).",
+                    MINUTE_HISTORY_DAYS, loaded, len(todo))
+
+
+async def _daily_crosscheck_loop(redis_client) -> None:
+    """Once a day: the latest stored daily bars against a second vendor
+    (shared/utils/daily_crosscheck.py). With a POLYGON_API_KEY, Polygon's
+    grouped-daily (every stock, one request); without one, a keyless Yahoo
+    sample of about a hundred names."""
+    from shared.db import get_timescale
+    from shared.utils import daily_crosscheck as dc
+
+    key = os.getenv("POLYGON_API_KEY", "").strip()
+    if not key:
+        logger.info("Daily cross-check: no POLYGON_API_KEY, checking a daily Yahoo sample instead.")
+    raw = getattr(redis_client, "raw", redis_client)
+    await asyncio.sleep(15 * 60)
+    while True:
+        try:
+            db = await get_timescale()
+            row = await db.query_one("SELECT max(day) AS day FROM daily_bars WHERE ticker = 'SPY' AND day < CURRENT_DATE")
+            day = row.get("day") if row else None
+            if day:
+                rows = await db.query("SELECT ticker, close, volume FROM daily_bars WHERE day = $1 "
+                                      "ORDER BY close * volume DESC NULLS LAST", day) or []
+                ours = {str(r["ticker"]).upper(): {"close": r["close"], "volume": r["volume"]} for r in rows}
+                if key:
+                    theirs = await _polygon_grouped(dc, day, key)
+                    vendor = "Polygon"
+                else:
+                    theirs = await _yahoo_sample(dc, day, list(ours))
+                    ours = {t: ours[t] for t in theirs}
+                    vendor = "Yahoo (sample)"
+                report = {"day": day.isoformat(), "vendor": vendor, **dc.compare(ours, theirs),
+                          "checked_at": datetime.now(timezone.utc).isoformat()}
+                await raw.set(dc.CROSSCHECK_KEY, json.dumps(report), ex=4 * 86400)
+                log = logger.info if report["ok"] else logger.warning
+                log("Daily cross-check %s: %s stocks compared, %s closes and %s volumes off.", day,
+                    report["compared"], report["close_mismatches"], report["volume_mismatches"])
+        except Exception as e:
+            swallowed("collector.tradfi.daily_crosscheck", e, logger)
+        await asyncio.sleep(24 * 3600)
+
+
+async def _polygon_grouped(dc, day, key: str) -> Dict[str, Dict[str, float]]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(dc.GROUPED_URL.format(day=day.isoformat()),
+                               params={"adjusted": "true", "apiKey": key},
+                               timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            body = await resp.json(content_type=None) if resp.status == 200 else {}
+    return dc.parse_grouped(body)
+
+
+async def _yahoo_sample(dc, day, by_dollar_volume: list) -> Dict[str, Dict[str, float]]:
+    """The day's sample from Yahoo's chart endpoint, one gentle request at a
+    time; names Yahoo does not answer for are left out of the comparison."""
+    out: Dict[str, Dict[str, float]] = {}
+    async with aiohttp.ClientSession(headers=dc.YAHOO_HEADERS) as session:
+        for t in dc.yahoo_sample(by_dollar_volume, day):
+            try:
+                async with session.get(dc.YAHOO_DAILY_URL.format(symbol=dc.yahoo_symbol(t)),
+                                       params={"range": "1mo", "interval": "1d"},
+                                       timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    body = await resp.json(content_type=None) if resp.status == 200 else {}
+                bar = dc.parse_yahoo_daily(body, day)
+                if bar:
+                    out[t] = bar
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+                logger.debug("Yahoo cross-check %s: %s", t, e)
+            await asyncio.sleep(0.5)
+    return out
+
+
+ROLLUP_VIEWS = ("tradfi_bars_5m", "tradfi_bars_15m", "tradfi_bars_30m", "tradfi_bars_1h",
+                "tradfi_bars_4h", "tradfi_bars_1d")
+# How far behind now each view may be refreshed: a bucket still filling is left
+# to the view's own policy.
+_ROLLUP_END_LAG = {"tradfi_bars_5m": timedelta(minutes=5), "tradfi_bars_15m": timedelta(minutes=15),
+                   "tradfi_bars_30m": timedelta(minutes=30), "tradfi_bars_1h": timedelta(hours=1),
+                   "tradfi_bars_4h": timedelta(hours=4), "tradfi_bars_1d": timedelta(days=1)}
+
+
+async def refresh_rollups(db, start: datetime, views=ROLLUP_VIEWS) -> None:
+    """Re-materialise the rollups over a window just rewritten.
+
+    Each view's policy refreshes only a trailing window (the 5m view: one day),
+    so bars a backfill rewrote further back -- consolidated replacing IEX, or a
+    re-adjusted history after a split -- never reached the 5m, 15m and 30m
+    views. Only the hourly and daily views used to be refreshed after a backfill."""
+    now_ts = datetime.now(timezone.utc)
+    for view in views:
+        end = now_ts - _ROLLUP_END_LAG.get(view, timedelta(hours=1))
+        if start >= end:
+            continue
+        try:
+            await db.execute_without_transaction(
+                f"CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)",
+                (start, end), timeout=1800,
+            )
+        except Exception as e:
+            swallowed("collector.tradfi.refresh_aggregate", e, logger, detail=view)
+
+
+# Corporate actions: a split, spin-off or dividend re-adjusts every earlier
+# bar at the vendor, and the stored copy must be re-downloaded to match.
+CORP_ACTIONS_KEY = "sentinel:corporate_actions:checked_through"
+CORP_ACTIONS_INTERVAL_SEC = 6 * 3600
+CORP_ACTIONS_CATCHUP_DAYS = 400
+CORP_ACTIONS_URL = "https://data.alpaca.markets/v1/corporate-actions"
+
+
+async def _fetch_corporate_actions(session, headers, start, end) -> dict:
+    from shared.utils.corporate_actions import PRICE_ACTION_TYPES
+    merged: dict = {"corporate_actions": {}}
+    token = None
+    for _ in range(50):
+        params = {"types": ",".join(PRICE_ACTION_TYPES), "start": start.isoformat(), "end": end.isoformat(),
+                  "limit": 1000}
+        if token:
+            params["page_token"] = token
+        async with session.get(CORP_ACTIONS_URL, params=params, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=180)) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"corporate actions HTTP {resp.status}: {(await resp.text())[:200]}")
+            body = await resp.json()
+        for k, v in (body.get("corporate_actions") or {}).items():
+            merged["corporate_actions"].setdefault(k, []).extend(v or [])
+        token = body.get("next_page_token")
+        if not token:
+            break
+    return merged
+
+
+# Each weekday's full daily bars, written just after the session ends: the
+# twelve-hourly top-up lands wherever the collector's start put it, and a
+# post-midnight one left the 22:00 UTC model run reading the morning's partial
+# bar (or, now partial bars are refused, yesterday's close) as today's.
+POST_CLOSE_TOPUP_NY = (16, 35)
+POST_CLOSE_TOPUP_DAYS = 5
+
+
+async def _post_close_daily_loop(redis_client) -> None:
+    from zoneinfo import ZoneInfo
+    from shared.db import get_timescale
+    from shared.utils.signal_store import DAILY_DEEP_KEY
+    from historical_backfill import backfill_daily_bars
+
+    ny = ZoneInfo("America/New_York")
+    raw = getattr(redis_client, "raw", redis_client)
+    done_for: Optional[str] = None
+    while True:
+        try:
+            now = datetime.now(timezone.utc).astimezone(ny)
+            today = now.date().isoformat()
+            if now.weekday() < 5 and (now.hour, now.minute) >= POST_CLOSE_TOPUP_NY and done_for != today:
+                names = sorted((m.decode() if isinstance(m, bytes) else str(m)).upper()
+                               for m in (await raw.smembers(DAILY_DEEP_KEY) or []))
+                if names:
+                    rep = await backfill_daily_bars(await get_timescale(), names, lookback_days=POST_CLOSE_TOPUP_DAYS)
+                    logger.info("Post-close daily bars: %s bars for %s names", rep.get("bars_written"),
+                                rep.get("tickers_with_data"))
+                done_for = today
+        except Exception as e:
+            swallowed("collector.tradfi.post_close_daily", e, logger)
+        await asyncio.sleep(120)
+
+
+async def _corporate_actions_loop(redis_client) -> None:
+    from datetime import date as _date
+    from historical_backfill import DAILY_DEEP_YEARS, _credentials, backfill_bars, backfill_daily_bars
+    from shared.db import get_timescale
+    from shared.utils.corporate_actions import affected
+
+    raw = getattr(redis_client, "raw", redis_client)
+    await asyncio.sleep(20 * 60)
+    while True:
+        try:
+            headers = _credentials()
+            stored = await raw.get(CORP_ACTIONS_KEY)
+            today = datetime.now(timezone.utc).date()
+            since = (_date.fromisoformat(stored.decode() if isinstance(stored, bytes) else stored)
+                     if stored else today - timedelta(days=CORP_ACTIONS_CATCHUP_DAYS))
+            if headers:
+                db = await get_timescale()
+                # Thirty days at a time, saving progress after each: a year of
+                # actions with dividends in one request timed out (15 Oct), and
+                # a timeout should cost one window, not the whole catch-up.
+                window_start = since - timedelta(days=3)
+                while window_start < today:
+                    window_end = min(today, window_start + timedelta(days=30))
+                    async with aiohttp.ClientSession() as session:
+                        body = await _fetch_corporate_actions(session, headers, window_start, window_end)
+                    hits = affected(body, today)
+                    held = {str(r["ticker"]).upper() for r in await db.query(
+                        "SELECT DISTINCT ticker FROM daily_bars WHERE ticker = ANY($1::text[])", sorted(hits)) or []}
+                    names = sorted(held)
+                    for k in range(0, len(names), 200):
+                        await backfill_daily_bars(db, names[k:k + 200], lookback_days=365 * DAILY_DEEP_YEARS + 7)
+                    # Minute history re-scales on splits only; a dividend moves
+                    # it by a fraction of a percent, not worth sixty days of bars.
+                    split_names = sorted(t for t in held if hits[t]["split"])
+                    if split_names:
+                        await backfill_bars(db, split_names, timeframe="1Min", lookback_days=60)
+                        await refresh_rollups(db, datetime.now(timezone.utc) - timedelta(days=61))
+                    await raw.set(CORP_ACTIONS_KEY, window_end.isoformat())
+                    logger.info("Corporate actions %s to %s: %s symbols named, %s stored and re-adjusted "
+                                "(%s splits/spin-offs re-scaled in minute history).",
+                                window_start, window_end, len(hits), len(names), len(split_names))
+                    window_start = window_end
+        except Exception as e:
+            swallowed("collector.tradfi.corporate_actions", e, logger)
+        await asyncio.sleep(CORP_ACTIONS_INTERVAL_SEC)
 
 
 async def _persist_baselines_loop(redis_client, interval_sec: int = 300) -> None:
@@ -2623,10 +3316,55 @@ async def main():
     # whose history it needs.
     backfill_task = safe_create_task(_run_historical_backfill(redis_client))
     signal_backfill_task = safe_create_task(_signal_backfill_loop(redis_client), name="signal-backfill")
+    settle_task = safe_create_task(_settle_minute_bars_loop(redis_client), name="settle-minute-bars")
+    universe_task = safe_create_task(_minute_universe_loop(redis_client), name="minute-universe")
+    corp_actions_task = safe_create_task(_corporate_actions_loop(redis_client), name="corporate-actions")
+    post_close_task = safe_create_task(_post_close_daily_loop(redis_client), name="post-close-daily")
+    bar_quality_task = safe_create_task(_bar_quality_loop(redis_client), name="bar-quality")
+    crosscheck_task = safe_create_task(_daily_crosscheck_loop(redis_client), name="daily-crosscheck")
+    from alpaca_stream import run_stream as _alpaca_stream
+    from historical_backfill import _credentials as _alpaca_credentials
+    from shared.db import get_timescale as _get_timescale
+    alpaca_stream_task = safe_create_task(
+        _alpaca_stream(_alpaca_credentials, _get_timescale, getattr(redis_client, "raw", redis_client),
+                       lambda: MINUTE_UNIVERSE, lambda: FINNHUB_SUBSCRIBED, lambda: LIVE_FOCUS),
+        name="alpaca-iex-stream",
+    )
+    live_focus_task = safe_create_task(_live_focus_loop(redis_client), name="live-focus")
+    # Live option quotes and trades for the focus on the free indicative feed
+    # (option_stream.py): 200 contracts, MessagePack.
+    from option_stream import run_stream as _option_stream
+    option_stream_task = safe_create_task(
+        _option_stream(_alpaca_credentials, _get_timescale, getattr(redis_client, "raw", redis_client),
+                       lambda: LIVE_FOCUS),
+        name="alpaca-option-stream",
+    )
 
     # Flush the baselines periodically, so a crash loses minutes of learning
     # rather than all of it.
     baseline_task = safe_create_task(_persist_baselines_loop(redis_client))
+
+    # Free short-side data: FINRA daily short volume and IB's borrow file
+    # (services/collector-tradfi/short_data.py).
+    from short_data import run_forever as _short_data_forever
+    short_data_task = safe_create_task(_short_data_forever(), name="short-data")
+    # Finnhub's earnings calendar and surprises, kept (earnings_estimates.py).
+    from earnings_estimates import run_forever as _estimates_forever
+    estimates_task = safe_create_task(_estimates_forever(), name="earnings-estimates")
+    # Company news from Alpaca, live and back to mid-2022 (stock_news.py).
+    from stock_news import run_forever as _stock_news_forever
+    stock_news_task = safe_create_task(_stock_news_forever(), name="stock-news")
+    # Option implied-volatility history, rebuilt from daily option bars (option_history.py).
+    from option_history import run_forever as _option_history_forever
+    option_history_task = safe_create_task(_option_history_forever(), name="option-iv-history")
+    # Each evening's full option chains from Cboe's free delayed quotes:
+    # volume, open interest, IV and skew per stock (cboe_chains.py).
+    from cboe_chains import run_forever as _cboe_chains_forever
+    cboe_chains_task = safe_create_task(_cboe_chains_forever(), name="cboe-chains")
+    # Futures, memory-chip spot and GPU rental prices, and each linked stock's
+    # exposure to them (commodities.py, shared/utils/commodity_links.py).
+    from commodities import run_forever as _commodities_forever
+    commodities_task = safe_create_task(_commodities_forever(), name="commodities")
 
     try:
         await asyncio.gather(
@@ -2642,6 +3380,21 @@ async def main():
         pubsub_task.cancel()
         backfill_task.cancel()
         signal_backfill_task.cancel()
+        settle_task.cancel()
+        universe_task.cancel()
+        corp_actions_task.cancel()
+        post_close_task.cancel()
+        bar_quality_task.cancel()
+        crosscheck_task.cancel()
+        alpaca_stream_task.cancel()
+        live_focus_task.cancel()
+        option_stream_task.cancel()
+        short_data_task.cancel()
+        stock_news_task.cancel()
+        option_history_task.cancel()
+        cboe_chains_task.cancel()
+        commodities_task.cancel()
+        estimates_task.cancel()
         await producer.close()
 
 if __name__ == "__main__":

@@ -1,13 +1,15 @@
 import React from 'react';
 import OperationsConsole from '@/components/OperationsConsole';
+import { PageHeader } from '@/components/ui/PageHeader';
 
 export default function OperationsPage() {
   return (
-    <div className="h-full w-full p-2 overflow-hidden">
-      {/* One heading per page. The panel below carries its own chrome,
-          so this is for the document outline and for anyone navigating
-          by heading rather than by eye. */}
-      <h1 className="sr-only">Operations</h1>
+    <div className="h-full w-full overflow-y-auto p-2 space-y-4">
+      <PageHeader
+        title="Operations"
+        description="The jobs that need a person: events that failed to process, companies that may be the same entity, and rules waiting for feedback."
+        related={[{ href: '/audit', label: 'Audit trail' }, { href: '/agents', label: 'AI analysts' }]}
+      />
       <OperationsConsole />
     </div>
   );

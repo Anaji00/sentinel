@@ -2,9 +2,9 @@
 
 import React, { useState, useEffect } from 'react';
 import { ProvenanceBadge, type ProvenanceType } from './ProvenanceBadge';
-import { ProvenanceValue } from './ProvenanceValue';
 import { formatNumber, formatPercent } from '../lib/format';
 import { IconDocument } from './ui/icons';
+import { LoadingLines } from './ui/Skeleton';
 
 interface Position {
   ticker?: string;
@@ -64,9 +64,18 @@ const NO_FILERS: FilerSummary[] = [];
  * provenance as proven provenance is the exact inversion of what a provenance
  * badge is for.
  */
+const PROVENANCE_TYPES: readonly ProvenanceType[] = [
+  'live_measurement',
+  'computed_deterministic',
+  'llm_inference',
+  'disclosed_placeholder',
+];
+
 function provenanceOf(report: PortfolioReport | null): ProvenanceType {
   if (!report) return 'disclosed_placeholder';
-  if (report.source_type) return report.source_type as any;
+  // A label the badge does not know is not passed through as if it were one.
+  const named = PROVENANCE_TYPES.find((t) => t === report.source_type);
+  if (named) return named;
   if (report.is_synthetic === false) return 'live_measurement';
   // Unknown provenance is not proven provenance.
   return 'disclosed_placeholder';
@@ -142,25 +151,25 @@ export const Institutional13FPanel: React.FC = () => {
     switch (changeType) {
       case 'NEW':
         return (
-          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
+          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-positive/10 text-positive border border-positive/30">
             NEW
           </span>
         );
       case 'INCREASED':
         return (
-          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/40">
+          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-accent-dim text-accent border border-line-accent">
             +{changePct.toFixed(1)}%
           </span>
         );
       case 'DECREASED':
         return (
-          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-amber-500/20 text-amber-400 border border-amber-500/40">
+          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-caution/10 text-caution border border-caution/30">
             {changePct.toFixed(1)}%
           </span>
         );
       case 'EXITED':
         return (
-          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-rose-500/20 text-rose-400 border border-rose-500/40">
+          <span className="px-2 py-0.5 text-xs font-semibold rounded bg-negative/10 text-negative border border-negative/30">
             EXITED
           </span>
         );
@@ -186,13 +195,13 @@ export const Institutional13FPanel: React.FC = () => {
   const activePositions = getActivePositions();
 
   return (
-    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-xl p-5 shadow-2xl text-ink">
+    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-xl p-5 text-ink">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
         <div>
           <div className="flex items-center gap-2">
-            <IconDocument className="text-cyan-400" size={20} />
-            <h2 className="text-lg font-bold tracking-wide text-white">
+            <IconDocument className="text-accent" size={20} />
+            <h2 className="text-lg font-bold tracking-wide text-ink">
               13F Institutional Intelligence & Ownership Flow
             </h2>
             <ProvenanceBadge sourceType={provenanceOf(report)} />
@@ -200,8 +209,11 @@ export const Institutional13FPanel: React.FC = () => {
           <p className="text-xs text-ink-dim mt-0.5">
             Quarterly SEC Form 13F-HR portfolio holdings & QoQ changes from premier asset managers
           </p>
+          {loading && !loadError && (
+            <LoadingLines />
+          )}
           {loadError && (
-            <p className="text-xs text-amber-400 mt-1">
+            <p className="text-xs text-caution mt-1">
               {loadError} Nothing is shown rather than a placeholder.
             </p>
           )}
@@ -233,7 +245,7 @@ export const Institutional13FPanel: React.FC = () => {
                   : 'bg-page/60 border-line text-ink-dim hover:border-line-strong hover:text-ink'
               }`}
             >
-              <span className="text-xs font-bold text-white">{f.manager_name}</span>
+              <span className="text-xs font-bold text-ink">{f.manager_name}</span>
               <span className="text-micro text-ink-dim">{f.filer_name.slice(0, 22)}</span>
             </button>
           );
@@ -248,7 +260,7 @@ export const Institutional13FPanel: React.FC = () => {
               <span className="text-micro text-ink-dim font-medium">Total Portfolio Value</span>
               <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
-            <div className="text-base font-bold text-emerald-400 mt-0.5">
+            <div className="text-base font-bold text-positive mt-0.5">
               ${(report.total_value_usd / 1e9).toFixed(2)}B
             </div>
           </div>
@@ -273,7 +285,7 @@ export const Institutional13FPanel: React.FC = () => {
               <span className="text-micro text-ink-dim font-medium">Top 10 Concentration</span>
               <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
-            <div className="text-base font-bold text-purple-400 mt-0.5">
+            <div className="text-base font-bold text-accent mt-0.5">
               {formatPercent(report.top_10_concentration_pct, { decimals: 1 })}
             </div>
           </div>
@@ -296,7 +308,7 @@ export const Institutional13FPanel: React.FC = () => {
           onClick={() => setActiveTab('new')}
           className={`px-3 py-1.5 text-xs font-semibold border-b-2 transition-colors ${
             activeTab === 'new'
-              ? 'border-emerald-400 text-emerald-300'
+              ? 'border-positive/30 text-positive'
               : 'border-transparent text-ink-dim hover:text-ink'
           }`}
         >
@@ -306,7 +318,7 @@ export const Institutional13FPanel: React.FC = () => {
           onClick={() => setActiveTab('increased')}
           className={`px-3 py-1.5 text-xs font-semibold border-b-2 transition-colors ${
             activeTab === 'increased'
-              ? 'border-cyan-400 text-cyan-300'
+              ? 'border-line-accent text-accent'
               : 'border-transparent text-ink-dim hover:text-ink'
           }`}
         >
@@ -316,7 +328,7 @@ export const Institutional13FPanel: React.FC = () => {
           onClick={() => setActiveTab('decreased')}
           className={`px-3 py-1.5 text-xs font-semibold border-b-2 transition-colors ${
             activeTab === 'decreased'
-              ? 'border-amber-400 text-amber-300'
+              ? 'border-caution/30 text-caution'
               : 'border-transparent text-ink-dim hover:text-ink'
           }`}
         >
@@ -326,7 +338,7 @@ export const Institutional13FPanel: React.FC = () => {
           onClick={() => setActiveTab('exited')}
           className={`px-3 py-1.5 text-xs font-semibold border-b-2 transition-colors ${
             activeTab === 'exited'
-              ? 'border-rose-400 text-rose-300'
+              ? 'border-negative/30 text-negative'
               : 'border-transparent text-ink-dim hover:text-ink'
           }`}
         >
@@ -367,7 +379,7 @@ export const Institutional13FPanel: React.FC = () => {
                       <span className="text-ink font-medium">{pos.issuer_name}</span>
                     </div>
                   </td>
-                  <td className="py-2.5 px-3 font-semibold text-emerald-400">
+                  <td className="py-2.5 px-3 font-semibold text-positive">
                     ${(pos.market_value_usd / 1e6).toFixed(2)}M
                   </td>
                   <td className="py-2.5 px-3 text-ink-dim">

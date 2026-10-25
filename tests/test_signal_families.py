@@ -149,3 +149,27 @@ def test_a_short_volume_spike_points_down():
 def test_the_study_admits_finra_short_spikes():
     src = (ROOT / "services/agents/signal_engine.py").read_text(encoding="utf-8")
     assert "NOT IN ('alpaca_quant_radar', 'finra_short_volume')" in src
+
+
+def test_old_and_amended_filings_raise_no_observation() -> None:
+    from shared.utils import signal_families as sf
+    base = {"type": "filing", "source": "sec_edgar", "event_id": "f1", "financial_data": {"ticker": "QCOM"},
+            "created_at": datetime(2026, 10, 13, 10, tzinfo=timezone.utc),
+            "headline": "SEC Filing: QUALCOMM INC/DE (QCOM) filed Form 8-K",
+            "summary": "Material 8-K Event for QCOM: 3.02: Unregistered Sales of Equity Securities (Dilution). "
+                       "Filed on 2026-09-08."}
+    assert sf.observations(base) == []
+    fresh = dict(base, summary=base["summary"].replace("2026-09-08", "2026-10-13"))
+    assert [o.family for o in sf.observations(fresh)] == ["8k_dilution"]
+    amended = dict(fresh, headline="SEC Filing: WATSCO INC (WSO) filed Form 8-K/A")
+    assert sf.observations(amended) == []
+
+
+def test_earnings_reactions_are_also_measured_by_size() -> None:
+    from datetime import datetime, timezone
+    from shared.utils import signal_families as sf
+    row = {"type": "earnings_reaction", "source": "sentinel_earnings_reaction", "event_id": "e",
+           "created_at": datetime(2026, 10, 15, 20, tzinfo=timezone.utc), "financial_data": {"ticker": "NVDA", "ear": 0.05},
+           "tags": ["earnings_reaction", "size:large"]}
+    assert sorted((o.family, o.direction) for o in sf.observations(row)) == [
+        ("earnings_fade_large", -1), ("earnings_reaction_up", 1), ("earnings_reaction_up_large", 1)]

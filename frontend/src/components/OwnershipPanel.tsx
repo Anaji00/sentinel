@@ -140,12 +140,12 @@ export default function OwnershipPanel() {
   }
 
   return (
-    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-xl p-5 shadow-2xl text-ink">
+    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-xl p-5 text-ink">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
         <div>
           <div className="flex items-center gap-2">
-            <IconDocument className="text-cyan-400" size={20} />
-            <h2 className="text-lg font-bold tracking-wide text-white">Follow the Money: Who Owns Whom</h2>
+            <IconDocument className="text-accent" size={20} />
+            <h2 className="text-lg font-bold tracking-wide text-ink">Follow the Money: Who Owns Whom</h2>
           </div>
           <p className="text-xs text-ink-dim mt-0.5">
             Institutional stakes as a share of each company, from 13F filings. Long positions as filed,
@@ -163,14 +163,14 @@ export default function OwnershipPanel() {
             value={ticker}
             onChange={(e) => setTicker(e.target.value)}
             aria-label="Ticker"
-            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-white uppercase"
+            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-ink uppercase"
           />
           <span className="text-xs text-ink-dim">vs</span>
           <input
             value={compareTo}
             onChange={(e) => setCompareTo(e.target.value)}
             aria-label="Compare with ticker"
-            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-white uppercase"
+            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-ink uppercase"
           />
           <button
             type="submit"
@@ -184,7 +184,7 @@ export default function OwnershipPanel() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <section className="p-3 bg-page/70 border border-line rounded-lg">
           <div className="flex items-baseline justify-between">
-            <h3 className="text-sm font-bold text-white">Who holds {holders?.ticker || ticker.toUpperCase()}</h3>
+            <h3 className="text-sm font-bold text-ink">Who holds {holders?.ticker || ticker.toUpperCase()}</h3>
             {holders && (
               <span className="text-xs text-ink-dim">
                 Big Three {pct(holders.big_three_pct, 1)} · tracked institutions{' '}
@@ -212,7 +212,7 @@ export default function OwnershipPanel() {
                         {h.filer}
                       </button>
                     </td>
-                    <td className="text-right text-white">{pct(h.pct_outstanding)}</td>
+                    <td className="text-right text-ink">{pct(h.pct_outstanding)}</td>
                     <td className="text-right">{usd(h.value_usd)}</td>
                     <td className="text-right text-ink-dim">{h.period}</td>
                   </tr>
@@ -224,10 +224,10 @@ export default function OwnershipPanel() {
 
         <section className="p-3 bg-page/70 border border-line rounded-lg">
           <div className="flex items-baseline justify-between">
-            <h3 className="text-sm font-bold text-white">
+            <h3 className="text-sm font-bold text-ink">
               Common ownership {common ? `${common.a} · ${common.b}` : ''}
             </h3>
-            {common && <span className="text-xs text-amber-300">{pct(common.common_ownership_pct, 1)} held by the same institutions</span>}
+            {common && <span className="text-xs text-caution">{pct(common.common_ownership_pct, 1)} held by the same institutions</span>}
           </div>
           {!common || common.shared_holders.length === 0 ? (
             <p className="text-xs text-ink-dim mt-2">No shared holders collected for this pair yet.</p>
@@ -245,7 +245,7 @@ export default function OwnershipPanel() {
                   <tr key={s.filer_id} className="border-t border-line/60">
                     <td className="py-1">
                       {s.filer}
-                      {s.big_three && <span className="ml-1 text-micro text-amber-300">Big Three</span>}
+                      {s.big_three && <span className="ml-1 text-micro text-caution">Big Three</span>}
                     </td>
                     <td className="text-right">{pct(s.pct_a)}</td>
                     <td className="text-right">{pct(s.pct_b)}</td>
@@ -259,7 +259,7 @@ export default function OwnershipPanel() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <section className="p-3 bg-page/70 border border-line rounded-lg">
-          <h3 className="text-sm font-bold text-white">Board interlocks</h3>
+          <h3 className="text-sm font-bold text-ink">Board interlocks</h3>
           <p className="text-xs text-ink-dim">
             Insiders of {holders?.ticker || ticker.toUpperCase()} who also report at other companies (Form 4).
           </p>
@@ -269,7 +269,7 @@ export default function OwnershipPanel() {
             <ul className="mt-2 text-xs space-y-1">
               {interlocks.slice(0, 12).map((i) => (
                 <li key={i.person}>
-                  <span className="text-white">{i.person}</span>{' '}
+                  <span className="text-ink">{i.person}</span>{' '}
                   <span className="text-ink-dim">({i.roles.slice(0, 2).join(', ')})</span>: {i.companies.join(', ')}
                 </li>
               ))}
@@ -277,7 +277,7 @@ export default function OwnershipPanel() {
           )}
         </section>
         <section className="p-3 bg-page/70 border border-line rounded-lg">
-          <h3 className="text-sm font-bold text-white">Federal money in</h3>
+          <h3 className="text-sm font-bold text-ink">Federal money in</h3>
           <p className="text-xs text-ink-dim">Agencies obligating contract money to this company (USAspending).</p>
           {contracts.length === 0 ? (
             <p className="text-xs text-ink-dim mt-2">No federal obligations recorded.</p>
@@ -286,7 +286,7 @@ export default function OwnershipPanel() {
               {contracts.map((c) => (
                 <li key={c.agency} className="flex justify-between gap-2">
                   <span>{c.agency}</span>
-                  <span className="text-white">{usd(c.amount_usd)}</span>
+                  <span className="text-ink">{usd(c.amount_usd)}</span>
                 </li>
               ))}
             </ul>
@@ -295,7 +295,7 @@ export default function OwnershipPanel() {
       </div>
 
       <section className="p-3 bg-page/70 border border-line rounded-lg">
-        <h3 className="text-sm font-bold text-white">Institutions that own each other</h3>
+        <h3 className="text-sm font-bold text-ink">Institutions that own each other</h3>
         <p className="text-xs text-ink-dim">
           A listed manager or bank holding another listed one. Where both directions are reported, the
           two own each other.
@@ -321,8 +321,8 @@ export default function OwnershipPanel() {
                   <td>
                     {r.held} {r.held_ticker && <span className="text-ink-dim">({r.held_ticker})</span>}
                   </td>
-                  <td className="text-right text-white">{pct(r.pct)}</td>
-                  <td className={`text-right ${r.reverse_pct ? 'text-amber-300' : 'text-ink-dim'}`}>
+                  <td className="text-right text-ink">{pct(r.pct)}</td>
+                  <td className={`text-right ${r.reverse_pct ? 'text-caution' : 'text-ink-dim'}`}>
                     {r.reverse_pct ? pct(r.reverse_pct) : '—'}
                   </td>
                 </tr>
@@ -335,7 +335,7 @@ export default function OwnershipPanel() {
       {filer && (
         <section className="p-3 bg-page/70 border border-line rounded-lg">
           <div className="flex items-baseline justify-between">
-            <h3 className="text-sm font-bold text-white">
+            <h3 className="text-sm font-bold text-ink">
               {filer.name} {filer.listed_as && <span className="text-ink-dim">({filer.listed_as})</span>}
             </h3>
             <span className="text-xs text-ink-dim">
@@ -356,10 +356,10 @@ export default function OwnershipPanel() {
               {filer.holdings.map((h) => (
                 <tr key={h.ticker} className="border-t border-line/60">
                   <td className="py-1">
-                    <span className="text-white">{h.ticker}</span> <span className="text-ink-dim">{h.issuer}</span>
+                    <span className="text-ink">{h.ticker}</span> <span className="text-ink-dim">{h.issuer}</span>
                   </td>
                   <td className="text-right">{usd(h.value_usd)}</td>
-                  <td className="text-right text-white">{pct(h.pct_outstanding)}</td>
+                  <td className="text-right text-ink">{pct(h.pct_outstanding)}</td>
                   <td className="text-right">{pct(h.pct_of_portfolio)}</td>
                 </tr>
               ))}

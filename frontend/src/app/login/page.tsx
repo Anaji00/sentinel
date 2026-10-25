@@ -112,7 +112,7 @@ export default function LoginPage() {
       } else {
         setErrorMsg(data.error || 'Authentication failed. Please check credentials.');
       }
-    } catch (err: any) {
+    } catch {
       setErrorMsg('Connection error during authentication.');
     } finally {
       setIsLoading(false);
@@ -121,10 +121,10 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen w-full bg-page text-ink flex flex-col items-center justify-center relative overflow-hidden select-none p-4">
-      {/* Dynamic Cyber Grid Background & Glow Orbs */}
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-cyan-950/30 via-page to-[#030407]" />
-      <div className="absolute -top-40 -left-40 w-96 h-96 bg-cyan-500/15 rounded-full blur-3xl pointer-events-none" />
-      <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-purple-500/15 rounded-full blur-3xl pointer-events-none" />
+      {/* A soft accent wash for depth. */}
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-cyan-950/30 via-page to-page" />
+      <div className="absolute -top-40 -left-40 w-96 h-96 bg-accent-dim rounded-full blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl pointer-events-none" />
 
       {/* Main Glass Card */}
       <div className="relative w-full max-w-md bg-raised/90 border border-accent/40 rounded-3xl p-8 z-10 space-y-6">
@@ -133,43 +133,36 @@ export default function LoginPage() {
           <div className="inline-flex h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-950 to-slate-950 border border-accent/60 items-center justify-center mb-2">
             <span className="text-accent font-black text-2xl tracking-tighter drop-">S</span>
           </div>
-          <h1 className="text-xl font-semibold text-white">
-            SENTINEL <span className="text-accent">INTELLIGENCE</span>
-          </h1>
-          <p className="text-micro text-ink-dim tracking-wide">
-            Multi-domain market and geopolitical intelligence
+          <h1 className="text-xl font-semibold text-ink">Welcome back to Sentinel</h1>
+          <p className="text-sm text-ink-dim">
+            Smarter markets, and a clear view of who&apos;s watching.
           </p>
         </div>
 
         {/* Authentication Form */}
         <form onSubmit={handleSubmit} className="space-y-4 text-xs">
           <div>
-            <label className="text-micro text-ink-dim font-bold uppercase tracking-wider">
-              Corporate Email
+            <label className="text-xs text-ink-dim font-medium">
+              Email
             </label>
             <input
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-white outline-none transition-colors"
-              placeholder="name@firm.com"
+              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-ink outline-none transition-colors"
+              placeholder="you@example.com"
               required
             />
           </div>
           <div>
-            <div className="flex justify-between items-center">
-              <label className="text-micro text-ink-dim font-bold uppercase tracking-wider">
-                Password
-              </label>
-              <span className="text-micro text-cyan-400 hover:underline cursor-pointer">
-                SAML SSO
-              </span>
-            </div>
+            <label className="text-xs text-ink-dim font-medium">
+              Password
+            </label>
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-white outline-none transition-colors"
+              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-ink outline-none transition-colors"
               required
             />
           </div>
@@ -196,7 +189,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={isLoading || isSuccess}
-            className="w-full py-3.5 mt-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-extrabold tracking-widest uppercase transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+            className="w-full py-3.5 mt-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-ink font-semibold text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2"
           >
             {isLoading ? (
               <span className="flex items-center gap-2">
@@ -204,9 +197,9 @@ export default function LoginPage() {
                 Signing in…
               </span>
             ) : isSuccess ? (
-              <span className="text-emerald-300 font-bold"> AUTHENTICATED</span>
+              <span className="font-semibold">Signed in</span>
             ) : (
-              'ENTER COMMAND HUD'
+              'Sign in'
             )}
           </button>
         </form>
@@ -226,9 +219,9 @@ export default function LoginPage() {
               type="button"
               onClick={startSso}
               disabled={ssoBusy || isLoading || isSuccess}
-              className="w-full py-3 rounded-xl border border-line-strong hover:border-cyan-500/60 text-ink font-bold tracking-wide uppercase text-xs transition-all disabled:opacity-50"
+              className="w-full py-3 rounded-xl border border-line-strong hover:border-line-accent text-ink font-medium text-sm transition-all disabled:opacity-50"
             >
-              {ssoBusy ? 'REDIRECTING...' : sso.label}
+              {ssoBusy ? 'Redirecting…' : sso.label}
             </button>
           </div>
         )}
@@ -236,10 +229,10 @@ export default function LoginPage() {
         {/* Open signup: the platform is free to join, so the way in belongs on
             the sign-in page rather than behind it. */}
         <div className="flex items-center justify-between text-xs pt-1">
-          <Link href="/forgot" className="text-ink-dim hover:text-cyan-400">
+          <Link href="/forgot" className="text-ink-dim hover:text-accent">
             Forgot password?
           </Link>
-          <Link href="/signup" className="text-cyan-400 hover:text-cyan-300 font-bold">
+          <Link href="/signup" className="text-accent hover:text-accent font-bold">
             Create a free account
           </Link>
         </div>
@@ -255,8 +248,7 @@ export default function LoginPage() {
 
       {/* Footer Security Badges */}
       <div className="mt-8 text-center text-micro text-ink-mute space-y-1 z-10">
-        <p>SENTINEL ENTERPRISE SECURITY • RSA 4096 / TLS 1.3 ENCRYPTED</p>
-        <p className="text-ink-mute">CONFIDENTIAL & PROPRIETARY SYSTEM</p>
+        <p>Your searches and the places you look at are never shared.</p>
       </div>
     </div>
   );

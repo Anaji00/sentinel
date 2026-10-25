@@ -761,6 +761,11 @@ class AnomalyBreakdown(BaseModel):
     # for a field it never had.
     spatial_score: Optional[float] = None
     temporal_score: Optional[float] = None
+    # The score as a probability, fitted to what followed this producer's
+    # events (shared/utils/score_calibration.py): the chance the stock's next
+    # session moves twice its usual amount, and that against the base rate.
+    calibrated_p_big_move: Optional[float] = None
+    calibrated_lift: Optional[float] = None
     volume_z_score: Optional[float] = None
     volatility_z_score: Optional[float] = None
     cross_domain_correlation_score: Optional[float] = None

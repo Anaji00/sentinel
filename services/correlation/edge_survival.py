@@ -45,6 +45,10 @@ SURVIVAL_MAX_P_VALUE = 0.05
 
 # Retention for registered edges, so an un-retested cohort cannot grow forever.
 COHORT_TTL_SEC = 90 * 24 * 3600
+# Graph proposals held until their edge replicates, and the edges that have.
+HELD_KEY = "sentinel:edges:held"              # hash: edge_id -> {"proposal", "key"}
+REPLICATED_KEY = "sentinel:edges:replicated"  # hash: edge_id -> verdict JSON
+REPLICATED_TTL_SEC = 30 * 24 * 3600
 
 
 @dataclass
@@ -125,6 +129,45 @@ class EdgeSurvivalTracker:
             return True
         except Exception as e:
             logger.warning("Edge registration failed for %s: %s", reg.edge_id, e)
+            return False
+
+    async def hold(self, edge_id: str, proposal: Dict[str, Any], key: str) -> None:
+        """Keep a graph proposal until the edge's re-test (the latest wins)."""
+        if not self.redis:
+            return
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            await raw.hset(HELD_KEY, edge_id, json.dumps({"proposal": proposal, "key": key}, default=str))
+            await raw.expire(HELD_KEY, COHORT_TTL_SEC)
+        except Exception as e:
+            logger.warning("Could not hold the proposal for %s: %s", edge_id, e)
+
+    async def release(self, edge_id: str) -> Optional[Dict[str, Any]]:
+        """The held proposal for an edge, removed from the hold; None if none."""
+        if not self.redis:
+            return None
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            blob = await raw.hget(HELD_KEY, edge_id)
+            await raw.hdel(HELD_KEY, edge_id)
+            return json.loads(blob.decode() if isinstance(blob, bytes) else blob) if blob else None
+        except Exception as e:
+            logger.warning("Could not release the proposal for %s: %s", edge_id, e)
+            return None
+
+    async def is_replicated(self, edge_id: str) -> bool:
+        """The edge survived its last re-test within REPLICATED_TTL_SEC."""
+        if not self.redis:
+            return False
+        try:
+            raw = getattr(self.redis, "raw", self.redis)
+            blob = await raw.hget(REPLICATED_KEY, edge_id)
+            if not blob:
+                return False
+            at = float(json.loads(blob.decode() if isinstance(blob, bytes) else blob).get("at", 0))
+            return time.time() - at <= REPLICATED_TTL_SEC
+        except Exception as e:
+            logger.warning("Could not read replication for %s: %s", edge_id, e)
             return False
 
     async def due_for_retest(
@@ -237,6 +280,10 @@ class EdgeSurvivalTracker:
                 pipe.hincrby(SUMMARY_KEY, "survived_total", 1)
                 pipe.hincrby(SUMMARY_KEY, f"survived:{verdict.method}", 1)
             pipe.hincrby(SUMMARY_KEY, f"reason:{verdict.reason}", 1)
+            if verdict.survived:
+                pipe.hset(REPLICATED_KEY, verdict.edge_id, json.dumps({**asdict(verdict), "at": time.time()}))
+            else:
+                pipe.hdel(REPLICATED_KEY, verdict.edge_id)
             # Retire from the cohort: an edge is judged once, so a re-discovered
             # relationship enters as a fresh observation rather than
             # double-counting the original.

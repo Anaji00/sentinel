@@ -52,6 +52,12 @@ NOT_GOVERNANCE = {
     "reports.py": "generates a document; changes no platform state",
     # Compute, not governance. A backtest reads history and returns a number.
     "backtest.py": "runs a computation over stored history; changes no state",
+    # POST only to keep sensitive answers (immigration, reproductive care,
+    # domestic violence) out of URLs and logs; computes a plan, stores nothing.
+    "civic.py": "privacy plan: computes from answers it must not retain; changes no state",
+    # The person's own followed stocks and town: private settings, not
+    # governance, and a person's town in an admin-served ledger would expose it.
+    "me.py": "a person's own settings (followed stocks, their town); private, changes no platform state",
 }
 
 

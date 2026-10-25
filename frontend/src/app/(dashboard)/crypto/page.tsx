@@ -1,24 +1,21 @@
 import React from 'react';
 import { CryptoAnalyticsIsland, CryptoPriceChartIsland } from './islands';
+import { PageHeader } from '@/components/ui/PageHeader';
 
-/** Server Component. Only the chart and analytics panel hydrate on the client. */
 export default function CryptoPage() {
   return (
-    <div className="flex h-full w-full flex-col p-4 gap-4 overflow-y-auto">
-      <div className="flex items-center justify-between mb-1">
-        <h1 className="text-lg font-semibold text-ink">Crypto &amp; perps</h1>
-      </div>
-
-      <div className="grid grid-cols-12 gap-4">
-        <div className="col-span-12">
-          <CryptoPriceChartIsland />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-12 gap-4 flex-1 min-h-0">
-        <div className="col-span-12 flex flex-col bg-[#0f1115] rounded-xl border border-line overflow-hidden relative min-h-[450px]">
-          <CryptoAnalyticsIsland />
-        </div>
+    <div className="flex h-full w-full flex-col p-2 gap-4 overflow-y-auto">
+      <PageHeader
+        title="Crypto"
+        description="Bitcoin's price as it trades, plus what the futures market is paying to stay long or short, open interest, order flow and large wallet transfers."
+        related={[
+          { href: '/charts', label: 'Charts' },
+          { href: '/charts?view=economy', label: 'The economy' },
+        ]}
+      />
+      <CryptoPriceChartIsland />
+      <div className="flex flex-col rounded-2xl border border-line bg-raised overflow-hidden min-h-[450px]">
+        <CryptoAnalyticsIsland />
       </div>
     </div>
   );

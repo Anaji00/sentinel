@@ -40,7 +40,7 @@ const RATE_LIMIT_PER_SEC = 10;
 const Field: React.FC<{ label: string; value: React.ReactNode; tone?: string; hint?: string }> = ({
   label,
   value,
-  tone = 'text-white',
+  tone = 'text-ink',
   hint,
 }) => (
   <div className="p-3 bg-raised/60 rounded-xl border border-line">
@@ -53,10 +53,10 @@ const Field: React.FC<{ label: string; value: React.ReactNode; tone?: string; hi
 type TabKey = 'overview' | 'access' | 'integrations' | 'telemetry';
 
 const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
-  { key: 'overview', label: 'OVERVIEW' },
-  { key: 'access', label: 'ACCESS & LIMITS' },
-  { key: 'integrations', label: 'DATA SOURCES' },
-  { key: 'telemetry', label: 'PLATFORM STATUS' },
+  { key: 'overview', label: 'Overview' },
+  { key: 'access', label: 'Access & limits' },
+  { key: 'integrations', label: 'Data sources' },
+  { key: 'telemetry', label: 'Platform status' },
 ];
 
 export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen, onClose }) => {
@@ -151,11 +151,11 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
 
   const statusTone =
     platform?.systemStatus === 'OPERATIONAL'
-      ? 'text-emerald-400'
+      ? 'text-positive'
       : platform?.systemStatus === 'DEGRADED'
-        ? 'text-amber-400'
+        ? 'text-caution'
         : platform?.systemStatus
-          ? 'text-rose-400'
+          ? 'text-negative'
           : 'text-ink-dim';
 
   return (
@@ -168,13 +168,13 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
         {...dialog.panelProps}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 bg-page/80 border-b border-cyan-500/20">
+        <div className="flex items-center justify-between px-6 py-4 bg-page/80 border-b border-line">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-lg">
+            <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-ink font-bold text-lg">
               {initials}
             </div>
             <div>
-              <h3 className="text-sm font-bold text-white">{email ?? 'Not signed in'}</h3>
+              <h3 className="text-sm font-bold text-ink">{email ?? 'Not signed in'}</h3>
               <p className="text-micro text-ink-dim">
                 {identity.role ? `Role: ${formatSymbol(identity.role)}` : 'Role unavailable'}
               </p>
@@ -183,7 +183,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
           <button
             onClick={onClose}
             aria-label="Close account panel"
-            className="text-ink-dim hover:text-white transition-colors text-lg px-2 rounded focus:outline-none focus:ring-2 focus:ring-cyan-400"
+            className="text-ink-dim hover:text-ink transition-colors text-lg px-2 rounded focus:outline-none focus:ring-2 focus:ring-cyan-400"
           >
             <IconClose />
           </button>
@@ -202,7 +202,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
               onClick={() => setActiveTab(key)}
               className={`px-4 py-2.5 text-micro font-bold tracking-wider transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-cyan-400 ${
                 activeTab === key
-                  ? 'text-cyan-300 border-b-2 border-cyan-400 bg-raised/40'
+                  ? 'text-accent border-b-2 border-line-accent bg-raised/40'
                   : 'text-ink-mute hover:text-ink-dim'
               }`}
             >
@@ -227,7 +227,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
 
         <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto">
           {error && (
-            <div className="p-3 bg-rose-950/40 border border-rose-500/40 rounded-xl text-micro text-rose-300">
+            <div className="p-3 bg-negative/10 border border-negative/30 rounded-xl text-micro text-negative">
               {error} —{' '}
               <button onClick={load} className="underline hover:text-rose-100">
                 retry
@@ -282,7 +282,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
           {activeTab === 'access' && (
             <div className="space-y-4">
               <div className="p-3 bg-raised/60 rounded-xl border border-line space-y-2">
-                <span className="text-micro font-bold text-ink-dim">SESSION AUTHENTICATION</span>
+                <span className="text-micro font-bold text-ink-dim">Session authentication</span>
                 <ul className="text-micro text-ink-dim space-y-1 list-disc list-inside leading-relaxed">
                   <li>
                     Browser requests authenticate with an HttpOnly, SameSite=Strict session cookie
@@ -299,17 +299,17 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
               </div>
 
               <div className="p-3 bg-raised/60 rounded-xl border border-line space-y-2">
-                <span className="text-micro font-bold text-ink-dim">RATE LIMIT</span>
+                <span className="text-micro font-bold text-ink-dim">Rate limit</span>
                 <div className="grid grid-cols-2 gap-3 text-micro mt-1">
                   <div>
                     <span className="text-ink-mute">Burst capacity</span>
-                    <p className="text-cyan-400 font-bold">
+                    <p className="text-accent font-bold">
                       {formatNumber(RATE_LIMIT_BURST, { decimals: 0 })} requests
                     </p>
                   </div>
                   <div>
                     <span className="text-ink-mute">Sustained refill</span>
-                    <p className="text-cyan-400 font-bold">
+                    <p className="text-accent font-bold">
                       {formatNumber(RATE_LIMIT_PER_SEC, { decimals: 0 })} req/sec
                     </p>
                   </div>
@@ -321,13 +321,13 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 </p>
               </div>
 
-              <div className="p-3 bg-amber-950/30 border border-amber-500/30 rounded-xl">
-                <span className="text-micro font-bold text-amber-300">API KEY</span>
+              <div className="p-3 bg-caution/10 border border-caution/30 rounded-xl">
+                <span className="text-micro font-bold text-caution">API key</span>
                 <p className="text-micro text-ink-dim mt-1 leading-relaxed">
                   The gateway API key is held server-side and is deliberately not exposed to this
                   interface. To issue direct REST or WebSocket calls, read{''}
-                  <code className="text-amber-300">API_GATEWAY_KEY</code> from the deployment
-                  environment and send it in the <code className="text-amber-300">X-API-KEY</code>{' '}
+                  <code className="text-caution">API_GATEWAY_KEY</code> from the deployment
+                  environment and send it in the <code className="text-caution">X-API-KEY</code>{' '}
                   header.
                 </p>
               </div>
@@ -341,7 +341,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                surfaces rather than account settings. */
             <a
               href="/account"
-              className="mt-4 inline-flex items-center gap-2 text-micro font-bold uppercase tracking-widest text-cyan-400 hover:text-cyan-300"
+              className="mt-4 inline-flex items-center gap-2 text-micro font-bold uppercase tracking-widest text-accent hover:text-accent"
             >
               Manage plan &amp; billing →
             </a>
@@ -380,7 +380,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
               </div>
 
               <div className="p-3 bg-raised/60 rounded-xl border border-line">
-                <span className="text-micro font-bold text-ink-dim">AGENT TIERS</span>
+                <span className="text-micro font-bold text-ink-dim">Agent tiers</span>
                 {platform && Object.keys(platform.reportingTiers).length > 0 ? (
                   <div className="mt-2 space-y-1">
                     {Object.entries(platform.reportingTiers).map(([tier, status]) => (
@@ -389,12 +389,12 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                         <span
                           className={
                             status === 'HEALTHY'
-                              ? 'text-emerald-400'
+                              ? 'text-positive'
                               : status === 'DEGRADED'
-                                ? 'text-amber-400'
+                                ? 'text-caution'
                                 : status === 'NOT_DEPLOYED'
                                   ? 'text-ink-mute'
-                                  : 'text-rose-400'
+                                  : 'text-negative'
                           }
                         >
                           {status}

@@ -87,7 +87,7 @@ export function verifySessionToken(token: string): {
     }
 
     return { valid: true, email, role };
-  } catch (e) {
+  } catch {
     return { valid: false };
   }
 }

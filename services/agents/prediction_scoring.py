@@ -36,6 +36,10 @@ from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.quote_cache import parse_quote, quote_key
 
+# SPY's last minute bar at or before a moment: the market's price when a
+# prediction was made, for grading it net of the market.
+_SPY_AT_SQL = "SELECT close FROM tradfi_bars WHERE ticker = 'SPY' AND time <= $1 ORDER BY time DESC LIMIT 1"
+
 # How far an entry may sit from the ticker's live quote and still be its price.
 MAX_ENTRY_DEVIATION = 0.15
 
@@ -691,6 +695,15 @@ class PredictionScoringMixin:
         # Relative, so the threshold means the same thing for a $3 stock and a
         # $3,000 one.
         move = (current - pred.entry_price) / abs(pred.entry_price)
+        # And net of the market, for a stock. Graded on its raw move, every
+        # "up" call on a stock was right in a rally whatever the stock did
+        # against the market -- and these hit rates size positions (the quant
+        # engine's Kelly) and weight agents in the consensus. The track record
+        # already grades the same calls against SPY; the scorecards now agree.
+        # Where SPY's move over the window is unknown, the raw move stands.
+        bench = await self._benchmark_move(pred)
+        if bench is not None:
+            move -= bench
 
         if direction == "flat":
             return abs(move) <= self.FLAT_BAND
@@ -704,6 +717,27 @@ class PredictionScoringMixin:
         # credited the agent for a word the resolver did not understand.
         self.logger.debug("Unscoreable direction %r on %s", pred.direction, pred.ticker)
         return None
+
+    async def _benchmark_move(self, pred: "AgentPrediction") -> Optional[float]:
+        """SPY's return from the prediction's creation to now, for a stock
+        prediction; None for anything else or when either price is unknown."""
+        from shared.utils.equities import asset_class
+
+        ticker = str(pred.ticker or "").upper().strip()
+        db = getattr(self, "db", None)
+        if not ticker or ticker == "SPY" or asset_class(ticker) != "equity" or db is None:
+            return None
+        try:
+            created = datetime.fromisoformat(pred.created_at) if isinstance(pred.created_at, str) else pred.created_at
+            row = await db.query_one(_SPY_AT_SQL, created)
+            then = float(row["close"]) if row and row.get("close") else None
+        except Exception as e:
+            swallowed("agents.prediction_scoring.benchmark_then", e, self.logger)
+            return None
+        now = await self._latest_price("SPY")
+        if not then or not now or then <= 0:
+            return None
+        return (now - then) / then
 
     async def _record_unresolvable(self, pred) -> None:
         """Track predictions that reached their horizon and could not be scored.

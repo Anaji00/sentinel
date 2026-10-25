@@ -6,15 +6,12 @@ import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import {
   X,
-  ShieldAlert,
   Cpu,
   Activity,
   Database,
   CheckCircle,
-  AlertTriangle,
   Layers,
   Clock,
-  Hash,
 } from 'lucide-react';
 import { Badge } from './ui/Badge';
 import { useDialog } from './ui/useDialog';
@@ -85,7 +82,7 @@ interface ExplainResponse {
   score_adjustments: ScoreAdjustment[];
   provenance: ProvenanceData;
   model_card: ModelCard;
-  market_microstructure: Record<string, any>;
+  market_microstructure: Record<string, unknown>;
   /** Which estimator produced the score, and how much of the history it
    *  wanted was available. A 0.4 from a warm-up curve and a 0.4 from a full
    *  percentile window are different claims. Null on events whose scorer
@@ -108,7 +105,7 @@ export default function ExplainabilityModal({
   const targetPath = eventId
     ? `/explain/event/${eventId}`
     : `/explain/signal/${signalId || 'NVDA'}`;
-  const { data, error, isLoading } = useSWR<ExplainResponse>(targetPath, fetcher);
+  const { data, isLoading } = useSWR<ExplainResponse>(targetPath, fetcher);
 
   // Escape, focus trap, focus restore, backdrop dismiss. This overlay had
   // none of them: a keyboard user could tab out of it into the page behind,
@@ -127,17 +124,17 @@ export default function ExplainabilityModal({
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b border-line/80 pb-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-400">
+            <div className="p-2 rounded-xl bg-accent-dim border border-line text-accent">
               <Cpu className="w-5 h-5" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h3 className="text-sm font-bold text-ink">Explain Computation & Model Card</h3>
-                <Badge variant="live">AUDIT TRAIL</Badge>
+                <Badge variant="live">Audit trail</Badge>
               </div>
               <p className="text-micro text-ink-dim">
                 Target:{' '}
-                <span className="text-cyan-300 font-semibold">
+                <span className="text-accent font-semibold">
                   {data?.entity || eventId || signalId || 'SYSTEM_SIGNAL'}
                 </span>
               </p>
@@ -153,7 +150,7 @@ export default function ExplainabilityModal({
 
         {isLoading ? (
           <div className="py-12 flex flex-col items-center justify-center gap-3 text-ink-dim">
-            <Activity className="w-6 h-6 animate-spin text-cyan-400" />
+            <Activity className="w-6 h-6 animate-spin text-accent" />
             <span>Hydrating mathematical factor attribution & model card...</span>
           </div>
         ) : !data ? (
@@ -168,7 +165,7 @@ export default function ExplainabilityModal({
            * than as one that was never read. On this panel above all others,
            * those two must not look the same. */
           <div className="py-12 flex flex-col items-center justify-center gap-2 text-ink-dim">
-            <span className="text-ink-dim font-bold">NO EXPLANATION AVAILABLE</span>
+            <span className="text-ink-dim font-bold">No explanation yet</span>
             <span className="text-micro text-center max-w-sm">
               The server returned no derivation for this {eventId ? 'event' : 'signal'}. Nothing
               below would be a description of it.
@@ -182,13 +179,13 @@ export default function ExplainabilityModal({
                 <div className="text-micro uppercase tracking-wider text-ink-dim">
                   Anomaly Score
                 </div>
-                <div className="text-lg font-bold text-cyan-400 mt-1">
+                <div className="text-lg font-bold text-accent mt-1">
                   {formatPercent(data?.overall_anomaly_score, { from: 'ratio', decimals: 1 })}
                 </div>
                 {/* Significance comes from the backend, which applies the
                     threshold. It was previously asserted unconditionally. */}
                 {data?.is_significant === true ? (
-                  <div className="text-micro text-emerald-400 flex items-center gap-1 mt-0.5">
+                  <div className="text-micro text-positive flex items-center gap-1 mt-0.5">
                     <CheckCircle className="w-3 h-3" /> Statistically Significant
                   </div>
                 ) : data?.is_significant === false ? (
@@ -207,11 +204,11 @@ export default function ExplainabilityModal({
                 <div
                   className={`text-lg font-bold mt-1 ${
                     data?.model_card?.model_drift_status?.drift_state === 'STABLE'
-                      ? 'text-emerald-400'
+                      ? 'text-positive'
                       : data?.model_card?.model_drift_status?.drift_state === 'SIGNIFICANT_DRIFT'
-                        ? 'text-rose-400'
+                        ? 'text-negative'
                         : data?.model_card?.model_drift_status?.drift_state === 'SLIGHT_DRIFT'
-                          ? 'text-amber-400'
+                          ? 'text-caution'
                           : 'text-ink-dim'
                   }`}
                 >
@@ -232,7 +229,7 @@ export default function ExplainabilityModal({
                 <div className="text-micro uppercase tracking-wider text-ink-dim">
                   Latency & Hash
                 </div>
-                <div className="text-lg font-bold text-amber-400 mt-1">
+                <div className="text-lg font-bold text-caution mt-1">
                   {formatNumber(data?.provenance?.processing_latency_ms, { decimals: 2 })}
                   <span className="text-xs text-ink-mute ml-0.5">ms</span>
                 </div>
@@ -249,7 +246,7 @@ export default function ExplainabilityModal({
             <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
-                  <Layers className="w-4 h-4 text-cyan-400" />
+                  <Layers className="w-4 h-4 text-accent" />
                   Factor Attribution Waterfall
                 </span>
                 <span className="text-micro text-ink-dim">Relative Weight Contribution (%)</span>
@@ -260,7 +257,7 @@ export default function ExplainabilityModal({
                   <div key={idx} className="space-y-1">
                     <div className="flex justify-between text-micro">
                       <span className="text-ink-dim">{f.label}</span>
-                      <span className="text-cyan-400 font-bold">
+                      <span className="text-accent font-bold">
                         {f.contribution_pct === null ? '--' : `${f.contribution_pct}%`}
                       </span>
                     </div>
@@ -279,7 +276,7 @@ export default function ExplainabilityModal({
             <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-amber-400" />
+                  <Clock className="w-4 h-4 text-caution" />
                   Score Derivation Timeline
                 </span>
                 {/* However many steps there were. The server used to emit a
@@ -306,9 +303,9 @@ export default function ExplainabilityModal({
                       <span
                         className={`font-bold ${
                           step.delta > 0
-                            ? 'text-emerald-400'
+                            ? 'text-positive'
                             : step.delta < 0
-                              ? 'text-rose-400'
+                              ? 'text-negative'
                               : 'text-ink-dim'
                         }`}
                       >
@@ -327,7 +324,7 @@ export default function ExplainabilityModal({
             <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
-                  <Database className="w-4 h-4 text-emerald-400" />
+                  <Database className="w-4 h-4 text-positive" />
                   Model Specification Card
                 </span>
                 {/* Schema version, not a governance verdict. The card
@@ -359,7 +356,7 @@ export default function ExplainabilityModal({
                     {(data?.model_card?.features_used || []).map((feat, i) => (
                       <span
                         key={i}
-                        className="px-1.5 py-0.5 rounded bg-overlay text-micro text-cyan-300 font-mono"
+                        className="px-1.5 py-0.5 rounded bg-overlay text-micro text-accent font-mono"
                       >
                         {feat}
                       </span>

@@ -280,8 +280,8 @@ export interface NormalizedEvent {
   prediction_market_data?: PredictionMarketData;
   market_microstructure?: MarketMicrostructure;
   score_adjustments?: ScoreAdjustment[];
-  domain_data?: Record<string, any>;
-  raw_payload?: Record<string, any>;
+  domain_data?: Record<string, unknown>;
+  raw_payload?: Record<string, unknown>;
 }
 
 /**

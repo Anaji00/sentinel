@@ -40,7 +40,7 @@ NO_EDGE_WEIGHT = 0.0
 EVIDENCE_EVENT_TYPES = [
     "headline", "social_signal", "vessel_dark", "vessel_sts", "supply_chain_metric",
     "filing", "regulatory_event", "insider_cluster", "earnings_surprise", "options_flow",
-    "market_anomaly", "equity_block", "thirteen_f",
+    "market_anomaly", "equity_block", "thirteen_f", "earnings_reaction", "insider_trade",
 ]
 
 # The same admission the signal engine applies: radar anomalies only, and
@@ -101,6 +101,7 @@ SOURCE_OF = {
 _SOURCE_PREFIXES = (
     ("sector_news_", "news"), ("country_news_", "news"), ("company_news_", "news"),
     ("earnings_surprise", "earnings"),
+    ("earnings_reaction", "earnings"),
     ("8k_", "filings"),
 )
 

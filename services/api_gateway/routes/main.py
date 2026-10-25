@@ -29,6 +29,7 @@ from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
     ownership,
+    me,
     auth,
     oidc,
     billing,
@@ -41,6 +42,7 @@ from services.api_gateway.routes import (
     conflict_zones,
     signals,
     predictions,
+    civic,
     graph,
     radar,
     agents,
@@ -177,6 +179,8 @@ app.include_router(chokepoints.router)
 app.include_router(conflict_zones.router)
 app.include_router(signals.router)
 app.include_router(predictions.router)
+# Watching the watchers: mapped plate readers, agency surveillance tech, report cards.
+app.include_router(civic.router)
 app.include_router(graph.router)
 app.include_router(radar.router)
 app.include_router(agents.router)
@@ -191,6 +195,7 @@ app.include_router(attribution.router)
 app.include_router(feedback.router)
 app.include_router(health.router)
 app.include_router(watchlists.router)
+app.include_router(me.router)
 app.include_router(audit.router)
 app.include_router(dlq.router)
 app.include_router(cases.router)

@@ -88,3 +88,35 @@ def test_technicals_alone_make_no_play_when_evidence_is_required() -> None:
     assert deterministic_play("NVDA", BULL, [1], {"block_trade"}, set(), 4.0, require_evidence=True) is None
     proven = deterministic_play("NVDA", BULL, [1], {"8k_dilution"}, {"8k_dilution"}, 4.0, require_evidence=True)
     assert proven["evidence_status"] == "proven"
+
+
+def test_a_side_whose_leg_lost_to_spy_does_not_vote() -> None:
+    """9 Oct 2026: the model's favourites trailed SPY (-10 bps a week) while its
+    least favourites lagged it further (+39 for the short leg)."""
+    from shared.utils.trade_plan import _model_side, leg_earns
+
+    m = {"validated": True, "quintile": 5, "ic_t": 3, "net_sharpe": 1, "positive_fold_share": 0.9,
+         "long_leg_bps": -9.7, "short_leg_bps": 38.7}
+    assert _model_side(m) == 0
+    assert _model_side({**m, "quintile": 1}) == -1
+    assert leg_earns({"exposures": {"long_leg_bps": 5.0}}, 1) is True
+    assert leg_earns({"validated": True}, 1) is True          # older reports: unchanged
+
+
+def test_buys_are_judged_against_the_average_stock_shorts_against_spy() -> None:
+    """9 Oct 2026: the picks beat the average stock (+31 bps a week) while the
+    average stock trailed SPY (-30), so the picks trailed SPY too."""
+    from shared.utils.trade_plan import _model_side, leg_earns
+
+    m = {"validated": True, "quintile": 5, "ic_t": 3, "net_sharpe": 1, "positive_fold_share": 0.9,
+         "long_leg_bps": -8.4, "long_vs_universe_bps": 30.8, "short_leg_bps": 39.1}
+    assert _model_side(m) == 1
+    assert leg_earns({**m, "long_vs_universe_bps": -2.0}, 1) is False
+    assert leg_earns({**m, "short_leg_bps": -1.0}, -1) is False
+
+
+def test_the_buy_note_says_what_the_evidence_supports() -> None:
+    import importlib
+    eng = importlib.import_module("services.agents.recommendation_engine")
+    note = eng.long_note({"long_vs_universe_bps": 30.8, "long_leg_bps": -8.4})
+    assert "beat the average stock by 0.31%" in note and "holding the index is the bar" in note

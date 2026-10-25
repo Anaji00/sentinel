@@ -59,23 +59,33 @@ local key_base = KEYS[1]
 local raw_val = tonumber(ARGV[1])
 local alpha = tonumber(ARGV[2])
 
+local warmup = tonumber(ARGV[3])
+
 local mean_key = key_base .. ":mean"
 local var_key = key_base .. ":var"
+local n_key = key_base .. ":n"
 
 local mean = redis.call('GET', mean_key)
 local var = redis.call('GET', var_key)
+local n = tonumber(redis.call('GET', n_key) or "0")
 
 local m = mean and tonumber(mean) or raw_val
 local v = var and tonumber(var) or 1.0
 
 local std_dev = math.sqrt(v) + 1e-5
 local norm_score = (raw_val - m) / std_dev
+-- No score until the baseline has seen `warmup` values: a mean of one
+-- observation and a guessed variance is not a distribution.
+if n < warmup then
+    norm_score = 0.0
+end
 
 local new_m = (alpha * raw_val) + ((1.0 - alpha) * m)
 local new_v = (alpha * (raw_val - m)^2) + ((1.0 - alpha) * v)
 
 redis.call('SET', mean_key, tostring(new_m), 'EX', 604800)
 redis.call('SET', var_key, tostring(new_v), 'EX', 604800)
+redis.call('SET', n_key, tostring(n + 1), 'EX', 604800)
 
 return tostring(norm_score)
 """
@@ -197,6 +207,21 @@ BASELINE_RETENTION_WINDOWS = 24  # remember an entity's rate for a day of window
 
 # The most of a score's headroom that all boosts together may consume.
 MAX_TOTAL_LIFT_SHARE = float(os.getenv("ANOMALY_MAX_TOTAL_LIFT", "0.55"))
+
+
+# Values a per-name baseline sees before its z-scores count.
+NORMALIZE_WARMUP = 5
+
+
+def log_scale(value: Any) -> float:
+    """sign(x) x log1p(|x|): sizes spanning orders of magnitude on one scale."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(x):
+        return 0.0
+    return math.copysign(math.log1p(abs(x)), x)
 
 
 def lift_score(anomaly: float, weight: float, spent: float = 0.0) -> float:
@@ -641,15 +666,26 @@ class DynamicAnomalyScorer:
         
     async def _dynamic_normalize_batch(self, requests: list) -> list:
         # requests = [(ticker, feature_name, raw_value), ...]
+        #
+        # On a log scale, after a warm-up (22 Oct 2026). The baseline began each
+        # name with a variance of 1.0 in raw units -- dollars for a trade's
+        # notional -- so the second trade after a quiet week scored hundreds of
+        # thousands of standard deviations ($500k then $1M: z ~ 500,000) and the
+        # detector read every freshly seen name as extreme. Sizes span orders of
+        # magnitude, so the z-score is taken on sign x log1p|x|, where a unit
+        # variance is a sensible prior, and nothing scores until NORMALIZE_WARMUP
+        # values have been seen. New keys (":log"), so the dollar-scale
+        # baselines are not mixed in.
         if not requests:
             return []
         if not self.redis or not getattr(self.redis, "raw", None):
-            return [r[2] / 1000.0 for r in requests]
-            
+            return [log_scale(r[2]) for r in requests]
+
         pipe = self.redis.raw.pipeline()
         for ticker, feature_name, raw_value in requests:
-            key_base = f"sentinel:stats:{ticker}:{feature_name}"
-            pipe.eval(DYNAMIC_NORMALIZE_LUA, 1, key_base, float(raw_value), float(self.alpha))
+            key_base = f"sentinel:stats:{ticker}:{feature_name}:log"
+            pipe.eval(DYNAMIC_NORMALIZE_LUA, 1, key_base, log_scale(raw_value), float(self.alpha),
+                      int(NORMALIZE_WARMUP))
         
         res = await pipe.execute()
         return [float(r) for r in res]

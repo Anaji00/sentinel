@@ -249,6 +249,30 @@ async def _universe(raw: Any) -> set:
     return {t for t in tickers if t}
 
 
+async def resolve_cusips(session: aiohttp.ClientSession, raw: Any, positions: Dict[str, Dict[str, Any]],
+                         resolve: Callable[[str, Optional[str]], Optional[str]],
+                         cusip_cache: Dict[str, Optional[str]]) -> None:
+    """Tickers for an information table's CUSIPs into `cusip_cache`: exact
+    identifiers first, names second, and OpenFIGI for the largest positions
+    neither could place."""
+    for cusip, pos in positions.items():
+        if cusip not in cusip_cache:
+            known = await raw.hget(CUSIP_KEY, cusip)
+            known = known.decode() if isinstance(known, bytes) else known
+            cusip_cache[cusip] = None if known in (None, "-") else known
+            if cusip_cache[cusip] is None and known is None:
+                cusip_cache[cusip] = resolve(str(pos["issuer"]), cusip)
+    unresolved = sorted(
+        (c for c, p in positions.items() if not cusip_cache.get(c)),
+        key=lambda c: -float(positions[c]["value"]),
+    )[:FIGI_TOP_N]
+    if unresolved:
+        # The plain session: the SEC one carries the contact address SEC
+        # requires in its User-Agent, which has no business going to OpenFIGI.
+        for c, t in (await _figi_tickers(session, raw, unresolved)).items():
+            cusip_cache[c] = None if t == "-" else t
+
+
 async def _load_holdings(
     session: aiohttp.ClientSession, sec: aiohttp.ClientSession, raw: Any, cik: str, accession: str,
     resolve: Callable[[str, Optional[str]], Optional[str]], universe: set,
@@ -275,24 +299,7 @@ async def _load_holdings(
         for p in positions.values():
             p["value"] = float(p["value"]) * scale
 
-    # Exact identifiers first, names second, and OpenFIGI for the largest
-    # positions neither could place.
-    for cusip, pos in positions.items():
-        if cusip not in cusip_cache:
-            known = await raw.hget(CUSIP_KEY, cusip)
-            known = known.decode() if isinstance(known, bytes) else known
-            cusip_cache[cusip] = None if known in (None, "-") else known
-            if cusip_cache[cusip] is None and known is None:
-                cusip_cache[cusip] = resolve(str(pos["issuer"]), cusip)
-    unresolved = sorted(
-        (c for c, p in positions.items() if not cusip_cache.get(c)),
-        key=lambda c: -float(positions[c]["value"]),
-    )[:FIGI_TOP_N]
-    if unresolved:
-        # The plain session: the SEC one carries the contact address SEC
-        # requires in its User-Agent, which has no business going to OpenFIGI.
-        for c, t in (await _figi_tickers(session, raw, unresolved)).items():
-            cusip_cache[c] = None if t == "-" else t
+    await resolve_cusips(session, raw, positions, resolve, cusip_cache)
 
     kept: List[Dict[str, Any]] = []
     for cusip, pos in positions.items():

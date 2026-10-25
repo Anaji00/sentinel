@@ -3,9 +3,9 @@ import type { Metadata } from 'next';
 import { SessionProvider } from '@/components/ui/SessionContext';
 
 export const metadata: Metadata = {
-  title: 'SENTINEL — Autonomous Market Intelligence & Quantitative Operations',
+  title: 'Sentinel — markets and civic watch',
   description:
-    'Enterprise Autonomous Quantitative Trading, Macro Regime Tracking & Event-Driven Intelligence Platform.',
+    'Stock signals graded on real prices, and a public map of who is watching your town.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

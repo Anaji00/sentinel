@@ -91,12 +91,37 @@ def model_support(model: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def leg_earns(model: Optional[Dict[str, Any]], side: int) -> bool:
+    """Whether the model's long (side 1) or short (-1) leg beat SPY out of sample.
+
+    Measured 9 Oct 2026 on the top thousand stocks: the short leg earned +39 bps
+    a week and the long leg -10, so the model's favourites trailed the index. A
+    side without that record does not vote. Reports from before legs were
+    measured carry neither number and keep the old behaviour."""
+    if not model:
+        return False
+    # Buys are a stock-selection question: did the picks beat the average
+    # stock? (9 Oct 2026: +31 bps a week, t 2.1, while the average stock
+    # trailed SPY by 30.) Shorts keep the SPY test. Older reports fall back.
+    keys = ("long_vs_universe_bps", "long_leg_bps") if side > 0 else ("short_leg_bps",)
+    expo = model.get("exposures") or {}
+    for key in keys:
+        v = model.get(key)
+        if v is None:
+            v = expo.get(key)
+        if v is not None:
+            return float(v) > 0
+    return True
+
+
 def _model_side(model: Optional[Dict[str, Any]]) -> int:
-    """+1 / -1 for a validated or supported model's top / bottom quintile."""
+    """+1 / -1 for a validated or supported model's top / bottom quintile,
+    on a side whose leg has beaten SPY out of sample."""
     if not model_support(model):
         return 0
     q = model.get("quintile")
-    return 1 if q == 5 else -1 if q == 1 else 0
+    side = 1 if q == 5 else -1 if q == 1 else 0
+    return side if side and leg_earns(model, side) else 0
 
 
 def direction_votes(

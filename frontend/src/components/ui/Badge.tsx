@@ -20,27 +20,27 @@ export const Badge: React.FC<BadgeProps> = ({
     { bg: string; text: string; border: string; dot: string }
   > = {
     live: {
-      bg: 'bg-cyan-950/60',
+      bg: 'bg-accent-dim',
       text: 'text-accent',
       border: 'border-accent/40',
       dot: 'bg-accent',
     },
     anomaly: {
-      bg: 'bg-rose-950/60',
-      text: 'text-rose-400',
-      border: 'border-rose-500/40',
+      bg: 'bg-negative/10',
+      text: 'text-negative',
+      border: 'border-negative/30',
       dot: 'bg-rose-500',
     },
     success: {
-      bg: 'bg-emerald-950/60',
-      text: 'text-emerald-400',
-      border: 'border-emerald-500/40',
+      bg: 'bg-positive/10',
+      text: 'text-positive',
+      border: 'border-positive/30',
       dot: 'bg-emerald-400',
     },
     warning: {
-      bg: 'bg-amber-950/60',
-      text: 'text-amber-400',
-      border: 'border-amber-500/40',
+      bg: 'bg-caution/10',
+      text: 'text-caution',
+      border: 'border-caution/30',
       dot: 'bg-amber-400',
     },
     info: {

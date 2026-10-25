@@ -75,10 +75,12 @@ def rates_brief_fields(
     state = curve_state(spread_bps, history_bps)
     credit = credit_signal(credit_ratio, previous_credit_ratio)
     level = risk_level(state, credit)
-    parts = [f"2s10s {spread_bps:+.1f} bps ({state})"]
+    # Read by people on the AI analysts page: rates in percentage points, not
+    # basis points, with the jargon named once in brackets.
+    parts = [f"10-year rate {spread_bps / 100:+.2f} points over the 2-year ({state.lower()} curve)"]
     if breakeven_bps is not None:
-        parts.append(f"breakeven {breakeven_bps:.0f} bps")
-    parts.append(f"credit {credit.lower()}")
+        parts.append(f"markets expect inflation near {breakeven_bps / 100:.2f}% a year (breakeven)")
+    parts.append(f"corporate credit {credit.lower()}")
     return {
         "curve_state": state,
         "yield_spread_2y10y_bps": round(spread_bps, 1),

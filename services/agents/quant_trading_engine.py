@@ -1154,8 +1154,15 @@ MEASURED SIZING INPUTS:
                     play.stop_loss = round(play.entry_level - stop_distance, 2)
                     play.target_price = play.entry_level
 
-                # Hard clamp Kelly allocation to server-calculated half-Kelly limit
-                play.kelly_allocation_pct = round(min(max(0.0, float(play.kelly_allocation_pct)), max_kelly_pct), 2)
+                # Hard clamp Kelly allocation to server-calculated half-Kelly limit,
+                # and to Kelly at this play's own payoff. The limit above used the
+                # payoff of whichever backtested strategy (covered call, momentum,
+                # mean reversion) was found first for the ticker -- not this play,
+                # whose exits are its stop and a target rr stops away. A payoff
+                # better than the play's own structure can deliver oversizes it.
+                play_cap = round(min(max_kelly_pct, 100.0 * quant_calc.kelly_criterion(
+                    win_prob, min(win_loss_ratio, rr), half_kelly=True)), 2)
+                play.kelly_allocation_pct = round(min(max(0.0, float(play.kelly_allocation_pct)), play_cap), 2)
 
             # Evaluate closed-form Covered Call recommendation if CAGG Z-score >= +2.5 (§2.3, §2.6)
             z_score = 0.0
@@ -1450,7 +1457,10 @@ MEASURED SIZING INPUTS:
             return {**entry, "validated": bool(meta.get("validated")), "model": meta.get("chosen"),
                     "horizon": want if horizons.get(want) else None,
                     "ic_t": chosen.get("ic_t"), "net_sharpe": chosen.get("net_sharpe"),
-                    "positive_fold_share": chosen.get("positive_fold_share")}
+                    "positive_fold_share": chosen.get("positive_fold_share"),
+                    "long_leg_bps": (chosen.get("exposures") or {}).get("long_leg_bps"),
+                    "long_vs_universe_bps": (chosen.get("exposures") or {}).get("long_vs_universe_bps"),
+                    "short_leg_bps": (chosen.get("exposures") or {}).get("short_leg_bps")}
         except Exception as e:
             swallowed("agents.quant_trading_engine.model_rank", e, logger)
             return None
@@ -1843,16 +1853,27 @@ MEASURED SIZING INPUTS:
         if not self.db or not tickers:
             return [], []
         try:
+            # Official consolidated daily closes, falling back to the 1d
+            # aggregate only for tickers with none (its UTC-day close is an
+            # after-hours print, up to 1.5% from the official close).
             rows = await self.db.query(
                 """
+                SELECT ticker, day::timestamptz AS bucket_time, close
+                FROM daily_bars
+                WHERE ticker = ANY($1::text[])
+                  AND close > 0
+                  AND day > CURRENT_DATE - $2::int
+                UNION ALL
                 SELECT ticker, bucket_time, close
                 FROM tradfi_bars_1d
                 WHERE ticker = ANY($1::text[])
+                  AND ticker NOT IN (SELECT DISTINCT ticker FROM daily_bars
+                                     WHERE ticker = ANY($1::text[]) AND day > CURRENT_DATE - $2::int)
                   AND close IS NOT NULL AND close > 0
-                  AND bucket_time > NOW() - ($2 || ' days')::INTERVAL
+                  AND bucket_time > NOW() - make_interval(days => $2::int)
                 ORDER BY bucket_time
                 """,
-                tickers, str(BL_LOOKBACK_DAYS),
+                tickers, BL_LOOKBACK_DAYS,
             )
         except Exception as e:
             self.logger.debug("Black-Litterman bar lookup failed: %s", e)

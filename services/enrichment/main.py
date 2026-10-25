@@ -310,7 +310,14 @@ async def _ticker_stats_loop(timescale, redis_client) -> None:
                 logger.debug("Ticker stats: the watchlist is empty; nothing to compute.")
             written = thin = 0
             for ticker in tickers:
+                # Official consolidated closes first: the 1d aggregate buckets by
+                # UTC day, so its close is the last after-hours print. It stays
+                # the fallback for what has no daily bars (crypto, futures).
                 rows = await timescale.query(
+                    "SELECT close FROM daily_bars WHERE ticker = $1 "
+                    "ORDER BY day DESC LIMIT $2",
+                    ticker, TICKER_STATS_LOOKBACK_SESSIONS,
+                ) or await timescale.query(
                     "SELECT close FROM tradfi_bars_1d WHERE ticker = $1 "
                     "ORDER BY bucket_time DESC LIMIT $2",
                     ticker, TICKER_STATS_LOOKBACK_SESSIONS,
@@ -720,6 +727,49 @@ ROUTINE_POSITION_FLOOR = 0.30
 ROUTINE_POSITION_EXEMPT_TAGS = frozenset({"sanctions_risk"})
 
 
+# Producer score models (shared/utils/score_calibration.py), refit daily by the
+# grader and read here at most every ten minutes.
+_CALIBRATION_TTL_SEC = 600
+_CALIBRATION_CACHE: dict = {"at": 0.0, "models": {}}
+
+
+async def _anomaly_calibration(redis_client) -> dict:
+    import time as _time
+    from shared.utils.score_calibration import ANOMALY_CALIBRATION_KEY
+    if _time.time() - _CALIBRATION_CACHE["at"] < _CALIBRATION_TTL_SEC:
+        return _CALIBRATION_CACHE["models"]
+    models: dict = {}
+    try:
+        blob = await getattr(redis_client, "raw", redis_client).get(ANOMALY_CALIBRATION_KEY)
+        if blob:
+            models = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")).get("producers") or {}
+    except Exception as exc:
+        swallowed("enrichment.anomaly_calibration", exc, logger)
+    _CALIBRATION_CACHE.update(at=_time.time(), models=models)
+    return models
+
+
+def _apply_calibration(event, models: dict) -> None:
+    """The event's calibrated probability onto its breakdown, and its score
+    held below the high band when its producer's scores carry no information."""
+    from shared.models.events import AnomalyBreakdown, ScoreAdjustment
+    from shared.utils import score_calibration as scal
+    etype = getattr(event.type, "value", event.type)
+    model = models.get(scal.producer_key(str(etype), str(event.source)))
+    if not model or event.anomaly_score is None:
+        return
+    p, lift = scal.calibrate(model, float(event.anomaly_score))
+    if event.anomaly_breakdown is None:
+        event.anomaly_breakdown = AnomalyBreakdown(composite_score=float(event.anomaly_score))
+    event.anomaly_breakdown.calibrated_p_big_move = p
+    event.anomaly_breakdown.calibrated_lift = lift
+    new = scal.capped(float(event.anomaly_score), model)
+    if new < event.anomaly_score:
+        event.score_adjustments.append(ScoreAdjustment(reason="uninformative_producer_cap",
+                                                       delta=round(new - float(event.anomaly_score), 6)))
+        event.anomaly_score = new
+
+
 def _is_routine_position(event) -> bool:
     """A position fix with nothing to say: below the floor and untagged."""
     etype = getattr(getattr(event, "type", None), "value", getattr(event, "type", None))
@@ -968,8 +1018,10 @@ async def main():
 
                         vessel_positions_to_write = []
                         flat_events = _flatten(batch_result)
+                        calibration = await _anomaly_calibration(redis)
                         for enriched in flat_events:
                             if isinstance(enriched, NormalizedEvent):
+                                _apply_calibration(enriched, calibration)
                                 batch_to_write.append(enriched)
                                 if enriched.vessel_data and getattr(enriched.vessel_data, 'mmsi', None):
                                     vd = enriched.vessel_data

@@ -54,7 +54,7 @@ function VerifyInner() {
 
   if (state === 'working') {
     return (
-      <AuthShell title="Confirming" subtitle="ONE MOMENT">
+      <AuthShell title="Confirming" subtitle="One moment">
         <p className="text-sm text-ink-dim text-center">Checking your link…</p>
       </AuthShell>
     );
@@ -62,10 +62,10 @@ function VerifyInner() {
 
   if (state === 'confirmed') {
     return (
-      <AuthShell title="Email confirmed" subtitle="YOU ARE ALL SET">
+      <AuthShell title="Email confirmed" subtitle="You're all set">
         <div className="space-y-4 text-sm text-ink-dim">
           <p>Your address is confirmed. Nothing else to do.</p>
-          <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
+          <Link href="/login" className="block text-center text-accent hover:text-accent">
             Sign in
           </Link>
         </div>
@@ -74,7 +74,7 @@ function VerifyInner() {
   }
 
   return (
-    <AuthShell title="Link not valid" subtitle="IT MAY HAVE EXPIRED">
+    <AuthShell title="Link not valid" subtitle="It may have expired">
       <div className="space-y-4 text-sm text-ink-dim">
         <p className="text-ink-dim">
           Confirmation links last 48 hours and can be used once. Request a fresh one below — your
@@ -82,7 +82,7 @@ function VerifyInner() {
         </p>
 
         {resent ? (
-          <p className="text-cyan-400">
+          <p className="text-accent">
             If that address still needs confirming, a new link is on its way.
           </p>
         ) : (
@@ -116,7 +116,7 @@ export default function VerifyPage() {
   return (
     <Suspense
       fallback={
-        <AuthShell title="Confirming" subtitle="ONE MOMENT">
+        <AuthShell title="Confirming" subtitle="One moment">
           <p className="text-sm text-ink-dim text-center">Loading…</p>
         </AuthShell>
       }

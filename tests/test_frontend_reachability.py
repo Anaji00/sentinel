@@ -59,8 +59,13 @@ def test_priority_domains_appear_in_the_navigation():
     sidebar = (FRONTEND / "components/ui/Sidebar.tsx").read_text(encoding="utf-8")
     # /graph is deliberately absent: the knowledge-graph view was removed from
     # the product. Its backend and Neo4j remain, feeding the agent swarm.
-    for route in ("/filings", "/osint", "/intelligence"):
+    for route in ("/filings", "/intelligence"):
         assert route in sidebar, f"{route} is missing from the navigation"
+    # Open-source intel is a view of /intelligence, and /osint redirects there.
+    intel = (FRONTEND / "app/(dashboard)/intelligence/page.tsx").read_text(encoding="utf-8")
+    assert "OsintThreatMatrix" in intel, "open-source intel is no longer reachable"
+    config = (FRONTEND.parent / "next.config.ts").read_text(encoding="utf-8")
+    assert '"/osint"' in config, "old /osint links no longer resolve"
     assert "/graph" not in sidebar, "the removed graph view is back in the nav"
 
 

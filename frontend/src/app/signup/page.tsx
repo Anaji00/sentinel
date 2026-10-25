@@ -66,7 +66,7 @@ export default function SignupPage() {
         <div className="space-y-4 text-sm text-ink-dim leading-relaxed">
           {emailSent ? (
             <p>
-              We sent a confirmation link to <span className="text-cyan-400">{email}</span>. It
+              We sent a confirmation link to <span className="text-accent">{email}</span>. It
               works for 48 hours.
             </p>
           ) : (
@@ -82,7 +82,7 @@ export default function SignupPage() {
           </p>
           <Link
             href="/login"
-            className="block text-center text-cyan-400 hover:text-cyan-300 text-sm"
+            className="block text-center text-accent hover:text-accent text-sm"
           >
             Go to sign in
           </Link>
@@ -146,7 +146,7 @@ export default function SignupPage() {
           </p>
         </div>
 
-        {error && <p className="text-sm text-rose-400">{error}</p>}
+        {error && <p className="text-sm text-negative">{error}</p>}
 
         <button type="submit" disabled={busy} className={buttonClass}>
           {busy ? 'Creating…' : 'Create account'}
@@ -154,7 +154,7 @@ export default function SignupPage() {
 
         <p className="text-center text-xs text-ink-mute">
           Already have one?{''}
-          <Link href="/login" className="text-cyan-400 hover:text-cyan-300">
+          <Link href="/login" className="text-accent hover:text-accent">
             Sign in
           </Link>
         </p>

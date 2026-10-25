@@ -120,6 +120,30 @@ except (ImportError, ModuleNotFoundError):
     _si_spec.loader.exec_module(short_interest)
 
 try:
+    import fundamentals
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _fund_spec = _ilu.spec_from_file_location(
+        "fundamentals", Path(__file__).resolve().parent / "fundamentals.py"
+    )
+    fundamentals = _ilu.module_from_spec(_fund_spec)
+    _sys.modules["fundamentals"] = fundamentals
+    _fund_spec.loader.exec_module(fundamentals)
+
+try:
+    import company_facts
+except (ImportError, ModuleNotFoundError):
+    import importlib.util as _ilu
+    import sys as _sys
+    _cf_spec = _ilu.spec_from_file_location(
+        "company_facts", Path(__file__).resolve().parent / "company_facts.py"
+    )
+    company_facts = _ilu.module_from_spec(_cf_spec)
+    _sys.modules["company_facts"] = company_facts
+    _cf_spec.loader.exec_module(company_facts)
+
+try:
     import ownership
 except (ImportError, ModuleNotFoundError):
     import importlib.util as _ilu
@@ -558,6 +582,11 @@ async def _edgar_history_loop(session, redis_client) -> None:
             tickers |= {str(r["ticker"]).upper() for r in rows or []}
             cik_to_ticker = resolve_ticker_dynamically.__globals__.get("_DYNAMIC_CIK_TO_TICKER") or {}
             mapping = history.universe_ciks(cik_to_ticker, tickers)
+            # Every ticker of an issuer, share classes included: company_facts
+            # resolves ticker -> CIK, which the inverted map above cannot
+            # (GOOG, BRK.B; and every bank while that map kept preferreds).
+            for r in await db.query("SELECT ticker, cik FROM issuer_ticker") or []:
+                mapping.setdefault(str(r["ticker"]).upper(), str(r["cik"]))
             await history.backfill_8k_history(
                 session, SEC_HEADERS, db, redis_client, mapping, ITEM_DESCRIPTIONS, EDGAR_8K_HISTORY_DONE_KEY,
             )
@@ -651,11 +680,23 @@ async def main():
                 ownership.run_forever(producer, redis_client, resolve_ticker_dynamically),
                 name="ownership",
             )
+            # Five years of institutional flows for the study (ownership_history.py).
+            import ownership_history as _ownership_history
+            safe_create_task(_ownership_history.run_forever(resolve_ticker_dynamically), name="ownership-history")
             # 5%+ holders and activists, as they file (Schedule 13D/13G).
             safe_create_task(
                 beneficial.run_forever(producer, redis_client, _cik_ticker),
                 name="beneficial",
             )
+            # Share counts for ranked stocks the SEC frames leave out (multi-class, foreign).
+            import vendor_shares as _vendor_shares
+            safe_create_task(_vendor_shares.run_forever(), name="vendor-shares")
+            # Insiders' notices of proposed sales (Form 144), ahead of the Form 4.
+            import form144 as _form144
+            safe_create_task(_form144.run_forever(_cik_ticker), name="form144")
+            # Ten years of insider trades, routine or opportunistic, for the study.
+            import insider_history as _insider_history
+            safe_create_task(_insider_history.run_forever(), name="insider-history")
             # Federal contract obligations to listed companies (USAspending).
             safe_create_task(
                 contracts.run_forever(producer, redis_client, lambda name: resolve_ticker_dynamically(name)),
@@ -668,6 +709,20 @@ async def main():
             # FINRA short interest, every settlement since 2020, for the
             # cross-sectional model's days-to-cover feature.
             safe_create_task(short_interest.run_forever(), name="short-interest")
+            # Reported financials (SEC XBRL frames) for the model's value,
+            # profitability, investment and accruals features.
+            safe_create_task(
+                fundamentals.run_forever(
+                    SEC_HEADERS, redis_client,
+                    lambda: {str(int(k)): str(v).upper()
+                             for k, v in (resolve_ticker_dynamically.__globals__.get("_DYNAMIC_CIK_TO_TICKER") or {}).items()
+                             if str(k).strip().isdigit()},
+                ),
+                name="fundamentals",
+            )
+            # Every fact with its filing date (SEC company facts): the point-
+            # in-time source the model reads; frames stay as a cross-check.
+            safe_create_task(company_facts.run_forever(SEC_HEADERS), name="company-facts")
 
             # Fetch live 13F filings from SEC EDGAR on startup
             await seed_prominent_13f_reports(session, producer, redis_client)

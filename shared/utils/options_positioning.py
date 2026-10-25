@@ -27,8 +27,9 @@ underlying's next returns:
   on that side. High-spread stocks beat low-spread ones by ~50 bps a week.
 
 Both are kept per ticker per day (option_daily) from the first day they are
-read: option IV history cannot be bought back on this feed, so it is measured
-going forward and studied once enough days exist.
+read. The snapshots' IV cannot be fetched for past days; a history back to
+February 2024 is rebuilt from daily option bars instead (shared/utils/
+option_iv.py, option_iv_history), kept apart from this table's definitions.
 """
 from __future__ import annotations
 

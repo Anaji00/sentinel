@@ -2,30 +2,26 @@ import React from 'react';
 import Institutional13FPanel from '@/components/Institutional13FPanel';
 import FilingsStream from '@/components/FilingsStream';
 import OwnershipPanel from '@/components/OwnershipPanel';
-import { IconDocument } from '@/components/ui/icons';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { InsiderIntent } from '@/components/InsiderIntent';
 
 export const metadata = {
-  title: 'Corporate Filings & 13F Intelligence | Sentinel',
-  description:
-    'SEC EDGAR 8-K material event tracking, 13F institutional hedge fund portfolios, and regulatory disclosures.',
+  title: 'Filings & fund holdings | Sentinel',
+  description: 'Company filings as they reach the SEC, what the big funds own, and who controls each company.',
 };
 
 export default function FilingsPage() {
   return (
-    <div className="flex flex-col gap-6 p-6 max-w-7xl mx-auto">
-      {/* Top Header */}
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-          <span>
-            <IconDocument className="inline-block shrink-0" />
-          </span>
-          <span>Corporate Filings & 13F Institutional Intelligence</span>
-        </h1>
-        <p className="text-sm text-ink-dim">
-          Real-time primary source SEC EDGAR 8-K material events, quarterly 13F-HR institutional
-          holdings, and regulatory disclosures.
-        </p>
-      </div>
+    <div className="flex flex-col gap-6 p-2 max-w-7xl mx-auto w-full">
+      <PageHeader
+        title="Filings & fund holdings"
+        description="Company filings as they reach the SEC (big events, ownership stakes, insider sales), what the largest funds own each quarter, and who controls each company."
+        related={[
+          { href: '/options', label: 'Big-money flow' },
+          { href: '/ticker', label: 'Look up a stock' },
+          { href: '/board', label: 'Signal board' },
+        ]}
+      />
 
       {/* The page promised "8-K material events ... and regulatory disclosures"
           in its own subtitle and rendered only the 13F panel. `/filings/latest`
@@ -33,6 +29,8 @@ export default function FilingsPage() {
       <div className="min-h-[24rem]">
         <FilingsStream />
       </div>
+
+      <InsiderIntent />
 
       <Institutional13FPanel />
 

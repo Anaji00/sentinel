@@ -1,7 +1,7 @@
 /**
  * @file Centralized API Client & Universal SWR Fetcher
  * Provides full-stack data resilience with CORS-proxied public API fetching
- * (Binance Futures, Yahoo Finance, PolyMarket, CISA KEV) when the backend is offline.
+ * (Binance Futures, Yahoo Finance, PolyMarket) when the backend is offline.
  * STRICT POLICY: 100% authentic live external data or clean "AWAITING LIVE DATA STREAM..." state.
  */
 
@@ -52,42 +52,9 @@ apiClient.interceptors.response.use(
   },
 );
 
-const SYMBOL_YAF_MAP: Record<string, string> = {
-  SPX: '^GSPC',
-  NDX: '^NDX',
-  SPY: '^GSPC',
-  QQQ: '^NDX',
-  DJI: '^DJI',
-  VIX: '^VIX',
-  WTI: 'CL=F',
-  BRENT: 'BZ=F',
-  GLD: 'GC=F',
-  US30: '^TYX',
-  US30Y: '^TYX',
-  US10Y: '^TNX',
-  US2Y: '2YY=F',
-  US02Y: '2YY=F',
-  '2Y': '2YY=F',
-  '2YR': '2YY=F',
-  TLT: 'TLT',
-  SHY: 'SHY',
-};
-
 /**
  * Helper to fetch 100% authentic live series directly from public APIs in browser when backend is offline.
  * Uses Coinbase Exchange Candles API for Crypto and Yahoo Finance via AllOrigins proxy for Equities/Yields.
- */
-
-/**
- * Direct Binance Futures REST API fetcher for Crypto Derivatives, Funding Rates, & OI
- */
-
-/**
- * Direct CISA Known Exploited Vulnerabilities (KEV) Catalog fetcher for Cyber Intelligence
- */
-
-/**
- * Direct PolyMarket API fetcher for Prediction Market Probability Radar
  */
 
 /**
@@ -150,15 +117,15 @@ export function describeApiError(err: unknown): string | null {
   return 'Feed error';
 }
 
-export const fetcher = async (url: string) => {
+export const fetcher = async <T = unknown>(url: string): Promise<T> => {
   // Prevent duplicate /api/v1/api/v1 prefix errors if component passed full /api/v1 path
   const normalizedUrl = url.startsWith('/api/v1/') ? url.replace('/api/v1/', '/') : url;
 
-  let data: any = null;
+  let data: unknown = null;
   try {
     const res = await apiClient.get(normalizedUrl);
     data = res.data;
-  } catch (err: any) {
+  } catch (err: unknown) {
     // Thrown, not swallowed, and carrying the status.
     //
     // Every caller of this fetcher is an SWR hook, and SWR's `error` is the
@@ -166,8 +133,12 @@ export const fetcher = async (url: string) => {
     // here meant that channel was fed a generic Error with the status
     // discarded -- and for /radar/market-series, which returns below before
     // reaching the throw, it was never fed anything at all.
-    const status = err?.response?.status ?? null;
-    const detail = err?.response?.data?.detail;
+    // Read by shape, not by `isAxiosError`: interceptors and adapters can
+    // reject with a plain object carrying `response`, and its status still counts.
+    const response = (err as { response?: { status?: number; data?: { detail?: unknown } } } | null)
+      ?.response;
+    const status = response?.status ?? null;
+    const detail = response?.data?.detail;
     throw new ApiError(normalizedUrl, status, typeof detail === 'string' ? detail : undefined);
   }
 
@@ -175,19 +146,18 @@ export const fetcher = async (url: string) => {
   if (normalizedUrl.includes('/radar/market-series')) {
     const dummyUrl = new URL(normalizedUrl, 'http://localhost:8000/api/v1');
     const symbolsParam = dummyUrl.searchParams.get('symbols');
-    if (!symbolsParam) return { symbols: [], series: {} };
+    if (!symbolsParam) return { symbols: [], series: {} } as T;
     const targetSymbols = symbolsParam
       .split(',')
       .map((s: string) => s.trim().toUpperCase())
       .filter(Boolean);
-    const limit = parseInt(dummyUrl.searchParams.get('limit') || '60', 10);
 
     // `data` is a real response by the time control reaches here: a failed
     // request threw above. An empty `series` therefore means the platform has
     // no history for these symbols, which is a different statement from "the
     // request did not work" -- and this branch used to make them the same, by
     // returning this shape from a caught exception.
-    const seriesData: Record<string, any[]> = data?.series || {};
+    const seriesData: Record<string, unknown[]> = (data as { series?: Record<string, unknown[]> } | null)?.series || {};
 
     // No external substitution.
     //
@@ -225,7 +195,7 @@ export const fetcher = async (url: string) => {
     return {
       symbols: targetSymbols,
       series: seriesData,
-    };
+    } as T;
   }
 
   // A 200 carrying a literal null body. Rare, and not a success.
@@ -233,5 +203,5 @@ export const fetcher = async (url: string) => {
     throw new ApiError(normalizedUrl, 200, 'empty response body');
   }
 
-  return data;
+  return data as T;
 };

@@ -79,6 +79,17 @@ class AlpacaBroker(BrokerInterface):
                     text = await resp.text()
                     raise RuntimeError(f"Alpaca get_account failed ({resp.status}): {text}")
 
+    async def is_market_open(self) -> bool:
+        """The venue's own clock: True only while the regular session trades."""
+        if not self.api_key or not self.secret_key:
+            return False
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            async with session.get(f"{self.base_url}/clock", timeout=10) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                return bool(data.get("is_open"))
+
     async def get_positions(self) -> List[Position]:
         if not self.api_key or not self.secret_key:
             return []

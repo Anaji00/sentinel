@@ -57,6 +57,8 @@ FRED_SERIES: List[FredSeries] = [
     FredSeries("PCE", "PCEPI", "yoy"),
     FredSeries("CORE_PCE", "PCEPILFE", "yoy"),
     FredSeries("GDP", "A191RL1Q225SBEA", "level"),
+    # Weekly, Thursdays: the most frequent read on the labour market.
+    FredSeries("JOBLESS_CLAIMS", "ICSA", "level"),
     # Daily, so a new observation appears every day. It is a release only
     # when the target actually moves; see `release_from_observations`.
     FredSeries("FOMC_RATE_DECISION", "DFEDTARU", "level"),

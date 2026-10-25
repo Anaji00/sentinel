@@ -8,7 +8,6 @@ Dynamically tracks probability shifts (Delta P) and YES/NO bid sizes.
 Delegates statistical Z-score and RRCF anomaly scoring to AnomalyScorer.
 """
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -41,6 +40,26 @@ logger = logging.getLogger("enrichment.prediction")
 # Exact vocabulary for a two-sided market. "outcome 0"/"outcome 1" are kept only
 # because events collected before the collector read the right field carry those
 # placeholders; new events carry the real names.
+# Kalshi's economic markets trade tens to thousands of dollars a print. Scored
+# against Polymarket-sized flow, the forest called a $34 change a whale bid at
+# 0.89 (8 Oct 2026). A label and a high score need real money or a real move in
+# the odds; below both, the event is an odds update.
+KALSHI_MIN_NOTIONAL_USD = 5_000.0
+KALSHI_MIN_PROB_SHIFT = 0.03
+KALSHI_QUIET_SCORE_CAP = 0.3
+
+
+def kalshi_floor(notional_usd: float, delta_p: float, score: float, z_vol: float, z_prob: float):
+    """(score, z_vol, z_prob), quieted when neither the money nor the odds moved enough."""
+    if notional_usd < KALSHI_MIN_NOTIONAL_USD:
+        z_vol = 0.0
+    if abs(delta_p) < KALSHI_MIN_PROB_SHIFT:
+        z_prob = 0.0
+    if notional_usd < KALSHI_MIN_NOTIONAL_USD and abs(delta_p) < KALSHI_MIN_PROB_SHIFT:
+        score = min(score, KALSHI_QUIET_SCORE_CAP)
+    return score, z_vol, z_prob
+
+
 _YES_TOKENS = frozenset({"yes", "y", "true", "1", "outcome 0"})
 _NO_TOKENS = frozenset({"no", "n", "false", "0", "outcome 1"})
 
@@ -205,17 +224,17 @@ class PredictionEnricher:
                 side_str = outcome.upper()
             else:
                 side_str = "YES" if yes_val > no_val else ("NO" if no_val > yes_val else outcome.upper())
-            headline = f"🐋 LARGE POLYMARKET BID ({side_str}): {display_contract}{rank_note} (${notional:,.2f} @ {(price*100):.1f}%)"
+            headline = f"🐋 Big bet on {side_str} for \"{display_contract}\"{rank_note}: ${notional:,.0f} at {(price*100):.0f}% odds (Polymarket)"
         elif z_prob >= 2.5 or (abs(delta_p) > 0 and anomaly_score >= 0.65):
-            shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
             tags.extend(["odd_shift", "probability_spike"])
-            headline = f"🎯 {shift_dir}: {display_contract}{rank_note} ({choice_name or outcome} shift: {(delta_p*100):+.1f}%)"
+            headline = (f"🎯 Odds of {choice_name or outcome} {'jumped' if delta_p > 0 else 'fell'} "
+                        f"{abs(delta_p) * 100:.1f} points: \"{display_contract}\"{rank_note} (Polymarket)")
         elif anomaly_score >= 0.50:
             tags.append("volume_spike")
-            headline = f"🎯 POLYMARKET VOLUME MOVER: {display_contract}{rank_note} (${notional:,.2f} — {choice_name or outcome})"
+            headline = f"🎯 Busy betting on \"{display_contract}\"{rank_note}: ${notional:,.0f} on {choice_name or outcome} (Polymarket)"
         else:
             tags.append("odds_update")
-            headline = f"🎯 POLYMARKET ODDS: {display_contract}{rank_note} ({choice_name or outcome} @ {(price*100):.1f}%)"
+            headline = f"🎯 Betting odds: \"{display_contract}\"{rank_note}, {choice_name or outcome} at {(price*100):.0f}% (Polymarket)"
 
         # Only a slug worth polling again goes back into the watch set.
         #
@@ -313,10 +332,16 @@ class PredictionEnricher:
 
             await self.redis.raw.set(vol_key, str(current_vol), ex=86400)
             await self.redis.raw.set(prob_key, str(yes_prob), ex=86400)
+            # A market seen for the first time only sets the baseline. Read as
+            # a delta, its lifetime volume headlined every new or returning
+            # market as a whale bid.
+            if not last_vol_str:
+                return None
         except Exception:
             delta_vol = current_vol
 
-        notional_usd = delta_vol * price if delta_vol > 0 else current_vol * price
+        # New money only: lifetime volume on an unchanged market is not a bid.
+        notional_usd = delta_vol * price
         yes_val = yes_bid * delta_vol
         no_val = no_bid * delta_vol
 
@@ -332,6 +357,7 @@ class PredictionEnricher:
         anomaly_score = anomaly_res.get("score", 0.0)
         z_vol = anomaly_res.get("z_score_volume", 0.0)
         z_prob = anomaly_res.get("z_score_prob", 0.0)
+        anomaly_score, z_vol, z_prob = kalshi_floor(notional_usd, delta_p, anomaly_score, z_vol, z_prob)
 
         # Record Hawkes cross-domain excitation event
         self.scorer.record_hawkes_event("prediction")
@@ -342,17 +368,17 @@ class PredictionEnricher:
         if z_vol >= 2.5 or (notional_usd > 0 and anomaly_score >= 0.75):
             tags.extend(["volume_spike", "whale_bet"])
             side = "YES" if yes_bid >= no_bid else "NO"
-            headline = f"🚨 KALSHI WHALE BID ({side}): {ticker} (+${notional_usd:,.2f})"
+            headline = f"🐋 Big bet on {side} for {ticker}: ${notional_usd:,.0f} (Kalshi)"
         elif z_prob >= 2.5 or (abs(delta_p) > 0 and anomaly_score >= 0.65):
-            shift_dir = "▲ PROBABILITY SPIKE" if delta_p > 0 else "▼ PROBABILITY DROP"
             tags.extend(["odd_shift", "probability_spike"])
-            headline = f"🎯 KALSHI {shift_dir}: {ticker} ({title} shift: {(delta_p*100):+.1f}%)"
+            headline = (f"🎯 Odds {'jumped' if delta_p > 0 else 'fell'} {abs(delta_p) * 100:.1f} points: "
+                        f"{title or ticker} (Kalshi)")
         elif anomaly_score >= 0.50:
             tags.append("volume_spike")
-            headline = f"🎯 KALSHI VOLUME MOVER: {ticker} (+${notional_usd:,.2f})"
+            headline = f"🎯 Busy betting on {title or ticker}: ${notional_usd:,.0f} (Kalshi)"
         else:
             tags.append("odds_update")
-            headline = f"🎯 KALSHI ODDS: {ticker} ({title})"
+            headline = f"🎯 Betting odds: {title or ticker} (Kalshi)"
 
         entity = Entity(id=ticker, type=EntityType.PREDICTION_MARKET, name=ticker)
 

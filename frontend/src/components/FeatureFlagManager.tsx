@@ -4,17 +4,13 @@ import React, { useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import { fetcher } from '../lib/api';
 import {
-  Shield,
-  ShieldAlert,
-  Power,
   Sliders,
-  RefreshCw,
   AlertOctagon,
   CheckCircle2,
-  Lock,
 } from 'lucide-react';
 import { Badge } from './ui/Badge';
 import { POLL } from './ui/DataProvider';
+import { LoadingLines } from './ui/Skeleton';
 
 interface FlagConfig {
   description: string;
@@ -147,11 +143,11 @@ export default function FeatureFlagManager() {
   const isMasterActive = data?.master_kill_switch?.active;
 
   return (
-    <div className="bg-raised/90 border border-line/80 rounded-2xl p-5 space-y-5 text-xs text-ink shadow-xl">
+    <div className="bg-raised/90 border border-line/80 rounded-2xl p-5 space-y-5 text-xs text-ink">
       {/* Header & Master Control */}
       <div className="flex items-center justify-between border-b border-line/80 pb-4">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-400">
+          <div className="p-2 rounded-xl bg-accent-dim border border-line text-accent">
             <Sliders className="w-5 h-5" />
           </div>
           <div>
@@ -175,8 +171,8 @@ export default function FeatureFlagManager() {
           disabled={processingFlag === 'MASTER'}
           className={`flex items-center gap-2 px-3.5 py-2 rounded-xl font-bold uppercase tracking-wider text-xs border transition-all cursor-pointer shadow-lg ${
             isMasterActive
-              ? 'bg-emerald-950/60 text-emerald-400 border-emerald-500/50 hover:bg-emerald-900/60'
-              : 'bg-rose-950/60 text-rose-400 border-rose-500/50 hover:bg-rose-900/70 hover:shadow-rose-500/20'
+              ? 'bg-positive/10 text-positive border-positive/30 hover:bg-positive/10'
+              : 'bg-negative/10 text-negative border-negative/30 hover:bg-negative/10 hover:shadow-rose-500/20'
           }`}
         >
           <AlertOctagon className="w-4 h-4" />
@@ -185,10 +181,15 @@ export default function FeatureFlagManager() {
       </div>
 
       {actionMessage && (
-        <div className="px-3.5 py-2 rounded-xl bg-cyan-950/50 border border-cyan-500/40 text-cyan-300 text-micro flex items-center gap-2 animate-fadeIn">
-          <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+        <div className="px-3.5 py-2 rounded-xl bg-accent-dim border border-line-accent text-accent text-micro flex items-center gap-2 animate-fadeIn">
+          <CheckCircle2 className="w-4 h-4 text-accent" />
           {actionMessage}
         </div>
+      )}
+
+      {isLoading && !data && <LoadingLines />}
+      {error && !data && (
+        <p className="text-micro text-negative">The flags could not be read from the gateway.</p>
       )}
 
       {/* Signal Flag Cards Grid */}
@@ -225,7 +226,7 @@ export default function FeatureFlagManager() {
               <div className="flex items-center justify-between pt-2 border-t border-line/60 text-micro">
                 <div className="flex items-center gap-2 text-ink-dim">
                   <span>
-                    Rollout: <strong className="text-cyan-400">{flag.rollout_pct}%</strong>
+                    Rollout: <strong className="text-accent">{flag.rollout_pct}%</strong>
                   </span>
                 </div>
 
@@ -236,7 +237,7 @@ export default function FeatureFlagManager() {
                     className={`px-2.5 py-1 rounded-lg border text-micro font-bold uppercase transition-all cursor-pointer ${
                       flag.enabled
                         ? 'bg-overlay text-ink-dim border-line-strong hover:bg-slate-700'
-                        : 'bg-emerald-950/40 text-emerald-400 border-emerald-500/40 hover:bg-emerald-900/50'
+                        : 'bg-positive/10 text-positive border-positive/30 hover:bg-positive/10'
                     }`}
                   >
                     {flag.enabled ? 'Disable' : 'Enable'}
@@ -246,7 +247,7 @@ export default function FeatureFlagManager() {
                     <button
                       onClick={() => handleResetKillSwitch(key)}
                       disabled={processingFlag === key}
-                      className="px-2.5 py-1 rounded-lg bg-emerald-950/40 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-900/50 transition-all font-bold cursor-pointer"
+                      className="px-2.5 py-1 rounded-lg bg-positive/10 text-positive border border-positive/30 hover:bg-positive/10 transition-all font-bold cursor-pointer"
                     >
                       Reset
                     </button>
@@ -254,7 +255,7 @@ export default function FeatureFlagManager() {
                     <button
                       onClick={() => handleTripKillSwitch(key)}
                       disabled={processingFlag === key}
-                      className="px-2.5 py-1 rounded-lg bg-rose-950/40 text-rose-400 border border-rose-500/40 hover:bg-rose-900/50 transition-all font-bold cursor-pointer"
+                      className="px-2.5 py-1 rounded-lg bg-negative/10 text-negative border border-negative/30 hover:bg-negative/10 transition-all font-bold cursor-pointer"
                     >
                       Kill
                     </button>

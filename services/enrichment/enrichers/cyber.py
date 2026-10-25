@@ -402,7 +402,7 @@ class CyberEnricher:
             event_id=raw.event_id, trace_id=raw.trace_id, type=EventType.INFRA_EXPOSED,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
-            headline=f"Exposed {product} on {ip} (Port: {port}) ({org})",
+            headline=f"{product} left open to the internet at {org} ({ip}, port {port})",
             security_data=SecurityData(exposure_type="open_port", ip_address=ip, affected_org=org, port=port),
             tags=tags, anomaly_score=anomaly
         )
@@ -464,7 +464,8 @@ class CyberEnricher:
             event_id=raw.event_id, trace_id=raw.trace_id, type=event_type,
             occurred_at=raw.occurred_at or datetime.now(timezone.utc),
             source=raw.source, primary_entity=entity,
-            headline=f"KEV Added: {cve_id} — {vendor} {product} (ransomware:{ransomware_use})",
+            headline=(f"Hackers are actively using a flaw in {vendor} {product} ({cve_id})"
+                      f"{'; it is used in ransomware attacks' if str(ransomware_use).strip().lower() == 'known' else ''}"),
             security_data=SecurityData(
                 breach_type="known_exploited_vulnerability", affected_org=vendor,
                 cve_id=cve_id, data_types=[cve_id, vuln_name],

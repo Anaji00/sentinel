@@ -142,6 +142,16 @@ FEEDS = [
 
     # ─── EXPANDED OFFICIAL ───
     ("euro_parliament", "https://www.europarl.europa.eu/rss/doc/top-stories/en.xml", "official", 0.98),
+
+    # ─── CIVIL LIBERTIES & SURVEILLANCE (the civic watch feed, shared/utils/watch_feed.py) ───
+    # Names match watch_feed.CIVIC_SOURCES: these join the feed whole.
+    ("eff",             "https://www.eff.org/rss/updates.xml",                 "civic",      0.92),
+    ("404media",        "https://www.404media.co/rss/",                        "civic",      0.88),
+    ("therecord",       "https://therecord.media/feed",                        "civic",      0.88),
+    ("themarkup",       "https://themarkup.org/feeds/rss.xml",                 "civic",      0.90),
+    ("techdirt",        "https://www.techdirt.com/feed/",                      "civic",      0.75),
+    ("aclu",            "https://www.aclu.org/news/feed",                      "civic",      0.90),
+    ("epic",            "https://epic.org/feed/",                              "civic",      0.90),
 ]
 # ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 class URLDeduplicator:

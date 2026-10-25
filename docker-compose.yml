@@ -407,7 +407,8 @@ services:
           # at ~12 events/s against 22/s of production, and it is CPU-bound:
           # scoring, sanctions matching and payload construction per event.
           cpus: '4.0'
-          memory: 1.5G
+          # 1G of 1.5: measured 473MiB on 8 Oct; the 512MiB funds the factor model.
+          memory: 1G
     depends_on:
       migrator:
         condition: service_completed_successfully
@@ -514,7 +515,8 @@ services:
         limits:
           cpus: '1.5'
           # Measured 124MiB. Orchestrates via HTTP; holds nothing large.
-          memory: 512M
+          # 384M of 512: measured 188MiB on 8 Oct; 128MiB funds the factor model.
+          memory: 384M
     depends_on:
       kafka:
         condition: service_healthy
@@ -938,6 +940,30 @@ services:
           # returns is an aggregate small enough to iterate. One sweep a day.
           memory: 192M
 
+  collector-civic:
+    profiles: ["collectors"]
+    build: .
+    container_name: sentinel-civic
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+    command: python services/collector-civic/main.py
+    env_file: .env
+    volumes:
+      - ./services:/app/services:ro
+      - ./shared:/app/shared:ro
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          # Weekly passes: Overpass tiles of a few MB, the Atlas CSV (8.5 MB)
+          # and two Census gazetteers parsed once. No live stream.
+          memory: 160M
+
   collector-ais:
     profiles: ["collectors"]
     build: .
@@ -1304,7 +1330,12 @@ services:
         limits:
           cpus: '2.0'
           # Measured peak 1.29GiB on 1,943 names x 1,259 days with every feature.
-          memory: 1.75G
+          # Consolidated history (8 Oct 2026) filled IEX's missing days: ~5,200
+          # stock columns, and 1.75G was killed twice. Funded from enrichment
+          # and reasoning headroom, not added to the stack's total.
+          # Raised 23 Oct 2026 for history from 2016: 3,235 names x 2,717 days
+          # peaked at 3.0G building features (trial M1); the host has 27G.
+          memory: 6144M
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -1404,8 +1435,9 @@ services:
           # Measured 30MiB under live load. Next.js standalone does not
           # grow with traffic; 512M retains ~17x headroom.
           # 47.6 MiB observed against 512M, a production Next.js build
-          # serving static output.
-          memory: 192M
+          # serving static output. 45.6 MiB on 9 Oct 2026; 128M funds
+          # collector-civic inside the 26 GiB budget, ~2.8x headroom.
+          memory: 128M
     depends_on:
       api-gateway:
         condition: service_healthy
@@ -1505,8 +1537,9 @@ services:
         limits:
           cpus: '0.5'
           # Trimmed 7 Oct 2026 to fit the full stack in the 26 GiB budget beside
-          # factor-model; measured 37 MiB in use.
-          memory: 192M
+          # factor-model; measured 37 MiB in use (49 MiB 9 Oct 2026). 128M from
+          # 9 Oct funds collector-civic, ~2.6x headroom.
+          memory: 128M
     depends_on:
       api-gateway:
         condition: service_healthy

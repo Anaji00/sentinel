@@ -40,17 +40,19 @@ from shared.models import NormalizedEvent, RawEvent
 from shared.models.events import EventType
 from shared.utils.confidence_calibration import record_outcome
 from shared.utils.feature_flags import FeatureFlagManager
-from shared.utils.market_session import instrument_closed_at
-from shared.utils.quiet_failures import swallowed
+from shared.utils.market_session import Session, instrument_closed_at, session_label_at
+from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.short_data import HARD_TO_BORROW_FEE
 from shared.utils.reaction_study import (
-    HORIZONS, CellResult, Series, combine, cost_bps, evaluate_cell, finalize,
+    HORIZONS, SIZE_BENCHMARKS, CellResult, Series, combine, cost_bps, evaluate_cell, finalize, size_benchmark,
+    trailing_dollar_volume,
     measure, pre_move, scaled_horizon_stats, shrunk_hit_rate,
 )
 from shared.utils.signal_families import (
     FAMILY_DESCRIPTIONS, PRICE_DIRECTED, episodes, observations,
 )
 from shared.utils.signal_store import (
-    ACTIVE_KEY, CURSOR_KEY, EVIDENCE_KEY, MAX_NEEDS_BARS, NEEDS_BARS_KEY, OUTCOMES_KEY, STUDY_KEY,
+    ACTIVE_KEY, AWAITING_KEY, CURSOR_KEY, EVIDENCE_KEY, MAX_NEEDS_BARS, NEEDS_BARS_KEY, OUTCOMES_KEY, STUDY_KEY,
 )
 from shared.utils.tasks import safe_create_task
 
@@ -66,7 +68,7 @@ STUDY_LOOKBACK_DAYS = int(os.getenv("SIGNAL_STUDY_LOOKBACK_DAYS", "365"))
 # Event types with years of point-in-time history in the archive (EDGAR 8-Ks,
 # stamped at acceptance), studied that far back at the daily horizons.
 HISTORY_LOOKBACK_DAYS = int(os.getenv("SIGNAL_STUDY_HISTORY_DAYS", str(5 * 365 + 30)))
-DEEP_HISTORY_TYPES = ["filing"]
+DEEP_HISTORY_TYPES = ["filing", "earnings_reaction", "insider_trade", "thirteen_f"]
 ARCHIVE_INTERVAL_SEC = 3600
 # Tape families (volume spikes, blocks) touch ~1,500 tickers with a few
 # episodes each. Every instrument any other family points at is studied; the
@@ -77,11 +79,16 @@ MIN_SIGNAL_PROBABILITY = 0.55
 MAX_PRICE_AGE = timedelta(days=3)
 SIGNAL_SOURCE = "signal_engine"
 OUTCOMES_KEPT = 2000
+# How long an expired signal may wait for its exit price. A signal expiring
+# after Friday's close is first priced at Monday's open; a long weekend adds a
+# day. Past this the instrument has stopped printing and the signal is closed
+# unpriced.
+GRADE_GRACE = timedelta(days=5)
 
 SIGNAL_EVENT_TYPES = [
     "headline", "social_signal", "vessel_dark", "vessel_sts", "supply_chain_metric",
     "filing", "regulatory_event", "insider_cluster", "earnings_surprise", "options_flow",
-    "market_anomaly", "equity_block", "thirteen_f",
+    "market_anomaly", "equity_block", "thirteen_f", "earnings_reaction", "insider_trade",
 ]
 
 _EVENTS_SQL = """
@@ -127,6 +134,11 @@ _SERIES_SQL = """
 _DAILY_SQL = """
     SELECT day, close FROM daily_bars
     WHERE ticker = $1 AND day >= $2::date AND close > 0
+    ORDER BY day
+"""
+_DOLLAR_VOLUME_SQL = """
+    SELECT day, close * volume AS dv FROM daily_bars
+    WHERE ticker = $1 AND day >= $2::date AND close > 0 AND volume > 0
     ORDER BY day
 """
 
@@ -248,6 +260,18 @@ class SignalEngine:
                 continue
         return (times, closes) if times else None
 
+    async def _dollar_volume(self, instrument: str, since: datetime) -> Optional[Series]:
+        try:
+            rows = await self.db.query(_DOLLAR_VOLUME_SQL, instrument, since.date())
+        except Exception as exc:
+            swallowed("agents.signal_engine.dollar_volume", exc, logger)
+            return None
+        times, values = array("d"), array("d")
+        for r in rows or []:
+            times.append(_close_ts(r["day"]))
+            values.append(float(r["dv"]))
+        return (times, values) if times else None
+
     # -- the study ------------------------------------------------------------
 
     async def _archive_recent(self, hours: int = 72) -> None:
@@ -313,6 +337,12 @@ class SignalEngine:
         daily_since = min([since] + [e.known_at for e in eps]) - timedelta(days=7)
         bench_intraday = await self._series("SPY", since - timedelta(days=1))
         bench_merged = merge_daily(await self._daily_series("SPY", daily_since), bench_intraday)
+        # Size-matched indexes for the daily horizons (reaction_study.size_benchmark).
+        size_bench: Dict[str, Optional[Series]] = {"SPY": bench_merged}
+        for _floor, etf in SIZE_BENCHMARKS:
+            if etf not in size_bench:
+                size_bench[etf] = merge_daily(await self._daily_series(etf, daily_since),
+                                              await self._series(etf, since - timedelta(days=1)))
         measured: Dict[Tuple[str, str], list] = {}
         intel = {inst for inst, es in by_inst.items() if any(e.family not in PRICE_DIRECTED for e in es)}
         tape_only = sorted(
@@ -334,13 +364,16 @@ class SignalEngine:
                     needs_bars.append((inst, len(inst_eps)))
                 continue
             marks = [e.known_at.timestamp() for e in inst_eps]
+            dv = await self._dollar_volume(inst, min(since, first) - timedelta(days=40))
+            matched = {e.known_at: size_bench.get(size_benchmark(trailing_dollar_volume(dv, e.known_at.timestamp())))
+                       or bench_merged for e in inst_eps}
             for hname, h in HORIZONS.items():
                 use = series if h >= timedelta(days=1) else intraday
-                bench = bench_merged if h >= timedelta(days=1) else bench_intraday
                 if use is None:
                     continue
                 stats = scaled_horizon_stats(use, h, marks)
                 for e in inst_eps:
+                    bench = matched[e.known_at] if h >= timedelta(days=1) else bench_intraday
                     m = measure(e, h, use, bench, stats)
                     if m is not None:
                         measured.setdefault((e.family, hname), []).append(m)
@@ -468,6 +501,13 @@ class SignalEngine:
         if prob < MIN_SIGNAL_PROBABILITY:
             return 0
         signal_id = f"{instrument}:{hname}:{'long' if direction > 0 else 'short'}"
+        if hname == "1h" and (session_label_at(instrument, now) != Session.REGULAR.name
+                              or session_label_at(instrument, now + HORIZONS[hname]) != Session.REGULAR.name):
+            # An hour's signal outside the hour it could be traded in: 102 of
+            # 130 graded outcomes to 19 Oct 2026 were "no price at expiry",
+            # most of them 1h signals raised after the close.
+            dropped("agents.signal_engine.outside_session", f"{signal_id} at {now.isoformat()}", logger)
+            return 0
         existing = await raw.hget(ACTIVE_KEY, signal_id)
         if existing:
             sig = json.loads(existing)
@@ -475,17 +515,30 @@ class SignalEngine:
             sig["probability"] = round(prob, 3)
             await raw.hset(ACTIVE_KEY, signal_id, json.dumps(sig))
             return 0
+        cost = cost_bps(instrument)
+        if direction < 0:
+            # A short pays its borrow over the horizon, and a name too costly to
+            # borrow is not shorted at all: the filing families' edge sits
+            # mostly in small issuers, where borrow is dearest.
+            fee = await self._borrow_fee(instrument)
+            if fee is not None and fee > HARD_TO_BORROW_FEE:
+                dropped("agents.signal_engine.hard_to_borrow", f"{instrument}: borrow {fee:.1f}%/yr", logger)
+                return 0
+            cost += borrow_cost_bps(fee, HORIZONS[hname])
         recent = await self._series(instrument, now - timedelta(days=4))
         entry_price = float(recent[1][-1]) if recent else None
+        spy_recent = await self._series("SPY", now - timedelta(days=4))
         expected_bps = round(sum(float(ev.get("mean_bps") or 0) for ev in latest.values()), 1)
         sig = {
             "id": signal_id, "instrument": instrument, "horizon": hname,
             "direction": "long" if direction > 0 else "short",
             "probability": round(prob, 3), "expected_bps": expected_bps,
-            "cost_bps": cost_bps(instrument),
+            "cost_bps": round(cost, 1),
             "created_at": now.isoformat(),
             "expires_at": (now + HORIZONS[hname]).isoformat(),
             "entry_price": entry_price,
+            # Graded net of the market, as the study judges the families.
+            "spy_entry": float(spy_recent[1][-1]) if spy_recent else None,
             "evidence": list(latest.values()),
             "families": sorted(latest),
         }
@@ -503,7 +556,10 @@ class SignalEngine:
             "occurred_at": sig["created_at"],
             "source": SIGNAL_SOURCE,
             "primary_entity": {"id": sig["instrument"], "type": "instrument", "name": sig["instrument"]},
-            "headline": f"{side} {sig['instrument']} over {sig['horizon']}: p={sig['probability']:.2f} from {fams}",
+            "headline": (
+                f"{sig['instrument']} {'leans up' if sig['direction'] == 'long' else 'leans down'} over the next "
+                f"{sig['horizon']} ({sig['probability']:.0%} likely), from {fams.replace('_', ' ')}"
+            ),
             "summary": (
                 f"Raised because {len(sig['families'])} proven signal famil"
                 f"{'y' if len(sig['families']) == 1 else 'ies'} agree ({fams}). Expected move "
@@ -523,43 +579,101 @@ class SignalEngine:
             key=sig["instrument"],
         )
 
+    async def _borrow_fee(self, instrument: str) -> Optional[float]:
+        """The latest quoted annual borrow fee in percent, or None."""
+        try:
+            row = await self.db.query_one(_FEE_SQL, instrument.upper())
+            return float(row["fee_rate"]) if row and row.get("fee_rate") is not None else None
+        except Exception as exc:
+            swallowed("agents.signal_engine.borrow_fee", exc, logger)
+            return None
+
     async def expire_signals(self) -> int:
-        """Close expired signals and score them against what the price did."""
+        """Take expired signals off the board, then grade every one whose exit
+        price now exists.
+
+        Grading used to happen on the first pass after expiry, which runs within
+        a minute of it. The exit price is the first bar stamped at or after the
+        expiry, and bars are stamped at the start of their five minutes, so that
+        bar could not exist yet: every signal closed "no price at expiry" and the
+        calibration behind the probabilities never received an outcome. Expired
+        signals now wait in AWAITING_KEY until the bar exists, or GRADE_GRACE
+        passes."""
         raw = self.redis.raw
         now = datetime.now(timezone.utc)
-        closed = 0
         for sid, blob in (await raw.hgetall(ACTIVE_KEY) or {}).items():
             sig = json.loads(blob)
             if _ts(sig["expires_at"]) > now.timestamp():
                 continue
-            series = await self._series(sig["instrument"], now - timedelta(days=12))
-            outcome: Dict[str, Any] = {"id": sig["id"], "instrument": sig["instrument"],
-                                       "horizon": sig["horizon"], "direction": sig["direction"],
-                                       "probability": sig["probability"], "families": sig["families"],
-                                       "created_at": sig["created_at"]}
-            exit_px = None
-            if series is not None:
-                times, closes = series
-                exp = _ts(sig["expires_at"])
-                for t, c in zip(times, closes):
-                    if t >= exp:
-                        exit_px = c
-                        break
-            if exit_px and sig.get("entry_price"):
-                sign = 1 if sig["direction"] == "long" else -1
-                ret_bps = 1e4 * sign * math.log(exit_px / sig["entry_price"])
-                outcome.update(return_bps=round(ret_bps, 1), hit=ret_bps > sig["cost_bps"])
+            # Keyed by creation too: a fresh signal with the same id may expire
+            # while this one is still waiting.
+            await raw.hset(AWAITING_KEY, f"{sid}@{sig['created_at']}", blob)
+            await raw.hdel(ACTIVE_KEY, sid)
+        closed = 0
+        for wid, blob in (await raw.hgetall(AWAITING_KEY) or {}).items():
+            sig = json.loads(blob)
+            exp = _ts(sig["expires_at"])
+            series = await self._series(sig["instrument"], datetime.fromtimestamp(exp, timezone.utc) - timedelta(hours=1))
+            exit_px = exit_price(series, exp)
+            if exit_px is None and now.timestamp() - exp < GRADE_GRACE.total_seconds():
+                continue
+            spy_exit = exit_price(await self._series("SPY", datetime.fromtimestamp(exp, timezone.utc) - timedelta(hours=1)),
+                                  exp) if sig.get("spy_entry") else None
+            outcome = grade(sig, exit_px, spy_exit)
+            if outcome.get("hit") is not None:
                 try:
                     await record_outcome(self.redis, float(sig["probability"]), bool(outcome["hit"]))
                 except Exception as exc:
                     swallowed("agents.signal_engine.record_outcome", exc, logger)
-            else:
-                outcome.update(return_bps=None, hit=None, note="no price at expiry")
             await raw.lpush(OUTCOMES_KEY, json.dumps(outcome))
             await raw.ltrim(OUTCOMES_KEY, 0, OUTCOMES_KEPT - 1)
-            await raw.hdel(ACTIVE_KEY, sid)
+            await raw.hdel(AWAITING_KEY, wid)
             closed += 1
         return closed
 
 
-__all__ = ["SignalEngine"]
+_FEE_SQL = "SELECT fee_rate FROM borrow_rates WHERE ticker = $1 AND fee_rate IS NOT NULL ORDER BY day DESC LIMIT 1"
+
+
+def borrow_cost_bps(fee_pct_annual: Optional[float], horizon: timedelta) -> float:
+    """Borrow paid over a holding period, in bps, from an annual fee in percent."""
+    if not fee_pct_annual:
+        return 0.0
+    return float(fee_pct_annual) * 100.0 * horizon.total_seconds() / (365 * 86400)
+
+
+def exit_price(series: Optional[Series], expires_ts: float) -> Optional[float]:
+    """The first close stamped at or after the expiry, or None while none exists."""
+    if series is None:
+        return None
+    for t, c in zip(*series):
+        if t >= expires_ts:
+            return float(c)
+    return None
+
+
+def grade(sig: Dict[str, Any], exit_px: Optional[float], spy_exit: Optional[float] = None) -> Dict[str, Any]:
+    """A closed signal's outcome: its return in the signal's direction, net of
+    SPY's move over the same window when both SPY prices are known, and a hit
+    when that beats the signal's own costs."""
+    outcome: Dict[str, Any] = {"id": sig["id"], "instrument": sig["instrument"], "horizon": sig["horizon"],
+                               "direction": sig["direction"], "probability": sig["probability"],
+                               "families": sig["families"], "created_at": sig["created_at"],
+                               "expires_at": sig["expires_at"]}
+    entry = sig.get("entry_price")
+    if exit_px and entry:
+        sign = 1 if sig["direction"] == "long" else -1
+        move = math.log(exit_px / float(entry))
+        spy_entry = sig.get("spy_entry")
+        if spy_entry and spy_exit:
+            move -= math.log(spy_exit / float(spy_entry))
+            outcome["net_of"] = "SPY"
+        ret_bps = 1e4 * sign * move
+        outcome.update(exit_price=exit_px, return_bps=round(ret_bps, 1), hit=ret_bps > float(sig["cost_bps"]))
+    else:
+        outcome.update(return_bps=None, hit=None,
+                       note="no entry price" if not entry else "no price within the grace period")
+    return outcome
+
+
+__all__ = ["GRADE_GRACE", "SignalEngine", "borrow_cost_bps", "exit_price", "grade"]

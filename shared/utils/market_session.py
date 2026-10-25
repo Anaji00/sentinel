@@ -211,6 +211,20 @@ def instrument_closed_at(ticker: str, utc_ts: Optional[datetime] = None) -> bool
     return current_session(utc_ts, asset_class="equities") == Session.CLOSED
 
 
+def session_label_at(ticker: str, utc_ts: Optional[datetime] = None) -> str:
+    """The session a bar at `utc_ts` belongs to, by its own time.
+
+    Bars arriving without a session were stored as REGULAR whatever the clock
+    said: 06:59 and 22:01 ET equity bars were labelled regular hours, so anything
+    filtering on the session counted pre-market and evening prints as the day.
+    Crypto and futures trade around the clock and keep REGULAR."""
+    t = str(ticker or "").strip().upper()
+    base = t.replace("-USD", "").replace("USDT", "").replace("USD", "") if t else t
+    if base in _CRYPTO_BASES or t.endswith("-USD") or t.endswith("=F"):
+        return Session.REGULAR.name
+    return current_session(utc_ts, asset_class="equities").name
+
+
 # How much to stretch a poll interval in each session.
 #
 # A multiplier rather than a table of intervals, so each collector keeps its own

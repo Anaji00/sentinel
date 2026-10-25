@@ -470,12 +470,52 @@ async def _publish_movers(redis_client, movers: Dict[str, Dict[str, float]], eva
         swallowed("collector_radar.publish_movers", _exc, logger)
 
 
+# The official previous close, once a day.
+#
+# The day's move was measured against the IEX feed's previous close -- IEX's
+# last trade, 25-40 bps from the official close on lower-priced names -- so
+# every percentage on the movers board carried that error. The free plan's
+# delayed_sip snapshots carry yesterday's consolidated bar exactly (only the
+# current day is delayed), so one sweep a day fixes the reference while the
+# live price stays on the real-time feed.
+_OFFICIAL_PREV_CLOSE: Dict[str, float] = {}
+_OFFICIAL_PREV_DAY: Dict[str, str] = {"day": ""}
+
+
+async def _refresh_official_prev_close(session: aiohttp.ClientSession, headers: dict, universe: List[str]) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _OFFICIAL_PREV_DAY["day"] == today and _OFFICIAL_PREV_CLOSE:
+        return
+    fresh: Dict[str, float] = {}
+    for chunk in chunk_list(universe, 1000):
+        try:
+            async with session.get(f"{ALPACA_DATA_URL}?symbols={','.join(chunk)}&feed=delayed_sip",
+                                   headers=headers, timeout=20) as resp:
+                if resp.status != 200:
+                    logger.warning("Official previous close: HTTP %s from delayed_sip", resp.status)
+                    return
+                for ticker, snap in (await resp.json() or {}).items():
+                    c = _as_float(((snap or {}).get("prevDailyBar") or {}).get("c"))
+                    if c > 0:
+                        fresh[ticker] = c
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            swallowed("collector.radar.official_prev_close", e, logger)
+            return
+        await asyncio.sleep(0.3)
+    if fresh:
+        _OFFICIAL_PREV_CLOSE.clear()
+        _OFFICIAL_PREV_CLOSE.update(fresh)
+        _OFFICIAL_PREV_DAY["day"] = today
+        logger.info("Official previous closes loaded for %s symbols (delayed_sip).", len(fresh))
+
+
 async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: SentinelProducer, radar: QuantRadar, universe: List[str], alpha: float, z_threshold: float, state: dict, metrics: Optional[CollectorMetrics] = None):
     state["polls"] += 1
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY, "Accept": "application/json"}
     feed = os.getenv("ALPACA_DATA_FEED", "iex")
     chunks = list(chunk_list(universe, 1000))
-    
+    await _refresh_official_prev_close(session, headers, universe)
+
     semaphore = asyncio.Semaphore(10)
 
     async def fetch_chunk(chunk_tickers: List[str]) -> dict:
@@ -535,7 +575,7 @@ async def poll_alpaca_snapshots(session: aiohttp.ClientSession, producer: Sentin
             # what the session has done since the open, and `day_pct` is the
             # two together. A name up 6% that gapped 7% and has been sold all
             # day is not the same event as one that ground higher from the bell.
-            prev_close = _as_float(prev_daily_bar.get("c"))
+            prev_close = _OFFICIAL_PREV_CLOSE.get(ticker) or _as_float(prev_daily_bar.get("c"))
             day_open = _as_float(daily_bar.get("o"))
             day_close = _as_float(daily_bar.get("c")) or _as_float(minute_bar.get("c"))
             move = _percent_moves(prev_close, day_open, day_close)

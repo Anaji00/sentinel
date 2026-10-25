@@ -22,7 +22,7 @@ Pure: rows in, observations out.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -40,7 +40,7 @@ MIN_VOLUME_Z = 4.0
 
 # Families whose direction is read from the price tape at the knowable time.
 PRICE_DIRECTED = frozenset({
-    "volume_spike", "block_trade",
+    "volume_spike", "block_trade", "block_buy", "block_sell",
     # 8-K items with no reliable sign of their own: the study directs them by
     # the price move into the filing and measures continuation or reversal.
     "8k_officer_change", "8k_material_agreement", "8k_acquisition_completed",
@@ -68,10 +68,20 @@ EIGHT_K_ITEMS: Dict[str, Tuple[str, int]] = {
 # How far apart two observations may be and still be one episode.
 EPISODE_GAP: Dict[str, timedelta] = {
     "insider_cluster": timedelta(days=14),
+    "insider_opportunistic_buy": timedelta(days=14),
+    "insider_opportunistic_sell": timedelta(days=14),
+    "insider_routine_buy": timedelta(days=14),
     "activist_13d": timedelta(days=14),
     "institutional_accumulation": timedelta(days=60),
     "institutional_distribution": timedelta(days=60),
     "contract_award": timedelta(days=3),
+    "earnings_reaction_up": timedelta(days=5),
+    "earnings_reaction_down": timedelta(days=5),
+    "earnings_reaction_up_small": timedelta(days=5),
+    "earnings_reaction_down_small": timedelta(days=5),
+    "earnings_reaction_up_large": timedelta(days=5),
+    "earnings_reaction_down_large": timedelta(days=5),
+    "earnings_fade_large": timedelta(days=5),
     "earnings_surprise_positive": timedelta(days=5),
     "earnings_surprise_negative": timedelta(days=5),
     **{fam: timedelta(days=2) for fam, _d in EIGHT_K_ITEMS.values()},
@@ -80,9 +90,39 @@ DEFAULT_EPISODE_GAP = timedelta(hours=12)
 
 # Item codes as the filings collector writes them: "4.02: Non-Reliance...".
 _EIGHT_K_CODE = re.compile(r"\b(\d\.\d\d):")
+# "Filed on 2026-09-08." at the end of the collector's summary.
+_FILED_ON = re.compile(r"Filed on (\d{4}-\d{2}-\d{2})")
+# A filing the platform first saw more than this long after it was filed is
+# old news: QUALCOMM's Item 3.02 8-K of 8 September, collected on 13 October,
+# raised a live short signal that day as though it were new.
+STALE_FILING_DAYS = 3
+# Registered 18 Oct 2026 (see "stock_news_fade" below): only articles the
+# platform knew of from this moment count, so history cannot vote for it.
+NEWS_FADE_REGISTERED = datetime(2026, 10, 18, tzinfo=timezone.utc)
+
+
+def _filed_on(summary: str) -> Optional[Any]:
+    """The filing date the collector's summary states, or None."""
+    m = _FILED_ON.search(summary or "")
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1)).date()
+    except ValueError:
+        return None          # a malformed date reads as no date: the filing is judged as new
+
 
 # Plain-language description of each family, for the provenance card.
 FAMILY_DESCRIPTIONS: Dict[str, str] = {
+    "earnings_reaction_up": "A stock that rose 2%+ against the market on its earnings release; drift expected to continue",
+    "earnings_reaction_down": "A stock that fell 2%+ against the market on its earnings release; drift expected to continue",
+    "earnings_reaction_up_small": "An earnings jump of 2%+ in a stock trading under $50M a day; drift expected",
+    "earnings_reaction_down_small": "An earnings drop of 2%+ in a stock trading under $50M a day; drift expected",
+    "earnings_reaction_up_large": "An earnings jump of 2%+ in a stock trading $50M+ a day, where drift has faded",
+    "earnings_reaction_down_large": "An earnings drop of 2%+ in a stock trading $50M+ a day, where drift has faded",
+    "earnings_fade_large": ("An earnings jump of 2%+ in a stock trading $50M+ a day, expected to give some back. Added 17 Oct "
+                            "2026 after the study found large-cap jumps reversing 38 bps over five days (t -3.2, the "
+                            "held-out half -3.2); chosen on the data that measures it, so its forward record decides"),
     "zone_escalation": "Escalation reported in a conflict zone, on the instruments the zone moves",
     "zone_deescalation": "A ceasefire or truce in a conflict zone; expected moves reversed",
     "sector_news_positive": "Clearly positive news about a sector",
@@ -91,19 +131,33 @@ FAMILY_DESCRIPTIONS: Dict[str, str] = {
     "country_news_negative": "Clearly negative economic or political news about a country",
     "company_news_positive": "Clearly positive news naming a company",
     "company_news_negative": "Clearly negative news naming a company",
+    "stock_news_positive": "A company news article (Alpaca/Benzinga) FinBERT reads as clearly positive, about one or two stocks",
+    "stock_news_negative": "A company news article (Alpaca/Benzinga) FinBERT reads as clearly negative, about one or two stocks",
+    "stock_news_fade": ("A clearly positive company news article, expected to give the move back. Registered 18 Oct 2026 "
+                        "after the study found such articles followed by -48 bps in a day (t -4.3) and -130 bps in five "
+                        "(t -5.6), the held-out half agreeing (t -2.5, -3.8); judged only on articles from that date"),
     "dark_vessel_in_zone": "A vessel's transponder going dark inside a conflict zone",
     "tanker_sts_in_zone": "A ship-to-ship transfer involving a tanker inside a conflict zone",
     "radar_no_ais": "Radar returns where AIS saw no vessel (ships not transmitting)",
     "radar_traffic_drop": "Radar traffic through a chokepoint well below its baseline",
     "activist_13d": "An activist crossing 5% under Schedule 13D",
     "insider_cluster": "Two or more insiders buying on the open market within 14 days",
+    "insider_opportunistic_buy": "An insider buying outside their own calendar pattern (Cohen, Malloy & Pomorski)",
+    "insider_opportunistic_sell": "An insider selling outside their own calendar pattern, not under a 10b5-1 plan",
+    "insider_routine_buy": "An insider buying in the month they buy every year: the control, expected to show nothing",
     "contract_award": "A federal contract award to a listed company",
     "earnings_surprise_positive": "Earnings above estimates",
     "earnings_surprise_negative": "Earnings below estimates",
     "options_call_sweep": "A large call sweep (premium and volume over open interest)",
     "options_put_sweep": "A large put sweep",
+    "options_call_buy": "Calls bought at the offer with $50k+ paid above intrinsic value",
+    "options_put_buy": "Puts bought at the offer with $50k+ paid above intrinsic value",
+    "options_opening_call": "Bought calls that opened a position (open interest up next morning)",
+    "options_opening_put": "Bought puts that opened a position (open interest up next morning)",
     "volume_spike": "A volume spike, directed by the price move into it",
     "block_trade": "A large block trade, directed by the price move into it",
+    "block_buy": "A large buyer-initiated block (tick test)",
+    "block_sell": "A large seller-initiated block (tick test)",
     "institutional_accumulation": "Three or more active managers opening or adding 25%+ to a position in one quarter",
     "institutional_distribution": "Three or more active managers cutting 25%+ or exiting a position in one quarter",
     "8k_nonreliance": "8-K Item 4.02: prior financial statements can no longer be relied on",
@@ -116,6 +170,10 @@ FAMILY_DESCRIPTIONS: Dict[str, str] = {
     "8k_material_agreement": "8-K Item 1.01: entry into a material definitive agreement",
     "8k_acquisition_completed": "8-K Item 2.01: completion of an acquisition or disposition",
     "short_volume_spike": "Short share of volume at least two standard deviations above the name's own norm",
+    "guidance_raised": "An earnings release that raises the company's own guidance (read by the local model)",
+    "guidance_lowered": "An earnings release that lowers the company's own guidance (read by the local model)",
+    "offering_large": "An unregistered equity sale worth 5%+ of the company's market value",
+    "offering_small": "An unregistered equity sale worth under 5% of the company's market value",
 }
 
 
@@ -204,6 +262,19 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
     def add(family: str, sym: str, direction: int, key_part: str) -> None:
         out.append(Observation(family, sym, direction, when, eid, f"{family}|{key_part}|{sym}"))
 
+    # Company news scored by FinBERT (shared/utils/stock_news.py), ahead of the
+    # world-news mappings below: these articles are about the stocks they name.
+    if etype == "headline" and source == "alpaca_news" and "stock_news" in tags:
+        sign = 1 if "tone_positive" in tags else -1 if "tone_negative" in tags else 0
+        if sign:
+            for sym in _exposed(row):
+                add("stock_news_positive" if sign > 0 else "stock_news_negative", sym, sign, "stocknews")
+                # The same article read the other way, as a pre-registered
+                # hypothesis of its own (NEWS_FADE_REGISTERED).
+                if sign > 0 and when >= NEWS_FADE_REGISTERED:
+                    add("stock_news_fade", sym, -1, "stocknews")
+        return out
+
     if etype in ("headline", "social_signal"):
         text = str(row.get("headline") or "")
         affected = map_headline(text)
@@ -249,6 +320,21 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
         return out
 
     ticker = _ticker(row)
+    if etype == "earnings_reaction" and ticker:
+        # services/agents/earnings_reaction.py: stamped at the second close after
+        # the release, carrying the market-adjusted reaction; the prior is drift
+        # in the reaction's direction.
+        ear = _num(_fd(row).get("ear"))
+        if ear is not None and ear != 0:
+            side, sign = ("up", 1) if ear > 0 else ("down", -1)
+            add(f"earnings_reaction_{side}", ticker, sign, "ear")
+            for size in ("small", "large"):
+                if f"size:{size}" in tags:
+                    add(f"earnings_reaction_{side}_{size}", ticker, sign, "ear")
+            if sign > 0 and "size:large" in tags:
+                add("earnings_fade_large", ticker, -1, "ear")
+        return out
+
     if source == "sec_13d" and "activist" in tags:
         for sym in _exposed(row) or ([ticker] if ticker else []):
             add("activist_13d", sym, 1, "13d")
@@ -258,14 +344,41 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
         add("insider_cluster", ticker, 1, "insiders")
         return out
 
+    # Routine or opportunistic, from the insider's own three prior years
+    # (shared/utils/insider_history.py); live Form 4 events and the SEC data
+    # set history carry the same tags.
+    if etype == "insider_trade" and ticker:
+        buy, sell = "open_market_buy" in tags, "open_market_sale" in tags
+        if "insider_opportunistic" in tags and (buy or sell):
+            add("insider_opportunistic_buy" if buy else "insider_opportunistic_sell", ticker, 1 if buy else -1,
+                "insider")
+        elif "insider_routine" in tags and buy:
+            add("insider_routine_buy", ticker, 1, "insider")
+        return out
+
     # Diether, Lee & Werner (2009): increases in short selling predict negative
     # abnormal returns. A spike against the name's own history, from FINRA.
     if source == "finra_short_volume" and "short_volume_spike" in tags and ticker:
         add("short_volume_spike", ticker, -1, "finra")
         return out
 
+    # What the filing extractor read in a filing (shared/utils/filing_extract.py).
+    if etype == "filing" and ticker and source == "filing_extract":
+        for tag, fam, direction in (("guidance_raised", "guidance_raised", 1), ("guidance_lowered", "guidance_lowered", -1),
+                                    ("offering_large", "offering_large", -1), ("offering_small", "offering_small", -1)):
+            if tag in tags:
+                add(fam, ticker, direction, "extract")
+        return out
+
     if etype == "filing" and ticker:
         summary = str(row.get("summary") or "")
+        # An amendment re-reports an event already filed (Watsco's 8-K/A of
+        # 14 October raised a fresh signal on an old sale).
+        if "8-K/A" in str(row.get("headline") or ""):
+            return out
+        filed = _filed_on(summary)
+        if filed is not None and (when.date() - filed).days > STALE_FILING_DAYS:
+            return out
         if summary.startswith("Material 8-K Event"):
             for code in sorted(set(_EIGHT_K_CODE.findall(summary))):
                 if code in EIGHT_K_ITEMS:
@@ -290,9 +403,19 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
         premium = _num(fd.get("premium_usd")) or 0.0
         vol_oi = _num(fd.get("volume_oi_ratio")) or 0.0
         kind = str(fd.get("option_type") or "").upper()
-        if premium >= MIN_OPTIONS_PREMIUM_USD and vol_oi >= MIN_OPTIONS_VOL_OI and kind in ("CALL", "PUT"):
+        if kind not in ("CALL", "PUT"):
+            return out
+        sign = 1 if kind == "CALL" else -1
+        # Buyer-initiated, directional, opening volume (Pan & Poteshman 2006;
+        # shared/utils/options_flow.py), measured beside the premium-sized sweeps.
+        if "opening_confirmed" in tags:
+            add("options_opening_call" if sign > 0 else "options_opening_put", ticker, sign, "opening")
+            return out
+        if "buyer_initiated" in tags and "intrinsic_heavy" not in tags:
+            add("options_call_buy" if sign > 0 else "options_put_buy", ticker, sign, "bought")
+        if premium >= MIN_OPTIONS_PREMIUM_USD and vol_oi >= MIN_OPTIONS_VOL_OI:
             fam = "options_call_sweep" if kind == "CALL" else "options_put_sweep"
-            add(fam, ticker, 1 if kind == "CALL" else -1, "options")
+            add(fam, ticker, sign, "options")
         return out
 
     if etype == "market_anomaly" and source == "alpaca_quant_radar" and ticker:
@@ -302,7 +425,15 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
         return out
 
     if etype == "equity_block" and ticker:
-        add("block_trade", ticker, 0, "block")
+        # The side from the tick test (aggressor tags set at enrichment):
+        # buyer-initiated blocks carry information sellers' do not as often
+        # (Chan & Lakonishok 1993). Unsided blocks stay undirected.
+        if "aggressor_buy" in tags:
+            add("block_buy", ticker, 1, "block")
+        elif "aggressor_sell" in tags:
+            add("block_sell", ticker, -1, "block")
+        else:
+            add("block_trade", ticker, 0, "block")
         return out
 
     if etype == "thirteen_f" and ticker:

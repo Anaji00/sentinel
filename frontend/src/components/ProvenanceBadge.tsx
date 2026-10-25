@@ -41,25 +41,25 @@ export const ProvenanceBadge: React.FC<ProvenanceBadgeProps> = ({
 
   switch (sourceType) {
     case 'live_measurement':
-      badgeStyle = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40';
-      label = 'Live Telemetry';
+      badgeStyle = 'bg-positive/10 text-positive border-positive/30';
+      label = 'Live';
       Mark = IconRadar;
       break;
     case 'computed_deterministic':
       badgeStyle = 'bg-sky-500/15 text-sky-400 border-sky-500/40';
-      label = isSynthetic ? 'Simulated' : 'Deterministic Math';
+      label = isSynthetic ? 'Simulated' : 'Calculated';
       Mark = isSynthetic ? IconSimulated : IconMethodology;
       break;
     case 'llm_inference':
-      badgeStyle = 'bg-purple-500/15 text-purple-400 border-purple-500/40';
+      badgeStyle = 'bg-accent-dim text-accent border-line-accent';
       label = confidence
-        ? `Local AI (${formatPercent(confidence, { from: 'ratio', decimals: 0 })})`
-        : 'Local AI Inference';
+        ? `AI estimate (${formatPercent(confidence, { from: 'ratio', decimals: 0 })})`
+        : 'AI estimate';
       Mark = IconModel;
       break;
     case 'disclosed_placeholder':
-      badgeStyle = 'bg-amber-500/15 text-amber-400 border-amber-500/40';
-      label = 'Pending History';
+      badgeStyle = 'bg-caution/10 text-caution border-caution/30';
+      label = 'Needs more history';
       Mark = IconPending;
       break;
   }
@@ -78,10 +78,10 @@ export const ProvenanceBadge: React.FC<ProvenanceBadgeProps> = ({
   return (
     <span
       title={tooltipContent || label}
-      className={`inline-flex items-center gap-1.5 px-2 py-0.5 text-micro font-semibold rounded-md border tracking-tight transition-all cursor-help select-none ${badgeStyle} ${className}`}
+      className={`inline-flex max-w-full items-center gap-1 px-1.5 py-0.5 text-micro font-medium rounded-md border whitespace-nowrap overflow-hidden transition-all cursor-help select-none ${badgeStyle} ${className}`}
     >
       <Mark label={label} className="shrink-0" />
-      <span>{label}</span>
+      <span className="truncate">{label}</span>
     </span>
   );
 };

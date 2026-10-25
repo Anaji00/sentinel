@@ -15,6 +15,7 @@ import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
+import { LoadingLines } from './ui/Skeleton';
 
 interface Live {
   call_volume?: number;
@@ -62,50 +63,54 @@ export function PositioningCard({ ticker }: { ticker: string }) {
 
   return (
     <div className="rounded-lg border border-line p-3 space-y-2">
-      <span className="stat-label">Options and short positioning</span>
+      <span className="stat-label">What options traders and short sellers are doing</span>
       {!data ? (
-        <p className="text-micro text-ink-mute">Reading…</p>
+        <LoadingLines />
       ) : (
         <>
-          <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-micro font-mono">
-            <dt className="text-ink-mute" title="Put volume over call volume, today's session">Put/call volume</dt>
-            <dd className="text-right">{live?.put_call_ratio != null ? formatNumber(live.put_call_ratio, { decimals: 2 }) : ABSENT}</dd>
+          <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-micro">
+            <dt className="text-ink-mute" title="Put/call volume ratio: puts traded for every call today. Above 1 means more bets on a fall.">
+              Bets on a fall for every bet on a rise
+            </dt>
+            <dd className="text-right font-mono">{live?.put_call_ratio != null ? formatNumber(live.put_call_ratio, { decimals: 2 }) : ABSENT}</dd>
             <dt
               className="text-ink-mute"
               title="IV of a 25-delta put minus a 50-delta call, about a month out. Steep skew preceded underperformance (Xing, Zhang and Zhao 2010)."
             >
-              IV skew, vol pts{live?.skew_expiry_days != null ? ` (${live.skew_expiry_days}d)` : ''}
+              Price of crash protection{live?.skew_expiry_days != null ? ` (${live.skew_expiry_days} days out)` : ''}
             </dt>
-            <dd className={`text-right ${(live?.iv_skew ?? 0) > 0.06 ? 'text-rose-300' : ''}`}>{pts(live?.iv_skew)}</dd>
-            <dt className="text-ink-mute">ATM IV</dt>
-            <dd className="text-right">{pts(live?.atm_iv)}</dd>
+            <dd className={`text-right font-mono ${(live?.iv_skew ?? 0) > 0.06 ? 'text-negative' : ''}`}>{pts(live?.iv_skew)}</dd>
+            <dt className="text-ink-mute" title="At-the-money implied volatility: the yearly swing option prices expect">
+              How much options expect it to swing (a year)
+            </dt>
+            <dd className="text-right font-mono">{pts(live?.atm_iv)}</dd>
             <dt
               className="text-ink-mute"
               title="Mean call IV minus put IV at matched strikes. Calls dearer than puts preceded outperformance (Cremers and Weinbaum 2010)."
             >
-              Call-put IV spread{live?.cp_pairs != null ? ` (${live.cp_pairs} pairs)` : ''}
+              Which way option traders lean{live?.cp_pairs != null ? ` (${live.cp_pairs} price pairs)` : ''}
             </dt>
-            <dd className={`text-right ${(live?.cp_iv_spread ?? 0) > 0 ? 'text-emerald-300' : (live?.cp_iv_spread ?? 0) < -0.02 ? 'text-rose-300' : ''}`}>
+            <dd className={`text-right font-mono ${(live?.cp_iv_spread ?? 0) > 0 ? 'text-positive' : (live?.cp_iv_spread ?? 0) < -0.02 ? 'text-negative' : ''}`}>
               {pts(live?.cp_iv_spread)}
             </dd>
             <dt
               className="text-ink-mute"
               title="Shares short over average daily volume (FINRA). High days-to-cover preceded underperformance (Hong, Li, Ni, Scheinkman and Yan 2015)."
             >
-              Days to cover{latest ? ` (${latest.settlement_date})` : ''}
+              Days for short sellers to buy back{latest ? ` (${latest.settlement_date})` : ''}
             </dt>
-            <dd className="text-right">{latest?.days_to_cover != null ? formatNumber(latest.days_to_cover, { decimals: 2 }) : ABSENT}</dd>
-            <dt className="text-ink-mute">Short interest change</dt>
-            <dd className="text-right">{latest?.change_pct != null ? `${formatNumber(latest.change_pct, { decimals: 1 })}%` : ABSENT}</dd>
+            <dd className="text-right font-mono">{latest?.days_to_cover != null ? formatNumber(latest.days_to_cover, { decimals: 2 }) : ABSENT}</dd>
+            <dt className="text-ink-mute">Change in short selling</dt>
+            <dd className="text-right font-mono">{latest?.change_pct != null ? `${formatNumber(latest.change_pct, { decimals: 1 })}%` : ABSENT}</dd>
           </dl>
           {data.daily.length > 1 && (
             <table className="w-full text-micro font-mono">
               <thead className="text-ink-mute">
                 <tr>
                   <th className="text-left font-normal">Day</th>
-                  <th className="text-right font-normal">P/C</th>
-                  <th className="text-right font-normal">Skew</th>
-                  <th className="text-right font-normal">C-P IV</th>
+                  <th className="text-right font-normal">Falls per rise</th>
+                  <th className="text-right font-normal">Crash protection</th>
+                  <th className="text-right font-normal">Lean</th>
                 </tr>
               </thead>
               <tbody>

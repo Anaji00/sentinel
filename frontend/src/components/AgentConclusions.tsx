@@ -123,7 +123,7 @@ function SpreadSparkline({ series }: { series: SpreadSeries }) {
           className="tabular-nums font-medium"
           style={{ color: inverted ? PALETTE.negative : PALETTE.textPrimary }}
         >
-          {series.latest != null ? `${series.latest.toFixed(1)} bps` : '—'}
+          {series.latest != null ? `${series.latest >= 0 ? '+' : ''}${(series.latest / 100).toFixed(2)} pts` : '—'}
         </span>
         <span className="text-ink-mute">
           {series.inverted == null ? 'no reading' : inverted ? 'inverted' : 'positive slope'}
@@ -222,7 +222,7 @@ export default function AgentConclusions() {
       </Card>
 
       <Card
-        title="2s10s spread"
+        title="10-year minus 2-year rate"
         note={data.yield_spread_2y10y_bps ? 'last 100 readings' : undefined}
       >
         {data.yield_spread_2y10y_bps ? (

@@ -5,6 +5,7 @@ import {
   RECONNECT_INITIAL_MS,
   RECONNECT_MAX_MS,
 } from '../lib/useLiveEvents';
+import type { NormalizedEvent } from '../lib/types';
 
 /**
  * These tests import `useLiveEvents.ts`.
@@ -36,7 +37,7 @@ describe('useLiveEvents buffering', () => {
         primary_entity: { id: 'IP_1.1.1.1' },
         anomaly_score: 0.9,
       },
-    ] as any[];
+    ] as unknown as NormalizedEvent[];
 
     const out = dedupePositionBatch(batch);
     const ids = out.map((e) => e.event_id).sort();
@@ -52,7 +53,7 @@ describe('useLiveEvents buffering', () => {
     const batch = [
       { event_id: 'a', type: 'vessel_position', primary_entity: {} },
       { event_id: 'b', type: 'vessel_position', primary_entity: {} },
-    ] as any[];
+    ] as unknown as NormalizedEvent[];
     expect(dedupePositionBatch(batch)).toHaveLength(2);
   });
 

@@ -181,14 +181,14 @@ export default function StateStrip() {
       className="panel grid w-full grid-cols-2 gap-x-1 gap-y-1 px-3.5 py-2 sm:grid-cols-3 lg:grid-cols-6"
     >
       <Figure
-        label="Sources reporting"
+        label="Data sources on time"
         value={sourceList === null ? null : String(reporting)}
         basis={sourceBasis}
         tone={sourceTone}
         icon={<IconRadar />}
       />
       <Figure
-        label="Rate collapsed"
+        label="Running slow"
         value={collapsed === null ? null : String(collapsed)}
         basis={
           collapsed === null
@@ -196,26 +196,26 @@ export default function StateStrip() {
               ? 'health probe unreachable'
               : 'asking…'
             : collapsed === 0
-              ? 'every source at its usual rate'
-              : 'arriving far below their usual rate'
+              ? 'everything arriving normally'
+              : 'sources arriving far less than usual'
         }
         tone={collapsed === null ? 'unknown' : collapsed > 0 ? 'caution' : 'positive'}
         icon={collapsed ? <IconAlert /> : <IconCheck />}
       />
       <Figure
-        label="Longest silence"
+        label="Quietest source"
         value={worstSilence === null ? null : formatDuration(worstSilence)}
         basis={
           worstSilence === null
             ? sourceList === null
               ? 'asking…'
-              : 'no source is past its cadence'
-            : 'since the latest source last delivered'
+              : 'nothing overdue'
+            : 'since it last sent anything'
         }
         tone={worstSilence === null ? 'positive' : 'caution'}
       />
       <Figure
-        label="Stores"
+        label="Databases up"
         value={stores === null ? null : `${stores}/3`}
         basis={
           platformError
@@ -228,12 +228,12 @@ export default function StateStrip() {
         icon={<IconStore />}
       />
       <Figure
-        label="Instruments tracked"
+        label="Symbols tracked"
         value={instruments === null ? null : String(instruments)}
-        basis={instruments === null ? 'asking…' : 'symbols under active collection'}
+        basis={instruments === null ? 'asking…' : 'stocks, funds and coins being collected'}
       />
       <Figure
-        label="Semantic index"
+        label="Searchable events"
         value={
           searchError || !search
             ? null

@@ -97,7 +97,10 @@ async def get_agent_processes(redis = Depends(get_redis_client)):
             cursor = 0
             keys = []
             while True:
-                cursor, scan_keys = await redis.raw.scan(cursor=cursor, match="sentinel:agent:decision:*", count=50)
+                # COUNT is keys examined per round trip, not matches returned. At
+                # 50 a keyspace of ~100k with no decision keys took ~2,000 trips
+                # (4.5 s per call, on every poll of the roster); at 1,000, ~0.2 s.
+                cursor, scan_keys = await redis.raw.scan(cursor=cursor, match="sentinel:agent:decision:*", count=1000)
                 if scan_keys:
                     keys.extend(scan_keys)
                 if cursor == 0 or len(keys) >= 15:

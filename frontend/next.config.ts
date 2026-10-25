@@ -7,6 +7,17 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.resolve(__dirname),
   },
+  // Pages folded into others keep their old addresses working: each old
+  // page is now a view (?view=) of the page that absorbed it.
+  async redirects() {
+    return [
+      { source: "/flow", destination: "/options?view=flow", permanent: false },
+      { source: "/osint", destination: "/intelligence?view=osint", permanent: false },
+      { source: "/macro", destination: "/charts?view=economy", permanent: false },
+      { source: "/reports", destination: "/cases?view=briefs", permanent: false },
+      { source: "/attribution", destination: "/strategies?view=drivers", permanent: false },
+    ];
+  },
   async headers() {
     return [
       {

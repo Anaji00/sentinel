@@ -45,6 +45,14 @@ EXEMPT = {
     # Renders existing data into a document. Worth logging as access if data
     # egress is ever in scope; it is not a governance change.
     "reports": "renders existing data, changes no platform state",
+    # The privacy plan is a POST only to keep a person's sensitive answers out of
+    # URLs and access logs; it computes a list and stores nothing. Recording it
+    # in a ledger served to admins would defeat its purpose.
+    "civic": "computes a privacy plan from answers it must not retain; changes no platform state",
+    # A person's own settings: the stocks they follow and their town. Personal,
+    # not platform governance, and writing a person's town into a ledger served
+    # to admins would expose where they live -- the privacy plan's reason again.
+    "me": "a person's own settings (followed stocks, their town); private, changes no platform state",
 }
 
 

@@ -131,7 +131,7 @@ export function useLiveEvents(selectedDomain: string = 'all') {
           useTelemetryStore.getState().setConnected(false);
         };
 
-        ws.onclose = (event) => {
+        ws.onclose = () => {
           if (!isMounted) return;
           useTelemetryStore.getState().setConnected(false);
 
@@ -233,17 +233,6 @@ export function useLiveEvents(selectedDomain: string = 'all') {
     }
     if (selectedDomain === 'prediction') {
       return t.includes('pred') || s.includes('polymarket') || s.includes('kalshi');
-    }
-    if (selectedDomain === 'cyber') {
-      return (
-        t.includes('cyber') ||
-        t.includes('bgp') ||
-        t.includes('breach') ||
-        t.includes('ransomware') ||
-        t.includes('infra') ||
-        t.includes('vulnerability') ||
-        s.includes('cisa')
-      );
     }
     if (selectedDomain === 'maritime') {
       return (

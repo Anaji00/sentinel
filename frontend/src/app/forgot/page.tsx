@@ -32,7 +32,7 @@ export default function ForgotPasswordPage() {
 
   if (sent) {
     return (
-      <AuthShell title="Check your email" subtitle="IF THAT ADDRESS HAS AN ACCOUNT">
+      <AuthShell title="Check your email" subtitle="If that address has an account">
         <div className="space-y-4 text-sm text-ink-dim">
           <p>
             If an account exists for that address and it has been confirmed, a reset link is on its
@@ -42,13 +42,13 @@ export default function ForgotPasswordPage() {
             The link works for 30 minutes and can be used once.
           </p>
           {!emailDelivery && (
-            <p className="text-amber-300 text-xs">
+            <p className="text-caution text-xs">
               This deployment has no email server configured, so no email will arrive. The
               operator can find the link in the API gateway log, or set a new password with{' '}
               <code>scripts/reset_password.py</code>.
             </p>
           )}
-          <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
+          <Link href="/login" className="block text-center text-accent hover:text-accent">
             Back to sign in
           </Link>
         </div>
@@ -57,7 +57,7 @@ export default function ForgotPasswordPage() {
   }
 
   return (
-    <AuthShell title="Reset your password" subtitle="WE WILL EMAIL YOU A LINK">
+    <AuthShell title="Reset your password" subtitle="We'll email you a link">
       <form onSubmit={submit} className="space-y-4">
         <div className="space-y-1">
           <label htmlFor="email" className="text-micro uppercase tracking-widest text-ink-dim">
@@ -79,7 +79,7 @@ export default function ForgotPasswordPage() {
         </button>
         <p className="text-center text-xs text-ink-mute">
           Remembered it?{' '}
-          <Link href="/login" className="text-cyan-400 hover:text-cyan-300">
+          <Link href="/login" className="text-accent hover:text-accent">
             Sign in
           </Link>
         </p>

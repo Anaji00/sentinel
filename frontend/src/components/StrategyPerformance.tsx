@@ -122,10 +122,10 @@ const measured = (r: BacktestResult, v: number | null): number | null =>
   r.performance_metrics.total_trades >= MIN_TRADES_FOR_METRICS ? v : null;
 
 const SORTS: { key: SortKey; label: string; of: (r: BacktestResult) => number | null }[] = [
-  { key: 'alpha', label: 'Alpha', of: (r) => measured(r, r.performance_metrics.alpha_pct) },
-  { key: 'sharpe', label: 'Sharpe', of: (r) => measured(r, r.risk_metrics.realized_sharpe_ratio) },
+  { key: 'alpha', label: 'Beat holding', of: (r) => measured(r, r.performance_metrics.alpha_pct) },
+  { key: 'sharpe', label: 'Steadiness', of: (r) => measured(r, r.risk_metrics.realized_sharpe_ratio) },
   { key: 'trades', label: 'Trades', of: (r) => r.performance_metrics.total_trades },
-  { key: 'drawdown', label: 'Drawdown', of: (r) => r.risk_metrics.max_drawdown_pct },
+  { key: 'drawdown', label: 'Worst drop', of: (r) => r.risk_metrics.max_drawdown_pct },
 ];
 
 /** A signed figure with the arrow and colour that match its sign. */
@@ -303,10 +303,16 @@ export default function StrategyPerformance() {
             <tr className="border-b border-line">
               <th className="stat-label px-3 py-2">Strategy</th>
               <th className="stat-label px-3 py-2">Ticker</th>
-              <th className="stat-label px-3 py-2 text-right">Alpha</th>
-              <th className="stat-label px-3 py-2 text-right">Sharpe</th>
-              <th className="stat-label px-3 py-2 text-right">Hit rate</th>
-              <th className="stat-label px-3 py-2 text-right">Drawdown</th>
+              <th className="stat-label px-3 py-2 text-right" title="Alpha: return above simply holding the stock">
+                Beat holding
+              </th>
+              <th className="stat-label px-3 py-2 text-right" title="Sharpe ratio: return for each unit of ups and downs; above 1 is good">
+                Steadiness
+              </th>
+              <th className="stat-label px-3 py-2 text-right">Trades won</th>
+              <th className="stat-label px-3 py-2 text-right" title="Maximum drawdown: the largest fall from a high">
+                Worst drop
+              </th>
               <th className="stat-label px-3 py-2 text-right">Trades</th>
             </tr>
           </thead>
@@ -376,19 +382,19 @@ export default function StrategyPerformance() {
                                   `${formatNumber(perf.total_return_pct, { decimals: 2 })}%`,
                                 ],
                                 [
-                                  'Benchmark',
+                                  'Just holding it',
                                   `${formatNumber(perf.benchmark_return_pct, { decimals: 2 })}%`,
                                 ],
                                 [
-                                  'Sortino',
+                                  'Steadiness, counting only falls',
                                   formatNumber(open.risk_metrics.sortino_ratio, { decimals: 2 }),
                                 ],
                                 [
-                                  'Payoff ratio',
+                                  'Average win vs average loss',
                                   formatNumber(open.risk_metrics.payoff_ratio, { decimals: 2 }),
                                 ],
                                 [
-                                  'Profit factor',
+                                  'Total won vs total lost',
                                   formatNumber(perf.profit_factor, { decimals: 2 }),
                                 ],
                                 ['Bars tested', formatNumber(open.bar_count, { decimals: 0 })],

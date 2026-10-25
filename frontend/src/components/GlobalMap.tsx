@@ -1,8 +1,14 @@
 'use client';
 
 import { ABSENT, formatNumber } from '../lib/format';
-import React, { useEffect, useMemo, useState } from 'react';
-import { ComposableMap, Geographies, Geography, Marker as MapMarker, useZoomPanContext } from 'react-simple-maps';
+import React, { useMemo, useState } from 'react';
+import {
+  ComposableMap,
+  Geographies,
+  Geography,
+  Marker as MapMarker,
+  useZoomPanContext,
+} from 'react-simple-maps';
 import { PanZoomGroup } from './map/PanZoomGroup';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
@@ -248,6 +254,122 @@ interface ChokepointStatus {
   radar_areas?: RadarArea[];
 }
 
+/** A coordinate as feeds send it: a number, a numeric string, or nothing. */
+type RawCoord = number | string | null | undefined;
+
+/** An AIS position report, as nested inside the stream's message envelope. */
+interface RawPositionReport {
+  Latitude?: RawCoord;
+  Longitude?: RawCoord;
+  Sog?: RawCoord;
+  TrueHeading?: number | null;
+}
+
+/** AIS metadata, under either of the two names the collectors have used. */
+interface RawVesselMeta {
+  MMSI?: string | number;
+  latitude?: RawCoord;
+  longitude?: RawCoord;
+  region?: string;
+  ShipType?: string | number;
+  ShipName?: string;
+}
+
+/** A vessel payload in any of the shapes the map reads: the typed
+ * `vessel_data`, the stream's raw envelope, or a flattened `domain_data`. */
+interface RawVessel {
+  mmsi?: string | number;
+  latitude?: RawCoord;
+  longitude?: RawCoord;
+  lat?: RawCoord;
+  lon?: RawCoord;
+  position?: { latitude?: RawCoord; longitude?: RawCoord };
+  region?: string;
+  vessel_type?: string;
+  type?: string;
+  name?: string;
+  speed_knots?: number | null;
+  speed?: number | null;
+  heading?: number | null;
+  nav_status?: string | null;
+  MetaData?: RawVesselMeta;
+  meta?: RawVesselMeta;
+  Message?: { PositionReport?: RawPositionReport };
+  PositionReport?: RawPositionReport;
+}
+
+/** A flight payload: the typed `flight_data` or a flattened `domain_data`. */
+interface RawFlight {
+  icao24?: string;
+  callsign?: string;
+  latitude?: RawCoord;
+  longitude?: RawCoord;
+  lat?: RawCoord;
+  lon?: RawCoord;
+  region?: string;
+  squawk?: string;
+  baro_altitude_m?: number | null;
+  velocity_ms?: number | null;
+  origin_country?: string;
+}
+
+/** Events as the live socket delivers them, which can carry a top-level
+ * position and altitude beside the normalised fields. */
+type MapEvent = NormalizedEvent & { lat?: RawCoord; lon?: RawCoord; altitude_ft?: number | null };
+
+interface MapVessel {
+  mmsi: string;
+  name: string;
+  lat: number;
+  lon: number;
+  isTanker: boolean;
+  vessel_type: string;
+  anomaly: number;
+  approximatePosition: boolean;
+  speed: number | null;
+  heading: number | null;
+  region: string | null;
+  nav_status: string | null;
+}
+
+interface MapFlight {
+  icao24: string;
+  callsign: string;
+  lat: number;
+  lon: number;
+  altitude_ft: number | null;
+  speed_kts: number | null;
+  squawk: string | null;
+  isEmergency: boolean;
+  origin_country: string | null;
+  anomaly: number;
+  headline: string;
+  approximatePosition: boolean;
+}
+
+interface ExchangeHit {
+  ticker: string;
+  anomaly: number;
+  headline: string;
+}
+
+type Exchange = (typeof FINANCIAL_EXCHANGES)[number];
+type Chokepoint = (typeof GLOBAL_CHOKEPOINTS)[number];
+
+/** The first candidate that parses to a coordinate within `maxBound`. Zero is
+ * a coordinate: the (0, 0) pair is handled by the caller, where both are known. */
+function parseValidCoord(candidates: RawCoord[], maxBound: number): number | null {
+  for (const c of candidates) {
+    if (c !== null && c !== undefined && c !== '') {
+      const n = parseFloat(String(c));
+      if (!isNaN(n) && Math.abs(n) <= maxBound) {
+        return n;
+      }
+    }
+  }
+  return null;
+}
+
 // A marker whose glyph and label keep their on-screen size at any zoom; the
 // position still follows the map. Without this, zooming in scaled every label
 // and ring with the countries until they covered each other.
@@ -263,8 +385,8 @@ function Marker({ children, ...props }: React.ComponentProps<typeof MapMarker>) 
 const StaticWorldBase = React.memo(function StaticWorldBase() {
   return (
     <Geographies geography={geoUrl}>
-      {({ geographies }: { geographies: any[] }) =>
-        geographies.map((geo: any) => (
+      {({ geographies }) =>
+        geographies.map((geo) => (
           <Geography
             key={geo.rsmKey}
             geography={geo}
@@ -311,9 +433,13 @@ export default function GlobalMap() {
     fetcher,
     { refreshInterval: POLL.live },
   );
-  const { data: aviationEvents } = useSWR<NormalizedEvent[]>('/events/aviation?limit=80&region_spread=2', fetcher, {
-    refreshInterval: POLL.standard,
-  });
+  const { data: aviationEvents } = useSWR<NormalizedEvent[]>(
+    '/events/aviation?limit=80&region_spread=2',
+    fetcher,
+    {
+      refreshInterval: POLL.standard,
+    },
+  );
   // Which straits are reporting, and from which instrument.
   //
   // AIS is terrestrial and volunteer-fed, so it is dense over Taiwan and
@@ -403,17 +529,27 @@ export default function GlobalMap() {
   const [showWarnings, setShowWarnings] = useState(true);
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [zonePanelOpen, setZonePanelOpen] = useState(true);
+  const [chokeOpen, setChokeOpen] = useState(true);
+  const [legendOpen, setLegendOpen] = useState(false);
   const [zonePanelTab, setZonePanelTab] = useState<'zones' | 'exposed'>('zones');
   const selectedZone = conflict?.zones.find((z) => z.zone_id === selectedZoneId) ?? null;
 
-  const [selectedObject, setSelectedObject] = useState<{
-    type: 'vessel' | 'flight' | 'exchange' | 'chokepoint' | 'radar' | 'liveVessel' | 'warning';
-    data: any;
-  } | null>(null);
+  type RadarContact = (typeof radarContacts)[number];
+  // One union, so each inspector branch below reads its own object's fields.
+  const [selectedObject, setSelectedObject] = useState<
+    | { type: 'vessel'; data: MapVessel }
+    | { type: 'flight'; data: MapFlight }
+    | { type: 'exchange'; data: Exchange }
+    | { type: 'chokepoint'; data: Chokepoint }
+    | { type: 'radar'; data: RadarContact }
+    | { type: 'liveVessel'; data: LiveVessel }
+    | { type: 'warning'; data: NavWarning }
+    | null
+  >(null);
   const selectedLiveVessel: LiveVessel | null =
-    selectedObject?.type === 'liveVessel' ? (selectedObject.data as LiveVessel) : null;
+    selectedObject?.type === 'liveVessel' ? selectedObject.data : null;
   const selectedWarning: NavWarning | null =
-    selectedObject?.type === 'warning' ? (selectedObject.data as NavWarning) : null;
+    selectedObject?.type === 'warning' ? selectedObject.data : null;
 
   // 1. MARITIME TELEMETRY COMPUTATION (WITH SPATIAL ANTI-COLLISION)
   const rawMaritime = useMemo(() => {
@@ -429,10 +565,11 @@ export default function GlobalMap() {
   }, [wsLiveEvents, maritimeEvents]);
 
   const { vessels, tankersCount } = useMemo(() => {
-    const vesselMap = new Map<string, any>();
+    const vesselMap = new Map<string, MapVessel>();
 
-    rawMaritime.forEach((e: any) => {
-      const d = e.vessel_data || e.domain_data || e.raw_payload || {};
+    rawMaritime.forEach((ev) => {
+      const e = ev as MapEvent;
+      const d = (e.vessel_data || e.domain_data || e.raw_payload || {}) as RawVessel;
       const meta = d.MetaData || d.meta || {};
       const pos = d.Message?.PositionReport || d.PositionReport || {};
 
@@ -445,23 +582,6 @@ export default function GlobalMap() {
           e.event_id ||
           'UNKNOWN',
       );
-
-      const parseValidCoord = (candidates: any[], maxBound: number): number | null => {
-        for (const c of candidates) {
-          if (c !== null && c !== undefined && c !== '') {
-            const n = parseFloat(String(c));
-            // `n !== 0` was here, which discards the equator and the prime
-            // meridian. Vessels in the Gulf of Guinea report latitudes of
-            // exactly 0 and were being treated as having no position at all --
-            // and then placed in the Persian Gulf by the fallback below. The
-            // (0, 0) pair is handled by the caller, where both values are known.
-            if (!isNaN(n) && Math.abs(n) <= maxBound) {
-              return n;
-            }
-          }
-        }
-        return null;
-      };
 
       let lat = parseValidCoord(
         [e.latitude, d.latitude, d.lat, pos.Latitude, meta.latitude, d.position?.latitude, e.lat],
@@ -491,7 +611,7 @@ export default function GlobalMap() {
       // vessel is not drawn at all.
       let approximatePosition = false;
       if (lat === null || lon === null) {
-        const reg = String(e.region || d.region || meta.region || e.vessel_data?.region || '');
+        const reg = String(e.region || d.region || meta.region || '');
         const centroid = resolveRegionFallback(reg);
         if (!centroid) return;
         lat = centroid[0];
@@ -499,9 +619,7 @@ export default function GlobalMap() {
         approximatePosition = true;
       }
 
-      const vtype = String(
-        d.vessel_type || d.type || meta.ShipType || e.vessel_data?.vessel_type || '',
-      ).toLowerCase();
+      const vtype = String(d.vessel_type || d.type || meta.ShipType || '').toLowerCase();
       const name =
         e.primary_entity_name ||
         e.entity_name ||
@@ -584,29 +702,14 @@ export default function GlobalMap() {
   }, [wsLiveEvents, aviationEvents]);
 
   const flights = useMemo(() => {
-    const flightMap = new Map<string, any>();
+    const flightMap = new Map<string, MapFlight>();
 
-    rawAviation.forEach((e: any) => {
-      const d = e.flight_data || e.domain_data || e.raw_payload || {};
+    rawAviation.forEach((ev) => {
+      const e = ev as MapEvent;
+      const d = (e.flight_data || e.domain_data || e.raw_payload || {}) as RawFlight;
       const icao24 = String(
         d.icao24 || e.primary_entity?.id || e.primary_entity_id || e.event_id || 'UNKNOWN',
       ).toUpperCase();
-      const parseValidCoord = (candidates: any[], maxBound: number): number | null => {
-        for (const c of candidates) {
-          if (c !== null && c !== undefined && c !== '') {
-            const n = parseFloat(String(c));
-            // `n !== 0` was here, which discards the equator and the prime
-            // meridian. Vessels in the Gulf of Guinea report latitudes of
-            // exactly 0 and were being treated as having no position at all --
-            // and then placed in the Persian Gulf by the fallback below. The
-            // (0, 0) pair is handled by the caller, where both values are known.
-            if (!isNaN(n) && Math.abs(n) <= maxBound) {
-              return n;
-            }
-          }
-        }
-        return null;
-      };
 
       let lat = parseValidCoord([e.latitude, d.latitude, d.lat], 90);
       let lon = parseValidCoord([e.longitude, d.longitude, d.lon], 180);
@@ -619,7 +722,7 @@ export default function GlobalMap() {
         lon = null;
       }
       if (lat === null || lon === null) {
-        const reg = String(e.region || d.region || e.flight_data?.region || '');
+        const reg = String(e.region || d.region || '');
         const centroid = resolveRegionFallback(reg);
         if (!centroid) return;
         lat = centroid[0];
@@ -656,6 +759,7 @@ export default function GlobalMap() {
         origin_country: d.origin_country || e.country_code || null,
         anomaly: e.anomaly_score ?? 0.0,
         headline: e.headline,
+        approximatePosition,
       });
     });
 
@@ -670,14 +774,14 @@ export default function GlobalMap() {
 
   // 3. FINANCIAL ANOMALIES MAPPED TO EXCHANGES
   const exchangeAnomalies = useMemo(() => {
-    const map = new Map<string, any[]>();
-    (tradfiEvents || []).forEach((e: any) => {
-      const d = e.financial_data || e.domain_data || {};
+    const map = new Map<string, ExchangeHit[]>();
+    (tradfiEvents || []).forEach((e) => {
+      const d = (e.financial_data || e.domain_data || {}) as { ticker?: string };
       const ticker = d.ticker || e.primary_entity_name || 'MARKET';
       const anomaly = e.anomaly_score ?? 0.0;
 
       // Map ticker to an exchange hub
-      let matchedExchange =
+      const matchedExchange =
         FINANCIAL_EXCHANGES.find((ex) => ex.keyTickers.includes(ticker)) || FINANCIAL_EXCHANGES[0];
       const existing = map.get(matchedExchange.symbol) || [];
       existing.push({ ticker, anomaly, headline: e.headline });
@@ -700,8 +804,7 @@ export default function GlobalMap() {
   // map. Restoring the layer means an ASN-to-location dataset the platform
   // does not have; drawing it from what is here would mean inventing the
   // half that is missing, which is the class of defect this audit exists to
-  // remove. The cyber domain is served by CyberIntelligencePanel, which
-  // renders what is actually known about these events.
+  // remove. The cyber domain is retired from the platform altogether.
 
   return (
     <div className="w-full h-full bg-inset relative overflow-hidden text-white rounded-xl border border-cyan-500/20 shadow-panel">
@@ -889,11 +992,14 @@ export default function GlobalMap() {
           {selectedLiveVessel && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                NAME: <span className="text-white font-bold">{selectedLiveVessel.name ?? ABSENT}</span>
+                NAME:{' '}
+                <span className="text-white font-bold">{selectedLiveVessel.name ?? ABSENT}</span>
               </div>
               <div>
                 TYPE:{' '}
-                <span className="text-amber-300 font-bold">{selectedLiveVessel.vessel_type ?? ABSENT}</span>
+                <span className="text-amber-300 font-bold">
+                  {selectedLiveVessel.vessel_type ?? ABSENT}
+                </span>
               </div>
               <div>
                 MMSI: <span className="text-cyan-400 font-mono">{selectedLiveVessel.mmsi}</span>
@@ -905,7 +1011,8 @@ export default function GlobalMap() {
                 </span>
               </div>
               <div>
-                REGION: <span className="text-emerald-400">{selectedLiveVessel.region ?? ABSENT}</span>
+                REGION:{' '}
+                <span className="text-emerald-400">{selectedLiveVessel.region ?? ABSENT}</span>
               </div>
               <div>
                 SPEED:{' '}
@@ -926,8 +1033,8 @@ export default function GlobalMap() {
               )}
               {selectedLiveVessel.dark && (
                 <div className="text-fuchsia-300">
-                  Transponder silent longer than is normal for this area. Drawn at its last
-                  reported position.
+                  Transponder silent longer than is normal for this area. Drawn at its last reported
+                  position.
                 </div>
               )}
             </div>
@@ -963,6 +1070,13 @@ export default function GlobalMap() {
               <div>
                 ICAO24: <span className="text-ink-dim font-mono">{selectedObject.data.icao24}</span>
               </div>
+              {/* Computed and dropped before: a flight drawn at its region's
+                  centroid looked like a reported position. */}
+              {selectedObject.data.approximatePosition && (
+                <div className="text-amber-400">
+                  POSITION IS THE REGION CENTROID &mdash; the aircraft reported none.
+                </div>
+              )}
               <div>
                 ALTITUDE:{' '}
                 <span className="text-emerald-400 font-bold">
@@ -1042,8 +1156,7 @@ export default function GlobalMap() {
           {selectedObject.type === 'radar' && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                REGION:{' '}
-                <span className="text-white font-bold">{selectedObject.data.region}</span>
+                REGION: <span className="text-white font-bold">{selectedObject.data.region}</span>
               </div>
               <div>
                 CELL CENTRE:{' '}
@@ -1053,15 +1166,11 @@ export default function GlobalMap() {
               </div>
               <div>
                 TARGET DENSITY:{' '}
-                <span className="text-violet-300 font-bold">
-                  {selectedObject.data.density}
-                </span>
+                <span className="text-violet-300 font-bold">{selectedObject.data.density}</span>
               </div>
               <div>
                 IMAGED:{' '}
-                <span className="text-emerald-400">
-                  {selectedObject.data.observedOn ?? ABSENT}
-                </span>
+                <span className="text-emerald-400">{selectedObject.data.observedOn ?? ABSENT}</span>
               </div>
               {selectedObject.data.aisChecked && (
                 <div>
@@ -1073,8 +1182,8 @@ export default function GlobalMap() {
               )}
               {selectedObject.data.noAis && (
                 <div className="text-fuchsia-300 font-bold">
-                  Radar return with no AIS vessel in this cell over the same days: a
-                  likely hull not transmitting.
+                  Radar return with no AIS vessel in this cell over the same days: a likely hull not
+                  transmitting.
                 </div>
               )}
               {selectedObject.data.fixedStructure && (
@@ -1085,9 +1194,8 @@ export default function GlobalMap() {
               {/* Said on every one of these, because a reader who takes a radar
                   cell for a vessel count will draw conclusions it cannot carry. */}
               <div className="text-amber-400 pt-1">
-                Sentinel-1 SAR. This is water returning like metal, not a vessel
-                count &mdash; no MMSI, no name, and two hulls close together read
-                as one.
+                Sentinel-1 SAR. This is water returning like metal, not a vessel count &mdash; no
+                MMSI, no name, and two hulls close together read as one.
               </div>
             </div>
           )}
@@ -1232,70 +1340,89 @@ export default function GlobalMap() {
 
       {/* Chokepoint coverage: reporting, AIS-silent, or unobserved. */}
       {chokepointStatus && chokepointStatus.chokepoints.length > 0 && (
-        <div className="absolute bottom-3 left-3 z-10 bg-page/85 px-3 py-2 rounded-lg border border-accent/30 text-micro space-y-1 shadow-lg max-w-xs">
-          <div className="text-ink-dim font-bold uppercase tracking-wide">
-            Chokepoints &middot; last {chokepointStatus.window_hours}h
-          </div>
-          {chokepointStatus.chokepoints.map((c) => {
-            const instruments = [c.ais ? 'AIS' : null, c.sar ? 'SAR' : null].filter(Boolean);
-            return (
-              <div key={c.region} className="flex items-center justify-between gap-3">
-                <span className="flex items-center gap-2">
+        <div className="absolute bottom-3 left-3 z-10 bg-page/85 px-3 py-2 rounded-lg border border-line text-micro space-y-1 max-w-xs">
+          <button
+            type="button"
+            aria-expanded={chokeOpen}
+            onClick={() => setChokeOpen(!chokeOpen)}
+            className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold uppercase tracking-wide hover:text-ink"
+          >
+            <span>Chokepoints &middot; last {chokepointStatus.window_hours}h</span>
+            <span aria-hidden>{chokeOpen ? '−' : '+'}</span>
+          </button>
+          {chokeOpen &&
+            chokepointStatus.chokepoints.map((c) => {
+              const instruments = [c.ais ? 'AIS' : null, c.sar ? 'SAR' : null].filter(Boolean);
+              return (
+                <div key={c.region} className="flex items-center justify-between gap-3">
+                  <span className="flex items-center gap-2">
+                    <span
+                      className={
+                        'h-1.5 w-1.5 rounded-full ' +
+                        (!c.observed
+                          ? 'bg-rose-500'
+                          : c.ais_silent
+                            ? 'bg-amber-400'
+                            : 'bg-emerald-400')
+                      }
+                    />
+                    <span className={c.observed ? '' : 'text-ink-dim'}>{c.region}</span>
+                  </span>
                   <span
-                    className={
-                      'h-1.5 w-1.5 rounded-full ' +
-                      (!c.observed
-                        ? 'bg-rose-500'
-                        : c.ais_silent
-                          ? 'bg-amber-400'
-                          : 'bg-emerald-400')
-                    }
-                  />
-                  <span className={c.observed ? '' : 'text-ink-dim'}>{c.region}</span>
-                </span>
-                <span
-                  className={
-                    'font-mono ' + (c.observed ? 'text-emerald-300' : 'text-rose-400')
-                  }
-                >
-                  {/* Not observed and quiet are different claims. */}
-                  {instruments.length > 0 ? instruments.join('+') : 'no coverage'}
-                </span>
-              </div>
-            );
-          })}
+                    className={'font-mono ' + (c.observed ? 'text-emerald-300' : 'text-rose-400')}
+                  >
+                    {/* Not observed and quiet are different claims. */}
+                    {instruments.length > 0 ? instruments.join('+') : 'no coverage'}
+                  </span>
+                </div>
+              );
+            })}
         </div>
       )}
 
-      {/* Bottom-Right Multi-Domain Spatial HUD */}
-      <div className="absolute bottom-3 right-3 z-10 bg-page/85 px-3 py-2 rounded-lg border border-cyan-500/30 text-micro space-y-1 shadow-lg">
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-caution animate-pulse" />
-          <span className="text-amber-300 font-bold"> Tankers ({tankersCount})</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span>Total Vessels ({liveVessels?.count ?? vessels.length})</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full border border-fuchsia-400" />
-          <span className="text-fuchsia-300 font-bold"> Dark ({liveVessels?.dark ?? 0})</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
-          <span className="text-rose-300 font-bold"> Sanctioned</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
-          <span className="text-cyan-300 font-bold"> Flights ({flights.length})</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
-          <span className="text-purple-300 font-bold">
-            {' '}
-            Financial Exchanges ({FINANCIAL_EXCHANGES.length})
-          </span>
-        </div>
+      {/* Colour legend, folded by default: the layer toggles above already
+          carry each count, and an open legend covered the Americas. */}
+      <div className="absolute bottom-3 right-3 z-10 bg-page/85 px-3 py-2 rounded-lg border border-line text-micro space-y-1">
+        <button
+          type="button"
+          aria-expanded={legendOpen}
+          onClick={() => setLegendOpen(!legendOpen)}
+          className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold uppercase tracking-wide hover:text-ink"
+        >
+          <span>Legend</span>
+          <span aria-hidden>{legendOpen ? '−' : '+'}</span>
+        </button>
+        {legendOpen && (
+          <>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-caution animate-pulse" />
+              <span className="text-amber-300 font-bold"> Tankers ({tankersCount})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span>Total Vessels ({liveVessels?.count ?? vessels.length})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full border border-fuchsia-400" />
+              <span className="text-fuchsia-300 font-bold"> Dark ({liveVessels?.dark ?? 0})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+              <span className="text-rose-300 font-bold"> Sanctioned</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
+              <span className="text-cyan-300 font-bold"> Flights ({flights.length})</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
+              <span className="text-purple-300 font-bold">
+                {' '}
+                Financial Exchanges ({FINANCIAL_EXCHANGES.length})
+              </span>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Interactive World Map Canvas */}
@@ -1305,238 +1432,116 @@ export default function GlobalMap() {
         className="w-full h-full"
       >
         <PanZoomGroup center={[20, 20]} minZoom={1} maxZoom={12}>
-        <StaticWorldBase />
+          <StaticWorldBase />
 
-        {/* 0. Conflict zones, beneath everything else. */}
-        {showZones && conflict && (
-          <ConflictZonesLayer
-            zones={conflict.zones}
-            selectedId={selectedZoneId}
-            onSelect={(z) => setSelectedZoneId(z.zone_id)}
-          />
-        )}
+          {/* 0. Conflict zones, beneath everything else. */}
+          {showZones && conflict && (
+            <ConflictZonesLayer
+              zones={conflict.zones}
+              selectedId={selectedZoneId}
+              onSelect={(z) => setSelectedZoneId(z.zone_id)}
+            />
+          )}
 
-        {/* 0b. Every tracked vessel, dark hulls ringed at their last position. */}
-        {showVessels && liveVessels && (
-          <VesselDotsLayer
-            vessels={liveVessels.vessels}
-            tankersOnly={tankersOnly}
-            darkOnly={darkOnly}
-            onSelect={(v) => setSelectedObject({ type: 'liveVessel', data: v })}
-          />
-        )}
+          {/* 0b. Every tracked vessel, dark hulls ringed at their last position. */}
+          {showVessels && liveVessels && (
+            <VesselDotsLayer
+              vessels={liveVessels.vessels}
+              tankersOnly={tankersOnly}
+              darkOnly={darkOnly}
+              onSelect={(v) => setSelectedObject({ type: 'liveVessel', data: v })}
+            />
+          )}
 
-        {/* 0b'. Lit vessels seen from orbit at night (VIIRS), when configured. */}
-        {showVessels && liveVessels && liveVessels.light_detections.length > 0 && (
-          <LightDetectionsLayer detections={liveVessels.light_detections} />
-        )}
+          {/* 0b'. Lit vessels seen from orbit at night (VIIRS), when configured. */}
+          {showVessels && liveVessels && liveVessels.light_detections.length > 0 && (
+            <LightDetectionsLayer detections={liveVessels.light_detections} />
+          )}
 
-        {/* 0c. Navigational warnings: military in red. */}
-        {showWarnings && (
-          <NavWarningsLayer
-            warnings={allWarnings}
-            onSelect={(w) => setSelectedObject({ type: 'warning', data: w })}
-          />
-        )}
+          {/* 0c. Navigational warnings: military in red. */}
+          {showWarnings && (
+            <NavWarningsLayer
+              warnings={allWarnings}
+              onSelect={(w) => setSelectedObject({ type: 'warning', data: w })}
+            />
+          )}
 
-        {/* 1. Maritime Chokepoints Layer */}
-        {showChokepoints &&
-          GLOBAL_CHOKEPOINTS.map((m) => (
-            <Marker
-              key={m.name}
-              coordinates={[m.lon, m.lat]}
-              onClick={() => setSelectedObject({ type: 'chokepoint', data: m })}
-            >
-              <circle
-                r={7}
-                fill="rgba(245, 158, 11, 0.25)"
-                stroke={PALETTE.caution}
-                strokeWidth={1.5}
-                className="animate-ping cursor-pointer"
-              />
-              <circle r={3.5} fill={PALETTE.caution} className="cursor-pointer" />
-              <text
-                textAnchor="middle"
-                y={-10}
-                style={{
-                  fontFamily: 'monospace',
-                  fill: PALETTE.caution,
-                  fontSize: '7px',
-                  fontWeight: 'bold',
-                }}
-                className="cursor-pointer"
-              >
-                {m.name}
-              </text>
-            </Marker>
-          ))}
-
-        {/* 1b. Radar returns, where no transponder is reporting.
-             Drawn as a square rather than a vessel glyph on purpose: this is a
-             cell of water that returned like metal, not a ship. It carries no
-             identity and cannot separate two hulls from one. */}
-        {showChokepoints &&
-          radarContacts.map((rc, i) => (
-            <Marker
-              key={`radar-${rc.region}-${i}`}
-              coordinates={[rc.lon, rc.lat]}
-              onClick={() => setSelectedObject({ type: 'radar', data: rc })}
-            >
-              <rect
-                x={-3}
-                y={-3}
-                width={6}
-                height={6}
-                fill={rc.noAis ? 'rgba(232, 121, 249, 0.45)' : 'rgba(56, 189, 248, 0.18)'}
-                stroke={rc.noAis ? '#e879f9' : PALETTE.info}
-                strokeWidth={1}
-                className="cursor-pointer"
-              />
-            </Marker>
-          ))}
-
-        {/* 2. Global Financial Exchange Hubs Layer */}
-        {showExchanges &&
-          FINANCIAL_EXCHANGES.map((ex) => {
-            const anomalies = exchangeAnomalies.get(ex.symbol) || [];
-            const topAnomaly = anomalies.length > 0 ? anomalies[0] : null;
-
-            return (
+          {/* 1. Maritime Chokepoints Layer */}
+          {showChokepoints &&
+            GLOBAL_CHOKEPOINTS.map((m) => (
               <Marker
-                key={ex.symbol}
-                coordinates={[ex.lon, ex.lat]}
-                onClick={() => setSelectedObject({ type: 'exchange', data: ex })}
+                key={m.name}
+                coordinates={[m.lon, m.lat]}
+                onClick={() => setSelectedObject({ type: 'chokepoint', data: m })}
               >
-                <rect
-                  x={-5}
-                  y={-5}
-                  width={10}
-                  height={10}
-                  fill="rgba(168, 85, 247, 0.4)"
-                  stroke="#c084fc"
+                <circle
+                  r={7}
+                  fill="rgba(245, 158, 11, 0.25)"
+                  stroke={PALETTE.caution}
                   strokeWidth={1.5}
-                  className="cursor-pointer"
+                  className="animate-ping cursor-pointer"
                 />
+                <circle r={3.5} fill={PALETTE.caution} className="cursor-pointer" />
                 <text
                   textAnchor="middle"
-                  y={-9}
+                  y={-10}
                   style={{
                     fontFamily: 'monospace',
-                    fill: '#e9d5ff',
-                    fontSize: '7.5px',
+                    fill: PALETTE.caution,
+                    fontSize: '7px',
                     fontWeight: 'bold',
                   }}
                   className="cursor-pointer"
                 >
-                  {ex.symbol}
+                  {m.name}
                 </text>
-                {topAnomaly && (
-                  <text
-                    textAnchor="middle"
-                    y={15}
-                    style={{
-                      fontFamily: 'monospace',
-                      fill: PALETTE.negative,
-                      fontSize: '7px',
-                      fontWeight: 'bold',
-                    }}
-                    className="cursor-pointer"
-                  >
-                    {topAnomaly.ticker}
-                  </text>
-                )}
               </Marker>
-            );
-          })}
+            ))}
 
-        {/* 3. Aviation ADS-B Flights Layer */}
-        {showFlights &&
-          flights.map((flt) => (
-            <Marker
-              key={flt.icao24}
-              coordinates={[flt.lon, flt.lat]}
-              onClick={() => setSelectedObject({ type: 'flight', data: flt })}
-            >
-              {flt.isEmergency ? (
-                <>
-                  <circle
-                    r={8}
-                    fill="rgba(239, 68, 68, 0.35)"
-                    stroke={PALETTE.negative}
-                    strokeWidth={1.5}
-                    className="animate-ping cursor-pointer"
-                  />
-                  <circle
-                    r={4}
-                    fill={PALETTE.negative}
-                    stroke="#ffffff"
-                    strokeWidth={1}
-                    className="cursor-pointer"
-                  />
-                  <text
-                    textAnchor="middle"
-                    y={-10}
-                    style={{
-                      fontFamily: 'monospace',
-                      fill: '#fca5a5',
-                      fontSize: '7.5px',
-                      fontWeight: 'bold',
-                    }}
-                    className="cursor-pointer"
-                  >
-                    {flt.callsign}
-                  </text>
-                </>
-              ) : (
-                <>
-                  <circle
-                    r={4.5}
-                    fill="rgba(6, 182, 212, 0.4)"
-                    stroke="#06b6d4"
-                    strokeWidth={1}
-                    className="cursor-pointer"
-                  />
-                  <text
-                    textAnchor="middle"
-                    y={-8}
-                    style={{
-                      fontFamily: 'monospace',
-                      fill: '#67e8f9',
-                      fontSize: '7px',
-                      fontWeight: 'bold',
-                    }}
-                    className="cursor-pointer"
-                  >
-                    {flt.callsign}
-                  </text>
-                </>
-              )}
-            </Marker>
-          ))}
+          {/* 1b. Radar returns, where no transponder is reporting.
+             Drawn as a square rather than a vessel glyph on purpose: this is a
+             cell of water that returned like metal, not a ship. It carries no
+             identity and cannot separate two hulls from one. */}
+          {showChokepoints &&
+            radarContacts.map((rc, i) => (
+              <Marker
+                key={`radar-${rc.region}-${i}`}
+                coordinates={[rc.lon, rc.lat]}
+                onClick={() => setSelectedObject({ type: 'radar', data: rc })}
+              >
+                <rect
+                  x={-3}
+                  y={-3}
+                  width={6}
+                  height={6}
+                  fill={rc.noAis ? 'rgba(232, 121, 249, 0.45)' : 'rgba(56, 189, 248, 0.18)'}
+                  stroke={rc.noAis ? '#e879f9' : PALETTE.info}
+                  strokeWidth={1}
+                  className="cursor-pointer"
+                />
+              </Marker>
+            ))}
 
-        {/* 4. Maritime AIS Vessels Layer */}
-        {showVessels &&
-          filteredVessels.map((v) => (
-            <Marker
-              key={v.mmsi}
-              coordinates={[v.lon, v.lat]}
-              onClick={() => setSelectedObject({ type: 'vessel', data: v })}
-            >
-              {v.isTanker ? (
-                <>
-                  <circle
-                    r={6}
-                    fill="rgba(245, 158, 11, 0.35)"
-                    stroke={PALETTE.caution}
+          {/* 2. Global Financial Exchange Hubs Layer */}
+          {showExchanges &&
+            FINANCIAL_EXCHANGES.map((ex) => {
+              const anomalies = exchangeAnomalies.get(ex.symbol) || [];
+              const topAnomaly = anomalies.length > 0 ? anomalies[0] : null;
+
+              return (
+                <Marker
+                  key={ex.symbol}
+                  coordinates={[ex.lon, ex.lat]}
+                  onClick={() => setSelectedObject({ type: 'exchange', data: ex })}
+                >
+                  <rect
+                    x={-5}
+                    y={-5}
+                    width={10}
+                    height={10}
+                    fill="rgba(168, 85, 247, 0.4)"
+                    stroke="#c084fc"
                     strokeWidth={1.5}
-                    opacity={0.7}
-                    className="cursor-pointer"
-                  />
-                  <circle
-                    r={3.5}
-                    fill={PALETTE.caution}
-                    stroke="#ffffff"
-                    strokeWidth={1}
                     className="cursor-pointer"
                   />
                   <text
@@ -1544,49 +1549,171 @@ export default function GlobalMap() {
                     y={-9}
                     style={{
                       fontFamily: 'monospace',
-                      fill: '#fef08a',
+                      fill: '#e9d5ff',
                       fontSize: '7.5px',
                       fontWeight: 'bold',
                     }}
                     className="cursor-pointer"
                   >
-                    {v.name}
+                    {ex.symbol}
                   </text>
-                </>
-              ) : (
-                <>
-                  <circle
-                    r={5}
-                    fill="rgba(16, 185, 129, 0.3)"
-                    stroke={PALETTE.positive}
-                    strokeWidth={1}
-                    opacity={0.6}
-                    className="cursor-pointer"
-                  />
-                  <circle
-                    r={3}
-                    fill={PALETTE.positive}
-                    stroke="#ffffff"
-                    strokeWidth={1}
-                    className="cursor-pointer"
-                  />
-                  <text
-                    textAnchor="middle"
-                    y={-8}
-                    style={{
-                      fontFamily: 'monospace',
-                      fill: PALETTE.positive,
-                      fontSize: '7px',
-                      fontWeight: 'bold',
-                    }}
-                    className="cursor-pointer"
-                  >
-                    {v.name}
-                  </text>
-                </>
-              )}
-            </Marker>
-          ))}
+                  {topAnomaly && (
+                    <text
+                      textAnchor="middle"
+                      y={15}
+                      style={{
+                        fontFamily: 'monospace',
+                        fill: PALETTE.negative,
+                        fontSize: '7px',
+                        fontWeight: 'bold',
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {topAnomaly.ticker}
+                    </text>
+                  )}
+                </Marker>
+              );
+            })}
+
+          {/* 3. Aviation ADS-B Flights Layer */}
+          {showFlights &&
+            flights.map((flt) => (
+              <Marker
+                key={flt.icao24}
+                coordinates={[flt.lon, flt.lat]}
+                onClick={() => setSelectedObject({ type: 'flight', data: flt })}
+              >
+                {flt.isEmergency ? (
+                  <>
+                    <circle
+                      r={8}
+                      fill="rgba(239, 68, 68, 0.35)"
+                      stroke={PALETTE.negative}
+                      strokeWidth={1.5}
+                      className="animate-ping cursor-pointer"
+                    />
+                    <circle
+                      r={4}
+                      fill={PALETTE.negative}
+                      stroke="#ffffff"
+                      strokeWidth={1}
+                      className="cursor-pointer"
+                    />
+                    <text
+                      textAnchor="middle"
+                      y={-10}
+                      style={{
+                        fontFamily: 'monospace',
+                        fill: '#fca5a5',
+                        fontSize: '7.5px',
+                        fontWeight: 'bold',
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {flt.callsign}
+                    </text>
+                  </>
+                ) : (
+                  <>
+                    <circle
+                      r={4.5}
+                      fill="rgba(6, 182, 212, 0.4)"
+                      stroke="#06b6d4"
+                      strokeWidth={1}
+                      className="cursor-pointer"
+                    />
+                    <text
+                      textAnchor="middle"
+                      y={-8}
+                      style={{
+                        fontFamily: 'monospace',
+                        fill: '#67e8f9',
+                        fontSize: '7px',
+                        fontWeight: 'bold',
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {flt.callsign}
+                    </text>
+                  </>
+                )}
+              </Marker>
+            ))}
+
+          {/* 4. Maritime AIS Vessels Layer */}
+          {showVessels &&
+            filteredVessels.map((v) => (
+              <Marker
+                key={v.mmsi}
+                coordinates={[v.lon, v.lat]}
+                onClick={() => setSelectedObject({ type: 'vessel', data: v })}
+              >
+                {v.isTanker ? (
+                  <>
+                    <circle
+                      r={6}
+                      fill="rgba(245, 158, 11, 0.35)"
+                      stroke={PALETTE.caution}
+                      strokeWidth={1.5}
+                      opacity={0.7}
+                      className="cursor-pointer"
+                    />
+                    <circle
+                      r={3.5}
+                      fill={PALETTE.caution}
+                      stroke="#ffffff"
+                      strokeWidth={1}
+                      className="cursor-pointer"
+                    />
+                    <text
+                      textAnchor="middle"
+                      y={-9}
+                      style={{
+                        fontFamily: 'monospace',
+                        fill: '#fef08a',
+                        fontSize: '7.5px',
+                        fontWeight: 'bold',
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {v.name}
+                    </text>
+                  </>
+                ) : (
+                  <>
+                    <circle
+                      r={5}
+                      fill="rgba(16, 185, 129, 0.3)"
+                      stroke={PALETTE.positive}
+                      strokeWidth={1}
+                      opacity={0.6}
+                      className="cursor-pointer"
+                    />
+                    <circle
+                      r={3}
+                      fill={PALETTE.positive}
+                      stroke="#ffffff"
+                      strokeWidth={1}
+                      className="cursor-pointer"
+                    />
+                    <text
+                      textAnchor="middle"
+                      y={-8}
+                      style={{
+                        fontFamily: 'monospace',
+                        fill: PALETTE.positive,
+                        fontSize: '7px',
+                        fontWeight: 'bold',
+                      }}
+                      className="cursor-pointer"
+                    >
+                      {v.name}
+                    </text>
+                  </>
+                )}
+              </Marker>
+            ))}
         </PanZoomGroup>
       </ComposableMap>
     </div>

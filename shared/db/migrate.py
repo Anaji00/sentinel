@@ -1321,6 +1321,1039 @@ MIGRATIONS = [
             );
         """,
         "transactional": True
+    },
+    {
+        "version": "0037_track_record",
+        "sql": """
+            -- What the platform said, graded against what prices did
+            -- (shared/utils/track_record.py, services/agents/grader.py).
+            ALTER TABLE recommendation_log
+                ADD COLUMN IF NOT EXISTS spy_entry_price DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS graded_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS exit_day DATE,
+                ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS ret DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS spy_ret DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS excess DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS signed_excess DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS hit BOOLEAN;
+
+            -- The first board snapshot of each ticker each day, so the board's
+            -- net vote can be tested as a predictor rather than trusted as one.
+            CREATE TABLE IF NOT EXISTS signal_matrix_log (
+                day              DATE NOT NULL,
+                ticker           TEXT NOT NULL,
+                net              DOUBLE PRECISION,
+                lean             DOUBLE PRECISION,
+                votes            DOUBLE PRECISION,
+                proven_net       INTEGER,
+                supported_net    INTEGER,
+                published_net    INTEGER,
+                anomaly_score    DOUBLE PRECISION,
+                price            DOUBLE PRECISION,
+                spy_price        DOUBLE PRECISION,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                excess_1d        DOUBLE PRECISION,
+                excess_5d        DOUBLE PRECISION,
+                graded_1d_at     TIMESTAMPTZ,
+                graded_5d_at     TIMESTAMPTZ,
+                PRIMARY KEY (day, ticker)
+            );
+
+            -- Every model run kept, so drift in what it finds is visible.
+            CREATE TABLE IF NOT EXISTS factor_model_runs (
+                run_at           TIMESTAMPTZ NOT NULL PRIMARY KEY,
+                as_of            DATE,
+                primary_horizon  TEXT,
+                universe         INTEGER,
+                tradable         INTEGER,
+                report           JSONB NOT NULL
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0038_fundamentals",
+        "sql": """
+            -- Reported financials for every filer, from SEC XBRL frames
+            -- (services/collector-filings/fundamentals.py): one row per company,
+            -- line item and period. Read point in time by the factor model --
+            -- a period's figures count only from 90 days after it ends.
+            CREATE TABLE IF NOT EXISTS fundamentals (
+                cik           TEXT NOT NULL,
+                ticker        TEXT,
+                concept       TEXT NOT NULL,
+                frame         TEXT NOT NULL,
+                period_start  DATE,
+                period_end    DATE NOT NULL,
+                value         DOUBLE PRECISION NOT NULL,
+                accn          TEXT,
+                PRIMARY KEY (cik, concept, frame)
+            );
+            CREATE INDEX IF NOT EXISTS fundamentals_ticker ON fundamentals (ticker, concept, period_end);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0039_fundamental_facts",
+        "sql": """
+            -- Every reported value with the date it was filed, from SEC company
+            -- facts (services/collector-filings/company_facts.py). Append-only,
+            -- keyed by accession: a restatement is a new row with a later
+            -- filing date, so "what was known when" is a query. Frames (0038)
+            -- carry only the latest filing for each period and no filing date.
+            CREATE TABLE IF NOT EXISTS fundamental_facts (
+                cik           TEXT NOT NULL,
+                concept       TEXT NOT NULL,
+                unit          TEXT NOT NULL,
+                period_start  DATE,
+                period_end    DATE NOT NULL,
+                value         DOUBLE PRECISION NOT NULL,
+                fy            INTEGER,
+                fp            TEXT,
+                form          TEXT,
+                filed         DATE NOT NULL,
+                accn          TEXT NOT NULL
+            );
+            -- The value is part of the key: a cover page reports one share
+            -- count per class under the same accession and date.
+            CREATE UNIQUE INDEX IF NOT EXISTS fundamental_facts_key ON fundamental_facts
+                (cik, concept, accn, period_end, (COALESCE(period_start, DATE '1900-01-01')), value);
+            CREATE INDEX IF NOT EXISTS fundamental_facts_cik ON fundamental_facts (cik, concept, filed);
+            -- Ticker -> issuer. Keyed by ticker, so a company with two classes
+            -- (GOOGL, GOOG) maps both, and a ticker can carry an issuer's old
+            -- registration as well as its new one.
+            CREATE TABLE IF NOT EXISTS issuer_ticker (
+                ticker      TEXT NOT NULL,
+                cik         TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                fetched_at  TIMESTAMPTZ,
+                last_filed  DATE,
+                PRIMARY KEY (ticker, cik)
+            );
+            CREATE INDEX IF NOT EXISTS issuer_ticker_cik ON issuer_ticker (cik);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0040_paper_trades",
+        "sql": """
+            -- Every trade idea traded on paper (shared/utils/paper_ledger.py):
+            -- filled at the next session's open, costed both ways, exited at
+            -- its stop or its horizon's last close, net of SPY.
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                idea_day      DATE NOT NULL,
+                horizon       TEXT NOT NULL,
+                ticker        TEXT NOT NULL,
+                direction     SMALLINT NOT NULL,
+                idea_at       TIMESTAMPTZ NOT NULL,
+                model         TEXT,
+                stop_price    DOUBLE PRECISION,
+                notional_usd  DOUBLE PRECISION NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                entry_day     DATE,
+                entry_price   DOUBLE PRECISION,
+                spy_entry     DOUBLE PRECISION,
+                cost_bps      DOUBLE PRECISION,
+                adv_usd       DOUBLE PRECISION,
+                exit_day      DATE,
+                exit_price    DOUBLE PRECISION,
+                spy_exit      DOUBLE PRECISION,
+                exit_reason   TEXT,
+                gross_excess  DOUBLE PRECISION,
+                net_excess    DOUBLE PRECISION,
+                pnl_usd       DOUBLE PRECISION,
+                PRIMARY KEY (idea_day, horizon, ticker, direction)
+            );
+            CREATE INDEX IF NOT EXISTS paper_trades_status ON paper_trades (status, horizon);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0041_paper_trades_vol_scale",
+        "sql": """
+            -- Volatility-managed sizing beside fixed size (shared/utils/paper_ledger.py).
+            ALTER TABLE paper_trades
+                ADD COLUMN IF NOT EXISTS scale DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS pnl_scaled_usd DOUBLE PRECISION;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0042_model_portfolio",
+        "sql": """
+            -- The actively managed model portfolio (shared/utils/model_portfolio.py):
+            -- its current books, every order with its reason, and its value
+            -- each session beside SPY's.
+            CREATE TABLE IF NOT EXISTS model_portfolio_state (
+                portfolio       TEXT PRIMARY KEY,
+                long_book       JSONB NOT NULL DEFAULT '[]',
+                short_book      JSONB NOT NULL DEFAULT '[]',
+                pending         JSONB,
+                rebalanced_on   DATE,
+                scores_as_of    DATE,
+                marked_through  DATE,
+                started_on      DATE,
+                nav             DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                spy_nav         DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS model_portfolio_orders (
+                portfolio   TEXT NOT NULL,
+                decided_on  DATE NOT NULL,
+                ticker      TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                reason      TEXT NOT NULL,
+                percentile  DOUBLE PRECISION,
+                fill_day    DATE,
+                fill_price  DOUBLE PRECISION,
+                PRIMARY KEY (portfolio, decided_on, ticker, action)
+            );
+            CREATE TABLE IF NOT EXISTS model_portfolio_nav (
+                portfolio   TEXT NOT NULL,
+                day         DATE NOT NULL,
+                nav         DOUBLE PRECISION NOT NULL,
+                spy_nav     DOUBLE PRECISION NOT NULL,
+                ret         DOUBLE PRECISION NOT NULL,
+                spy_ret     DOUBLE PRECISION NOT NULL,
+                long_ret    DOUBLE PRECISION,
+                short_ret   DOUBLE PRECISION,
+                cost        DOUBLE PRECISION,
+                borrow      DOUBLE PRECISION,
+                n_long      INTEGER,
+                n_short     INTEGER,
+                missing     INTEGER,
+                PRIMARY KEY (portfolio, day)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0043_short_data",
+        "sql": """
+            -- Free short-side data (shared/utils/short_data.py): FINRA's daily
+            -- off-exchange short sale volume (history from 2021), and Interactive
+            -- Brokers' public borrow file, kept one snapshot a day from first run.
+            CREATE TABLE IF NOT EXISTS finra_short_volume (
+                day            DATE NOT NULL,
+                ticker         TEXT NOT NULL,
+                short_volume   REAL NOT NULL,
+                exempt_volume  REAL,
+                total_volume   REAL NOT NULL,
+                PRIMARY KEY (day, ticker)
+            );
+            CREATE TABLE IF NOT EXISTS borrow_rates (
+                day          DATE NOT NULL,
+                ticker       TEXT NOT NULL,
+                fee_rate     REAL,
+                rebate_rate  REAL,
+                available    BIGINT,
+                taken_at     TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (day, ticker)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0044_earnings_estimates",
+        "sql": """
+            -- Finnhub's free earnings data, kept (services/collector-tradfi/
+            -- earnings_estimates.py): the calendar's consensus snapshotted daily,
+            -- so estimate revisions can be measured from our own copies, and
+            -- reported quarters' actual against estimate.
+            CREATE TABLE IF NOT EXISTS earnings_estimates (
+                snap_day          DATE NOT NULL,
+                ticker            TEXT NOT NULL,
+                report_date       DATE NOT NULL,
+                fiscal_year       INTEGER,
+                fiscal_quarter    INTEGER,
+                hour              TEXT,
+                eps_estimate      DOUBLE PRECISION,
+                revenue_estimate  DOUBLE PRECISION,
+                eps_actual        DOUBLE PRECISION,
+                revenue_actual    DOUBLE PRECISION,
+                PRIMARY KEY (snap_day, ticker, report_date)
+            );
+            CREATE TABLE IF NOT EXISTS earnings_surprises (
+                ticker        TEXT NOT NULL,
+                period        DATE NOT NULL,
+                eps_actual    DOUBLE PRECISION,
+                eps_estimate  DOUBLE PRECISION,
+                surprise_pct  DOUBLE PRECISION,
+                first_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ticker, period)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0045_civic_surveillance",
+        "sql": """
+            -- Watching the watchers (shared/utils/surveillance.py): mapped
+            -- licence-plate readers and gunshot detectors from OpenStreetMap,
+            -- and which agency uses which surveillance technology (EFF Atlas).
+            CREATE TABLE IF NOT EXISTS surveillance_devices (
+                osm_id        BIGINT PRIMARY KEY,
+                lat           DOUBLE PRECISION NOT NULL,
+                lon           DOUBLE PRECISION NOT NULL,
+                kind          TEXT NOT NULL,
+                manufacturer  TEXT,
+                operator      TEXT,
+                direction     TEXT,
+                tags          JSONB NOT NULL DEFAULT '{}',
+                first_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS surveillance_devices_geo ON surveillance_devices (lat, lon);
+            CREATE TABLE IF NOT EXISTS surveillance_agency_tech (
+                aos_id      TEXT PRIMARY KEY,
+                agency      TEXT NOT NULL,
+                city        TEXT,
+                county      TEXT,
+                state       TEXT,
+                lea_type    TEXT,
+                juris_type  TEXT,
+                technology  TEXT NOT NULL,
+                vendor      TEXT,
+                summary     TEXT,
+                link        TEXT,
+                link_date   DATE,
+                lat         DOUBLE PRECISION,
+                lon         DOUBLE PRECISION,
+                geo_level   TEXT,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS surveillance_agency_state ON surveillance_agency_tech (state, agency);
+            CREATE INDEX IF NOT EXISTS surveillance_agency_geo ON surveillance_agency_tech (lat, lon);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0046_civic_legal",
+        "sql": """
+            -- "Is it legal here?" (shared/utils/civic_law.py): each agency's
+            -- published Flock practice (transparency portals via EyesOnFlock,
+            -- CC BY-SA 4.0), ICE 287(g) agreements, and the findings that
+            -- check one against the state's licence-plate-reader law.
+            CREATE TABLE IF NOT EXISTS flock_portals (
+                slug                 TEXT PRIMARY KEY,
+                portal_url           TEXT,
+                city                 TEXT,
+                county               TEXT,
+                state                TEXT,
+                agency_type          TEXT,
+                population           BIGINT,
+                total_cameras        INTEGER,
+                total_searches       BIGINT,
+                data_retention       DOUBLE PRECISION,
+                vehicles_captured    BIGINT,
+                hotlist_hits         BIGINT,
+                hotlist_hit_rate     DOUBLE PRECISION,
+                shared_with_count    INTEGER,
+                received_from_count  INTEGER,
+                shared_with          JSONB NOT NULL DEFAULT '[]',
+                prohibited_uses      TEXT,
+                public_search_audit  BOOLEAN,
+                data_last_updated    TEXT,
+                lat                  DOUBLE PRECISION,
+                lon                  DOUBLE PRECISION,
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS flock_portals_state ON flock_portals (state);
+            CREATE TABLE IF NOT EXISTS ice_287g_agreements (
+                state         TEXT NOT NULL,
+                agency        TEXT NOT NULL,
+                agency_type   TEXT,
+                county        TEXT,
+                support_type  TEXT NOT NULL,
+                signed        DATE,
+                moa           TEXT,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (state, agency, support_type)
+            );
+            CREATE TABLE IF NOT EXISTS civic_findings (
+                slug        TEXT NOT NULL,
+                code        TEXT NOT NULL,
+                severity    TEXT NOT NULL,
+                state       TEXT,
+                agency      TEXT,
+                title       TEXT NOT NULL,
+                detail      TEXT NOT NULL,
+                citation    TEXT,
+                source      TEXT,
+                evidence    JSONB NOT NULL DEFAULT '{}',
+                first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (slug, code)
+            );
+            CREATE INDEX IF NOT EXISTS civic_findings_state ON civic_findings (state, severity);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0047_geo_places",
+        "sql": """
+            -- Census gazetteer centroids by state and normalised name (shared/utils/
+            -- surveillance.py norm_place / norm_county), written by the Atlas
+            -- pass so later passes place agencies with a lookup instead of
+            -- re-parsing the gazetteers in a 160M service.
+            CREATE TABLE IF NOT EXISTS geo_places (
+                state  TEXT NOT NULL,
+                norm   TEXT NOT NULL,
+                kind   TEXT NOT NULL,
+                lat    DOUBLE PRECISION NOT NULL,
+                lon    DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (state, norm, kind)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0048_unwrap_double_encoded_jsonb",
+        "sql": """
+            -- The pool's jsonb codec already JSON-encodes parameters; values
+            -- written as json.dumps(...) were stored as JSON *strings* holding
+            -- the document, invisible to SQL operators. Unwrapped here for the
+            -- tables added 9-10 Oct 2026, whose writers now pass Python values.
+            -- (Older tables share the pattern and are left to their own fix.)
+            UPDATE model_portfolio_state SET long_book = (long_book #>> '{}')::jsonb WHERE jsonb_typeof(long_book) = 'string';
+            UPDATE model_portfolio_state SET short_book = (short_book #>> '{}')::jsonb WHERE jsonb_typeof(short_book) = 'string';
+            UPDATE model_portfolio_state SET pending = (pending #>> '{}')::jsonb WHERE jsonb_typeof(pending) = 'string';
+            UPDATE surveillance_devices SET tags = (tags #>> '{}')::jsonb WHERE jsonb_typeof(tags) = 'string';
+            UPDATE flock_portals SET shared_with = (shared_with #>> '{}')::jsonb WHERE jsonb_typeof(shared_with) = 'string';
+            UPDATE civic_findings SET evidence = (evidence #>> '{}')::jsonb WHERE jsonb_typeof(evidence) = 'string';
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0049_flock_audits_and_departures",
+        "sql": """
+            -- Per-agency summaries of released Flock search logs (EyesOnFlock):
+            -- counts by reason category and matched term, never reason text.
+            CREATE TABLE IF NOT EXISTS flock_audit_stats (
+                slug                   TEXT PRIMARY KEY,
+                days                   INTEGER NOT NULL,
+                searches               INTEGER NOT NULL,
+                first_search           TIMESTAMPTZ,
+                last_search            TIMESTAMPTZ,
+                immigration_hits       INTEGER NOT NULL DEFAULT 0,
+                immigration_terms      JSONB NOT NULL DEFAULT '{}',
+                first_amendment_hits   INTEGER NOT NULL DEFAULT 0,
+                first_amendment_terms  JSONB NOT NULL DEFAULT '{}',
+                wide_searches          INTEGER NOT NULL DEFAULT 0,
+                no_reason              INTEGER NOT NULL DEFAULT 0,
+                updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            -- A portal missing from a full pass is marked, not deleted: a
+            -- likely contract cancellation (or a gap in the aggregator).
+            ALTER TABLE flock_portals ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW();
+            ALTER TABLE flock_portals ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0050_drone_waivers_and_federal_money",
+        "sql": """
+            -- FAA drone-as-first-responder waivers (EFF's FOIA release, a public
+            -- Google Sheet) and federal awards for surveillance (USAspending):
+            -- contracts to named vendors, grants whose descriptions name a technology.
+            CREATE TABLE IF NOT EXISTS drone_waivers (
+                applicant    TEXT NOT NULL,
+                city         TEXT,
+                state        TEXT NOT NULL,
+                category     TEXT,
+                status       TEXT,
+                received     DATE,
+                completed    DATE,
+                start_date   DATE,
+                altitude     TEXT,
+                lat          DOUBLE PRECISION,
+                lon          DOUBLE PRECISION,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (applicant, state)
+            );
+            CREATE TABLE IF NOT EXISTS federal_awards (
+                award_id      TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL,          -- 'contract' or 'grant'
+                matched       TEXT NOT NULL,          -- vendor name or technology keyword
+                recipient     TEXT,
+                amount        DOUBLE PRECISION,
+                agency        TEXT,
+                sub_agency    TEXT,
+                start_date    DATE,
+                description   TEXT,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS federal_awards_matched ON federal_awards (kind, matched);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0051_data_brokers",
+        "sql": """
+            -- California's data broker registry (CPPA): what each broker
+            -- declares it collects and who it sold data to, with its opt-out page.
+            CREATE TABLE IF NOT EXISTS data_brokers (
+                name         TEXT PRIMARY KEY,
+                dba          TEXT,
+                website      TEXT,
+                privacy_url  TEXT,
+                email        TEXT,
+                city         TEXT,
+                state        TEXT,
+                flags        JSONB NOT NULL DEFAULT '{}',
+                registry     TEXT NOT NULL DEFAULT 'CA',
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0052_unwrap_double_encoded_jsonb_platform",
+        "sql": """
+            -- The pool's jsonb codec JSON-encodes parameters; writers that also
+            -- called json.dumps stored the document as a JSON *string*, which
+            -- SQL's ->> cannot read (the dossier and macro engines' ticker and
+            -- sector lookups returned NULL for 264k archived filings and
+            -- earnings reactions). Writers fixed 10 Oct 2026; rows unwrapped
+            -- here, a year at a time on the compressed hypertable. Left as is:
+            -- audit_ledger.details (the hash chain covers the exact string) and
+            -- the *_jsonb_backup_20260902 tables (backups).
+            -- Compressed chunks: one year of archive exceeds the default cap on
+            -- rows a statement may decompress; lifted for this session only.
+            SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0;
+            -- Only strings that parse as a JSON object or array are unwrapped;
+            -- anything else (a genuinely textual payload) is left untouched.
+            CREATE OR REPLACE FUNCTION sentinel_try_jsonb(t text) RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $f$
+            DECLARE j jsonb;
+            BEGIN
+                j := t::jsonb;
+                IF jsonb_typeof(j) IN ('object', 'array') THEN RETURN j; END IF;
+                RETURN NULL;
+            EXCEPTION WHEN others THEN RETURN NULL;
+            END $f$;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2015-01-01' AND occurred_at < '2016-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2016-01-01' AND occurred_at < '2017-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2017-01-01' AND occurred_at < '2018-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2018-01-01' AND occurred_at < '2019-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2019-01-01' AND occurred_at < '2020-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2020-01-01' AND occurred_at < '2021-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2021-01-01' AND occurred_at < '2022-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2022-01-01' AND occurred_at < '2023-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2023-01-01' AND occurred_at < '2024-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2024-01-01' AND occurred_at < '2025-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2025-01-01' AND occurred_at < '2026-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE signal_event_archive SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE occurred_at >= '2026-01-01' AND occurred_at < '2027-01-01' AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE events SET financial_data = sentinel_try_jsonb(financial_data #>> '{}')
+                WHERE type = 'earnings_reaction' AND occurred_at >= '2026-09-01'
+                  AND jsonb_typeof(financial_data) = 'string' AND sentinel_try_jsonb(financial_data #>> '{}') IS NOT NULL;
+            UPDATE failed_events SET raw_payload = sentinel_try_jsonb(raw_payload #>> '{}') WHERE jsonb_typeof(raw_payload) = 'string' AND sentinel_try_jsonb(raw_payload #>> '{}') IS NOT NULL;
+            UPDATE recommendation_log SET option_idea = sentinel_try_jsonb(option_idea #>> '{}') WHERE jsonb_typeof(option_idea) = 'string' AND sentinel_try_jsonb(option_idea #>> '{}') IS NOT NULL;
+            UPDATE factor_model_runs SET report = sentinel_try_jsonb(report #>> '{}') WHERE jsonb_typeof(report) = 'string' AND sentinel_try_jsonb(report #>> '{}') IS NOT NULL;
+            DROP FUNCTION IF EXISTS sentinel_try_jsonb(text);
+        """,
+        "transactional": False,
+        "timeout": 1800
+    },
+    {
+        "version": "0053_courts",
+        "sql": """
+            -- Surveillance in the federal courts (shared/utils/courts.py,
+            -- CourtListener): the cases, the judges' disclosures, and disclosed
+            -- holdings in surveillance vendors.
+            CREATE TABLE IF NOT EXISTS court_cases (
+                docket_id        BIGINT PRIMARY KEY,
+                case_name        TEXT NOT NULL,
+                court_id         TEXT,
+                date_filed       DATE,
+                date_terminated  DATE,
+                judge            TEXT,
+                judge_id         BIGINT,
+                suit_nature      TEXT,
+                docket_number    TEXT,
+                url              TEXT NOT NULL,
+                topics           TEXT[] NOT NULL DEFAULT '{}',
+                first_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS court_cases_judge ON court_cases (judge_id);
+            CREATE TABLE IF NOT EXISTS judge_disclosures (
+                disclosure_id  BIGINT PRIMARY KEY,
+                person_id      BIGINT NOT NULL,
+                year           INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS judge_disclosures_person ON judge_disclosures (person_id);
+            CREATE TABLE IF NOT EXISTS judge_checked (
+                person_id   BIGINT PRIMARY KEY,
+                checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS vendor_holdings (
+                investment_id     BIGINT PRIMARY KEY,
+                disclosure_id     BIGINT NOT NULL,
+                vendor            TEXT NOT NULL,
+                description       TEXT,
+                gross_value_code  TEXT,
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS vendor_holdings_disclosure ON vendor_holdings (disclosure_id);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0054_lobbying",
+        "sql": """
+            -- Federal lobbying by surveillance vendors (shared/utils/lobbying.py, lda.gov).
+            CREATE TABLE IF NOT EXISTS lobbying_filings (
+                filing_uuid   TEXT PRIMARY KEY,
+                vendor        TEXT NOT NULL,
+                client_name   TEXT,
+                registrant    TEXT,
+                year          INTEGER,
+                period        TEXT,
+                filing_type   TEXT,
+                amount        DOUBLE PRECISION,
+                in_house      BOOLEAN NOT NULL DEFAULT FALSE,
+                issues        TEXT[] NOT NULL DEFAULT '{}',
+                entities      TEXT[] NOT NULL DEFAULT '{}',
+                description   TEXT,
+                url           TEXT,
+                posted        DATE,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS lobbying_vendor_year ON lobbying_filings (vendor, year);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0055_tradfi_bars_source",
+        "sql": """
+            -- Where a bar came from, apart from which session it belongs to.
+            -- Vendor rows were written with session = 'vendor_backfill', so a
+            -- backfilled 06:59 bar could not say it was pre-market, and a
+            -- reader could not tell an IEX bar from a consolidated one.
+            ALTER TABLE tradfi_bars ADD COLUMN IF NOT EXISTS source TEXT;
+        """,
+        "transactional": False,
+        "timeout": 600
+    },
+    {
+        "version": "0056_factor_scores_and_ic",
+        "sql": """
+            -- Each night's factor scores, kept, and their grade once the horizon
+            -- has passed (shared/utils/ic_monitor.py): the live IC beside the
+            -- IC the walk-forward promised.
+            CREATE TABLE IF NOT EXISTS factor_scores_daily (
+                as_of       DATE NOT NULL,
+                horizon     TEXT NOT NULL,
+                ticker      TEXT NOT NULL,
+                percentile  DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (as_of, horizon, ticker)
+            );
+            CREATE TABLE IF NOT EXISTS factor_ic (
+                as_of       DATE NOT NULL,
+                horizon     TEXT NOT NULL,
+                ic          DOUBLE PRECISION,
+                n           INTEGER NOT NULL,
+                end_day     DATE,
+                graded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (as_of, horizon)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0057_form144_and_eia",
+        "sql": """
+            -- Insiders' notices of proposed sales (shared/utils/form144.py).
+            CREATE TABLE IF NOT EXISTS form144_notices (
+                accession         TEXT PRIMARY KEY,
+                issuer_cik        TEXT,
+                ticker            TEXT,
+                issuer_name       TEXT,
+                seller            TEXT,
+                relationship      TEXT,
+                security          TEXT,
+                shares            DOUBLE PRECISION,
+                market_value      DOUBLE PRECISION,
+                pct_outstanding   DOUBLE PRECISION,
+                approx_sale_date  DATE,
+                acquired_how      TEXT,
+                notice_date       DATE,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS form144_ticker ON form144_notices (ticker, notice_date DESC);
+            -- EIA's weekly petroleum stocks (shared/utils/eia.py): one row per
+            -- series per week, in thousand barrels.
+            CREATE TABLE IF NOT EXISTS eia_weekly (
+                series       TEXT NOT NULL,
+                week_ending  DATE NOT NULL,
+                value        DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (series, week_ending)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0058_macro_first_release",
+        "sql": """
+            -- Macro series as first published (FRED output_type=4): point in
+            -- time, before the revisions today's history carries.
+            CREATE TABLE IF NOT EXISTS macro_first_release (
+                series_id       TEXT NOT NULL,
+                period          DATE NOT NULL,
+                value           DOUBLE PRECISION NOT NULL,
+                realtime_start  DATE,
+                PRIMARY KEY (series_id, period)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0059_vendor_shares",
+        "sql": """
+            -- Shares outstanding from Finnhub for ranked stocks the SEC frames
+            -- leave out (services/collector-filings/vendor_shares.py).
+            CREATE TABLE IF NOT EXISTS vendor_shares (
+                ticker   TEXT NOT NULL,
+                as_of    DATE NOT NULL,
+                shares   DOUBLE PRECISION NOT NULL,
+                source   TEXT NOT NULL,
+                PRIMARY KEY (ticker, as_of)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0060_overlay_sizing",
+        "sql": """
+            -- The model portfolio's overlay size and SPY core weight, decided
+            -- each night (volatility target, equity-regime gauge, beta hedge),
+            -- and what each marked session used.
+            ALTER TABLE model_portfolio_state ADD COLUMN IF NOT EXISTS sizing JSONB;
+            ALTER TABLE model_portfolio_nav ADD COLUMN IF NOT EXISTS gross DOUBLE PRECISION;
+            ALTER TABLE model_portfolio_nav ADD COLUMN IF NOT EXISTS core DOUBLE PRECISION;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0061_insider_transactions",
+        "sql": """
+            -- Insider open-market trades from the SEC's quarterly Form 3/4/5
+            -- data sets, each classified routine or opportunistic
+            -- (shared/utils/insider_history.py).
+            CREATE TABLE IF NOT EXISTS insider_transactions (
+                accession      TEXT NOT NULL,
+                line           TEXT NOT NULL,
+                owner_cik      TEXT NOT NULL,
+                filed          DATE NOT NULL,
+                traded         DATE NOT NULL,
+                issuer_cik     TEXT,
+                ticker         TEXT NOT NULL,
+                owner_name     TEXT,
+                relationship   TEXT,
+                title          TEXT,
+                code           TEXT NOT NULL,
+                shares         DOUBLE PRECISION,
+                price          DOUBLE PRECISION,
+                planned        BOOLEAN NOT NULL DEFAULT FALSE,
+                insider_class  TEXT,
+                PRIMARY KEY (accession, line, owner_cik)
+            );
+            CREATE INDEX IF NOT EXISTS insider_transactions_owner ON insider_transactions (owner_cik, traded);
+            CREATE INDEX IF NOT EXISTS insider_transactions_ticker ON insider_transactions (ticker, filed);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0062_stock_news",
+        "sql": """
+            -- Company news from Alpaca's feed (Benzinga), tagged with its
+            -- stocks, and FinBERT's tone for each headline
+            -- (shared/utils/stock_news.py).
+            CREATE TABLE IF NOT EXISTS stock_news (
+                id          BIGINT PRIMARY KEY,
+                created_at  TIMESTAMPTZ NOT NULL,
+                symbols     TEXT[] NOT NULL DEFAULT '{}',
+                headline    TEXT NOT NULL,
+                summary     TEXT,
+                source      TEXT,
+                url         TEXT,
+                positive    REAL,
+                negative    REAL,
+                neutral     REAL,
+                scored_at   TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS stock_news_created ON stock_news (created_at DESC);
+            CREATE INDEX IF NOT EXISTS stock_news_symbols ON stock_news USING GIN (symbols);
+            CREATE INDEX IF NOT EXISTS stock_news_unscored ON stock_news (created_at DESC) WHERE scored_at IS NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0063_option_idea_grades",
+        "sql": """
+            -- Each logged option idea's result at expiry: profit or loss per
+            -- contract from the stock's close, and on the capital at risk.
+            ALTER TABLE recommendation_log ADD COLUMN IF NOT EXISTS option_pnl DOUBLE PRECISION;
+            ALTER TABLE recommendation_log ADD COLUMN IF NOT EXISTS option_return_on_risk DOUBLE PRECISION;
+            ALTER TABLE recommendation_log ADD COLUMN IF NOT EXISTS option_graded_at TIMESTAMPTZ;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0064_option_iv_history",
+        "sql": """
+            -- Option-implied measures rebuilt from daily option bars
+            -- (shared/utils/option_iv.py), apart from the live option_daily
+            -- so a study never mixes the two definitions.
+            CREATE TABLE IF NOT EXISTS option_iv_history (
+                ticker            TEXT NOT NULL,
+                day               DATE NOT NULL,
+                atm_iv            DOUBLE PRECISION,
+                iv_skew           DOUBLE PRECISION,
+                skew_expiry_days  INTEGER,
+                cp_iv_spread      DOUBLE PRECISION,
+                cp_pairs          INTEGER,
+                call_volume       DOUBLE PRECISION,
+                put_volume        DOUBLE PRECISION,
+                put_call_ratio    DOUBLE PRECISION,
+                contracts         INTEGER,
+                spot              DOUBLE PRECISION,
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ticker, day)
+            );
+            CREATE INDEX IF NOT EXISTS option_iv_history_day ON option_iv_history (day);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0065_news_embed",
+        "sql": """
+            -- Each stock's company-news embeddings summed per news day
+            -- (shared/utils/news_embed.py): 768 float16 values packed in v.
+            -- The monthly refit reads it; the live scorer adds to it.
+            CREATE TABLE IF NOT EXISTS news_embed_daily (
+                day     DATE NOT NULL,
+                ticker  TEXT NOT NULL,
+                n       INTEGER NOT NULL,
+                v       BYTEA NOT NULL,
+                PRIMARY KEY (day, ticker)
+            );
+            -- The walk-forward's out-of-sample score for each stock and
+            -- session, from a model trained only on earlier months.
+            CREATE TABLE IF NOT EXISTS news_embed_oos (
+                day       DATE NOT NULL,
+                ticker    TEXT NOT NULL,
+                score     DOUBLE PRECISION NOT NULL,
+                fitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (day, ticker)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0066_issuer_kind",
+        "sql": """
+            -- What kind of issuer stands behind a ticker, from its EDGAR
+            -- submissions: a domestic operating company, a foreign private
+            -- issuer (annual report on 20-F or 40-F: traded here as ADRs or
+            -- foreign ordinary shares), or a partnership (L.P. units).
+            ALTER TABLE company_profile ADD COLUMN IF NOT EXISTS issuer_kind TEXT;
+            ALTER TABLE company_profile ADD COLUMN IF NOT EXISTS state_of_incorporation TEXT;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0067_user_preferences",
+        "sql": """
+            -- Each signed-in person's own settings: the stocks they follow, their
+            -- town, and what home leads with. Keyed by the gateway-verified
+            -- identity (the session's email), one row per person.
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                owner       TEXT PRIMARY KEY,
+                prefs       JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0068_auto_trade_orders",
+        "sql": """
+            -- Every order the auto-trader (services/agents/auto_trader.py) sent to
+            -- the paper account to mirror the model portfolio, with the venue's
+            -- answer. Also the record of which names it manages: it never trades
+            -- a position it did not open.
+            CREATE TABLE IF NOT EXISTS auto_trade_orders (
+                id            BIGSERIAL PRIMARY KEY,
+                day           DATE NOT NULL,
+                portfolio     TEXT NOT NULL,
+                symbol        TEXT NOT NULL,
+                side          TEXT NOT NULL,
+                qty           DOUBLE PRECISION NOT NULL,
+                reason        TEXT NOT NULL,
+                order_id      TEXT,
+                status        TEXT NOT NULL,
+                error         TEXT,
+                submitted_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS auto_trade_orders_day ON auto_trade_orders (portfolio, day);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0069_tick_trades_quotes",
+        "sql": """
+            -- Every trade and top-of-book change for the names the portfolio
+            -- holds or is about to trade (shared/utils/live_focus.py), from the
+            -- free IEX stream: one venue's prints, a few percent of the tape,
+            -- but tick by tick. Compressed after a day, kept 90 days -- enough
+            -- to study order flow around the book's own trades.
+            CREATE TABLE IF NOT EXISTS tick_trades (
+                ticker      TEXT NOT NULL,
+                time        TIMESTAMPTZ NOT NULL,
+                price       DOUBLE PRECISION NOT NULL,
+                size        DOUBLE PRECISION NOT NULL,
+                trade_id    BIGINT,
+                exchange    TEXT,
+                conditions  TEXT[],
+                source      TEXT NOT NULL
+            );
+            SELECT create_hypertable('tick_trades', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+            CREATE INDEX IF NOT EXISTS tick_trades_ticker_time ON tick_trades (ticker, time DESC);
+            ALTER TABLE tick_trades SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'ticker',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+            SELECT add_compression_policy('tick_trades', INTERVAL '1 day', if_not_exists => TRUE);
+            SELECT add_retention_policy('tick_trades', INTERVAL '90 days', if_not_exists => TRUE);
+
+            CREATE TABLE IF NOT EXISTS tick_quotes (
+                ticker      TEXT NOT NULL,
+                time        TIMESTAMPTZ NOT NULL,
+                bid         DOUBLE PRECISION,
+                bid_size    DOUBLE PRECISION,
+                ask         DOUBLE PRECISION,
+                ask_size    DOUBLE PRECISION,
+                source      TEXT NOT NULL
+            );
+            SELECT create_hypertable('tick_quotes', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+            CREATE INDEX IF NOT EXISTS tick_quotes_ticker_time ON tick_quotes (ticker, time DESC);
+            ALTER TABLE tick_quotes SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'ticker',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+            SELECT add_compression_policy('tick_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+            SELECT add_retention_policy('tick_quotes', INTERVAL '90 days', if_not_exists => TRUE);
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0070_option_ticks",
+        "sql": """
+            -- Quotes and trades on the options of the live focus, from the free
+            -- plan's indicative option stream (200 contracts; not OPRA, so
+            -- prices are indicative, not executable). Compressed after a day,
+            -- kept 90 days.
+            CREATE TABLE IF NOT EXISTS option_ticks (
+                contract    TEXT NOT NULL,
+                underlying  TEXT NOT NULL,
+                time        TIMESTAMPTZ NOT NULL,
+                kind        TEXT NOT NULL,
+                bid         DOUBLE PRECISION,
+                bid_size    DOUBLE PRECISION,
+                ask         DOUBLE PRECISION,
+                ask_size    DOUBLE PRECISION,
+                price       DOUBLE PRECISION,
+                size        DOUBLE PRECISION,
+                source      TEXT NOT NULL
+            );
+            SELECT create_hypertable('option_ticks', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+            CREATE INDEX IF NOT EXISTS option_ticks_underlying_time ON option_ticks (underlying, time DESC);
+            ALTER TABLE option_ticks SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'underlying',
+                timescaledb.compress_orderby = 'time DESC'
+            );
+            SELECT add_compression_policy('option_ticks', INTERVAL '1 day', if_not_exists => TRUE);
+            SELECT add_retention_policy('option_ticks', INTERVAL '90 days', if_not_exists => TRUE);
+        """,
+        "transactional": False
+    },
+    {
+        "version": "0071_option_chain_daily",
+        "sql": """
+            -- Each evening's option chain per stock, summarised
+            -- (shared/utils/option_chain.py) from Cboe's free delayed chains:
+            -- volume and open interest by side, Cboe's 30-day IV, ATM IV and
+            -- 25-delta skew. Open interest day over day shows positions being
+            -- opened, which Alpaca's option bars cannot.
+            CREATE TABLE IF NOT EXISTS option_chain_daily (
+                ticker       TEXT NOT NULL,
+                day          DATE NOT NULL,
+                call_volume  DOUBLE PRECISION,
+                put_volume   DOUBLE PRECISION,
+                call_oi      DOUBLE PRECISION,
+                put_oi       DOUBLE PRECISION,
+                pcr_volume   DOUBLE PRECISION,
+                pcr_oi       DOUBLE PRECISION,
+                iv30         DOUBLE PRECISION,
+                atm_iv       DOUBLE PRECISION,
+                skew_25d     DOUBLE PRECISION,
+                expiry_days  INTEGER,
+                contracts    INTEGER,
+                spot         DOUBLE PRECISION,
+                source       TEXT NOT NULL DEFAULT 'cboe_delayed',
+                fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ticker, day)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0072_commodity_prices_and_stock_features",
+        "sql": """
+            -- Daily prices of what companies make and buy: futures, memory-chip
+            -- spot prices, GPU rental rates (services/collector-tradfi/commodities.py).
+            CREATE TABLE IF NOT EXISTS commodity_prices (
+                series  TEXT NOT NULL,
+                day     DATE NOT NULL,
+                value   DOUBLE PRECISION NOT NULL,
+                unit    TEXT,
+                source  TEXT NOT NULL,
+                PRIMARY KEY (series, day)
+            );
+
+            -- One table every domain writes per-stock, per-day values into:
+            -- the integration contract between the platform's domains and the
+            -- stock model. Point in time (a value is dated the day it became
+            -- known); read by the model only through a pre-registered trial.
+            CREATE TABLE IF NOT EXISTS stock_features_daily (
+                ticker   TEXT NOT NULL,
+                day      DATE NOT NULL,
+                feature  TEXT NOT NULL,
+                value    DOUBLE PRECISION,
+                source   TEXT NOT NULL,
+                PRIMARY KEY (ticker, day, feature)
+            );
+            CREATE INDEX IF NOT EXISTS stock_features_feature_day ON stock_features_daily (feature, day);
+        """,
+        "transactional": True
     }
 ]
 
@@ -1339,7 +2372,7 @@ async def apply_migrations():
     rows = await db.query("SELECT version FROM schema_migrations;")
     applied_versions = {row["version"] for row in rows}
 
-    logger.info(f"Checking database migration status...")
+    logger.info("Checking database migration status...")
 
     # 3. Apply pending migrations sequentially
     for migration in MIGRATIONS:

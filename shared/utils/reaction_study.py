@@ -43,9 +43,15 @@ HORIZONS: Dict[str, timedelta] = {
     "1h": timedelta(hours=1),
     "1d": timedelta(days=1),
     "5d": timedelta(days=5),
+    # A month, where most event research measures (17 Oct 2026): opportunistic
+    # insider trades earn their 82 bps a month (Cohen, Malloy & Pomorski) and
+    # showed nothing at one or five days. Every family is measured at it, so
+    # the false-discovery step tests a third more cells.
+    "30d": timedelta(days=30),
 }
 
 MIN_UNITS = 20
+WINSOR_Z = 5.0           # cap on a unit's standardized move in the t-test
 FDR_Q = 0.10
 VALIDATION_SHARE = 0.4
 MIN_VALIDATION_UNITS = 8
@@ -205,6 +211,40 @@ class Measured:
     aligned: float           # standardized * direction
 
 
+# Size-matched benchmarks (Barber & Lyon 1997: long-horizon abnormal returns
+# against a broad index are biased by size). Measured against SPY alone, the
+# 30-day horizon read the small, volatile stocks these events involve lagging
+# SPY over 2021-26 as an effect of the event: on 17 Oct 2026 routine insider
+# buys -- the control -- showed -142 bps a month, and earnings jumps and drops
+# alike were followed by falls. Subtracting each stock's own quiet-window
+# drift instead removed it, but that drift was estimated over the whole
+# sample, the stock's future included. Each episode is now set against the
+# index of its own size, chosen from its average daily dollar volume over the
+# SIZE_LOOKBACK sessions before the event: nothing from after it.
+SIZE_BENCHMARKS: Tuple[Tuple[float, str], ...] = ((200e6, "SPY"), (50e6, "IJH"), (5e6, "IJR"), (0.0, "IWC"))
+SIZE_LOOKBACK = 20
+
+
+def size_benchmark(dollar_volume: Optional[float]) -> str:
+    """The index matching a stock's daily dollar volume; SPY when unknown."""
+    if dollar_volume is None:
+        return "SPY"
+    for floor, etf in SIZE_BENCHMARKS:
+        if dollar_volume >= floor:
+            return etf
+    return SIZE_BENCHMARKS[-1][1]
+
+
+def trailing_dollar_volume(series: Optional[Series], t: float, n: int = SIZE_LOOKBACK) -> Optional[float]:
+    """Mean of the last `n` daily dollar volumes stamped before `t`."""
+    if series is None:
+        return None
+    times, values = series
+    i = bisect.bisect_left(times, t)
+    window = [v for v in values[max(0, i - n): i] if v > 0]
+    return sum(window) / len(window) if window else None
+
+
 def measure(
     ep: Episode,
     horizon: timedelta,
@@ -212,7 +252,10 @@ def measure(
     benchmark: Optional[Series],
     stats: Optional[Tuple[float, float]],
 ) -> Optional[Measured]:
-    """One episode on one horizon, or None when it cannot be measured honestly."""
+    """One episode on one horizon, or None when it cannot be measured honestly.
+
+    `benchmark` is the size-matched index for the episode (size_benchmark):
+    the caller picks it from the stock's dollar volume before the event."""
     if series is None or stats is None:
         return None
     direction = ep.direction
@@ -348,7 +391,13 @@ def evaluate_cell(family: str, horizon: str, measured: Sequence[Measured], n_epi
     if len(us) < MIN_UNITS:
         res.verdict, res.reason = "insufficient_data", f"{len(us)} independent units of the {MIN_UNITS} needed"
         return res
-    xs = [u.aligned for u in us]
+    # Winsorized at +-WINSOR_Z standard deviations before the t-test. Episodes
+    # are scaled by the name's own volatility, but microcap filers still produce
+    # 20-sigma squeezes, and one of those inflates the variance enough to hide a
+    # consistent effect: on 8 October, 8-K dilution held a 58% hit rate over
+    # 1,068 independent episodes and tested at p = 0.09 on raw means. Fixed in
+    # advance, applied to every cell; hit rate and the bps size stay raw.
+    xs = [max(-WINSOR_Z, min(WINSOR_Z, u.aligned)) for u in us]
     t = t_stat(xs)
     mean = sum(xs) / len(xs)
     res.mean_aligned = round(mean, 4)
@@ -424,7 +473,7 @@ def combine(hit_rates: Sequence[float]) -> float:
 
 
 __all__ = [
-    "CellResult", "FDR_Q", "HORIZONS", "MIN_HIT_RATE", "MIN_UNITS", "Measured", "Series", "Unit",
+    "CellResult", "FDR_Q", "HORIZONS", "SIZE_BENCHMARKS", "size_benchmark", "trailing_dollar_volume", "MIN_HIT_RATE", "MIN_UNITS", "Measured", "Series", "Unit",
     "benjamini_hochberg", "combine", "cost_bps", "evaluate_cell", "finalize", "forward_window",
     "horizon_stats", "is_future", "measure", "scaled_horizon_stats", "pre_move", "shrunk_hit_rate", "t_stat", "units",
 ]

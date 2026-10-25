@@ -1199,3 +1199,109 @@ async def get_covered_call_recommendations(
         live_iv=live_iv
     )
     return rec or {"status": "GATED_OR_INVALID", "message": f"Covered call overlay requires CAGG Z >= 2.5 or valid ticker (Z={z_score})"}
+
+
+# ── Daily Treasury yield curve (shared/utils/treasury.py) ─────────────────────
+YIELD_CURVE_CACHE_TTL_SEC = 3600   # the Treasury publishes once a day
+
+
+async def _treasury_year(session: aiohttp.ClientSession, year: int) -> Dict[str, Any]:
+    from shared.utils import treasury as tr
+    try:
+        async with session.get(tr.TREASURY_XML.format(year=year)) as resp:
+            if resp.status != 200:
+                logger.warning("Treasury yield curve %s: HTTP %s", year, resp.status)
+                return {}
+            return tr.parse_par_yields(await resp.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        swallowed("api_gateway.routes.radar.treasury_year", e, logger)
+        return {}
+
+
+@router.get("/yield-curve")
+async def get_yield_curve(
+    days: int = Query(60, ge=5, le=250),
+    redis = Depends(get_redis_optional),
+) -> Dict[str, Any]:
+    """Daily 2-, 10- and 30-year par yields from the US Treasury, one source and
+    one time scale for all three, newest last."""
+    from shared.utils import treasury as tr
+    key = f"sentinel:treasury:curve:{days}"
+    if redis is not None:
+        try:
+            cached = await redis.raw.get(key)
+            if cached:
+                return json.loads(cached if isinstance(cached, str) else cached.decode("utf-8"))
+        except Exception as e:
+            swallowed("api_gateway.routes.radar.yield_curve.cache_read", e, logger)
+    year = datetime.now(timezone.utc).year
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"},
+                                     timeout=aiohttp.ClientTimeout(total=8)) as session:
+        this_year = await _treasury_year(session, year)
+        parts = [this_year]
+        if min((len(v) for v in this_year.values()), default=0) < days:
+            parts.insert(0, await _treasury_year(session, year - 1))
+    series = tr.merge_years(*parts, days=days)
+    out = {"series": series, "source": "US Department of the Treasury, daily par yield curve",
+           "as_of": max((s[-1]["date"] for s in series.values() if s), default=None)}
+    if redis is not None and any(series.values()):
+        try:
+            await redis.raw.set(key, json.dumps(out), ex=YIELD_CURVE_CACHE_TTL_SEC)
+        except Exception as e:
+            swallowed("api_gateway.routes.radar.yield_curve.cache_write", e, logger)
+    return out
+
+
+@router.get("/data-quality")
+async def get_data_quality(redis = Depends(get_redis_optional)) -> Dict[str, Any]:
+    """Whether the stored minute bars add up to each stock's official daily
+    volume (shared/utils/bar_quality.py), checked every two hours by the
+    tradfi collector."""
+    if redis is None:
+        return {"available": False}
+    try:
+        from shared.utils.bar_quality import BAR_QUALITY_KEY
+        raw_report = await redis.raw.get(BAR_QUALITY_KEY)
+    except Exception as e:
+        swallowed("api_gateway.routes.radar.data_quality", e, logger)
+        return {"available": False}
+    cross = None
+    try:
+        from shared.utils.daily_crosscheck import CROSSCHECK_KEY
+        cross_raw = await redis.raw.get(CROSSCHECK_KEY)
+        cross = json.loads(cross_raw if isinstance(cross_raw, str) else cross_raw.decode("utf-8")) if cross_raw else None
+    except Exception as e:
+        swallowed("api_gateway.routes.radar.data_quality_cross", e, logger)
+    if not raw_report:
+        return {"available": False, "crosscheck": cross,
+                "note": "The first check runs ten minutes after the collector starts."}
+    return {"available": True, "crosscheck": cross,
+            **json.loads(raw_report if isinstance(raw_report, str) else raw_report.decode("utf-8"))}
+
+
+_EIA_SQL = "SELECT series, week_ending, value FROM eia_weekly WHERE week_ending > CURRENT_DATE - 2200 ORDER BY series, week_ending"
+
+
+@router.get("/eia-stocks")
+async def get_eia_stocks(db = Depends(get_db_optional)) -> Dict[str, Any]:
+    """The EIA's weekly petroleum stocks: this week's level and change, how
+    unusual the change is against three years of weekly changes, and the level
+    against the five-year average for the same week (shared/utils/eia.py)."""
+    from shared.utils import eia
+    out: Dict[str, Any] = {"series": [], "source": "US Energy Information Administration, weekly petroleum status",
+                           "unit": "thousand barrels"}
+    if not db:
+        return out
+    try:
+        rows = await db.query(_EIA_SQL) or []
+    except Exception as e:
+        swallowed("api_gateway.routes.radar.eia", e, logger)
+        return out
+    by: Dict[str, list] = {}
+    for r in rows:
+        by.setdefault(r["series"], []).append((r["week_ending"], float(r["value"])))
+    for name, (_sid, label) in eia.SERIES.items():
+        rep = eia.week_report(by.get(name, []))
+        if rep:
+            out["series"].append({"series": name, "label": label, **rep})
+    return out

@@ -36,14 +36,17 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
     { refreshInterval: POLL.live },
   );
 
-  const rawSeries =
-    data?.series?.[cleanTicker] ||
-    data?.series?.[cleanTicker.replace('USD', '')] ||
-    data?.series?.[`${cleanTicker}USD`] ||
-    data?.series?.[
-      cleanTicker === '2YR' ? 'US02Y' : cleanTicker === '30YR' ? 'US30Y' : cleanTicker
-    ] ||
-    [];
+  const rawSeries = useMemo(
+    () =>
+      data?.series?.[cleanTicker] ||
+      data?.series?.[cleanTicker.replace('USD', '')] ||
+      data?.series?.[`${cleanTicker}USD`] ||
+      data?.series?.[
+        cleanTicker === '2YR' ? 'US02Y' : cleanTicker === '30YR' ? 'US30Y' : cleanTicker
+      ] ||
+      [],
+    [data, cleanTicker],
+  );
   const hasData = rawSeries.length > 0;
 
   const currentPrice = rawSeries[rawSeries.length - 1]?.price ?? null;
@@ -100,14 +103,14 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
             </span>
             <div className="flex items-center gap-2 mt-0.5">
               <span
-                className={`font-extrabold text-lg ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}
+                className={`font-extrabold text-lg ${isPositive ? 'text-positive' : 'text-negative'}`}
               >
                 {currentPrice !== null ? `$${currentPrice.toFixed(2)}` : 'AWAITING TICK...'}
               </span>
               {isPositive ? (
-                <TrendingUp className="w-4 h-4 text-emerald-400 animate-pulse" />
+                <TrendingUp className="w-4 h-4 text-positive animate-pulse" />
               ) : (
-                <TrendingDown className="w-4 h-4 text-rose-400 animate-pulse" />
+                <TrendingDown className="w-4 h-4 text-negative animate-pulse" />
               )}
             </div>
           </div>
@@ -129,7 +132,7 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
         </div>
 
         {/* SVG Sparkline */}
-        <div className="relative bg-[#050810] p-2 rounded-lg border border-line/80 overflow-hidden">
+        <div className="relative bg-inset p-2 rounded-lg border border-line/80 overflow-hidden">
           {hasData ? (
             <svg
               viewBox={`0 0 ${svgWidth} ${svgHeight}`}
@@ -182,14 +185,14 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
             </svg>
           ) : (
             <div className="h-[180px] flex items-center justify-center text-ink-mute">
-              <Activity className="w-5 h-5 animate-spin mr-2 text-cyan-400" />
+              <Activity className="w-5 h-5 animate-spin mr-2 text-accent" />
               <span>Fetching live FIX & REST market series for {cleanTicker}...</span>
             </div>
           )}
 
           {/* Hover Tooltip */}
           {hoverPoint && (
-            <div className="absolute top-2 right-2 bg-raised/90 border border-cyan-500/40 text-cyan-300 p-2 rounded text-micro shadow-lg">
+            <div className="absolute top-2 right-2 bg-raised/90 border border-line-accent text-accent p-2 rounded text-micro shadow-lg">
               <div className="font-bold">${hoverPoint.price.toFixed(2)}</div>
               <div className="text-micro text-ink-dim">
                 <ClockTime value={hoverPoint.time} />

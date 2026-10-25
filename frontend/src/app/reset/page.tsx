@@ -47,10 +47,10 @@ function ResetInner() {
 
   if (!token) {
     return (
-      <AuthShell title="Link not valid" subtitle="NO TOKEN">
+      <AuthShell title="Link not valid" subtitle="This link is missing its code">
         <div className="space-y-4 text-sm text-ink-dim">
           <p className="text-ink-dim">This page needs a reset link from your email.</p>
-          <Link href="/forgot" className="block text-center text-cyan-400 hover:text-cyan-300">
+          <Link href="/forgot" className="block text-center text-accent hover:text-accent">
             Request a reset link
           </Link>
         </div>
@@ -60,10 +60,10 @@ function ResetInner() {
 
   if (done) {
     return (
-      <AuthShell title="Password changed" subtitle="YOU CAN SIGN IN NOW">
+      <AuthShell title="Password changed" subtitle="You can sign in now">
         <div className="space-y-4 text-sm text-ink-dim">
           <p>Your password has been changed. Any other reset links have stopped working.</p>
-          <Link href="/login" className="block text-center text-cyan-400 hover:text-cyan-300">
+          <Link href="/login" className="block text-center text-accent hover:text-accent">
             Sign in
           </Link>
         </div>
@@ -72,7 +72,7 @@ function ResetInner() {
   }
 
   return (
-    <AuthShell title="Choose a new password" subtitle="LINK VALID FOR 30 MINUTES">
+    <AuthShell title="Choose a new password" subtitle="The link works for 30 minutes">
       <form onSubmit={submit} className="space-y-4">
         <div className="space-y-1">
           <label htmlFor="pw" className="text-micro uppercase tracking-widest text-ink-dim">
@@ -105,7 +105,7 @@ function ResetInner() {
           />
         </div>
 
-        {error && <p className="text-sm text-rose-400">{error}</p>}
+        {error && <p className="text-sm text-negative">{error}</p>}
 
         <button type="submit" disabled={busy} className={buttonClass}>
           {busy ? 'Saving…' : 'Change password'}
@@ -119,7 +119,7 @@ export default function ResetPage() {
   return (
     <Suspense
       fallback={
-        <AuthShell title="Loading" subtitle="ONE MOMENT">
+        <AuthShell title="Loading" subtitle="One moment">
           <p className="text-sm text-ink-dim text-center">Loading…</p>
         </AuthShell>
       }

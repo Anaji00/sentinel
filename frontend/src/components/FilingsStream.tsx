@@ -49,19 +49,22 @@ const CSV_COLUMNS: CsvColumn<Filing>[] = [
 ];
 
 export default function FilingsStream() {
-  const [materialOnly, setMaterialOnly] = React.useState(false);
+  // Unset until the reader chooses: material filings lead whenever there are
+  // any, so the page does not open on a wall of routine 424B2 notices.
+  const [materialChoice, setMaterialChoice] = React.useState<boolean | null>(null);
 
   const { data, error, isLoading } = useSWR<Filing[]>('/filings/latest?limit=50', fetcher, {
     // EDGAR publishes in bursts through the day; this is not a tick feed.
     refreshInterval: POLL.slow,
   });
 
+  const materialCount = (Array.isArray(data) ? data : []).filter((f) => f.is_material_8k).length;
+  const materialOnly = materialChoice ?? materialCount > 0;
+
   const filings = React.useMemo(() => {
     const rows = Array.isArray(data) ? data : [];
     return materialOnly ? rows.filter((f) => f.is_material_8k) : rows;
   }, [data, materialOnly]);
-
-  const materialCount = (Array.isArray(data) ? data : []).filter((f) => f.is_material_8k).length;
 
   if (error) {
     return (
@@ -92,7 +95,7 @@ export default function FilingsStream() {
         <div className="flex items-center gap-1.5">
           <ExportButton subject="filings" rows={filings} columns={CSV_COLUMNS} />
           <button
-            onClick={() => setMaterialOnly((v) => !v)}
+            onClick={() => setMaterialChoice(!materialOnly)}
             aria-pressed={materialOnly}
             className={`cursor-pointer rounded-md border px-2 py-0.5 text-micro font-medium transition-colors ${
               materialOnly

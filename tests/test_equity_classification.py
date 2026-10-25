@@ -135,10 +135,14 @@ def test_the_snapshot_request_uses_the_filtered_list():
 
     src = (Path(__file__).resolve().parents[1]
            / "services" / "collector-tradfi" / "main.py").read_text(encoding="utf-8")
+    # The URL is built inside the batching helper, from the symbols it is given;
+    # every call to that helper must hand it the filtered list.
     url_line = next(
         ln for ln in src.splitlines() if "stocks/snapshots?symbols=" in ln
     )
-    assert "snapshot_symbols" in url_line, (
+    assert "chunk" in url_line, "the snapshot URL must be built from the batch it was given"
+    calls = [ln for ln in src.splitlines() if "_snapshot_batches(session" in ln]
+    assert calls and all("snapshot_symbols" in ln for ln in calls), (
         "the snapshot URL must be built from the filtered list, not from the "
         "raw subscription universe"
     )

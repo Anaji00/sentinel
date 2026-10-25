@@ -79,7 +79,7 @@ export const ProvenanceValue: React.FC<ProvenanceValueProps> = ({
   }
 
   const isLlm = provenance?.source_type === 'llm_inference';
-  const textStyle = isLlm ? 'text-purple-300 font-medium' : 'text-white font-bold';
+  const textStyle = isLlm ? 'text-accent font-medium' : 'text-ink font-bold';
 
   return (
     <div className={`inline-flex items-center gap-2 ${className}`}>

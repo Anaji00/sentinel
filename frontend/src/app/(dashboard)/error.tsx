@@ -30,10 +30,10 @@ export default function DashboardError({
 
   return (
     <div role="alert" className="flex h-full w-full items-center justify-center p-6">
-      <div className="w-full max-w-md rounded-xl border border-rose-500/30 bg-rose-950/20 p-6">
+      <div className="w-full max-w-md rounded-xl border border-negative/30 bg-negative/10 p-6">
         <div className="flex items-center gap-2.5">
-          <AlertTriangle className="h-4 w-4 shrink-0 text-rose-400" />
-          <h2 className="text-sm font-bold text-rose-300">This view could not be loaded</h2>
+          <AlertTriangle className="h-4 w-4 shrink-0 text-negative" />
+          <h2 className="text-sm font-bold text-negative">This view could not be loaded</h2>
         </div>
 
         <p className="mt-3 text-micro leading-relaxed text-ink-dim">
@@ -49,7 +49,7 @@ export default function DashboardError({
 
         <button
           onClick={reset}
-          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-micro font-bold text-rose-300 transition-colors hover:bg-rose-900/40 focus:outline-none focus:ring-2 focus:ring-rose-400"
+          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-negative/30 bg-negative/10 px-3 py-2 text-micro font-bold text-negative transition-colors hover:bg-negative/10 focus:outline-none focus:ring-2 focus:ring-rose-400"
         >
           <RotateCw className="h-3.5 w-3.5" />
           RETRY

@@ -47,7 +47,7 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
   if (patienceSpent) {
     return (
       <div className="w-full h-full p-4 glass-panel rounded-xl flex flex-col items-center justify-center gap-1.5 text-center">
-        <p className="text-micro font-medium text-amber-400/90" role="alert">
+        <p className="text-micro font-medium text-caution/90" role="alert">
           {title.replace(/\.\.\.$|â€¦$/, '')} is not responding
         </p>
         <p className="max-w-xs text-micro leading-relaxed text-ink-mute">
@@ -65,7 +65,7 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
       aria-live="polite"
       aria-label={title}
     >
-      <div className="flex items-center justify-between border-b border-cyan-500/10 pb-3">
+      <div className="flex items-center justify-between border-b border-line pb-3">
         {/* The title the callers were already passing. */}
         <span className="text-micro font-medium text-ink-mute animate-pulse">{title}</span>
         <Skeleton height="20px" width="60px" />
@@ -76,6 +76,33 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
         <Skeleton height="60px" width="100%" />
         <Skeleton height="60px" width="100%" />
       </div>
+    </div>
+  );
+};
+
+/**
+ * A few shimmering lines for a section still loading, in place of the bare
+ * "Loadingâ€¦" text that read the same whether a request was slow or dead. After
+ * the same patience as a panel it says so, quietly, instead of shimmering on.
+ */
+export const LoadingLines: React.FC<{ lines?: number; label?: string }> = ({ lines = 3, label = 'Loading' }) => {
+  const [patienceSpent, setPatienceSpent] = React.useState(false);
+  React.useEffect(() => {
+    const t = setTimeout(() => setPatienceSpent(true), PATIENCE_MS);
+    return () => clearTimeout(t);
+  }, []);
+  if (patienceSpent) {
+    return (
+      <p className="text-micro text-caution/90" role="status">
+        Still waiting for the server after {PATIENCE_MS / 1000} seconds; it may be unreachable.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2 animate-pulse" role="status" aria-label={label}>
+      {Array.from({ length: lines }, (_, i) => (
+        <Skeleton key={i} height="12px" width={i === lines - 1 ? '60%' : '100%'} />
+      ))}
     </div>
   );
 };

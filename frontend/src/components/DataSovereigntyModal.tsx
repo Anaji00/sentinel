@@ -164,7 +164,7 @@ export const DataSovereigntyModal: React.FC = () => {
           {...dialog.overlayProps}
         >
           <div
-            className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-2xl border border-line-strong bg-raised p-6 text-ink shadow-2xl"
+            className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-2xl border border-line-strong bg-raised p-6 text-ink"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-4">

@@ -21,7 +21,7 @@ export const MetricCard: React.FC<MetricCardProps> = ({
 }) => {
   return (
     <div
-      className={`p-3 rounded-lg bg-raised/60 border border-cyan-500/10 flex flex-col justify-between ${className}`}
+      className={`p-3 rounded-lg bg-raised/60 border border-line flex flex-col justify-between ${className}`}
     >
       <span className="text-micro font-mono uppercase tracking-wider text-ink-dim">{label}</span>
       <div className="flex items-baseline justify-between mt-1">
@@ -35,8 +35,8 @@ export const MetricCard: React.FC<MetricCardProps> = ({
               isPositive === undefined
                 ? 'text-ink-dim'
                 : isPositive
-                  ? 'text-emerald-400'
-                  : 'text-rose-400'
+                  ? 'text-positive'
+                  : 'text-negative'
             }`}
           >
             {isPositive === undefined ? (

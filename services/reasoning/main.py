@@ -76,7 +76,7 @@ from shared.utils.dlq_payload import encode_dlq_payload
 from shared.utils.backpressure import declare_pressure, clear_pressure
 from shared.utils.rule_feedback import conversion_rates, conversion_weight
 from shared.utils.instrument_reach import cluster_reaches_instrument
-from shared.utils.quiet_failures import dropped
+from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.heartbeat import start_heartbeat_task
 
 def _jsonable(value):
@@ -230,9 +230,39 @@ def tier_warrants_synthesis(tier) -> bool:
         return name != "WATCH"
 
 
+_RETIRED_CACHE: dict = {"at": 0.0, "rules": set()}
+_RETIRED_TTL_SEC = 3600
+
+
+async def retired_rules(redis_client) -> set:
+    """Equity rules graded against prices with no edge (services/agents/grader.py):
+    measured 8 October, none of the busiest preceded moves larger than the
+    stock's normal ones. Their clusters still alert and are stored; they no
+    longer take a model-written scenario."""
+    import time as _time
+    if _time.time() - _RETIRED_CACHE["at"] < _RETIRED_TTL_SEC:
+        return _RETIRED_CACHE["rules"]
+    rules: set = set()
+    try:
+        from shared.utils.producer_grades import uninformative_rules
+        from shared.utils.signal_store import PRODUCER_GRADES_KEY
+        raw = getattr(redis_client, "raw", redis_client)
+        blob = await raw.get(PRODUCER_GRADES_KEY)
+        if blob:
+            rules = uninformative_rules(json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")))
+    except Exception as exc:
+        swallowed("reasoning.retired_rules", exc, logger)
+    _RETIRED_CACHE.update(at=_time.time(), rules=rules)
+    return rules
+
+
 async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
     """The core synthesis pipeline."""
     if not tier_warrants_synthesis(cluster.alert_tier):
+        return
+    from shared.utils.producer_grades import is_uninformative
+    if is_uninformative(cluster.rule_name, await retired_rules(redis_client)):
+        dropped("reasoning.rule_graded_uninformative", f"{cluster.rule_name}: no edge against prices", logger)
         return
         
     logger.info("🧠 Synthesizing [%s] %s via Ollama...", cluster.alert_tier.name, cluster.rule_name)

@@ -7,11 +7,8 @@ import { useLiveEvents } from '../lib/useLiveEvents';
 import { NormalizedEvent, Scenario } from '../lib/types';
 import { resolveEventDomain } from '../lib/domain';
 import { recordInteraction } from '../lib/interactions';
-import { Card } from './ui/Card';
-import { Badge } from './ui/Badge';
-import { Tabs } from './ui/Tabs';
 import { DataGrid } from './ui/DataGrid';
-import { formatPercent } from '../lib/format';
+import { decodeEntities, formatPercent } from '../lib/format';
 import { IconChevronDown, IconModel } from '@/components/ui/icons';
 import { ClockTime } from './ui/ClockTime';
 import { POLL } from './ui/DataProvider';
@@ -85,7 +82,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     return {
       label: 'PREDICTION',
       icon: '',
-      badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10',
+      badgeStyle: 'text-accent border-line-accent bg-accent-dim',
     };
   }
   if (
@@ -103,28 +100,28 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     return {
       label: 'CRYPTO',
       icon: '₿',
-      badgeStyle: 'text-amber-400 border-amber-500/40 bg-amber-500/10',
+      badgeStyle: 'text-caution border-caution/30 bg-caution/10',
     };
   }
   if (t.includes('earnings')) {
     return {
       label: 'EARNINGS',
       icon: '',
-      badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10',
+      badgeStyle: 'text-positive border-positive/30 bg-positive/10',
     };
   }
   if (t.includes('funding')) {
     return {
-      label: 'PERP FUNDING',
+      label: 'FUTURES FEE',
       icon: '',
-      badgeStyle: 'text-purple-400 border-purple-500/40 bg-purple-500/10',
+      badgeStyle: 'text-accent border-line-accent bg-accent-dim',
     };
   }
   if (t.includes('vessel') || t.includes('maritime') || t.includes('ais')) {
     return {
       label: 'MARITIME',
       icon: '',
-      badgeStyle: 'text-cyan-400 border-cyan-500/40 bg-cyan-500/10',
+      badgeStyle: 'text-accent border-line-accent bg-accent-dim',
     };
   }
   if (t.includes('flight') || t.includes('aviation') || t.includes('adsb')) {
@@ -138,7 +135,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     return {
       label: 'CYBER',
       icon: '',
-      badgeStyle: 'text-rose-400 border-rose-500/40 bg-rose-500/10',
+      badgeStyle: 'text-negative border-negative/30 bg-negative/10',
     };
   }
   if (
@@ -151,7 +148,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     return {
       label: 'TRADFI',
       icon: '',
-      badgeStyle: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10',
+      badgeStyle: 'text-positive border-positive/30 bg-positive/10',
     };
   }
   return { label: 'NEWS', icon: '', badgeStyle: 'text-ink-dim border-line-strong bg-overlay' };
@@ -182,12 +179,12 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
     !rawHeadline.startsWith('Event') &&
     !rawHeadline.match(/^[0-9a-f]{8}-[0-9a-f]{4}/i)
   ) {
-    return rawHeadline.replace(/tradfi\s*[|\-]\s*prediction_market/gi, 'Prediction Market');
+    return decodeEntities(rawHeadline.replace(/tradfi\s*[|\-]\s*prediction_market/gi, 'Prediction Market'));
   }
 
   // Priority 2: If summary is present and rich, use it
   if (e.summary && e.summary.length > 15 && !e.summary.startsWith('Event')) {
-    return e.summary;
+    return decodeEntities(e.summary);
   }
 
   if (e.prediction_market_data?.question) {
@@ -198,28 +195,34 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
   }
 
   const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || '';
-  const t = (e.type || '').toLowerCase();
   const regionStr = e.region ? `in ${e.region}` : '';
 
   return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Target'}${regionStr}`;
 }
 
+// Red is kept for the rare event: at 0.75 nearly every ship report in the feed
+// read CRITICAL, and a colour on every card tells the reader nothing. Below the
+// elevated line a score is routine, shown in grey -- green already means "good"
+// or "bullish" everywhere else on the platform.
+const SCORE_CRITICAL = 0.9;
+const SCORE_ELEVATED = 0.7;
+
 const getScoreBadge = (score: number) => {
-  if (score >= 0.75)
+  if (score >= SCORE_CRITICAL)
     return (
-      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">
+      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-negative/15 text-negative border border-negative/40">
         CRITICAL {score.toFixed(2)}
       </span>
     );
-  if (score >= 0.5)
+  if (score >= SCORE_ELEVATED)
     return (
-      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 glow-amber">
+      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-caution/10 text-caution border border-caution/30">
         ELEVATED {score.toFixed(2)}
       </span>
     );
   return (
-    <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
-      NORMAL {score.toFixed(2)}
+    <span className="px-2 py-0.5 rounded text-micro font-mono text-ink-mute border border-line">
+      ROUTINE {score.toFixed(2)}
     </span>
   );
 };
@@ -289,7 +292,7 @@ const EventRow = React.memo(
     return (
       <div
         onClick={() => onClick(e)}
-        className="p-3 rounded-lg bg-raised/60 border border-cyan-500/15 hover:border-accent/50 cursor-pointer transition-all hover:bg-raised/90 group glass-panel-hover"
+        className="p-3 rounded-lg bg-raised/60 border border-line hover:border-accent/50 cursor-pointer transition-all hover:bg-raised/90 group glass-panel-hover"
       >
         <div className="flex items-center justify-between mb-1.5 text-micro">
           <div className="flex items-center gap-1.5 flex-wrap">
@@ -303,8 +306,8 @@ const EventRow = React.memo(
               <span
                 className={`px-1.5 py-0.5 rounded border font-extrabold text-micro ${
                   fd.option_type === 'CALL'
-                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    ? 'bg-positive/10 text-positive border-positive/30'
+                    : 'bg-negative/10 text-negative border-negative/30'
                 }`}
               >
                 {fd.option_type}
@@ -314,28 +317,28 @@ const EventRow = React.memo(
               <span
                 className={`px-1.5 py-0.5 rounded border font-extrabold text-micro ${
                   fd.eps_surprise_pct >= 0
-                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    ? 'bg-positive/10 text-positive border-positive/30'
+                    : 'bg-negative/10 text-negative border-negative/30'
                 }`}
               >
                 EPS {formatPercent(fd.eps_surprise_pct, { decimals: 1, signed: true })}
               </span>
             )}
             {cd.funding_rate !== undefined && (
-              <span className="px-1.5 py-0.5 rounded border border-purple-500/40 bg-purple-500/20 text-purple-300 font-extrabold text-micro">
+              <span className="px-1.5 py-0.5 rounded border border-line-accent bg-accent-dim text-accent font-extrabold text-micro">
                 {formatPercent(cd.funding_rate, { from: 'ratio', decimals: 4 })} RATE
               </span>
             )}
             {sourceName && (
               <span className="text-ink-dim font-medium">
-                via <span className="text-cyan-400 font-bold">{sourceName}</span>
+                via <span className="text-accent font-bold">{sourceName}</span>
               </span>
             )}
           </div>
           {getScoreBadge(e.anomaly_score)}
         </div>
 
-        <p className="text-xs text-ink font-sans font-semibold line-clamp-2 group-hover:text-white transition-colors leading-snug">
+        <p className="text-xs text-ink font-sans font-semibold line-clamp-2 group-hover:text-ink transition-colors leading-snug">
           {title}
         </p>
 
@@ -347,7 +350,7 @@ const EventRow = React.memo(
 
         <div className="mt-2 flex items-center justify-between text-micro text-ink-dim pt-1 border-t border-line/60">
           <span>
-            Entity: <span className="text-amber-300 font-bold">{entityName}</span>
+            Entity: <span className="text-caution font-bold">{entityName}</span>
           </span>
           <span>
             <ClockTime value={e.occurred_at} />
@@ -364,13 +367,13 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
   const trail = c.evidence_trail || [];
 
   return (
-    <div className="p-3 rounded-lg bg-raised/80 border border-amber-500/20 hover:border-amber-400/60 transition-all space-y-1.5">
+    <div className="p-3 rounded-lg bg-raised/80 border border-caution/30 hover:border-caution/30 transition-all space-y-1.5">
       <div className="flex items-center justify-between">
-        <span className="font-bold text-amber-400 uppercase text-xs flex items-center gap-1.5">
+        <span className="font-semibold text-caution text-xs flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping" />
-          RULE: {c.rule_name}
+          Rule: {c.rule_name}
         </span>
-        <span className="px-2 py-0.5 rounded text-micro font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+        <span className="px-2 py-0.5 rounded text-micro font-bold bg-caution/10 text-caution border border-caution/30">
           TIER {c.alert_tier}
         </span>
       </div>
@@ -385,7 +388,7 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
         <div className="pt-1">
           <button
             onClick={() => setShowEvidence(!showEvidence)}
-            className="text-micro text-cyan-400 hover:text-cyan-300 font-bold flex items-center gap-1 cursor-pointer"
+            className="text-micro text-accent hover:text-accent font-bold flex items-center gap-1 cursor-pointer"
           >
             <IconChevronDown
               className={`transition-transform ${showEvidence ? '' : '-rotate-90'}`}
@@ -394,9 +397,9 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
             <span className="text-ink-dim font-normal">({trail.length} signals)</span>
           </button>
           {showEvidence && (
-            <div className="mt-1.5 p-2 bg-page/80 rounded border border-cyan-500/20 space-y-1 text-micro">
-              <span className="text-cyan-300 font-bold block mb-1">
-                EVIDENCE TRAIL (SWARM FUSION):
+            <div className="mt-1.5 p-2 bg-page/80 rounded border border-line space-y-1 text-micro">
+              <span className="text-accent font-bold block mb-1">
+                Evidence from the AI analysts:
               </span>
               {trail.map((item, idx) => (
                 <div
@@ -406,13 +409,13 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
                   <span className="text-ink font-bold">{item.agent_name}</span>
                   <span className="text-ink-dim">
                     Dir:{' '}
-                    <span className="text-amber-300 font-bold">{item.direction || 'neutral'}</span>{' '}
+                    <span className="text-caution font-bold">{item.direction || 'neutral'}</span>{' '}
                     | Score:{' '}
-                    <span className="text-emerald-400 font-bold">
+                    <span className="text-positive font-bold">
                       {(item.conviction ?? item.score ?? 0).toFixed(2)}
                     </span>{' '}
                     | Weight:{' '}
-                    <span className="text-cyan-400">{(item.weight ?? 1.0).toFixed(2)}</span>
+                    <span className="text-accent">{(item.weight ?? 1.0).toFixed(2)}</span>
                   </span>
                 </div>
               ))}
@@ -438,7 +441,7 @@ export default function IntelligenceFeed() {
   const [scenarioStatus, setScenarioStatus] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedEvent, setSelectedEvent] = useState<NormalizedEvent | null>(null);
-  const [fullEventDetail, setFullEventDetail] = useState<any | null>(null);
+  const [fullEventDetail, setFullEventDetail] = useState<unknown>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState<boolean>(false);
 
   // Real-time WebSocket Live Feed connection
@@ -526,7 +529,7 @@ export default function IntelligenceFeed() {
     searchQuery,
   ]);
 
-  const mainTabs = [
+  const mainTabs: { id: typeof activeTab; label: string; count: number }[] = [
     { id: 'events', label: 'Events', count: sortedEvents.length },
     { id: 'scenarios', label: 'Scenarios', count: scenarios?.length || 0 },
     { id: 'correlations', label: 'Correlations', count: correlations?.length || 0 },
@@ -614,7 +617,7 @@ export default function IntelligenceFeed() {
   return (
     <div className="space-y-4 max-w-[1600px] mx-auto font-sans">
       {/* Header Bar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 bg-raised border border-cyan-500/20 rounded-xl shadow-panel">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 bg-raised border border-line rounded-xl shadow-panel">
         <div>
           {/* The page already carries the title. This was a second <h1> with a
               louder version of the same words directly beneath the first -- two
@@ -632,7 +635,7 @@ export default function IntelligenceFeed() {
             placeholder="Search events, tickers, entities..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-page border border-line text-xs text-ink focus:outline-none focus:border-cyan-500/60 font-mono w-48 md:w-64"
+            className="px-3 py-1.5 rounded-lg bg-page border border-line text-xs text-ink focus:outline-none focus:border-line-accent font-mono w-48 md:w-64"
           />
         </div>
       </div>
@@ -643,15 +646,16 @@ export default function IntelligenceFeed() {
           {mainTabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
+              onClick={() => setActiveTab(tab.id)}
+              aria-pressed={activeTab === tab.id}
               className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
                 activeTab === tab.id
-                  ? 'bg-cyan-500/20 text-accent border border-cyan-500/40 shadow-panel'
+                  ? 'bg-accent-dim text-accent border border-line-accent shadow-panel'
                   : 'bg-raised/60 text-ink-dim border border-line hover:text-ink'
               }`}
             >
               {tab.label}
-              <span className="px-1.5 py-0.2 rounded bg-page text-micro font-mono text-cyan-300 font-bold border border-cyan-500/20">
+              <span className="px-1.5 py-0.2 rounded bg-page text-micro font-mono text-accent font-bold border border-line">
                 {tab.count}
               </span>
             </button>
@@ -665,9 +669,10 @@ export default function IntelligenceFeed() {
               <button
                 key={d.id}
                 onClick={() => setSelectedDomain(d.id)}
+                aria-pressed={selectedDomain === d.id}
                 className={`px-2.5 py-1 rounded transition-colors cursor-pointer font-bold ${
                   selectedDomain === d.id
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    ? 'bg-accent-dim text-accent border border-line-accent'
                     : 'text-ink-dim hover:text-ink hover:bg-raised'
                 }`}
               >
@@ -684,9 +689,10 @@ export default function IntelligenceFeed() {
               <button
                 key={status}
                 onClick={() => setScenarioStatus(status)}
+                aria-pressed={scenarioStatus === status}
                 className={`px-2 py-0.5 rounded uppercase font-bold cursor-pointer ${
                   scenarioStatus === status
-                    ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                    ? 'bg-accent-dim text-accent border border-line-accent'
                     : 'text-ink-dim hover:text-ink'
                 }`}
               >
@@ -729,26 +735,26 @@ export default function IntelligenceFeed() {
               <div
                 key={s.scenario_id}
                 onClick={() => setSelectedScenario(s)}
-                className="p-4 rounded-xl bg-[#0d0a18] border border-purple-500/20 hover:border-purple-500/60 transition-all cursor-pointer space-y-2 group glass-panel-hover font-mono"
+                className="p-4 rounded-xl bg-inset border border-line hover:border-line-accent transition-all cursor-pointer space-y-2 group glass-panel-hover font-mono"
               >
                 <div className="flex items-center justify-between text-micro">
-                  <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 font-bold uppercase border border-purple-500/40">
+                  <span className="px-2 py-0.5 rounded bg-accent-dim text-accent font-bold uppercase border border-line-accent">
                     {s.status || 'HYPOTHESIS'}
                   </span>
-                  <span className="text-emerald-400 font-bold">
+                  <span className="text-positive font-bold">
                     CONFIDENCE: {s.confidence_overall}%
                   </span>
                 </div>
-                <h3 className="text-xs font-bold text-ink group-hover:text-purple-300 transition-colors font-sans line-clamp-2 leading-snug">
+                <h3 className="text-xs font-bold text-ink group-hover:text-accent transition-colors font-sans line-clamp-2 leading-snug">
                   {s.headline}
                 </h3>
                 <p className="text-micro text-ink-dim font-sans line-clamp-2 leading-tight">
                   {s.narrative_summary}
                 </p>
-                <div className="pt-2 flex items-center justify-between text-micro text-ink-dim border-t border-purple-500/10">
+                <div className="pt-2 flex items-center justify-between text-micro text-ink-dim border-t border-line">
                   <span>
                     Entity:{' '}
-                    <span className="text-amber-300 font-bold">
+                    <span className="text-caution font-bold">
                       {s.primary_entity_name || 'Multi-Entity'}
                     </span>
                   </span>
@@ -785,7 +791,7 @@ export default function IntelligenceFeed() {
             className="bg-raised border border-accent/40 rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
             {...eventDialog.panelProps}
           >
-            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-3">
+            <div className="flex items-center justify-between border-b border-line pb-3">
               <div className="flex items-center gap-2">
                 <span
                   className={`px-2 py-0.5 rounded text-micro font-bold border ${getDomainMeta(selectedEvent.type).badgeStyle}`}
@@ -799,7 +805,7 @@ export default function IntelligenceFeed() {
                   setSelectedEvent(null);
                   setFullEventDetail(null);
                 }}
-                className="text-ink-dim hover:text-white text-sm font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
+                className="text-ink-dim hover:text-ink text-sm font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
               >
                 CLOSE
               </button>
@@ -807,8 +813,8 @@ export default function IntelligenceFeed() {
 
             <div className="space-y-3 text-xs">
               <div>
-                <span className="text-ink-dim block mb-0.5">EVENT HEADLINE:</span>
-                <p className="text-white font-bold font-sans text-sm">
+                <span className="text-ink-dim block mb-0.5">Event headline:</span>
+                <p className="text-ink font-bold font-sans text-sm">
                   {formatEnglishHeadline(selectedEvent)}
                 </p>
               </div>
@@ -816,7 +822,7 @@ export default function IntelligenceFeed() {
               {selectedEvent.summary && (
                 <div>
                   <span className="text-ink-dim block mb-0.5">Summary</span>
-                  <p className="text-ink font-sans text-xs bg-page p-3 rounded-lg border border-cyan-500/20 leading-relaxed">
+                  <p className="text-ink font-sans text-xs bg-page p-3 rounded-lg border border-line leading-relaxed">
                     {selectedEvent.summary}
                   </p>
                 </div>
@@ -834,20 +840,20 @@ export default function IntelligenceFeed() {
 
               <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-lg border border-line">
                 <div>
-                  <span className="text-ink-dim">EVENT ID:</span>{' '}
-                  <span className="text-cyan-400 font-bold block truncate">
+                  <span className="text-ink-dim">Event ID:</span>{' '}
+                  <span className="text-accent font-bold block truncate">
                     {selectedEvent.event_id}
                   </span>
                 </div>
                 <div>
                   <span className="text-ink-dim">SOURCE:</span>{' '}
-                  <span className="text-cyan-400 font-bold block">
+                  <span className="text-accent font-bold block">
                     {getCleanSource(selectedEvent) || 'unattributed'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
-                  <span className="text-amber-400 font-bold block">
+                  <span className="text-ink-dim">Anomaly score:</span>{' '}
+                  <span className="text-caution font-bold block">
                     {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
@@ -858,8 +864,8 @@ export default function IntelligenceFeed() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">PRIMARY ENTITY:</span>{' '}
-                  <span className="text-emerald-400 font-bold block">
+                  <span className="text-ink-dim">Primary entity:</span>{' '}
+                  <span className="text-positive font-bold block">
                     {selectedEvent.primary_entity_name ||
                       selectedEvent.entity_name ||
                       selectedEvent.primary_entity?.name ||
@@ -868,7 +874,7 @@ export default function IntelligenceFeed() {
                 </div>
                 <div>
                   <span className="text-ink-dim">REGION:</span>{' '}
-                  <span className="text-purple-400 font-bold block">
+                  <span className="text-accent font-bold block">
                     {selectedEvent.region || 'GLOBAL'}
                   </span>
                 </div>
@@ -876,11 +882,11 @@ export default function IntelligenceFeed() {
 
               {/* Full JSON Payload from TimescaleDB */}
               <div>
-                <span className="text-cyan-400 font-bold block mb-1">
+                <span className="text-accent font-bold block mb-1">
                   DEEP DATABASE JSON PAYLOAD ({isLoadingDetail ? 'FETCHING...' : 'LIVE'}):
                 </span>
                 {isLoadingDetail ? (
-                  <div className="p-4 bg-page rounded border border-cyan-500/20 text-ink-dim text-center animate-pulse">
+                  <div className="p-4 bg-page rounded border border-line text-ink-dim text-center animate-pulse">
                     Querying Hypertable event payload...
                   </div>
                 ) : (
@@ -897,7 +903,7 @@ export default function IntelligenceFeed() {
                   setSelectedEvent(null);
                   setFullEventDetail(null);
                 }}
-                className="w-full py-2 bg-raised text-accent border border-cyan-500/30 rounded-lg text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
+                className="w-full py-2 bg-raised text-accent border border-line rounded-lg text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
               >
                 Close
               </button>
@@ -913,68 +919,68 @@ export default function IntelligenceFeed() {
           {...scenarioDialog.overlayProps}
         >
           <div
-            className="bg-[#0c0914] border border-purple-500/50 rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
+            className="bg-inset border border-line-accent rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
             {...scenarioDialog.panelProps}
           >
-            <div className="flex items-center justify-between border-b border-purple-500/30 pb-3">
+            <div className="flex items-center justify-between border-b border-line pb-3">
               <div className="flex items-center gap-2">
                 <span className="text-xl">
                   <IconModel className="inline-block shrink-0" />
                 </span>
-                <span className="text-xs font-bold text-purple-300 uppercase tracking-wider">
+                <span className="text-xs font-semibold text-accent">
                   Scenario review
                 </span>
               </div>
               <button
                 onClick={() => setSelectedScenario(null)}
-                className="text-ink-dim hover:text-white text-sm font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
+                className="text-ink-dim hover:text-ink text-sm font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
               >
                 CLOSE
               </button>
             </div>
 
             <div className="space-y-3 text-xs">
-              <div className="flex items-center justify-between bg-purple-950/40 p-3 rounded-lg border border-purple-500/30">
+              <div className="flex items-center justify-between bg-accent-dim p-3 rounded-lg border border-line">
                 <div>
-                  <span className="text-ink-dim block text-micro">SCENARIO STATUS:</span>
-                  <span className="text-purple-300 font-bold text-sm">
+                  <span className="text-ink-dim block text-micro">Scenario status:</span>
+                  <span className="text-accent font-bold text-sm">
                     {selectedScenario.status || 'HYPOTHESIS'}
                   </span>
                 </div>
                 <div className="text-right">
-                  <span className="text-ink-dim block text-micro">CONFIDENCE SCORE:</span>
-                  <span className="text-emerald-400 font-extrabold text-sm">
+                  <span className="text-ink-dim block text-micro">Confidence score:</span>
+                  <span className="text-positive font-extrabold text-sm">
                     {selectedScenario.confidence_overall}%
                   </span>
                 </div>
               </div>
 
               <div>
-                <span className="text-purple-400 font-bold block mb-1">HEADLINE:</span>
-                <h3 className="text-sm font-bold text-white font-sans">
+                <span className="text-accent font-bold block mb-1">HEADLINE:</span>
+                <h3 className="text-sm font-bold text-ink font-sans">
                   {selectedScenario.headline}
                 </h3>
               </div>
 
               {selectedScenario.primary_entity_name && (
                 <div>
-                  <span className="text-ink-dim block mb-0.5">PRIMARY ENTITY:</span>
-                  <span className="text-amber-300 font-bold">
+                  <span className="text-ink-dim block mb-0.5">Primary entity:</span>
+                  <span className="text-caution font-bold">
                     {selectedScenario.primary_entity_name}
                   </span>
                 </div>
               )}
 
               <div>
-                <span className="text-ink-dim block mb-1">STRATEGIC SIGNIFICANCE:</span>
-                <p className="text-ink bg-page p-3 rounded border border-purple-500/20 leading-relaxed font-sans">
+                <span className="text-ink-dim block mb-1">Strategic significance:</span>
+                <p className="text-ink bg-page p-3 rounded border border-line leading-relaxed font-sans">
                   {selectedScenario.significance}
                 </p>
               </div>
 
               {selectedScenario.confidence_rationale && (
                 <div>
-                  <span className="text-ink-dim block mb-1">CONFIDENCE RATIONALE:</span>
+                  <span className="text-ink-dim block mb-1">Confidence rationale:</span>
                   <p className="text-ink-dim bg-page p-3 rounded border border-line text-micro leading-relaxed">
                     {selectedScenario.confidence_rationale}
                   </p>
@@ -983,10 +989,10 @@ export default function IntelligenceFeed() {
 
               {selectedScenarioTrail.length > 0 && (
                 <div>
-                  <span className="text-cyan-400 font-bold block mb-1">
-                    EVIDENCE TRAIL (SWARM FUSION):
+                  <span className="text-accent font-bold block mb-1">
+                    Evidence from the AI analysts:
                   </span>
-                  <div className="p-2.5 bg-page rounded border border-cyan-500/20 space-y-1 text-micro">
+                  <div className="p-2.5 bg-page rounded border border-line space-y-1 text-micro">
                     {selectedScenarioTrail.map((item, idx) => (
                       <div
                         key={idx}
@@ -995,11 +1001,11 @@ export default function IntelligenceFeed() {
                         <span className="text-ink font-bold">{item.agent_name}</span>
                         <span className="text-ink-dim">
                           Dir:{' '}
-                          <span className="text-amber-300 font-bold">
+                          <span className="text-caution font-bold">
                             {item.direction || 'neutral'}
                           </span>{' '}
                           | Conviction:{' '}
-                          <span className="text-emerald-400 font-bold">
+                          <span className="text-positive font-bold">
                             {(item.conviction ?? item.score ?? 0).toFixed(2)}
                           </span>
                         </span>
@@ -1013,9 +1019,9 @@ export default function IntelligenceFeed() {
             <div className="pt-2">
               <button
                 onClick={() => setSelectedScenario(null)}
-                className="w-full py-2 bg-purple-950/60 text-purple-300 border border-purple-500/40 rounded-lg text-xs font-bold hover:bg-purple-900/60 transition-colors cursor-pointer"
+                className="w-full py-2 bg-accent-dim text-accent border border-line-accent rounded-lg text-xs font-bold hover:bg-accent-dim transition-colors cursor-pointer"
               >
-                DISMISS REVIEW
+                Dismiss review
               </button>
             </div>
           </div>

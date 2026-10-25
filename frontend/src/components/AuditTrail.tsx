@@ -96,6 +96,23 @@ const VERDICT: Record<
   VERIFICATION_ERROR: { tone: 'text-negative', Icon: IconAlert, title: 'Could not verify' },
 };
 
+/** `EXECUTE_BUY_ORDER` -> "Execute buy order". The raw code stays on hover. */
+export function actionWords(code: string): string {
+  const w = code.replace(/[_.]+/g, ' ').trim().toLowerCase();
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}
+
+/** A resource naming hundreds of ids ("11505,11506,...") as a count and range. */
+export function compactIds(id: string): string {
+  const parts = id.split(',').map((p) => p.trim()).filter(Boolean);
+  if (parts.length <= 3) return id;
+  const nums = parts.map(Number);
+  if (nums.every(Number.isFinite)) {
+    return `${parts.length} items (${Math.min(...nums)}–${Math.max(...nums)})`;
+  }
+  return `${parts.slice(0, 2).join(', ')} and ${parts.length - 2} more`;
+}
+
 export default function AuditTrail() {
   const [offset, setOffset] = React.useState(0);
   const [verify, setVerify] = React.useState<VerifyResponse | null>(null);
@@ -237,14 +254,21 @@ export default function AuditTrail() {
                   <td className="px-3 py-2 font-mono text-ink-dim">
                     <ClockTime value={e.timestamp} />
                   </td>
-                  <td className="px-3 py-2 text-ink">{e.actor || ABSENT}</td>
-                  <td className="px-3 py-2 text-ink-dim">{e.action || ABSENT}</td>
+                  <td className="px-3 py-2 text-ink">
+                    {!e.actor || e.actor === 'unknown' ? 'the system' : e.actor.replace(/^session:/, '')}
+                  </td>
+                  <td className="px-3 py-2 text-ink-dim" title={e.action ?? undefined}>
+                    {e.action ? actionWords(e.action) : ABSENT}
+                  </td>
                   <td className="px-3 py-2 text-ink-dim">
                     {e.resource_type ? (
                       <span>
-                        {e.resource_type}
+                        {actionWords(e.resource_type)}
                         {e.resource_id ? (
-                          <span className="font-mono text-ink-mute"> {e.resource_id}</span>
+                          <span className="font-mono text-ink-mute" title={e.resource_id}>
+                            {' '}
+                            {compactIds(e.resource_id)}
+                          </span>
                         ) : null}
                       </span>
                     ) : (

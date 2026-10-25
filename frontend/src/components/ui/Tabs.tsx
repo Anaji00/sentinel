@@ -15,7 +15,10 @@ interface TabsProps {
 
 export const Tabs: React.FC<TabsProps> = ({ tabs, activeTab, onChange, className = '' }) => {
   return (
+    // A tab list a screen reader can follow: which tab is selected was shown
+    // only by colour, so the selected one announced the same as the rest.
     <div
+      role="tablist"
       className={`flex items-center gap-1 p-1 rounded-lg bg-page/60 border border-line/60 ${className}`}
     >
       {tabs.map((tab) => {
@@ -23,10 +26,13 @@ export const Tabs: React.FC<TabsProps> = ({ tabs, activeTab, onChange, className
         return (
           <button
             key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
             onClick={() => onChange(tab.id)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono transition-all duration-200 cursor-pointer ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-200 cursor-pointer ${
               isActive
-                ? 'bg-cyan-950/80 text-accent border border-accent/30 shadow-panel'
+                ? 'bg-accent-dim text-accent border border-accent/30 shadow-panel'
                 : 'text-ink-dim hover:text-ink hover:bg-raised/40 border border-transparent'
             }`}
           >

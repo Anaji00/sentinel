@@ -33,22 +33,32 @@ interface Command {
 }
 
 const PAGES: Command[] = [
-  { id: 'p:/', label: 'Command Center', kind: 'page', href: '/' },
-  { id: 'p:/map', label: 'Global Map', kind: 'page', href: '/map' },
-  { id: 'p:/signals', label: 'Trading Signals', kind: 'page', href: '/signals' },
-  { id: 'p:/predictions', label: 'Stock Predictions', kind: 'page', href: '/predictions' },
-  { id: 'p:/ticker', label: 'Ticker Inspector', kind: 'page', href: '/ticker' },
-  { id: 'p:/charts', label: 'Market Charts', kind: 'page', href: '/charts' },
-  { id: 'p:/options', label: 'Options Flow', kind: 'page', href: '/options' },
-  { id: 'p:/flow', label: 'Dark Pool & Sweeps', kind: 'page', href: '/flow' },
-  { id: 'p:/crypto', label: 'Crypto & Perps', kind: 'page', href: '/crypto' },
-  { id: 'p:/macro', label: 'Macro Matrix', kind: 'page', href: '/macro' },
-  { id: 'p:/filings', label: 'Filings & 13F', kind: 'page', href: '/filings' },
-  { id: 'p:/intelligence', label: 'Intelligence Feed', kind: 'page', href: '/intelligence' },
-  { id: 'p:/osint', label: 'OSINT Matrix', kind: 'page', href: '/osint' },
-  { id: 'p:/agents', label: 'Agent Swarm', kind: 'page', href: '/agents' },
+  { id: 'p:/', label: 'Home', kind: 'page', href: '/' },
+  { id: 'p:/map', label: 'World Map', kind: 'page', href: '/map' },
+  { id: 'p:/signals', label: 'Trade Signals', kind: 'page', href: '/signals' },
+  { id: 'p:/board', label: 'Signal Board', kind: 'page', href: '/board' },
+  { id: 'p:/predictions', label: 'Stock Calls', kind: 'page', href: '/predictions' },
+  { id: 'p:/ticker', label: 'Look Up a Stock', kind: 'page', href: '/ticker' },
+  { id: 'p:/book', label: 'Portfolio & Track Record', kind: 'page', href: '/book' },
+  { id: 'p:/charts', label: 'Markets & Economy', kind: 'page', href: '/charts' },
+  { id: 'p:/options', label: 'Options & Flow', kind: 'page', href: '/options' },
+  { id: 'p:/flow', label: 'Big-Money Flow', kind: 'page', href: '/options?view=flow' },
+  { id: 'p:/crypto', label: 'Crypto', kind: 'page', href: '/crypto' },
+  { id: 'p:/macro', label: 'The Economy', kind: 'page', href: '/charts?view=economy' },
+  { id: 'p:/filings', label: 'Filings & Fund Holdings', kind: 'page', href: '/filings' },
+  { id: 'p:/watch', label: 'Surveillance Map', hint: 'Who is watching your town', kind: 'page', href: '/watch' },
+  { id: 'p:/watch#accountability', label: 'Surveillance: Accountability', kind: 'page', href: '/watch#accountability' },
+  { id: 'p:/watch#money', label: 'Surveillance: Follow the Money', kind: 'page', href: '/watch#money' },
+  { id: 'p:/watch#protect', label: 'Protect Yourself (privacy plan)', kind: 'page', href: '/watch#protect' },
+  { id: 'p:/intelligence', label: 'News & Intel', kind: 'page', href: '/intelligence' },
+  { id: 'p:/osint', label: 'Open-Source Intel', kind: 'page', href: '/intelligence?view=osint' },
+  { id: 'p:/agents', label: 'AI Analysts', kind: 'page', href: '/agents' },
   { id: 'p:/operations', label: 'Operations', kind: 'page', href: '/operations' },
-  { id: 'p:/methodology', label: 'Methodology', kind: 'page', href: '/methodology' },
+  { id: 'p:/cases', label: 'Investigations: Cases', kind: 'page', href: '/cases' },
+  { id: 'p:/reports', label: 'Investigations: Briefs', kind: 'page', href: '/cases?view=briefs' },
+  { id: 'p:/strategies', label: 'Research: Backtests', kind: 'page', href: '/strategies' },
+  { id: 'p:/attribution', label: 'Research: What Drives Signals', kind: 'page', href: '/strategies?view=drivers' },
+  { id: 'p:/methodology', label: 'How It Works', kind: 'page', href: '/methodology' },
 ];
 
 const KIND_ICON: Record<Kind, React.ComponentType<{ className?: string }>> = {
@@ -173,7 +183,7 @@ export function CommandPalette() {
       role="presentation"
     >
       <div
-        className="w-full max-w-xl rounded-xl border border-line-strong bg-[#0d1017] shadow-2xl overflow-hidden"
+        className="w-full max-w-xl rounded-xl border border-line-strong bg-inset overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -222,11 +232,11 @@ export function CommandPalette() {
                   onMouseEnter={() => setCursor(i)}
                   onClick={() => go(cmd)}
                   className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
-                    active ? 'bg-cyan-500/10 text-cyan-100' : 'text-ink-dim hover:bg-overlay/50'
+                    active ? 'bg-accent-dim text-cyan-100' : 'text-ink-dim hover:bg-overlay/50'
                   }`}
                 >
                   <Icon
-                    className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-300' : 'text-ink-mute'}`}
+                    className={`h-4 w-4 shrink-0 ${active ? 'text-accent' : 'text-ink-mute'}`}
                   />
                   <span className="flex-1 truncate">{cmd.label}</span>
                   {cmd.hint && (

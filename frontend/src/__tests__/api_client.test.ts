@@ -16,13 +16,14 @@ describe('Frontend API Client (api.ts)', () => {
     // The BFF at /api/proxy is the only path that verifies the session cookie
     // and refuses to attach the operator's master key. A component fetching
     // /api/v1/... directly reaches a Next.js origin with no such route.
-    const realWindow = (globalThis as any).window;
-    (globalThis as any).window = { location: { host: 'sentinel.local' } };
+    const g = globalThis as { window?: unknown };
+    const realWindow = g.window;
+    g.window = { location: { host: 'sentinel.local' } };
     try {
       expect(getBaseUrl()).toBe('/api/proxy/api/v1');
     } finally {
-      if (realWindow === undefined) delete (globalThis as any).window;
-      else (globalThis as any).window = realWindow;
+      if (realWindow === undefined) delete g.window;
+      else g.window = realWindow;
     }
   });
 
@@ -89,19 +90,19 @@ describe('fetcher failure reporting', () => {
 
   it('separates "no such thing" from "could not ask"', async () => {
     failWith(404);
-    const missing = await fetcher('/events/detail/nope').catch((e) => e as ApiError);
+    const missing = await fetcher<never>('/events/detail/nope').catch((e) => e as ApiError);
     expect(missing.isMissing).toBe(true);
     expect(missing.isUnreachable).toBe(false);
 
     failWith(null);
-    const unreachable = await fetcher('/events/detail/nope').catch((e) => e as ApiError);
+    const unreachable = await fetcher<never>('/events/detail/nope').catch((e) => e as ApiError);
     expect(unreachable.isUnreachable).toBe(true);
     expect(unreachable.isMissing).toBe(false);
   });
 
   it('names an expired session as one', async () => {
     failWith(401);
-    const err = await fetcher('/portfolio/positions').catch((e) => e as ApiError);
+    const err = await fetcher<never>('/portfolio/positions').catch((e) => e as ApiError);
     expect(err.isUnauthenticated).toBe(true);
   });
 
@@ -129,7 +130,9 @@ describe('fetcher failure reporting', () => {
     vi.spyOn(apiClient, 'get').mockResolvedValue({
       data: { series: { BTCUSD: ticks } },
     } as never);
-    const out = await fetcher('/radar/market-series?symbols=BTC&limit=60');
+    const out = await fetcher<{ series: Record<string, unknown[]> }>(
+      '/radar/market-series?symbols=BTC&limit=60',
+    );
     expect(out.series.BTC).toEqual(ticks);
     expect(out.series.BTCUSDT).toEqual(ticks);
   });

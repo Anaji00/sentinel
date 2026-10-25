@@ -9,7 +9,7 @@ transfers or exchange liquidations) and transforming it into a standardized
 import json
 import logging
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, CryptoData, MarketMicrostructure
 from shared.models.events import ScoreAdjustment
@@ -32,7 +32,7 @@ from shared.utils.streaming_detectors import FALLBACK_MAX_SCORE
 from shared.utils.quiet_failures import swallowed, dropped
 # One definition, shared with the tradfi candle path: the two were
 # stamping the same kind of event by different rules.
-from shared.utils.candles import candle_observation_ts
+from shared.utils.candles import candle_observation_ts, window_words
 from shared.utils.event_identity import derive_event_id
 from shared.utils.feature_flags import FeatureFlagManager
 logger = logging.getLogger("enrichment.crypto")
@@ -422,7 +422,7 @@ class CryptoEnricher:
             
             tags = ["crypto", "spot_trade", asset.lower(), side.lower()]
             entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
-            headline = f"🐋 ML Outlier CRYPTO Trade ({side}): ${notional/1e6:.2f}M {asset} at ${price:,.2f}"
+            headline = f"🐋 Unusually large {asset} {side.lower()}: ${notional/1e6:.2f}M at ${price:,.2f}"
 
             await self.graph.producer.send(Topics.ONTOLOGY_PROPOSALS, {
                 "entity_id": asset,
@@ -572,7 +572,6 @@ class CryptoEnricher:
         mark_price = p.get("mark_price", 0.0)
         index_price = p.get("index_price", 0.0)
         basis_bps = p.get("basis_bps", 0.0)
-        next_funding_time = p.get("next_funding_time", 0)
 
         if mark_price <= 0 or index_price <= 0:
             return None
@@ -715,7 +714,8 @@ class CryptoEnricher:
             source_reliability=baseline_reliability(raw.source),
             primary_entity=Entity(id=asset, type=EntityType.INSTRUMENT, name=asset),
             headline=(
-                f"{asset} perp funding diverged {spread_bps:.1f} bps across venues "
+                f"{asset}: traders on two exchanges are paying different rates to hold bets "
+                f"({spread_bps / 100:.3f}% apart) "
                 f"(Binance {float(p.get('binance_funding_rate') or 0) * 100:.4f}% vs "
                 f"Bybit {float(p.get('bybit_funding_rate') or 0) * 100:.4f}%)"
             ),
@@ -914,8 +914,12 @@ class CryptoEnricher:
                 }, key=asset)
             
             entity = Entity(id=asset, type=EntityType.INSTRUMENT, name=asset)
-            direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
-            headline = f"{direction} Structural Anomaly: {asset} {tf}-min moved {price_change_pct*100:.2f}% (Range Vol: {volatility_pct*100:.2f}%) on ${notional/1e6:.1f}M vol"
+            rose = block["close"] >= block["open"]
+            headline = (
+                f"{'🟢' if rose else '🔴'} {asset} {'rose' if rose else 'fell'} {abs(price_change_pct) * 100:.2f}% "
+                f"in {window_words(tf)} on ${notional/1e6:.1f}M of trading "
+                f"(it swung {volatility_pct*100:.2f}% from low to high)"
+            )
     
             events.append(NormalizedEvent(
                 # One id per bar, not one per batch.
@@ -1225,11 +1229,11 @@ class CryptoEnricher:
         elif is_baseline:
             anomaly = 0.1
             tags = ["crypto", "liquidation", "baseline_data"]
-            headline = f"Standard Liquidation: ${notional:,.2f} {asset}"
+            headline = f"Forced sale of {asset} bets: ${notional:,.2f}"
         else:
             anomaly = min(1.0, notional / 10_000_000 * 0.4)
             tags = ["crypto", "liquidation", asset.lower(), side.lower()] + crypto_exposure_tags(asset)
-            headline = f"Massive Liquidation ({side}): ${notional/1e6:.1f}M {asset}"
+            headline = f"Forced sale of {asset} bets ({side.lower()}): ${notional/1e6:.1f}M"
             
             # Liquidation events are the strongest Hawkes excitation source:
             # crypto liquidation cascades → tradfi anomaly intensity spikes

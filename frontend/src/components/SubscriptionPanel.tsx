@@ -6,6 +6,7 @@ import { useTimeZone } from './ui/TimeZoneContext';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { POLL } from './ui/DataProvider';
+import { LoadingLines } from './ui/Skeleton';
 
 /** What the gateway reports about the signed-in account's entitlement. */
 interface BillingStatus {
@@ -88,10 +89,10 @@ export default function SubscriptionPanel() {
   };
 
   if (error && !status) {
-    return <p className="text-sm text-rose-400">{error}</p>;
+    return <p className="text-sm text-negative">{error}</p>;
   }
   if (!status) {
-    return <p className="text-sm text-ink-dim">Loading your plan…</p>;
+    return <LoadingLines />;
   }
 
   // A renewal date is a date in someone's calendar, so it renders in the zone
@@ -115,7 +116,7 @@ export default function SubscriptionPanel() {
         <div className="flex items-center gap-3">
           <span
             className={`text-xs font-mono font-bold uppercase tracking-widest px-2 py-1 rounded ${
-              status.has_pro ? 'bg-emerald-500/15 text-emerald-400' : 'bg-slate-600/30 text-ink-dim'
+              status.has_pro ? 'bg-positive/10 text-positive' : 'bg-slate-600/30 text-ink-dim'
             }`}
           >
             {status.has_pro ? 'Pro' : 'Free'}
@@ -124,7 +125,7 @@ export default function SubscriptionPanel() {
             <span className="text-xs text-ink-dim font-mono">Renews {renews}</span>
           )}
           {!status.has_pro && status.subscription_status === 'past_due' && (
-            <span className="text-xs text-amber-400 font-mono">Payment retrying</span>
+            <span className="text-xs text-caution font-mono">Payment retrying</span>
           )}
         </div>
 
@@ -143,7 +144,7 @@ export default function SubscriptionPanel() {
           </ul>
         )}
 
-        {error && <p className="text-sm text-rose-400">{error}</p>}
+        {error && <p className="text-sm text-negative">{error}</p>}
 
         <div className="flex flex-wrap gap-3 pt-1 items-center">
           {!status.has_pro && status.billing_enabled && (

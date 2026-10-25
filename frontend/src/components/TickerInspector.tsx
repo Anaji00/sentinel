@@ -29,10 +29,14 @@ import { ClockTime } from './ui/ClockTime';
 import { TickerEvidence } from './ConvergingEvidence';
 import { TickerModelCard } from './ModelRanking';
 import { PositioningCard } from './PositioningCard';
+import { TickerSignalMatrix } from './SignalBoard';
+import { StockNews } from './StockNews';
+import { Tabs } from './ui/Tabs';
 import { POLL } from './ui/DataProvider';
 import { IconBlocked, IconCheck, IconDown, IconSignal, IconUp } from './ui/icons';
 import { ABSENT, formatCurrency, formatNumber, isPresent } from '../lib/format';
 import type { CsvColumn } from '../lib/csv';
+import { LoadingLines } from './ui/Skeleton';
 
 const TIMEFRAMES = ['5m', '15m', '1h', '4h', '1d'] as const;
 
@@ -97,6 +101,15 @@ function Direction({ open, close }: { open: number; close: number }) {
   );
 }
 
+type TabId = 'happening' | 'signals' | 'owners' | 'options';
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'happening', label: "What's happening" },
+  { id: 'signals', label: 'Signals & model' },
+  { id: 'owners', label: 'Who owns & trades it' },
+  { id: 'options', label: 'Options' },
+];
+
 export default function TickerInspector() {
   // ?symbol=NVDA opens the inspector on that name, so every ticker on the
   // stock pages links straight here instead of being retyped.
@@ -112,6 +125,9 @@ export default function TickerInspector() {
     setTicker(linked);
   }
   const [timeframe, setTimeframe] = React.useState<string>('1h');
+  // One story at a time: everything on a stock in one long scroll read as a
+  // data dump; four tabs answer the four questions people actually ask.
+  const [tab, setTab] = React.useState<TabId>('happening');
 
   const q = ticker ? encodeURIComponent(ticker) : null;
 
@@ -134,15 +150,15 @@ export default function TickerInspector() {
   const rows = candles.data?.candles ?? [];
 
   return (
-    <Card noPadding className="flex h-full flex-col overflow-hidden">
+    <Card noPadding className="flex flex-col h-auto! overflow-visible!">
       <div className="panel-header shrink-0">
         <div className="min-w-0">
           <h2 className="panel-title flex items-center gap-1.5">
             <IconSignal />
-            Ticker inspector
+            {ticker ? `Everything on ${ticker}` : 'Look up a stock'}
           </h2>
           <p className="panel-subtitle">
-            Stored bars, institutional holdings and the covered-call gate, for one symbol
+            What&apos;s happening, what the signals say, who owns and trades it, and its options
           </p>
         </div>
         {rows.length > 0 && (
@@ -174,194 +190,246 @@ export default function TickerInspector() {
           disabled={!input.trim()}
           className="rounded-md border border-line px-2 py-1 text-micro font-medium text-ink-dim transition-colors enabled:cursor-pointer enabled:hover:border-line-strong enabled:hover:text-ink disabled:opacity-40"
         >
-          Inspect
+          Look up
         </button>
-        <span className="stat-label ml-2">Bars</span>
-        {TIMEFRAMES.map((t) => (
-          <button
-            key={t}
-            onClick={() => setTimeframe(t)}
-            aria-pressed={timeframe === t}
-            className={`cursor-pointer rounded-md border px-2 py-0.5 text-micro font-medium transition-colors ${
-              timeframe === t
-                ? 'border-line-accent bg-accent-dim text-accent'
-                : 'border-line text-ink-mute hover:text-ink-dim'
-            }`}
-          >
-            {t}
-          </button>
-        ))}
+        {ticker && (
+          <Tabs
+            className="ml-auto"
+            tabs={TABS.map((x) => ({ id: x.id, label: x.label }))}
+            activeTab={tab}
+            onChange={(id) => setTab(id as TabId)}
+          />
+        )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div>
         {!ticker ? (
-          <EmptyState
-            kind="empty"
-            title="No symbol selected"
-            detail="Enter a ticker to see the bars this platform has stored for it, who holds it, and whether a covered-call overlay clears its own gate."
-          />
+          <div className="space-y-4">
+            <EmptyState
+              kind="empty"
+              title="Pick a stock to look up"
+              detail="Type a ticker above, or start with one of these. You'll see its recent prices, which funds hold it, every signal the platform has seen on it, and the model's view."
+            />
+            <div className="flex flex-wrap justify-center gap-2 px-4">
+              {['SPY', 'NVDA', 'AAPL', 'MSFT', 'TSLA', 'AMZN', 'META', 'AXON', 'MSI', 'PLTR'].map(
+                (t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => {
+                      setInput(t);
+                      setTicker(t);
+                    }}
+                    className="symbol rounded-full border border-line bg-inset px-3 py-1 text-xs text-ink-dim hover:border-line-accent hover:text-ink"
+                  >
+                    {t}
+                  </button>
+                ),
+              )}
+            </div>
+          </div>
         ) : (
           <div className="space-y-3 px-3.5 py-3">
-            {/* ── evidence: every signal family that has seen this name ── */}
-            <TickerEvidence ticker={ticker} />
-            <TickerModelCard ticker={ticker} />
-            <PositioningCard ticker={ticker} />
-
-            {/* ── holdings ───────────────────────────────────────────── */}
-            <div className="space-y-1.5 rounded-lg border border-line bg-inset p-3">
-              <span className="stat-label">Institutional consensus</span>
-              {consensus.error ? (
-                <p className="text-micro text-ink-mute">
-                  {describeApiError(consensus.error) ?? 'Could not read 13F holdings.'}
-                </p>
-              ) : !consensus.data ? (
-                <p className="text-micro text-ink-mute">Reading filings…</p>
-              ) : consensus.data.total_prominent_holders === 0 ? (
-                <p className="text-micro text-ink-mute">
-                  No prominent filer in this platform&rsquo;s set holds {ticker}. That is a fact
-                  about the set, not about the company.
-                </p>
-              ) : (
-                <>
-                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                    <span
-                      className={`badge ${
-                        consensus.data.consensus_sentiment === 'ACCUMULATING'
-                          ? 'tone-positive'
-                          : consensus.data.consensus_sentiment === 'DISTRIBUTING'
-                            ? 'tone-negative'
-                            : 'tone-muted'
-                      }`}
-                    >
-                      {consensus.data.consensus_sentiment}
-                    </span>
-                    <span className="text-micro text-ink-mute">
-                      {formatNumber(consensus.data.total_prominent_holders, { decimals: 0 })}{' '}
-                      prominent{' '}
-                      {consensus.data.total_prominent_holders === 1 ? 'holder' : 'holders'}
-                      {/* Quarterly filings, and worth saying so: a 13F is a
+            {tab === 'happening' && (
+              <>
+                {/* ── what set it off, in the last three days ─────────── */}
+                <TickerEvidence ticker={ticker} />
+                <StockNews ticker={ticker} />
+              </>
+            )}
+            {tab === 'signals' && (
+              <>
+                <TickerModelCard ticker={ticker} />
+                <TickerSignalMatrix ticker={ticker} />
+              </>
+            )}
+            {tab === 'owners' && (
+              <>
+                <PositioningCard ticker={ticker} />
+                {/* ── holdings ───────────────────────────────────────────── */}
+                <div className="space-y-1.5 rounded-lg border border-line bg-inset p-3">
+                  <span className="stat-label">Institutional consensus</span>
+                  {consensus.error ? (
+                    <p className="text-micro text-ink-mute">
+                      {describeApiError(consensus.error) ?? 'Could not read 13F holdings.'}
+                    </p>
+                  ) : !consensus.data ? (
+                    <LoadingLines />
+                  ) : consensus.data.total_prominent_holders === 0 ? (
+                    <p className="text-micro text-ink-mute">
+                      No prominent filer in this platform&rsquo;s set holds {ticker}. That is a fact
+                      about the set, not about the company.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                        <span
+                          className={`badge ${
+                            consensus.data.consensus_sentiment === 'ACCUMULATING'
+                              ? 'tone-positive'
+                              : consensus.data.consensus_sentiment === 'DISTRIBUTING'
+                                ? 'tone-negative'
+                                : 'tone-muted'
+                          }`}
+                        >
+                          {consensus.data.consensus_sentiment}
+                        </span>
+                        <span className="text-micro text-ink-mute">
+                          {formatNumber(consensus.data.total_prominent_holders, { decimals: 0 })}{' '}
+                          prominent{' '}
+                          {consensus.data.total_prominent_holders === 1 ? 'holder' : 'holders'}
+                          {/* Quarterly filings, and worth saying so: a 13F is a
                           snapshot up to 45 days stale by the time it is filed. */}
-                      , from quarterly 13F filings
-                    </span>
-                  </div>
-                  <p className="text-micro text-ink-dim">
-                    {consensus.data.institutional_buyers.join(' · ')}
-                  </p>
-                </>
-              )}
-            </div>
+                          , from quarterly 13F filings
+                        </span>
+                      </div>
+                      <p className="text-micro text-ink-dim">
+                        {consensus.data.institutional_buyers.join(' · ')}
+                      </p>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
 
             {/* ── the overlay gate ───────────────────────────────────── */}
-            <div className="space-y-1.5 rounded-lg border border-line bg-inset p-3">
-              <span className="stat-label flex items-center gap-1.5">
-                {gated ? <IconBlocked /> : <IconCheck />}
-                Covered-call overlay
-              </span>
-              {overlay.error ? (
+            {tab === 'options' && (
+              <div className="space-y-1.5 rounded-lg border border-line bg-inset p-3">
+                <span className="stat-label flex items-center gap-1.5">
+                  {gated ? <IconBlocked /> : <IconCheck />}
+                  Earning extra by selling calls on shares you own
+                </span>
                 <p className="text-micro text-ink-mute">
-                  {describeApiError(overlay.error) ?? 'Could not evaluate the overlay.'}
+                  If you own {ticker}, you can sell someone the right to buy it from you at a higher price and keep the
+                  fee. We only suggest it when the fee is unusually rich.
                 </p>
-              ) : !overlay.data ? (
-                <p className="text-micro text-ink-mute">Evaluating…</p>
-              ) : gated ? (
-                // A considered no, not a failure. The endpoint returns the
-                // z-score that missed its own threshold, so the reason is
-                // quoted rather than summarised.
-                <p className="text-micro text-ink-dim">{overlay.data.message}</p>
-              ) : (
-                <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-micro sm:grid-cols-4">
-                  {(
-                    [
-                      ['Underlying', formatCurrency(overlay.data.underlying_price)],
-                      ['Strike', formatCurrency(overlay.data.strike)],
-                      ['Premium', formatCurrency(overlay.data.premium)],
+                {overlay.error ? (
+                  <p className="text-micro text-ink-mute">
+                    {describeApiError(overlay.error) ?? 'Could not evaluate the overlay.'}
+                  </p>
+                ) : !overlay.data ? (
+                  <p className="text-micro text-ink-mute">Checking…</p>
+                ) : gated ? (
+                  // A considered no, not a failure. The endpoint returns the
+                  // z-score that missed its own threshold, so the reason is
+                  // quoted rather than summarised.
+                  <p className="text-micro text-ink-dim" title={overlay.data.message}>
+                    {`Not worth it on ${ticker} right now: its options aren't paying enough extra to justify capping your gains.`}
+                  </p>
+                ) : (
+                  <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-micro sm:grid-cols-4">
+                    {(
                       [
-                        'Annualised',
-                        isPresent(overlay.data.annualized_yield_pct)
-                          ? `${formatNumber(overlay.data.annualized_yield_pct, { decimals: 1 })}%`
-                          : ABSENT,
-                      ],
-                    ] as const
-                  ).map(([label, value]) => (
-                    <React.Fragment key={label}>
-                      <dt className="text-ink-mute">{label}</dt>
-                      <dd className="text-right font-mono text-ink-dim">{value}</dd>
-                    </React.Fragment>
-                  ))}
-                </dl>
-              )}
-            </div>
-
-            {/* ── the bars ───────────────────────────────────────────── */}
-            <div className="space-y-1.5">
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="stat-label">Stored bars</span>
-                {candles.data && (
-                  <span className="text-micro text-ink-mute">
-                    {formatNumber(candles.data.count, { decimals: 0 })} at {candles.data.timeframe}{' '}
-                    {/* Where the bars came from. A cache read and a database
-                        read can differ in freshness and the endpoint says
-                        which it did. */}
-                    from {candles.data.source}
-                  </span>
+                        ['Stock price', formatCurrency(overlay.data.underlying_price)],
+                        ['Sell the right to buy at', formatCurrency(overlay.data.strike)],
+                        ['You collect', formatCurrency(overlay.data.premium)],
+                        [
+                          'As a yearly yield',
+                          isPresent(overlay.data.annualized_yield_pct)
+                            ? `${formatNumber(overlay.data.annualized_yield_pct, { decimals: 1 })}%`
+                            : ABSENT,
+                        ],
+                      ] as const
+                    ).map(([label, value]) => (
+                      <React.Fragment key={label}>
+                        <dt className="text-ink-mute">{label}</dt>
+                        <dd className="text-right font-mono text-ink-dim">{value}</dd>
+                      </React.Fragment>
+                    ))}
+                  </dl>
                 )}
               </div>
-              {candles.error ? (
-                <p className="text-micro text-ink-mute">
-                  {describeApiError(candles.error) ?? 'Could not read bars.'}
-                </p>
-              ) : !candles.data ? (
-                <p className="text-micro text-ink-mute">Reading bars…</p>
-              ) : rows.length === 0 ? (
-                <p className="text-micro text-ink-mute">
-                  Nothing stored for {ticker} at {timeframe}. The platform tracks a fixed universe;
-                  a symbol outside it has no bars rather than empty ones.
-                </p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-micro">
-                    <thead>
-                      <tr className="border-b border-line">
-                        <th className="stat-label px-2 py-1">Time</th>
-                        <th className="stat-label px-2 py-1 text-right">Open</th>
-                        <th className="stat-label px-2 py-1 text-right">High</th>
-                        <th className="stat-label px-2 py-1 text-right">Low</th>
-                        <th className="stat-label px-2 py-1 text-right">Close</th>
-                        <th className="stat-label px-2 py-1 text-right">Move</th>
-                        <th className="stat-label px-2 py-1 text-right">Volume</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((c) => (
-                        <tr key={c.ts} className="border-b border-line/60">
-                          <td className="whitespace-nowrap px-2 py-1 font-mono text-ink-mute">
-                            <ClockTime value={c.ts} seconds={false} withDate />
-                          </td>
-                          <td className="px-2 py-1 text-right font-mono text-ink-dim">
-                            {formatNumber(c.open)}
-                          </td>
-                          <td className="px-2 py-1 text-right font-mono text-ink-dim">
-                            {formatNumber(c.high)}
-                          </td>
-                          <td className="px-2 py-1 text-right font-mono text-ink-dim">
-                            {formatNumber(c.low)}
-                          </td>
-                          <td className="px-2 py-1 text-right font-mono text-ink">
-                            {formatNumber(c.close)}
-                          </td>
-                          <td className="px-2 py-1 text-right">
-                            <Direction open={c.open} close={c.close} />
-                          </td>
-                          <td className="px-2 py-1 text-right font-mono text-ink-mute">
-                            {formatNumber(c.volume, { decimals: 0 })}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+            )}
+
+            {/* ── the bars ───────────────────────────────────────────── */}
+            {tab === 'happening' && (
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <span className="stat-label">Recent prices</span>
+                    {TIMEFRAMES.map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => setTimeframe(t)}
+                        aria-pressed={timeframe === t}
+                        className={`cursor-pointer rounded-md border px-2 py-0.5 text-micro font-medium transition-colors ${
+                          timeframe === t
+                            ? 'border-line-accent bg-accent-dim text-accent'
+                            : 'border-line text-ink-mute hover:text-ink-dim'
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </span>
+                  {candles.data && (
+                    <span className="text-micro text-ink-mute">
+                      {formatNumber(candles.data.count, { decimals: 0 })} at{' '}
+                      {candles.data.timeframe}{' '}
+                      {/* Where the bars came from. A cache read and a database
+                        read can differ in freshness and the endpoint says
+                        which it did. */}
+                      from {candles.data.source}
+                    </span>
+                  )}
                 </div>
-              )}
-            </div>
+                {candles.error ? (
+                  <p className="text-micro text-ink-mute">
+                    {describeApiError(candles.error) ?? 'Could not read bars.'}
+                  </p>
+                ) : !candles.data ? (
+                  <LoadingLines />
+                ) : rows.length === 0 ? (
+                  <p className="text-micro text-ink-mute">
+                    Nothing stored for {ticker} at {timeframe}. The platform tracks a fixed
+                    universe; a symbol outside it has no bars rather than empty ones.
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-micro">
+                      <thead>
+                        <tr className="border-b border-line">
+                          <th className="stat-label px-2 py-1">Time</th>
+                          <th className="stat-label px-2 py-1 text-right">Open</th>
+                          <th className="stat-label px-2 py-1 text-right">High</th>
+                          <th className="stat-label px-2 py-1 text-right">Low</th>
+                          <th className="stat-label px-2 py-1 text-right">Close</th>
+                          <th className="stat-label px-2 py-1 text-right">Move</th>
+                          <th className="stat-label px-2 py-1 text-right">Volume</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map((c) => (
+                          <tr key={c.ts} className="border-b border-line/60">
+                            <td className="whitespace-nowrap px-2 py-1 font-mono text-ink-mute">
+                              <ClockTime value={c.ts} seconds={false} withDate />
+                            </td>
+                            <td className="px-2 py-1 text-right font-mono text-ink-dim">
+                              {formatNumber(c.open)}
+                            </td>
+                            <td className="px-2 py-1 text-right font-mono text-ink-dim">
+                              {formatNumber(c.high)}
+                            </td>
+                            <td className="px-2 py-1 text-right font-mono text-ink-dim">
+                              {formatNumber(c.low)}
+                            </td>
+                            <td className="px-2 py-1 text-right font-mono text-ink">
+                              {formatNumber(c.close)}
+                            </td>
+                            <td className="px-2 py-1 text-right">
+                              <Direction open={c.open} close={c.close} />
+                            </td>
+                            <td className="px-2 py-1 text-right font-mono text-ink-mute">
+                              {formatNumber(c.volume, { decimals: 0 })}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>

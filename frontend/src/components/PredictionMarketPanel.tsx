@@ -3,15 +3,16 @@
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
-import { ABSENT, formatCurrency, formatPercent } from '../lib/format';
+import { ABSENT, formatCurrency, formatNumber, formatPercent } from '../lib/format';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
 import { Tabs } from './ui/Tabs';
-import { NormalizedEvent } from '../lib/types';
+import { NormalizedEvent, PredictionMarketData } from '../lib/types';
 import { IconTarget } from '@/components/ui/icons';
 import { ClockTime } from './ui/ClockTime';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
+import { NoteTile, StatTile } from './ui/StatTile';
 
 // Scores arrive null on some rows; one null took the whole Macro page down.
 function fixed(value: number | null | undefined, digits: number): string {
@@ -34,10 +35,10 @@ export default function PredictionMarketPanel() {
   });
 
   const categoryTabs = [
-    { id: 'all', label: 'ALL MARKETS' },
-    { id: 'macro', label: 'MACRO & FED RATES' },
-    { id: 'geopolitics', label: 'GEOPOLITICS' },
-    { id: 'tech', label: 'TECH & AI' },
+    { id: 'all', label: 'All' },
+    { id: 'macro', label: 'Economy & the Fed' },
+    { id: 'geopolitics', label: 'World events' },
+    { id: 'tech', label: 'Tech & AI' },
   ];
 
   const filteredEvents = useMemo(() => {
@@ -84,7 +85,7 @@ export default function PredictionMarketPanel() {
 
   return (
     <Card
-      title="POLYMARKET & KALSHI PROBABILITY RADAR"
+      title="What prediction markets expect"
       badge={
         <Badge variant="live" pulse>
           Live odds
@@ -96,32 +97,16 @@ export default function PredictionMarketPanel() {
       noPadding
     >
       <div className="p-3.5 space-y-3">
-        {/* Metric Summary HUD */}
-        <div className="grid grid-cols-4 gap-2.5">
-          <div className="p-2.5 bg-page border border-line rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              Tracked Prediction Contracts
-            </div>
-            <div className="text-base font-bold text-purple-400 mt-0.5">
-              {predEvents?.length || 0}
-            </div>
-          </div>
-          <div className="p-2.5 bg-page border border-purple-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              High Volume (&gt; $500k)
-            </div>
-            <div className="text-base font-bold text-purple-400 mt-0.5">{highVolumeCount}</div>
-          </div>
-          <div className="p-2.5 bg-page border border-cyan-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              Probability Swing Signal
-            </div>
-            <div className="text-base font-bold text-cyan-300 mt-0.5">&ge; 10% Shift</div>
-          </div>
-          <div className="p-2.5 bg-page border border-emerald-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">Cross-Domain Engine</div>
-            <div className="text-base font-bold text-emerald-400 mt-0.5">EXCITATION ACTIVE</div>
-          </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <StatTile value={formatNumber(predEvents?.length ?? 0, { decimals: 0 })} label="Betting markets followed" />
+          <StatTile
+            value={formatNumber(highVolumeCount, { decimals: 0 })}
+            label="With over $500K bet on them"
+          />
+          <NoteTile title="What this shows">
+            Real-money betting markets on elections, the Fed and world events. The odds are what bettors collectively
+            think will happen; a jump of 10 points or more is flagged.
+          </NoteTile>
         </div>
 
         {/* Search Bar */}
@@ -131,7 +116,7 @@ export default function PredictionMarketPanel() {
             placeholder="Search prediction contract, ticker, or catalyst..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-inset border border-purple-500/20 rounded-xl px-3.5 py-2 text-xs text-ink placeholder-slate-500 focus:outline-none focus:border-purple-400/60 font-mono transition-colors"
+            className="w-full bg-inset border border-line rounded-xl px-3.5 py-2 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-line-accent font-mono transition-colors"
           />
         </div>
 
@@ -139,7 +124,7 @@ export default function PredictionMarketPanel() {
         <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
           {filteredEvents.length > 0 ? (
             filteredEvents.map((e, i) => {
-              const pd: any = e.prediction_market_data || {};
+              const pd: Partial<PredictionMarketData> = e.prediction_market_data || {};
               // Probabilities and volume are reported only when quoted. A
               // defaulted 50/50 book or a "$120k Vol" placeholder is a market
               // claim the platform has not observed.
@@ -162,18 +147,18 @@ export default function PredictionMarketPanel() {
                 <div
                   key={e.event_id || i}
                   onClick={() => setSelectedEvent(e)}
-                  className="p-3 bg-raised/70 rounded-xl border border-line hover:border-purple-500/50 transition-all cursor-pointer hover:bg-raised/95 shadow-panel"
+                  className="p-3 bg-raised/70 rounded-xl border border-line hover:border-line-accent transition-all cursor-pointer hover:bg-raised/95 shadow-panel"
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-purple-300 font-bold text-xs uppercase flex items-center gap-1">
+                      <span className="text-accent font-bold text-xs uppercase flex items-center gap-1">
                         {pd.ticker || e.primary_entity_name || 'Prediction Contract'}
                       </span>
                       <span className="text-micro text-ink-dim bg-page px-1.5 py-0.5 rounded border border-line">
                         {e.source || 'PolyMarket API'}
                       </span>
                     </div>
-                    <span className="text-micro font-bold px-2 py-0.5 rounded border bg-purple-500/20 text-purple-300 border-purple-500/40">
+                    <span className="text-micro font-bold px-2 py-0.5 rounded border bg-accent-dim text-accent border-line-accent">
                       {volumeStr}
                     </span>
                   </div>
@@ -185,8 +170,8 @@ export default function PredictionMarketPanel() {
                   {/* Probability Bar */}
                   <div className="mt-2.5 space-y-1">
                     <div className="flex justify-between text-micro font-bold">
-                      <span className="text-emerald-400">YES: {yesProb}</span>
-                      <span className="text-rose-400">NO: {noProb}</span>
+                      <span className="text-positive">YES: {yesProb}</span>
+                      <span className="text-negative">NO: {noProb}</span>
                     </div>
                     <div className="w-full h-1.5 bg-page rounded-full overflow-hidden flex border border-line">
                       <div className="bg-emerald-400 h-full" style={{ width: `${yesPct ?? 0}%` }} />
@@ -206,7 +191,7 @@ export default function PredictionMarketPanel() {
               );
             })
           ) : (
-            <div className="p-8 text-center border border-dashed border-purple-500/20 rounded-xl text-ink-dim text-xs">
+            <div className="p-8 text-center border border-dashed border-line rounded-xl text-ink-dim text-xs">
               No matching prediction market contracts found.
             </div>
           )}
@@ -220,21 +205,21 @@ export default function PredictionMarketPanel() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-purple-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
+            className="bg-raised border border-line-accent rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
             {...dialog.panelProps}
           >
-            <div className="flex items-center justify-between border-b border-purple-500/30 pb-3">
+            <div className="flex items-center justify-between border-b border-line pb-3">
               <div className="flex items-center gap-2">
                 <span className="text-lg">
                   <IconTarget className="inline-block shrink-0" />
                 </span>
-                <span className="font-bold text-purple-300 uppercase tracking-wider">
+                <span className="font-bold text-accent uppercase tracking-wider">
                   Contract detail
                 </span>
               </div>
               <button
                 onClick={() => setSelectedEvent(null)}
-                className="text-ink-dim hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
+                className="text-ink-dim hover:text-ink text-xs font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
               >
                 CLOSE
               </button>
@@ -243,27 +228,27 @@ export default function PredictionMarketPanel() {
             <div className="space-y-3">
               <div>
                 <span className="text-ink-dim block mb-0.5 text-micro uppercase font-bold">
-                  CONTRACT TITLE:
+                  Contract title:
                 </span>
-                <p className="text-white font-bold font-sans text-sm">
+                <p className="text-ink font-bold font-sans text-sm">
                   {selectedEvent.headline || selectedEvent.summary}
                 </p>
               </div>
 
               <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line">
                 <div>
-                  <span className="text-ink-dim">EVENT ID:</span>{' '}
-                  <span className="text-purple-300 font-bold block truncate">
+                  <span className="text-ink-dim">Event ID:</span>{' '}
+                  <span className="text-accent font-bold block truncate">
                     {selectedEvent.event_id}
                   </span>
                 </div>
                 <div>
                   <span className="text-ink-dim">SOURCE:</span>{' '}
-                  <span className="text-purple-300 font-bold block">{selectedEvent.source}</span>
+                  <span className="text-accent font-bold block">{selectedEvent.source}</span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
-                  <span className="text-purple-400 font-bold block">
+                  <span className="text-ink-dim">Anomaly score:</span>{' '}
+                  <span className="text-accent font-bold block">
                     {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
@@ -276,14 +261,14 @@ export default function PredictionMarketPanel() {
               </div>
 
               {selectedEvent.prediction_market_data && (
-                <div className="p-3 bg-page rounded-xl border border-purple-500/30 space-y-2">
-                  <span className="text-purple-300 font-bold block text-micro">
+                <div className="p-3 bg-page rounded-xl border border-line space-y-2">
+                  <span className="text-accent font-bold block text-micro">
                     Odds and volume
                   </span>
                   <div className="grid grid-cols-2 gap-2 text-micro">
                     <div>
                       <span className="text-ink-dim block">YES Bid Probability:</span>{' '}
-                      <span className="text-emerald-400 font-bold">
+                      <span className="text-positive font-bold">
                         {formatPercent(selectedEvent.prediction_market_data.yes_probability, {
                           from: 'ratio',
                           decimals: 1,
@@ -292,7 +277,7 @@ export default function PredictionMarketPanel() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">NO Bid Probability:</span>{' '}
-                      <span className="text-rose-400 font-bold">
+                      <span className="text-negative font-bold">
                         {formatPercent(selectedEvent.prediction_market_data.no_probability, {
                           from: 'ratio',
                           decimals: 1,
@@ -301,7 +286,7 @@ export default function PredictionMarketPanel() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">Total Volume:</span>{' '}
-                      <span className="text-cyan-300 font-bold">
+                      <span className="text-accent font-bold">
                         {selectedEvent.prediction_market_data.total_volume
                           ? formatCurrency(selectedEvent.prediction_market_data.total_volume, {
                               decimals: 0,
@@ -322,7 +307,7 @@ export default function PredictionMarketPanel() {
 
             <button
               onClick={() => setSelectedEvent(null)}
-              className="w-full py-2 bg-raised text-purple-300 border border-purple-500/40 rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
+              className="w-full py-2 bg-raised text-accent border border-line-accent rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
             >
               DISMISS
             </button>

@@ -26,8 +26,11 @@ def test_daily_bars_are_written_adjusted_and_bad_prices_skipped(monkeypatch) -> 
     monkeypatch.setattr(hb, "_credentials", lambda: {"k": "v"})
     monkeypatch.setattr(hb, "INTER_REQUEST_SLEEP_SEC", 0)
 
-    async def fake_page(session, headers, symbols, timeframe, s, e, token):
+    feeds = []
+
+    async def fake_page(session, headers, symbols, timeframe, s, e, token, feed="iex"):
         assert timeframe == "1Day"
+        feeds.append(feed)
         return {"NVDA": [
             {"t": "2026-10-01T04:00:00Z", "o": 230, "h": 236, "l": 229, "c": 235, "v": 1e6},
             {"t": "2026-10-02T04:00:00Z", "o": 235, "h": 236, "l": 233, "c": 0, "v": 1e6},
@@ -43,7 +46,31 @@ def test_daily_bars_are_written_adjusted_and_bad_prices_skipped(monkeypatch) -> 
     report = asyncio.run(hb.backfill_daily_bars(db, ["nvda"], lookback_days=30, session=_S()))
     assert report["bars_written"] == 1 and report["tickers_with_data"] == 1
     assert db.rows[0][0] == "NVDA" and str(db.rows[0][1]) == "2026-10-01" and db.rows[0][5] == 235
+    # Daily history is consolidated (SIP) and says so; minute bars stay on IEX.
+    assert feeds == ["sip"] and db.rows[0][7] == "alpaca_adjusted_sip"
 
+
+
+def test_older_years_can_be_added_without_refetching_recent_ones(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(hb, "_credentials", lambda: {"k": "v"})
+    monkeypatch.setattr(hb, "INTER_REQUEST_SLEEP_SEC", 0)
+    windows = []
+
+    async def fake_page(session, headers, symbols, timeframe, s, e, token, feed="sip"):
+        windows.append((s[:10], e[:10]))
+        return {}, None
+
+    monkeypatch.setattr(hb, "_fetch_page", fake_page)
+
+    class _S:
+        async def close(self):
+            pass
+
+    until = datetime(2021, 10, 8, tzinfo=timezone.utc)
+    asyncio.run(hb.backfill_daily_bars(_Db(), ["AAPL"], lookback_days=365 * 6, session=_S(), until=until))
+    assert windows == [("2015-10-09", "2021-10-07")]          # 6 x 365 days, two leap days among them
 
 def test_no_credentials_writes_nothing(monkeypatch) -> None:
     monkeypatch.setattr(hb, "_credentials", lambda: None)

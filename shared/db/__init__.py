@@ -16,12 +16,17 @@ import os
 import json
 import asyncio as _asyncio
 import asyncio
-from typing import Optional, List, Dict
+from typing import TYPE_CHECKING, Dict, List, Optional
 import time
 # Using the native async client in modern redis-py
 import redis.asyncio as aioredis
 import asyncpg
-from neo4j import AsyncGraphDatabase as _Neo4j
+# The neo4j driver is imported where it is used: importing it at module load
+# also imports pandas wherever pandas is installed (~90 MB), and every service
+# that touches Postgres or Redis through this module paid for it -- the 160M
+# civic collector was OOM-killed on start (10 Oct 2026) before doing any work.
+if TYPE_CHECKING:
+    from neo4j import AsyncSession
 from shared.utils.env_guard import resolve_env_var
 from shared.utils.quiet_failures import swallowed
 
@@ -68,6 +73,34 @@ class RedisClient:
 
     async def ping(self) -> bool:
         return await self._client.ping()
+
+def _discard_desynced_connection(session: "AsyncSession", exc: Exception) -> None:
+    """Kills the session's Bolt connection when its stream state is unknown.
+
+    The driver retires a connection itself on a socket error, a cancellation or
+    a server-reported failure. Anything else raised from inside a query -- a
+    RuntimeError from two readers on one StreamReader, a BufferError from the
+    receive buffer, a PackStream ValueError ("Expected structure, found marker
+    A2") -- leaves the connection marked healthy. Releasing it then sends RESET
+    down that same stream: on neo4j 5.14.1 the reset raised BufferError before
+    the pool cleared `in_use`, so the socket leaked with its stray reader still
+    attached. Observed on the supervisor, 2026-10-06/07: bursts of all three
+    errors on ontology proposals, each a dispatch dead-lettered.
+
+    Neo4jError and DriverError are the driver's own outcomes and leave it in
+    charge of the connection. Everything else means the stream can no longer be
+    trusted, so the connection is closed instead of pooled; the cost is one
+    reconnect.
+    """
+    from neo4j.exceptions import DriverError, Neo4jError
+
+    if isinstance(exc, (Neo4jError, DriverError)):
+        return
+    logger.warning(
+        "Neo4j connection discarded after %s: %s", type(exc).__name__, exc,
+    )
+    session.cancel()
+
 
 # --- Neo4j Synchronous Client (For Supervisor ONLY) ---
 class Neo4jClient:
@@ -120,7 +153,9 @@ class Neo4jClient:
         for uri in self._candidate_uris():
             driver = None
             try:
-                driver = _Neo4j.driver(uri, auth=self._auth)
+                from neo4j import AsyncGraphDatabase
+
+                driver = AsyncGraphDatabase.driver(uri, auth=self._auth)
                 await driver.verify_connectivity()
                 self._driver = driver
                 self._uri = uri
@@ -149,14 +184,25 @@ class Neo4jClient:
             f"No reachable Neo4j among {self._candidate_uris()}: {last_error}"
         )
 
-    async def execute(self, cypher: str, params: dict = None):
+    async def execute(self, cypher: str, params: Optional[dict] = None) -> None:
         async with self._driver.session() as s:
-            await s.run(cypher, **(params or {}))
+            try:
+                result = await s.run(cypher, **(params or {}))
+                # Consumed here rather than by the session's close, so a failure
+                # while draining the stream reaches the handler below.
+                await result.consume()
+            except Exception as exc:
+                _discard_desynced_connection(s, exc)
+                raise
 
-    async def query(self, cypher: str, params: dict = None) -> List[Dict]:
+    async def query(self, cypher: str, params: Optional[dict] = None) -> List[Dict]:
         async with self._driver.session() as s:
-            result = await s.run(cypher, **(params or {}))
-            return await result.data()
+            try:
+                result = await s.run(cypher, **(params or {}))
+                return await result.data()
+            except Exception as exc:
+                _discard_desynced_connection(s, exc)
+                raise
     
     async def close(self):
         if self._driver:

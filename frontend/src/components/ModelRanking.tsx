@@ -16,6 +16,8 @@ import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
+import { rankWords } from '../lib/ideas';
+import { LoadingLines } from './ui/Skeleton';
 
 interface ModelReport {
   model: string;
@@ -30,6 +32,7 @@ interface ModelReport {
   turnover: number | null;
   deflated_sharpe: number | null;
   vol_managed_sharpe: number | null;
+  exposures?: Record<string, number>;
   validated: boolean;
   reasons: string[];
 }
@@ -53,12 +56,21 @@ interface ModelResponse {
     validated: boolean;
     models: ModelReport[];
     caveats: string[];
-    gate: { min_ic: number; min_ic_t: number; min_positive_folds: number; min_net_sharpe: number; cost_bps_per_side: number };
+    gate: {
+      min_ic: number;
+      min_ic_t: number;
+      min_positive_folds: number;
+      min_net_sharpe: number;
+      cost_bps_per_side: number;
+    };
     primary_horizon?: string | null;
     selected_horizon?: string | null;
     trials?: number;
     tradable?: number;
-    horizons?: Record<string, { horizon_days: number; validated: boolean; chosen: string | null; net_sharpe: number | null }>;
+    horizons?: Record<
+      string,
+      { horizon_days: number; validated: boolean; chosen: string | null; net_sharpe: number | null }
+    >;
   } | null;
   top: Ranked[];
   bottom: Ranked[];
@@ -104,12 +116,20 @@ function RankList({ title, rows, tone }: { title: string; rows: Ranked[]; tone: 
       <h4 className={`font-bold ${tone}`}>{title}</h4>
       <ul className="space-y-0.5">
         {rows.map((r) => (
-          <li key={r.ticker} className="flex items-center justify-between gap-2 border-b border-line/60 pb-0.5">
-            <Link href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`} className="font-mono font-bold text-white hover:text-accent hover:underline">
+          <li
+            key={r.ticker}
+            className="flex items-center justify-between gap-2 border-b border-line/60 pb-0.5"
+          >
+            <Link
+              href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
+              className="font-mono font-bold text-ink hover:text-accent hover:underline"
+            >
               {r.ticker}
             </Link>
             <span className="text-micro text-ink-mute truncate">{standouts(r.features)}</span>
-            <span className="font-mono text-micro text-ink-dim">p{formatNumber(r.percentile * 100, { decimals: 0 })}</span>
+            <span className="font-mono text-micro text-ink-dim">
+              p{formatNumber(r.percentile * 100, { decimals: 0 })}
+            </span>
           </li>
         ))}
       </ul>
@@ -117,7 +137,11 @@ function RankList({ title, rows, tone }: { title: string; rows: Ranked[]; tone: 
   );
 }
 
-const HORIZON_LABEL: Record<string, string> = { daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly' };
+const HORIZON_LABEL: Record<string, string> = {
+  daily: 'Daily',
+  weekly: 'Weekly',
+  monthly: 'Monthly',
+};
 
 export function ModelRanking() {
   const [horizon, setHorizon] = useState<string | null>(null);
@@ -130,13 +154,29 @@ export function ModelRanking() {
   const horizonKeys = ['daily', 'weekly', 'monthly'].filter((k) => rep?.horizons?.[k]);
 
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <h3 className="font-bold text-white">Model ranking: next {rep?.horizon_days ?? 5} trading days</h3>
+    // The model's research record, folded: readers need the one-line answer;
+    // the IC, Sharpe and turnover table is there for anyone checking it.
+    <details className="group bg-raised border border-line rounded-xl p-4 space-y-3">
+      <summary className="cursor-pointer list-none space-y-1">
+        <div className="text-sm font-semibold text-ink">
+          Behind the scenes: how the ranking model is tested{' '}
+          <span className="text-micro font-normal text-accent group-open:hidden">Show</span>
+          <span className="text-micro font-normal text-accent hidden group-open:inline">Hide</span>
+        </div>
+        <p className="text-xs text-ink-dim">
+          Several models are tried on years of data each never saw, after trading costs; the
+          steadiest one is used for the calls above, and it only counts as fully tested once it
+          clears every check.
+        </p>
+      </summary>
+      <div className="flex items-center justify-between gap-2 flex-wrap pt-2">
+        <h3 className="font-bold text-ink">
+          Model ranking: next {rep?.horizon_days ?? 5} trading days
+        </h3>
         {rep && (
           <span
             className={`px-2 py-0.5 rounded border text-micro font-bold uppercase ${
-              rep.validated ? 'border-emerald-500/50 text-emerald-300' : 'border-amber-500/50 text-amber-300'
+              rep.validated ? 'border-positive/30 text-positive' : 'border-caution/30 text-caution'
             }`}
           >
             {rep.validated ? `Validated · ${rep.chosen}` : 'Not validated'}
@@ -156,10 +196,11 @@ export function ModelRanking() {
                 aria-selected={sel}
                 onClick={() => setHorizon(k)}
                 className={`px-2 py-0.5 rounded border text-micro font-bold ${
-                  sel ? 'border-accent text-accent' : 'border-line text-ink-dim hover:text-white'
+                  sel ? 'border-accent text-accent' : 'border-line text-ink-dim hover:text-ink'
                 }`}
               >
-                {HORIZON_LABEL[k]} · Sharpe {hv?.net_sharpe != null ? formatNumber(hv.net_sharpe, { decimals: 2 }) : ABSENT}
+                {HORIZON_LABEL[k]} · Sharpe{' '}
+                {hv?.net_sharpe != null ? formatNumber(hv.net_sharpe, { decimals: 2 }) : ABSENT}
                 {rep?.primary_horizon === k ? ' · primary' : ''}
               </button>
             );
@@ -167,10 +208,10 @@ export function ModelRanking() {
         </div>
       )}
       <p className="text-ink-dim">
-        Every stock ranked against every other on momentum, reversal, 52-week-high distance, volatility, beta and
-        liquidity, combined by a model chosen walk-forward: trained only on the past, tested on the next quarter, graded
-        on rank correlation and a long-short portfolio net of {rep?.gate.cost_bps_per_side ?? 10} bps per side. Only a
-        validated model votes on trades.
+        Every stock ranked against every other on momentum, reversal, 52-week-high distance,
+        volatility, beta and liquidity, combined by a model chosen walk-forward: trained only on the
+        past, tested on the next quarter, graded on rank correlation and a long-short portfolio net
+        of {rep?.gate.cost_bps_per_side ?? 10} bps per side. Only a validated model votes on trades.
       </p>
       {error ? (
         <p className="text-ink-mute">The model report could not be read.</p>
@@ -188,7 +229,10 @@ export function ModelRanking() {
                   <th className="text-right">Folds +</th>
                   <th className="text-right">L/S net bps</th>
                   <th className="text-right">Net Sharpe</th>
-                  <th className="text-right" title="Probability the Sharpe is real after correcting for the number of models tried (Bailey and Lopez de Prado). The gate needs 0.95.">
+                  <th
+                    className="text-right"
+                    title="Probability the Sharpe is real after correcting for the number of models tried (Bailey and Lopez de Prado). The gate needs 0.95."
+                  >
                     Deflated
                   </th>
                   <th className="text-right">Turnover</th>
@@ -199,19 +243,35 @@ export function ModelRanking() {
                 {rep.models.map((m) => (
                   <tr key={m.model} className="border-b border-line/60 align-top">
                     <td className="py-1 font-mono">{m.model}</td>
-                    <td className="text-right font-mono">{m.mean_ic != null ? formatNumber(m.mean_ic, { decimals: 3 }) : ABSENT}</td>
-                    <td className="text-right font-mono">{m.ic_t != null ? formatNumber(m.ic_t, { decimals: 2 }) : ABSENT}</td>
                     <td className="text-right font-mono">
-                      {m.positive_fold_share != null ? `${formatNumber(m.positive_fold_share * 100, { decimals: 0 })}%` : ABSENT}
+                      {m.mean_ic != null ? formatNumber(m.mean_ic, { decimals: 3 }) : ABSENT}
                     </td>
-                    <td className="text-right font-mono">{m.ls_net_bps != null ? formatNumber(m.ls_net_bps, { decimals: 1 }) : ABSENT}</td>
-                    <td className="text-right font-mono">{m.net_sharpe != null ? formatNumber(m.net_sharpe, { decimals: 2 }) : ABSENT}</td>
                     <td className="text-right font-mono">
-                      {m.deflated_sharpe != null ? formatNumber(m.deflated_sharpe, { decimals: 2 }) : ABSENT}
+                      {m.ic_t != null ? formatNumber(m.ic_t, { decimals: 2 }) : ABSENT}
                     </td>
-                    <td className="text-right font-mono">{m.turnover != null ? `${formatNumber(m.turnover * 100, { decimals: 0 })}%` : ABSENT}</td>
+                    <td className="text-right font-mono">
+                      {m.positive_fold_share != null
+                        ? `${formatNumber(m.positive_fold_share * 100, { decimals: 0 })}%`
+                        : ABSENT}
+                    </td>
+                    <td className="text-right font-mono">
+                      {m.ls_net_bps != null ? formatNumber(m.ls_net_bps, { decimals: 1 }) : ABSENT}
+                    </td>
+                    <td className="text-right font-mono">
+                      {m.net_sharpe != null ? formatNumber(m.net_sharpe, { decimals: 2 }) : ABSENT}
+                    </td>
+                    <td className="text-right font-mono">
+                      {m.deflated_sharpe != null
+                        ? formatNumber(m.deflated_sharpe, { decimals: 2 })
+                        : ABSENT}
+                    </td>
+                    <td className="text-right font-mono">
+                      {m.turnover != null
+                        ? `${formatNumber(m.turnover * 100, { decimals: 0 })}%`
+                        : ABSENT}
+                    </td>
                     <td className="pl-3">
-                      <span className={m.validated ? 'text-emerald-300 font-bold' : 'text-ink-mute'}>
+                      <span className={m.validated ? 'text-positive font-bold' : 'text-ink-mute'}>
                         {m.validated ? 'passes' : m.reasons.join('; ') || 'fails'}
                       </span>
                     </td>
@@ -220,19 +280,40 @@ export function ModelRanking() {
               </tbody>
             </table>
           </div>
+          {(() => {
+            const e = rep.models.find((m) => m.model === rep.chosen)?.exposures;
+            if (!e || !Object.keys(e).length) return null;
+            const pctx = (v?: number) =>
+              v == null ? ABSENT : `${formatNumber(v * 100, { decimals: 0 })}%`;
+            return (
+              <p className="text-micro text-ink-dim">
+                What the {rep.chosen} book leans on, out of sample: net beta{' '}
+                {formatNumber(e.net_beta ?? 0, { decimals: 2 })}, momentum tilt{' '}
+                {formatNumber(e.momentum_tilt ?? 0, { decimals: 2 })}, size tilt{' '}
+                {formatNumber(e.size_tilt_log_dollar_volume ?? 0, { decimals: 2 })} log $vol;
+                largest industry {pctx(e.long_top_industry_share)} of longs,{' '}
+                {pctx(e.short_top_industry_share)} of shorts. Gross spread{' '}
+                {formatNumber(e.gross_bps ?? 0, { decimals: 1 })} bps; industry-neutral{' '}
+                {formatNumber(e.industry_neutral_gross_bps ?? 0, { decimals: 1 })} bps.
+              </p>
+            );
+          })()}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <RankList title="Strongest ranks" rows={data?.top ?? []} tone="text-emerald-300" />
             <RankList title="Weakest ranks" rows={data?.bottom ?? []} tone="text-rose-300" />
           </div>
           <p className="text-micro text-ink-mute">
             {formatNumber(rep.universe, { decimals: 0 })} stocks
-            {rep.tradable != null ? ` (${formatNumber(rep.tradable, { decimals: 0 })} tradable today)` : ''} ·{' '}
-            {formatNumber(rep.trading_days, { decimals: 0 })} trading days
-            {rep.trials != null ? ` · deflated across ${rep.trials} trials` : ''} · as of {rep.as_of} · computed {formatAge(rep.generated_at)} ago. {rep.caveats.join('; ')}.
+            {rep.tradable != null
+              ? ` (${formatNumber(rep.tradable, { decimals: 0 })} tradable today)`
+              : ''}{' '}
+            · {formatNumber(rep.trading_days, { decimals: 0 })} trading days
+            {rep.trials != null ? ` · deflated across ${rep.trials} trials` : ''} · as of{' '}
+            {rep.as_of} · computed {formatAge(rep.generated_at)} ago. {rep.caveats.join('; ')}.
           </p>
         </>
       )}
-    </section>
+    </details>
   );
 }
 
@@ -243,44 +324,86 @@ interface TickerModel {
   model: string | null;
   as_of: string | null;
   horizon_days: number | null;
+  /** What stands out about the stock, in words (signal_plain.stand_out). */
+  traits?: { feature: string; rank: number; text: string }[];
 }
 
 export function TickerModelCard({ ticker }: { ticker: string }) {
-  const { data } = useSWR<TickerModel>(ticker ? `/predictions/model/${encodeURIComponent(ticker)}` : null, fetcher, {
-    refreshInterval: POLL.slow,
-  });
+  const { data } = useSWR<TickerModel>(
+    ticker ? `/predictions/model/${encodeURIComponent(ticker)}` : null,
+    fetcher,
+    {
+      refreshInterval: POLL.slow,
+    },
+  );
   const e = data?.entry;
   return (
     <div className="rounded-lg border border-line p-3 space-y-1">
       <div className="flex items-center justify-between gap-2">
-        <span className="stat-label">Model rank, next {data?.horizon_days ?? 5} days</span>
+        <span className="stat-label">
+          Our model&apos;s view, next {data?.horizon_days ?? 5} trading days
+        </span>
         {data && (
-          <span className={`text-micro font-bold ${data.validated ? 'text-emerald-300' : 'text-amber-300'}`}>
-            {data.validated ? 'validated' : 'not validated'}
+          <span
+            className={`text-micro font-semibold ${data.validated ? 'text-positive' : 'text-caution'}`}
+          >
+            {data.validated ? 'fully tested' : 'still being tested'}
           </span>
         )}
       </div>
       {!data ? (
-        <p className="text-micro text-ink-mute">Reading…</p>
+        <LoadingLines />
       ) : !e ? (
-        <p className="text-micro text-ink-mute">{ticker} is not in the ranked universe yet (it needs a year of daily history).</p>
+        <p className="text-micro text-ink-mute">
+          The model doesn&apos;t rank {ticker} yet: it needs a year of daily prices first.
+        </p>
       ) : (
         <>
-          <p className="text-sm text-white font-mono">
-            Quintile {e.quintile} of 5 · percentile {formatNumber(e.percentile * 100, { decimals: 0 })}
+          <p
+            className="text-sm text-ink"
+            title={`Quintile ${e.quintile} of 5, percentile ${formatNumber(e.percentile * 100, { decimals: 0 })}`}
+          >
+            Ranks in the {rankWords(e.percentile).toLowerCase()} of the stocks it follows
           </p>
-          <ul className="grid grid-cols-2 gap-x-3 text-micro font-mono">
-            {Object.entries(e.features).map(([k, v]) => (
-              <li key={k} className="flex justify-between">
-                <span className="text-ink-mute">{LABELS[k] ?? k}</span>
-                <span className={v > 0.25 ? 'text-emerald-300' : v < -0.25 ? 'text-rose-300' : 'text-ink-dim'}>
-                  {v >= 0 ? '+' : ''}
-                  {formatNumber(v, { decimals: 2 })}
-                </span>
-              </li>
-            ))}
-          </ul>
-          <p className="text-micro text-ink-mute">Feature values are cross-sectional ranks from -0.5 to +0.5. As of {data.as_of}.</p>
+          {(data.traits ?? []).length > 0 && (
+            <div className="space-y-1 pt-1">
+              <div className="text-micro text-ink-mute">What stands out about {ticker}</div>
+              <ul className="space-y-0.5 text-xs text-ink-dim">
+                {(data.traits ?? []).map((t) => (
+                  <li key={t.feature} className="flex gap-2">
+                    <span aria-hidden className="text-ink-mute">
+                      •
+                    </span>
+                    <span>It {t.text}.</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <details className="pt-1">
+            <summary className="cursor-pointer text-micro text-accent">
+              All {Object.keys(e.features).length} measures (technical)
+            </summary>
+            <ul className="grid grid-cols-2 gap-x-3 text-micro font-mono">
+              {Object.entries(e.features).map(([k, v]) => (
+                <li key={k} className="flex justify-between">
+                  <span className="text-ink-mute">{LABELS[k] ?? k}</span>
+                  <span
+                    className={
+                      v > 0.25 ? 'text-positive' : v < -0.25 ? 'text-negative' : 'text-ink-dim'
+                    }
+                  >
+                    {v >= 0 ? '+' : ''}
+                    {formatNumber(v, { decimals: 2 })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-micro text-ink-mute">
+              Each is where the stock ranks among all others, from -0.5 (lowest) to +0.5 (highest).
+              As of {data.as_of}.
+            </p>
+          </details>
         </>
       )}
     </div>

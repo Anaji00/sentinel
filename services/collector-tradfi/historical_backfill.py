@@ -47,8 +47,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -61,9 +62,23 @@ ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
 # relied upon.
 ADJUSTMENT = os.getenv("ALPACA_BAR_ADJUSTMENT", "all")
 
-# sip is all US exchanges; iex is the free tier and covers materially less
-# volume. Stated because the choice changes what a volume z-score means.
-FEED = os.getenv("ALPACA_BAR_FEED", "iex")
+# Consolidated (every exchange) minute bars. The free plan serves them once
+# they are fifteen minutes old -- the seam guard below keeps backfill well past
+# that -- and IEX alone is a different object: on 14 Oct its minute bars summed
+# to 3.4M NVDA shares against 113.4M consolidated (119.4M with the auctions),
+# and 0.6M AMD against 21.2M. Nothing downstream scales minute volume by the
+# IEX share (the 5m z-score is on price; volume spikes read the live stream
+# against its own baselines), so the backfilled record simply becomes the tape.
+FEED = os.getenv("ALPACA_BAR_FEED", "sip")
+# Daily history from every exchange. The free plan serves consolidated (SIP)
+# bars older than fifteen minutes, and an IEX daily bar is a different object:
+# its close is IEX's last trade, measured 25-40 bps from the official close on
+# low-priced names (PLUG, AMC; 8 Oct 2026) and 3-4 bps on large caps, and its
+# volume is 2-7% of the tape depending on the stock. Minute bars are
+# consolidated too since 15 Oct 2026 (FEED above).
+from shared.utils.bar_feed import DAILY_FEED  # noqa: E402  one setting for the data and its readers
+from shared.utils.market_session import session_label_at  # noqa: E402
+DAILY_SOURCE = "alpaca_adjusted" if DAILY_FEED == "iex" else f"alpaca_adjusted_{DAILY_FEED}"
 
 # The endpoint caps at 10,000 data points per response and the limit applies to
 # the TOTAL across symbols, not per symbol -- so a large batch with a long
@@ -106,15 +121,16 @@ SEAM_GUARD_MINUTES = int(os.getenv("ALPACA_BACKFILL_SEAM_GUARD_MIN", "30"))
 INTER_REQUEST_SLEEP_SEC = float(os.getenv("ALPACA_BACKFILL_SLEEP_SEC", "0.35"))
 
 _INSERT_SQL = """
-    INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session, source)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT (ticker, time) DO UPDATE
     SET open = EXCLUDED.open,
         high = EXCLUDED.high,
         low = EXCLUDED.low,
         close = EXCLUDED.close,
         volume = EXCLUDED.volume,
-        session = EXCLUDED.session;
+        session = EXCLUDED.session,
+        source = EXCLUDED.source;
 """
 
 
@@ -159,6 +175,7 @@ async def _fetch_page(
     start_iso: str,
     end_iso: str,
     page_token: Optional[str],
+    feed: str = FEED,
 ) -> Tuple[Dict[str, List[dict]], Optional[str]]:
     """One page of bars. Returns ({symbol: [bar, ...]}, next_page_token)."""
     params = {
@@ -167,7 +184,7 @@ async def _fetch_page(
         "start": start_iso,
         "end": end_iso,
         "adjustment": ADJUSTMENT,
-        "feed": FEED,
+        "feed": feed,
         "limit": str(PAGE_LIMIT),
     }
     if page_token:
@@ -193,8 +210,15 @@ async def backfill_bars(
     timeframe: str = "1Min",
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     session: Optional[aiohttp.ClientSession] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Load adjusted vendor bars into tradfi_bars for the given tickers.
+
+    `start`/`end` bound an exact window (the settle pass); otherwise the window
+    is `lookback_days` back from the seam guard. `end` is clamped to the seam
+    guard either way: the free plan refuses consolidated bars under fifteen
+    minutes old.
 
     Idempotent: the insert upserts on (ticker, time), so a re-run repairs rows
     rather than duplicating them -- which is also how an unadjusted history
@@ -239,9 +263,13 @@ async def backfill_bars(
     if not tickers:
         return report
 
-    end = datetime.now(timezone.utc) - timedelta(minutes=SEAM_GUARD_MINUTES)
-    start = end - timedelta(days=lookback_days)
+    guard = datetime.now(timezone.utc) - timedelta(minutes=SEAM_GUARD_MINUTES)
+    end = min(end, guard) if end else guard
+    start = start or (end - timedelta(days=lookback_days))
+    if start >= end:
+        return report
     start_iso, end_iso = start.isoformat(), end.isoformat()
+    source = f"alpaca_{FEED}"
 
     owns_session = session is None
     session = session or aiohttp.ClientSession()
@@ -279,9 +307,11 @@ async def backfill_bars(
                                 float(b.get("l", 0.0)),
                                 float(b.get("c", 0.0)),
                                 float(b.get("v", 0.0) or 0.0),
-                                # Vendor bars are labelled so a reader can tell
-                                # them from live-aggregated ones at the seam.
-                                "vendor_backfill",
+                                # The session by the bar's own time, and the
+                                # provider in its own column (was session =
+                                # 'vendor_backfill', which lost both).
+                                session_label_at(symbol, ts),
+                                source,
                             ))
                         except (TypeError, ValueError):
                             continue
@@ -311,11 +341,27 @@ async def backfill_bars(
 
 _DAILY_INSERT_SQL = """
     INSERT INTO daily_bars (ticker, day, open, high, low, close, volume, source)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'alpaca_adjusted')
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT (ticker, day) DO UPDATE
     SET open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
         close = EXCLUDED.close, volume = EXCLUDED.volume, source = EXCLUDED.source;
 """
+
+# Today's daily bar is not stored until the session is over. Alpaca serves the
+# current day's bar as it stands at the request, and a top-up that ran at 09:39
+# New York time on 19 Oct 2026 stored Monday's "close" from nine minutes of
+# trading (AAPL 2.8M shares of a 60M day) -- read that night as the session's
+# close by the factor model, the paper ledger and the portfolio's marks.
+SESSION_FINAL_NY = dtime(16, 30)
+_NY = ZoneInfo("America/New_York")
+
+
+def is_final(bar_day: date, now: Optional[datetime] = None) -> bool:
+    """Whether a daily bar for `bar_day` is complete: any earlier day, or
+    today once New York is past SESSION_FINAL_NY."""
+    ny = (now or datetime.now(timezone.utc)).astimezone(_NY)
+    return bar_day < ny.date() or (bar_day == ny.date() and ny.time() >= SESSION_FINAL_NY)
+
 
 # How deep a ticker's first daily load goes, and how much a top-up rewrites.
 DAILY_DEEP_YEARS = int(os.getenv("DAILY_BARS_DEEP_YEARS", "5"))
@@ -327,13 +373,17 @@ async def backfill_daily_bars(
     tickers: List[str],
     lookback_days: int,
     session: Optional[aiohttp.ClientSession] = None,
+    until: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Adjusted daily bars into the permanent daily_bars table.
 
     Separate from tradfi_bars on purpose: that is the one-minute base every
     continuous aggregate rolls up from, retained 400 days. Daily history is
     small, kept forever, and is what anything measured over months or years
-    reads. Idempotent: upserts on (ticker, day), so a top-up also repairs."""
+    reads. Idempotent: upserts on (ticker, day), so a top-up also repairs.
+
+    `until` ends the window earlier than now, so older years can be added to
+    names already loaded without fetching their recent history again."""
     report: Dict[str, Any] = {"requested_tickers": len(tickers), "lookback_days": lookback_days,
                               "bars_written": 0, "tickers_with_data": 0, "pages": 0, "errors": []}
     headers = _credentials()
@@ -341,7 +391,8 @@ async def backfill_daily_bars(
         if headers is None:
             report["errors"].append("no Alpaca credentials; daily backfill skipped")
         return report
-    end = datetime.now(timezone.utc) - timedelta(minutes=SEAM_GUARD_MINUTES)
+    end = min(until, datetime.now(timezone.utc)) if until else datetime.now(timezone.utc)
+    end -= timedelta(minutes=SEAM_GUARD_MINUTES)
     start = end - timedelta(days=lookback_days)
     owns_session = session is None
     session = session or aiohttp.ClientSession()
@@ -352,7 +403,8 @@ async def backfill_daily_bars(
             while True:
                 try:
                     bars_by_symbol, page_token = await _fetch_page(
-                        session, headers, batch, "1Day", start.isoformat(), end.isoformat(), page_token
+                        session, headers, batch, "1Day", start.isoformat(), end.isoformat(), page_token,
+                        feed=DAILY_FEED,
                     )
                 except Exception as e:
                     report["errors"].append(f"{batch[0]}..{batch[-1]}: {e}")
@@ -369,13 +421,13 @@ async def backfill_daily_bars(
                             close = float(b.get("c"))
                         except (TypeError, ValueError):
                             continue
-                        if close <= 0:
+                        if close <= 0 or not is_final(ts.astimezone(_NY).date()):
                             continue
                         seen.add(symbol)
                         rows.append((
                             symbol, ts.date(),
                             float(b.get("o") or close), float(b.get("h") or close),
-                            float(b.get("l") or close), close, float(b.get("v") or 0.0),
+                            float(b.get("l") or close), close, float(b.get("v") or 0.0), DAILY_SOURCE,
                         ))
                 if rows:
                     try:

@@ -170,3 +170,29 @@ def test_an_instrument_signalled_every_day_still_has_a_baseline():
     s = walk(60, 22)
     marks = [(T0 + timedelta(days=d, hours=3)).timestamp() for d in range(60)]
     assert rs.horizon_stats(s, timedelta(days=1), marks) is not None
+
+
+def test_one_extreme_episode_cannot_hide_a_consistent_effect() -> None:
+    """Winsorized t-test: 60 units at +0.3 sd and one -40 sd squeeze still test positive."""
+    from shared.utils import reaction_study as rs
+
+    us = [rs.Unit(entry=float(k), aligned=0.3, aligned_abnormal_bps=10.0, cost_bps=1.0, episodes=1)
+          for k in range(60)]
+    us.append(rs.Unit(entry=99.0, aligned=-40.0, aligned_abnormal_bps=-900.0, cost_bps=1.0, episodes=1))
+    xs = [max(-rs.WINSOR_Z, min(rs.WINSOR_Z, u.aligned)) for u in us]
+    raw_t, w_t = rs.t_stat([u.aligned for u in us]), rs.t_stat(xs)
+    assert raw_t < 1.0 < w_t
+
+
+def test_each_episode_is_measured_against_the_index_of_its_own_size() -> None:
+    from array import array
+    from shared.utils import reaction_study as rs
+
+    assert rs.size_benchmark(None) == "SPY"
+    assert rs.size_benchmark(500e6) == "SPY" and rs.size_benchmark(80e6) == "IJH"
+    assert rs.size_benchmark(9e6) == "IJR" and rs.size_benchmark(1e6) == "IWC"
+    days = array("d", [86400.0 * i for i in range(30)])
+    dv = (days, array("d", [1e6] * 25 + [1e9] * 5))
+    # Before day 25 only the small volumes are known; after, the large ones count.
+    assert rs.trailing_dollar_volume(dv, 86400.0 * 25) == 1e6
+    assert rs.trailing_dollar_volume(dv, 86400.0 * 30, n=5) == 1e9

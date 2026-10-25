@@ -272,3 +272,33 @@ async def get_13f_consensus_for_ticker(
         consensus_sentiment=sentiment,
         derived_from_filings=derived,
     )
+
+
+_FORM144_SQL = """
+    SELECT ticker, issuer_name, seller, relationship, shares, market_value, pct_outstanding, approx_sale_date,
+           acquired_how, notice_date, accession
+    FROM form144_notices
+    WHERE ($1::text IS NULL OR ticker = $1) AND notice_date > CURRENT_DATE - $2::int
+    ORDER BY notice_date DESC, market_value DESC NULLS LAST LIMIT $3
+"""
+
+
+@router.get("/form144")
+async def form144_notices(
+    ticker: Optional[str] = Query(None, max_length=12),
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(100, ge=1, le=500),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+    db=Depends(get_db_optional),
+) -> Dict[str, Any]:
+    """Insiders' notices of proposed sales (Form 144): who intends to sell, how
+    much, and when -- filed before the sale, ahead of the Form 4 that reports it."""
+    if not db:
+        return {"notices": []}
+    try:
+        rows = await db.query(_FORM144_SQL, ticker.upper() if ticker else None, days, limit) or []
+    except Exception as e:
+        swallowed("api_gateway.filings.form144", e, logger)
+        return {"notices": []}
+    return {"notices": [{k: (str(v) if hasattr(v, "isoformat") else v) for k, v in dict(r).items()} for r in rows],
+            "note": "A notice of intent, not a sale: the Form 4 that follows reports what actually sold."}

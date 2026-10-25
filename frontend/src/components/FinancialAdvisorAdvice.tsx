@@ -8,7 +8,7 @@ import { Badge } from './ui/Badge';
 import ExplainabilityModal from './ExplainabilityModal';
 import { ProvenanceBadge } from './ProvenanceBadge';
 import { ProvenanceValue } from './ProvenanceValue';
-import { ABSENT, formatCurrency, formatNumber, formatPercent } from '../lib/format';
+import { formatCurrency, formatNumber, formatPercent } from '../lib/format';
 import { IconCheck, IconClose, IconSignal, IconTarget } from '@/components/ui/icons';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
@@ -151,7 +151,7 @@ export default function FinancialAdvisorAdvice() {
   const capitalIsFromBook = capitalOverride === null && account?.portfolio_value !== undefined;
 
   const brief = data?.brief;
-  const plays = brief?.highest_conviction_plays || [];
+  const plays = useMemo(() => brief?.highest_conviction_plays || [], [brief]);
   const metrics = brief?.portfolio_metrics;
   const blAllocations = brief?.black_litterman_allocations || [];
 
@@ -223,7 +223,7 @@ export default function FinancialAdvisorAdvice() {
       setToastMessage(
         `EXECUTED [${data.order_id}]: ${signal.action} ${signal.ticker} @ $${signal.entry_level} | Sized ${formatCurrency(positionUsd, { decimals: 0 })} (${signal.kelly_allocation_pct}% Kelly) via ${data.broker || 'broker'}`,
       );
-    } catch (err) {
+    } catch {
       // A genuine network failure. The request did not arrive, so nothing was
       // placed -- the old copy here read "SIMULATED DISPATCH ... via Alpaca
       // Paper Bridge", which a reader takes for a successful paper trade.
@@ -264,9 +264,9 @@ export default function FinancialAdvisorAdvice() {
     >
       {/* Execution Toast Notification */}
       {toastMessage && (
-        <div className="absolute top-12 left-3 right-3 z-30 bg-emerald-950/95 border border-emerald-400/80 p-3 rounded-xl text-emerald-300 text-xs shadow-panel flex items-center justify-between animate-pulse">
+        <div className="absolute top-12 left-3 right-3 z-30 bg-positive/10 border border-positive/30 p-3 rounded-xl text-positive text-xs shadow-panel flex items-center justify-between animate-pulse">
           <div className="flex items-center gap-2">
-            <span className="text-emerald-400 font-bold text-sm">
+            <span className="text-positive font-bold text-sm">
               <IconCheck className="inline-block shrink-0" />
             </span>
             <span>{toastMessage}</span>
@@ -274,7 +274,7 @@ export default function FinancialAdvisorAdvice() {
           <button
             onClick={() => setToastMessage(null)}
             aria-label="Dismiss"
-            className="text-emerald-400 font-bold text-sm ml-2 hover:text-white"
+            className="text-positive font-bold text-sm ml-2 hover:text-ink"
           >
             <IconClose />
           </button>
@@ -283,7 +283,7 @@ export default function FinancialAdvisorAdvice() {
 
       <div className="p-3.5 space-y-3 flex-1 overflow-y-auto text-xs">
         {/* Portfolio Risk Telemetry HUD */}
-        <div className="grid grid-cols-4 gap-2 bg-inset p-2.5 rounded-xl border border-cyan-500/20 text-micro">
+        <div className="grid grid-cols-4 gap-2 bg-inset p-2.5 rounded-xl border border-line text-micro">
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
             <div className="flex items-center justify-between">
               <span
@@ -310,7 +310,7 @@ export default function FinancialAdvisorAdvice() {
               }}
               showBadge={false}
               format="percent"
-              className="text-cyan-400 font-bold"
+              className="text-accent font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
@@ -336,12 +336,12 @@ export default function FinancialAdvisorAdvice() {
               }}
               showBadge={false}
               format="number"
-              className="text-emerald-400 font-bold"
+              className="text-positive font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-ink-mute block text-micro">CASH BUFFER</span>
+              <span className="text-ink-mute block text-micro">Cash buffer</span>
               <ProvenanceBadge
                 sourceType={
                   metrics?.recommended_cash_pct !== undefined
@@ -360,12 +360,12 @@ export default function FinancialAdvisorAdvice() {
               }}
               showBadge={false}
               format="percent"
-              className="text-amber-400 font-bold"
+              className="text-caution font-bold"
             />
           </div>
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-ink-mute block text-micro">HAWKES FACTOR</span>
+              <span className="text-ink-mute block text-micro">Hawkes factor</span>
               <ProvenanceBadge
                 sourceType={
                   metrics?.hawkes_risk_factor !== undefined
@@ -384,7 +384,7 @@ export default function FinancialAdvisorAdvice() {
               }}
               showBadge={false}
               format="number"
-              className="text-purple-400 font-bold"
+              className="text-accent font-bold"
             />
           </div>
         </div>
@@ -393,7 +393,7 @@ export default function FinancialAdvisorAdvice() {
         <div className="p-2.5 rounded-xl bg-page border border-line space-y-1.5 text-micro">
           <div className="flex items-center justify-between text-ink-dim">
             <span className="font-semibold text-ink text-xs">Black-Litterman target weights</span>
-            <span className="text-cyan-400 font-bold">MVO POSTERIOR ALLOCATION</span>
+            <span className="text-accent font-bold">Suggested allocation</span>
           </div>
           <div className="flex h-3.5 w-full rounded-md overflow-hidden bg-raised border border-line">
             {blAllocations.map((a, i) => (
@@ -436,13 +436,13 @@ export default function FinancialAdvisorAdvice() {
         </div>
 
         {/* Hedging Strategy Briefing */}
-        <div className="p-2.5 rounded-xl bg-[#080c14] border border-cyan-500/20 text-xs space-y-1">
-          <div className="flex items-center justify-between text-cyan-400 font-bold text-micro">
+        <div className="p-2.5 rounded-xl bg-inset border border-line text-xs space-y-1">
+          <div className="flex items-center justify-between text-accent font-bold text-micro">
             <span className="flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
-              RISK MANDATE
+              Risk mandate
             </span>
-            <span className="text-emerald-400 text-micro">QUARTER-KELLY ACTIVE</span>
+            <span className="text-positive text-micro">Sized at quarter-Kelly</span>
           </div>
           <p className="text-micro text-ink-dim font-sans leading-relaxed">
             {brief?.general_hedging_strategy ||
@@ -456,18 +456,20 @@ export default function FinancialAdvisorAdvice() {
             CONVICTION SIGNALS ({filteredPlays.length})
           </span>
           <div className="flex items-center gap-1">
-            {[
-              { id: 'ALL', label: 'ALL' },
-              { id: 'BUY', label: 'BUY / LONG' },
-              { id: 'SELL', label: 'SELL / HEDGE' },
-              { id: 'SMART_MONEY', label: 'SMART MONEY' },
-            ].map((tab) => (
+            {(
+              [
+                { id: 'ALL', label: 'ALL' },
+                { id: 'BUY', label: 'Buy' },
+                { id: 'SELL', label: 'Sell or hedge' },
+                { id: 'SMART_MONEY', label: 'Smart money' },
+              ] as const
+            ).map((tab) => (
               <button
                 key={tab.id}
-                onClick={() => setFilterCategory(tab.id as any)}
+                onClick={() => setFilterCategory(tab.id)}
                 className={`px-2 py-0.5 rounded transition-colors cursor-pointer font-bold ${
                   filterCategory === tab.id
-                    ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
+                    ? 'bg-accent-dim text-accent border border-line-accent'
                     : 'bg-raised text-ink-dim hover:bg-overlay'
                 }`}
               >
@@ -492,18 +494,18 @@ export default function FinancialAdvisorAdvice() {
               <div
                 key={idx}
                 onClick={() => setSelectedPlay(p)}
-                className="p-3 rounded-xl bg-page border border-line hover:border-cyan-500/50 hover:bg-raised/80 cursor-pointer transition-all space-y-2 group shadow-md"
+                className="p-3 rounded-xl bg-page border border-line hover:border-line-accent hover:bg-raised/80 cursor-pointer transition-all space-y-2 group shadow-md"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-bold text-white group-hover:text-cyan-300 transition-colors">
+                    <span className="text-sm font-bold text-ink group-hover:text-accent transition-colors">
                       {p.ticker}
                     </span>
                     <span
                       className={`px-2 py-0.5 rounded text-micro font-bold ${
                         p.action === 'BUY'
-                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
-                          : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
+                          ? 'bg-positive/10 text-positive border border-positive/30'
+                          : 'bg-negative/10 text-negative border border-negative/30'
                       }`}
                     >
                       {p.trade_type || p.action}
@@ -516,20 +518,20 @@ export default function FinancialAdvisorAdvice() {
                       }
                       className={`px-1.5 py-0.5 rounded text-micro font-bold border ${
                         p.evidence_status === 'proven'
-                          ? 'border-emerald-500/40 text-emerald-300'
+                          ? 'border-positive/30 text-positive'
                           : 'border-line text-ink-mute'
                       }`}
                     >
                       {p.evidence_status === 'proven' ? 'PROVEN' : 'UNPROVEN'}
                     </span>
                     {p.smart_money?.is_aligned && (
-                      <span className="px-1.5 py-0.5 rounded text-micro font-extrabold bg-purple-500/20 text-purple-300 border border-purple-500/40">
+                      <span className="px-1.5 py-0.5 rounded text-micro font-extrabold bg-accent-dim text-accent border border-line-accent">
                         Institutional agreement
                       </span>
                     )}
                     {typeof p.microstructure_stop_multiplier === 'number' &&
                       p.microstructure_stop_multiplier < 1.0 && (
-                        <span className="px-1.5 py-0.5 rounded text-micro font-extrabold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                        <span className="px-1.5 py-0.5 rounded text-micro font-extrabold bg-caution/10 text-caution border border-caution/30 animate-pulse">
                           OFI STOP TIGHTENED ({p.microstructure_stop_multiplier}x ATR)
                         </span>
                       )}
@@ -538,11 +540,11 @@ export default function FinancialAdvisorAdvice() {
                   <div className="flex items-center gap-2">
                     <span className="text-micro text-ink-dim">
                       CONVICTION:{' '}
-                      <span className="text-emerald-400 font-bold">
+                      <span className="text-positive font-bold">
                         {formatPercent(p.conviction_score, { from: 'ratio', decimals: 0 })}
                       </span>
                     </span>
-                    <span className="px-2 py-0.5 rounded text-micro font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                    <span className="px-2 py-0.5 rounded text-micro font-bold bg-accent-dim text-accent border border-line">
                       KELLY {p.kelly_allocation_pct}%
                     </span>
                   </div>
@@ -551,15 +553,15 @@ export default function FinancialAdvisorAdvice() {
                 {/* Price & Moving Average Distances Breakdown */}
                 <div className="grid grid-cols-4 gap-1 text-micro bg-raised/70 p-2 rounded-lg border border-line">
                   <div>
-                    <span className="text-ink-mute block">ENTRY / TARGET</span>
+                    <span className="text-ink-mute block">Entry / target</span>
                     <span className="text-ink font-bold">
-                      ${p.entry_level} &rarr; ${p.target_price}
+                      ${p.entry_level}{' '}&rarr; ${p.target_price}
                     </span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">SMA 20 DIST</span>
+                    <span className="text-ink-mute block">SMA 20 dist</span>
                     <span
-                      className={`font-bold ${(p.technical_indicators?.dist_sma_20_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                      className={`font-bold ${(p.technical_indicators?.dist_sma_20_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                     >
                       {p.technical_indicators?.dist_sma_20_pct !== undefined
                         ? `${p.technical_indicators.dist_sma_20_pct > 0 ? '+' : ''}${p.technical_indicators.dist_sma_20_pct}%`
@@ -567,9 +569,9 @@ export default function FinancialAdvisorAdvice() {
                     </span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">SMA 50 DIST</span>
+                    <span className="text-ink-mute block">SMA 50 dist</span>
                     <span
-                      className={`font-bold ${(p.technical_indicators?.dist_sma_50_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                      className={`font-bold ${(p.technical_indicators?.dist_sma_50_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                     >
                       {p.technical_indicators?.dist_sma_50_pct !== undefined
                         ? `${p.technical_indicators.dist_sma_50_pct > 0 ? '+' : ''}${p.technical_indicators.dist_sma_50_pct}%`
@@ -577,9 +579,9 @@ export default function FinancialAdvisorAdvice() {
                     </span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">SMA 200 DIST</span>
+                    <span className="text-ink-mute block">SMA 200 dist</span>
                     <span
-                      className={`font-bold ${(p.technical_indicators?.dist_sma_200_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                      className={`font-bold ${(p.technical_indicators?.dist_sma_200_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                     >
                       {p.technical_indicators?.dist_sma_200_pct !== undefined
                         ? `${p.technical_indicators.dist_sma_200_pct > 0 ? '+' : ''}${p.technical_indicators.dist_sma_200_pct}%`
@@ -604,29 +606,29 @@ export default function FinancialAdvisorAdvice() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-cyan-400/50 rounded-2xl max-w-xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto"
+            className="bg-raised border border-line-accent rounded-2xl max-w-xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto"
             {...dialog.panelProps}
           >
             {/* Modal Header */}
-            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-3">
+            <div className="flex items-center justify-between border-b border-line pb-3">
               <div className="flex items-center gap-2">
-                <span className="text-base font-extrabold text-white">{selectedPlay.ticker}</span>
+                <span className="text-base font-extrabold text-ink">{selectedPlay.ticker}</span>
                 <span
                   className={`px-2.5 py-0.5 rounded-md text-xs font-extrabold ${
                     selectedPlay.action === 'BUY'
-                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50'
-                      : 'bg-rose-500/20 text-rose-400 border border-rose-500/50'
+                      ? 'bg-positive/10 text-positive border border-positive/30'
+                      : 'bg-negative/10 text-negative border border-negative/30'
                   }`}
                 >
                   {selectedPlay.trade_type || selectedPlay.action}
                 </span>
-                <span className="text-micro text-cyan-300 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">
+                <span className="text-micro text-accent bg-accent-dim px-2 py-0.5 rounded border border-line">
                   {selectedPlay.technical_indicators?.ma_alignment || 'BULLISH_STACK'}
                 </span>
               </div>
               <button
                 onClick={() => setSelectedPlay(null)}
-                className="text-ink-dim hover:text-white font-bold text-xs bg-overlay hover:bg-slate-700 px-2.5 py-1 rounded-lg cursor-pointer"
+                className="text-ink-dim hover:text-ink font-bold text-xs bg-overlay hover:bg-slate-700 px-2.5 py-1 rounded-lg cursor-pointer"
               >
                 CLOSE
               </button>
@@ -669,24 +671,24 @@ export default function FinancialAdvisorAdvice() {
               {modalCalculations && (
                 <div className="grid grid-cols-4 gap-2 text-micro pt-1 border-t border-line">
                   <div>
-                    <span className="text-ink-mute block">POSITION SIZE</span>
-                    <span className="text-cyan-400 font-bold">
+                    <span className="text-ink-mute block">Position size</span>
+                    <span className="text-accent font-bold">
                       {formatCurrency(Number(modalCalculations.posSizeUsd), { compact: false })}
                     </span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">UNITS / SHARES</span>
+                    <span className="text-ink-mute block">Units / shares</span>
                     <span className="text-ink font-bold">{modalCalculations.shares}</span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">MAX RISK</span>
-                    <span className="text-rose-400 font-bold">
+                    <span className="text-ink-mute block">Max risk</span>
+                    <span className="text-negative font-bold">
                       {formatCurrency(-Number(modalCalculations.maxRiskUsd), { compact: false })}
                     </span>
                   </div>
                   <div>
-                    <span className="text-ink-mute block">TARGET PROFIT</span>
-                    <span className="text-emerald-400 font-bold">
+                    <span className="text-ink-mute block">Target profit</span>
+                    <span className="text-positive font-bold">
                       {formatCurrency(Number(modalCalculations.maxProfitUsd), {
                         compact: false,
                         signed: true,
@@ -698,20 +700,20 @@ export default function FinancialAdvisorAdvice() {
             </div>
 
             {/* Moving Average Distance Breakdown Grid */}
-            <div className="p-3 bg-page border border-cyan-500/30 rounded-xl space-y-2 text-micro">
+            <div className="p-3 bg-page border border-line rounded-xl space-y-2 text-micro">
               <div className="flex items-center justify-between">
-                <span className="text-cyan-400 font-bold uppercase">
+                <span className="text-accent font-bold uppercase">
                   Distance from moving averages
                 </span>
-                <span className="px-2 py-0.5 rounded text-micro font-bold bg-cyan-500/20 text-cyan-300">
+                <span className="px-2 py-0.5 rounded text-micro font-bold bg-accent-dim text-accent">
                   REGIME: {selectedPlay.technical_indicators?.ma_alignment || 'BULLISH_STACK'}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <div className="bg-raised p-2 rounded border border-line">
-                  <span className="text-ink-mute block">SMA 20 DISTANCE</span>
+                  <span className="text-ink-mute block">SMA 20 distance</span>
                   <span
-                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_20_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_20_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                   >
                     {selectedPlay.technical_indicators?.dist_sma_20_pct !== undefined
                       ? `${selectedPlay.technical_indicators.dist_sma_20_pct > 0 ? '+' : ''}${selectedPlay.technical_indicators.dist_sma_20_pct}%`
@@ -719,9 +721,9 @@ export default function FinancialAdvisorAdvice() {
                   </span>
                 </div>
                 <div className="bg-raised p-2 rounded border border-line">
-                  <span className="text-ink-mute block">SMA 50 DISTANCE</span>
+                  <span className="text-ink-mute block">SMA 50 distance</span>
                   <span
-                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_50_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_50_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                   >
                     {selectedPlay.technical_indicators?.dist_sma_50_pct !== undefined
                       ? `${selectedPlay.technical_indicators.dist_sma_50_pct > 0 ? '+' : ''}${selectedPlay.technical_indicators.dist_sma_50_pct}%`
@@ -729,9 +731,9 @@ export default function FinancialAdvisorAdvice() {
                   </span>
                 </div>
                 <div className="bg-raised p-2 rounded border border-line">
-                  <span className="text-ink-mute block">SMA 200 DISTANCE</span>
+                  <span className="text-ink-mute block">SMA 200 distance</span>
                   <span
-                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_200_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                    className={`font-bold ${(selectedPlay.technical_indicators?.dist_sma_200_pct || 0) >= 0 ? 'text-positive' : 'text-negative'}`}
                   >
                     {selectedPlay.technical_indicators?.dist_sma_200_pct !== undefined
                       ? `${selectedPlay.technical_indicators.dist_sma_200_pct > 0 ? '+' : ''}${selectedPlay.technical_indicators.dist_sma_200_pct}%`
@@ -743,8 +745,8 @@ export default function FinancialAdvisorAdvice() {
 
             {/* GARCH Volatility Cone Tranche Exits */}
             {selectedPlay.volatility_cone && (
-              <div className="p-3 bg-page rounded-xl border border-amber-500/30 space-y-1.5 text-micro">
-                <div className="flex items-center justify-between text-amber-400 font-bold uppercase">
+              <div className="p-3 bg-page rounded-xl border border-caution/30 space-y-1.5 text-micro">
+                <div className="flex items-center justify-between text-caution font-bold uppercase">
                   <span>GARCH(1,1) VOLATILITY CONE TRANCHE EXITS</span>
                   <span>
                     COND VOL:{' '}
@@ -756,7 +758,7 @@ export default function FinancialAdvisorAdvice() {
                 <div className="grid grid-cols-3 gap-2">
                   <div className="bg-raised p-2 rounded border border-line">
                     <span className="text-ink-dim block">TP1 (1.0&sigma; / 33%)</span>
-                    <span className="text-emerald-400 font-bold">
+                    <span className="text-positive font-bold">
                       $
                       {selectedPlay.volatility_cone.tp1_sigma_1_0 ||
                         (selectedPlay.entry_level * 1.05).toFixed(2)}
@@ -764,7 +766,7 @@ export default function FinancialAdvisorAdvice() {
                   </div>
                   <div className="bg-raised p-2 rounded border border-line">
                     <span className="text-ink-dim block">TP2 (2.0&sigma; / 33%)</span>
-                    <span className="text-emerald-300 font-bold">
+                    <span className="text-positive font-bold">
                       $
                       {selectedPlay.volatility_cone.tp2_sigma_2_0 ||
                         (selectedPlay.entry_level * 1.1).toFixed(2)}
@@ -772,7 +774,7 @@ export default function FinancialAdvisorAdvice() {
                   </div>
                   <div className="bg-raised p-2 rounded border border-line">
                     <span className="text-ink-dim block">TP3 (3.0&sigma; / 34%)</span>
-                    <span className="text-cyan-300 font-bold">
+                    <span className="text-accent font-bold">
                       $
                       {selectedPlay.volatility_cone.tp3_sigma_3_0 ||
                         (selectedPlay.entry_level * 1.15).toFixed(2)}
@@ -785,20 +787,20 @@ export default function FinancialAdvisorAdvice() {
             {/* Trade Levels & Risk Metrics */}
             <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line text-micro">
               <div>
-                <span className="text-ink-dim">ENTRY PRICE:</span>{' '}
-                <span className="text-white font-bold">${selectedPlay.entry_level}</span>
+                <span className="text-ink-dim">Entry price:</span>{' '}
+                <span className="text-ink font-bold">${selectedPlay.entry_level}</span>
               </div>
               <div>
-                <span className="text-ink-dim">TARGET PRICE:</span>{' '}
-                <span className="text-emerald-400 font-bold">${selectedPlay.target_price}</span>
+                <span className="text-ink-dim">Target price:</span>{' '}
+                <span className="text-positive font-bold">${selectedPlay.target_price}</span>
               </div>
               <div>
-                <span className="text-ink-dim">STOP LOSS:</span>{' '}
-                <span className="text-rose-400 font-bold">${selectedPlay.stop_loss}</span>
+                <span className="text-ink-dim">Stop loss:</span>{' '}
+                <span className="text-negative font-bold">${selectedPlay.stop_loss}</span>
               </div>
               <div>
-                <span className="text-ink-dim">STOP MULTIPLIER:</span>{' '}
-                <span className="text-amber-400 font-bold">
+                <span className="text-ink-dim">Stop multiplier:</span>{' '}
+                <span className="text-caution font-bold">
                   {formatNumber(selectedPlay.microstructure_stop_multiplier, { decimals: 2 })}x ATR
                 </span>
               </div>
@@ -806,7 +808,7 @@ export default function FinancialAdvisorAdvice() {
 
             {/* Rationale */}
             <div className="space-y-1">
-              <span className="text-ink-dim block text-micro">QUANTITATIVE MODEL RATIONALE:</span>
+              <span className="text-ink-dim block text-micro">Why the model suggests it:</span>
               <p className="text-ink font-sans text-micro leading-relaxed bg-page p-3 rounded-xl border border-line">
                 {selectedPlay.quantitative_rationale}
               </p>
@@ -822,7 +824,7 @@ export default function FinancialAdvisorAdvice() {
                   <span>
                     <IconSignal className="inline-block shrink-0" />
                   </span>
-                  <span>CONFIRM ORDER DISPATCH</span>
+                  <span>Place this paper order</span>
                 </button>
                 <button
                   onClick={() => setSelectedPlay(null)}
@@ -834,12 +836,12 @@ export default function FinancialAdvisorAdvice() {
 
               <button
                 onClick={() => setExplainingSignal(selectedPlay.ticker)}
-                className="w-full py-2 rounded-xl bg-cyan-950/40 border border-cyan-500/40 text-cyan-300 text-xs font-bold hover:bg-cyan-900/50 transition-colors cursor-pointer flex items-center justify-center gap-2"
+                className="w-full py-2 rounded-xl bg-accent-dim border border-line-accent text-accent text-xs font-bold hover:bg-accent-dim transition-colors cursor-pointer flex items-center justify-center gap-2"
               >
                 <span>
                   <IconTarget className="inline-block shrink-0" />
                 </span>
-                <span>EXPLAIN COMPUTATION & MODEL CARD</span>
+                <span>How this was worked out</span>
               </button>
             </div>
           </div>

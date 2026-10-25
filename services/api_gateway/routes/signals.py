@@ -31,7 +31,7 @@ from shared.utils.signal_families import observations
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.quiet_failures import swallowed
 from shared.utils.rbac import Role, require_role
-from shared.utils.signal_store import ACTIVE_KEY, EVIDENCE_CACHE_PREFIX, OUTCOMES_KEY, STUDY_KEY
+from shared.utils.signal_store import ACTIVE_KEY, EVIDENCE_CACHE_PREFIX, OUTCOMES_KEY, STUDY_KEY, SIGNAL_MATRIX_INDEX_KEY, SIGNAL_MATRIX_KEY
 
 logger = logging.getLogger("api.signals")
 
@@ -219,3 +219,98 @@ async def evidence_dossier(
         "instrument": ticker.strip().upper(),
         "dossier": d,
     }
+
+
+@router.get("/matrix")
+async def signal_matrix_board(
+    redis_client=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """Every anomalous ticker of the last three days with its signal tally:
+    proven, supported and published votes counted separately, execution cost,
+    and the headline measures (services/agents/dossier_engine.py)."""
+    raw = getattr(redis_client, "raw", redis_client)
+    blob = await raw.get(SIGNAL_MATRIX_INDEX_KEY)
+    if not blob:
+        return {"board": [], "note": "The signal matrix is built every few minutes; none yet."}
+    return json.loads(_decode(blob))
+
+
+@router.get("/matrix/{ticker}")
+async def signal_matrix_ticker(
+    ticker: str,
+    redis_client=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """Every signal for one anomalous ticker, each with its evidence status,
+    source, citation and as-of time."""
+    raw = getattr(redis_client, "raw", redis_client)
+    t = ticker.strip().upper()
+    blob = await raw.hget(SIGNAL_MATRIX_KEY, t)
+    if not blob:
+        return {"ticker": t, "signals": [], "note": "Not anomalous in the last three days, or not yet built."}
+    return json.loads(_decode(blob))
+
+
+# Source -> (SQL for its newest record, seconds after which it is stale in a session).
+_FRESHNESS_SQL = {
+    "live bars": ("SELECT max(time) FROM tradfi_bars WHERE time > NOW() - INTERVAL '7 days'", 300),
+    "daily history": ("SELECT max(day)::timestamptz FROM daily_bars WHERE day > CURRENT_DATE - 14", 3 * 86400),
+    "option chains": ("SELECT max(updated_at) FROM option_daily WHERE day > CURRENT_DATE - 7", 3600),
+    "option sweeps": ("SELECT max(created_at) FROM events WHERE type = 'options_flow' AND created_at > NOW() - INTERVAL '7 days'", 3600),
+    "short interest": ("SELECT max(settlement_date)::timestamptz FROM short_interest", 30 * 86400),
+    "filings": ("SELECT max(created_at) FROM events WHERE type = 'filing' AND created_at > NOW() - INTERVAL '7 days'", 6 * 3600),
+    "insider trades": ("SELECT max(created_at) FROM events WHERE type = 'insider_trade' AND created_at > NOW() - INTERVAL '7 days'", 24 * 3600),
+    "news": ("SELECT max(created_at) FROM events WHERE type = 'headline' AND created_at > NOW() - INTERVAL '7 days'", 1800),
+}
+
+
+@router.get("/freshness")
+async def data_freshness(
+    db=Depends(get_db),
+    redis_client=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """How old each input is, against how often it should arrive."""
+    from shared.utils.market_session import Session, current_session
+    from shared.utils.signal_store import FACTOR_REPORT_KEY, RECOMMENDATIONS_KEY
+
+    now = datetime.now(timezone.utc)
+    in_session = current_session() == Session.REGULAR
+    out: List[Dict[str, Any]] = []
+
+    def entry(name: str, ts: Any, stale_after: int) -> Dict[str, Any]:
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                ts = None
+        if isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (now - ts).total_seconds() if isinstance(ts, datetime) else None
+        return {"source": name, "newest": ts.isoformat() if isinstance(ts, datetime) else None,
+                "age_sec": round(age) if age is not None else None, "stale_after_sec": stale_after,
+                "stale": age is None or (age > stale_after and (in_session or stale_after >= 86400))}
+
+    for name, (sql, stale) in _FRESHNESS_SQL.items():
+        try:
+            rows = await db.query(sql)
+            ts = next(iter(rows[0].values())) if rows else None
+        except Exception as exc:
+            swallowed("api.signals.freshness", exc, logger)
+            ts = None
+        out.append(entry(name, ts, stale))
+    raw = getattr(redis_client, "raw", redis_client)
+    for name, key, field_, stale in (("model", FACTOR_REPORT_KEY, "generated_at", 36 * 3600),
+                                     ("reaction study", STUDY_KEY, "generated_at", 12 * 3600),
+                                     ("signal board", SIGNAL_MATRIX_INDEX_KEY, "generated_at", 900),
+                                     ("trade ideas", RECOMMENDATIONS_KEY, "generated_at", 7200)):
+        try:
+            blob = await raw.get(key)
+            ts = json.loads(_decode(blob)).get(field_) if blob else None
+        except Exception as exc:
+            swallowed("api.signals.freshness_redis", exc, logger)
+            ts = None
+        out.append(entry(name, ts, stale))
+    return {"generated_at": now.isoformat(), "in_session": in_session, "sources": out,
+            "stale": [s["source"] for s in out if s["stale"]]}

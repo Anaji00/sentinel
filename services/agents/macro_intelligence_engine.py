@@ -17,22 +17,17 @@ import json
 import math
 import logging
 from shared.utils.agent_conclusions import (
-    AGENT_CORRELATION_ANALYSIS_PREFIX,
-    HAWKES_BRANCHING_RATIOS_KEY,
     MACRO_CREDIT_RATIO_KEY,
     MACRO_INVERSE_CORRELATION_PREFIX,
     MACRO_RATES_REGIME_KEY,
     MACRO_SPREAD_2Y10Y_KEY,
-    TRADFI_BACKFILL_REPORT_KEY,
 )
 import os
-import sys
 import time
 import numpy as np
 from shared.utils.deterministic_briefs import rates_brief_fields, vol_surface_fields
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -802,7 +797,8 @@ class MacroIntelligenceEngine(SentinelAgent):
             round((put_iv - call_iv) * 10000.0, 1)
             if (call_iv is not None and put_iv is not None) else None
         )
-        skew_str = f"{iv_skew_bps:+.1f} bps" if iv_skew_bps is not None else "not measured"
+        # Volatility points for readers (100 bps of implied vol = 1 point).
+        skew_str = f"{iv_skew_bps / 100:+.1f} points" if iv_skew_bps is not None else "not measured"
 
         dedup_key = f"vol_surface_eval:{ticker}:{int(time.time() // 1800)}"
         if await self.is_recently_processed(dedup_key, window_seconds=DEDUP_WINDOW_MEDIUM_SEC):
@@ -845,7 +841,10 @@ class MacroIntelligenceEngine(SentinelAgent):
             # Publish structured AgentBulletin
             safe_create_task(self.publish_bulletin(
                 bulletin_type="alert",
-                summary=f"Vol Surface {ticker}: P/C {pc_ratio_str}, Skew {skew_str} ({brief.volatility_regime})",
+                summary=(
+                    f"{ticker} options: {pc_ratio_str} bets on a fall for every bet on a rise; "
+                    f"extra cost of crash protection {skew_str} ({brief.volatility_regime.lower()})"
+                ),
                 ticker=ticker,
                 conviction=brief.tail_risk_conviction,
                 # No measured ratio, no directional claim.

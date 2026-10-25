@@ -141,9 +141,9 @@ async function handleProxy(req: NextRequest, context: { params: Promise<{ path: 
       statusText: res.statusText,
       headers: responseHeaders,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     return NextResponse.json(
-      { error: 'Backend gateway proxy error', message: err.message },
+      { error: 'Backend gateway proxy error', message: err instanceof Error ? err.message : String(err) },
       { status: 502 },
     );
   }

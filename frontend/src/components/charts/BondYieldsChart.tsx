@@ -1,13 +1,13 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import useSWR from 'swr';
 import { describeApiError, fetcher } from '../../lib/api';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { useLiveEvents } from '../../lib/useLiveEvents';
 import { Activity, Radio } from 'lucide-react';
-import { formatBps, formatPercent } from '../../lib/format';
+import { formatNumber, formatPercent } from '../../lib/format';
 import ProvenanceBadge, { ProvenanceType } from '../ProvenanceBadge';
 import { PALETTE } from '../../lib/palette';
 import { POLL } from '../ui/DataProvider';
@@ -41,11 +41,69 @@ interface MarketSeriesResponse {
   series: Record<string, SeriesPoint[]>;
 }
 
+/** Live-tick symbols for each yield, matched exactly. A substring test sent
+ * every ticker containing a "2" into the 2-year line, and counted IRX -- the
+ * 13-week bill -- as a 2-year yield. */
+interface YieldCurveResponse {
+  series: Record<'US30Y' | 'US10Y' | 'US02Y', { date: string; yield: number }[]>;
+  source: string;
+  as_of: string | null;
+}
+
+/** The 2s10s spread from one date of the Treasury curve: the latest date that
+ * has both maturities. Null when no date has both. */
+export function sameDaySpread(
+  series: Partial<Record<'US02Y' | 'US10Y' | 'US30Y', { date: string; yield: number }[]>> | undefined,
+): { date: string; spread: number } | null {
+  const two = new Map((series?.US02Y ?? []).map((p) => [p.date, p.yield]));
+  const ten = [...(series?.US10Y ?? [])].sort((a, b) => b.date.localeCompare(a.date));
+  for (const p of ten) {
+    const y2 = two.get(p.date);
+    if (y2 !== undefined) return { date: p.date, spread: p.yield - y2 };
+  }
+  return null;
+}
+
+export const YIELD_SYMBOLS = {
+  US30Y: new Set(['US30Y', 'US30', 'TYX']),
+  US10Y: new Set(['US10Y', 'TNX']),
+  US02Y: new Set(['US02Y', 'US2Y', '2Y']),
+};
+
+export interface PlotBox {
+  t0: number;
+  t1: number;
+  lo: number;
+  hi: number;
+  width: number;
+  height: number;
+}
+
+/** An SVG path for one series, x by timestamp on the shared axis, y by value. */
+export function timePath(series: { timestamp: string; price: number | null }[], b: PlotBox): string {
+  const span = b.t1 - b.t0;
+  const range = b.hi - b.lo || 1;
+  const pts = series
+    .map((s) => ({ t: Date.parse(s.timestamp), v: s.price }))
+    .filter((p): p is { t: number; v: number } => Number.isFinite(p.t) && typeof p.v === 'number' && Number.isFinite(p.v))
+    .sort((a, b2) => a.t - b2.t);
+  return pts
+    .map((p, i) => {
+      const x = span > 0 ? ((p.t - b.t0) / span) * b.width : b.width;
+      const y = b.height - ((p.v - b.lo) / range) * b.height;
+      return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(' ');
+}
+
 export default function BondYieldsChart() {
-  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
   // Real-time WebSocket stream ticks
   const liveTradfiEvents = useLiveEvents('tradfi');
+
+  // The lines: one official daily series per maturity, so all three share a
+  // time scale. The figures above them stay on the latest intraday readings.
+  const { data: curve } = useSWR<YieldCurveResponse>('/radar/yield-curve?days=60', fetcher, { refreshInterval: POLL.slow });
 
   const { data, error } = useSWR<MarketSeriesResponse>(
     '/radar/market-series?symbols=US30Y,US10Y,US02Y,TLT,IEF&limit=50',
@@ -53,9 +111,12 @@ export default function BondYieldsChart() {
     { refreshInterval: POLL.live },
   );
 
-  const base30Y = data?.series?.['US30Y'] || data?.series?.['US30'] || [];
-  const base10Y = data?.series?.['US10Y'] || [];
-  const base2Y = data?.series?.['US02Y'] || data?.series?.['US2Y'] || data?.series?.['2Y'] || [];
+  const base30Y = useMemo(() => data?.series?.['US30Y'] || data?.series?.['US30'] || [], [data]);
+  const base10Y = useMemo(() => data?.series?.['US10Y'] || [], [data]);
+  const base2Y = useMemo(
+    () => data?.series?.['US02Y'] || data?.series?.['US2Y'] || data?.series?.['2Y'] || [],
+    [data],
+  );
 
   // Merge live ticks from WebSocket stream
   const us30ySeries = useMemo(() => {
@@ -67,7 +128,7 @@ export default function BondYieldsChart() {
         e.primary_entity?.name ||
         ''
       ).toUpperCase();
-      if (sym.includes('30') || sym.includes('TYX')) {
+      if (YIELD_SYMBOLS.US30Y.has(sym)) {
         const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
         if (p)
           list.push({
@@ -90,7 +151,7 @@ export default function BondYieldsChart() {
         e.primary_entity?.name ||
         ''
       ).toUpperCase();
-      if (sym.includes('10') || sym.includes('TNX')) {
+      if (YIELD_SYMBOLS.US10Y.has(sym)) {
         const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
         if (p)
           list.push({
@@ -113,7 +174,7 @@ export default function BondYieldsChart() {
         e.primary_entity?.name ||
         ''
       ).toUpperCase();
-      if (sym.includes('2') || sym.includes('2YY') || sym.includes('IRX')) {
+      if (YIELD_SYMBOLS.US02Y.has(sym)) {
         const p = e.financial_data?.underlying_price || e.financial_data?.close_price;
         if (p)
           list.push({
@@ -133,104 +194,49 @@ export default function BondYieldsChart() {
   const latest10Y = us10ySeries[us10ySeries.length - 1]?.price || null;
   const latest2Y = us02ySeries[us02ySeries.length - 1]?.price || null;
 
-  const spread2Y10Y = latest10Y !== null && latest2Y !== null ? latest10Y - latest2Y : null;
-  const spread10Y30Y = latest30Y !== null && latest10Y !== null ? latest30Y - latest10Y : null;
+  // Both legs from the same day. The intraday 10-year minus the 2-year's
+  // previous Treasury close mixed two days, wrong by exactly the day's move
+  // (14 bp on 15 Oct). The Treasury curve publishes both for one date; the
+  // intraday pair is used only when both legs are intraday.
+  const sameDay = sameDaySpread(curve?.series);
+  const spread2Y10Y = sameDay ? sameDay.spread : null;
+  const spreadDate = sameDay?.date ?? null;
   const isInverted = spread2Y10Y !== null ? spread2Y10Y < 0 : false;
-
-  const pointsCount = Math.max(us30ySeries.length, us10ySeries.length, us02ySeries.length);
 
   // The provenance of whichever point is actually on screen. A live WebSocket
   // tick carries none, so the badge falls back to the last point that did.
-  const latest2YProvenance = useMemo(() => {
+  const latest2YProvenance = (() => {
     for (let i = us02ySeries.length - 1; i >= 0; i--) {
       const point = us02ySeries[i];
-      if (point?.provenance) {
-        return { provenance: point.provenance, provider: point.provider };
-      }
+      if (point?.provenance) return { provenance: point.provenance, provider: point.provider };
     }
     return null;
-  }, [us02ySeries]);
+  })();
 
-  // Normalize SVG Path Coordinates for Real Ticks Only
-  const { path30Y, path10Y, path2Y, pointsData } = useMemo(() => {
-    if (!hasData) {
-      return { path30Y: '', path10Y: '', path2Y: '', pointsData: [] };
-    }
-    const p30: { x: number; y: number }[] = [];
-    const p10: { x: number; y: number }[] = [];
-    const p2: { x: number; y: number }[] = [];
-    const combined: {
-      time: string;
-      y30: number | null;
-      y10: number | null;
-      y2: number | null;
-      spread: number | null;
-    }[] = [];
-
-    const allPrices = [
-      ...us30ySeries.map((s) => s.price),
-      ...us10ySeries.map((s) => s.price),
-      ...us02ySeries.map((s) => s.price),
-    ].filter((p): p is number => typeof p === 'number' && Number.isFinite(p));
-
-    // Guard the empty case explicitly. `Math.min(...[])` is Infinity, which is
-    // truthy, so an `|| fallback` never fires and the axis domain becomes
-    // [Infinity, -Infinity] -- every plotted coordinate then evaluates to NaN.
-    const hasPrices = allPrices.length > 0;
-    const minVal = hasPrices ? Math.min(...allPrices) * 0.98 : 0;
-    const maxVal = hasPrices ? Math.max(...allPrices) * 1.02 : 1;
-    const height = 180;
-    const width = 600;
-
-    for (let i = 0; i < pointsCount; i++) {
-      const x = (i / Math.max(1, pointsCount - 1)) * width;
-      const v30 = us30ySeries[i]?.price ?? null;
-      const v10 = us10ySeries[i]?.price ?? null;
-      const v2 = us02ySeries[i]?.price ?? null;
-
-      if (v30 !== null) {
-        const y30 = height - ((v30 - minVal) / (maxVal - minVal || 1)) * height;
-        p30.push({ x, y: y30 });
-      }
-
-      if (v10 !== null) {
-        const y10 = height - ((v10 - minVal) / (maxVal - minVal || 1)) * height;
-        p10.push({ x, y: y10 });
-      }
-
-      if (v2 !== null) {
-        const y2 = height - ((v2 - minVal) / (maxVal - minVal || 1)) * height;
-        p2.push({ x, y: y2 });
-      }
-
-      combined.push({
-        time:
-          us30ySeries[i]?.timestamp ||
-          us10ySeries[i]?.timestamp ||
-          us02ySeries[i]?.timestamp ||
-          new Date().toISOString(),
-        y30: v30,
-        y10: v10,
-        y2: v2,
-        spread: v10 !== null && v2 !== null ? v10 - v2 : null,
-      });
-    }
-
-    const path30YStr = p30.reduce(
-      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
-      '',
-    );
-    const path10YStr = p10.reduce(
-      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
-      '',
-    );
-    const path2YStr = p2.reduce(
-      (acc, pt, idx) => `${acc} ${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`,
-      '',
-    );
-
-    return { path30Y: path30YStr, path10Y: path10YStr, path2Y: path2YStr, pointsData: combined };
-  }, [us30ySeries, us10ySeries, us02ySeries, pointsCount, hasData]);
+  // Each line is placed by its own dates on one shared time axis. Placing
+  // points by array position squeezed a short series into a corner, and the
+  // intraday ticks of one maturity sat beside the daily closes of another.
+  const { path30Y, path10Y, path2Y, curveSpan } = useMemo(() => {
+    const toPts = (k: 'US30Y' | 'US10Y' | 'US02Y') =>
+      (curve?.series?.[k] ?? []).map((p) => ({ timestamp: `${p.date}T20:00:00Z`, price: p.yield }));
+    const s30 = toPts('US30Y');
+    const s10 = toPts('US10Y');
+    const s2 = toPts('US02Y');
+    const all = [...s30, ...s10, ...s2];
+    const times = all.map((p) => Date.parse(p.timestamp)).filter(Number.isFinite);
+    const prices = all.map((p) => p.price).filter((v) => Number.isFinite(v));
+    if (!times.length || !prices.length) return { path30Y: '', path10Y: '', path2Y: '', curveSpan: null };
+    const lo = Math.min(...prices);
+    const hi = Math.max(...prices);
+    const pad = Math.max(0.05, (hi - lo) * 0.1);
+    const box = { t0: Math.min(...times), t1: Math.max(...times), lo: lo - pad, hi: hi + pad, width: 600, height: 180 };
+    return {
+      path30Y: timePath(s30, box),
+      path10Y: timePath(s10, box),
+      path2Y: timePath(s2, box),
+      curveSpan: { from: s2[0]?.timestamp.slice(0, 10) ?? null, to: curve?.as_of ?? null, days: s2.length, lo: box.lo, hi: box.hi },
+    };
+  }, [curve]);
 
   return (
     <Card
@@ -253,18 +259,18 @@ export default function BondYieldsChart() {
     >
       <div className="p-4 space-y-3">
         {/* Metric Summary Ribbon */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 bg-inset p-3 rounded-lg border border-cyan-500/20 text-xs">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 bg-inset p-3 rounded-lg border border-line text-xs">
           <div>
             <span className="text-ink-dim block text-micro uppercase font-bold">
               30Y BOND YIELD (US30Y)
             </span>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="text-emerald-400 font-extrabold text-base">
+              <span className="text-positive font-extrabold text-base">
                 {latest30Y !== null
                   ? formatPercent(latest30Y, { decimals: 2 })
-                  : 'AWAITING FEED...'}
+                  : 'Waiting…'}
               </span>
-              <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+              <Activity className="w-3.5 h-3.5 text-positive animate-pulse" />
             </div>
           </div>
 
@@ -273,10 +279,10 @@ export default function BondYieldsChart() {
               10Y TREASURY YIELD (US10Y)
             </span>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="text-cyan-400 font-extrabold text-base">
+              <span className="text-accent font-extrabold text-base">
                 {latest10Y !== null
                   ? formatPercent(latest10Y, { decimals: 2 })
-                  : 'AWAITING FEED...'}
+                  : 'Waiting…'}
               </span>
             </div>
           </div>
@@ -286,8 +292,8 @@ export default function BondYieldsChart() {
               2Y TREASURY YIELD (US02Y)
             </span>
             <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-              <span className="text-purple-400 font-extrabold text-base">
-                {latest2Y !== null ? formatPercent(latest2Y, { decimals: 2 }) : 'AWAITING FEED...'}
+              <span className="text-accent font-extrabold text-base">
+                {latest2Y !== null ? formatPercent(latest2Y, { decimals: 2 }) : 'Waiting…'}
               </span>
               {latest2Y !== null && latest2YProvenance && (
                 <ProvenanceBadge
@@ -300,26 +306,42 @@ export default function BondYieldsChart() {
           </div>
 
           <div>
-            <span className="text-ink-dim block text-micro uppercase font-bold">2Y/10Y SPREAD</span>
+            <span className="text-ink-dim block text-micro uppercase font-bold" title="10-year minus 2-year Treasury yield. Below zero (an inverted curve) has often come before recessions.">
+              10-year minus 2-year rate
+            </span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span
-                className={`font-extrabold text-base ${spread2Y10Y !== null && spread2Y10Y < 0 ? 'text-rose-400' : 'text-emerald-400'}`}
+                className={`font-extrabold text-base ${spread2Y10Y !== null && spread2Y10Y < 0 ? 'text-negative' : 'text-positive'}`}
               >
                 {spread2Y10Y !== null
-                  ? formatBps(spread2Y10Y, { from: 'percent', decimals: 1 })
-                  : 'AWAITING FEED...'}
+                  ? `${spread2Y10Y >= 0 ? '+' : ''}${formatNumber(spread2Y10Y, { decimals: 2 })} pts`
+                  : 'Waiting…'}
               </span>
+              {spreadDate && <span className="text-micro text-ink-mute">close of {spreadDate}</span>}
             </div>
           </div>
         </div>
 
         {/* SVG Yield Chart or Awaiting Live Stream State */}
-        {hasData ? (
+        {path2Y && (
+          <div className="flex flex-wrap gap-4 text-micro text-ink-dim">
+            <span className="flex items-center gap-1.5"><span className="h-0.5 w-4 rounded" style={{ background: PALETTE.positive }} />30-year</span>
+            <span className="flex items-center gap-1.5"><span className="h-0.5 w-4 rounded" style={{ background: PALETTE.accent }} />10-year</span>
+            <span className="flex items-center gap-1.5"><span className="h-0.5 w-4 rounded" style={{ background: PALETTE.info }} />2-year</span>
+            {curveSpan && (
+              <span className="text-ink-mute">
+                Daily close, last {curveSpan.days} trading days ({curveSpan.from} to {curveSpan.to}) · {curveSpan.lo.toFixed(2)}% to{' '}
+                {curveSpan.hi.toFixed(2)}% · US Treasury
+              </span>
+            )}
+          </div>
+        )}
+        {path2Y || path10Y || path30Y ? (
           <div className="relative h-48 w-full bg-page rounded-lg border border-line p-2 overflow-hidden">
             <svg
               viewBox="0 0 600 180"
+              preserveAspectRatio="none"
               className="w-full h-full overflow-visible"
-              onMouseLeave={() => setHoverIndex(null)}
             >
               <line
                 x1="0"
@@ -356,6 +378,7 @@ export default function BondYieldsChart() {
                   fill="none"
                   stroke={PALETTE.positive}
                   strokeWidth="2.5"
+                  vectorEffect="non-scaling-stroke"
                   strokeLinecap="round"
                 />
               )}
@@ -366,6 +389,7 @@ export default function BondYieldsChart() {
                   fill="none"
                   stroke={PALETTE.accent}
                   strokeWidth="2.5"
+                  vectorEffect="non-scaling-stroke"
                   strokeLinecap="round"
                 />
               )}
@@ -376,18 +400,19 @@ export default function BondYieldsChart() {
                   fill="none"
                   stroke={PALETTE.info}
                   strokeWidth="2.5"
+                  vectorEffect="non-scaling-stroke"
                   strokeLinecap="round"
                 />
               )}
             </svg>
           </div>
         ) : (
-          <div className="h-48 w-full bg-page rounded-lg border border-dashed border-amber-500/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
-            <Radio className="w-6 h-6 text-amber-400 animate-pulse" />
-            <span className="text-xs font-bold text-amber-400 uppercase tracking-widest">
+          <div className="h-48 w-full bg-page rounded-lg border border-dashed border-caution/30 flex flex-col items-center justify-center text-center p-4 space-y-2">
+            <Radio className="w-6 h-6 text-caution animate-pulse" />
+            <span className="text-xs font-semibold text-caution">
               {error
                 ? `Treasury yields: ${describeApiError(error)}`
-                : 'AWAITING LIVE DATA STREAM FOR TREASURY YIELDS (30Y, 10Y, 2Y)'}
+                : 'Waiting for the first Treasury yield readings'}
             </span>
             {/* The reassurance below is a claim about the backend, and it was
                 printed while the request to that backend was failing. */}

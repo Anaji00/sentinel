@@ -16,114 +16,66 @@ import Link from 'next/link';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatAge, formatNumber } from '../lib/format';
+import {
+  ideaDetails,
+  LABEL,
+  ORDER,
+  plainIdea,
+  plainOption,
+  type Idea,
+  type Recommendations,
+} from '../lib/ideas';
 import { POLL } from './ui/DataProvider';
 import { IconCheck } from './ui/icons';
+import { IdeaCard } from './IdeaCard';
 
-interface OptionLeg {
-  symbol: string;
-  right: 'C' | 'P';
-  side: 'buy' | 'sell';
-  strike: number;
-  delta: number;
-  iv: number | null;
-  mid: number;
-}
+export { ideaDetails, plainIdea, plainOption };
 
-interface OptionIdea {
-  structure: string;
-  expiry: string;
-  dte: number;
-  legs: OptionLeg[];
-  net: number;
-  max_loss: number;
-  max_gain: number | null;
-  breakeven: number;
-  prob_profit_by_delta: number;
-  iv_regime: string;
-  atm_iv: number | null;
-  realized_vol: number | null;
-}
+/** Event chips shown before "more": the strongest first, as the engine orders them. */
+const EVENT_CHIPS = 12;
 
-interface Idea {
-  ticker: string;
-  direction: 1 | -1;
-  percentile: number | null;
-  action: string;
-  entry: number;
-  stop: number | null;
-  exit: string;
-  expected_excess_bps: number | null;
-  realized_vol: number | null;
-  cp_iv_spread: number | null;
-  option: OptionIdea | null;
-}
-
-interface HorizonIdeas {
-  withheld?: string | null;
-  horizon_days: number;
-  validated: boolean;
-  model: string | null;
-  net_sharpe: number | null;
-  deflated_sharpe: number | null;
-  expected_excess_bps: number | null;
-  ideas: Idea[];
-}
-
-interface IntradaySignal {
-  id: string;
-  instrument: string;
-  horizon: string;
-  direction: string;
-  probability: number;
-  expected_bps: number | null;
-  entry_price: number | null;
-  families?: string[];
-}
-
-interface Recommendations {
-  generated_at?: string;
-  as_of?: string;
-  primary_horizon?: string;
-  horizons: Record<string, HorizonIdeas>;
-  intraday: IntradaySignal[];
-  note?: string;
-}
-
-const STRUCTURE: Record<string, string> = {
-  long_call: 'Buy call',
-  long_put: 'Buy put',
-  bull_call_debit: 'Bull call spread (debit)',
-  bear_put_debit: 'Bear put spread (debit)',
-  bull_put_credit: 'Bull put spread (credit)',
-  bear_call_credit: 'Bear call spread (credit)',
+const HORIZON_HINT: Record<string, string> = {
+  daily: 'Hold for one trading day',
+  weekly: 'Hold for a week',
+  monthly: 'Hold for about a month',
+  events: 'Driven by insider buying, large trades and company filings',
 };
 
-const ORDER = ['daily', 'weekly', 'monthly'];
-const LABEL: Record<string, string> = { daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly' };
+/** A Sharpe ratio in words: how steady the model's record has been on data it
+ * never saw. The number itself goes in the tooltip, for those who want it. */
+export function recordWords(sharpe: number | null | undefined): string {
+  if (sharpe == null) return 'not yet measured';
+  if (sharpe >= 1.5) return 'strong';
+  if (sharpe >= 0.8) return 'good';
+  if (sharpe > 0) return 'modest';
+  return 'weak';
+}
 
-const money = (v: number | null | undefined) => (v == null ? ABSENT : `$${formatNumber(Math.abs(v), { decimals: 0 })}`);
-
-function OptionCell({ o }: { o: OptionIdea | null }) {
-  if (!o) return <span className="text-ink-mute">no tradable chain in window</span>;
+function BetsMeter({ bets, of }: { bets: number | null | undefined; of: number }) {
+  if (!of) return null;
+  const share = bets != null ? Math.min(1, bets / of) : 0;
   return (
-    <div className="space-y-0.5">
-      <div className="text-white">
-        {STRUCTURE[o.structure] ?? o.structure} · {o.expiry} ({o.dte}d)
-      </div>
-      <div className="font-mono text-ink-dim">
-        {o.legs.map((l) => `${l.side === 'buy' ? '+' : '-'}${l.strike}${l.right} @${formatNumber(l.mid, { decimals: 2 })}`).join('  ')}
-      </div>
-      <div className="font-mono text-micro text-ink-mute">
-        {o.net < 0 ? 'debit' : 'credit'} {money(o.net)} · max loss {money(o.max_loss)} · max gain{' '}
-        {o.max_gain == null ? 'open' : money(o.max_gain)} · BE {formatNumber(o.breakeven, { decimals: 2 })} · P(profit)~
-        {formatNumber(o.prob_profit_by_delta * 100, { decimals: 0 })}%
-      </div>
-      <div className="text-micro text-ink-mute">
-        IV {o.atm_iv != null ? `${formatNumber(o.atm_iv * 100, { decimals: 0 })}%` : ABSENT} vs realised{' '}
-        {o.realized_vol != null ? `${formatNumber(o.realized_vol * 100, { decimals: 0 })}%` : ABSENT}: {o.iv_regime}
-      </div>
-    </div>
+    <span
+      className="inline-flex items-center gap-1.5 text-micro text-ink-mute"
+      title="Stocks that tend to move together count as one bet"
+    >
+      <span className="inline-block h-1.5 w-16 rounded-full bg-inset overflow-hidden">
+        <span
+          className="block h-full rounded-full bg-accent"
+          style={{ width: `${share * 100}%` }}
+        />
+      </span>
+      really {bets != null ? formatNumber(bets, { decimals: 1 }) : ABSENT} separate bets of {of}
+    </span>
   );
+}
+
+interface Column {
+  title: string;
+  ideas: Idea[];
+  bets: number | null | undefined;
+  of: number;
+  tone: string;
 }
 
 export function TradeIdeas() {
@@ -132,122 +84,244 @@ export function TradeIdeas() {
   });
   const available = ORDER.filter((h) => data?.horizons?.[h]);
   const [tab, setTab] = useState<string | null>(null);
-  const active = tab && data?.horizons?.[tab] ? tab : data?.primary_horizon && data.horizons?.[data.primary_horizon] ? data.primary_horizon : available[0];
+  const [showAllEvents, setShowAllEvents] = useState(false);
+  const active =
+    tab && data?.horizons?.[tab]
+      ? tab
+      : data?.primary_horizon && data.horizons?.[data.primary_horizon]
+        ? data.primary_horizon
+        : available[0];
   const h = active ? data?.horizons?.[active] : undefined;
+  const label = (k: string) => LABEL[k]?.split(' (')[0] ?? k;
+  const columns: Column[] = h
+    ? [
+        {
+          title: 'Buy',
+          ideas: h.ideas.filter((i) => i.direction > 0),
+          bets: h.effective_bets?.long,
+          of: h.effective_bets?.long_ideas ?? 0,
+          tone: 'text-positive',
+        },
+        {
+          title: 'Bet against (short)',
+          ideas: h.ideas.filter((i) => i.direction < 0),
+          bets: h.effective_bets?.short,
+          of: h.effective_bets?.short_ideas ?? 0,
+          tone: 'text-negative',
+        },
+      ]
+    : [];
 
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <h3 className="font-bold text-white">Trade ideas</h3>
-        <div className="flex gap-1" role="tablist" aria-label="Horizon">
+    <section className="rounded-2xl border border-line bg-raised p-4 sm:p-5 space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-head font-semibold text-ink">Today&apos;s calls</h2>
+          <p className="text-xs text-ink-mute">
+            Stocks to buy and stocks to bet against, how much each should beat or trail the S&amp;P
+            500, how likely that is, and the best options trade if one is worth making. Not financial
+            advice.
+          </p>
+        </div>
+        <div
+          className="inline-flex rounded-xl border border-line bg-inset p-1"
+          role="tablist"
+          aria-label="How long to hold"
+        >
           {available.map((k) => (
             <button
               key={k}
               type="button"
               role="tab"
               aria-selected={k === active}
+              title={HORIZON_HINT[k]}
               onClick={() => setTab(k)}
-              className={`px-2 py-0.5 rounded border text-micro font-bold ${
-                k === active ? 'border-accent text-accent' : 'border-line text-ink-dim hover:text-white'
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                k === active ? 'bg-overlay text-ink shadow-panel' : 'text-ink-dim hover:text-ink'
               }`}
             >
-              {LABEL[k]}
-              {data?.horizons?.[k]?.validated ? <IconCheck className="inline w-3 h-3 ml-1" label="validated" /> : null}
+              {label(k)}
+              {data?.horizons?.[k]?.validated ? (
+                <IconCheck className="inline w-3 h-3 ml-1 text-accent" label="fully tested" />
+              ) : null}
             </button>
           ))}
         </div>
       </div>
-      <p className="text-ink-dim">
-        Strongest and weakest names from the model at each horizon, each with an option structure picked from the live
-        chain: options cheap against the stock&apos;s realised movement are bought, fairly priced ones spread, rich ones
-        sold as defined-risk credit. Every idea is logged and graded. Not financial advice.
-      </p>
       {error ? (
         <p className="text-ink-mute">Ideas could not be read.</p>
       ) : !data ? (
-        <p className="text-ink-mute">Reading…</p>
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {[0, 1, 2, 3].map((n) => (
+            <div key={n} className="h-64 rounded-2xl border border-line bg-inset animate-pulse" />
+          ))}
+        </div>
       ) : !h ? (
         <p className="text-ink-mute">{data.note ?? 'No ideas yet.'}</p>
       ) : (
         <>
-          <div
-            className={`rounded border px-3 py-2 text-micro ${
-              h.validated ? 'border-emerald-500/40 text-emerald-200' : 'border-amber-500/40 text-amber-200'
-            }`}
-          >
-            {h.validated ? 'Validated' : 'Not validated'} · {h.model ?? ABSENT} · net Sharpe{' '}
-            {h.net_sharpe != null ? formatNumber(h.net_sharpe, { decimals: 2 }) : ABSENT} · deflated{' '}
-            {h.deflated_sharpe != null ? formatNumber(h.deflated_sharpe, { decimals: 2 }) : ABSENT} · expected excess per side{' '}
-            {h.expected_excess_bps != null ? `${formatNumber(h.expected_excess_bps, { decimals: 0 })} bps` : ABSENT} over{' '}
-            {h.horizon_days} day{h.horizon_days === 1 ? '' : 's'}
-            {h.validated ? '' : ' — research only until the model passes its gate'}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-micro">
+            <span
+              className={`rounded-full px-2 py-0.5 ${
+                h.validated ? 'bg-accent-dim text-accent' : 'bg-caution/10 text-caution'
+              }`}
+            >
+              {h.validated ? 'Fully tested model' : 'Model still being tested'}
+            </span>
+            <span
+              className="text-ink-mute"
+              title={`Sharpe ratio after costs on years of data the model never saw: ${
+                h.net_sharpe != null ? formatNumber(h.net_sharpe, { decimals: 2 }) : ABSENT
+              } (${h.model ?? ABSENT})`}
+            >
+              Past record: {recordWords(h.net_sharpe)} · {HORIZON_HINT[active ?? ''] ?? ''}
+            </span>
+            {data.pulse && data.pulse.sizing_scale < 0.95 && (
+              <span className="text-caution">
+                Suggested sizes cut to {formatNumber(data.pulse.sizing_scale * 100, { decimals: 0 })}%
+                of normal: fast-rising stocks are swinging harder than usual
+              </span>
+            )}
           </div>
-          {h.withheld && <p className="text-ink-mute">No ideas at this horizon. {h.withheld}.</p>}
-          <div className="overflow-x-auto">
-            <table className="w-full text-left">
-              <thead className="text-ink-mute">
-                <tr className="border-b border-line">
-                  <th className="py-1">Ticker</th>
-                  <th>Stock</th>
-                  <th className="text-right">Entry</th>
-                  <th className="text-right">Stop</th>
-                  <th className="pl-3">Option structure</th>
-                </tr>
-              </thead>
-              <tbody>
-                {h.ideas.map((i) => (
-                  <tr key={`${i.ticker}-${i.direction}`} className="border-b border-line/60 align-top">
-                    <td className="py-1">
-                      <Link
-                        href={`/ticker?symbol=${encodeURIComponent(i.ticker)}`}
-                        className="font-mono font-bold text-white hover:text-accent hover:underline"
-                      >
-                        {i.ticker}
-                      </Link>
-                      <div className="text-micro text-ink-mute">
-                        p{i.percentile != null ? formatNumber(i.percentile * 100, { decimals: 0 }) : ABSENT}
-                      </div>
-                    </td>
-                    <td className={i.direction > 0 ? 'text-emerald-300' : 'text-rose-300'}>
-                      {i.action}
-                      <div className="text-micro text-ink-mute">{i.exit}</div>
-                    </td>
-                    <td className="text-right font-mono">{formatNumber(i.entry, { decimals: 2 })}</td>
-                    <td className="text-right font-mono">{i.stop != null ? formatNumber(i.stop, { decimals: 2 }) : ABSENT}</td>
-                    <td className="pl-3">
-                      <OptionCell o={i.option} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {h.withheld && (
+            <p className="text-xs text-ink-mute">No calls for this holding period. {h.withheld}.</p>
+          )}
+          <div className="grid gap-5 lg:grid-cols-2">
+            {columns.map((c) => (
+              <div key={c.title} className="space-y-3">
+                <div className="flex items-baseline justify-between gap-2">
+                  <h3 className={`text-sm font-semibold ${c.tone}`}>
+                    {c.title} <span className="text-ink-mute font-normal">({c.ideas.length})</span>
+                  </h3>
+                  <BetsMeter bets={c.bets} of={c.of} />
+                </div>
+                {c.ideas.length === 0 ? (
+                  <p className="rounded-2xl border border-dashed border-line p-4 text-xs text-ink-mute">
+                    None for this holding period.
+                  </p>
+                ) : (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {c.ideas.map((i) => (
+                      <IdeaCard
+                        key={`${i.ticker}-${i.direction}`}
+                        idea={i}
+                        days={h.horizon_days}
+                        validated={h.validated}
+                        horizonLabel={label(active ?? '')}
+                        fallbackBps={h.expected_excess_bps}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
+          {(data.consensus ?? []).some((c) => c.horizons.length > 1) && (
+            <div className="rounded-xl border border-line px-3 py-2 text-micro space-y-1">
+              <div className="text-ink font-semibold">Called for more than one holding period</div>
+              <div className="flex flex-wrap gap-1.5">
+                {(data.consensus ?? [])
+                  .filter((c) => c.horizons.length > 1)
+                  .slice(0, 10)
+                  .map((c) => (
+                    <Link
+                      key={`${c.ticker}-${c.direction}`}
+                      href={`/ticker?symbol=${encodeURIComponent(c.ticker)}`}
+                      title={c.reasons.slice(0, 2).join('; ')}
+                      className={`rounded-full px-2 py-0.5 font-mono ${
+                        c.direction > 0
+                          ? 'bg-positive/10 text-positive'
+                          : 'bg-negative/10 text-negative'
+                      }`}
+                    >
+                      {c.direction > 0 ? 'Buy' : 'Sell'} {c.ticker} ·{' '}
+                      {c.horizons.map((k) => label(k)).join(', ')}
+                    </Link>
+                  ))}
+              </div>
+            </div>
+          )}
+          <details className="rounded-xl border border-line px-3 py-2 text-micro text-ink-dim">
+            <summary className="cursor-pointer text-ink">How these are built</summary>
+            <div className="mt-2 space-y-1.5 leading-relaxed">
+              <p>
+                The model ranks every stock against others in its own industry and picks the
+                strongest to buy and the weakest to bet against, so no single sector fills a side.
+                Stocks that tend to move together count as one bet. Each call&apos;s forecast is
+                checked against how the model did on years of data it never saw. Every option
+                available is priced at what you would actually pay, and only the best one is shown.
+                Suggested sizes are kept deliberately small and cut further when markets get jumpy.
+                Every call, options included, is recorded and scored later against what really
+                happened.
+              </p>
+              {h.long_note && <p>{h.long_note}</p>}
+              {h.book && (
+                <p>
+                  Bought together as a ${formatNumber(h.book.book_usd / 1e6, { decimals: 0 })}M
+                  portfolio: it moves {formatNumber(Math.abs(h.book.net_beta), { decimals: 2 })}×
+                  as much as the market ({h.book.net_beta >= 0 ? 'with' : 'against'} it); to cancel
+                  that out you would {h.book.spy_hedge_usd >= 0 ? 'buy' : 'sell'} $
+                  {formatNumber(Math.abs(h.book.spy_hedge_usd) / 1e6, { decimals: 2 })}M of an S&amp;P
+                  500 fund. It could typically swing about{' '}
+                  {h.book.ex_ante_vol != null
+                    ? `${formatNumber(h.book.ex_ante_vol * 100, { decimals: 1 })}%`
+                    : ABSENT}{' '}
+                  in a year. Its biggest industry is {h.book.top_industry} at{' '}
+                  {formatNumber(h.book.top_industry_share * 100, { decimals: 0 })}%, and getting in
+                  costs about ${formatNumber(h.book.cost_to_enter_usd, { decimals: 0 })}.
+                </p>
+              )}
+              {data.book_effective_bets && (
+                <p>
+                  The model portfolio holds {data.book_effective_bets.long_names} stocks to buy, but
+                  they behave like only{' '}
+                  {formatNumber(data.book_effective_bets.long ?? 0, { decimals: 1 })} separate bets;
+                  its {data.book_effective_bets.short_names} bets against behave like{' '}
+                  {formatNumber(data.book_effective_bets.short ?? 0, { decimals: 1 })}.
+                </p>
+              )}
+            </div>
+          </details>
         </>
       )}
-      <div className="space-y-1">
-        <h4 className="font-bold text-white">Intraday signals</h4>
+      <div className="space-y-2">
+        <h3 className="text-sm font-semibold text-ink">Quick signals from news and filings</h3>
         {(data?.intraday ?? []).length === 0 ? (
           <p className="text-micro text-ink-mute">
-            None live. Intraday signals fire only from event families the reaction study has proven.
+            None right now. These only fire on kinds of events that have moved prices reliably for years.
           </p>
         ) : (
-          <ul className="space-y-0.5">
-            {data!.intraday.map((s) => (
-              <li key={s.id} className="flex justify-between gap-2 font-mono text-micro">
-                <span className="text-white">{s.instrument}</span>
-                <span className={s.direction === 'long' ? 'text-emerald-300' : 'text-rose-300'}>
-                  {s.direction} {s.horizon}
-                </span>
-                <span>p {formatNumber(s.probability * 100, { decimals: 0 })}%</span>
-                <span className="text-ink-mute">{(s.families ?? []).join(', ')}</span>
-              </li>
+          <div className="flex flex-wrap gap-1.5">
+            {(showAllEvents ? data!.intraday : data!.intraday.slice(0, EVENT_CHIPS)).map((s) => (
+              <Link
+                key={s.id}
+                href={`/ticker?symbol=${encodeURIComponent(s.instrument)}`}
+                title={(s.families ?? []).join(', ')}
+                className={`rounded-full border px-2.5 py-1 text-micro font-mono ${
+                  s.direction === 'long'
+                    ? 'border-positive/30 text-positive'
+                    : 'border-negative/30 text-negative'
+                }`}
+              >
+                {s.instrument} {s.direction === 'long' ? '▲' : '▼'} {s.horizon} ·{' '}
+                {formatNumber(s.probability * 100, { decimals: 0 })}%
+              </Link>
             ))}
-          </ul>
+            {data!.intraday.length > EVENT_CHIPS && (
+              <button
+                type="button"
+                onClick={() => setShowAllEvents((v) => !v)}
+                className="rounded-full border border-line px-2.5 py-1 text-micro text-accent hover:bg-inset"
+              >
+                {showAllEvents ? 'Show fewer' : `+${data!.intraday.length - EVENT_CHIPS} more`}
+              </button>
+            )}
+          </div>
         )}
       </div>
       {data?.generated_at && (
         <p className="text-micro text-ink-mute">
-          Built {formatAge(data.generated_at)} ago from the model as of {data.as_of}.
+          Updated {formatAge(data.generated_at)} ago from the model as of {data.as_of}.
         </p>
       )}
     </section>

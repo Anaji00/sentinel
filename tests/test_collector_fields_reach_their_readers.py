@@ -51,12 +51,16 @@ def test_the_model_carries_the_three_fields_the_cyber_panel_reads():
         assert name in fields, f"the frontend reads security_data.{name}"
 
 
-def test_the_panel_still_reads_them():
-    """If the panel stops, the fields above are cargo rather than a repair."""
-    panel = (ROOT / "frontend" / "src" / "components" / "CyberIntelligencePanel.tsx")
-    text = panel.read_text(encoding="utf-8")
-    assert "security_data?.cisa_kev" in text
-    assert "sd.asn" in text
+def test_no_frontend_reads_the_retired_cyber_fields():
+    """Cyber is retired from the interface: the archive panel that read these
+    fields is gone, so no component should still be reading them as though a
+    cyber view existed. The model keeps the fields for the stored history."""
+    src = ROOT / "frontend" / "src"
+    assert not (src / "components" / "CyberIntelligencePanel.tsx").exists()
+    for path in src.rglob("*.tsx"):
+        if "__tests__" in path.parts:
+            continue
+        assert "security_data?.cisa_kev" not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_a_kev_entry_says_it_is_one():
@@ -117,9 +121,44 @@ def test_the_kalshi_poller_keeps_the_expiry_it_already_reads():
         encoding="utf-8"
     )
     assert 'market.get("expiration_ts")' in collector, "the poller stopped reading it"
-    assert '"resolution_date": market.get("expiration_ts")' in collector, (
+    assert '"resolution_date": kalshi_expiry(market)' in collector, (
         "the expiry is read and still not carried into the payload"
     )
+
+
+def test_the_kalshi_poller_reads_the_current_market_schema():
+    """Kalshi renamed open -> active, volume -> volume_fp, expiration_ts ->
+    expiration_time; under the old names every market was filtered out."""
+    import importlib.util
+    import sys
+    import types
+    from datetime import datetime, timezone
+
+    for name in ("websockets", "dotenv"):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            if name == "dotenv":
+                stub.load_dotenv = lambda *a, **k: None
+            sys.modules[name] = stub
+    spec = importlib.util.spec_from_file_location(
+        "collector_prediction_main", ROOT / "services" / "collector-prediction" / "main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    now = datetime(2026, 10, 8, 16, tzinfo=timezone.utc)
+    current = {"ticker": "KXCPI-26OCT-T0.3", "status": "active", "volume_fp": "1250.00",
+               "expiration_time": "2026-11-12T13:30:00Z"}
+    legacy = {"ticker": "FED-26NOV-T4.00", "status": "open", "volume": 40,
+              "expiration_ts": "2026-11-05T18:00:00Z"}
+    parlay = {"ticker": "KXMVECROSSCATEGORY-X", "status": "active", "volume_fp": "9999",
+              "mve_collection_ticker": "KXMVE", "expiration_time": "2026-11-01T00:00:00Z"}
+    expired = {"ticker": "KXU3-26SEP", "status": "active", "volume_fp": "500",
+               "expiration_time": "2026-10-01T00:00:00Z"}
+    untraded = {"ticker": "KXGDP-27Q2", "status": "active", "volume_fp": "0.00"}
+    live = mod.kalshi_live_markets([legacy, parlay, expired, untraded, current], now)
+    assert [m["ticker"] for m in live] == ["KXCPI-26OCT-T0.3", "FED-26NOV-T4.00"]
+    assert mod.kalshi_expiry(current) == "2026-11-12T13:30:00Z"
+    assert mod.kalshi_volume(current) == 1250.0 and mod.kalshi_volume(legacy) == 40.0
 
 
 def test_the_enricher_asks_for_it_by_that_name():

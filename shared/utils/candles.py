@@ -479,3 +479,24 @@ def normalize_candle(raw: Dict[str, Any], ticker: str = "") -> Dict[str, Any]:
         "volume": _num("volume", "v") or 0.0,
         "ticker": (raw.get("ticker") or ticker or "").upper() or None,
     }
+
+
+def window_words(minutes: Any) -> str:
+    """A candle's span as a reader says it: 60 -> "1 hour", 240 -> "4 hours"."""
+    try:
+        m = int(float(minutes))
+    except (TypeError, ValueError):
+        return f"{minutes} minutes"
+    if m >= 1440 and m % 1440 == 0:
+        d = m // 1440
+        return f"{d} day{'s' if d != 1 else ''}"
+    if m >= 60 and m % 60 == 0:
+        h = m // 60
+        return f"{h} hour{'s' if h != 1 else ''}"
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+def above_normal_words(z: float) -> str:
+    """How far a reading sits above its own normal, without the statistics:
+    a z-score of 5 or more reads "far above normal", 3 or more "well above"."""
+    return "far above normal" if z >= 5 else "well above normal" if z >= 3 else "above normal"

@@ -1,7 +1,9 @@
 'use client';
 
+import Link from 'next/link';
 import React, { useState } from 'react';
 import useSWR from 'swr';
+import type { NormalizedEvent } from '../lib/types';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { formatNumber } from '../lib/format';
@@ -23,10 +25,26 @@ interface FlowItem {
   occurred_at: string;
 }
 
+/** The financial fields a block or sweep event carries, as the collectors write them. */
+interface RawFlowFinancials {
+  ticker?: string;
+  premium_usd?: number | string | null;
+  notional_usd?: number | string | null;
+  strike?: number | string | null;
+  option_type?: string;
+  close_price?: number | string | null;
+  price?: number | string | null;
+  volume?: number | string | null;
+  side?: string;
+  direction?: string;
+  occ_symbol?: string;
+  expiry?: string;
+}
+
 export default function DarkPoolFlowPanel() {
   const [filterType, setFilterType] = useState<string>('ALL');
 
-  const { data } = useSWR<FlowItem[]>('/api/v1/events/tradfi?limit=40&types=equity_block,options_flow', fetcher, {
+  const { data } = useSWR<NormalizedEvent[]>('/api/v1/events/tradfi?limit=40&types=equity_block,options_flow', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -49,8 +67,8 @@ export default function DarkPoolFlowPanel() {
   // matched the fabricated rows above it.
   // The same print can arrive twice (two feeds, one trade); show it once.
   const seen = new Set<string>();
-  const flows: FlowItem[] = (Array.isArray(data) ? data : []).map((e: any) => {
-    const fd = e.financial_data || {};
+  const flows: FlowItem[] = (Array.isArray(data) ? data : []).map((e) => {
+    const fd = (e.financial_data || {}) as RawFlowFinancials;
     const isOption = e.type === 'options_flow';
     // For an option, notional_usd is exposure (strike x 100 x contracts) -- a
     // $120K sweep read as $10M. The premium is the money that changed hands.
@@ -86,22 +104,23 @@ export default function DarkPoolFlowPanel() {
   });
 
   return (
-    <Card className="h-full flex flex-col bg-[#06080e]/90 border border-cyan-500/20 shadow-2xl overflow-hidden font-mono">
+    <Card className="h-full flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-cyan-500/20 bg-[#090d18]/80 shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-line shrink-0">
         <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-emerald-950/80 border border-emerald-500/60 flex items-center justify-center shadow-panel">
-            <IconFlow className="text-emerald-400" size={18} />
+          <div className="h-9 w-9 rounded-lg bg-positive/10 border border-positive/30 flex items-center justify-center shadow-panel">
+            <IconFlow className="text-positive" size={18} />
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-              Block trades and options sweeps
-              <span className="px-2 py-0.5 rounded text-micro bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+            <h2 className="text-sm font-semibold text-ink flex items-center gap-2">
+              Big trades as they print
+              <span className="px-2 py-0.5 rounded text-micro bg-positive/10 text-positive border border-positive/30">
                 Live
               </span>
             </h2>
             <p className="text-micro text-ink-dim">
-              Prints large for their instrument (at least $200K and well above its usual size) and option sweeps
+              Stock trades of $200K or more, well above the stock&apos;s usual size, and big options bets placed across
+              several exchanges at once
             </p>
           </div>
         </div>
@@ -111,17 +130,24 @@ export default function DarkPoolFlowPanel() {
           {/* DARK_POOL is not offered: the platform has never produced an
               event of that type, so the filter could only ever return
               nothing. */}
-          {['ALL', 'SWEEP', 'BLOCK'].map((t) => (
+          {(
+            [
+              ['ALL', 'Everything'],
+              ['SWEEP', 'Options bets'],
+              ['BLOCK', 'Block trades'],
+            ] as const
+          ).map(([t, label]) => (
             <button
               key={t}
               onClick={() => setFilterType(t)}
-              className={`px-2.5 py-1 rounded-lg font-bold border transition-all cursor-pointer ${
+              aria-pressed={filterType === t}
+              className={`px-2.5 py-1 rounded-lg border transition-colors cursor-pointer ${
                 filterType === t
-                  ? 'bg-cyan-500/20 text-accent border-accent/60'
-                  : 'bg-raised text-ink-dim border-line hover:text-white'
+                  ? 'bg-overlay text-ink font-semibold border-line-strong'
+                  : 'text-ink-dim border-line hover:text-ink'
               }`}
             >
-              {t.replace('_', ' ')}
+              {label}
             </button>
           ))}
         </div>
@@ -131,51 +157,53 @@ export default function DarkPoolFlowPanel() {
       <div className="flex-1 overflow-y-auto p-4">
         <table className="w-full text-left text-xs border-collapse">
           <thead>
-            <tr className="text-micro text-ink-dim uppercase border-b border-line pb-2">
-              <th className="pb-2">TICKER</th>
-              <th className="pb-2">TYPE</th>
-              <th className="pb-2">SIDE</th>
-              <th className="pb-2" title="Shares x price for blocks; premium paid for option sweeps">$ TRADED</th>
-              <th className="pb-2">PRICE</th>
-              <th className="pb-2">OCC CONTRACT / DETAILS</th>
-              <th className="pb-2 text-right">TIME</th>
+            <tr className="text-micro text-ink-mute border-b border-line">
+              <th className="pb-2 font-normal">Stock</th>
+              <th className="pb-2 font-normal">Kind</th>
+              <th className="pb-2 font-normal">Side</th>
+              <th className="pb-2 font-normal" title="Shares x price for blocks; premium paid for options bets">Size</th>
+              <th className="pb-2 font-normal">Price</th>
+              <th className="pb-2 font-normal">Details</th>
+              <th className="pb-2 font-normal text-right">Time</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line/60">
             {filteredFlows.map((item) => (
               <tr key={item.id} className="hover:bg-raised/60 transition-colors">
-                <td className="py-3 font-extrabold text-amber-300">{item.ticker}</td>
+                <td className="py-2.5">
+                  <Link href={`/ticker?symbol=${encodeURIComponent(item.ticker)}`} className="font-mono font-semibold text-ink hover:text-accent">
+                    {item.ticker}
+                  </Link>
+                </td>
                 <td>
                   <span
-                    className={`px-2 py-0.5 rounded text-micro font-bold ${
-                      item.type === 'SWEEP'
-                        ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
-                        : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    className={`px-2 py-0.5 rounded-full text-micro ${
+                      item.type === 'SWEEP' ? 'bg-accent-dim text-accent' : 'bg-inset text-ink-dim border border-line'
                     }`}
                   >
-                    {item.type}
+                    {item.type === 'SWEEP' ? 'Options bet' : 'Block trade'}
                   </span>
                 </td>
                 <td>
                   <span
-                    className={`px-2 py-0.5 rounded text-micro font-black ${
+                    className={`px-2 py-0.5 rounded-full text-micro font-semibold ${
                       item.side === 'BUY'
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                        ? 'bg-positive/10 text-positive border border-positive/30'
                         : item.side === 'SELL'
-                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40'
+                          ? 'bg-negative/10 text-negative border border-negative/30'
                           : 'border border-line text-ink-mute'
                     }`}
                   >
                     {item.side}
                   </span>
                 </td>
-                <td className="font-extrabold text-ink">
+                <td className="font-mono font-semibold text-ink">
                   {item.notional_usd >= 1e6
                     ? `$${(item.notional_usd / 1e6).toFixed(2)}M`
                     : `$${Math.round(item.notional_usd / 1e3)}K`}
                 </td>
-                <td className="text-ink-dim">${item.price.toFixed(2)}</td>
-                <td className="text-micro text-cyan-300/90 font-mono">
+                <td className="font-mono text-ink-dim">${item.price.toFixed(2)}</td>
+                <td className="text-micro text-ink-dim">
                   {item.type === 'SWEEP'
                     ? `${formatNumber(item.size_shares, { decimals: 0 })} contracts${item.contract ? ` · ${item.contract}` : ''}`
                     : item.occ_symbol ||

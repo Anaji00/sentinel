@@ -197,3 +197,29 @@ def test_an_edge_without_data_is_pending_not_failed():
     assert re.search(r"if coefficient is None:\s*\n\s*skipped \+= 1\s*\n\s*continue", fn), (
         "an edge with no usable series would be scored as a failure"
     )
+
+
+def test_a_stock_call_is_graded_against_the_market():
+    """Up 3% while SPY is up 5% is a wrong "up" call and a right "down" one."""
+    import json
+    from datetime import datetime, timezone
+
+    class _Db:
+        async def query_one(self, sql, *args):
+            assert "SPY" in sql and isinstance(args[0], datetime)
+            return {"close": 400.0}
+
+    agent = _scoring_agent(price=103.0)
+    agent.redis.raw._store["sentinel:quotes:latest:SPY"] = json.dumps({"price": 420.0})
+    agent.db = _Db()
+    made = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc).isoformat()
+    # TEST is not a recognised equity symbol here, so use a real-looking one.
+    agent.redis.raw._store["sentinel:quotes:latest:AAPL"] = json.dumps({"price": 103.0})
+    from services.agents.base import AgentPrediction
+    up = AgentPrediction(agent_name="t", ticker="AAPL", direction="up", conviction=0.6, entry_price=100.0, created_at=made)
+    down = AgentPrediction(agent_name="t", ticker="AAPL", direction="down", conviction=0.6, entry_price=100.0, created_at=made)
+    assert _run(agent._score_directional(up)) is False
+    assert _run(agent._score_directional(down)) is True
+    # Without a market price for the window, the raw move stands.
+    agent.db = None
+    assert _run(agent._score_directional(up)) is True

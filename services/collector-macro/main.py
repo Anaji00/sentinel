@@ -23,6 +23,7 @@ Instruments Tracked:
   TLT    — 20+ Year Treasury ETF  (TLT ETF)
 """
 
+import json
 import os
 import sys
 import time
@@ -209,10 +210,13 @@ async def fetch_alpaca_quotes(tickers: list) -> dict:
                         mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else (bid or ask)
 
                         price = float(trade.get("p") or mid or minute.get("c") or daily.get("c") or prev.get("c") or 0.0)
-                        open_p = float(minute.get("o") or daily.get("o") or prev.get("o") or price)
-                        high_p = float(minute.get("h") or daily.get("h") or prev.get("h") or price)
-                        low_p  = float(minute.get("l") or daily.get("l") or prev.get("l") or price)
-                        vol    = float(minute.get("v") or daily.get("v") or prev.get("v") or 0.0)
+                        # A minute bar's range, or none: falling back to the
+                        # daily bar stored the whole day's high and low as one
+                        # minute, stretching every 5m candle built on it.
+                        open_p = float(minute.get("o") or price)
+                        high_p = max(float(minute.get("h") or price), price)
+                        low_p  = min(float(minute.get("l") or price), price)
+                        vol    = float(minute.get("v") or 0.0)
 
                         if price > 0.0:
                             results[ticker] = {
@@ -245,16 +249,20 @@ async def fetch_finnhub_quote(session: aiohttp.ClientSession, ticker: str) -> di
             if resp.status == 200:
                 data = await resp.json()
                 current_p = float(data.get("c") or 0.0)
-                open_p = float(data.get("o") or data.get("pc") or current_p)
-                high_p = float(data.get("h") or current_p)
-                low_p = float(data.get("l") or current_p)
 
                 if current_p > 0.0:
+                    # A quote is one print. Finnhub's o/h/l are the day's, and
+                    # published as a minute bar they gave CL=F a 153.37-158.10
+                    # "minute" (15 Oct). The day's range rides along under its
+                    # own names for anything that wants it.
                     return {
                         "close": current_p,
-                        "open": open_p,
-                        "high": high_p,
-                        "low": low_p,
+                        "open": current_p,
+                        "high": current_p,
+                        "low": current_p,
+                        "day_open": float(data.get("o") or data.get("pc") or current_p),
+                        "day_high": float(data.get("h") or current_p),
+                        "day_low": float(data.get("l") or current_p),
                         # Volume the feed did not supply is absent, not invented.
                         #
                         # This was a hardcoded 1000.0, and the 5-minute
@@ -275,6 +283,58 @@ async def fetch_finnhub_quote(session: aiohttp.ClientSession, ticker: str) -> di
     except Exception as e:
         logger.debug(f"Finnhub quote fetch bypass for {ticker}: {e}")
     return {}
+
+
+# Real futures prices, not ETF stand-ins. Until 15 Oct 2026 CL=F was stored
+# at USO's price ($153 against crude at $96.60), GC=F at GLD's, ES=F at SPY's:
+# returns roughly tracked, every level was wrong. Yahoo's chart endpoint serves
+# the contracts themselves (CME, NYMEX, COMEX, CBOT), free, in minute bars.
+#
+# Off until the stored proxy-level history under the futures symbols has been
+# moved to the ETF symbols it really is (scripts/relabel_futures_proxies.sql);
+# switched on before that, the first real crude print would read as a -37% move.
+REAL_FUTURES = os.getenv("MACRO_REAL_FUTURES", "0") == "1"
+YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m"
+FUTURES_MAX_AGE_SEC = 30 * 60
+
+
+def last_complete_bar(chart: dict, now_ts: float) -> dict:
+    """The newest finished minute bar in a Yahoo chart response, or {}.
+
+    The last bar is still filling, so the one before it is taken; a bar older
+    than half an hour is a closed market, not a price."""
+    try:
+        res = chart["chart"]["result"][0]
+        ts = res.get("timestamp") or []
+        q = res["indicators"]["quote"][0]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    for i in range(len(ts) - 2, -1, -1):
+        o, h, lo, c, v = (q.get(k, [None] * len(ts))[i] for k in ("open", "high", "low", "close", "volume"))
+        if None in (o, h, lo, c) or c <= 0:
+            continue
+        if now_ts - ts[i] > FUTURES_MAX_AGE_SEC:
+            return {}
+        return {"close": float(c), "open": float(o), "high": float(max(h, o, c)), "low": float(min(lo, o, c)),
+                "volume": float(v) if v is not None else None, "bar_time": int(ts[i])}
+    return {}
+
+
+async def fetch_yahoo_future(session: aiohttp.ClientSession, ticker: str) -> dict:
+    """Tier 0 for futures: the contract's own latest minute bar."""
+    try:
+        async with session.get(YAHOO_CHART.format(symbol=ticker), headers={"User-Agent": "Mozilla/5.0"},
+                               timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
+            if resp.status != 200:
+                return {}
+            bar = last_complete_bar(await resp.json(content_type=None), time.time())
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        swallowed("collector_macro.yahoo_future", e, logger, detail=ticker)
+        return {}
+    if not bar:
+        return {}
+    return {**bar, "is_proxy": False, "proxy_symbol": ticker,
+            "provider": f"Yahoo ({ticker}, exchange data, may be delayed up to 10 min)"}
 
 
 async def fetch_yfinance_single(ticker: str) -> dict:
@@ -588,8 +648,12 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
             try:
                 q = {}
 
+                # Tier 0: the futures contract itself.
+                if REAL_FUTURES and ticker.endswith("=F"):
+                    q = await fetch_yahoo_future(session, ticker)
+
                 # Tier 1: Alpaca API
-                if ticker in alpaca_quotes:
+                if (not q or q.get("close", 0.0) <= 0.0) and ticker in alpaca_quotes:
                     q = alpaca_quotes[ticker]
 
                 # Tier 2: Finnhub REST API
@@ -634,7 +698,9 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
                     unchanged += 1
                     continue
 
-                previous_price = q["open"]
+                # Direction against the day's open, as before; the bar's own
+                # open is now the print itself.
+                previous_price = q.get("day_open", q["open"])
                 high_val       = q["high"]
                 low_val        = q["low"]
                 volume         = q["volume"]
@@ -645,12 +711,18 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
                     else ("DownTick" if current_price < previous_price else "ZeroTick")
                 )
 
+                # A futures minute bar is stamped at its own minute, so it lands
+                # on the minute grid like every other bar; a quote at its fetch.
+                bar_at = (datetime.fromtimestamp(q["bar_time"], tz=timezone.utc).isoformat()
+                          if q.get("bar_time") else now)
                 payload = {
+                    # The enrichment path keys on this name; the provider rides
+                    # in the payload.
                     "source": "finnhub_equities",
                     "raw_payload": {
                         "ticker": ticker,
                         "trade_type": "OHLCV_MINUTE_BAR",
-                        "open": previous_price,
+                        "open": q["open"],
                         "close": current_price,
                         "high": high_val,
                         "low": low_val,
@@ -675,7 +747,7 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
                     # unique by construction, which means no consumer downstream can
                     # ever recognise a repeat.
                     "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"macro_{ticker}_{fingerprint}")),
-                    "occurred_at": now,
+                    "occurred_at": bar_at,
                 }
 
                 await producer.send(Topics.RAW_TRADFI, payload, key=ticker)
@@ -699,6 +771,122 @@ async def fetch_and_publish(producer: SentinelProducer, redis_client=None):
         logger.info(f"⏸️ Macro quotes unchanged for all {unchanged} ticker(s); nothing published.")
     else:
         logger.warning("No real macro ticks published this cycle.")
+
+
+EIA_INTERVAL_SEC = 6 * 3600
+_EIA_UPSERT_SQL = """
+    INSERT INTO eia_weekly (series, week_ending, value) VALUES ($1, $2, $3)
+    ON CONFLICT (series, week_ending) DO UPDATE SET value = EXCLUDED.value
+"""
+
+
+KALSHI_CONSENSUS_INTERVAL_SEC = 600
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+async def _kalshi_consensus_loop(redis_client) -> None:
+    """Every ten minutes, each indicator's Kalshi-implied median for its next
+    release (shared/utils/kalshi_consensus.py). Kept only when a median exists,
+    so the last snapshot before the markets close is the one the release meets."""
+    from economic_calendar import KALSHI_CONSENSUS_KEY
+    from shared.utils import kalshi_consensus as kc
+
+    raw = getattr(redis_client, "raw", redis_client)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                for indicator, (series, _factor) in kc.SERIES.items():
+                    async with session.get(f"{KALSHI_BASE}/markets",
+                                           params={"series_ticker": series, "status": "open", "limit": 200},
+                                           timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status != 200:
+                            continue
+                        markets = (await resp.json()).get("markets") or []
+                    snap = kc.consensus(markets, indicator, datetime.now(timezone.utc))
+                    if snap:
+                        await raw.hset(KALSHI_CONSENSUS_KEY, indicator, json.dumps(snap))
+                    await asyncio.sleep(1)
+        except Exception as e:
+            swallowed("collector_macro.kalshi_consensus", e, logger)
+        await asyncio.sleep(KALSHI_CONSENSUS_INTERVAL_SEC)
+
+
+FIRST_RELEASE_INTERVAL_SEC = 24 * 3600
+_FIRST_RELEASE_SQL = """
+    INSERT INTO macro_first_release (series_id, period, value, realtime_start) VALUES ($1, $2, $3, $4)
+    ON CONFLICT (series_id, period) DO NOTHING
+"""
+
+
+async def _first_release_loop() -> None:
+    """Each macro series as first published, before revisions (FRED
+    output_type=4, ALFRED's initial-release view): what a model could actually
+    have known on the day, rather than today's revised history."""
+    import fred_releases as fred
+    from datetime import date as _date
+    from shared.db import get_timescale
+
+    while True:
+        try:
+            if fred.FRED_API_KEY:
+                db = await get_timescale()
+                async with aiohttp.ClientSession() as session:
+                    for series in fred.FRED_SERIES:
+                        if series.series_id == "DFEDTARU":
+                            continue          # a decision, not a revised statistic
+                        params = {"series_id": series.series_id, "api_key": fred.FRED_API_KEY, "file_type": "json",
+                                  "output_type": 4, "observation_start": "2015-01-01",
+                                  # Every vintage: output_type=4 reads the first of them, and
+                                  # the default real-time window (today only) holds none.
+                                  "realtime_start": "1776-07-04", "realtime_end": "9999-12-31"}
+                        async with session.get(f"{fred.FRED_BASE}/series/observations", params=params,
+                                               timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                            if resp.status != 200:
+                                logger.warning("First release %s: HTTP %s %s", series.series_id, resp.status,
+                                               (await resp.text())[:160])
+                                continue
+                            obs = (await resp.json()).get("observations") or []
+                        rows = []
+                        for o in obs:
+                            try:
+                                v = float(o["value"])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            rows.append((series.series_id, _date.fromisoformat(o["date"]), v,
+                                         _date.fromisoformat(o["realtime_start"])))
+                        if rows:
+                            await db.execute_many(_FIRST_RELEASE_SQL, rows)
+                        await asyncio.sleep(1)
+                logger.info("First-release macro values refreshed for %s series.", len(fred.FRED_SERIES) - 1)
+        except Exception as e:
+            swallowed("collector_macro.first_release", e, logger)
+        await asyncio.sleep(FIRST_RELEASE_INTERVAL_SEC)
+
+
+async def _eia_loop() -> None:
+    """The EIA's weekly petroleum stocks, full history each pass (keyless;
+    shared/utils/eia.py). Published Wednesdays; every six hours catches it."""
+    from shared.db import get_timescale
+    from shared.utils import eia
+
+    while True:
+        try:
+            db = await get_timescale()
+            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+                for name, (series_id, _label) in eia.SERIES.items():
+                    async with session.get(eia.HISTORY_URL.format(series=series_id),
+                                           timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        if resp.status != 200:
+                            logger.warning("EIA %s: HTTP %s", series_id, resp.status)
+                            continue
+                        rows = eia.parse_history(await resp.text())
+                    if rows:
+                        await db.execute_many(_EIA_UPSERT_SQL, [(name, d, v) for d, v in rows])
+                    await asyncio.sleep(2)
+            logger.info("EIA weekly stocks refreshed for %s series.", len(eia.SERIES))
+        except Exception as e:
+            swallowed("collector_macro.eia", e, logger)
+        await asyncio.sleep(EIA_INTERVAL_SEC)
 
 
 async def main():
@@ -801,6 +989,9 @@ async def main():
                 await asyncio.sleep(3600)
 
     treasury_task = safe_create_task(_treasury_polling_loop())
+    eia_task = safe_create_task(_eia_loop(), name="eia")
+    consensus_task = safe_create_task(_kalshi_consensus_loop(redis_client), name="kalshi-consensus")
+    first_release_task = safe_create_task(_first_release_loop(), name="first-release")
     calendar_task = safe_create_task(_calendar_polling_loop())
     reg_task = safe_create_task(_regulatory_polling_loop())
 
@@ -816,6 +1007,9 @@ async def main():
         if hb_task:
             hb_task.cancel()
         treasury_task.cancel()
+        eia_task.cancel()
+        consensus_task.cancel()
+        first_release_task.cancel()
         calendar_task.cancel()
         reg_task.cancel()
         await calendar_collector.close()

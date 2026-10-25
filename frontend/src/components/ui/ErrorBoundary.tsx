@@ -34,8 +34,8 @@ export class ErrorBoundary extends Component<Props, State> {
   public render() {
     if (this.state.hasError) {
       return (
-        <div className="flex flex-col items-center justify-center h-full w-full p-6 bg-[#090b10] border border-amber-500/30 rounded-xl text-center">
-          <div className="h-10 w-10 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center font-bold text-lg mb-3 border border-amber-500/40 animate-pulse">
+        <div className="flex flex-col items-center justify-center h-full w-full p-6 bg-inset border border-caution/30 rounded-xl text-center">
+          <div className="h-10 w-10 rounded-full bg-caution/10 text-caution flex items-center justify-center font-bold text-lg mb-3 border border-caution/30 animate-pulse">
             <IconAlert className="inline-block shrink-0" />
           </div>
           <h3 className="text-sm font-bold text-ink mb-1">
@@ -47,7 +47,7 @@ export class ErrorBoundary extends Component<Props, State> {
           </p>
           <button
             onClick={this.handleReset}
-            className="px-3.5 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 rounded text-xs font-bold uppercase tracking-wider transition-all cursor-pointer shadow-panel"
+            className="px-3.5 py-1.5 bg-caution/10 hover:bg-caution/10 text-caution border border-caution/30 rounded text-xs font-bold uppercase tracking-wider transition-all cursor-pointer shadow-panel"
           >
             Reset Visualizer Context
           </button>

@@ -45,7 +45,13 @@ interface RadarAnomaly {
   z_score: number;
   occurred_at: string;
   region: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
+}
+
+/** `/radar/sweeps`: how much of the universe the sweep engine is covering. */
+interface SweepStatus {
+  total_universe_scanned?: number;
+  tracked_baselines?: number;
 }
 
 interface RadarResponse {
@@ -82,6 +88,9 @@ interface AgentResponse {
   recent_decisions: AgentDecision[];
 }
 
+/** The z-score thresholds as words: how far above a stock's own normal. */
+const LEVEL_WORD: Record<number, string> = { 3.0: 'Unusual', 4.5: 'Very unusual', 5.0: 'Extreme' };
+
 export default function QuantRadarPanel() {
   const [subTab, setSubTab] = useState<'radar' | 'agents'>('radar');
   const [selectedAnomaly, setSelectedAnomaly] = useState<RadarAnomaly | null>(null);
@@ -101,13 +110,15 @@ export default function QuantRadarPanel() {
     refreshInterval: POLL.live,
   });
 
-  const { data: sweepData } = useSWR<any>('/radar/sweeps', fetcher, { refreshInterval: POLL.live });
+  const { data: sweepData } = useSWR<SweepStatus>('/radar/sweeps', fetcher, {
+    refreshInterval: POLL.live,
+  });
 
   const { data: agentData } = useSWR<AgentResponse>('/agents/processes', fetcher, {
     refreshInterval: POLL.live,
   });
 
-  const rawAnomalies = radarData?.anomalies || [];
+  const rawAnomalies = useMemo(() => radarData?.anomalies || [], [radarData]);
   const agents = agentData?.agents || [];
   const decisions = agentData?.recent_decisions || [];
 
@@ -151,22 +162,23 @@ export default function QuantRadarPanel() {
         {subTab === 'radar' ? (
           <>
             {/* Radar Baseline Status HUD */}
-            <div className="p-2.5 rounded-lg bg-page border border-cyan-500/20 space-y-1.5">
+            <div className="p-2.5 rounded-lg bg-page border border-line space-y-1.5">
               <div className="flex items-center justify-between text-accent font-bold">
-                <span>Sweep engine</span>
+                <span>Unusual trading volume</span>
                 <div className="flex items-center gap-1">
-                  <span className="text-micro text-ink-dim">Min Z</span>
+                  <span className="text-micro text-ink-dim">Show</span>
                   {[3.0, 4.5, 5.0].map((z) => (
                     <button
                       key={z}
                       onClick={() => setMinZScore(z)}
+                      aria-pressed={minZScore === z}
                       className={`px-1.5 py-0.5 rounded text-micro font-bold transition-all cursor-pointer ${
                         minZScore === z
                           ? 'bg-accent text-inset border border-white'
                           : 'bg-raised text-ink-dim border border-line-strong'
                       }`}
                     >
-                      &ge; {z.toFixed(1)}&sigma;
+                      {LEVEL_WORD[z] ?? `${z.toFixed(1)}+`}
                     </button>
                   ))}
                 </div>
@@ -176,17 +188,17 @@ export default function QuantRadarPanel() {
                     guess in the same weight as a measured figure. */}
                 <div>
                   Scanned:{' '}
-                  <span className="text-white font-bold">
+                  <span className="text-ink font-bold">
                     {sweepData?.total_universe_scanned
                       ? `${formatNumber(sweepData.total_universe_scanned, { decimals: 0 })} equities`
                       : '—'}
                   </span>
                 </div>
                 <div>
-                  Baselines:{' '}
-                  <span className="text-emerald-400 font-bold">
+                  Known normals:{' '}
+                  <span className="text-positive font-bold">
                     {sweepData?.tracked_baselines
-                      ? `${formatNumber(sweepData.tracked_baselines, { decimals: 0 })} EWMA keys`
+                      ? `${formatNumber(sweepData.tracked_baselines, { decimals: 0 })} stocks with a known normal`
                       : '—'}
                   </span>
                 </div>
@@ -197,17 +209,17 @@ export default function QuantRadarPanel() {
             <div className="relative">
               <input
                 type="text"
-                placeholder="Filter volume anomalies by ticker or company name..."
+                placeholder="Find a stock by ticker or company name…"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-inset border border-cyan-500/20 rounded-lg px-3 py-1.5 text-xs text-ink placeholder-slate-500 focus:outline-none focus:border-accent/60 font-mono transition-colors"
+                className="w-full bg-inset border border-line rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-accent/60 font-mono transition-colors"
               />
             </div>
 
             {/* Radar Volume Anomalies List */}
             <div className="space-y-2">
               <span className="text-micro text-ink-dim uppercase font-bold tracking-wider">
-                QUANTITATIVE VOLUME ANOMALIES (Z &ge; {minZScore.toFixed(1)})
+                TRADING FAR ABOVE ITS NORMAL ({(LEVEL_WORD[minZScore] ?? '').toUpperCase()} AND UP)
               </span>
               {filteredAnomalies.length > 0 ? (
                 filteredAnomalies.map((a, idx) => {
@@ -216,14 +228,14 @@ export default function QuantRadarPanel() {
                     <div
                       key={a.event_id || idx}
                       onClick={() => setSelectedAnomaly(a)}
-                      className="p-2.5 rounded-lg bg-raised/80 border border-cyan-500/20 hover:border-accent/50 cursor-pointer transition-all space-y-1 hover:bg-raised/95"
+                      className="p-2.5 rounded-lg bg-raised/80 border border-line hover:border-accent/50 cursor-pointer transition-all space-y-1 hover:bg-raised/95"
                     >
                       <div className="flex items-center justify-between">
-                        <span className="font-bold text-white text-xs">
+                        <span className="font-bold text-ink text-xs">
                           {a.ticker} ({a.entity_name})
                         </span>
-                        <span className="px-2 py-0.5 rounded text-micro font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40 glow-crimson">
-                          +{zVal.toFixed(2)}&sigma; ANOMALY
+                        <span className="px-2 py-0.5 rounded text-micro font-bold bg-negative/10 text-negative border border-negative/30">
+                          {zVal >= 5 ? 'EXTREME' : zVal >= 4.5 ? 'VERY UNUSUAL' : 'UNUSUAL'} · {zVal.toFixed(1)}
                         </span>
                       </div>
                       <div className="flex items-center justify-between text-micro text-ink-dim pt-0.5">
@@ -238,8 +250,8 @@ export default function QuantRadarPanel() {
                   );
                 })
               ) : (
-                <div className="p-6 text-center border border-dashed border-cyan-500/20 rounded-lg text-ink-dim text-xs">
-                  No quantitative anomalies match Z &ge; {minZScore.toFixed(1)}.
+                <div className="p-6 text-center border border-dashed border-line rounded-lg text-ink-dim text-xs">
+                  Nothing is trading this far above its normal right now.
                 </div>
               )}
             </div>
@@ -254,14 +266,14 @@ export default function QuantRadarPanel() {
               {agents.map((ag, idx) => (
                 <div
                   key={idx}
-                  className="p-2.5 rounded-lg bg-raised/80 border border-purple-500/30 hover:border-purple-400/60 transition-all space-y-1.5"
+                  className="p-2.5 rounded-lg bg-raised/80 border border-line hover:border-line-accent transition-all space-y-1.5"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-bold text-purple-300 uppercase text-micro flex items-center gap-1.5">
+                    <span className="font-bold text-accent uppercase text-micro flex items-center gap-1.5">
                       <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
                       {ag.name}
                     </span>
-                    <span className="px-1.5 py-0.5 rounded text-micro font-bold bg-purple-500/20 text-purple-300 border border-purple-500/40">
+                    <span className="px-1.5 py-0.5 rounded text-micro font-bold bg-accent-dim text-accent border border-line-accent">
                       {ag.model}
                     </span>
                   </div>
@@ -284,7 +296,7 @@ export default function QuantRadarPanel() {
                   key={idx}
                   className="p-2.5 rounded-lg bg-page border border-line text-micro space-y-1"
                 >
-                  <div className="flex items-center justify-between text-cyan-400 font-bold">
+                  <div className="flex items-center justify-between text-accent font-bold">
                     <span>
                       [{dec.agent}] {dec.action}
                     </span>
@@ -310,13 +322,13 @@ export default function QuantRadarPanel() {
             className="bg-raised border border-accent/50 rounded-xl max-w-md w-full p-5 space-y-3 text-xs"
             {...dialog.panelProps}
           >
-            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-2.5">
-              <span className="text-xs font-bold text-white uppercase">
+            <div className="flex items-center justify-between border-b border-line pb-2.5">
+              <span className="text-xs font-bold text-ink uppercase">
                 {selectedAnomaly.ticker} VOLUME SPIKE INSPECTOR
               </span>
               <button
                 onClick={() => setSelectedAnomaly(null)}
-                className="text-ink-dim hover:text-white font-bold text-xs bg-overlay px-2 py-0.5 rounded cursor-pointer"
+                className="text-ink-dim hover:text-ink font-bold text-xs bg-overlay px-2 py-0.5 rounded cursor-pointer"
               >
                 CLOSE
               </button>
@@ -324,26 +336,26 @@ export default function QuantRadarPanel() {
             <div className="space-y-2">
               <div>
                 <span className="text-ink-dim">ENTITY:</span>{' '}
-                <span className="text-white font-bold">{selectedAnomaly.entity_name}</span>
+                <span className="text-ink font-bold">{selectedAnomaly.entity_name}</span>
               </div>
               <div>
-                <span className="text-ink-dim">Z-SCORE SPIKE:</span>{' '}
-                <span className="text-rose-400 font-bold">
+                <span className="text-ink-dim">Z-score spike:</span>{' '}
+                <span className="text-negative font-bold">
                   +{zOf(selectedAnomaly).toFixed(2)}&sigma;
                 </span>
               </div>
               <div>
-                <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
-                <span className="text-amber-400 font-bold">
+                <span className="text-ink-dim">Anomaly score:</span>{' '}
+                <span className="text-caution font-bold">
                   {fixed(selectedAnomaly.anomaly_score, 3)}
                 </span>
               </div>
               <div>
                 <span className="text-ink-dim">REGION:</span>{' '}
-                <span className="text-emerald-400">{selectedAnomaly.region}</span>
+                <span className="text-positive">{selectedAnomaly.region}</span>
               </div>
               <div>
-                <span className="text-ink-dim">DETECTED AT:</span>{' '}
+                <span className="text-ink-dim">Detected at:</span>{' '}
                 <span className="text-ink-dim">
                   {new Date(selectedAnomaly.occurred_at).toUTCString()}
                 </span>
@@ -352,7 +364,7 @@ export default function QuantRadarPanel() {
 
             <button
               onClick={() => setSelectedAnomaly(null)}
-              className="w-full py-2 bg-raised text-accent border border-cyan-500/30 rounded-lg text-xs font-bold hover:bg-overlay transition-colors cursor-pointer mt-2"
+              className="w-full py-2 bg-raised text-accent border border-line rounded-lg text-xs font-bold hover:bg-overlay transition-colors cursor-pointer mt-2"
             >
               DISMISS
             </button>

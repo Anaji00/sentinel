@@ -13,6 +13,7 @@ import { IconSignal } from '@/components/ui/icons';
 import { ClockTime } from './ui/ClockTime';
 import { useDialog } from './ui/useDialog';
 import { POLL } from './ui/DataProvider';
+import { NoteTile, StatTile } from './ui/StatTile';
 
 // Scores arrive null on some rows; a null here crashed the whole view.
 function fixed(value: number | null | undefined, digits: number): string {
@@ -39,11 +40,11 @@ export default function CryptoAnalytics() {
   });
 
   const chainTabs = [
-    { id: 'all', label: 'ALL DOMAINS' },
-    { id: 'funding', label: 'PERP FUNDING' },
-    { id: 'oi', label: 'OPEN INTEREST' },
-    { id: 'micro', label: 'MICROSTRUCTURE' },
-    { id: 'whales', label: 'WHALE TRANSFERS' },
+    { id: 'all', label: 'Everything' },
+    { id: 'funding', label: 'Futures fees' },
+    { id: 'oi', label: 'Open bets' },
+    { id: 'micro', label: 'Price moves' },
+    { id: 'whales', label: 'Big transfers' },
   ];
 
   const filteredEvents = useMemo(() => {
@@ -89,7 +90,7 @@ export default function CryptoAnalytics() {
 
   return (
     <Card
-      title="CRYPTO DERIVATIVES & MICROSTRUCTURE HUD"
+      title="Crypto futures and order flow"
       badge={
         <Badge variant="live" pulse>
           Binance &amp; Coinbase, live
@@ -99,32 +100,18 @@ export default function CryptoAnalytics() {
       noPadding
     >
       <div className="p-3.5 space-y-3">
-        {/* Metric Summary HUD */}
-        <div className="grid grid-cols-4 gap-2.5">
-          <div className="p-2.5 bg-page border border-line rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              Total Monitored Streams
-            </div>
-            <div className="text-base font-bold text-amber-400 mt-0.5">
-              {cryptoEvents?.length || 0}
-            </div>
-          </div>
-          <div className="p-2.5 bg-page border border-purple-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              Perp Funding Anomalies
-            </div>
-            <div className="text-base font-bold text-purple-400 mt-0.5">{fundingExtremesCount}</div>
-          </div>
-          <div className="p-2.5 bg-page border border-rose-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">
-              High Anomaly (Score &ge; 0.75)
-            </div>
-            <div className="text-base font-bold text-rose-400 mt-0.5">{highSeverityCount}</div>
-          </div>
-          <div className="p-2.5 bg-page border border-cyan-500/30 rounded-xl">
-            <div className="text-ink-dim text-micro uppercase font-bold">Microstructure Engine</div>
-            <div className="text-base font-bold text-accent mt-0.5">OFI / KYLE / AMIHUD</div>
-          </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+          <StatTile value={formatNumber(cryptoEvents?.length ?? 0, { decimals: 0 })} label="Recent events" />
+          <StatTile value={formatNumber(fundingExtremesCount, { decimals: 0 })} label="Unusual futures fees" />
+          <StatTile
+            value={formatNumber(highSeverityCount, { decimals: 0 })}
+            label="Very unusual events"
+            tone={highSeverityCount ? 'text-negative' : 'text-ink'}
+          />
+          <NoteTile title="What a futures fee means">
+            Futures traders pay each other a small fee to keep bets open. A high positive fee means most are betting on a
+            rise.
+          </NoteTile>
         </div>
 
         {/* Search Bar */}
@@ -134,7 +121,7 @@ export default function CryptoAnalytics() {
             placeholder="Filter by pair (BTCUSDT), funding rate, OFI, or exchange..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-inset border border-amber-500/20 rounded-xl px-3.5 py-2 text-xs text-ink placeholder-slate-500 focus:outline-none focus:border-amber-400/60 font-mono transition-colors"
+            className="w-full bg-inset border border-caution/30 rounded-xl px-3.5 py-2 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-caution/30 font-mono transition-colors"
           />
         </div>
 
@@ -147,19 +134,19 @@ export default function CryptoAnalytics() {
               const micro = cd.market_microstructure || e.market_microstructure;
 
               let typeBadge = 'CRYPTO';
-              let badgeColor = 'bg-amber-500/20 text-amber-300 border-amber-500/40';
+              let badgeColor = 'bg-caution/10 text-caution border-caution/30';
               if ((e.type || '').includes('funding')) {
-                typeBadge = 'PERP FUNDING';
-                badgeColor = 'bg-purple-500/20 text-purple-300 border-purple-500/40';
+                typeBadge = 'FUTURES FEE';
+                badgeColor = 'bg-accent-dim text-accent border-line-accent';
               } else if ((e.type || '').includes('interest')) {
-                typeBadge = 'OPEN INTEREST';
-                badgeColor = 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40';
+                typeBadge = 'OPEN BETS';
+                badgeColor = 'bg-accent-dim text-accent border-line-accent';
               } else if ((e.type || '').includes('liquidation')) {
-                typeBadge = 'LIQUIDATION';
-                badgeColor = 'bg-rose-500/20 text-rose-300 border-rose-500/40';
+                typeBadge = 'FORCED SALE';
+                badgeColor = 'bg-negative/10 text-negative border-negative/30';
               } else if (micro) {
-                typeBadge = 'MICROSTRUCTURE';
-                badgeColor = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40';
+                typeBadge = 'PRICE MOVE';
+                badgeColor = 'bg-positive/10 text-positive border-positive/30';
               }
 
               return (
@@ -168,13 +155,13 @@ export default function CryptoAnalytics() {
                   onClick={() => setSelectedEvent(e)}
                   className={`p-3 bg-raised/70 rounded-xl border transition-all cursor-pointer hover:bg-raised/95 ${
                     isHighSeverity
-                      ? 'border-rose-500/40 hover:border-rose-400 shadow-panel'
-                      : 'border-line hover:border-amber-500/50'
+                      ? 'border-negative/30 hover:border-negative/30 shadow-panel'
+                      : 'border-line hover:border-caution/30'
                   }`}
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-amber-300 font-bold text-xs uppercase flex items-center gap-1">
+                      <span className="text-caution font-bold text-xs uppercase flex items-center gap-1">
                         {cd.pair || e.primary_entity_name || e.entity_name || 'Crypto Asset'}
                       </span>
                       <span
@@ -189,8 +176,8 @@ export default function CryptoAnalytics() {
                     <span
                       className={`text-micro font-bold px-2 py-0.5 rounded border ${
                         isHighSeverity
-                          ? 'bg-rose-500/20 text-rose-400 border-rose-500/40'
-                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                          ? 'bg-negative/10 text-negative border-negative/30'
+                          : 'bg-caution/10 text-caution border-caution/30'
                       }`}
                     >
                       SCORE: {fixed(e.anomaly_score, 2)}
@@ -208,7 +195,7 @@ export default function CryptoAnalytics() {
                       presented as Sentinel's own analysis. */}
                   {e.data_provenance && (
                     <span
-                      className="mt-1 inline-block rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-amber-300"
+                      className="mt-1 inline-block rounded border border-caution/30 bg-caution/10 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-caution"
                       title="Fetched directly from the exchange by your browser. Not enriched, scored or correlated by Sentinel."
                     >
                       Unenriched · direct feed
@@ -218,14 +205,14 @@ export default function CryptoAnalytics() {
                   {/* Contextual Metric Cards for Funding, Basis, & Microstructure */}
                   <div className="mt-2 grid grid-cols-3 gap-2 pt-2 border-t border-line/80 text-micro">
                     {cd.funding_rate !== undefined && (
-                      <div className="bg-page p-1.5 rounded border border-purple-500/20">
-                        <span className="text-ink-dim block text-micro">FUNDING RATE:</span>
+                      <div className="bg-page p-1.5 rounded border border-line">
+                        <span className="text-ink-dim block text-micro">Futures fee:</span>
                         <span
-                          className={`font-bold ${cd.funding_rate > 0 ? 'text-emerald-400' : 'text-rose-400'}`}
+                          className={`font-bold ${cd.funding_rate > 0 ? 'text-positive' : 'text-negative'}`}
                         >
                           {formatPercent(cd.funding_rate, { from: 'ratio', decimals: 4 })} (
                           {cd.basis_bps
-                            ? `${cd.basis_bps > 0 ? '+' : ''}${cd.basis_bps.toFixed(1)} bps basis`
+                            ? `futures ${Math.abs(cd.basis_bps / 100).toFixed(3)}% ${cd.basis_bps >= 0 ? 'above' : 'below'} the spot price`
                             : 'N/A'}
                           )
                         </span>
@@ -233,21 +220,21 @@ export default function CryptoAnalytics() {
                     )}
 
                     {cd.open_interest !== undefined && (
-                      <div className="bg-page p-1.5 rounded border border-cyan-500/20">
-                        <span className="text-ink-dim block text-micro">OPEN INTEREST:</span>
-                        <span className="text-cyan-300 font-bold">
+                      <div className="bg-page p-1.5 rounded border border-line">
+                        <span className="text-ink-dim block text-micro">Open bets:</span>
+                        <span className="text-accent font-bold">
                           {formatNumber(cd.open_interest, { decimals: 0 })} tokens
                         </span>
                       </div>
                     )}
 
                     {micro && (
-                      <div className="bg-page p-1.5 rounded border border-emerald-500/20 col-span-2">
+                      <div className="bg-page p-1.5 rounded border border-positive/30 col-span-2">
                         <span className="text-ink-dim block text-micro">
                           ORDER FLOW IMBALANCE (OFI) / KYLE &lambda;:
                         </span>
-                        <span className="text-emerald-400 font-bold">
-                          OFI: {micro.order_flow_imbalance?.toFixed(3) || 'N/A'} | &lambda;:{' '}
+                        <span className="text-positive font-bold">
+                          OFI: {micro.order_flow_imbalance?.toFixed(3) || 'N/A'}{' '}| &lambda;:{' '}
                           {micro.kyle_lambda?.toExponential(2) || 'N/A'}
                         </span>
                       </div>
@@ -256,7 +243,7 @@ export default function CryptoAnalytics() {
 
                   <div className="mt-1.5 text-micro text-ink-dim flex justify-between items-center">
                     <span>
-                      Mark:{' '}
+                      Price:{' '}
                       <span className="text-ink">
                         $
                         {cd.mark_price
@@ -274,7 +261,7 @@ export default function CryptoAnalytics() {
               );
             })
           ) : (
-            <div className="p-8 text-center border border-dashed border-amber-500/20 rounded-xl text-ink-dim text-xs">
+            <div className="p-8 text-center border border-dashed border-caution/30 rounded-xl text-ink-dim text-xs">
               No matching crypto events found.
             </div>
           )}
@@ -288,21 +275,21 @@ export default function CryptoAnalytics() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-amber-500/50 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
+            className="bg-raised border border-caution/30 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
             {...dialog.panelProps}
           >
-            <div className="flex items-center justify-between border-b border-amber-500/30 pb-3">
+            <div className="flex items-center justify-between border-b border-caution/30 pb-3">
               <div className="flex items-center gap-2">
                 <span className="text-lg">
                   <IconSignal className="inline-block shrink-0" />
                 </span>
-                <span className="font-bold text-amber-300 uppercase tracking-wider">
+                <span className="font-bold text-caution uppercase tracking-wider">
                   Derivatives and order flow
                 </span>
               </div>
               <button
                 onClick={() => setSelectedEvent(null)}
-                className="text-ink-dim hover:text-white text-xs font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
+                className="text-ink-dim hover:text-ink text-xs font-bold px-2 py-0.5 rounded bg-overlay cursor-pointer"
               >
                 CLOSE
               </button>
@@ -311,27 +298,27 @@ export default function CryptoAnalytics() {
             <div className="space-y-3">
               <div>
                 <span className="text-ink-dim block mb-0.5 text-micro uppercase font-bold">
-                  HEADLINE / SUMMARY:
+                  Headline / summary:
                 </span>
-                <p className="text-white font-bold font-sans text-sm">
+                <p className="text-ink font-bold font-sans text-sm">
                   {selectedEvent.headline || selectedEvent.summary}
                 </p>
               </div>
 
               <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line">
                 <div>
-                  <span className="text-ink-dim">EVENT ID:</span>{' '}
-                  <span className="text-amber-300 font-bold block truncate">
+                  <span className="text-ink-dim">Event ID:</span>{' '}
+                  <span className="text-caution font-bold block truncate">
                     {selectedEvent.event_id}
                   </span>
                 </div>
                 <div>
                   <span className="text-ink-dim">SOURCE:</span>{' '}
-                  <span className="text-amber-300 font-bold block">{selectedEvent.source}</span>
+                  <span className="text-caution font-bold block">{selectedEvent.source}</span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">ANOMALY SCORE:</span>{' '}
-                  <span className="text-rose-400 font-bold block">
+                  <span className="text-ink-dim">Anomaly score:</span>{' '}
+                  <span className="text-negative font-bold block">
                     {fixed(selectedEvent.anomaly_score, 2)}
                   </span>
                 </div>
@@ -344,14 +331,14 @@ export default function CryptoAnalytics() {
               </div>
 
               {selectedEvent.crypto_data && (
-                <div className="p-3 bg-page rounded-xl border border-purple-500/30 space-y-2">
-                  <span className="text-purple-300 font-bold block text-micro">
+                <div className="p-3 bg-page rounded-xl border border-line space-y-2">
+                  <span className="text-accent font-bold block text-micro">
                     Crypto derivatives
                   </span>
                   <div className="grid grid-cols-3 gap-2 text-micro">
                     <div>
                       <span className="text-ink-dim block">Funding Rate:</span>{' '}
-                      <span className="text-white font-bold">
+                      <span className="text-ink font-bold">
                         {formatPercent(selectedEvent.crypto_data.funding_rate, {
                           from: 'ratio',
                           decimals: 4,
@@ -360,7 +347,7 @@ export default function CryptoAnalytics() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">Mark Price:</span>{' '}
-                      <span className="text-white font-bold">
+                      <span className="text-ink font-bold">
                         {selectedEvent.crypto_data.mark_price
                           ? formatCurrency(selectedEvent.crypto_data.mark_price)
                           : 'N/A'}
@@ -368,7 +355,7 @@ export default function CryptoAnalytics() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">Index Price:</span>{' '}
-                      <span className="text-white font-bold">
+                      <span className="text-ink font-bold">
                         {selectedEvent.crypto_data.index_price
                           ? formatCurrency(selectedEvent.crypto_data.index_price)
                           : 'N/A'}
@@ -376,7 +363,7 @@ export default function CryptoAnalytics() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">Perp-Spot Basis:</span>{' '}
-                      <span className="text-cyan-300 font-bold">
+                      <span className="text-accent font-bold">
                         {selectedEvent.crypto_data.basis_bps
                           ? `${selectedEvent.crypto_data.basis_bps.toFixed(2)} bps`
                           : 'N/A'}
@@ -384,7 +371,7 @@ export default function CryptoAnalytics() {
                     </div>
                     <div>
                       <span className="text-ink-dim block">Open Interest:</span>{' '}
-                      <span className="text-cyan-300 font-bold">
+                      <span className="text-accent font-bold">
                         {selectedEvent.crypto_data.open_interest
                           ? formatNumber(selectedEvent.crypto_data.open_interest, { decimals: 0 })
                           : 'N/A'}
@@ -395,8 +382,8 @@ export default function CryptoAnalytics() {
               )}
 
               <div>
-                <span className="text-amber-400 font-bold block mb-1 text-micro">
-                  EVENT DETAIL:
+                <span className="text-caution font-bold block mb-1 text-micro">
+                  Event detail:
                 </span>
                 <div className="max-h-40 overflow-y-auto">
                   <DataGrid
@@ -409,7 +396,7 @@ export default function CryptoAnalytics() {
 
             <button
               onClick={() => setSelectedEvent(null)}
-              className="w-full py-2 bg-raised text-amber-300 border border-amber-500/40 rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
+              className="w-full py-2 bg-raised text-caution border border-caution/30 rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
             >
               DISMISS
             </button>

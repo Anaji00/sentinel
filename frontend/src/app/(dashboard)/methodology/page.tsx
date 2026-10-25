@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
-import { IconAlert, IconMethodology, IconShield } from '@/components/ui/icons';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { IconAlert, IconShield } from '@/components/ui/icons';
 
 interface Parameter {
   name: string;
@@ -14,6 +15,8 @@ interface Parameter {
 interface SignalMethodology {
   id: string;
   name: string;
+  /** What it does, for someone who has never met the maths. */
+  plain: string;
   category: string;
   epistemic_tier: string;
   description: string;
@@ -28,6 +31,8 @@ interface SignalMethodology {
 const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
   covered_call_optimization: {
     id: 'covered_call_optimization',
+    plain:
+      'If you own a stock, you can sell someone the right to buy it from you at a higher price and keep the fee. This picks the price and date that pay the most fee for the least chance of having to sell.',
     name: 'Covered Call Overlay Optimization',
     category: 'Derivatives & Options',
     epistemic_tier: 'Deterministic Closed-Form',
@@ -65,6 +70,8 @@ const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
   },
   granger_causality: {
     id: 'granger_causality',
+    plain:
+      'Checks whether moves in one thing (say, oil) tend to come before moves in another (say, airline stocks), more often than chance would allow. It shows which way news travels, not that one causes the other.',
     name: 'Pairwise Bivariate Granger Causality',
     category: 'Statistical Discovery',
     epistemic_tier: 'Statistical Empirical',
@@ -101,6 +108,8 @@ const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
   },
   hawkes_point_process: {
     id: 'hawkes_point_process',
+    plain:
+      'Some events set off more events: a port closure, then a sell-off, then more alerts. This measures how strongly one burst of events makes the next more likely, and how fast that fades.',
     name: 'Mutually Exciting Hawkes Cross-Domain Contagion',
     category: 'Cross-Domain Epistemic',
     epistemic_tier: 'Stochastic Process',
@@ -136,6 +145,8 @@ const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
   },
   parametric_var_cvar: {
     id: 'parametric_var_cvar',
+    plain:
+      'Answers "how much could this lose on a bad day?": the loss a portfolio should only exceed about one day in twenty, and the average loss on the very worst days (about one in a hundred).',
     name: 'Parametric Value at Risk (VaR) & Expected Shortfall (CVaR)',
     category: 'Risk & Governance',
     epistemic_tier: 'Deterministic Closed-Form',
@@ -170,6 +181,8 @@ const STATIC_METHODOLOGIES: Record<string, SignalMethodology> = {
   },
   half_kelly_position_sizing: {
     id: 'half_kelly_position_sizing',
+    plain:
+      'Decides how much to put into each bet. It uses a well-known formula for the best size, then deliberately bets half of that, because the formula assumes we know the odds exactly, and we never do.',
     name: 'Half-Kelly Optimal Capital Sizing',
     category: 'Quantitative Strategy',
     epistemic_tier: 'Deterministic Closed-Form',
@@ -214,30 +227,24 @@ export default function MethodologyPage() {
     STATIC_METHODOLOGIES[selectedId] || STATIC_METHODOLOGIES['covered_call_optimization'];
 
   return (
-    <div className="flex flex-col gap-6 p-6 max-w-7xl mx-auto text-ink">
+    <div className="flex flex-col gap-6 p-2 max-w-7xl mx-auto text-ink">
       {/* Header */}
-      <div className="flex flex-col gap-1 border-b border-line pb-5">
-        <div className="flex items-center gap-2.5">
-          <span className="text-2xl">
-            <IconMethodology className="inline-block shrink-0" />
-          </span>
-          <h1 className="text-lg font-semibold tracking-tight text-white">Methodology</h1>
-          <span className="px-2.5 py-0.5 text-xs font-bold rounded-full bg-sky-500/20 text-sky-400 border border-sky-500/30 ml-2">
-            Anti-Palantir Integrity Standard
-          </span>
-        </div>
-        <p className="text-sm text-ink-dim mt-1">
-          Zero black boxes. Every mathematical equation, statistical derivation, parameter
-          calibration method, and falsifiability condition is fully published and verifiable.
-        </p>
-      </div>
+      <PageHeader
+        title="How it works"
+        description="No black boxes: every formula behind the platform, the assumptions it makes, how its settings were chosen, and what result would prove it wrong."
+        related={[
+          { href: '/strategies?view=drivers', label: 'What drives signals' },
+          { href: '/signals', label: 'Trade signals' },
+          { href: '/strategies', label: 'Backtests' },
+        ]}
+      />
 
       {/* Main Layout */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         {/* Sidebar Selector */}
         <div className="flex flex-col gap-2">
           <span className="text-xs font-bold text-ink-dim uppercase tracking-wider px-1">
-            Signal Catalog
+            The methods
           </span>
           {Object.values(STATIC_METHODOLOGIES).map((m) => {
             const isSelected = m.id === selectedId;
@@ -251,7 +258,7 @@ export default function MethodologyPage() {
                     : 'bg-raised/60 border-line text-ink-dim hover:border-line-strong hover:text-ink'
                 }`}
               >
-                <span className="text-xs font-bold text-white">{m.name}</span>
+                <span className="text-xs font-bold text-ink">{m.name}</span>
                 <span className="text-micro text-ink-dim mt-0.5">{m.category}</span>
               </button>
             );
@@ -259,24 +266,32 @@ export default function MethodologyPage() {
         </div>
 
         {/* Detailed Methodology View */}
-        <div className="md:col-span-3 flex flex-col gap-5 bg-raised/80 border border-line rounded-xl p-6 shadow-xl">
+        <div className="md:col-span-3 flex flex-col gap-5 bg-raised/80 border border-line rounded-xl p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
             <div>
-              <span className="px-2 py-0.5 text-micro font-semibold rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 uppercase tracking-wide">
+              <span className="px-2 py-0.5 text-micro font-semibold rounded bg-accent-dim text-accent border border-line-accent uppercase tracking-wide">
                 {current.epistemic_tier}
               </span>
-              <h2 className="text-xl font-bold text-white mt-1.5">{current.name}</h2>
+              <h2 className="text-xl font-bold text-ink mt-1.5">{current.name}</h2>
               <p className="text-xs text-ink-dim mt-1">{current.description}</p>
             </div>
+          </div>
+
+          {/* Plain words first: most readers stop here, and should be able to. */}
+          <div className="rounded-lg border border-accent/30 bg-accent-dim px-4 py-3">
+            <div className="text-micro font-semibold uppercase tracking-wider text-accent">
+              In plain words
+            </div>
+            <p className="mt-1 text-sm text-ink">{current.plain}</p>
           </div>
 
           {/* Mathematical Formula Card */}
           <div className="flex flex-col gap-2 p-4 bg-page/90 border border-line rounded-lg">
             <span className="text-xs font-semibold text-sky-400 flex items-center gap-1.5">
               <span>∑</span>
-              <span>Mathematical Formulation</span>
+              <span>The formula (for specialists)</span>
             </span>
-            <div className="text-sm text-emerald-400 bg-raised/90 p-3 rounded border border-line/80 overflow-x-auto">
+            <div className="text-sm text-positive bg-raised/90 p-3 rounded border border-line/80 overflow-x-auto">
               {current.formula_latex}
             </div>
           </div>
@@ -284,7 +299,7 @@ export default function MethodologyPage() {
           {/* Theoretical Assumptions */}
           <div className="flex flex-col gap-2">
             <h3 className="text-xs font-bold uppercase tracking-wider text-ink-dim">
-              Underlying Epistemic Assumptions
+              What it assumes
             </h3>
             <ul className="list-disc list-inside text-xs text-ink-dim space-y-1 bg-page/40 p-3 rounded-lg border border-line/60">
               {current.assumptions.map((assump, i) => (
@@ -296,7 +311,7 @@ export default function MethodologyPage() {
           {/* Parameter Calibration Grid */}
           <div className="flex flex-col gap-2">
             <h3 className="text-xs font-bold uppercase tracking-wider text-ink-dim">
-              Parameter Calibration & Empirical Tuning
+              Its settings, and how each was chosen
             </h3>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs border-collapse border border-line">
@@ -311,9 +326,9 @@ export default function MethodologyPage() {
                 <tbody className="divide-y divide-line">
                   {current.parameters.map((p, i) => (
                     <tr key={i} className="hover:bg-overlay/30">
-                      <td className="p-2.5 font-semibold text-white">{p.name}</td>
+                      <td className="p-2.5 font-semibold text-ink">{p.name}</td>
                       <td className="p-2.5 font-mono text-sky-400">{p.symbol}</td>
-                      <td className="p-2.5 font-mono text-emerald-400">{p.default_value}</td>
+                      <td className="p-2.5 font-mono text-positive">{p.default_value}</td>
                       <td className="p-2.5 text-ink-dim">{p.calibration_method}</td>
                     </tr>
                   ))}
@@ -324,23 +339,23 @@ export default function MethodologyPage() {
 
           {/* Validation Gate & Falsifiability */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
-            <div className="p-3.5 bg-emerald-950/20 border border-emerald-500/30 rounded-lg">
-              <span className="text-xs font-bold text-emerald-400 flex items-center gap-1">
+            <div className="p-3.5 bg-positive/10 border border-positive/30 rounded-lg">
+              <span className="text-xs font-bold text-positive flex items-center gap-1">
                 <span>
                   <IconShield className="inline-block shrink-0" />
                 </span>
-                <span>Pre-Deployment Validation Gate</span>
+                <span>What it must pass before we use it</span>
               </span>
-              <p className="text-xs text-emerald-200/90 mt-1">{current.validation_gate}</p>
+              <p className="text-xs text-positive/90 mt-1">{current.validation_gate}</p>
             </div>
-            <div className="p-3.5 bg-rose-950/20 border border-rose-500/30 rounded-lg">
-              <span className="text-xs font-bold text-rose-400 flex items-center gap-1">
+            <div className="p-3.5 bg-negative/10 border border-negative/30 rounded-lg">
+              <span className="text-xs font-bold text-negative flex items-center gap-1">
                 <span>
                   <IconAlert className="inline-block shrink-0" />
                 </span>
-                <span>Falsifiability / Model Degradation Condition</span>
+                <span>What would tell us it has stopped working</span>
               </span>
-              <p className="text-xs text-rose-200/90 mt-1">{current.falsifiability_condition}</p>
+              <p className="text-xs text-negative/90 mt-1">{current.falsifiability_condition}</p>
             </div>
           </div>
         </div>

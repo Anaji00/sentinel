@@ -73,7 +73,7 @@ export default function IntegrationsPanel() {
 
   return (
     <Card
-      title="DATA SOURCE INTEGRATIONS"
+      title="Data sources"
       badge={
         data ? (
           <Badge variant={data.needs_attention.length === 0 ? 'success' : 'warning'}>
@@ -92,13 +92,13 @@ export default function IntegrationsPanel() {
         {exec && (
           <div
             className={`p-3 rounded-xl border flex items-start gap-2.5 ${
-              exec.is_live_capital ? 'bg-rose-950/40 border-rose-500/50' : 'bg-page/70 border-line'
+              exec.is_live_capital ? 'bg-negative/10 border-negative/30' : 'bg-page/70 border-line'
             }`}
           >
             {exec.is_live_capital ? (
-              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <ShieldAlert className="w-4 h-4 text-negative shrink-0 mt-0.5" />
             ) : (
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              <CheckCircle2 className="w-4 h-4 text-positive shrink-0 mt-0.5" />
             )}
             <div className="min-w-0">
               <div className="text-micro uppercase tracking-wider text-ink-dim">
@@ -106,14 +106,14 @@ export default function IntegrationsPanel() {
               </div>
               <div
                 className={`font-bold mt-0.5 ${
-                  exec.is_live_capital ? 'text-rose-300' : 'text-emerald-300'
+                  exec.is_live_capital ? 'text-negative' : 'text-positive'
                 }`}
               >
                 {exec.venue}
               </div>
-              {exec.warning && <div className="text-micro text-rose-300 mt-1">{exec.warning}</div>}
+              {exec.warning && <div className="text-micro text-negative mt-1">{exec.warning}</div>}
               {!exec.operational && (
-                <div className="text-micro text-amber-300 mt-1">
+                <div className="text-micro text-caution mt-1">
                   Broker selected but credentials are absent — orders will fail at submission.
                 </div>
               )}
@@ -126,7 +126,7 @@ export default function IntegrationsPanel() {
         {/* Unconfigured first: this is the actionable half. */}
         {data && data.needs_attention.length > 0 && (
           <div className="space-y-2">
-            <div className="flex items-center gap-1.5 text-micro uppercase tracking-wider text-amber-400 font-bold">
+            <div className="flex items-center gap-1.5 text-micro uppercase tracking-wider text-caution font-bold">
               <AlertTriangle className="w-3.5 h-3.5" />
               {data.needs_attention.some((n) =>
                 data.integrations.some((i) => i.key === n.key && i.required),
@@ -144,14 +144,14 @@ export default function IntegrationsPanel() {
                 <div
                   key={item.key}
                   className={`p-2.5 bg-page/70 border rounded-xl space-y-1.5 ${
-                    isRequired ? 'border-rose-500/50' : 'border-amber-500/25'
+                    isRequired ? 'border-negative/30' : 'border-caution/30'
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-bold text-ink">
                       {item.label}
                       {isRequired && (
-                        <span className="ml-2 px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 text-micro font-black tracking-widest align-middle">
+                        <span className="ml-2 px-1.5 py-0.5 rounded bg-negative/10 text-negative text-micro font-black tracking-widest align-middle">
                           REQUIRED
                         </span>
                       )}
@@ -161,7 +161,7 @@ export default function IntegrationsPanel() {
                         href={item.signup_url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="flex items-center gap-1 text-micro text-cyan-400 hover:text-cyan-300 shrink-0"
+                        className="flex items-center gap-1 text-micro text-accent hover:text-accent shrink-0"
                       >
                         GET A FREE KEY <ExternalLink className="w-3 h-3" />
                       </a>
@@ -175,7 +175,7 @@ export default function IntegrationsPanel() {
                     {(item.missing_env_vars ?? []).map((v) => (
                       <code
                         key={v}
-                        className="px-1.5 py-0.5 bg-raised border border-line-strong rounded text-micro text-amber-300"
+                        className="px-1.5 py-0.5 bg-raised border border-line-strong rounded text-micro text-caution"
                       >
                         {v}
                       </code>
@@ -191,7 +191,7 @@ export default function IntegrationsPanel() {
         {/* Configured, compact — confirmation, not detail. */}
         {data && data.integrations.some((i) => i.configured) && (
           <div className="space-y-1.5">
-            <div className="text-micro uppercase tracking-wider text-emerald-400 font-bold">
+            <div className="text-micro uppercase tracking-wider text-positive font-bold">
               Configured
             </div>
             <div className="flex flex-wrap gap-1.5">
@@ -200,7 +200,7 @@ export default function IntegrationsPanel() {
                 .map((i) => (
                   <span
                     key={i.key}
-                    className="flex items-center gap-1 px-2 py-0.5 bg-emerald-950/40 border border-emerald-500/30 rounded text-micro text-emerald-300"
+                    className="flex items-center gap-1 px-2 py-0.5 bg-positive/10 border border-positive/30 rounded text-micro text-positive"
                   >
                     <CheckCircle2 className="w-3 h-3" />
                     {i.label.split('—')[0].trim()}

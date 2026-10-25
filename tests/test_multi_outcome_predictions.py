@@ -353,3 +353,65 @@ def test_nested_event_responses_still_work(collector):
     pairs = collector._pair_markets_with_events([ev], "queried-slug")
     assert len(pairs) == 2
     assert all(parent is ev for _, parent in pairs)
+
+
+# ── Kalshi: a market seen for the first time is a baseline, not a bid ────────
+
+class _Raw:
+    """The two Redis calls the Kalshi path makes, in memory."""
+
+    def __init__(self) -> None:
+        self.kv: dict = {}
+
+    async def get(self, key):
+        return self.kv.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.kv[key] = value
+
+    async def sadd(self, key, *values):
+        return len(values)
+
+
+class _Redis:
+    def __init__(self) -> None:
+        self.raw = _Raw()
+
+
+class _Scorer:
+    def __init__(self) -> None:
+        self.notionals: list = []
+
+    async def score_prediction_anomaly(self, asset_id, notional, delta_p=0.0, yes_val=0.0, no_val=0.0):
+        self.notionals.append(notional)
+        return {"score": 0.1, "z_score_volume": 0.0, "z_score_prob": 0.0}
+
+    def record_hawkes_event(self, kind) -> None:
+        return None
+
+
+def test_a_kalshi_market_seen_first_only_sets_the_baseline(enricher):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    scorer = _Scorer()
+    e = enricher.PredictionEnricher(scorer, _Redis(), None)
+
+    def raw(volume: float, yes: float):
+        return SimpleNamespace(
+            source="kalshi", event_id=str(uuid4()), trace_id=str(uuid4()), occurred_at=None,
+            raw_payload={"ticker": "KXCPI-26OCT-T0.3", "title": "CPI above 0.3%", "total_volume": volume,
+                         "price": yes, "yes_bid": yes, "no_bid": 1 - yes,
+                         "yes_probability": yes, "no_probability": 1 - yes})
+
+    assert _run(e.enrich(raw(120_000.0, 0.40))) is None          # lifetime volume, not a fresh bid
+    assert scorer.notionals == []
+    _run(e.enrich(raw(120_500.0, 0.42)))
+    assert scorer.notionals == [500.0 * 0.42]                     # only the new contracts count
+
+
+def test_a_few_dollars_on_kalshi_is_not_a_whale(enricher):
+    """8 Oct 2026: +$34 was headlined a whale bid at 0.89."""
+    assert enricher.kalshi_floor(34.0, 0.0, 0.89, 3.0, 0.0) == (0.3, 0.0, 0.0)
+    assert enricher.kalshi_floor(40_000.0, 0.0, 0.89, 3.0, 0.0) == (0.89, 3.0, 0.0)   # real money
+    assert enricher.kalshi_floor(10.0, 0.05, 0.8, 0.0, 2.6) == (0.8, 0.0, 2.6)        # real move in the odds

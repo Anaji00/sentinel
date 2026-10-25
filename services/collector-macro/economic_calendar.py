@@ -25,7 +25,7 @@ import os
 import sys
 import uuid
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional, Any
 
 from shared.models import NormalizedEvent, EventType, EntityType, Entity, MacroReleaseData, AnomalyBreakdown, RawEvent
@@ -75,6 +75,12 @@ INDICATOR_PROFILES = {
         "description": "US Non-Farm Payrolls Employment Change",
         "higher_is": "EXPANSIONARY_HAWKISH",
         "aliases": ["NFP", "NON-FARM", "NONFARM", "PAYROLLS"],
+    },
+    "JOBLESS_CLAIMS": {
+        "unit": "",
+        "description": "US Initial Jobless Claims (weekly)",
+        "higher_is": "CONTRACTIONARY_DOVISH",
+        "aliases": ["JOBLESS CLAIMS", "INITIAL CLAIMS"],
     },
     "UNEMPLOYMENT": {
         "unit": "%",
@@ -443,10 +449,11 @@ class EconomicCalendarCollector:
                 await raw.hset(fred.FRED_STATE_KEY, series.series_id, fred.state_marker(series, release))
             if not new:
                 continue
+            forecast = await _kalshi_forecast(raw, series.indicator, now)
             event = self.build_macro_release_event(
                 indicator=series.indicator,
                 actual=release["actual"],
-                forecast=None,
+                forecast=forecast,
                 previous=release["previous"],
                 period=release["period"],
                 source="fred",
@@ -513,3 +520,29 @@ class EconomicCalendarCollector:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+KALSHI_CONSENSUS_KEY = "sentinel:macro:kalshi_consensus"
+
+
+async def _kalshi_forecast(raw, indicator: str, now: datetime) -> Optional[float]:
+    """The Kalshi-implied median for this release, if the snapshot is for it:
+    its markets closed within the last three days (they close minutes before
+    the release) or close within the hour."""
+    if raw is None:
+        return None
+    try:
+        stored = await raw.hget(KALSHI_CONSENSUS_KEY, indicator)
+    except Exception as e:
+        swallowed("collector_macro.kalshi_consensus_read", e, logger)
+        return None
+    if not stored:
+        return None
+    try:
+        snap = json.loads(stored.decode() if isinstance(stored, bytes) else stored)
+        close = datetime.fromisoformat(str(snap["close_time"]).replace("Z", "+00:00"))
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not (now - timedelta(days=3) <= close <= now + timedelta(hours=1)):
+        return None
+    return float(snap["median"])

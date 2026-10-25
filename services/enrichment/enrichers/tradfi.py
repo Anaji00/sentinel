@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Optional
+from shared.utils.candles import window_words, above_normal_words
 from shared.models.events import entity_cache_key
 from shared.models.events import (
     FilingData,
@@ -22,7 +23,7 @@ from shared.models import (
 from shared.utils import quant_calc
 from shared.utils.equities import asset_class, is_valid_primary_equity
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
-from shared.utils.market_session import instrument_closed_at
+from shared.utils.market_session import instrument_closed_at, session_label_at
 from shared.utils.form4 import code_value_usd as form4_code_value_usd, dominant_code as form4_dominant_code
 from shared.utils.price_moves import (
     MOVE_KEY_TTL_SEC, band_crossed, band_key, day_move_pct, is_futures_move_subject, move_score,
@@ -213,7 +214,7 @@ THIRTEEN_F_MOVEMENT_SCALE = 2.0
 # Imported rather than declared: the gateway had its own Z_SCORE_SCALE = 4.5 and
 # used it to multiply a unit score back out into a field called z_score, which
 # is neither the same constant nor the inverse of this curve.
-from shared.utils.anomaly_scale import Z_SCORE_SCALE, z_to_score  # noqa: E402
+from shared.utils.anomaly_scale import Z_SCORE_SCALE, z_to_score  # noqa: E402,F401 -- Z_SCORE_SCALE is re-exported for callers and tests
 
 # Where an earnings surprise, judged on size alone, reaches the top of its band.
 # Fifty percent away from consensus is already extraordinary; the curve
@@ -301,6 +302,14 @@ def _options_premium_score(premium: float) -> float:
         return FALLBACK_MAX_SCORE
     span = math.log10(OPTIONS_PREMIUM_REFERENCE_USD) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)
     return round((math.log10(value) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)) / span, 4)
+
+
+def _options_headline(ticker: str, option_type: str, premium: float, aggressor: Optional[str] = None) -> str:
+    """A large options trade in words: who paid how much for which bet."""
+    bet = {"CALL": "calls (a bet it rises)", "PUT": "puts (a bet it falls)"}.get(option_type, "options")
+    size = f"${premium / 1e6:.1f}M" if premium >= 1e6 else f"${premium / 1e3:.0f}k"
+    who = "A buyer paid" if aggressor == "buy" else "A seller took" if aggressor == "sell" else "Someone traded"
+    return f"{ticker}: {who} {size} for {bet}"
 
 
 def _otm_percentage(strike, underlying_price, option_type) -> "Optional[float]":
@@ -756,7 +765,6 @@ class TradFiEnricher:
                 cov_fraction = 0.0
             is_watched, f_boost = check_results[i]
             w_boost = 0.15 if is_watched else 0.0
-            base_score = anomaly
 
             # Shared adjustment allowance, reset per event. Declared before the
             # first lift rather than after it: the watchlist and frequency
@@ -1364,7 +1372,9 @@ class TradFiEnricher:
             return None
 
         # Persist closed bar to durable TimescaleDB tradfi_bars hypertable (§2.1, §2.4)
-        session_tag = p.get("session", "REGULAR")
+        # The session by the bar's own time when the feed does not say: a
+        # blanket REGULAR labelled 06:59 and 22:01 ET bars as regular hours.
+        session_tag = p.get("session") or session_label_at(ticker, ts)
         try:
             db_conn = self.db
             if db_conn is None:
@@ -1373,8 +1383,8 @@ class TradFiEnricher:
             if db_conn:
                 await db_conn.execute(
                     """
-                    INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session, source)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (ticker, time) DO UPDATE 
                     SET open = EXCLUDED.open,
                         high = EXCLUDED.high,
@@ -1386,9 +1396,11 @@ class TradFiEnricher:
                         -- erase it; without this the last writer would win and
                         -- the winner is whichever feed polled last.
                         volume = COALESCE(EXCLUDED.volume, tradfi_bars.volume),
-                        session = EXCLUDED.session;
+                        session = EXCLUDED.session,
+                        source = EXCLUDED.source;
                     """,
-                    ticker, ts, open_p, high_p, low_p, close_p, volume_db, session_tag
+                    ticker, ts, open_p, high_p, low_p, close_p, volume_db, session_tag,
+                    getattr(raw, "source", None) or "live",
                 )
         except Exception as bar_err:
             # Counted, not only whispered. This handler is why bar persistence
@@ -1471,8 +1483,11 @@ class TradFiEnricher:
             }, key=ticker)
             
             entity = Entity(id=ticker, type=EntityType.INSTRUMENT, name=ticker)
-            direction = "🟢 Bullish" if block["close"] >= block["open"] else "🔴 Bearish"
-            headline = f"{direction} Structural Anomaly: {ticker} {tf}-min moved {price_change_pct*100:+.2f}% on ${notional/1e6:.1f}M vol"
+            rose = block["close"] >= block["open"]
+            headline = (
+                f"{'🟢' if rose else '🔴'} {ticker} {'rose' if rose else 'fell'} {abs(price_change_pct) * 100:.2f}% "
+                f"in {window_words(tf)} on ${notional/1e6:.1f}M of trading"
+            )
     
             # Multi-bar microstructure from 15-bar rolling history
             history_vol_key = f"tradfi:history{tf}m:{ticker}:volumes"
@@ -1603,7 +1618,12 @@ class TradFiEnricher:
             parkinson_text = (
                 f"{parkinson:.4f}" if parkinson is not None else "not enough history"
             )
-            bar_summary = f"Multi-Timeframe Structural Candle Anomaly on {ticker} ({tf}-minute frame): moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} on ${notional/1e6:.2f}M volume. High: ${block['high']:.2f}, Low: ${block['low']:.2f}. VWAP: ${bar_vwap:.2f}, Parkinson Volatility: {parkinson_text}. Anomaly Score: {anomaly:.2f}."
+            bar_summary = (
+                f"{ticker} moved {price_change_pct*100:+.2f}% to ${block['close']:.2f} over {window_words(tf)} on "
+                f"${notional/1e6:.2f}M of trading, an unusually large move for it. It traded between "
+                f"${block['low']:.2f} and ${block['high']:.2f}; the average price paid was ${bar_vwap:.2f}. "
+                f"Typical swing at this pace: {parkinson_text}."
+            )
 
             # Populate active statistical correlation IDs (§8.2)
             stat_corr_ids = []
@@ -1855,6 +1875,14 @@ class TradFiEnricher:
             tags=(
                 ["tradfi", "insider_trade", ticker.lower(), code_label.lower().replace(" ", "_")]
                 + ([] if value_known else ["size_unknown"])
+                # Kept on the stored event: the raw payload carries the 10b5-1
+                # flag and nothing downstream of enrichment could see it, so a
+                # pre-scheduled sale read the same as an opportunistic one.
+                + (["planned_10b5_1"] if isinstance(p, dict) and p.get("planned_10b5_1") else [])
+                # Routine or opportunistic from the insider's own history
+                # (shared/utils/insider_history.py): the insider families key on it.
+                + ([f"insider_{p['insider_class']}"] if isinstance(p, dict) and p.get("insider_class") in
+                   ("routine", "opportunistic") else [])
             ),
             anomaly_score=round(anomaly, 3),
         )
@@ -1940,7 +1968,11 @@ class TradFiEnricher:
                 strike = strike if strike is not None else parsed.get("strike")
                 expiry = expiry or parsed.get("expiry")
         
-        option_type = str(option_type or "CALL").upper()
+        # Unknown stays unknown. This defaulted to CALL, so a contract whose
+        # type could not be read -- a put as often as not -- reached every
+        # consumer as a bullish bet.
+        _t = str(option_type or "").strip().upper()
+        option_type = "CALL" if _t in ("CALL", "C") else "PUT" if _t in ("PUT", "P") else "UNKNOWN"
 
         # The underlying's last price, if the platform has one.
         underlying_spot = await self._underlying_spot(ticker)
@@ -1964,7 +1996,11 @@ class TradFiEnricher:
         # Premiums span four orders of magnitude and the interesting range
         # starts around $50k, so the scale is logarithmic between the floor and
         # the reference: $50k reads 0.0, $500k reads about 0.5, $5M reads 1.0.
-        base_score = _options_premium_score(premium)
+        # On the premium paid for direction where the collector could price it
+        # (shared/utils/options_flow.py): a deep in-the-money print is mostly
+        # intrinsic value and scored like the small directional bet it is.
+        extrinsic = p.get("extrinsic_premium_usd")
+        base_score = _options_premium_score(float(extrinsic) if extrinsic is not None else premium)
 
         # Sized against the session it happened in.
         #
@@ -1988,6 +2024,12 @@ class TradFiEnricher:
         tags = ["tradfi", "options_flow", ticker.lower(), option_type.lower()]
         if premium >= 100000.0:
             tags.append("options_sweep")
+        if p.get("aggressor") in ("buy", "sell"):
+            tags.append("buyer_initiated" if p["aggressor"] == "buy" else "seller_initiated")
+        if p.get("intrinsic_share") is not None and float(p["intrinsic_share"]) >= 0.8:
+            tags.append("intrinsic_heavy")
+        if p.get("opening_confirmed"):
+            tags.append("opening_confirmed")
             
         entity = Entity(id=ticker, type=EntityType.COMPANY, name=ticker)
         
@@ -2058,7 +2100,8 @@ class TradFiEnricher:
                 # does not, moneyness is None rather than computed from the
                 # wrong number. An absent field is recoverable and a wrong one
                 # is not.
-                otm_percentage=_otm_percentage(strike, underlying_spot, option_type),
+                otm_percentage=(_otm_percentage(strike, underlying_spot, option_type)
+                                if option_type != "UNKNOWN" else None),
                 volume_oi_ratio=_volume_oi_ratio(volume, open_interest),
                 implied_volatility=implied_volatility,
                 option_type=option_type,
@@ -2070,7 +2113,7 @@ class TradFiEnricher:
                 exchange=(ref_data or {}).get("exchange"),
                 index_membership=(ref_data or {}).get("index_membership", []),
             ),
-            headline=f"🐋 OPTIONS FLOW {option_type} Sweep | {ticker} ({option_symbol}) | Premium: ${premium/1e3:.1f}k",
+            headline=_options_headline(ticker, option_type, premium, p.get("aggressor")),
             tags=tags,
             anomaly_score=anomaly
         )
@@ -2195,7 +2238,7 @@ class TradFiEnricher:
                 # only logged, so downstream can rank two radar hits.
                 z_score=round(z_score, 4),
             ),
-            headline=f"⚡ QUANT RADAR VOLUME SPIKE | {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional/1e6:.2f}M",
+            headline=f"⚡ Heavy trading in {ticker}: ${notional/1e6:.2f}M, {above_normal_words(z_score)}",
             tags=tags,
             anomaly_score=anomaly,
         )

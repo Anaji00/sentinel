@@ -168,7 +168,10 @@ def test_the_session_is_carried_on_the_bar():
     collector = (ROOT / "services/collector-tradfi/main.py").read_text(encoding="utf-8")
     assert '"session": session_name' in collector
     enricher = (ROOT / "services/enrichment/enrichers/tradfi.py").read_text(encoding="utf-8")
-    assert 'session_tag = p.get("session", "REGULAR")' in enricher
+    # The feed's own session when it gives one, otherwise the session at the
+    # bar's time -- never a blanket REGULAR, which labelled 06:59 and 22:01 ET
+    # bars as regular hours (tests/test_minute_bar_alignment.py).
+    assert 'session_tag = p.get("session") or session_label_at(ticker, ts)' in enricher
 
 
 # -- the feed must notice when it stops receiving -----------------------------

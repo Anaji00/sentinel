@@ -960,3 +960,14 @@ def test_live_broker_requires_explicit_second_signal(monkeypatch):
     # Default remains paper.
     monkeypatch.setenv("BROKER_TYPE", "paper")
     assert type(get_broker()).__name__ == "PaperBroker"
+
+
+def test_a_play_is_never_sized_on_a_better_payoff_than_its_own_exits():
+    """Kelly read a backtested strategy's payoff, not the play's stop-to-target ratio."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "services" / "agents" / "quant_trading_engine.py"
+           ).read_text(encoding="utf-8")
+    assert "min(win_loss_ratio, rr)" in src
+    from shared.utils import quant_calc
+    # A 3:1 backtested payoff would size a 1.5:1 play near double its own Kelly.
+    assert quant_calc.kelly_criterion(0.55, 3.0) > quant_calc.kelly_criterion(0.55, min(3.0, 1.5))

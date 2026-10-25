@@ -94,7 +94,7 @@ const Value: React.FC<{ path: string; value: unknown }> = ({ path, value }) => {
       <span
         className={`px-1.5 py-0.5 rounded text-micro font-bold tracking-wider border ${
           value
-            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+            ? 'bg-positive/10 text-positive border-positive/30'
             : 'bg-slate-700/20 text-ink-dim border-line-strong/40'
         }`}
       >
@@ -143,7 +143,7 @@ const Value: React.FC<{ path: string; value: unknown }> = ({ path, value }) => {
     // Integers keep their exact value; fractional values are bounded so a
     // 17-digit float cannot reach the panel.
     const decimals = Number.isInteger(value) ? 0 : Math.abs(value) < 1 ? 4 : 2;
-    return <span className="text-cyan-300 tabular-nums">{formatNumber(value, { decimals })}</span>;
+    return <span className="text-accent tabular-nums">{formatNumber(value, { decimals })}</span>;
   }
 
   if (isPlainObject(value)) {

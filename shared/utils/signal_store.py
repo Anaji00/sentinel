@@ -8,6 +8,9 @@ STUDY_KEY = "sentinel:signals:study"
 ACTIVE_KEY = "sentinel:signals:active"
 EVIDENCE_KEY = "sentinel:signals:evidence:{instrument}:{horizon}"
 OUTCOMES_KEY = "sentinel:signals:outcomes"
+# Expired signals waiting for the first price past their expiry before they are
+# graded: off the board, not yet in the outcomes.
+AWAITING_KEY = "sentinel:signals:awaiting"
 CURSOR_KEY = "sentinel:signals:cursor"
 # Tickers whose daily_bars history has been loaded years deep; the rest get a
 # deep load before their routine top-up.
@@ -16,6 +19,9 @@ DAILY_DEEP_KEY = "sentinel:daily_bars:deep"
 FACTOR_REPORT_KEY = "sentinel:factor_model:report"
 FACTOR_SCORES_KEY = "sentinel:factor_model:scores"
 RECOMMENDATIONS_KEY = "sentinel:recommendations:latest"
+SIGNAL_MATRIX_KEY = "sentinel:signal_matrix"            # hash: ticker -> full matrix
+SIGNAL_MATRIX_INDEX_KEY = "sentinel:signal_matrix:index"  # board summary
+PRODUCER_GRADES_KEY = "sentinel:grades:producers"       # correlations, scenarios, agents vs prices
 
 
 def factor_scores_key(horizon: str) -> str:
@@ -33,6 +39,6 @@ BARS_BACKFILLED_KEY = "sentinel:signals:bars_backfilled"
 MAX_NEEDS_BARS = 300
 
 __all__ = [
-    "ACTIVE_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
+    "ACTIVE_KEY", "AWAITING_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "SIGNAL_MATRIX_INDEX_KEY", "PRODUCER_GRADES_KEY", "SIGNAL_MATRIX_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
     "NEEDS_BARS_KEY", "OUTCOMES_KEY", "STUDY_KEY",
 ]
