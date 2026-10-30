@@ -1,9 +1,9 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { ABSENT } from '../lib/format';
-import { fetcher } from '../lib/api';
+import { apiClient, fetcher } from '../lib/api';
 import { DataGrid } from './ui/DataGrid';
 import { IconAlert, IconCheck, IconClose, IconRadar, IconStore } from './ui/icons';
 import { useDialog } from './ui/useDialog';
@@ -90,6 +90,40 @@ export default function SystemHealthHUD() {
     refreshInterval: POLL.live,
   });
 
+  // Operator readings, moved here from the header, where they sat on every
+  // page for every user. Fetched only while the dialog is open: nobody reads
+  // them otherwise, and the header probe sent a request every ten seconds.
+  const { data: processes } = useSWR<{ active_agents_count: number }>(
+    isOpen ? '/agents/processes' : null,
+    fetcher,
+    { refreshInterval: POLL.standard },
+  );
+  const agentCount = processes?.active_agents_count;
+
+  // undefined: not measured yet. null: the probe failed.
+  const [latency, setLatency] = useState<number | null | undefined>(undefined);
+  useEffect(() => {
+    if (!isOpen) return;
+    let live = true;
+    const measureLatency = async () => {
+      const start = Date.now();
+      try {
+        await apiClient.get('/health');
+        if (live) setLatency(Date.now() - start);
+      } catch {
+        // A failed probe is not a latency reading. Reporting the elapsed time of
+        // a request that never completed would present an outage as a number.
+        if (live) setLatency(null);
+      }
+    };
+    void measureLatency();
+    const timer = setInterval(measureLatency, 10000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [isOpen]);
+
   const systemStatus = healthData?.system_status ?? healthData?.status;
   const isHealthy =
     typeof systemStatus === 'string' &&
@@ -142,6 +176,23 @@ export default function SystemHealthHUD() {
               >
                 <IconClose />
               </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg border border-line bg-page p-3">
+                <span className="stat-label block">Gateway response</span>
+                <span
+                  className={`font-mono text-head font-semibold ${latency === null ? 'text-negative' : 'text-ink'}`}
+                >
+                  {latency === undefined ? ABSENT : latency === null ? 'unreachable' : `${latency} ms`}
+                </span>
+              </div>
+              <div className="rounded-lg border border-line bg-page p-3">
+                <span className="stat-label block">AI analysts running</span>
+                <span className="font-mono text-head font-semibold text-ink">
+                  {typeof agentCount === 'number' ? agentCount : ABSENT}
+                </span>
+              </div>
             </div>
 
             <div className="space-y-2">

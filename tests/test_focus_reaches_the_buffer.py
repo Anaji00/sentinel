@@ -35,7 +35,10 @@ class _Agent(base.SentinelAgent):
 
 def _agent(offers):
     agent = _Agent.__new__(_Agent)
-    agent.name = "quant_trading_engine"
+    # The stock-tier agent that still calls the model: the quant engine's
+    # advisory was retired (llm_policy), and a model-disabled agent never
+    # reaches the candidate buffer.
+    agent.name = "stock_correlation_agent"
     agent.logger = base.logging.getLogger("test.focus_lift")
     agent.redis = MagicMock()
     agent._budget_instance = MagicMock()
@@ -68,7 +71,7 @@ def test_a_subject_another_agent_focused_outranks_any_unfocused_one():
 
 
 def test_an_agents_own_subject_is_not_lifted():
-    agent, restore = _agent({"AAPL": "quant_trading_engine"})
+    agent, restore = _agent({"AAPL": "stock_correlation_agent"})
     try:
         assert _offered_score(agent, {"ticker": "AAPL", "anomaly_score": 0.3}) == 0.3
     finally:
@@ -76,7 +79,7 @@ def test_an_agents_own_subject_is_not_lifted():
 
 
 def test_the_lift_is_counted():
-    agent, restore = _agent({"XOM": "stock_correlation_agent"})
+    agent, restore = _agent({"XOM": "quant_trading_engine"})
     try:
         _offered_score(agent, {"primary_entity": {"id": "XOM"}, "anomaly_score": 0.5})
     finally:

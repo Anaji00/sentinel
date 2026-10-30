@@ -67,7 +67,9 @@ def _source(rel: str) -> str:
     [
         ("services/agents/base.py", "self._inference_budget.finish()",
          "the slot is never shortened after an inference completes"),
-        ("services/agents/base.py", "score=_message_score(message)",
+        # Since 29 Oct 2026 the message score is weighted by the agent's graded
+        # standing before admission (SentinelAgent._budget_weight).
+        ("services/agents/base.py", "_score = _message_score(message)",
          "admission is decided by arrival time again"),
         ("services/agents/base.py", "owner=getattr(self, \"name\", None)",
          "the budget cannot tell callers apart, so it cannot be fair"),

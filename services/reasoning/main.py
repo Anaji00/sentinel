@@ -13,7 +13,7 @@ import asyncio
 import json
 import math
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 from shared.utils.agent_conclusions import (
     AGENT_CORRELATION_ANALYSIS_PREFIX,
     HAWKES_BRANCHING_RATIOS_KEY,
@@ -147,8 +147,9 @@ def _narrative_summary(scenario) -> str:
     return " ".join(p for p in parts if p)[:2000]
 
 
-async def _save_scenario(db, scenario):
-    """Persists the AI-generated scenario to PostgreSQL for frontend retrieval."""
+async def _save_scenario(db, scenario) -> bool:
+    """Persists the AI-generated scenario to PostgreSQL for frontend retrieval.
+    True when the row was written."""
     try:
         await db.execute("""
             INSERT INTO scenarios (
@@ -195,8 +196,10 @@ async def _save_scenario(db, scenario):
             (scenario.primary_entity_name or None),
         )
         logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
+        return True
     except Exception as e:
         logger.error("Error saving scenario %s to DB: %s", scenario.scenario_id, e, exc_info=True)
+        return False
 
 async def apply_autonomous_feedback(scenario, redis_client):
     """
@@ -230,6 +233,7 @@ def tier_warrants_synthesis(tier) -> bool:
         return name != "WATCH"
 
 
+SCENARIO_DAILY_CAP = int(os.getenv("SCENARIO_DAILY_CAP", "12"))
 _RETIRED_CACHE: dict = {"at": 0.0, "rules": set()}
 _RETIRED_TTL_SEC = 3600
 
@@ -256,15 +260,51 @@ async def retired_rules(redis_client) -> set:
     return rules
 
 
-async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library):
-    """The core synthesis pipeline."""
-    if not tier_warrants_synthesis(cluster.alert_tier):
+async def family_warrants_synthesis(cluster: CorrelationCluster, redis_client) -> bool:
+    """A scenario for an ALERT-or-above cluster whose family is graded to
+    precede bigger moves than its stocks' own headline days (producer_grades.
+    move_flagging_families: geopolitical cascade among them), within
+    SCENARIO_DAILY_CAP a day. Since quant and Hawkes clusters stopped reaching
+    INTELLIGENCE (29 Oct 2026) nothing did, and the generator sat idle while
+    the families that carry signal fired at ALERT."""
+    if str(getattr(cluster.alert_tier, "value", cluster.alert_tier)).upper() in ("WATCH", ""):
+        return False
+    from shared.utils.producer_grades import move_flagging_families, rule_family
+    raw = getattr(redis_client, "raw", redis_client)
+    try:
+        from shared.utils.signal_store import PRODUCER_GRADES_KEY
+        blob = await raw.get(PRODUCER_GRADES_KEY)
+        if rule_family(cluster.rule_name) not in move_flagging_families(json.loads(blob) if blob else None):
+            return False
+        key = f"sentinel:scenarios:auto:{datetime.now(timezone.utc).date().isoformat()}"
+        n = int(await raw.incr(key))
+        if n == 1:
+            await raw.expire(key, 2 * 86400)
+    except Exception as exc:
+        swallowed("reasoning.family_gate", exc, logger)
+        return False
+    return n <= SCENARIO_DAILY_CAP
+
+
+async def process_cluster(cluster: CorrelationCluster, db, redis_client, producer, context_builder, generator, library,
+                          force: bool = False):
+    """The core synthesis pipeline. `force` is a person's request: it skips the
+    tier, family and grade gates, never the persisted-row check."""
+    if not force:
+        if not (tier_warrants_synthesis(cluster.alert_tier)
+                or await family_warrants_synthesis(cluster, redis_client)):
+            return
+        from shared.utils.producer_grades import is_uninformative
+        if is_uninformative(cluster.rule_name, await retired_rules(redis_client)):
+            dropped("reasoning.rule_graded_uninformative", f"{cluster.rule_name}: no edge against prices", logger)
+            return
+    # The scenario row references its correlation; without that row the insert
+    # fails on scenarios_correlation_id_fkey after the model has spent minutes
+    # on it. Checked first, so an unpersisted cluster costs one indexed read.
+    if not await db.query("SELECT 1 FROM correlations WHERE correlation_id = $1::uuid", cluster.correlation_id):
+        dropped("reasoning.correlation_not_persisted", f"{cluster.rule_id}: no correlations row to attach a scenario to", logger)
         return
-    from shared.utils.producer_grades import is_uninformative
-    if is_uninformative(cluster.rule_name, await retired_rules(redis_client)):
-        dropped("reasoning.rule_graded_uninformative", f"{cluster.rule_name}: no edge against prices", logger)
-        return
-        
+
     logger.info("🧠 Synthesizing [%s] %s via Ollama...", cluster.alert_tier.name, cluster.rule_name)
 
     context = await context_builder.build(cluster)
@@ -281,10 +321,13 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
     scenario = await generator.generate(cluster, context, patterns)
     
     if scenario:
-        await asyncio.gather(
-            _save_scenario(db, scenario),
-            producer.send(Topics.SCENARIOS_GENERATED, scenario.model_dump(), key=scenario.scenario_id)
-        )
+        # Saved, then announced. Run together, a failed save still went out on
+        # Kafka and the live feed and was counted as generated, so consumers saw
+        # scenarios the database never held and the heartbeat read errors=0.
+        if not await _save_scenario(db, scenario):
+            dropped("reasoning.scenario_not_saved", f"{cluster.rule_id}: scenario insert failed", logger)
+            return None
+        await producer.send(Topics.SCENARIOS_GENERATED, scenario.model_dump(), key=scenario.scenario_id)
         logger.info("📡 Broadcasted Scenario %s to Kafka", scenario.scenario_id)
         # Broadcast synthesized scenario to live WebSocket feed
         try:
@@ -366,7 +409,7 @@ async def run_reasoning_loop(context_builder, generator, library, db, redis_clie
     # output; the lane bounds concurrency to one reasoning inference at a time.
     _budget = InferenceBudget(
         redis_client,
-        os.getenv("AGENT_MODEL", "qwen2.5:3b"),
+        os.getenv("REASONING_MODEL") or os.getenv("AGENT_MODEL", "qwen2.5:3b"),
         cooldown_sec=int(os.getenv("REASONING_COOLDOWN_SEC", "60")),
         lane="reasoning",
     )
@@ -911,6 +954,48 @@ def _reasoning_priority(item, priors: Optional[dict] = None) -> float:
     return round(ranked, 6)
 
 
+async def _scenario_request_loop(db, redis_client, producer, context_builder, generator, library) -> None:
+    """Scenarios people ask for (shared/utils/scenario_requests.py), one at a
+    time: the request becomes a persisted correlation row, then a scenario
+    through the same pipeline, then a result the gateway returns. A failed
+    request is recorded as failed, never left pending."""
+    from services.correlation.event_store import EventStore
+    from shared.utils import scenario_requests as sr
+
+    raw = getattr(redis_client, "raw", redis_client)
+    store = EventStore(redis_client, db)
+    while True:
+        try:
+            item = await raw.rpop(sr.REQUESTS_KEY)
+        except Exception as exc:
+            swallowed("reasoning.scenario_requests.pop", exc, logger)
+            item = None
+        if not item:
+            await asyncio.sleep(5)
+            continue
+        rec: Dict[str, Any] = {}
+        try:
+            rec = json.loads(item)
+            key = sr.RESULT_KEY.format(request_id=rec["request_id"])
+            await raw.set(key, json.dumps({"status": "running", **rec}), ex=sr.RESULT_TTL_SEC)
+            cluster = CorrelationCluster(alert_tier=AlertTier.INTELLIGENCE, **sr.cluster_fields(rec))
+            await store.save_correlation(cluster)
+            scenario = await process_cluster(cluster, db, redis_client, producer, context_builder, generator,
+                                             library, force=True)
+            done = {"status": "done", "scenario_id": str(scenario.scenario_id), "headline": scenario.headline} \
+                if scenario else {"status": "failed", "reason": "no scenario was produced"}
+            await raw.set(key, json.dumps({**rec, **done}), ex=sr.RESULT_TTL_SEC)
+            logger.info("Scenario request %s (%s): %s", rec["request_id"][:8], rec["topic"][:60], done["status"])
+        except Exception as exc:
+            swallowed("reasoning.scenario_requests", exc, logger)
+            if rec.get("request_id"):
+                try:
+                    await raw.set(sr.RESULT_KEY.format(request_id=rec["request_id"]),
+                                  json.dumps({**rec, "status": "failed", "reason": str(exc)[:200]}), ex=sr.RESULT_TTL_SEC)
+                except Exception as exc2:
+                    swallowed("reasoning.scenario_requests.result", exc2, logger)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL AI REASONING SERVICE")
@@ -955,6 +1040,8 @@ async def main():
     library         = PatternLibrary(db)
  
     tracker_task = safe_create_task(_tracker_loop(tracker), name="scenario-tracker")
+    safe_create_task(_scenario_request_loop(db, redis_client, tracker_producer, context_builder, generator, library),
+                     name="scenario-requests")
     reasoning_task = safe_create_task(run_reasoning_loop(context_builder, generator, library, db, redis_client), name="reasoning-main-loop")
     
     try:

@@ -2354,6 +2354,136 @@ MIGRATIONS = [
             CREATE INDEX IF NOT EXISTS stock_features_feature_day ON stock_features_daily (feature, day);
         """,
         "transactional": True
+    },
+    {
+        "version": "0073_macro_indices_and_customer_links",
+        "sql": """
+            -- Published risk indices, daily or monthly (a monthly value is dated
+            -- the first of its month): the Caldara-Iacoviello geopolitical risk
+            -- index and its country series (services/collector-tradfi/commodities.py).
+            CREATE TABLE IF NOT EXISTS macro_indices (
+                series  TEXT NOT NULL,
+                day     DATE NOT NULL,
+                value   DOUBLE PRECISION NOT NULL,
+                source  TEXT NOT NULL,
+                PRIMARY KEY (series, day)
+            );
+
+            -- A supplier's major customers as its 10-K names them (Regulation
+            -- S-K requires any customer over 10% of revenue). Dated by the
+            -- filing, so reading it forward is point in time.
+            CREATE TABLE IF NOT EXISTS customer_links (
+                supplier         TEXT NOT NULL,
+                customer_name    TEXT NOT NULL,
+                customer_ticker  TEXT,
+                pct              DOUBLE PRECISION,
+                filed            DATE NOT NULL,
+                accession        TEXT NOT NULL,
+                method           TEXT NOT NULL,
+                PRIMARY KEY (supplier, accession, customer_name)
+            );
+            CREATE INDEX IF NOT EXISTS customer_links_customer ON customer_links (customer_ticker);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0074_stock_news_llm",
+        "sql": """
+            -- A language model's read of each single-stock headline: good (1),
+            -- bad (-1) or unclear (0) for the price (services/agents/llm_news_job.py).
+            -- Scored forward only, as headlines arrive, with the model and its
+            -- training cutoff on every row: a model may remember what prices did
+            -- before its cutoff, so only headlines after it can test the score.
+            CREATE TABLE IF NOT EXISTS stock_news_llm (
+                news_id     BIGINT NOT NULL,
+                ticker      TEXT NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL,
+                score       SMALLINT NOT NULL,
+                model       TEXT NOT NULL,
+                cutoff      DATE,
+                scored_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (news_id, model)
+            );
+            CREATE INDEX IF NOT EXISTS stock_news_llm_ticker_time ON stock_news_llm (ticker, created_at);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0075_auto_trade_equity",
+        "sql": """
+            -- The traded book's equity and SPY's close once a session, for the
+            -- auto-trader's halts: day loss, drawdown, and drift against SPY.
+            CREATE TABLE IF NOT EXISTS auto_trade_equity (
+                day        DATE NOT NULL,
+                portfolio  TEXT NOT NULL,
+                equity     DOUBLE PRECISION NOT NULL,
+                spy_close  DOUBLE PRECISION,
+                PRIMARY KEY (day, portfolio)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0076_session_aligned_rollups",
+        "sql": """
+            -- Daily, weekly and monthly bars of the regular session on the New
+            -- York calendar, and 4-hour bars on New York hours. These bucketed
+            -- by UTC day over every session: measured 29 Oct 2026 against SIP
+            -- daily bars, the 1d view's close was off by more than 0.2% on 45%
+            -- of stock-days, its open on 59% and its range outside SIP's on
+            -- 38%; over the regular session from the same minutes, 8%, and the
+            -- range 0.9%. 09:30-16:00 inclusive by clock, not by the session
+            -- label: the 16:00 minute carries the closing auction and is
+            -- labelled AFTER_HOURS. The month view bucketed 30 days, not
+            -- calendar months. Nothing depends on these views.
+            DROP MATERIALIZED VIEW IF EXISTS tradfi_bars_1d CASCADE;
+            DROP MATERIALIZED VIEW IF EXISTS tradfi_bars_1w CASCADE;
+            DROP MATERIALIZED VIEW IF EXISTS tradfi_bars_1mth CASCADE;
+            DROP MATERIALIZED VIEW IF EXISTS tradfi_bars_4h CASCADE;
+
+            CREATE MATERIALIZED VIEW tradfi_bars_1d WITH (timescaledb.continuous) AS
+            SELECT ticker, time_bucket('1 day', time, 'America/New_York') AS bucket_time,
+                   FIRST(open, time) AS open, MAX(high) AS high, MIN(low) AS low,
+                   LAST(close, time) AS close, SUM(volume) AS volume
+            FROM tradfi_bars WHERE (time AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
+            GROUP BY ticker, time_bucket('1 day', time, 'America/New_York') WITH NO DATA;
+            ALTER MATERIALIZED VIEW tradfi_bars_1d SET (timescaledb.materialized_only = false);
+            SELECT add_continuous_aggregate_policy('tradfi_bars_1d', start_offset => INTERVAL '30 days',
+                end_offset => INTERVAL '1 day', schedule_interval => INTERVAL '1 day', if_not_exists => TRUE);
+
+            CREATE MATERIALIZED VIEW tradfi_bars_1w WITH (timescaledb.continuous) AS
+            SELECT ticker, time_bucket('1 week', time, 'America/New_York') AS bucket_time,
+                   FIRST(open, time) AS open, MAX(high) AS high, MIN(low) AS low,
+                   LAST(close, time) AS close, SUM(volume) AS volume
+            FROM tradfi_bars WHERE (time AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
+            GROUP BY ticker, time_bucket('1 week', time, 'America/New_York') WITH NO DATA;
+            SELECT add_continuous_aggregate_policy('tradfi_bars_1w', start_offset => INTERVAL '180 days',
+                end_offset => INTERVAL '1 week', schedule_interval => INTERVAL '1 day', if_not_exists => TRUE);
+
+            CREATE MATERIALIZED VIEW tradfi_bars_1mth WITH (timescaledb.continuous) AS
+            SELECT ticker, time_bucket('1 month', time, 'America/New_York') AS bucket_time,
+                   FIRST(open, time) AS open, MAX(high) AS high, MIN(low) AS low,
+                   LAST(close, time) AS close, SUM(volume) AS volume
+            FROM tradfi_bars WHERE (time AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
+            GROUP BY ticker, time_bucket('1 month', time, 'America/New_York') WITH NO DATA;
+            SELECT add_continuous_aggregate_policy('tradfi_bars_1mth', start_offset => INTERVAL '365 days',
+                end_offset => INTERVAL '1 month', schedule_interval => INTERVAL '1 day', if_not_exists => TRUE);
+
+            CREATE MATERIALIZED VIEW tradfi_bars_4h WITH (timescaledb.continuous) AS
+            SELECT ticker, time_bucket('4 hours', time, 'America/New_York') AS bucket_time,
+                   FIRST(open, time) AS open, MAX(high) AS high, MIN(low) AS low,
+                   LAST(close, time) AS close, SUM(volume) AS volume
+            FROM tradfi_bars
+            GROUP BY ticker, time_bucket('4 hours', time, 'America/New_York') WITH NO DATA;
+            SELECT add_continuous_aggregate_policy('tradfi_bars_4h', start_offset => INTERVAL '30 days',
+                end_offset => INTERVAL '4 hours', schedule_interval => INTERVAL '4 hours', if_not_exists => TRUE);
+
+            CALL refresh_continuous_aggregate('tradfi_bars_1d', NULL, NOW() - INTERVAL '1 day');
+            CALL refresh_continuous_aggregate('tradfi_bars_1w', NULL, NOW() - INTERVAL '1 week');
+            CALL refresh_continuous_aggregate('tradfi_bars_1mth', NULL, NOW() - INTERVAL '1 month');
+            CALL refresh_continuous_aggregate('tradfi_bars_4h', NULL, NOW() - INTERVAL '4 hours');
+        """,
+        "transactional": False
     }
 ]
 

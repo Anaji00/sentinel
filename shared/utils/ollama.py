@@ -19,10 +19,12 @@ import os
 from functools import lru_cache
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Type, Union
  
 import aiohttp
 from pydantic import BaseModel, ValidationError
+from shared.utils import hosted_llm
 from shared.utils.metrics import MetricsCollector
 from shared.utils.quiet_failures import swallowed
  
@@ -329,6 +331,42 @@ _tok_rate_redis: Any = None
 _tok_rate_loaded = False
 
 
+# Every generation's tokens, by calling site and model, per UTC day (28 Oct
+# 2026): what the platform's inference would cost if it moved to a hosted API.
+# Hash fields "<site>|<model>|calls", "|in" (prompt tokens), "|out" (generated
+# tokens) and "|ms" (Ollama's total duration). Best-effort: metering never
+# fails a call.
+USAGE_KEY = "sentinel:llm_usage:{day}"
+USAGE_TTL_SEC = 120 * 86400
+
+
+def usage_fields(site: str, model: str, data: dict) -> Dict[str, int]:
+    """The counters one response adds. Pure."""
+    base = f"{site}|{model}"
+    return {
+        f"{base}|calls": 1,
+        f"{base}|in": int(data.get("prompt_eval_count") or 0),
+        f"{base}|out": int(data.get("eval_count") or 0),
+        f"{base}|ms": int((data.get("total_duration") or 0) / 1e6),
+    }
+
+
+async def record_usage(site: str, model: str, data: dict) -> None:
+    if _tok_rate_redis is None or not isinstance(data, dict):
+        return
+    try:
+        raw = getattr(_tok_rate_redis, "raw", _tok_rate_redis)
+        key = USAGE_KEY.format(day=datetime.now(timezone.utc).date().isoformat())
+        async with raw.pipeline() as pipe:
+            for f, v in usage_fields(site, model, data).items():
+                if v:
+                    pipe.hincrby(key, f, v)
+            pipe.expire(key, USAGE_TTL_SEC)
+            await pipe.execute()
+    except Exception as _exc:
+        swallowed("utils.ollama.record_usage", _exc, logger)
+
+
 def bind_rate_store(redis_client: Any) -> None:
     """Hands this process the Redis client to persist the learned rate through."""
     global _tok_rate_redis
@@ -554,6 +592,27 @@ def get_ollama_semaphore(model_name: str = "default") -> asyncio.Semaphore:
 class InferenceError(Exception):
     """Ollama HTTP or network failure after retries."""
 
+
+class InferenceTimeout(InferenceError):
+    """Ollama gave no answer within OLLAMA_TIMEOUT. On this host that is a
+    saturated queue, not a bad request: resending it adds to the overload."""
+
+
+_PARAMS_RE = re.compile(r":(\d+(?:\.\d+)?)b\b", re.I)
+
+
+def _param_billions(model: Optional[str]) -> Optional[float]:
+    """The parameter count a tag declares ("qwen2.5:7b" -> 7.0), if any."""
+    m = _PARAMS_RE.search(model or "")
+    return float(m.group(1)) if m else None
+
+
+def smaller_model(candidate: Optional[str], than: str) -> bool:
+    """True when `candidate` is declared smaller than `than`. A timeout may only
+    fall back to a model that answers faster; an unknown size does not qualify."""
+    a, b = _param_billions(candidate), _param_billions(than)
+    return a is not None and b is not None and a < b
+
 class SchemaViolationError(Exception):
     """LLM output could not be coerced to the required Pydantic schema."""
 
@@ -605,6 +664,50 @@ def _calling_site() -> str:
     except Exception as _exc:
         swallowed("utils.ollama._calling_site", _exc, logger)
     return "unknown"
+
+
+def _usage_site() -> str:
+    """Who spent the tokens, for the usage meter: the agent's name when an agent
+    made the call (every agent calls through base.py's _execute_with_telemetry,
+    so a file:function label named that one frame for all of them), otherwise
+    the first file:function outside this module. Never raises."""
+    try:
+        import sys
+
+        f = sys._getframe(1)
+        while f is not None:
+            fn = f.f_code.co_filename.replace("\\", "/")
+            if "/shared/utils/ollama.py" not in fn:
+                agent = getattr(f.f_locals.get("self"), "name", None)
+                if isinstance(agent, str) and agent and "/services/agents/" in fn:
+                    return agent
+                if "/services/agents/base.py" not in fn:
+                    return f"{fn.rsplit('/', 1)[-1]}:{f.f_code.co_name}"
+            f = f.f_back
+    except Exception as _exc:
+        swallowed("utils.ollama._usage_site", _exc, logger)
+    return "unknown"
+
+
+def model_threads(raw: Optional[str]) -> Dict[str, int]:
+    """OLLAMA_MODEL_THREADS ("qwen2.5:7b=4,qwen2.5:3b=2") as {model: threads}. Pure."""
+    out: Dict[str, int] = {}
+    for part in (raw or "").split(","):
+        name, _, n = part.strip().rpartition("=")
+        if name and n.isdigit() and int(n) > 0:
+            out[name.strip()] = int(n)
+    return out
+
+
+def threads_for(model: str) -> Optional[int]:
+    """This model's thread count when OLLAMA_MODEL_THREADS names it, else the
+    server-wide OLLAMA_NUM_THREAD.
+
+    With two models resident (judgments on qwen2.5:7b, extraction on the 3B),
+    each runner sized to all six cores would put twelve busy-waiting threads on
+    six -- the collapse docker-compose.yml records. Split, the two together
+    never exceed the quota."""
+    return model_threads(os.getenv("OLLAMA_MODEL_THREADS")).get(model) or _inference_threads()
 
 
 def _truncate_middle(prompt: str, budget: int) -> str:
@@ -1225,10 +1328,24 @@ class OllamaClient:
             except (InferenceError, asyncio.TimeoutError) as inf_err:
                 last_error = f"Inference error: {inf_err}"
                 logger.warning(f"Ollama attempt {attempt+1} ({active_model}) failed/timed out: {inf_err}")
-                
+
+                # A timeout is overload, and overload is not retried (Google SRE,
+                # "Handling Overload"). It may hop once to a smaller, faster model;
+                # it is never resent to the same one. Before this, one 7B timeout
+                # became a 3B call and then three more 600s attempts: up to forty
+                # minutes of a saturated host for a single request, with every
+                # call queued behind it timing out in turn.
+                timed_out = isinstance(inf_err, (InferenceTimeout, asyncio.TimeoutError))
+                # A hosted-only model has no fallback: its answers are graded
+                # against the local model's, and a local stand-in would be
+                # scored as the hosted one.
+                if hosted_llm.is_hosted(active_model):
+                    raise InferenceError(f"{inf_err} -- hosted-only model, no local fallback")
                 target_fallback = fallback_model if (fallback_model and fallback_model not in visited) else None
                 if not target_fallback:
                     target_fallback = await self._get_fallback_model(active_model, exclude_models=visited)
+                if timed_out and not smaller_model(target_fallback, active_model):
+                    raise InferenceTimeout(f"{inf_err} -- not retried: the host is saturated")
 
                 if target_fallback and target_fallback not in visited:
                     logger.warning(f"Failed calling '{active_model}'. Offloading to fallback model: '{target_fallback}'")
@@ -1312,10 +1429,16 @@ class OllamaClient:
                     return await self._call_ollama(full_prompt, temperature, active_model, num_predict=num_predict, exclude_models=visited)
             except (InferenceError, asyncio.TimeoutError) as inf_err:
                 logger.warning(f"Raw Ollama attempt {attempt+1} ({active_model}) failed/timed out: {inf_err}")
-                
+
+                # As in infer(): a timeout hops once to a smaller model or stops.
+                timed_out = isinstance(inf_err, (InferenceTimeout, asyncio.TimeoutError))
+                if hosted_llm.is_hosted(active_model):
+                    raise InferenceError(f"{inf_err} -- hosted-only model, no local fallback")
                 target_fallback = fallback_model if (fallback_model and fallback_model not in visited) else None
                 if not target_fallback:
                     target_fallback = await self._get_fallback_model(active_model, exclude_models=visited)
+                if timed_out and not smaller_model(target_fallback, active_model):
+                    raise InferenceTimeout(f"{inf_err} -- not retried: the host is saturated")
 
                 if target_fallback and target_fallback not in visited:
                     logger.warning(f"Failed calling '{active_model}'. Recursively falling back to: '{target_fallback}'")
@@ -1336,6 +1459,24 @@ class OllamaClient:
         
     async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[Union[str, dict]] = None, num_predict: Optional[int] = None, exclude_models: Optional[set] = None) -> str:
         import time as _time
+
+        # A hosted route first, when one is configured for this model
+        # (shared/utils/hosted_llm.py). None means every hosted step was
+        # unavailable, and the local model answers as before; a model named
+        # "provider/model" is hosted-only and has no local fallback.
+        if hosted_llm.route_for(active_model):
+            got = await hosted_llm.complete(self._session, getattr(_tok_rate_redis, "raw", _tok_rate_redis),
+                                            active_model, prompt, temperature, format, num_predict)
+            if got is not None:
+                text, step, usage = got
+                # Read by infer's retry, which raises the budget after a cut-off
+                # answer instead of repeating it.
+                self.last_truncated = usage.get("done_reason") == "length"
+                self.last_effective_predict = int(num_predict or hosted_llm.DEFAULT_MAX_TOKENS)
+                await record_usage(_usage_site(), step, usage)
+                return text
+            if hosted_llm.is_hosted(active_model):
+                raise InferenceError(f"Hosted model '{active_model}' unavailable (no key, quota or error)")
 
         try:
             resolved_model = await self._resolve_model(active_model, exclude_models=exclude_models)
@@ -1436,7 +1577,7 @@ class OllamaClient:
                 "stop": ["</json>", "Human:", "User:", "Assistant:"]
             }
         }
-        _threads = _inference_threads()
+        _threads = threads_for(active_model)
         if _threads is not None:
             payload["options"]["num_thread"] = _threads
 
@@ -1536,6 +1677,7 @@ class OllamaClient:
             # That is the number a token budget should be sized against, and the
             # platform had been sizing against a wall-clock figure instead.
             observe_generation_rate(data)
+            await record_usage(_usage_site(), active_model, data)
 
             return data.get("response", "")
             
@@ -1557,7 +1699,7 @@ class OllamaClient:
                     f"🚨 CIRCUIT BREAKER OPENED for '{active_model}' after {consec} "
                     f"consecutive timeouts. Cooling down for {CIRCUIT_BREAKER_COOLDOWN}s."
                 )
-            raise InferenceError(f"Ollama timed out after {OLLAMA_TIMEOUT.total}s for model '{active_model}' (prompt_len={len(clean_prompt)})")
+            raise InferenceTimeout(f"Ollama timed out after {OLLAMA_TIMEOUT.total}s for model '{active_model}' (prompt_len={len(clean_prompt)})")
         except aiohttp.ClientError as e:
             raise InferenceError(f"Ollama connection error: {e}")
 

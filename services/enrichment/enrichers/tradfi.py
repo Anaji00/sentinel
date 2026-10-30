@@ -1397,7 +1397,12 @@ class TradFiEnricher:
                         -- the winner is whichever feed polled last.
                         volume = COALESCE(EXCLUDED.volume, tradfi_bars.volume),
                         session = EXCLUDED.session,
-                        source = EXCLUDED.source;
+                        source = EXCLUDED.source
+                    -- Never over a consolidated bar, as in the stream writer
+                    -- (collector-tradfi/alpaca_stream.py): a late or replayed
+                    -- live bar replaced settled SIP minutes, and on 28 Oct 155
+                    -- stocks carried a mix of SIP and partial-feed minutes.
+                    WHERE tradfi_bars.source IS DISTINCT FROM 'alpaca_sip';
                     """,
                     ticker, ts, open_p, high_p, low_p, close_p, volume_db, session_tag,
                     getattr(raw, "source", None) or "live",

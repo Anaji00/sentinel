@@ -226,9 +226,20 @@ def test_the_header_shows_the_signed_in_user_not_a_persona():
     )
 
 
+HEALTH_DIALOG = ROOT / "frontend/src/components/SystemHealthHUD.tsx"
+
+
 def test_the_header_reports_a_measured_agent_count():
-    """"AGENT SWARM: ACTIVE (8)" was fixed text; the deployment runs ten."""
-    src = _code(HEADER)
+    """"AGENT SWARM: ACTIVE (8)" was fixed text; the deployment runs ten.
+
+    The count and the latency probe below moved from the header strip into the
+    Platform health dialog the header opens (operator readings, not something
+    every page needs). The guarded property is unchanged, so the assertion
+    follows the code: the header still must not state a fixed count, and the
+    dialog must read the measured one.
+    """
+    assert "ACTIVE (8)" not in _code(HEADER)
+    src = _code(HEALTH_DIALOG)
     assert "ACTIVE (8)" not in src
     assert "'/agents/processes'" in src
     assert "active_agents_count" in src
@@ -241,8 +252,11 @@ def test_the_header_does_not_assert_domain_status_it_never_read():
 
 
 def test_a_failed_latency_probe_is_not_reported_as_a_latency():
-    """The old code returned the elapsed time of a request that never completed."""
-    src = _code(HEADER)
+    """The old code returned the elapsed time of a request that never completed.
+
+    Now in the Platform health dialog; see test_the_header_reports_a_measured_agent_count.
+    """
+    src = _code(HEALTH_DIALOG)
     assert "setLatency(null)" in src
     assert "unreachable" in src
 

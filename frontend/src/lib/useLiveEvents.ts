@@ -1,191 +1,71 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { NormalizedEvent } from './types';
 import { useTelemetryStore } from './store';
 import { resolveEventDomain } from './domain';
+import {
+  EMPTY_LIVE_EVENTS,
+  LiveStreamDeps,
+  liveFeedUrl,
+  sharedLiveStream,
+} from './liveStream';
 
-// Max events kept in memory per hook instance
-const MAX_LIVE_EVENTS = 300;
-// Reconnect backoff limits (ms)
-export const RECONNECT_INITIAL_MS = 1000;
-export const RECONNECT_MAX_MS = 30000;
+// The pure parts moved to `liveStream.ts` with the socket they serve; re-exported
+// so existing imports of them keep working.
+export {
+  MAX_LIVE_EVENTS,
+  RECONNECT_INITIAL_MS,
+  RECONNECT_MAX_MS,
+  dedupePositionBatch,
+  reconnectDelay,
+} from './liveStream';
 
-/** One position report per entity, plus every non-position event, order kept.
- *
- * Exported so a test can exercise it rather than restate it. The previous test
- * copied this loop into its own body and asserted on the copy, which cannot
- * fail when the hook changes.
- */
-export function dedupePositionBatch(batch: NormalizedEvent[]): NormalizedEvent[] {
-  const positionMap = new Map<string, NormalizedEvent>();
-  const nonPositionEvents: NormalizedEvent[] = [];
-
-  for (const item of batch) {
-    const t = (item.type || '').toLowerCase();
-    const isHighFreqPos =
-      t.includes('vessel_position') ||
-      t.includes('adsb_position') ||
-      t.includes('ais') ||
-      t.includes('adsb');
-    // An unattributed position report is still an event: collapsing those
-    // together on a missing key would drop all but one of them.
-    if (isHighFreqPos && item.primary_entity?.id) {
-      if (!positionMap.has(item.primary_entity.id)) {
-        positionMap.set(item.primary_entity.id, item);
+function browserDeps(): LiveStreamDeps {
+  const telemetry = () => useTelemetryStore.getState();
+  return {
+    url: () =>
+      liveFeedUrl(window.location, {
+        wsUrl: process.env.NEXT_PUBLIC_WS_URL,
+        apiUrl: process.env.NEXT_PUBLIC_API_URL,
+      }),
+    openSocket: (url) => new WebSocket(url),
+    checkSession: async () => {
+      try {
+        const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
+        return res.ok;
+      } catch {
+        return null;
       }
-    } else {
-      nonPositionEvents.push(item);
-    }
-  }
-  return [...Array.from(positionMap.values()), ...nonPositionEvents];
+    },
+    setConnected: (connected) => telemetry().setConnected(connected),
+    setAuthRequired: (required) => telemetry().setAuthRequired(required),
+    touched: () => telemetry().updateTelemetry(),
+  };
 }
 
-/** The next reconnect delay, doubling up to the ceiling. */
-export function reconnectDelay(current: number): number {
-  return Math.min(current * 2, RECONNECT_MAX_MS);
-}
+const stream = () => sharedLiveStream(browserDeps);
+const subscribe = (listener: () => void) => stream().subscribe(listener);
+const getSnapshot = () => stream().getSnapshot();
+const getServerSnapshot = () => EMPTY_LIVE_EVENTS;
 
 export function useLiveEvents(selectedDomain: string = 'all') {
-  const [liveEvents, setLiveEvents] = useState<NormalizedEvent[]>([]);
-  const wsRef = useRef<WebSocket | null>(null);
-  const seenIds = useRef(new Set<string>());
-  const backoffRef = useRef(RECONNECT_INITIAL_MS);
-  const flushTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const liveEvents = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
+  // Counts mounted panels, not sockets: the header reads "idle" on pages
+  // with no live panel at all.
   useEffect(() => {
-    // Determine WebSocket URL dynamically based on current window location
-    const protocol =
-      typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Default to the same origin the page is served from (through the ingress),
-    // NOT a hardcoded :8000 — the gateway port is not published to the host in the
-    // deployed stack, and http://...:8000 would be blocked as mixed content on HTTPS.
-    // NEXT_PUBLIC_WS_URL / NEXT_PUBLIC_API_URL remain explicit overrides.
-    let baseHost = typeof window !== 'undefined' ? window.location.host : 'localhost:8000';
-    if (process.env.NEXT_PUBLIC_WS_URL) {
-      baseHost = process.env.NEXT_PUBLIC_WS_URL.replace(/^wss?:\/\//, '').replace(/\/+$/, '');
-    } else if (process.env.NEXT_PUBLIC_API_URL) {
-      baseHost = process.env.NEXT_PUBLIC_API_URL.replace(/^https?:\/\//, '')
-        .replace(/\/api\/v1\/?$/, '')
-        .replace(/\/+$/, '');
-    }
-    const wsUrl = `${protocol}//${baseHost}/api/v1/events/ws/live-feed`;
-
-    let isMounted = true;
-    let reconnectTimer: NodeJS.Timeout | null = null;
     useTelemetryStore.getState().addStreamSubscriber(1);
-
-    function connect() {
-      if (!isMounted) return;
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          // Reset backoff on successful connection & sync Zustand store
-          backoffRef.current = RECONNECT_INITIAL_MS;
-          useTelemetryStore.getState().setConnected(true);
-          useTelemetryStore.getState().updateTelemetry();
-        };
-
-        let pendingBatch: NormalizedEvent[] = [];
-
-        const flushBatch = () => {
-          if (pendingBatch.length > 0) {
-            const batchToAdd = dedupePositionBatch(pendingBatch);
-            pendingBatch = [];
-
-            setLiveEvents((prev) => {
-              const combined = [...batchToAdd, ...prev];
-              return combined.slice(0, MAX_LIVE_EVENTS);
-            });
-            useTelemetryStore.getState().updateTelemetry();
-          }
-          flushTimerRef.current = null;
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data && data.event_id) {
-              // O(1) dedup check via Set
-              if (seenIds.current.has(data.event_id)) return;
-              seenIds.current.add(data.event_id);
-
-              if (seenIds.current.size > MAX_LIVE_EVENTS * 2) {
-                const ids = Array.from(seenIds.current);
-                seenIds.current = new Set(ids.slice(ids.length - MAX_LIVE_EVENTS));
-              }
-
-              pendingBatch.unshift(data);
-
-              // 1000ms sliding window buffer to reduce React re-render flooding from AIS/ADS-B telemetry
-              if (!flushTimerRef.current) {
-                flushTimerRef.current = setTimeout(flushBatch, 1000);
-              }
-            }
-          } catch (e) {
-            console.error('Error parsing WebSocket message:', e);
-          }
-        };
-
-        ws.onerror = () => {
-          useTelemetryStore.getState().setConnected(false);
-        };
-
-        ws.onclose = () => {
-          if (!isMounted) return;
-          useTelemetryStore.getState().setConnected(false);
-
-          // The gateway refuses the handshake before accepting it, so an
-          // unauthenticated browser sees an abnormal close (1006) rather than
-          // the server's 4003 policy code. Retrying on that forever is what left
-          // the dashboard reading "CONNECTING..." when the real cause was a
-          // missing session. Ask the session endpoint directly instead of
-          // inferring from a close code that never arrives.
-          void (async () => {
-            if (!isMounted) return;
-            try {
-              const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
-              if (!res.ok) {
-                useTelemetryStore.getState().setAuthRequired(true);
-                return; // Reconnecting cannot succeed until the user signs in.
-              }
-              useTelemetryStore.getState().setAuthRequired(false);
-            } catch {
-              // Session check itself failed: treat as a transient network fault
-              // and fall through to the normal backoff.
-            }
-            if (!isMounted) return;
-            reconnectTimer = setTimeout(connect, backoffRef.current);
-            backoffRef.current = reconnectDelay(backoffRef.current);
-          })();
-        };
-      } catch (err) {
-        console.warn('WebSocket connection fallback to polling:', err);
-        useTelemetryStore.getState().setConnected(false);
-        if (isMounted) {
-          reconnectTimer = setTimeout(connect, backoffRef.current);
-          backoffRef.current = reconnectDelay(backoffRef.current);
-        }
-      }
-    }
-
-    connect();
-
-    return () => {
-      isMounted = false;
-      useTelemetryStore.getState().addStreamSubscriber(-1);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.onerror = null;
-        wsRef.current.close();
-        useTelemetryStore.getState().setConnected(false);
-      }
-    };
+    return () => useTelemetryStore.getState().addStreamSubscriber(-1);
   }, []);
 
-  return liveEvents.filter((e) => {
+  return useMemo(() => filterLiveEvents(liveEvents, selectedDomain), [liveEvents, selectedDomain]);
+}
+
+/** One domain's view of the shared buffer; `all` (or nothing) passes everything. */
+export function filterLiveEvents(
+  events: NormalizedEvent[],
+  selectedDomain: string,
+): NormalizedEvent[] {
+  return events.filter((e) => {
     if (!selectedDomain || selectedDomain === 'all') return true;
 
     // The server's answer, when it has one.

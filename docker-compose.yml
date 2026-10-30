@@ -702,7 +702,10 @@ services:
       # failure -- so with two slots a single timeout was enough to spawn the
       # second runner. One slot makes that an eviction and a reload instead,
       # which is slow and survivable rather than fast and fatal.
-      - OLLAMA_MAX_LOADED_MODELS=1
+      # Two from 28 Oct 2026: judgments on qwen2.5:7b and extraction on qwen2.5:3b
+      # stay resident together (no reloads); OLLAMA_MODEL_THREADS splits the six
+      # cores 4/2 so the two runners never oversubscribe them.
+      - OLLAMA_MAX_LOADED_MODELS=2
       # f16, not q8_0. A quantised KV cache trades CPU for memory: every
       # attention step dequantises. That is the right trade on a GPU short of
       # VRAM and the wrong one here, where cycles are the scarce resource and
@@ -771,7 +774,9 @@ services:
           # inside the deployment memory budget that 7G broke. The host has the
           # spare RAM; the budget exists so the profiles remain schedulable
           # together, which is a different constraint from what is available.
-          memory: 5G
+          # 9G from 28 Oct 2026: qwen2.5:7b (~5.5 GiB resident) beside qwen2.5:3b
+          # (~2.3 GiB). The host has 27G.
+          memory: 9G
     healthcheck:
       test: [ "CMD", "ollama", "list" ]
       interval: 10s
@@ -1335,7 +1340,10 @@ services:
           # and reasoning headroom, not added to the stack's total.
           # Raised 23 Oct 2026 for history from 2016: 3,235 names x 2,717 days
           # peaked at 3.0G building features (trial M1); the host has 27G.
-          memory: 6144M
+          # Raised 28 Oct 2026: the run restarted silently at 5.6G of 6G while
+          # building features (with the researcher and 10-K jobs alongside).
+          # The rerun peaked at 5.74G mid-run; 8G leaves 40% headroom.
+          memory: 8192M
     depends_on:
       timescaledb:
         condition: service_healthy

@@ -20,13 +20,13 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from shared.utils import filing_extract as fx
 from shared.utils.form4 import index_json_url
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.quote_cache import parse_quote, quote_key
 from shared.utils.sec_rate import sec_slot
 from shared.utils.signal_store import factor_scores_key
@@ -38,6 +38,8 @@ FIRST_RUN_DELAY_SEC = 300
 MAX_LLM_PER_HOUR = 6
 DONE_KEY = "sentinel:filing_extract:done"
 DONE_TTL_SEC = 14 * 86400
+TRIES_KEY = "sentinel:filing_extract:tries"
+MAX_ATTEMPTS = 2                 # failed reads before a filing is parked
 SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local")}
 MARKETCAP_KEY = "sentinel:marketcap:usd:{ticker}"
 
@@ -47,6 +49,10 @@ _FILINGS_SQL = """
     WHERE type = 'filing' AND created_at > NOW() - INTERVAL '2 days' AND summary LIKE 'Material 8-K Event%'
       AND (summary LIKE '%2.02:%' OR summary LIKE '%3.02:%') AND headline NOT LIKE '%8-K/A%'
     ORDER BY created_at
+"""
+_STORED_RANKED_SQL = """
+    SELECT ticker FROM factor_scores_daily WHERE horizon = 'monthly'
+      AND as_of = (SELECT max(as_of) FROM factor_scores_daily WHERE horizon = 'monthly')
 """
 _EVENTS_SQL = """
     INSERT INTO events (event_id, type, source, occurred_at, collected_at, created_at, headline, summary, tags,
@@ -84,9 +90,13 @@ class FilingExtractor:
     async def _ranked(self) -> set:
         blob = await self.raw.get(factor_scores_key("monthly"))
         try:
-            return set(json.loads(blob)) if blob else set()
+            live = set(json.loads(blob)) if blob else set()
         except (ValueError, TypeError):
-            return set()
+            live = set()
+        # The stored ranking when the live key is absent. An empty set read as
+        # "no filter" in run_once, so every filing qualified while the key was
+        # missing; the analyst and researcher already fall back this way.
+        return live or {str(r["ticker"]) for r in await self.db.query(_STORED_RANKED_SQL) or []}
 
     async def _documents(self, session: aiohttp.ClientSession, index_link: str) -> List[Dict[str, str]]:
         url = index_json_url(index_link)
@@ -120,31 +130,16 @@ class FilingExtractor:
             if await self.raw.sismember(DONE_KEY, acc):
                 continue
             seen += 1
-            items = set(fd.get("items") or [])
-            docs = await self._documents(session, str(fd.get("primary_doc_url") or ""))
-            if not docs:
+            # One filing's failure is that filing's, not the run's. It raised
+            # out of the loop before being marked done, so the same timed-out
+            # filing was retried every pass and the filings behind it never ran.
+            try:
+                done, out = await self._read(session, llm, fd, ticker, acc)
+            except Exception as exc:
+                await self._failed(acc, exc)
                 continue
-            out: Optional[Dict[str, Any]] = None
-            urls = {d["name"]: d["url"] for d in docs}
-            picked = fx.pick_documents(list(urls), acc)
-            if "2.02" in items:
-                exhibit = urls.get(picked["release"] or "")
-                passage = fx.guidance_passages(await self._text(session, exhibit)) if exhibit else ""
-                if not passage:
-                    out = {"kind": "guidance", "direction": "none", "evidence": ""}
-                elif self._llm_budget():
-                    self._llm_calls.append(time.time())
-                    got = await llm.infer(fx.GUIDANCE_SYSTEM, passage, fx.Guidance, temperature=0.0)
-                    out = {"kind": "guidance", "direction": got.direction, "evidence": got.evidence[:300]}
-                else:
-                    continue                          # over budget: read next pass
-            elif "3.02" in items:
-                main = urls.get(picked["body"] or "")
-                shares = fx.offered_shares(await self._text(session, main)) if main else None
-                price = parse_quote(await self.raw.get(quote_key(ticker)))
-                cap_raw = await self.raw.get(MARKETCAP_KEY.format(ticker=ticker))
-                cap = float(cap_raw) if cap_raw else None
-                out = {"kind": "offering", "shares": shares, "tags": fx.offering_tags(shares, price, cap)}
+            if not done:
+                continue
             await self.raw.sadd(DONE_KEY, acc)
             await self.raw.expire(DONE_KEY, DONE_TTL_SEC)
             if out is None:
@@ -152,6 +147,50 @@ class FilingExtractor:
             await self._write(r, ticker, acc, out)
             written += 1
         return {"filings": seen, "written": written}
+
+    async def _read(self, session: aiohttp.ClientSession, llm: Any, fd: Dict[str, Any], ticker: str,
+                    acc: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """(done, extract): done is False when the filing should be read on a
+        later pass (no documents listed yet, or over the model budget)."""
+        items = set(fd.get("items") or [])
+        docs = await self._documents(session, str(fd.get("primary_doc_url") or ""))
+        if not docs:
+            return False, None
+        out: Optional[Dict[str, Any]] = None
+        urls = {d["name"]: d["url"] for d in docs}
+        picked = fx.pick_documents(list(urls), acc)
+        if "2.02" in items:
+            exhibit = urls.get(picked["release"] or "")
+            passage = fx.guidance_passages(await self._text(session, exhibit)) if exhibit else ""
+            if not passage:
+                out = {"kind": "guidance", "direction": "none", "evidence": ""}
+            elif self._llm_budget():
+                self._llm_calls.append(time.time())
+                got = await llm.infer(fx.GUIDANCE_SYSTEM, passage, fx.Guidance, temperature=0.0)
+                out = {"kind": "guidance", "direction": got.direction, "evidence": got.evidence[:300]}
+            else:
+                return False, None                    # over budget: read next pass
+        elif "3.02" in items:
+            main = urls.get(picked["body"] or "")
+            shares = fx.offered_shares(await self._text(session, main)) if main else None
+            price = parse_quote(await self.raw.get(quote_key(ticker)))
+            cap_raw = await self.raw.get(MARKETCAP_KEY.format(ticker=ticker))
+            cap = float(cap_raw) if cap_raw else None
+            out = {"kind": "offering", "shares": shares, "tags": fx.offering_tags(shares, price, cap)}
+        return True, out
+
+    async def _failed(self, acc: str, exc: Exception) -> None:
+        """Count a failed read; after MAX_ATTEMPTS the filing is parked (marked
+        done, and counted) so it cannot hold the queue."""
+        tries = int(await self.raw.hincrby(TRIES_KEY, acc, 1))
+        await self.raw.expire(TRIES_KEY, DONE_TTL_SEC)
+        if tries < MAX_ATTEMPTS:
+            swallowed("agents.filing_extractor.read", exc, logger)
+            return
+        await self.raw.sadd(DONE_KEY, acc)
+        await self.raw.expire(DONE_KEY, DONE_TTL_SEC)
+        dropped("agents.filing_extractor.parked", "filing failed MAX_ATTEMPTS reads and was marked done", logger,
+                detail=f"{acc} after {tries}: {exc}"[:300])
 
     async def _write(self, r: Dict[str, Any], ticker: str, acc: str, out: Dict[str, Any]) -> None:
         if out["kind"] == "guidance":

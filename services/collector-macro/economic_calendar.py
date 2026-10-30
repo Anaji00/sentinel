@@ -522,7 +522,7 @@ class EconomicCalendarCollector:
             await self._session.close()
 
 
-KALSHI_CONSENSUS_KEY = "sentinel:macro:kalshi_consensus"
+from shared.utils.kalshi_consensus import KALSHI_CONSENSUS_KEY  # noqa: E402  (re-exported for main.py)
 
 
 async def _kalshi_forecast(raw, indicator: str, now: datetime) -> Optional[float]:

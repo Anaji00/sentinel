@@ -18,6 +18,7 @@ import re
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
 from services.api_gateway.dependencies import get_db, get_redis_client, verify_websocket_api_key
+from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("api-gateway.events")
 router = APIRouter(prefix="/api/v1/events", tags=["Domain Events"])
@@ -462,6 +463,11 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                            ST_Y(coordinates::geometry) as latitude, ST_X(coordinates::geometry) as longitude,
                            ROW_NUMBER() OVER (PARTITION BY type ORDER BY occurred_at DESC) as rn
                     FROM events
+                    -- Without a bound the window ranks every row in the table:
+                    -- measured at 4.4 s and 2.07M rows decompressed per socket
+                    -- opened, against 30 ms with it. A type silent for a day
+                    -- is not live and has no place in the opening backlog.
+                    WHERE occurred_at > NOW() - INTERVAL '24 hours'
                 )
                 SELECT * FROM ranked_events WHERE rn <= 4
                 ORDER BY occurred_at DESC
@@ -494,28 +500,52 @@ async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0
                 await websocket.send_json(evt)
                 await asyncio.sleep(0.05)
         except Exception as e:
-            logger.warning(f"Failed to fetch initial events for WebSocket connection: {e}")
+            # Counted, and named by type: the previous warning printed str(e),
+            # which is empty for a timeout, so the log read "Failed to fetch
+            # initial events: " with nothing after it.
+            swallowed("api_gateway.routes.events.live_feed.backlog", e, logger)
 
     # 2. Continuous real-time streaming loop
-    try:
+    #
+    # The loop only ever sends, so on its own it notices a closed client at the
+    # next send -- on a quiet channel, never -- and holds that client's Redis
+    # subscription until the gateway restarts. Measured: three dropped sockets
+    # still subscribed 75 s later. A reader that waits for the disconnect
+    # bounds that to one poll interval.
+    async def _until_disconnect() -> None:
         while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+
+    reader = asyncio.create_task(_until_disconnect())
+    try:
+        while not reader.done():
+            # The timeout belongs to get_message itself. redis-py 5 defaults it
+            # to 0.0, which returns at once, so the previous outer wait_for
+            # never waited and every open socket spun a core (gateway at 99%).
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=4.0)
+            if not message or message["type"] != "message":
+                continue
             try:
-                message = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=4.0)
-                if message and message["type"] == "message":
-                    data = json.loads(message["data"])
-                    score = float(data.get("anomaly_score", 0.0) or 0.0)
-                    if score >= min_anomaly:
-                        await websocket.send_json(data)
-            except asyncio.TimeoutError:
-                pass
-            except WebSocketDisconnect:
-                break
+                data = json.loads(message["data"])
+                score = float(data.get("anomaly_score", 0.0) or 0.0)
             except Exception as ex:
-                logger.debug(f"PubSub message error: {ex}")
-    except WebSocketDisconnect:
+                swallowed("api_gateway.routes.events.live_feed.decode", ex, logger)
+                continue
+            if score >= min_anomaly:
+                # Outside any catch-all on purpose: uvicorn reports a send to a
+                # closed socket as ClientDisconnected (an OSError), which this
+                # Starlette does not translate, and swallowing it kept a dead
+                # connection's loop alive.
+                await websocket.send_json(data)
+    except (WebSocketDisconnect, OSError):
         logger.info("Client disconnected from /ws/live-feed")
     except Exception as e:
         logger.error(f"WebSocket live feed error: {e}")
     finally:
+        reader.cancel()
+        if reader.done() and not reader.cancelled() and reader.exception() is not None:
+            swallowed("api_gateway.routes.events.live_feed.reader", reader.exception(), logger)
         await pubsub.unsubscribe("sentinel:events:live")
         await pubsub.close()

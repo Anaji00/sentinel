@@ -102,7 +102,155 @@ def placebo_rate(hits: Sequence[bool], placebo_hits: Sequence[bool]) -> Dict[str
     return {"n": n, "hit_rate": round(h, 3), "placebo_rate": round(p, 3), "skill": round(h - p, 3)}
 
 
+def lift_table(rows: Iterable[Tuple[str, float]], baseline: Sequence[float], min_n: int = 10) -> List[Dict[str, object]]:
+    """Each group's move ratio against a naive baseline's: the same measure for
+    stocks that had a headline that day and no alert. "Moves more than usual"
+    is the wrong bar for an alert about a stock in the news, because news days
+    move more anyway (Boudoukh, Feldman, Kogan & Richardson 2019); an alert earns
+    its place only by beating a headline. Welch's t on the two means, BH q."""
+    from shared.utils.reaction_study import benjamini_hochberg
+
+    base = [b for b in baseline if b is not None and math.isfinite(b)]
+    if len(base) < min_n:
+        return []
+    bm = sum(base) / len(base)
+    bv = sum((x - bm) ** 2 for x in base) / (len(base) - 1)
+    by: Dict[str, List[float]] = {}
+    for g, r in rows:
+        if r is not None and math.isfinite(r):
+            by.setdefault(g, []).append(r)
+    out = []
+    for g, xs in by.items():
+        n = len(xs)
+        m = sum(xs) / n
+        v = sum((x - m) ** 2 for x in xs) / (n - 1) if n > 1 else 0.0
+        se = math.sqrt(v / n + bv / len(base)) if n > 1 else 0.0
+        t = (m - bm) / se if se > 0 else 0.0
+        out.append({"group": g, "n": n, "mean_ratio": round(m, 3), "baseline_ratio": round(bm, 3),
+                    "lift": round(m / bm, 3) if bm > 0 else None, "t": round(t, 2),
+                    "p": _p_two_sided(t) if n >= min_n else None})
+    tested = [r for r in out if r["p"] is not None]
+    for r, q in zip(tested, benjamini_hochberg([r["p"] for r in tested])):
+        r["q"] = round(q, 4)
+        r["verdict"] = ("beats a headline" if r["t"] > 0 else "below a headline") if q <= 0.10 else "no better than a headline"
+        r["p"] = round(r["p"], 4)
+    for r in out:
+        r.setdefault("q", None)
+        r.setdefault("verdict", "too few")
+    return sorted(out, key=lambda r: -r["n"])
+
+
+def paired_lift_table(rows: Iterable[Tuple[str, str, float]], baseline: Iterable[Tuple[str, float]],
+                      min_n: int = 10, min_base: int = 3) -> List[Dict[str, object]]:
+    """Each group's move ratio against the same stock's headline days.
+
+    lift_table compares an alert with other stocks' headline days, and the
+    stocks alerts name are calmer than the average stock in the news: on 29 Oct
+    2026 alerts pooled at 0.995 against 1.237, while within the same stock five
+    families beat that stock's own headline days (block and options +0.11, t
+    12.8; geopolitical cascade +0.29, t 8.0). Paired here: each alert minus
+    the mean of its stock's headline-day ratios (stocks with at least
+    `min_base` of them), a one-sample t on the differences, BH q. Same verdict
+    labels as lift_table, so uninformative_rules reads either."""
+    from shared.utils.reaction_study import benjamini_hochberg
+
+    per: Dict[str, List[float]] = {}
+    for t, b in baseline:
+        if b is not None and math.isfinite(b):
+            per.setdefault(t, []).append(b)
+    base = {t: sum(v) / len(v) for t, v in per.items() if len(v) >= min_base}
+    by: Dict[str, List[Tuple[float, float]]] = {}
+    for g, t, r in rows:
+        if r is not None and math.isfinite(r) and t in base:
+            by.setdefault(g, []).append((r, base[t]))
+    out = []
+    for g, pairs in by.items():
+        n = len(pairs)
+        d = [r - b for r, b in pairs]
+        m = sum(d) / n
+        sd = math.sqrt(sum((x - m) ** 2 for x in d) / (n - 1)) if n > 1 else 0.0
+        t = m / (sd / math.sqrt(n)) if sd > 0 else 0.0
+        mr, mb = sum(r for r, _ in pairs) / n, sum(b for _, b in pairs) / n
+        out.append({"group": g, "n": n, "mean_ratio": round(mr, 3), "baseline_ratio": round(mb, 3),
+                    "lift": round(mr / mb, 3) if mb > 0 else None, "diff": round(m, 3), "t": round(t, 2),
+                    "p": _p_two_sided(t) if n >= min_n else None})
+    tested = [r for r in out if r["p"] is not None]
+    for r, q in zip(tested, benjamini_hochberg([r["p"] for r in tested])):
+        r["q"] = round(q, 4)
+        r["verdict"] = ("beats a headline" if r["t"] > 0 else "below a headline") if q <= 0.10 else "no better than a headline"
+        r["p"] = round(r["p"], 4)
+    for r in out:
+        r.setdefault("q", None)
+        r.setdefault("verdict", "too few")
+    return sorted(out, key=lambda r: -r["n"])
+
+
 RETIRE_MIN_N = 50
+
+
+def prior_move(days: Sequence[date], closes: Sequence[float], spy_close: Dict[date, float],
+               at: datetime) -> Optional[float]:
+    """The session before entry, close to close, net of SPY: the move an alert
+    arrives on, known before the first open after it."""
+    i = entry_session(days, at)
+    if i is None or i < 2:
+        return None
+    a, b = days[i - 2], days[i - 1]
+    if not closes[i - 2] or not closes[i - 1] or not spy_close.get(a) or not spy_close.get(b):
+        return None
+    return math.log(closes[i - 1] / closes[i - 2]) - math.log(spy_close[b] / spy_close[a])
+
+
+def follow_table(rows: Iterable[Tuple[str, Optional[float], Optional[float]]], min_n: int = 10) -> List[Dict[str, object]]:
+    """[(group, prior move, signed abnormal move after)] -> per group: n, the share
+    that continued the prior move, the mean move after aligned with the prior's
+    sign in basis points, t, p, BH q.
+
+    move_ratio grades size only, and a family that precedes 2x moves is no use
+    to a trade until its direction is known: on 29 Oct 2026 peer-decoupling
+    alerts reversed the prior session by 82 bp the next day (n 174, t -2.0)
+    while block-and-options alerts continued it by 64 bp over five (n 1,794,
+    t 4.3). Groups with a zero or missing prior are skipped."""
+    from shared.utils.reaction_study import benjamini_hochberg
+
+    by: Dict[str, List[Tuple[bool, float]]] = {}
+    for g, prior, after in rows:
+        if prior is None or after is None or prior == 0 or not math.isfinite(prior) or not math.isfinite(after):
+            continue
+        by.setdefault(g, []).append(((after > 0) == (prior > 0), after * (1.0 if prior > 0 else -1.0)))
+    out = []
+    for g, xs in by.items():
+        n = len(xs)
+        al = [a * 1e4 for _, a in xs]
+        m = sum(al) / n
+        sd = math.sqrt(sum((x - m) ** 2 for x in al) / (n - 1)) if n > 1 else 0.0
+        t = m / (sd / math.sqrt(n)) if sd > 0 else 0.0
+        out.append({"group": g, "n": n, "continued": round(sum(c for c, _ in xs) / n, 3), "follow_bp": round(m, 1),
+                    "t": round(t, 2), "p": _p_two_sided(t) if n >= min_n else None})
+    tested = [r for r in out if r["p"] is not None]
+    for r, q in zip(tested, benjamini_hochberg([r["p"] for r in tested])):
+        r["q"] = round(q, 4)
+        r["verdict"] = ("continues" if r["t"] > 0 else "reverses") if q <= 0.10 else "no direction"
+        r["p"] = round(r["p"], 4)
+    for r in out:
+        r.setdefault("q", None)
+        r.setdefault("verdict", "too few")
+    return sorted(out, key=lambda r: -r["n"])
+
+
+def follow_tendencies(grades: Optional[Dict[str, object]], min_n: int = RETIRE_MIN_N) -> Dict[str, str]:
+    """Family -> a sentence on the direction its alerts were followed in, for
+    families with a significant verdict on enough alerts at 1 or 5 sessions."""
+    out: Dict[str, List[str]] = {}
+    for k, label in (("family_follow_1d", "next session"), ("family_follow_5d", "next 5 sessions")):
+        for r in (grades or {}).get(k) or []:
+            if isinstance(r, dict) and int(r.get("n") or 0) >= min_n and r.get("verdict") in ("continues", "reverses"):
+                verb = "continued" if r["verdict"] == "continues" else "reversed"
+                out.setdefault(str(r["group"]), []).append(
+                    f"{verb} the prior session's move over the {label} ({float(r['follow_bp']):+.0f} bp, n {r['n']})")
+    return {g: "; ".join(v) for g, v in out.items()}
+
+
 _ENTITY_SUFFIX = re.compile(r"\s*\([^()]*\)\s*$")
 
 
@@ -125,7 +273,35 @@ def uninformative_rules(grades: Optional[Dict[str, object]], min_n: int = RETIRE
         for r in grades.get(k) or []:
             if isinstance(r, dict) and int(r.get("n") or 0) >= min_n:
                 seen.setdefault(str(r.get("group")), []).append(str(r.get("verdict")))
-    return {g for g, vs in seen.items() if vs and "moves more" not in vs}
+    retired = {g for g, vs in seen.items() if vs and "moves more" not in vs}
+    # And a family that moves more than usual but no more than a stock with a
+    # headline and no alert: it has measured the news, not added to it.
+    lifts: Dict[str, List[str]] = {}
+    for k in ("family_lift_1d", "family_lift_5d"):
+        for r in grades.get(k) or []:
+            if isinstance(r, dict) and int(r.get("n") or 0) >= min_n:
+                lifts.setdefault(str(r.get("group")), []).append(str(r.get("verdict")))
+    retired |= {g for g, vs in lifts.items() if vs and "beats a headline" not in vs}
+    return retired
+
+
+def move_flagging_families(grades: Optional[Dict[str, object]], min_n: int = RETIRE_MIN_N) -> set:
+    """Families whose alerts precede bigger moves on both bars: more than the
+    stock usually moves, and more than its own headline days. Size, not
+    direction -- a risk input, not a trade signal."""
+    if not grades:
+        return set()
+
+    def verdicts(prefix: str) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for k in (f"{prefix}_1d", f"{prefix}_5d"):
+            for r in grades.get(k) or []:
+                if isinstance(r, dict) and int(r.get("n") or 0) >= min_n:
+                    out.setdefault(str(r.get("group")), []).append(str(r.get("verdict")))
+        return out
+
+    usual, lift = verdicts("correlation_families"), verdicts("family_lift")
+    return {g for g, vs in lift.items() if "beats a headline" in vs and "moves more" in usual.get(g, [])}
 
 
 def is_uninformative(rule_name: str, retired: set) -> bool:
@@ -133,5 +309,6 @@ def is_uninformative(rule_name: str, retired: set) -> bool:
     return rule_name in retired or rule_family(rule_name) in retired
 
 
-__all__ = ["LOOKBACK", "RETIRE_MIN_N", "is_uninformative", "move_ratio", "placebo_rate", "ratio_table", "rule_family",
-           "uninformative_rules"]
+__all__ = ["LOOKBACK", "RETIRE_MIN_N", "follow_table", "follow_tendencies", "is_uninformative", "lift_table",
+           "move_flagging_families", "move_ratio", "paired_lift_table", "placebo_rate", "prior_move", "ratio_table",
+           "rule_family", "uninformative_rules"]

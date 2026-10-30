@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, DEDUP_WINDOW_MEDIUM_SEC
+from services.correlation.event_store import EventStore
 from shared.kafka import Topics
 from shared.utils import quant_calc
 from shared.utils.form4 import code_value_usd as form4_code_value_usd, dominant_code as form4_dominant_code
@@ -578,15 +579,27 @@ class QuantTradingEngine(SentinelAgent):
 
             # Register discovered high-confidence peers in ontology/graph pipelines and emit CorrelationCluster
             high_conf_peers = [p for p in discovery.peer_tickers if p.discovery_confidence >= 0.65]
+            # Only what this engine measured goes back to the graph: a Granger
+            # lead it just tested. The candidates themselves came from the
+            # graph, and the proposal shape -- {source_entity, relationship:
+            # CORRELATED_PEER} -- had neither the action and entity_id the
+            # supervisor requires nor an allowlisted predicate: 1,129 refused.
             for peer in high_conf_peers:
+                if peer.verification != "granger_supported":
+                    continue
                 await self._producer.send(
                     Topics.ONTOLOGY_PROPOSALS,
                     {
-                        "source_entity": ticker,
-                        "target_entity": peer.ticker,
-                        "relationship": "CORRELATED_PEER",
-                        "confidence": peer.discovery_confidence,
-                        "rationale": peer.rationale,
+                        "entity_id": ticker,
+                        "action": "LINK_ENTITY",
+                        "data": {
+                            "target_id": peer.ticker,
+                            "source_label": "Company",
+                            "target_label": "Company",
+                            "relation_type": "GRANGER_CAUSES",
+                            "confidence": max(0.0, min(1.0, float(peer.discovery_confidence))),
+                            "method": "granger_hourly_lag3",
+                        },
                     },
                     key=peer.ticker,
                 )
@@ -596,7 +609,11 @@ class QuantTradingEngine(SentinelAgent):
                 corr_cluster = CorrelationCluster(
                     rule_id="QUANT_PEER_DECOUPLING",
                     rule_name="Quantitative Equity Peer Cointegration & Decoupling",
-                    alert_tier=AlertTier.INTELLIGENCE,
+                    # ALERT, not INTELLIGENCE: a Granger test over graph peers is
+                    # a statistic. Declared INTELLIGENCE it was the only cluster
+                    # reaching reasoning's synthesis floor -- 31 seven-billion-
+                    # parameter scenarios on 28 Oct, about eight minutes each.
+                    alert_tier=AlertTier.ALERT,
                     primary_domain="financial",
                     confidence_score=float(high_conf_peers[0].discovery_confidence),
                     summary_headline=f"Peer Decoupling Detected: {ticker} vs {', '.join(peer_ids[:3])}",
@@ -617,6 +634,10 @@ class QuantTradingEngine(SentinelAgent):
                     description=f"QuantTradingEngine discovered cointegrated peer correlation for {ticker} with {', '.join(peer_ids)}. Catalyst: {discovery.catalyst_category}",
                     tags=["quant_peer_discovery", f"ticker:{ticker}"] + [f"peer:{p}" for p in peer_ids],
                 )
+                # Persisted before it is published, as every correlation-service
+                # path does. Sent bare, the row never existed, and each scenario
+                # written for it failed scenarios_correlation_id_fkey and was lost.
+                await EventStore(self.redis, self.db).save_correlation(corr_cluster)
                 await self._producer.send(Topics.CORRELATIONS, corr_cluster.model_dump(), key=ticker)
 
             # Publish structured AgentBulletin

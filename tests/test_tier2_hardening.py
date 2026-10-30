@@ -348,16 +348,29 @@ def test_deployment_profiles_fit_the_memory_budget():
     assert ceiling(set()) < WSL_BUDGET_GIB
     assert ceiling({"collectors"}) < WSL_BUDGET_GIB, "analyst mode must fit"
     assert ceiling({"collectors", "obs"}) < WSL_BUDGET_GIB
-    assert ceiling({"agents"}) < WSL_BUDGET_GIB, "reasoning mode must fit"
+    # Reasoning mode's limits exceed the VM since 28 Oct 2026, by decision: the
+    # factor model reads 11 years (6G) and judgments run on qwen2.5:7b beside
+    # the 3B (ollama 9G). Limits are ceilings, not use: measured that day the
+    # whole stack used 17.7 GiB with the factor model mid-run at 5.5 GiB, and
+    # the resident 7B adds ~3 GiB. The bar is the VM plus a bounded overcommit,
+    # so a further raise still has to be argued here.
+    # Each bound below raised by 2 on 29 Oct 2026 for the factor model's 6G -> 8G:
+    # its run restarted silently at 18:43 near the 6G cap, and the rerun passed
+    # 5.74 GiB mid-run while the whole stack used 18.9 GiB of the 26 GiB VM.
+    assert ceiling({"agents"}) < WSL_BUDGET_GIB + 6.0, "reasoning mode must stay within a bounded overcommit"
 
     # Collectors and agents together previously exceeded the budget, and this
     # asserted the incompatibility to keep it deliberate. Ceilings were then
     # right-sized against measured usage -- frontend 30MiB of 1G, timescaledb
     # 143MiB of 2G, agents-heavy 705MiB of 2.5G -- and every mode now fits.
-    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB, (
+    # The full stack (collectors and agents, which is how it runs) used 17.7 GiB
+    # on 28 Oct 2026 against limits that now sum past the VM; the same bounded
+    # overcommit as above, sized to the full stack's limits.
+    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB + 9.0, (
         "collectors and agents must co-exist"
     )
-    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB, (
+    # Observability adds its own ceilings on top (not running on 28 Oct 2026).
+    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB + 10.0, (
         "the full stack including observability must fit"
     )
 
@@ -431,9 +444,17 @@ def test_heavy_tier_model_fits_the_cpu_only_budget():
 
     model = str(env.get("AGENT_MODEL", ""))
     assert "7b" not in model.lower(), (
-        f"agents-heavy pinned to {model!r}: a 7B model on this CPU serves ~3-5 "
-        f"tok/s and cannot stay resident beside the fast tier within budget"
+        f"agents-heavy pinned to {model!r}: the 7B serves judgments only (JUDGMENT_MODEL), "
+        f"never every agent call"
     )
 
-    limit = _mib(services["ollama"]["deploy"]["resources"]["limits"]["memory"])
-    assert limit <= 5 * 1024, "ollama ceiling should reflect the smaller tier models"
+    # Judgments may run on a 7B (28 Oct 2026) only with room for both models
+    # resident and the cores split between their runners, so neither a reload
+    # nor twelve busy-waiting threads on six cores can happen.
+    ollama = services["ollama"]
+    limit = _mib(ollama["deploy"]["resources"]["limits"]["memory"])
+    o_env = ollama.get("environment") or []
+    o_env = dict(kv.split("=", 1) for kv in o_env if "=" in kv) if isinstance(o_env, list) else o_env
+    assert limit <= 9 * 1024, "ollama ceiling: a 7B and a 3B resident, no more"
+    if limit > 5 * 1024:
+        assert str(o_env.get("OLLAMA_MAX_LOADED_MODELS")) == "2", "a 7B beside the 3B needs two resident slots"

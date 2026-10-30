@@ -624,6 +624,13 @@ async def main() -> None:
     from shared.utils import model_portfolio as mp
     from services.agents.auto_trader import AutoTrader
     from services.agents.feature_jobs import FeatureJobs
+    from services.agents.researcher import Researcher
+    from services.agents.customer_links_job import CustomerLinksJob
+    from services.agents.llm_news_job import LlmNewsJob
+    from services.agents.alert_move_job import AlertMoveJob
+    from services.agents.comention_job import CoMentionJob
+    from services.agents.case_file_job import CaseFileJob
+    from services.agents.activist_13d_job import Activist13DJob
 
     from services.agents.news_model_refit import NewsModelRefit
 
@@ -639,7 +646,21 @@ async def main() -> None:
                          # The headline book's positions taken in the paper account (off unless enabled).
                          AutoTrader(db, redis).run(),
                          # Filing-based stock features for the model's trials (stock_features_daily).
-                         FeatureJobs(db, redis).run())
+                         FeatureJobs(db, redis).run(),
+                         # The weekly feature screen that queues candidates for trials.
+                         Researcher(db, redis).run(),
+                         # Major customers from 10-Ks, and the customer-momentum feature.
+                         CustomerLinksJob(db, redis).run(),
+                         # A hosted model's read of new headlines, and its 30-day feature.
+                         LlmNewsJob(db, redis).run(),
+                         # The alerts' expected-move model, walk-forward weekly (reports only).
+                         AlertMoveJob(db, redis).run(),
+                         # Connected-firm momentum through news co-mentions (Ali & Hirshleifer).
+                         CoMentionJob(db, redis).run(),
+                         # One structured file of facts per stock for the agents to share.
+                         CaseFileJob(db, redis).run(),
+                         # Activist intent from 13D Item 4 (Brav et al. 2008).
+                         Activist13DJob(db, redis).run())
 
 
 __all__ = ["FactorEngine"]

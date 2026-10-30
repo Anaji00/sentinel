@@ -13,8 +13,9 @@ Two lists, each overridable from the environment with a comma-separated value
   LLM_DISABLED_AGENTS  launched, but every model call answers "no verdict" at
                        once and the agent's deterministic path does the work.
 
-The stock tier -- quant_trading_engine and stock_correlation_agent -- is on
-neither list by default.
+The stock tier keeps running: stock_correlation_agent with its model, and
+quant_trading_engine without its model-written advisory since 29 Oct 2026 (its
+record is below).
 """
 from __future__ import annotations
 
@@ -41,9 +42,18 @@ DEFAULT_AGENTS_DISABLED = frozenset({
 #                              the hourly narrative review is dropped.
 #   radar_agent:               escalation is a threshold on z-score and flow;
 #                              the model was asked to judge exactly those numbers.
+#   quant_trading_engine:      the model-written trading advisory (its only model
+#                              call). Graded on prices it never earned: 280 calls,
+#                              Brier 0.283 against a coin flip's 0.25, hit 49%,
+#                              -26 bp a call net of SPY (29 Oct 2026); and on 28 Oct
+#                              it lost every slot to the reasoning tier anyway. Peer
+#                              discovery and insider clustering are deterministic
+#                              and keep running. Re-enable through the environment
+#                              if hosted inference makes a trial free.
 DEFAULT_LLM_DISABLED = frozenset({
     "macro_intelligence_engine",
     "radar_agent",
+    "quant_trading_engine",
 })
 
 

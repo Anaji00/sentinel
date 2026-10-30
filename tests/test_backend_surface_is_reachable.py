@@ -29,6 +29,10 @@ FRONTEND = ROOT / "frontend" / "src"
 
 # Reached by something other than a browser, each with the reason.
 NOT_A_UI_SURFACE = {
+    # Scenario requests (29 Oct 2026): API first; the dashboard form to request one
+    # and poll its status is not built yet.
+    "/api/v1/scenarios/request",
+    "/api/v1/scenarios/request/{request_id}",
     # Single-interaction write for API clients; the console batches through
     # /feedback/interaction/batch instead of one POST per row.
     "/api/v1/feedback/interaction",

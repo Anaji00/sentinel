@@ -153,3 +153,13 @@ def test_it_is_off_unless_switched_on(monkeypatch) -> None:
     assert tr.leg_fraction() == 0.3
     monkeypatch.setenv("AUTO_TRADE_LEG_FRACTION", "2")
     assert tr.leg_fraction() == 0.5
+
+
+def test_positions_from_an_earlier_book_are_the_traders_own() -> None:
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "services" / "agents" / "auto_trader.py").read_text(
+        encoding="utf-8")
+    assert 'SELECT DISTINCT symbol FROM auto_trade_orders"' in src      # no filter on the book's name
+    # And a managed name the new book does not hold is closed.
+    plans = at.plan_orders({"NEW": 2.0}, {"OLD": 5.0, "NEW": 0.0}, managed={"OLD"}, prices={"OLD": 10.0, "NEW": 10.0})
+    assert ("OLD", "sell", 5.0, "close") in [(p.symbol, p.side, p.qty, p.reason) for p in plans]

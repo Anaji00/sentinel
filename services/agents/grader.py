@@ -134,7 +134,25 @@ _TICKER_RE = "^[A-Z]{1,5}([.][A-Z])?$"
 _CORR_SQL = f"""
     SELECT rule_name, primary_entity_id AS ticker, min(detected_at) AS at FROM correlations
     WHERE detected_at > NOW() - INTERVAL '{PRODUCER_WINDOW_DAYS} days' AND primary_entity_id ~ '{_TICKER_RE}'
+      AND rule_id IS DISTINCT FROM 'USER_SCENARIO_REQUEST'
     GROUP BY 1, 2, date(detected_at)
+"""
+# The naive baseline: a stock with a headline that day and no alert naming it,
+# first headline of the day. Drawn from the stocks alerts name, so each alert
+# can be set against its own stock's headline days (paired_lift_table); a
+# random 3,000 across all stocks left most alert stocks with none.
+_HEADLINE_ONLY_SQL = f"""
+    SELECT ticker, at FROM (
+        SELECT u.sym AS ticker, min(n.created_at) AS at
+        FROM stock_news n CROSS JOIN LATERAL unnest(n.symbols) AS u(sym)
+        WHERE n.created_at > NOW() - INTERVAL '{PRODUCER_WINDOW_DAYS} days' AND cardinality(n.symbols) <= 2
+          AND u.sym ~ '{_TICKER_RE}'
+          AND u.sym IN (SELECT DISTINCT primary_entity_id FROM correlations
+                        WHERE detected_at > NOW() - INTERVAL '{PRODUCER_WINDOW_DAYS} days')
+          AND NOT EXISTS (SELECT 1 FROM correlations c WHERE c.primary_entity_id = u.sym
+                          AND date(c.detected_at) = date(n.created_at))
+        GROUP BY u.sym, date(n.created_at)
+    ) x ORDER BY random() LIMIT 20000
 """
 # Scenarios carry no entity of their own; the correlation that produced one does.
 _SCEN_SQL = f"""
@@ -158,6 +176,7 @@ _PLACEBO_SQL = """
       AND (upper(primary_entity_id) = upper($1) OR upper(primary_entity_name) = upper($1)) LIMIT 1
 """
 _UP = {"long", "up", "bullish"}
+HEADLINE_DAYS = "(headline days, no alert)"     # the reference row in family_follow_*
 
 
 class Grader:
@@ -236,7 +255,8 @@ class Grader:
         corr = await self.db.query(_CORR_SQL) or []
         scen = await self.db.query(_SCEN_SQL) or []
         calls = await self.db.query(_CALLS_SQL) or []
-        tickers = [str(r["ticker"]).upper() for r in list(corr) + list(scen) + list(calls)]
+        news_only = await self.db.query(_HEADLINE_ONLY_SQL) or []
+        tickers = [str(r["ticker"]).upper() for r in list(corr) + list(scen) + list(calls) + list(news_only)]
         since = date.today() - timedelta(days=PRODUCER_WINDOW_DAYS + 120)
         bars = await self._bars(tickers, since)
         sd, so, sc = bars.get("SPY", ([], [], []))
@@ -246,6 +266,12 @@ class Grader:
             d, o, c = bars.get(ticker.upper(), ([], [], []))
             return pg.move_ratio(d, o, c, spy, at, k) if d else None
 
+        spy_close = {d: c for d, (_, c) in spy.items()}
+
+        def prior(ticker: str, at: Any) -> Optional[float]:
+            d, _, c = bars.get(ticker.upper(), ([], [], []))
+            return pg.prior_move(d, c, spy_close, _ts(at)) if d else None
+
         out: Dict[str, Any] = {"generated_at": date.today().isoformat(), "window_days": PRODUCER_WINDOW_DAYS}
         for k in (1, 5):
             rows = [(str(r["rule_name"]), (ratio(r["ticker"], r["at"], k) or (None,))[0]) for r in corr]
@@ -253,6 +279,18 @@ class Grader:
             out[f"correlation_families_{k}d"] = pg.ratio_table([(pg.rule_family(g), x) for g, x in rows])
             rows = [(str(r["status"]), (ratio(r["ticker"], r["at"], k) or (None,))[0]) for r in scen]
             out[f"scenarios_{k}d"] = pg.ratio_table(rows, min_n=5)
+            base = [(str(r["ticker"]).upper(), (ratio(r["ticker"], r["at"], k) or (None,))[0]) for r in news_only]
+            fam = [(pg.rule_family(str(r["rule_name"])), str(r["ticker"]).upper(),
+                    (ratio(r["ticker"], r["at"], k) or (None,))[0]) for r in corr]
+            out[f"family_lift_{k}d"] = pg.paired_lift_table(fam, base)
+            # Direction, beside size: did the stock continue the session the
+            # alert arrived on? Headline days are the reference row, since
+            # small stocks reverse a day's move whether or not anything fired.
+            follow = [(pg.rule_family(str(r["rule_name"])), prior(r["ticker"], r["at"]),
+                       (ratio(r["ticker"], r["at"], k) or (None, None))[1]) for r in corr]
+            follow += [(HEADLINE_DAYS, prior(r["ticker"], r["at"]),
+                        (ratio(r["ticker"], r["at"], k) or (None, None))[1]) for r in news_only]
+            out[f"family_follow_{k}d"] = pg.follow_table(follow)
         out["correlations"] = out["correlations_5d"]
         signed: Dict[str, List[float]] = defaultdict(list)
         for r in calls:

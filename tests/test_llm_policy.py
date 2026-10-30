@@ -13,11 +13,15 @@ from shared.utils.deterministic_briefs import (  # noqa: E402
 from shared.utils.llm_policy import agent_disabled, llm_disabled_for  # noqa: E402
 
 
-def test_the_stock_tier_keeps_its_model_by_default(monkeypatch) -> None:
+def test_the_stock_tier_runs_by_default(monkeypatch) -> None:
     monkeypatch.delenv("AGENTS_DISABLED", raising=False)
     monkeypatch.delenv("LLM_DISABLED_AGENTS", raising=False)
     for name in ("quant_trading_engine", "stock_correlation_agent"):
-        assert not agent_disabled(name) and not llm_disabled_for(name)
+        assert not agent_disabled(name)
+    assert not llm_disabled_for("stock_correlation_agent")
+    # The quant engine runs; its model-written advisory is retired on its graded
+    # record (Brier 0.283 over 280 calls, -26 bp a call; llm_policy.py).
+    assert llm_disabled_for("quant_trading_engine")
     assert agent_disabled("adversarial_wargamer") and agent_disabled("rule_synthesizer")
     assert llm_disabled_for("radar_agent") and llm_disabled_for("macro_intelligence_engine")
 

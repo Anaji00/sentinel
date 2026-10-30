@@ -11,27 +11,25 @@
  * and none of those three statuses was read from anything. The version badge
  * "v2.4 EDA ACTIVE" was likewise hardcoded.
  *
- * What remains is measured: the stream state from the telemetry store, gateway
- * latency from a timed request, the live agent count from /agents/processes, and
- * the signed-in identity from the session. The visual treatment follows the same
+ * What remains is measured: the stream state from the telemetry store and the
+ * signed-in identity from the session. Gateway latency and the live agent count
+ * are operator readings, so they moved into the Platform health dialog
+ * (SystemHealthHUD) rather than sitting on every page. The visual treatment follows the same
  * rules as the panels -- no neon halo, no backdrop blur, cyan reserved for what
  * is interactive.
  */
 
 import React, { useState, useEffect, useSyncExternalStore } from 'react';
-import useSWR from 'swr';
-import { Command, Menu } from 'lucide-react';
+import { ChevronDown, Command, Menu } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { IconLock } from './icons';
 import SystemHealthHUD from '../SystemHealthHUD';
-import { apiClient, fetcher } from '../../lib/api';
 import { useTelemetryStore } from '../../lib/store';
 import { AccountProfileModal } from '../AccountProfileModal';
 import { useNav } from './NavContext';
 import { TIMEZONES, useTimeZone } from './TimeZoneContext';
 import { useSession } from './SessionContext';
-import { POLL } from '../ui/DataProvider';
 
 /** Initials for the avatar, from whatever the session actually gives us. */
 function initialsFor(email?: string | null): string {
@@ -53,7 +51,6 @@ export const Header: React.FC = () => {
   // renders -- it used to govern only the clock beside it, while the event
   // rows below rendered in whatever zone the machine happened to be in.
   const { zone: timezone, setZone: setTimezone } = useTimeZone();
-  const [latency, setLatency] = useState<number | null>(null);
   const [isProfileOpen, setIsProfileOpen] = useState<boolean>(false);
   const isMac = useSyncExternalStore(
     noSubscription,
@@ -70,12 +67,6 @@ export const Header: React.FC = () => {
   // One shared session, rather than this component, the account modal and
   // the live-events hook each asking separately and disagreeing.
   const session = useSession();
-
-  const { data: processes } = useSWR<{ active_agents_count: number }>(
-    '/agents/processes',
-    fetcher,
-    { refreshInterval: POLL.standard },
-  );
 
   useEffect(() => {
     const updateClock = () => {
@@ -103,30 +94,13 @@ export const Header: React.FC = () => {
     return () => clearInterval(interval);
   }, [timezone]);
 
-  useEffect(() => {
-    const measureLatency = async () => {
-      const start = Date.now();
-      try {
-        await apiClient.get('/health');
-        setLatency(Date.now() - start);
-      } catch {
-        // A failed probe is not a latency reading. Reporting the elapsed time of
-        // a request that never completed would present an outage as a number.
-        setLatency(null);
-      }
-    };
-    measureLatency();
-    const timer = setInterval(measureLatency, 10000);
-    return () => clearInterval(timer);
-  }, []);
-
   const { email, role, status } = session;
 
   // Signing in returns the operator to the page they were on, which is the
   // whole reason this control exists in the header rather than only on the
   // login screen.
   const signInHref = `/login?next=${encodeURIComponent(pathname || '/')}`;
-  const agentCount = processes?.active_agents_count;
+  const zoneLabel = TIMEZONES.find(([tz]) => tz === timezone)?.[1] ?? timezone;
 
   const streamTone = isConnected
     ? 'tone-positive'
@@ -207,24 +181,6 @@ export const Header: React.FC = () => {
             <span className={streamTone}>{isConnected ? 'on' : streamIdle ? 'resting' : 'connecting…'}</span>
           )}
         </span>
-
-        <span className="text-ink-mute">·</span>
-
-        <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-ink-mute">AI analysts</span>
-          <span className="text-ink-dim tabular">
-            {typeof agentCount === 'number' ? agentCount : '—'}
-          </span>
-        </span>
-
-        <span className="text-ink-mute">·</span>
-
-        <span className="flex items-center gap-1.5 whitespace-nowrap">
-          <span className="text-ink-mute">Response</span>
-          <span className={latency === null ? 'tone-negative' : 'text-ink-dim tabular'}>
-            {latency === null ? 'unreachable' : `${latency} ms`}
-          </span>
-        </span>
       </div>
 
       {/* Controls */}
@@ -238,18 +194,24 @@ export const Header: React.FC = () => {
           <span className="font-medium">K</span>
         </span>
 
-        <div className="hidden xl:flex items-center gap-2">
-          <span
-            className="text-micro text-ink-dim tabular whitespace-nowrap"
-            suppressHydrationWarning
-          >
+        {/* The clock is the time-zone control: one element rather than a time
+            beside a select. The native select sits invisibly over the time, so
+            it keeps the platform picker and keyboard handling -- and the zone
+            still governs every timestamp the application renders. */}
+        <label
+          className="relative hidden xl:flex items-center gap-1 rounded px-1.5 py-1 text-micro
+                     text-ink-dim hover:text-ink hover:bg-overlay/50 transition-colors cursor-pointer
+                     focus-within:ring-1 focus-within:ring-accent/60"
+          title={`Times shown in ${zoneLabel}. Click to change.`}
+        >
+          <span className="tabular whitespace-nowrap" suppressHydrationWarning>
             {time}
           </span>
+          <ChevronDown aria-hidden className="h-3 w-3 text-ink-mute" />
           <select
             value={timezone}
             onChange={(e) => setTimezone(e.target.value)}
-            className="bg-raised text-micro text-ink-dim border border-line
-                       rounded px-1.5 py-1 outline-none cursor-pointer hover:text-ink transition-colors"
+            className="absolute inset-0 cursor-pointer opacity-0"
             aria-label="Clock timezone"
           >
             {TIMEZONES.map(([tz, label]) => (
@@ -258,7 +220,7 @@ export const Header: React.FC = () => {
               </option>
             ))}
           </select>
-        </div>
+        </label>
 
         <SystemHealthHUD />
 

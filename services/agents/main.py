@@ -32,6 +32,8 @@ from services.agents.adversarial_wargamer import AdversarialWargamerAgent
 from services.agents.edge_validator import EdgeValidatorAgent
 from services.agents.signal_engine import SignalEngine
 from services.agents.stock_correlation_agent import StockCorrelationAgent
+from services.agents.analyst_agent import AnalystAgent
+from shared.utils.hosted_llm import is_hosted
 from services.correlation.soft_correlator import SoftCorrelator
 from shared.utils.tasks import safe_create_task
 from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
@@ -110,7 +112,10 @@ async def run_task_queue_worker(redis_client, agents: dict):
 # This comment previously claimed compose set qwen2.5:3b for agents-heavy. It
 # did not, and had not for as long as the comment existed -- the tiering it
 # described was gone and the sentence describing it was not.
-HEAVY_MODEL = os.getenv("AGENT_MODEL", "qwen2.5:3b")
+# Judgments (macro and quant assessments, the wargamer) on a stronger model
+# when JUDGMENT_MODEL names one (qwen2.5:7b from 28 Oct 2026); extraction and
+# routing stay on AGENT_MODEL. Unset, both tiers run AGENT_MODEL as before.
+HEAVY_MODEL = os.getenv("JUDGMENT_MODEL") or os.getenv("AGENT_MODEL", "qwen2.5:3b")
 
 # The same value under a name the fast-tier call sites can use.
 #
@@ -444,6 +449,32 @@ async def main():
         fallback_model=HEAVY_MODEL,
     )
 
+    # The analyst: retrieval, several samples and the stock model's rank as a
+    # prior, on the day's strongest stock alerts (services/agents/analyst_agent.py).
+    analyst_agent = build_agent(
+        AnalystAgent,
+        agent_name="analyst_agent",
+        input_topics=[Topics.CORRELATIONS],
+        group_id="agent-analyst",
+        shared_infra=shared_infra,
+        model=HEAVY_MODEL,
+        fallback_model=HEAVY_MODEL,
+    )
+
+    # The analyst again on a free hosted model, graded under its own name, so
+    # the two records can be compared before any judgment is routed off-host.
+    # Built only when ANALYST_SHADOW_MODEL names a hosted model (provider/model).
+    shadow_model = os.getenv("ANALYST_SHADOW_MODEL", "").strip()
+    analyst_shadow = build_agent(
+        AnalystAgent,
+        agent_name="analyst_shadow",
+        input_topics=[Topics.CORRELATIONS],
+        group_id="agent-analyst-shadow",
+        shared_infra=shared_infra,
+        model=shadow_model,
+        fallback_model=None,
+    ) if is_hosted(shadow_model) else None
+
     # Dictionary map with backwards-compatible aliases for task queue dispatch
     agents_by_name = {
         # Core Consolidated Engines
@@ -457,6 +488,7 @@ async def main():
         "adversarial_wargamer":        adversarial_wargamer,
         "edge_validator":              edge_validator_agent,
         "stock_correlation_agent":     stock_correlation_agent,
+        "analyst_agent":               analyst_agent,
 
         # Backwards-compatible Task Routing Aliases
         "yield_curve_agent":          macro_intelligence_engine,
@@ -494,7 +526,11 @@ async def main():
         ("adversarial_wargamer", adversarial_wargamer, "heavy"),
         ("edge_validator", edge_validator_agent, "fast"),
         ("stock_correlation_agent", stock_correlation_agent, "fast"),
+        ("analyst_agent", analyst_agent, "heavy"),
     ]
+    if analyst_shadow is not None:
+        agents_by_name["analyst_shadow"] = analyst_shadow
+        agent_tier_map.append(("analyst_shadow", analyst_shadow, "heavy"))
 
     # Agents cut by policy are not launched; see shared.utils.llm_policy.
     active_agents = {

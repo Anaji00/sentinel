@@ -61,7 +61,10 @@ def test_every_cluster_site_propagates_exposures():
     cascade = (ROOT / "services" / "correlation" / "cascade.py").read_text(encoding="utf-8")
     main = (ROOT / "services" / "correlation" / "main.py").read_text(encoding="utf-8")
     assert '"exposes": exposure_tags(' in cascade
-    assert main.count("exposure_tags(") >= 3
+    # 2 since 29 Oct 2026: the Hawkes forecast no longer copies the exposures of
+    # whichever event arrived while two domains were elevated -- they were that
+    # event's, not the forecast's, and put arbitrary stocks on it.
+    assert main.count("exposure_tags(") >= 2
 
 
 def test_the_enrichers_attach_the_bridges():

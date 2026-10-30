@@ -123,6 +123,18 @@ _WORLD_DOMAINS = frozenset({
     "news", "maritime", "aviation", "cyber", "macro",
 })
 
+# What makes a cluster geopolitical: the physical world, not the news about a
+# company. Measured 28 Oct 2026: 93% of 1,197 "geopolitical cascades" in twenty
+# days were one stock's own headline meeting its own block trade, filing or
+# price anomaly within the hour -- NVDA, META, MSFT, TSLA, AAPL, which have
+# headlines every hour. Those are company news meeting trading, and are named so.
+_GEO_DOMAINS = _WORLD_DOMAINS - {"news"}
+
+# The evidence a multi-domain cluster needs beyond its domain count. The
+# flashpoint index adds 25 a domain, so any two domains cleared its old bar of
+# 35 whatever the scores. The same average a single-domain storm must show.
+CASCADE_MIN_AVG_SCORE = 0.45
+
 
 # What a single-domain cluster is called, keyed on the domain that actually
 # fired. Matched on prefix, because the event vocabulary is
@@ -209,8 +221,10 @@ def _classify_cluster(
         # "crypto_trade" are one domain and two very different clusters, and
         # the domain alone cannot tell a wallet movement from a price move.
         return _single_domain_label(next(iter(sorted(types_present)), ""))
-    if domains_present & _WORLD_DOMAINS:
+    if domains_present & _GEO_DOMAINS:
         return "geopolitical_cascade", "Geopolitical Cascade"
+    if "news" in domains_present:
+        return "company_news_trading", "Company News & Trading"
     return "cross_asset_cascade", "Cross-Asset Cascade"
 
 
@@ -369,7 +383,14 @@ class GeopoliticalCascadeEngine:
         # 2. High-Severity Single Domain: total events >= 4 AND avg_score >= 0.45 AND max score >= 0.60
         max_score = max((e[1]["score"] for e in current_entries), default=0.0)
         
-        is_multi_domain_cascade = (len(domains_present) >= 2 and flashpoint_index >= 35.0 and len(current_entries) >= 2)
+        is_multi_domain_cascade = (len(domains_present) >= 2 and flashpoint_index >= 35.0 and len(current_entries) >= 2
+                                   and avg_score >= CASCADE_MIN_AVG_SCORE)
+        # A stock's own news meeting its own trading counts only when the stock
+        # is busier than it usually is: a name with a headline every hour is
+        # not news by being in the news (mean + 3 sd of its own hours).
+        if (is_multi_domain_cascade and not (domains_present & _GEO_DOMAINS) and "news" in domains_present
+                and len(current_entries) < self.storm_threshold(key, now)):
+            is_multi_domain_cascade = False
         is_single_domain_storm = (
             len(domains_present) == 1 and len(current_entries) >= 4
             and avg_score >= 0.45 and max_score >= 0.60
@@ -430,9 +451,12 @@ class GeopoliticalCascadeEngine:
                 # anomalies, the largest a 1.10% move, scored 75.0/100 and went
                 # out as CRITICAL, because avg_score sat at ~1.0 where the
                 # domain scorers saturate.
+                # CRITICAL is for the physical world: company news meeting its
+                # own trading is a volatility flag, not a page.
                 alert_tier=(
                     AlertTier.CRITICAL
-                    if (flashpoint_index >= 75.0 and is_multi_domain_cascade)
+                    if (flashpoint_index >= 75.0 and is_multi_domain_cascade
+                        and bool(domains_present & _GEO_DOMAINS))
                     else AlertTier.ELEVATED
                 ),
                 # The index this engine exists to compute, carried where
@@ -457,7 +481,8 @@ class GeopoliticalCascadeEngine:
                 primary_domain=(
                     next(iter(sorted(domains_present)), None)
                     if len(domains_present) == 1
-                    else ("geopolitical" if domains_present & _WORLD_DOMAINS else "cross_asset")
+                    else ("geopolitical" if domains_present & _GEO_DOMAINS
+                          else "tradfi" if "news" in domains_present else "cross_asset")
                 ),
                 # Rankable, rather than only readable.
                 metrics_summary={

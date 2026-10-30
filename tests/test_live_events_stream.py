@@ -9,6 +9,7 @@ Validates:
   - High-frequency PositionReport batch deduplication
 """
 
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -80,3 +81,117 @@ def test_high_frequency_position_deduplication():
     deduped = list(position_map.values()) + non_position
     assert len(deduped) == 3
     assert any(e["event_id"] == "ev4" for e in deduped)
+
+
+# ── 5. A CLOSED CLIENT RELEASES ITS SUBSCRIPTION ──────────────────────────────
+#
+# Measured on the live gateway: redis-py 5 defaults `get_message(timeout=)` to
+# 0.0, so the loop never waited and every open socket spun a core (99% CPU);
+# three dropped sockets still held their Redis subscriptions 75 s later,
+# because the loop only noticed a closed client on a send and swallowed the
+# OSError that send raised.
+
+async def _never() -> dict:
+    await asyncio.Event().wait()
+    return {}
+
+
+class _Runaway(BaseException):
+    """Raised by the fake Redis once a loop has outlived its client.
+
+    A BaseException so a catch-all `except Exception` cannot swallow it. A loop
+    that never exits is not reliably cancellable on Python 3.11 -- `wait_for`
+    can lose the cancel when the inner await completes at the same moment -- so
+    the regression has to end the loop itself, or it hangs the suite.
+    """
+
+
+RUNAWAY_CALLS = 200
+
+
+def _socket(receive, get_message, db=None):
+    calls = 0
+
+    async def bounded_get_message(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > RUNAWAY_CALLS:
+            raise _Runaway(f"get_message called {calls} times after the client left")
+        return await get_message(**kwargs)
+
+    ws = MagicMock()
+    ws.accept = AsyncMock()
+    ws.send_json = AsyncMock()
+    ws.receive = AsyncMock(side_effect=receive)
+    ws.app.state.db = db
+    pubsub = MagicMock()
+    pubsub.subscribe = AsyncMock()
+    pubsub.unsubscribe = AsyncMock()
+    pubsub.close = AsyncMock()
+    pubsub.get_message = AsyncMock(side_effect=bounded_get_message)
+    ws.app.state.redis.raw.pubsub.return_value = pubsub
+    return ws, pubsub
+
+
+async def _quiet(**_kwargs):
+    await asyncio.sleep(0.01)
+    return None
+
+
+async def _run(ws):
+    with patch("services.api_gateway.routes.events.verify_websocket_api_key", new_callable=AsyncMock) as ok:
+        ok.return_value = True
+        await asyncio.wait_for(websocket_live_feed(ws, min_anomaly=0.0), timeout=2.0)
+
+
+@pytest.mark.anyio
+async def test_a_client_that_leaves_a_quiet_channel_is_released():
+    async def leave():
+        return {"type": "websocket.disconnect", "code": 1006}
+
+    ws, pubsub = _socket(leave, _quiet)
+    await _run(ws)
+    pubsub.unsubscribe.assert_awaited_once_with("sentinel:events:live")
+    pubsub.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_a_failed_send_ends_the_loop_instead_of_being_swallowed():
+    sent = {"type": "message", "data": json.dumps({"event_id": "e1", "anomaly_score": 0.9})}
+    messages = iter([sent])
+
+    async def one_then_quiet(**kwargs):
+        return next(messages, None) or await _quiet()
+
+    ws, pubsub = _socket(lambda: _never(), one_then_quiet)
+    # What uvicorn raises for a send to a closed socket: ClientDisconnected(OSError).
+    ws.send_json.side_effect = OSError("client disconnected")
+    await _run(ws)
+    pubsub.unsubscribe.assert_awaited_once_with("sentinel:events:live")
+
+
+@pytest.mark.anyio
+async def test_the_loop_waits_on_redis_rather_than_spinning():
+    async def leave():
+        await asyncio.sleep(0.05)
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    ws, pubsub = _socket(leave, _quiet)
+    await _run(ws)
+    timeouts = [c.kwargs.get("timeout", 0.0) for c in pubsub.get_message.await_args_list]
+    assert timeouts and all(t and t > 0 for t in timeouts)
+
+
+@pytest.mark.anyio
+async def test_the_opening_backlog_is_time_bounded():
+    # Unbounded, the window ranked all 2.07M rows: 4.4 s per socket opened.
+    db = MagicMock()
+    db.query = AsyncMock(return_value=[])
+
+    async def leave():
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    ws, _ = _socket(leave, _quiet, db=db)
+    await _run(ws)
+    sql = " ".join(db.query.await_args.args[0].split()).lower()
+    assert "where occurred_at > now() - interval" in sql

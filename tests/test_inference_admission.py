@@ -114,7 +114,9 @@ async def test_the_agent_passes_a_score_when_claiming_a_slot():
     """The bar is inert unless callers fill the parameter -- which none did for
     the entire life of the method."""
     source = (ROOT / "services/agents/base.py").read_text(encoding="utf-8")
-    assert "score=_message_score(message)" in source
+    # Since 29 Oct 2026 weighted by the agent's graded standing before it is
+    # passed (SentinelAgent._budget_weight).
+    assert "_score = _message_score(message)" in source and "score=_score," in source
 
 
 @pytest.mark.parametrize(

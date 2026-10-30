@@ -38,49 +38,40 @@ import {
   Zap,
   Grid3x3,
   Eye,
-  Radio,
-  Scale,
-  Banknote,
-  Lock,
   Wrench,
 } from 'lucide-react';
 
 import { useNav } from './NavContext';
+import { useSession } from './SessionContext';
 
 interface NavItem {
   href: string;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
+  /** Civic watch carries the civic hue, so it reads as its own half wherever it sits. */
+  civic?: boolean;
+  /** Deployment tooling, offered only to admins -- the same rule the account
+   * panel applies to its Data sources tab. */
+  operator?: boolean;
 }
 
 interface NavGroup {
   label: string;
   items: NavItem[];
-  /** The civic group's heading carries the civic hue, so it reads as its own half. */
-  civic?: boolean;
 }
 
 const NAV_GROUPS: NavGroup[] = [
   {
+    // The platform's two halves start here: markets (Home) and civic watch.
     label: 'Overview',
     items: [
       { href: '/', label: 'Home', icon: LayoutDashboard },
+      // Watching the watchers: who surveils the public, and how to push back.
+      // One entry, not five: its sections (#feed, #accountability, #money,
+      // #protect) were five sidebar doors into one page, which already has
+      // its own tabs for them. The command palette still opens each by name.
+      { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
       { href: '/map', label: 'World Map', icon: Map },
-    ],
-  },
-  {
-    // Watching the watchers: who surveils the public, and how to push back.
-    // Second, under Overview: half of what this platform is for.
-    label: "Who's Watching",
-    civic: true,
-    // Each entry opens one part of the same page (#feed, #accountability...),
-    // so the civic work reads as one place with five doors, not five pages.
-    items: [
-      { href: '/watch', label: 'Surveillance Map', icon: Eye },
-      { href: '/watch#feed', label: 'What\'s Changing', icon: Radio },
-      { href: '/watch#accountability', label: 'Accountability', icon: Scale },
-      { href: '/watch#money', label: 'Follow the Money', icon: Banknote },
-      { href: '/watch#protect', label: 'Protect Yourself', icon: Lock },
     ],
   },
   {
@@ -136,9 +127,9 @@ const NAV_GROUPS: NavGroup[] = [
       // The three surfaces that need a person: the merge queue, the rule
       // feedback loop and the dead-letter backlog. All were served and
       // none was reachable.
-      { href: '/operations', label: 'Operations', icon: Wrench },
+      { href: '/operations', label: 'Operations', icon: Wrench, operator: true },
       // The modal claimed a hash-chained ledger; nothing could open it.
-      { href: '/audit', label: 'Audit Trail', icon: ScrollText },
+      { href: '/audit', label: 'Audit Trail', icon: ScrollText, operator: true },
     ],
   },
 ];
@@ -169,6 +160,12 @@ export function Sidebar() {
   const [ready, setReady] = React.useState(false);
   const { drawerOpen, closeDrawer } = useNav();
   const [hash, setHash] = React.useState('');
+  const { role } = useSession();
+  const isOperator = (role || '').toUpperCase() === 'ADMIN';
+  const groups = NAV_GROUPS.map((g) => ({
+    ...g,
+    items: g.items.filter((i) => !i.operator || isOperator),
+  })).filter((g) => g.items.length > 0);
 
   // Next's router changes the URL with pushState, which fires no hashchange;
   // re-read on every path change as well as on the event.
@@ -228,11 +225,11 @@ export function Sidebar() {
         data-drawer-open={drawerOpen}
       >
         <nav className="flex-1 overflow-y-auto py-3">
-          {NAV_GROUPS.map((group) => (
+          {groups.map((group) => (
             <div key={group.label} className="mb-4 last:mb-0">
               {expanded && (
                 <div
-                  className={`px-4 pb-1.5 text-micro font-medium uppercase tracking-[0.12em] ${group.civic ? 'text-civic' : 'text-ink-mute'}`}
+                  className="px-4 pb-1.5 text-micro font-medium uppercase tracking-[0.12em] text-ink-mute"
                 >
                   {group.label}
                 </div>
@@ -274,7 +271,13 @@ export function Sidebar() {
                           <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-r bg-accent" />
                         )}
                         <Icon
-                          className={`h-4 w-4 shrink-0 ${active ? 'text-accent' : 'text-ink-mute group-hover:text-ink-dim'}`}
+                          className={`h-4 w-4 shrink-0 ${
+                            item.civic
+                              ? 'text-civic'
+                              : active
+                                ? 'text-accent'
+                                : 'text-ink-mute group-hover:text-ink-dim'
+                          }`}
                         />
                         {/* In the drawer the label always shows: a 240px overlay
                           has the room, and an icon-only drawer would be the

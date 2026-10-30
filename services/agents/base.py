@@ -8,7 +8,7 @@ import uuid
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Type
 
 import aiohttp
 from pydantic import BaseModel, Field, field_validator
@@ -44,6 +44,7 @@ from shared.utils.inference_budget import (
     InferenceShed,
 )
 from shared.utils.llm_policy import llm_disabled_for
+from shared.utils import hosted_llm
 
 # Ceiling on detached dispatches. Most finish in milliseconds; only the few
 # the inference budget admits run long, so this is rarely approached. It
@@ -322,6 +323,41 @@ class AgentBulletin(BaseModel):
 # A day: long enough that intraday noise is not what decides the Brier score,
 # short enough that an agent accumulates a record within a week of running.
 BULLETIN_PREDICTION_HORIZON_HOURS = int(os.getenv("AGENT_BULLETIN_HORIZON_HOURS", "24"))
+# Admission weight for an agent whose graded record is worse than a coin flip,
+# and how long its standing is cached (SentinelAgent._budget_weight).
+DEMOTED_BUDGET_WEIGHT = 0.5
+BUDGET_WEIGHT_TTL_SEC = 600
+# Each agent's share of hosted calls an hour, so one agent cannot spend the
+# free quotas every other caller shares (SentinelAgent._hosted_turn). Shares
+# follow importance, measured 29 Oct 2026: the shadow analyst is the trial
+# that decides whether judgments move off the CPU (3 samples x 24 alerts a day,
+# in bursts); the stock correlation agent was 732 of the day's calls with no
+# graded record yet; any other agent gets the default. HOSTED_SHARES overrides
+# ("agent=calls,...").
+HOSTED_CALLS_PER_AGENT_HOUR = int(os.getenv("HOSTED_CALLS_PER_AGENT_HOUR", "4"))
+DEFAULT_HOSTED_SHARES = {"analyst_shadow": 12, "analyst_agent": 12, "stock_correlation_agent": 6}
+# Agents that may use a hosted model's whole quota; the rest leave
+# HOSTED_RESERVE of every limit for them and for the headline scorer, which
+# stopped at 08:32 on 29 Oct when one agent had spent the day's allowance.
+DEFAULT_HOSTED_PRIORITY = ("analyst_shadow", "analyst_agent")
+HOSTED_RESERVE = float(os.getenv("HOSTED_RESERVE", "0.3"))
+
+
+def hosted_share(agent: str) -> int:
+    """An agent's hosted calls an hour: HOSTED_SHARES, then the defaults."""
+    shares = dict(DEFAULT_HOSTED_SHARES)
+    for part in (os.getenv("HOSTED_SHARES") or "").split(","):
+        name, _, n = part.partition("=")
+        if name.strip() and n.strip().isdigit():
+            shares[name.strip()] = int(n)
+    return shares.get(agent, HOSTED_CALLS_PER_AGENT_HOUR)
+
+
+def hosted_priority() -> FrozenSet[str]:
+    """Agents exempt from the reserve: HOSTED_PRIORITY, else the defaults."""
+    raw = os.getenv("HOSTED_PRIORITY")
+    names = raw.split(",") if raw is not None else DEFAULT_HOSTED_PRIORITY
+    return frozenset(n.strip() for n in names if n.strip())
 
 
 # The floor keeps a consistently wrong agent contributing something rather than
@@ -2021,6 +2057,42 @@ class SentinelAgent(PredictionScoringMixin, ABC):
             self.logger.debug(f"Scorecard fetch failed for {key}: {e}")
         return AgentScorecard(agent_name=self.name)
 
+    async def _hosted_turn(self, raw: Any) -> bool:
+        """Counts one hosted call against this agent's hourly share
+        (hosted_share); False once the share is spent."""
+        if raw is None:
+            return True
+        key = f"sentinel:hosted:calls:{self.name}:{time.strftime('%Y%m%d%H', time.gmtime())}"
+        try:
+            n = int(await raw.incr(key))
+            if n == 1:
+                await raw.expire(key, 7200)
+        except Exception as e:
+            swallowed(f"agents.{self.name}.hosted_turn", e, self.logger)
+            return True
+        return n <= hosted_share(self.name)
+
+    async def _budget_weight(self) -> float:
+        """How much this agent's candidates count at inference admission.
+
+        Calls go where they have paid off: a demoted agent -- a proven record
+        worse than a coin flip -- enters the admission percentile at half its
+        message score, so its work is held back first. Earning and unproven
+        agents are unchanged. Read from the scorecard at most every
+        BUDGET_WEIGHT_TTL_SEC, so admission costs no Redis read per call."""
+        now = time.monotonic()
+        cached = getattr(self, "_budget_weight_cache", None)
+        if cached and now - cached[0] < BUDGET_WEIGHT_TTL_SEC:
+            return cached[1]
+        try:
+            from services.agents.prediction_scoring import standing
+            w = DEMOTED_BUDGET_WEIGHT if standing(await self.get_scorecard()) == "demoted" else 1.0
+        except Exception as e:
+            swallowed(f"agents.{self.name}.budget_weight", e, self.logger)
+            w = 1.0
+        self._budget_weight_cache = (now, w)
+        return w
+
     async def get_conditional_scorecard(
         self,
         strategy: Optional[str] = None,
@@ -2630,8 +2702,23 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         # inference that reached no decision -- unlike a shed, it is not retried.
         if llm_disabled_for(getattr(self, "name", "")):
             return None
-        if not await self._inference_budget.try_acquire(
-            score=_message_score(message),
+        _score = _message_score(message)
+        if _score is not None:
+            _score = _score * await self._budget_weight()
+        # The budget meters the local CPU. A call a hosted route can take now
+        # skips the slot but not the importance bar, and only within this
+        # agent's hourly share of hosted calls: on 29 Oct, with neither, the
+        # stock correlation agent made 732 calls and spent every free quota
+        # by mid-morning. Past its share, or when no hosted step has room, a
+        # call is admitted through the local budget as before.
+        _raw = getattr(self.redis, "raw", self.redis)
+        _reserve = 0.0 if self.name in hosted_priority() else HOSTED_RESERVE
+        _hosted = (await hosted_llm.has_capacity(_raw, model or self.model, reserve=_reserve)
+                   and await self._hosted_turn(_raw))
+        if _hosted and not await self._inference_budget.passes_bar(_score, _message_domain(message)):
+            raise InferenceShed(self.name, model or self.model)
+        if not _hosted and not await self._inference_budget.try_acquire(
+            score=_score,
             domain=_message_domain(message),
         ):
             raise InferenceShed(self.name, model or self.model)
@@ -2719,8 +2806,11 @@ class SentinelAgent(PredictionScoringMixin, ABC):
             # In `finally` rather than after the success path because a failed
             # inference held the budget exactly as long as a successful one, and
             # a tier that is erroring is the last one that should also be
-            # blocking every other agent from trying.
-            await self._inference_budget.finish()
+            # blocking every other agent from trying. Only when this call
+            # claimed the slot: a hosted call did not, and shortening the key
+            # would cut another agent's claim short.
+            if not _hosted:
+                await self._inference_budget.finish()
 
         if hasattr(response, "model_dump"):
             output_payload = response.model_dump()

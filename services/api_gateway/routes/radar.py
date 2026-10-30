@@ -48,6 +48,16 @@ MOVERS_WALK_CAP = int(os.getenv('MOVERS_WALK_CAP', '3000'))
 
 router = APIRouter(prefix="/api/v1/radar", tags=["Quantitative Radar"])
 
+# Daily and longer chart bars from the consolidated daily table (get_candles):
+# one row per New York session, weeks from Monday, months from the 1st.
+DAILY_BUCKETS = {"1d": "1 day", "1w": "1 week", "1M": "1 month"}
+_DAILY_SERIES_SQL = """
+    SELECT time_bucket('{bucket}'::interval, day) AS ts, first(open, day) AS open, max(high) AS high,
+           min(low) AS low, last(close, day) AS close, sum(volume) AS volume
+    FROM daily_bars WHERE ticker = $1 AND close > 0
+    GROUP BY 1 ORDER BY 1 DESC LIMIT $2
+"""
+
 @router.get("/anomalies")
 async def get_radar_anomalies(
     limit: int = Query(20, ge=1, le=100),
@@ -998,8 +1008,28 @@ async def get_candles(
         if a not in ticker_candidates:
             ticker_candidates.append(a)
 
+    # 0. Daily and longer from the consolidated daily table first. The Redis
+    #    1d candles are built from a handful of streamed prints over a UTC day
+    #    (pre-market and after-hours included) and the 1d aggregate over the
+    #    same day: measured 29 Oct 2026 against SIP daily bars, their closes
+    #    were off by more than 0.2% on 50% and 45% of stock-days and the Redis
+    #    volume was 0.3% of the real one. Crypto and futures have no daily
+    #    bars and fall through to the paths below.
+    timeframe = normalize_timeframe(timeframe)
+    if db and timeframe in DAILY_BUCKETS:
+        try:
+            rows = await db.query(_DAILY_SERIES_SQL.format(bucket=DAILY_BUCKETS[timeframe]), ticker, limit)
+            candles = [{"ts": r["ts"].isoformat() if hasattr(r["ts"], "isoformat") else str(r["ts"]),
+                        "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+                        "close": float(r["close"]), "volume": float(r["volume"] or 0.0), "ticker": ticker}
+                       for r in rows or []]
+            if candles:
+                source = "timescale:daily_bars"
+        except Exception as e:
+            logger.warning("Daily-bar series failed for %s %s: %s", ticker, timeframe, e)
+
     # 1. Hot path: Query Redis multi-timeframe cache
-    if redis:
+    if redis and not candles:
         try:
             # Both spellings of the same duration are tried. Producers disagreed
             # -- equities wrote "1h"/"4h" and crypto wrote "60m"/"240m" -- so

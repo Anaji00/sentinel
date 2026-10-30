@@ -14,14 +14,16 @@ import asyncio
 import json
 import re
 import logging
+import os
 import time
 import numpy as np
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator
 
-from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError
-from shared.utils.equities import asset_class, split_macro_and_equities
+from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError
+from shared.utils.equities import asset_class, is_macro_asset, is_valid_primary_equity_async, split_macro_and_equities
+from shared.utils import fact_check
 from shared.kafka import Topics
 from shared.utils.focus import prioritise
 from shared.utils.quote_cache import quote_key
@@ -215,11 +217,89 @@ class DynamicCorrelationAssessment(BaseModel):
     impact_severity: str  # "LOW", "MODERATE", "SEVERE"
     sympathy_movers: List[SympathyMover] = Field(default_factory=list)
     recommended_hedging: List[str] = Field(default_factory=list)
+    # The claim that can be graded. Without it the bulletin carried no
+    # direction, so this agent -- the largest local model consumer on 28 Oct,
+    # 23 calls at 224 s -- recorded no forecast and could never earn or lose
+    # its budget. "neutral" is no claim and is not recorded.
+    expected_direction: str = Field(default="neutral",
+                                    description="up, down or neutral: the equity's move against the market next session")
+
+    @field_validator("expected_direction", mode="before")
+    @classmethod
+    def _direction(cls, v: object) -> str:
+        s = str(v or "").strip().lower()
+        return s if s in ("up", "down") else "neutral"
 
     @field_validator("macro_asset", "equity_ticker", mode="before")
     @classmethod
     def _strip_symbols(cls, v):
         return _clean_symbol(v)
+
+
+class DynamicCorrelationBatch(BaseModel):
+    """One assessment per pair in a batched prompt."""
+    assessments: List[DynamicCorrelationAssessment] = Field(default_factory=list)
+
+
+STOCK_CORR_BATCH_SIZE = int(os.getenv("STOCK_CORR_BATCH_SIZE", "6"))
+STOCK_CORR_BATCH_WAIT_SEC = float(os.getenv("STOCK_CORR_BATCH_WAIT_SEC", "30"))
+STOCK_CORR_SYSTEM = ("You are SENTINEL Stock Correlation & Sympathy Engine. Explain the causal economic mechanisms "
+                     "behind real, computed statistical correlations and identify sympathy transmission paths. "
+                     "Return ONLY raw JSON.")
+
+
+# A stock's measured exposures to macro instruments (sector-derived or
+# statistical; method and window say which).
+_EXPOSURE_CYPHER = """
+    MATCH (e) WHERE toUpper(e.name) = $ticker OR toUpper(e.id) = $ticker
+    MATCH (e)-[r:POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|COMMODITY_EXPOSURE]->(m)
+    RETURN coalesce(m.id, m.name) AS macro, type(r) AS rel, r.weight AS weight, r.method AS method,
+           r.window AS window, r.confidence AS confidence
+    LIMIT 25
+"""
+
+
+def macro_exposures(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Exposure rows whose target is a macro instrument, strongest |weight|
+    first; an edge to anything else (a feed name, a ranking) is dropped."""
+    out = []
+    for r in rows:
+        m = str(r.get("macro") or "").strip().upper()
+        if not m or not is_macro_asset(m):
+            continue
+        try:
+            w = float(r.get("weight")) if r.get("weight") is not None else None
+        except (TypeError, ValueError):
+            w = None
+        out.append({**r, "macro": m, "weight": w})
+    return sorted(out, key=lambda e: -abs(e["weight"] or 0.0))
+
+
+def exposure_line(e: Dict[str, Any]) -> str:
+    """One exposure as the prompt states it; nothing unmeasured is filled in."""
+    sign = "positive" if e.get("rel") == "POSITIVE_EXPOSURE_TO" else \
+        "inverse" if e.get("rel") == "INVERSE_EXPOSURE_TO" else "commodity"
+    parts = [f"{sign} exposure to {e['macro']}"]
+    parts.append(f"weight {e['weight']:.3f}" if e.get("weight") is not None else "weight unmeasured")
+    if e.get("method"):
+        parts.append(f"method {e['method']}")
+    if e.get("window"):
+        parts.append(f"window {e['window']}")
+    return ", ".join(parts)
+
+
+def pair_key(macro: str, equity: str) -> str:
+    """The batch key for a macro asset and an equity, case-insensitive."""
+    return f"{str(macro).strip().upper()}|{str(equity).strip().upper()}"
+
+
+def batch_prompt(sections: List[str]) -> str:
+    """Several pairs' own prompts as one, each assessed independently."""
+    parts = [f"PAIR {k + 1}\n{s.strip()}" for k, s in enumerate(sections)]
+    return ("Assess each pair below on its own data only; a finding for one pair says nothing about another.\n\n"
+            + "\n\n".join(parts)
+            + f'\n\nReturn ONLY JSON: {{"assessments": [one assessment per pair, {len(sections)} in all, each with '
+              "macro_asset and equity_ticker exactly as its pair names them]}")
 
 
 class StockCorrelationAgent(SentinelAgent):
@@ -263,6 +343,58 @@ class StockCorrelationAgent(SentinelAgent):
             model=model,
             fallback_model=fallback_model,
         )
+        # One stock/macro pair per call was 794 calls on 29 Oct, 68% of the
+        # day's hosted calls. Pairs arriving together now share one.
+        self._batcher = InferenceBatcher(
+            name="stock_correlation",
+            flush_fn=self._assess_batch,
+            max_items=STOCK_CORR_BATCH_SIZE,
+            max_wait_sec=STOCK_CORR_BATCH_WAIT_SEC,
+            logger=logger,
+            max_waiters=self.dispatch_concurrency,
+        )
+
+    async def _macro_exposures(self, ticker: str) -> List[Dict[str, Any]]:
+        """The stock's measured macro exposures from the graph, strongest first
+        (macro_exposures); [] without a graph or on failure."""
+        if not self.neo4j:
+            return []
+        try:
+            rows = await self.neo4j.query(_EXPOSURE_CYPHER, {"ticker": ticker.upper()})
+        except Exception as e:
+            swallowed("agents.stock_correlation_agent.exposures", e, logger)
+            return []
+        return macro_exposures([dict(r) for r in rows or []])
+
+    async def _assess_batch(self, items: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, DynamicCorrelationAssessment]:
+        """Assesses every queued pair in one inference; {pair_key: assessment}.
+
+        A pair the model does not answer for is absent, and the batcher
+        resolves it to None: no assessment rather than an invented one. One
+        pair alone is asked exactly as before."""
+        if not items:
+            return {}
+        message = items[0][1]["message"]
+        if len(items) == 1:
+            key, item = items[0]
+            got = await self._execute_with_telemetry(
+                message=message, system_prompt=STOCK_CORR_SYSTEM, user_prompt=item["section"],
+                schema=DynamicCorrelationAssessment, temperature=0.2,
+            )
+            return {key: got} if got else {}
+        batch = await self._execute_with_telemetry(
+            message=message, system_prompt=STOCK_CORR_SYSTEM,
+            user_prompt=batch_prompt([item["section"] for _, item in items]),
+            schema=DynamicCorrelationBatch, temperature=0.2,
+            num_predict=min(4096, 160 + 420 * len(items)),
+        )
+        wanted = {k for k, _ in items}
+        out: Dict[str, DynamicCorrelationAssessment] = {}
+        for a in (batch.assessments if batch else []):
+            k = pair_key(a.macro_asset, a.equity_ticker)
+            if k in wanted and k not in out:
+                out[k] = a
+        return out
 
     @property
     def output_topic(self) -> str:
@@ -405,7 +537,24 @@ class StockCorrelationAgent(SentinelAgent):
             except Exception as _exc:
                 swallowed("agents.stock_correlation_agent.focus", _exc, logger)
 
-            target_macro = await _next_macro_asset(self.redis, macro_assets)
+            # The macro asset this stock is measured against, not the next in
+            # a rotation. The rotation paired each stock with whichever macro
+            # symbol had waited longest -- GOOGL against wheat -- and the
+            # "measured relationship" gate below was then satisfied by the
+            # stock's competitor and peer edges, so the model was asked to
+            # explain a macro link nobody had measured (29 Oct 2026 review).
+            exposures = await self._macro_exposures(ticker)
+            exposures = [e for e in exposures if e["macro"] in price_map
+                         or await self.redis.raw.exists(quote_key(e["macro"]))]
+            if not exposures:
+                dropped(
+                    "agents.stock_correlation_agent.no_macro_exposure",
+                    "no measured macro exposure for the stock, so no inference",
+                    logger,
+                    variant="no_macro_exposure",
+                )
+                return None
+            target_macro = exposures[0]["macro"]
             target_equity = ticker
             if target_equity not in price_map:
                 # The scan is bounded, so a quoted equity can sit outside it.
@@ -427,41 +576,12 @@ class StockCorrelationAgent(SentinelAgent):
             cross_context = await self.get_cross_agent_context(ticker=target_equity, limit=2)
             cross_block = f"\n- Cross-Agent Memory:\n{cross_context}" if cross_context else ""
 
-            # ── QUERY REAL EMPIRICAL CORRELATIONS FROM NEO4J GRAPH (§7.2) ──
-            empirical_links = []
-            if self.neo4j:
-                try:
-                    neo_res = await self.neo4j.query("""
-                        MATCH (e) WHERE toUpper(e.name) = $ticker OR toUpper(e.id) = $ticker
-                        MATCH (e)-[r:STATISTICALLY_CORRELATED_WITH|GRANGER_CAUSES|SYMPATHY_MOVER|MEMBER_OF|CUSTOMER_OF|SUPPLIER_TO|COMPETES_WITH]-(p)
-                        RETURN coalesce(p.name, p.id) AS peer_id,
-                               type(r) AS rel,
-                               coalesce(r.coefficient, r.weight) AS coef,
-                               r.p_value AS p_val,
-                               r.lag AS lag,
-                               r.f_stat AS f_stat
-                        LIMIT 10
-                    """, {"ticker": target_equity.upper()})
-                    # No coalesce onto plausible numbers.
-                    #
-                    # A missing coefficient defaulted to 1.0 and a missing
-                    # p-value to 0.05, so an edge that had never been measured
-                    # reached the model as "Coef: 1.0, p-val: 0.05" -- a perfect
-                    # correlation, significant at the five percent level, both
-                    # invented by the query that fetched it.
-                    for nr in (neo_res or []):
-                        parts = [f"Relationship: {nr['rel']}"]
-                        coef = nr.get("coef") if hasattr(nr, "get") else nr["coef"]
-                        parts.append(f"Coef: {float(coef):.3f}" if coef is not None else "Coef: unmeasured")
-                        p_val = nr.get("p_val") if hasattr(nr, "get") else nr["p_val"]
-                        if p_val is not None:
-                            parts.append(f"p-val: {float(p_val):.4f}")
-                        lag = nr.get("lag") if hasattr(nr, "get") else nr["lag"]
-                        if lag is not None:
-                            parts.append(f"lag: {lag}")
-                        empirical_links.append(f"{nr['peer_id']} [{', '.join(parts)}]")
-                except Exception as ne:
-                    logger.debug(f"Neo4j empirical correlation lookup bypass: {ne}")
+            # ── THE MEASURED MACRO EXPOSURE, AND ONLY THAT (§7.2) ──
+            #
+            # Stock-to-stock edges (competitors, peers, Granger leads) are not
+            # evidence about a macro relationship, and this agent's scope is
+            # macro; peer structure is the quant engine's and the graph's.
+            empirical_links = [exposure_line(e) for e in exposures if e["macro"] == target_macro]
 
             # No measured relationship, no inference. The prompt for this case
             # told the model to say that no correlation was measured, and every
@@ -525,20 +645,41 @@ class StockCorrelationAgent(SentinelAgent):
 
             Task Requirements:
             1. {mechanism_task}
-            2. For each SYMPATHY MOVER, explain the business causality and structural transmission link (supply chain dependence, shared customer base, sector multiple contagion, or competitor displacement). If no such link exists, omit the mover entirely -- do not name a mechanism from that list to satisfy the format. Returning an empty sympathy_movers list is the correct answer when there is no structural relationship.
-            3. {grounding_task}
+            2. {grounding_task}
+            3. Return an empty sympathy_movers list: this assessment is about the macro relationship only.
             """
 
-            brief: Optional[DynamicCorrelationAssessment] = await self._execute_with_telemetry(
-                message=message,
-                system_prompt="You are SENTINEL Stock Correlation & Sympathy Engine. Explain the causal economic mechanisms behind real, computed statistical correlations and identify sympathy transmission paths. Return ONLY raw JSON.",
-                user_prompt=user_prompt,
-                schema=DynamicCorrelationAssessment,
-                temperature=0.2,
+            # Batched: several pairs share one inference (_assess_batch). Each
+            # pair keeps its own prompt section, which is also what its answer
+            # is fact-checked against below.
+            brief: Optional[DynamicCorrelationAssessment] = await self._batcher.submit(
+                pair_key(target_macro, target_equity),
+                {"message": message, "section": user_prompt},
             )
 
             if not brief:
                 return None
+            # Macro only: stock-to-stock sympathy is out of scope, and each
+            # mover became a SYMPATHY_MOVER graph edge (842 on 29 Oct) that the
+            # graph then served back as structure.
+            brief.sympathy_movers = []
+            # Checked against what it was given (shared/utils/fact_check.py):
+            # sympathy movers the prompt never named and that are not listed
+            # equities are dropped; when most numbers in the rationale are not
+            # in the prompt, the direction is withheld, so an unsupported
+            # story is never recorded as a forecast.
+            movers = [sm.ticker for sm in brief.sympathy_movers]
+            listed = {t for t in movers if await is_valid_primary_equity_async(t, redis_client=self.redis)}
+            fc = fact_check.check(f"{brief.agentic_rationale} {brief.transmission_channel}",
+                                  user_prompt, movers, known=listed)
+            if fc.unknown_tickers:
+                brief.sympathy_movers = [sm for sm in brief.sympathy_movers if sm.ticker not in fc.unknown_tickers]
+                dropped("agents.stock_correlation_agent.unknown_mover", "sympathy mover neither in the data nor listed",
+                        logger, detail=", ".join(fc.unknown_tickers)[:200])
+            if not fc.numbers_ok and brief.expected_direction != "neutral":
+                brief.expected_direction = "neutral"
+                dropped("agents.stock_correlation_agent.unsupported_numbers",
+                        "rationale's numbers not in the data; direction withheld", logger, detail=fc.summary())
 
             logger.info(
                 f"🧠 Stock Correlation Agent Reasoning | {brief.macro_asset} vs {brief.equity_ticker} | "
@@ -692,6 +833,7 @@ class StockCorrelationAgent(SentinelAgent):
                 primary_entity_id=brief.equity_ticker,
                 ticker=brief.equity_ticker,
                 conviction=brief.conviction,
+                expected_direction=brief.expected_direction,
                 summary=f"Dynamic Correlation Discovery ({brief.macro_asset} / {brief.equity_ticker}): {brief.agentic_rationale}.{sympathy_summary}",
                 payload=payload,
                 ttl_seconds=3600,

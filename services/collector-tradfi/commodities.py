@@ -8,6 +8,9 @@ API -- into commodity_prices. Then each linked stock's exposure to them
 (shared/utils/commodity_links.py), the signed 21- and 63-session move of what
 it makes or buys, into stock_features_daily for the model's trials.
 
+Also the Caldara-Iacoviello geopolitical risk index, daily and by country
+(shared/utils/gpr.py), into macro_indices, with its latest reading in Redis.
+
 Free and keyless, one request a second. The memory and GPU series have no free
 history; theirs starts the first evening this runs.
 """
@@ -26,6 +29,7 @@ import aiohttp
 
 from shared.db import get_redis, get_timescale
 from shared.utils import commodity_links as cl
+from shared.utils import gpr
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("collector.tradfi.commodities")
@@ -51,6 +55,11 @@ _UPSERT_FEATURE = """
     INSERT INTO stock_features_daily (ticker, day, feature, value, source) VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (ticker, day, feature) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source
 """
+_UPSERT_INDEX = """
+    INSERT INTO macro_indices (series, day, value, source) VALUES ($1, $2, $3, $4)
+    ON CONFLICT (series, day) DO UPDATE SET value = EXCLUDED.value
+"""
+_GPR_SQL = "SELECT day, value FROM macro_indices WHERE series = 'gpr_daily' ORDER BY day"
 _SESSIONS_SQL = "SELECT day FROM daily_bars WHERE ticker = 'SPY' AND day >= $1::date ORDER BY day"
 _LAST_UPDATE = re.compile(r"Last Update:\s*([A-Z][a-z]{2})\.?\s*(\d{1,2})\s+(\d{4})")
 
@@ -137,6 +146,35 @@ async def _gpus(session: aiohttp.ClientSession, db: Any, today: date) -> int:
         return 0
 
 
+async def _gpr(session: aiohttp.ClientSession, db: Any, raw: Any) -> int:
+    """The geopolitical risk index, daily and monthly (whole files: they are
+    small and revised), and its latest reading for the agents."""
+    import io
+
+    import pandas as pd
+
+    written = 0
+    for url, parse in ((gpr.DAILY_URL, gpr.daily_rows), (gpr.MONTHLY_URL, gpr.monthly_rows)):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    continue
+                body = await resp.read()
+            frame = await asyncio.to_thread(pd.read_stata, io.BytesIO(body))
+            rows = parse(frame.to_dict("records"))
+            for k in range(0, len(rows), 5000):
+                await db.execute_many(_UPSERT_INDEX, rows[k:k + 5000])
+            written += len(rows)
+        except Exception as e:
+            swallowed("collector.tradfi.commodities.gpr", e, logger, detail=url)
+        await asyncio.sleep(REQUEST_GAP_SEC)
+    hist = await db.query(_GPR_SQL) or []
+    s = gpr.summary([r["day"] for r in hist], [float(r["value"]) for r in hist])
+    if s and raw is not None:
+        await raw.set(gpr.LATEST_KEY, json.dumps(s))
+    return written
+
+
 async def write_features(db: Any, since: date) -> int:
     """Each linked stock's exposure on every session from `since`."""
     closes: Dict[str, List[Tuple[date, float]]] = {}
@@ -160,10 +198,10 @@ async def write_features(db: Any, since: date) -> int:
     return len(rows)
 
 
-async def run_once(session: aiohttp.ClientSession, today: date, backfill: bool) -> Dict[str, int]:
+async def run_once(session: aiohttp.ClientSession, today: date, backfill: bool, raw: Any = None) -> Dict[str, int]:
     db = await get_timescale()
     out = {"futures": await _futures(session, db, today), "memory": await _memory(session, db, today),
-           "gpu": await _gpus(session, db, today)}
+           "gpu": await _gpus(session, db, today), "gpr": await _gpr(session, db, raw)}
     out["features"] = await write_features(db, HISTORY_START if backfill else today - timedelta(days=14))
     return out
 
@@ -181,7 +219,7 @@ async def run_forever() -> None:
                 last = await raw.get(DONE_KEY)
                 last_s = last.decode() if isinstance(last, bytes) else last
                 if now.weekday() < 5 and now.hour >= RUN_AFTER_NY_HOUR and last_s != today.isoformat():
-                    out = await run_once(session, today, backfill=last_s is None)
+                    out = await run_once(session, today, backfill=last_s is None, raw=raw)
                     await raw.set(DONE_KEY, today.isoformat())
                     logger.info("Commodities for %s: %s", today, json.dumps(out))
             except Exception as e:

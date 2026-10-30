@@ -22,6 +22,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+# The latest snapshot per indicator, written by the macro collector and read by
+# the analyst as context: one spelling, imported by both.
+KALSHI_CONSENSUS_KEY = "sentinel:macro:kalshi_consensus"
 MAX_SPREAD = 0.15               # a wider bid-ask is not a price
 MIN_STRIKES = 3
 
@@ -103,4 +106,4 @@ def consensus(markets: Sequence[Mapping[str, Any]], indicator: str, now: datetim
             "median": round(median * SERIES[indicator][1], 4), "strikes": len(points)}
 
 
-__all__ = ["MAX_SPREAD", "SERIES", "consensus", "implied_median", "nearest_event", "strike_probabilities"]
+__all__ = ["KALSHI_CONSENSUS_KEY", "MAX_SPREAD", "SERIES", "consensus", "implied_median", "nearest_event", "strike_probabilities"]

@@ -115,10 +115,13 @@ def test_predictions_are_still_only_made_by_directional_agents():
     # scoring mixin was extracted. The call is gated on
     # `is_scoreable_direction(expected_direction)`, so it fires only for a
     # directional bulletin, which is the property this test is about.
+    # analyst_agent.py from 28 Oct 2026: a stock forecast against the S&P 500,
+    # graded on prices, recorded only with a direction ("up" or "down").
     assert callers == {
         "adversarial_wargamer.py",
         "quant_trading_engine.py",
         "base.py",
+        "analyst_agent.py",
     }
 
 

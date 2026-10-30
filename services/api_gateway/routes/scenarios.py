@@ -35,6 +35,8 @@ from shared.broker.alpaca import AlpacaBroker
 from shared.utils.serialization import to_dto
 from shared.utils.audit_ledger import AuditLedger, AuditLedgerUnavailable
 from shared.utils.feature_flags import FeatureFlagManager
+from shared.utils import scenario_requests as sr
+from shared.utils.scenario_requests import ScenarioRequest
 
 # Client-facing shape of a correlation record. Keeps the response contract
 # independent of the `correlations` table layout.
@@ -83,7 +85,46 @@ async def get_active_scenarios(
     except Exception as e:
         logger.error(f"Error fetching scenarios: {e}")
         raise HTTPException(status_code=500, detail="Database query failed")
-    
+
+
+@router.post("/scenarios/request", status_code=202, dependencies=[Depends(require_pro("scenarios"))])
+async def request_scenario(body: ScenarioRequest, request: Request, redis = Depends(get_redis_client)) -> Dict[str, Any]:
+    """Queue a scenario on a development a person names ("a ceasefire in
+    Ukraine"), with optional tickers to tie it to. The reasoning service writes
+    the hypotheses -- outcomes, likelihoods, what would confirm or deny each --
+    and the result is read back from GET /scenarios/request/{request_id}."""
+    raw = getattr(redis, "raw", redis)
+    if int(await raw.llen(sr.REQUESTS_KEY) or 0) >= sr.MAX_PENDING:
+        raise HTTPException(status_code=429, detail="Too many scenario requests pending; try again shortly.")
+    rec = sr.queued(body, str(getattr(request.state, "identity", "anonymous")))
+    await raw.set(sr.RESULT_KEY.format(request_id=rec["request_id"]), json.dumps({"status": "queued", **rec}),
+                  ex=sr.RESULT_TTL_SEC)
+    await raw.lpush(sr.REQUESTS_KEY, json.dumps(rec))
+    return {"request_id": rec["request_id"], "status": "queued"}
+
+
+@router.get("/scenarios/request/{request_id}", dependencies=[Depends(require_pro("scenarios"))])
+async def scenario_request_status(request_id: str, redis = Depends(get_redis_client)) -> Dict[str, Any]:
+    """queued, running, done (with scenario_id and headline) or failed."""
+    raw = getattr(redis, "raw", redis)
+    blob = await raw.get(sr.RESULT_KEY.format(request_id=request_id))
+    if not blob:
+        raise HTTPException(status_code=404, detail="No such scenario request.")
+    return json.loads(blob)
+
+
+@router.get("/case/{ticker}")
+async def get_case_file(ticker: str, redis = Depends(get_redis_client)) -> Dict[str, Any]:
+    """The stock's case file: the facts agents share, each with an id, a kind,
+    a source and when it was true (shared/utils/case_file.py)."""
+    from shared.utils.case_file import CASE_KEY
+    raw = getattr(redis, "raw", redis)
+    blob = await raw.get(CASE_KEY.format(ticker=ticker.strip().upper()))
+    if not blob:
+        raise HTTPException(status_code=404, detail="No case file for this ticker (built for the book, alerts and strong headline reads).")
+    return json.loads(blob)
+
+
 @router.get("/correlations")
 async def get_correlations(
     limit: int = Query(50, le=500),

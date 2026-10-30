@@ -83,3 +83,21 @@ def test_the_engine_falls_back_to_this_default():
     no stored card, which is every agent right now."""
     engine = (ROOT / "services/agents/consensus_engine.py").read_text(encoding="utf-8")
     assert "AgentScorecard(agent_name=agent_name)).consensus_weight" in engine
+
+
+def test_an_agent_worse_than_a_coin_flip_counts_for_nothing():
+    """1 - Brier gave a worse-than-chance agent (Brier 0.30) a weight of 0.70."""
+    from services.agents.prediction_scoring import (
+        CALIBRATION_MIN_RESOLVED, AgentScorecard, fold_outcome, standing,
+    )
+    assert consensus_weight_for(0.30, resolved=CALIBRATION_MIN_RESOLVED) == 0.0
+    assert consensus_weight_for(0.15, resolved=CALIBRATION_MIN_RESOLVED) == 0.4       # skill 1 - 0.15/0.25
+    assert consensus_weight_for(0.30, resolved=5) == 0.7                               # unproven: unchanged
+    card = AgentScorecard(agent_name="x")
+    for k in range(CALIBRATION_MIN_RESOLVED):
+        card = fold_outcome(card, prediction_correct=(k % 3 == 0), conviction=0.8)      # confident and mostly wrong
+    assert standing(card) == "demoted" and card.standing == "demoted" and card.consensus_weight == 0.0
+    good = AgentScorecard(agent_name="y")
+    for k in range(CALIBRATION_MIN_RESOLVED):
+        good = fold_outcome(good, prediction_correct=(k % 5 != 0), conviction=0.75)
+    assert good.standing == "earning" and good.consensus_weight > 0

@@ -483,6 +483,11 @@ class InferenceBudget:
         # admits everything; the local deque is the honest fallback.
         return out or list(self._recent_scores)
 
+    async def passes_bar(self, score: Optional[float], domain: Optional[str] = None) -> bool:
+        """The importance bar alone, without claiming the local slot: for work a
+        hosted model will run, which needs ranking but not the CPU."""
+        return await self._passes_admission_bar(score, domain)
+
     async def _passes_admission_bar(
         self, score: Optional[float], domain: Optional[str] = None
     ) -> bool:

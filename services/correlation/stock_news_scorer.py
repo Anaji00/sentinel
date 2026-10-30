@@ -5,7 +5,7 @@ FinBERT tone for every stock_news headline (shared/utils/stock_news.py),
 newest first so live news is scored within minutes, then the history.
 
 A strongly toned article about one or two stocks becomes an event: live ones
-(published in the last LIVE_DAYS) go into `events`, where the signal engine
+(no older than LIVE_EVENT_MAX_AGE_HOURS when scored) go into `events`, where the signal engine
 reads them and archives them; older ones go straight into the study's
 archive. Same threshold either way, so the study measures what fires live.
 
@@ -38,6 +38,11 @@ MODEL = "ProsusAI/finbert"
 THREADS = 3
 BATCH = 64
 LIVE_DAYS = 3
+# An article older than this when scored is archived, not raised as a live
+# event. After the 28 Oct outage, 483 one-to-two-day-old articles entered the
+# live stream in one hour (median age 21 h) and were correlated as fresh; in
+# steady state an article is scored within minutes.
+LIVE_EVENT_MAX_AGE_HOURS = 6
 IDLE_SEC = 60
 _UNSCORED_SQL = f"""
     SELECT id, created_at, symbols, headline FROM {sn.NEWS_TABLE}
@@ -106,6 +111,7 @@ class StockNewsScorer:
         scores = await asyncio.to_thread(self.score, [str(r["headline"]) for r in rows])
         await db.execute_many(_SCORE_SQL, [(int(r["id"]), *sc) for r, sc in zip(rows, scores)])
         live_cut = datetime.now(timezone.utc) - timedelta(days=LIVE_DAYS)
+        event_cut = datetime.now(timezone.utc) - timedelta(hours=LIVE_EVENT_MAX_AGE_HOURS)
         live, history = [], []
         for r, (pos, neg, _neu) in zip(rows, scores):
             ev = sn.event_row(r, pos, neg)
@@ -116,7 +122,7 @@ class StockNewsScorer:
                 at = datetime.fromisoformat(at.replace("Z", "+00:00"))
             fd = {"ticker": ev["symbols"][0], "symbols": ev["symbols"], "tone": ev["tone"], "news_id": int(r["id"])}
             eid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"alpaca-news:{r['id']}"))
-            if at >= live_cut:
+            if at >= event_cut:
                 live.append((eid, sn.EVENT_SOURCE, at, datetime.now(timezone.utc), str(r["headline"]), ev["tags"],
                              ev["tone"], ev["symbols"][0], fd, min(1.0, abs(ev["tone"]))))
             else:

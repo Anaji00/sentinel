@@ -176,14 +176,32 @@ class AgentPrediction(BaseModel):
     outcome_correct: Optional[bool] = None
 
 
-def consensus_weight_for(brier_score: float) -> float:
+# A coin flip's Brier score on a yes/no call: the bar an agent's record must beat.
+COIN_FLIP_BRIER = 0.25
+
+
+def consensus_weight_for(brier_score: float, resolved: Optional[int] = None) -> float:
     """How much an agent's opinion counts, given its calibration.
 
     One function so the stored default and the value written at calibration
     time cannot drift apart, which is exactly what had happened: the default
     said 1.0 and this formula says 0.5 for the same Brier score.
+
+    Once an agent has CALIBRATION_MIN_RESOLVED resolved calls its weight is its
+    Brier skill against a coin flip, 1 - Brier / 0.25, floored at zero (28 Oct
+    2026). As 1 - Brier, an agent worse than chance (Brier 0.30) still counted
+    0.70 in the consensus; now it counts nothing until its record recovers.
     """
+    if resolved is not None and resolved >= CALIBRATION_MIN_RESOLVED:
+        return round(max(0.0, min(1.0, 1.0 - float(brier_score) / COIN_FLIP_BRIER)), 4)
     return max(MIN_CONSENSUS_WEIGHT, 1.0 - float(brier_score))
+
+
+def standing(card: "AgentScorecard") -> str:
+    """earning (better than a coin flip on a proven record), demoted (worse), or unproven."""
+    if card.predictions_made < CALIBRATION_MIN_RESOLVED:
+        return "unproven"
+    return "earning" if card.brier_score < COIN_FLIP_BRIER else "demoted"
 
 
 # Resolved predictions before an agent's record caps what it may claim.
@@ -235,6 +253,8 @@ class AgentScorecard(BaseModel):
     # theoretical exposure: there are no scorecards in Redis at all, so every
     # agent in the swarm is currently weighted through this default.
     consensus_weight: float = consensus_weight_for(UNPROVEN_BRIER)
+    # earning | unproven | demoted (standing()); a demoted agent's weight is zero.
+    standing: str = "unproven"
     last_calibrated_at: Optional[str] = None
 
 
@@ -288,7 +308,8 @@ def fold_outcome(card: "AgentScorecard", prediction_correct: bool, conviction: f
     outcome = 1.0 if prediction_correct else 0.0
     total = card.predictions_made
     card.brier_score = (card.brier_score * (total - 1) + (conviction - outcome) ** 2) / total
-    card.consensus_weight = consensus_weight_for(card.brier_score)
+    card.consensus_weight = consensus_weight_for(card.brier_score, total)
+    card.standing = standing(card)
     card.last_calibrated_at = datetime.now(timezone.utc).isoformat()
     return card
 

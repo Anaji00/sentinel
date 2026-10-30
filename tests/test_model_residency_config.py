@@ -50,6 +50,16 @@ def test_ollama_restarts_like_everything_that_depends_on_it(compose):
 def test_one_model_slot_because_two_runners_do_not_fit_six_cores(compose):
     slots = int(_env(compose["services"]["ollama"])["OLLAMA_MAX_LOADED_MODELS"])
     cpus = float(compose["services"]["ollama"]["deploy"]["resources"]["limits"]["cpus"])
+    # Two resident runners fit only when OLLAMA_MODEL_THREADS gives each a share
+    # of the quota rather than all of it (28 Oct 2026: 7B judgments, 3B extraction).
+    from shared.utils.ollama import model_threads
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    raw = next((ln.partition("=")[2] for ln in example.splitlines() if ln.startswith("OLLAMA_MODEL_THREADS=")), "")
+    split = model_threads(raw)
+    if slots == 2 and len(split) == 2:
+        assert sum(split.values()) <= cpus, f"thread split {split} oversubscribes a {cpus}-core quota"
+        return
     assert slots == 1, (
         f"{slots} model slots against a {cpus}-core quota. Each resident model is "
         "a runner started with NumThreads matching the quota, so two of them "

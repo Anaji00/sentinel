@@ -87,3 +87,74 @@ def test_a_seeded_hour_with_no_events_is_a_measured_zero():
     engine.seed_history({"taiwan strait": {hour - 1: 12}}, start_hour=hour - 12, now=now)
     # Eleven quiet hours and one of twelve: mean 1, sd ~3.32, bar ~10.95.
     assert 10.9 < engine.storm_threshold("taiwan strait", now) < 11.0
+
+
+def _evt(i, etype, entity, score, region=None, source="x"):
+    from datetime import datetime, timezone
+    from shared.models import Entity, EntityType, NormalizedEvent
+
+    return NormalizedEvent(
+        event_id=f"e{entity}{i}", trace_id=f"t{entity}{i}", type=etype, occurred_at=datetime.now(timezone.utc),
+        source=source, primary_entity=Entity(id=entity, name=entity, type=EntityType.COMPANY),
+        headline=f"{entity} event {i}", anomaly_score=score, region=region)
+
+
+def test_a_stocks_own_news_and_trading_is_not_geopolitical():
+    """93% of 'geopolitical cascades' were a headline meeting the same stock's trading."""
+    from services.correlation.cascade import _classify_cluster
+
+    assert _classify_cluster({"news", "tradfi"}, {"headline", "equity_block"}, True)[1] == "Company News & Trading"
+    assert _classify_cluster({"news", "maritime"}, {"headline", "vessel_dark"}, True)[1] == "Geopolitical Cascade"
+    assert _classify_cluster({"macro", "maritime"}, {"supply_chain_metric", "vessel_position"}, True)[1] == \
+        "Geopolitical Cascade"
+    assert _classify_cluster({"tradfi", "crypto"}, {"equity_block", "crypto_trade"}, True)[1] == "Cross-Asset Cascade"
+
+
+def test_two_domains_alone_no_longer_clear_the_bar():
+    from shared.models import EventType
+
+    engine = GeopoliticalCascadeEngine(window_seconds=3600, cooldown_seconds=0)
+    assert engine.ingest_event(_evt(1, EventType.HEADLINE, "TAIWAN", 0.2, region="TAIWAN")) is None
+    # Index 50 from the domain count, but the scores average 0.25: no cluster.
+    assert engine.ingest_event(_evt(2, EventType.FLIGHT_DARK, "TAIWAN", 0.3, region="TAIWAN")) is None
+
+
+def test_a_megacaps_hourly_news_needs_to_be_unusual_for_it():
+    """A name with headlines every hour fires only when busier than its own normal."""
+    from shared.models import EventType
+
+    engine = GeopoliticalCascadeEngine(window_seconds=3600, cooldown_seconds=0, storm_baseline_hours=12)
+    now_hour = int(__import__("time").time() // 3600)
+    engine.seed_history({"nvda": {h: 6 for h in range(now_hour - 12, now_hour)}}, now_hour - 12,
+                        __import__("time").time())
+    got = [engine.ingest_event(_evt(i, t, "NVDA", 0.6)) for i, t in
+           enumerate([EventType.HEADLINE, EventType.EQUITY_BLOCK, EventType.HEADLINE])]
+    assert got == [None, None, None]                     # 3 events against a normal of ~6 an hour
+
+
+def test_company_news_cannot_page_anyone():
+    from services.correlation import cascade
+    from shared.models import AlertTier, EventType
+
+    engine = GeopoliticalCascadeEngine(window_seconds=3600, cooldown_seconds=0, storm_baseline_hours=0)
+    engine.ingest_event(_evt(1, EventType.HEADLINE, "XYZ", 0.95))
+    c = engine.ingest_event(_evt(2, EventType.EQUITY_BLOCK, "XYZ", 0.95))
+    assert c is not None and c.rule_name.startswith("Company News & Trading")
+    assert c.alert_tier == AlertTier.ELEVATED and c.primary_domain == "tradfi"
+    assert cascade.CASCADE_MIN_AVG_SCORE == 0.45
+
+
+def test_a_rule_must_beat_a_headline_to_stay():
+    from shared.utils import producer_grades as pg
+
+    base = [1.2, 1.3, 1.25, 1.1, 1.35, 1.2, 1.3, 1.15, 1.25, 1.2] * 6          # news days move ~1.23x usual
+    news_echo = [("Echo", x) for x in [1.2, 1.3, 1.25, 1.2, 1.25] * 12]       # the same as a headline
+    real = [("Real", x) for x in [1.9, 2.1, 1.8, 2.0, 2.2] * 12]              # well beyond a headline
+    rows = {r["group"]: r for r in pg.lift_table(news_echo + real, base)}
+    assert rows["Echo"]["verdict"] == "no better than a headline"
+    assert rows["Real"]["verdict"] == "beats a headline" and rows["Real"]["lift"] > 1.5
+    grades = {"correlation_families_1d": [{"group": "Echo", "n": 60, "verdict": "moves more"},
+                                          {"group": "Real", "n": 60, "verdict": "moves more"}],
+              "family_lift_1d": list(rows.values())}
+    retired = pg.uninformative_rules(grades)
+    assert "Echo" in retired and "Real" not in retired

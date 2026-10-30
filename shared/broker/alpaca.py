@@ -5,6 +5,7 @@ Alpaca Markets Brokerage Adapter (Paper & Live API v2).
 """
 
 import os
+import re
 import aiohttp
 import logging
 from typing import Dict, List, Optional, Any
@@ -21,6 +22,10 @@ from shared.broker.base import (
 )
 
 logger = logging.getLogger("broker.alpaca")
+
+
+DATA_URL = "https://data.alpaca.markets"     # market data; the same keys, paper or live
+_SYMBOL = re.compile(r"^[A-Z][A-Z.]{0,6}$")
 
 
 class AlpacaBroker(BrokerInterface):
@@ -115,6 +120,37 @@ class AlpacaBroker(BrokerInterface):
                     return positions
                 else:
                     return []
+
+    async def latest_prices(self, symbols: List[str], feed: str = "iex") -> Dict[str, float]:
+        """The latest trade per symbol from the market-data API ({} on failure).
+
+        IEX by default: the free plan serves it in real time, and SIP only once
+        it is 15 minutes old. A reference for a limit price, not a mark."""
+        if not self.api_key or not self.secret_key or not symbols:
+            return {}
+        out: Dict[str, float] = {}
+        syms = sorted({s.upper() for s in symbols if _SYMBOL.match(s.upper())})
+
+        async def fetch(session: aiohttp.ClientSession, batch: List[str]) -> bool:
+            params = {"symbols": ",".join(batch), "feed": feed}
+            async with session.get(f"{DATA_URL}/v2/stocks/trades/latest", params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return False
+                for s, t in ((await resp.json()).get("trades") or {}).items():
+                    p = float((t or {}).get("p") or 0.0)
+                    if p > 0:
+                        out[s.upper()] = p
+                return True
+
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            for k in range(0, len(syms), 100):
+                batch = syms[k:k + 100]
+                # One symbol the venue rejects fails its whole batch, so a
+                # rejected batch is retried a symbol at a time.
+                if not await fetch(session, batch) and len(batch) > 1:
+                    for s in batch:
+                        await fetch(session, [s])
+        return out
 
     async def get_position(self, symbol: str) -> Optional[Position]:
         positions = await self.get_positions()

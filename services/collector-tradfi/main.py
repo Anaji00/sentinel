@@ -756,6 +756,28 @@ def seconds_to_next_minute(now: datetime) -> float:
     return 60.0 - (now.second + now.microsecond / 1e6)
 
 
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def candle_bucket_start(now: datetime, minutes: int, tf: str) -> datetime:
+    """The start of the candle `now` falls in, on the New York clock.
+
+    Days and weeks were cut at midnight UTC -- 8 pm in New York -- so a daily
+    candle ran from the previous evening and its date was not the session's;
+    4-hour buckets split the session at UTC hours. Returned as the New York
+    wall-clock start expressed in UTC: a daily candle is stamped with its
+    session's date at New York midnight, a week from Monday."""
+    ny = now.astimezone(NY_TZ)
+    if tf == "1w":
+        start = ny.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=ny.weekday())
+    elif tf == "1d":
+        start = ny.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        floored = ((ny.hour * 60 + ny.minute) // minutes) * minutes
+        start = ny.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
+    return start.astimezone(timezone.utc)
+
+
 class OHLCVAggregator:
     """Builds true Open, High, Low, Close, Volume candles and stores them in Redis and Kafka."""
 
@@ -771,9 +793,11 @@ class OHLCVAggregator:
 
     local latest = redis.call("LRANGE", key, 0, 0)
     if #latest == 0 then
-        -- No previous candle, push new
+        -- No previous candle, push new, with the same expiry as below: the
+        -- first candle of a list was written without one.
         local new_candle = '{"ts":"' .. ts .. '","o":' .. open .. ',"h":' .. high .. ',"l":' .. low .. ',"c":' .. close .. ',"v":' .. volume .. '}'
         redis.call("LPUSH", key, new_candle)
+        redis.call("EXPIRE", key, 604800)
     else
         local c = cjson.decode(latest[1])
         if c.ts == ts then
@@ -941,20 +965,13 @@ class OHLCVAggregator:
                         
                         # Aggregate higher timeframes atomically via Lua script
                         for tf, cfg in self.TIMEFRAMES.items():
-                            minutes = cfg["minutes"]
-                            # Calculate floored interval timestamp
-                            if tf == "1w":
-                                # Align to Monday start of week
-                                days_since_monday = now.weekday()
-                                interval_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
-                            elif tf == "1d":
-                                interval_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                            else:
-                                total_minutes = now.hour * 60 + now.minute
-                                floored_minutes = (total_minutes // minutes) * minutes
-                                interval_dt = now.replace(hour=floored_minutes // 60, minute=floored_minutes % 60, second=0, microsecond=0)
-                            
-                            interval_ts = interval_dt.isoformat()
+                            # Daily and weekly candles are the regular session's:
+                            # a pre-market or after-hours print set their open,
+                            # high and low (measured 29 Oct: 78% of Redis 1d opens
+                            # off the official one by more than 0.2%).
+                            if tf in ("1d", "1w") and session_name != "REGULAR":
+                                continue
+                            interval_ts = candle_bucket_start(now, cfg["minutes"], tf).isoformat()
                             # Canonical helper, not a hand-built key. Building
                             # it inline here is what let this producer's
                             # vocabulary drift from the crypto producer's.
@@ -2852,6 +2869,7 @@ async def _signal_backfill_loop(redis_client) -> None:
 # so each upsert overwrites the provisional live row rather than adding one.
 SETTLE_INTERVAL_SEC = int(os.getenv("SETTLE_MINUTE_BARS_SEC", str(30 * 60)))
 SETTLE_SESSIONS = {"PRE_MARKET", "REGULAR", "AFTER_HOURS"}
+_PROVISIONAL_SQL = "SELECT DISTINCT ticker FROM tradfi_bars WHERE time >= $1 AND source IS DISTINCT FROM 'alpaca_sip'"
 
 
 async def _settle_minute_bars_loop(redis_client) -> None:
@@ -2875,8 +2893,13 @@ async def _settle_minute_bars_loop(redis_client) -> None:
             # what the free plan serves.
             start = (settled_to - timedelta(minutes=10)) if settled_to else \
                 now_ts.replace(hour=8, minute=0, second=0, microsecond=0)
+            db = await get_timescale()
+            # And every name that has provisional minutes in the window, so a
+            # stock streamed only through Finnhub is settled too: on 28 Oct, 118
+            # stocks had live-feed minutes and no consolidated bar at all.
+            provisional = {str(r["ticker"]).upper() for r in await db.query(_PROVISIONAL_SQL, start) or []}
+            names = sorted(set(names) | {t for t in provisional if _clean_equity(t)})
             if names:
-                db = await get_timescale()
                 report = await backfill_bars(db, names, timeframe="1Min", start=start, end=now_ts)
                 settled_to = now_ts - timedelta(minutes=SEAM_GUARD_MINUTES)
                 await refresh_rollups(db, start, views=("tradfi_bars_5m", "tradfi_bars_15m", "tradfi_bars_30m",

@@ -47,6 +47,10 @@ AGENT_FILES = {
     "adversarial_wargamer": "adversarial_wargamer",
     "edge_validator": "edge_validator",
     "stock_correlation_agent": "stock_correlation_agent",
+    "analyst_agent": "analyst_agent",
+    # The analyst on a hosted model, graded under its own name; built only when
+    # ANALYST_SHADOW_MODEL is set (main.py).
+    "analyst_shadow": "analyst_agent",
 }
 
 
@@ -125,7 +129,9 @@ def test_self_consumption_does_not_grow():
 
 # Total fan-out across the tier. Every subscription is a deserialisation cost
 # on a topic, paid per agent; RAW_NEWS and CORRELATIONS reached all ten.
-MAX_TOTAL_SUBSCRIPTIONS = 62
+# 63 from 28 Oct 2026: the analyst reads CORRELATIONS only, and it publishes nothing.
+# 64 from 29 Oct 2026: its hosted shadow, the same one subscription, when configured.
+MAX_TOTAL_SUBSCRIPTIONS = 64
 
 
 def test_total_fan_out_does_not_grow():

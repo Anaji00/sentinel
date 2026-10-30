@@ -46,6 +46,8 @@ from typing import Optional, List, Dict, Any, Literal
 import aiohttp
 from pydantic import BaseModel, Field, field_validator
 from shared.utils.untrusted_text import quote_untrusted_block
+from shared.utils import fact_check
+from shared.utils.quiet_failures import dropped
 from shared.models.events import ResolutionSignal
 
 from shared.models import CorrelationCluster, Scenario, ScenarioStatus
@@ -273,6 +275,15 @@ def critique_enabled() -> bool:
 
 
 SCENARIO_TOKEN_BUDGET = 1800
+# The most a scenario whose numbers are mostly not in its data may claim.
+UNSUPPORTED_CONFIDENCE_CAP = 30
+# A scenario a person asked for (shared/utils/scenario_requests.py), and the
+# recent headlines that share its topic's key words.
+REQUEST_RULE_ID = "USER_SCENARIO_REQUEST"
+_REQUEST_HEADLINES_SQL = """
+    SELECT headline FROM events WHERE type = 'headline' AND created_at > NOW() - INTERVAL '7 days'
+      AND headline ILIKE ANY($1::text[]) ORDER BY created_at DESC LIMIT 8
+"""
 
 # Room set aside for the prose statement of the JSON schema.
 #
@@ -964,7 +975,10 @@ class ScenarioGenerator:
         # Store the database connection and redis client
         self.db    = db_client
         self.redis = redis_client
-        self.model = os.getenv("AGENT_MODEL", DEFAULT_MODEL)
+        # Scenarios are judgments: REASONING_MODEL when set (qwen2.5:7b), else the agents' model.
+        # SCENARIO_MODEL first: a hosted model (groq/openai/gpt-oss-120b) writes
+        # the user-facing scenarios in seconds where the local 7B took minutes.
+        self.model = os.getenv("SCENARIO_MODEL") or os.getenv("REASONING_MODEL") or os.getenv("AGENT_MODEL", DEFAULT_MODEL)
         
         # Concurrency limit: one synthesis at a time per process.
         # The OllamaClient also acquires the global semaphore, but we keep this
@@ -1022,7 +1036,13 @@ class ScenarioGenerator:
         raw_events = await self._fetch_events(event_ids)
 
         # ── 2. BUILD USER PROMPT ───────────────────────────────────────────────
-        user_prompt = self._build_user_prompt(cluster, context, patterns, raw_events)
+        # A person's request is a hypothetical, not an observed cluster: built
+        # from the named instruments' case files and matching headlines, with
+        # no observed-event framing (which led the model to invent "moves").
+        if getattr(cluster, "rule_id", "") == REQUEST_RULE_ID:
+            user_prompt = await self._request_prompt(cluster)
+        else:
+            user_prompt = self._build_user_prompt(cluster, context, patterns, raw_events)
 
         # ── 3. PASS 1 (GENERATION) ─────────────────────────────────────────────
         #
@@ -1131,7 +1151,7 @@ class ScenarioGenerator:
                 else "draft is confident and internally consistent",
             )
             output = self._normalize_probabilities(output)
-            scenario = self._to_scenario(cluster, output)
+            scenario = self._to_scenario(cluster, output, source=user_prompt)
             return scenario if self._grounded(scenario, cluster) else None
 
         try:
@@ -1198,9 +1218,9 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
         output = self._normalize_probabilities(output)
 
         # ── 5. MAP TO DB SCENARIO MODEL ────────────────────────────────────────
-        return self._to_scenario(cluster, output)
+        return self._to_scenario(cluster, output, source=user_prompt)
 
-    def _to_scenario(self, cluster, output) -> Scenario:
+    def _to_scenario(self, cluster, output, source: str = "") -> Scenario:
         """Maps a validated model output onto the database Scenario.
 
         Shared by both exits from synthesis -- the critiqued path and the
@@ -1242,11 +1262,62 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
             ],
         )
 
+        # Checked against the prompt it was written from (shared/utils/
+        # fact_check.py). A scenario whose numbers are mostly not in its data
+        # is kept, with its confidence capped and the reason on the record, so
+        # nothing downstream weighs it as if it were grounded.
+        if source:
+            fc = fact_check.check(_scenario_body_text(output), source)
+            if not fc.ok:
+                scenario.confidence_overall = min(scenario.confidence_overall, UNSUPPORTED_CONFIDENCE_CAP)
+                scenario.confidence_rationale = f"{scenario.confidence_rationale or ''} [Fact check: {fc.summary()}]".strip()
+                dropped("reasoning.scenario_unsupported_numbers", "scenario numbers not in its data; confidence capped",
+                        logger, detail=fc.summary())
+
         logger.info(
             "✅ Scenario synthesized: %s (confidence=%d%%)",
             scenario.headline[:80], scenario.confidence_overall,
         )
         return scenario
+
+    async def _request_prompt(self, cluster: CorrelationCluster) -> str:
+        """The prompt for a requested scenario: the development as posed, the
+        facts the platform holds on the named instruments (their case files),
+        and recent headlines that share the topic's key words."""
+        from shared.utils import case_file as cf
+
+        topic = str(cluster.summary_headline or "")
+        tickers = [str(t).upper() for t in (cluster.entity_ids or [])][:10]
+        facts: List[str] = []
+        raw = getattr(self.redis, "raw", self.redis)
+        for t in tickers:
+            try:
+                case = json.loads(await raw.get(cf.CASE_KEY.format(ticker=t)) or "null") if raw is not None else None
+            except Exception as exc:
+                logger.debug("Case file read failed for %s: %s", t, exc)
+                case = None
+            lines = cf.fact_lines(case)[:8]
+            facts += [f"{t}: {line}" for line in lines] or [f"{t}: no case file on record"]
+        words = sorted({w for w in re.findall(r"[A-Za-z]{5,}", topic)}, key=len, reverse=True)[:3]
+        headlines: List[str] = []
+        if words and self.db is not None:
+            try:
+                rows = await self.db.query(_REQUEST_HEADLINES_SQL, [f"%{w}%" for w in words])
+                headlines = [str(r["headline"])[:200] for r in rows or []]
+            except Exception as exc:
+                logger.debug("Request headline search failed: %s", exc)
+        return (
+            "=== A DEVELOPMENT POSED BY A USER (hypothetical, not observed) ===\n"
+            f"{topic}\n\n"
+            f"Instruments to consider: {', '.join(tickers) or 'none named; reason about the markets most exposed'}\n\n"
+            "=== FACTS THE PLATFORM HOLDS (cite these; state nothing else as observed) ===\n"
+            + ("\n".join(facts) or "None") + "\n\n"
+            + quote_untrusted_block(headlines, label="RECENT HEADLINES ON THE TOPIC", max_items=8) + "\n\n"
+            "Task: if this development happened, what are the plausible outcomes? Give 2 to 4 hypotheses whose "
+            "probabilities sum to 100, each with its mechanism, time horizon, who benefits and who loses among the "
+            "instruments, and the observable signals that would confirm or deny it. Do not describe market moves, "
+            "volumes or filings that are not in the facts above."
+        )
 
     def _build_user_prompt(
         self,

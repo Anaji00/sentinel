@@ -117,5 +117,5 @@ def test_both_exits_from_synthesis_map_through_one_function():
     # assigns first so it can apply the grounding gate before returning, which
     # is still one function producing both shapes -- the property this test
     # exists to hold.
-    assert src.count("self._to_scenario(cluster, output)") == 2
+    assert src.count("self._to_scenario(cluster, output, source=user_prompt)") == 2
     assert src.count("scenario = Scenario(") == 1, "two places build a Scenario and can drift"

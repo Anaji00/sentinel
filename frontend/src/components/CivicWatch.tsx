@@ -851,7 +851,12 @@ export function CivicWatch() {
       </header>
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_420px] gap-4">
-        <div className="relative rounded-2xl border border-line overflow-hidden h-[68vh] min-h-[480px]">
+        {/* `isolate`: Leaflet's panes and controls carry z-index 400-1000,
+            which outranked every dialog (z-50) and the phone nav drawer (z-40)
+            -- Platform health opened underneath the map. Its own stacking
+            context keeps those numbers inside the map, where the legend's
+            z-[500] still sits above the tiles. */}
+        <div className="relative isolate rounded-2xl border border-line overflow-hidden h-[68vh] min-h-[480px]">
           <div ref={mapEl} className="absolute inset-0" />
           <div className="absolute left-3 top-3 z-[500] rounded-xl border border-line bg-overlay/95 p-2.5 text-xs space-y-1.5 shadow-overlay">
             <div className="text-micro uppercase tracking-wider text-ink-mute">On the map</div>

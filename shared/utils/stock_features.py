@@ -45,6 +45,15 @@ REGISTRY: Dict[str, Feature] = {
     "ev_8k_auditor_change": Feature(30, "filings", "8-K Item 4.01 auditor change in the last 30 days"),
     "ev_8k_nonreliance": Feature(30, "filings", "8-K Item 4.02 non-reliance on past statements in the last 30 days"),
     "ev_8k_bankruptcy": Feature(30, "filings", "8-K Item 1.03 bankruptcy in the last 30 days"),
+    "cust_mom_21": Feature(4, "customer_links", "Major customers' 21-session return, weighted by their share of "
+                                                "revenue in the latest 10-K (Cohen & Frazzini 2008)"),
+    "comention_mom_21": Feature(4, "comention", "21-session return of the firms named in the same headlines over "
+                                                "the past year, weighted by co-mentions (Scherbina & Schlusche 2020; "
+                                                "Ali & Hirshleifer 2020)"),
+    "ev_13d_activist": Feature(30, "activist_13d", "A Schedule 13D in the last 30 days whose Item 4 states an "
+                                                 "activist purpose (Brav, Jiang, Partnoy & Thomas 2008)"),
+    "llm_news_30": Feature(4, "llm_news", "Mean of a hosted language model's good/bad/unclear read of the stock's "
+                                          "headlines over 30 days (Lopez-Lira & Tang); scored forward only"),
 }
 
 EIGHT_K_FEATURES = {"3.02": "ev_8k_dilution", "3.01": "ev_8k_delisting_notice", "2.06": "ev_8k_impairment",

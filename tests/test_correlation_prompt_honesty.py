@@ -32,12 +32,16 @@ def test_the_query_no_longer_invents_a_perfect_coefficient():
 
 
 def test_the_query_no_longer_invents_significance():
+    # Since 29 Oct 2026 the agent reads the stock's measured macro exposure,
+    # not its stock-to-stock edges; the invariant is the same: no default
+    # stands in for a number that was never measured.
     assert "coalesce(r.p_value, 0.05)" not in SOURCE
-    assert "r.p_value AS p_val" in SOURCE
+    assert "r.weight AS weight" in SOURCE and "coalesce(r.weight" not in SOURCE
 
 
 def test_an_unmeasured_coefficient_is_labelled_as_such():
-    assert "Coef: unmeasured" in SOURCE
+    from services.agents.stock_correlation_agent import exposure_line
+    assert "weight unmeasured" in exposure_line({"macro": "CL=F", "rel": "INVERSE_EXPOSURE_TO", "weight": None})
 
 
 def _string_constants():

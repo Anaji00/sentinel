@@ -1293,6 +1293,7 @@ SEMANTIC_CONF_FACTOR = 0.85
 # The excitation at which a forecast is worth publishing at all, and the one at
 # which it has said everything it can. Below the gate no cluster is emitted.
 HAWKES_EXCITATION_GATE = 2.0
+HAWKES_REFIRE_SEC = 3600          # one forecast per source -> target pair an hour
 HAWKES_CONF_SATURATION = 20.0
 HAWKES_CONF_FLOOR = 0.50
 
@@ -2503,8 +2504,22 @@ async def main():
                 logger.info(
                     f"⚡ Hawkes Excitation Forecast: {top_forecast['narrative']}"
                 )
-                # Publish excitation forecasts as correlation alerts
-                if top_forecast["excess_multiplier"] >= 2.0:
+                # Publish excitation forecasts as correlation alerts: once per
+                # source -> target pair an hour. This fired on every event while
+                # the pair stayed elevated -- 5,327 clusters in 30 days -- and
+                # 51-59% of headlines, prediction trades and anomalies arrive in
+                # collector bursts of ten or more a minute, so most of that
+                # "excitation" is two pollers running close together.
+                _hk_redis = getattr(getattr(store, "_redis", None), "raw", getattr(store, "_redis", None))
+                _hk_new = True
+                if top_forecast["excess_multiplier"] >= 2.0 and _hk_redis is not None:
+                    try:
+                        _hk_new = bool(await _hk_redis.set(
+                            f"sentinel:hawkes:fired:{top_forecast['source_domain']}:{top_forecast['target_domain']}",
+                            "1", nx=True, ex=HAWKES_REFIRE_SEC))
+                    except Exception as _exc:
+                        swallowed("correlation.hawkes_dedupe", _exc, logger)
+                if top_forecast["excess_multiplier"] >= 2.0 and _hk_new:
                     import uuid as _uuid
                     _fc_raw, _fc_conf, _fc_calib = await _calibrated(
                         getattr(store, "_redis", None),
@@ -2515,7 +2530,12 @@ async def main():
                         trace_id=event.trace_id,
                         rule_id="HAWKES_EXCITATION",
                         rule_name="Cross-Domain Hawkes Excitation Forecast",
-                        alert_tier=AlertTier.INTELLIGENCE if top_forecast["excess_multiplier"] >= 3.0 else AlertTier.ALERT,
+                        # A domain-level rate forecast names no instrument and
+                        # was graded below a headline: ALERT at most, then the
+                        # same confidence and grade ceilings as every other path
+                        # (applied below). It reached INTELLIGENCE 2,303 times in
+                        # 30 days on the multiplier alone.
+                        alert_tier=AlertTier.ALERT,
                         primary_domain=top_forecast["source_domain"],
                         confidence_score=_fc_conf,
                         summary_headline=(
@@ -2547,8 +2567,12 @@ async def main():
                         },
                         trigger_event_id=event.event_id,
                         supporting_event_ids=[],
-                        primary_entity_id=event.primary_entity.id if event.primary_entity else "HAWKES",
-                        primary_entity_name=event.primary_entity.name if event.primary_entity and event.primary_entity.name else top_forecast["source_domain"],
+                        # The forecast is about two domains, not the event that
+                        # happened to arrive while they were elevated. Naming
+                        # that event's entity put an arbitrary stock on the
+                        # alert, and the grader then scored the stock.
+                        primary_entity_id="HAWKES",
+                        primary_entity_name=f"{top_forecast['source_domain']} → {top_forecast['target_domain']}",
                         entity_ids=[],
                         entity_names=[],
                         description=top_forecast["narrative"],
@@ -2556,9 +2580,12 @@ async def main():
                             ["hawkes_excitation"]
                             + (["cross_domain"] if top_forecast["source_domain"] != top_forecast["target_domain"] else ["self_excitation"])
                             + [f"src:{top_forecast['source_domain']}", f"tgt:{top_forecast['target_domain']}"]
-                            + exposure_tags(event.tags)
                         )
                     )
+                    forecast_cluster.alert_tier = _tier_supported_by(_fc_conf, forecast_cluster.alert_tier)
+                    forecast_cluster.alert_tier = _tier_after_grades(
+                        forecast_cluster.rule_name, forecast_cluster.alert_tier,
+                        await _retired_rules(getattr(store, "_redis", None)))
                     await store.save_correlation(forecast_cluster)
                     await producer.send(Topics.CORRELATIONS, forecast_cluster.model_dump(), key=forecast_cluster.correlation_id)
                     await _stream_live_correlation(forecast_cluster)
