@@ -82,11 +82,14 @@ export default function SystemHealthHUD() {
   // fetch follows the gateway's 307 internally and the browser sees one 200.
   //
   // Measured through the deployment: `health` -> 200, `health/` -> 308.
+  // Every 15 s: this is the header's status light, on every page. At 5 s it
+  // and the metrics below cost every open page 24 requests a minute.
   const { data: healthData } = useSWR<SystemHealthResponse>('/health', fetcher, {
-    refreshInterval: POLL.live,
+    refreshInterval: POLL.standard,
   });
 
-  const { data: metricsData } = useSWR<MetricsSummary>('/health/metrics/json', fetcher, {
+  // The telemetry table is only inside the dialog, so it is only fetched there.
+  const { data: metricsData } = useSWR<MetricsSummary>(isOpen ? '/health/metrics/json' : null, fetcher, {
     refreshInterval: POLL.live,
   });
 

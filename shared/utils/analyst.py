@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -37,10 +37,14 @@ _FACT = re.compile(r"\bF(\d{1,2})\b")
 class AnalystView(BaseModel):
     """One sample of the analyst's answer (the schema the model must fill)."""
 
-    direction: Literal["up", "down", "flat"] = Field(description="Beats the S&P 500 (up), trails it (down), or neither")
-    probability: float = Field(ge=0.0, le=1.0, description="Chance the direction is right over five sessions")
+    # Reasoning first: the local grammar and a hosted model both write fields in
+    # this order, so the number comes after the argument, not before it. One
+    # probability with one meaning: "direction" plus "chance the direction is
+    # right" let {"down", 0.3} mean either 30% sure of down or a 30% chance of
+    # beating, and p_up read it one way only.
+    rationale: str = Field(default="", max_length=600, description="One or two sentences citing fact ids")
     cited: List[str] = Field(default_factory=list, description="Fact ids used, e.g. ['F1', 'F4']")
-    rationale: str = Field(default="", max_length=600)
+    p_beat: float = Field(ge=0.0, le=1.0, description="Chance the stock beats the S&P 500 over the next five sessions")
 
 
 def prior_from_percentile(percentile: Optional[float]) -> float:
@@ -53,7 +57,13 @@ def prior_from_percentile(percentile: Optional[float]) -> float:
 
 
 def p_up(view: Mapping[str, object]) -> float:
-    """One sample as a probability the stock beats the market."""
+    """One sample as a probability the stock beats the market. Reads p_beat;
+    the older {direction, probability} shape is still understood."""
+    if view.get("p_beat") is not None:
+        try:
+            return min(1.0, max(0.0, float(view.get("p_beat"))))
+        except (TypeError, ValueError):
+            return 0.5
     try:
         prob = min(1.0, max(0.0, float(view.get("probability"))))
     except (TypeError, ValueError):
@@ -106,15 +116,46 @@ def facts(ticker: str, percentile: Optional[float], horizon: str, moves: Mapping
 
 
 def prompt(ticker: str, fact_lines: Sequence[str]) -> Tuple[str, str]:
-    system = ("You are an equity analyst. Use only the numbered facts. Estimate whether "
-              f"{ticker} will beat the S&P 500 over the next five trading days. Cite the fact ids you rely on "
-              "(for example F2). Most single news items do not move a stock against the market: unless the facts "
-              "give a clear reason, keep the probability near 0.5. Answer in JSON only.")
+    system = ("You are an equity analyst. Use only the numbered facts. Estimate the chance that "
+              f"{ticker} beats the S&P 500 over the next five trading days. A separate stock model's view is "
+              "combined with your answer afterwards: judge only what these facts say. Most single news "
+              "items do not move a stock against the market, and half of all stocks beat it in any week: unless the "
+              "facts give a clear reason, answer between 0.45 and 0.55. Write the rationale first, citing the fact "
+              "ids you rely on (for example F2), then the number. Answer in JSON only.")
     user = "Facts:\n" + "\n".join(fact_lines) + (
-        '\n\nReturn {"direction": "up"|"down"|"flat", "probability": 0-1, "cited": ["F1", ...], '
-        '"rationale": "one or two sentences"}.')
+        '\n\nReturn {"rationale": "one or two sentences citing fact ids", "cited": ["F1", ...], '
+        '"p_beat": 0-1}.')
     return system, user
 
 
-__all__ = ["AnalystView", "HORIZON_HOURS", "PRIOR_SPREAD", "combine", "facts", "p_up", "prior_from_percentile",
-           "prompt", "verified"]
+class BatchView(BaseModel):
+    """One stock's answer in a batched prompt (AnalystView's fields, the stock
+    named first); its fact ids are that stock's own."""
+    ticker: str = Field(description="The stock this answer is for, exactly as its section names it")
+    rationale: str = Field(default="", max_length=600, description="One or two sentences citing fact ids")
+    cited: List[str] = Field(default_factory=list, description="Fact ids used, e.g. ['F1', 'F4']")
+    p_beat: float = Field(ge=0.0, le=1.0, description="Chance the stock beats the S&P 500 over the next five sessions")
+
+
+class AnalystBatch(BaseModel):
+    views: List[BatchView] = Field(default_factory=list)
+
+
+def batch_prompt(sections: Sequence[Tuple[str, Sequence[str]]]) -> Tuple[str, str]:
+    """Several stocks in one call, each judged on its own facts only. Several
+    items per call holds accuracy on capable models (batch prompting studies,
+    10-25 items); used for the hosted shadow, not the local model."""
+    system = ("You are an equity analyst. For EACH stock below, using only that stock's numbered facts, estimate the "
+              "chance it beats the S&P 500 over the next five trading days. Fact ids belong to their own stock; a "
+              "finding for one stock says nothing about another. A separate stock model's view is combined with your "
+              "answers afterwards: judge only these facts. Most single news items do not move a stock against the "
+              "market, and half of all stocks beat it in any week: unless the facts give a clear reason, answer "
+              "between 0.45 and 0.55. Answer in JSON only.")
+    parts = [f"STOCK {t}\nFacts:\n" + "\n".join(lines) for t, lines in sections]
+    user = ("\n\n".join(parts) + '\n\nReturn {"views": [one per stock: {"ticker": "...", "rationale": "one or two '
+            'sentences citing that stock\'s fact ids", "cited": ["F1", ...], "p_beat": 0-1}]}.')
+    return system, user
+
+
+__all__ = ["AnalystBatch", "AnalystView", "BatchView", "HORIZON_HOURS", "PRIOR_SPREAD", "batch_prompt", "combine",
+           "facts", "p_up", "prior_from_percentile", "prompt", "verified"]

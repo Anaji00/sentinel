@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
+from shared.utils.quiet_failures import swallowed
+
 logger = logging.getLogger("sentinel.hosted_llm")
 
 PROVIDERS: Dict[str, Tuple[str, str]] = {
@@ -111,16 +113,19 @@ def over_quota(used: Dict[str, int], q: Quota, tokens: int) -> Optional[str]:
 
 
 def request_body(model: str, prompt: str, temperature: float, fmt: Optional[Union[str, dict]],
-                 max_tokens: int) -> Dict[str, Any]:
+                 max_tokens: int, system: Optional[str] = None) -> Dict[str, Any]:
     """The chat request. A JSON-schema `format` becomes json_object mode plus the
     schema stated in the prompt: the local path enforces the shape with a grammar
-    and drops the prose schema, which these endpoints cannot replace."""
+    and drops the prose schema, which these endpoints cannot replace. The system
+    prompt goes in the system role (it was pasted above the user text, where a
+    chat model weighs it as one more paragraph of input)."""
     if isinstance(fmt, dict):
         prompt = (f"{prompt}\n\nJSON SCHEMA:\n{json.dumps(fmt, separators=(',', ':'))}\n"
                   "Return ONLY a raw JSON object conforming to this schema.")
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
     body: Dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
@@ -216,6 +221,41 @@ async def _reserve(raw: Any, step: str, q: Optional[Quota], tokens: int) -> Opti
     return broken
 
 
+def unused_tokens(reserved: int, usage: Optional[Dict[str, Any]]) -> int:
+    """Tokens reserved for a request that it did not use: all of them when it
+    was not served (usage None), else the reservation less prompt and
+    completion as the provider counted them. Never negative."""
+    if usage is None:
+        return max(0, reserved)
+    used = int(usage.get("prompt_eval_count") or 0) + int(usage.get("eval_count") or 0)
+    return max(0, reserved - used) if used else 0
+
+
+async def _release(raw: Any, step: str, q: Optional[Quota], tokens: int) -> None:
+    """Gives unused tokens back to the step's minute and day buckets.
+
+    A request reserves its prompt plus max_tokens, and nothing gave back what
+    it did not use: headline scoring reserved ~2,300 a call and used ~1,280,
+    so three calls closed the 120B's 8,000-a-minute bucket and a 4,000-token
+    scenario behind them was skipped (36 such skips on 30 Oct 2026)."""
+    if q is None or tokens <= 0:
+        return
+    w = windows(time.time())
+    keys = [BUCKET_KEY.format(step=step, unit="t", window=w["m"]), BUCKET_KEY.format(step=step, unit="t", window=w["d"])]
+    if raw is None:
+        for k in keys:
+            if k in _local_counts:
+                _local_counts[k] = max(0, _local_counts[k] - tokens)
+        return
+    try:
+        async with raw.pipeline() as pipe:
+            for k in keys:
+                pipe.decrby(k, tokens)
+            await pipe.execute()
+    except Exception as exc:
+        swallowed("utils.hosted_llm.release", exc, logger)
+
+
 async def _cooling(raw: Any, step: str) -> bool:
     if raw is None:
         return _local_cooldown.get(step, 0.0) > time.time()
@@ -267,7 +307,7 @@ async def has_capacity(raw: Any, local_model: str, tokens: int = 1000, reserve: 
 
 async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_model: str, prompt: str,
                    temperature: float, fmt: Optional[Union[str, dict]],
-                   max_tokens: Optional[int]) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+                   max_tokens: Optional[int], system: Optional[str] = None) -> Optional[Tuple[str, str, Dict[str, Any]]]:
     """(text, step, usage) from the first hosted step that answers, or None when
     the route is empty or every step is unavailable (no key, cooling, over
     quota, 429, error). Never retries a step."""
@@ -288,27 +328,34 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
             try:
                 if await _cooling(raw, step):
                     continue
-                broken = await _reserve(raw, step, quotas.get(step), estimate_tokens(prompt, mt))
+                reserved = estimate_tokens((system or "") + prompt, mt)
+                broken = await _reserve(raw, step, quotas.get(step), reserved)
                 if broken:
                     logger.info("Hosted %s skipped: %s quota would be exceeded", step, broken)
                     continue
-                t0 = time.monotonic()
-                async with sess.post(url, json=request_body(model, prompt, temperature, fmt, mt),
-                                     headers={"Authorization": f"Bearer {key}"}, timeout=HOSTED_TIMEOUT) as resp:
-                    if resp.status == 429:
-                        retry = resp.headers.get("retry-after", "60")
-                        await _cool(raw, step, int(float(retry)) if retry.replace(".", "", 1).isdigit() else 60)
-                        logger.warning("Hosted %s rate-limited (429); cooling down", step)
+                usage: Optional[Dict[str, Any]] = None
+                try:
+                    t0 = time.monotonic()
+                    async with sess.post(url, json=request_body(model, prompt, temperature, fmt, mt, system),
+                                         headers={"Authorization": f"Bearer {key}"}, timeout=HOSTED_TIMEOUT) as resp:
+                        if resp.status == 429:
+                            retry = resp.headers.get("retry-after", "60")
+                            await _cool(raw, step, int(float(retry)) if retry.replace(".", "", 1).isdigit() else 60)
+                            logger.warning("Hosted %s rate-limited (429); cooling down", step)
+                            continue
+                        if resp.status != 200:
+                            logger.warning("Hosted %s HTTP %s: %s", step, resp.status, (await resp.text())[:200])
+                            continue
+                        data = await resp.json(content_type=None)
+                    usage = usage_as_ollama(data, time.monotonic() - t0)
+                    text = reply_text(data)
+                    if text is None:
+                        logger.warning("Hosted %s returned no content", step)
                         continue
-                    if resp.status != 200:
-                        logger.warning("Hosted %s HTTP %s: %s", step, resp.status, (await resp.text())[:200])
-                        continue
-                    data = await resp.json(content_type=None)
-                text = reply_text(data)
-                if text is None:
-                    logger.warning("Hosted %s returned no content", step)
-                    continue
-                return text, step, usage_as_ollama(data, time.monotonic() - t0)
+                    return text, step, usage
+                finally:
+                    # What the request did not use goes back to the bucket.
+                    await _release(raw, step, quotas.get(step), unused_tokens(reserved, usage))
             except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
                 logger.warning("Hosted %s failed: %s", step, exc)
                 continue

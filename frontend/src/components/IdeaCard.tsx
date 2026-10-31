@@ -7,8 +7,7 @@
  */
 
 import React, { useState } from 'react';
-import Link from 'next/link';
-import { ABSENT, formatNumber } from '../lib/format';
+import { ABSENT, directionMark, formatNumber } from '../lib/format';
 import {
   expectedMove,
   ideaDetails,
@@ -23,6 +22,7 @@ import {
 } from '../lib/ideas';
 import { ConvictionMeter } from './ui/ConvictionMeter';
 import { Sparkline } from './ui/Sparkline';
+import { StockLink } from './StockDrawer';
 
 const pct = (v: number | null | undefined, digits = 1) =>
   v == null ? ABSENT : `${v >= 0 ? '+' : ''}${formatNumber(v, { decimals: digits })}%`;
@@ -84,17 +84,15 @@ export function IdeaCard({
       <header className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <Link
-              href={`/ticker?symbol=${encodeURIComponent(i.ticker)}`}
-              className="font-mono text-head font-semibold text-ink hover:text-accent"
-            >
+            <StockLink ticker={i.ticker} className="font-mono text-head font-semibold text-ink hover:text-accent">
               {i.ticker}
-            </Link>
+            </StockLink>
             <span
               className={`rounded-full px-2 py-0.5 text-micro font-semibold tracking-wide ${
                 long ? 'bg-positive/15 text-positive' : 'bg-negative/15 text-negative'
               }`}
             >
+              <span aria-hidden>{directionMark(i.direction)} </span>
               {long ? 'BUY' : 'SHORT'}
             </span>
           </div>
@@ -168,25 +166,27 @@ export function IdeaCard({
         </div>
       )}
 
-      {o ? (
+      {/* The options trade is the card's most detailed block, so it folds in
+          with the reasoning on full cards: the card leads with direction,
+          move, odds and size. Compact cards have no toggle and keep it. */}
+      {o && (compact || open) ? (
         <div className="rounded-xl border border-line px-3 py-2 text-xs">
           <div className="flex items-center justify-between gap-2">
             <span className="text-ink">{optionHeadline(o)}</span>
             {o.prob_profit != null && (
-              <span className="shrink-0 font-mono text-micro text-ink-dim">
+              <span className="shrink-0 tabular text-micro text-ink-dim">
                 {formatNumber(o.prob_profit * 100, { decimals: 0 })}% chance of profit
               </span>
             )}
           </div>
-          <div className="mt-0.5 font-mono text-micro text-ink-mute">
+          <div className="mt-0.5 tabular text-micro text-ink-mute">
             {o.net < 0 ? 'costs' : 'pays you'} {usd(o.net)} · can lose up to {usd(o.max_loss)}
             {o.ev != null && ` · expected ${o.ev >= 0 ? 'profit' : 'loss'} ${usd(o.ev)}`}
           </div>
         </div>
       ) : (
-        !compact && (
-          <div className="text-micro text-ink-mute">No options trade is worth it at this forecast.</div>
-        )
+        !compact &&
+        !o && <div className="text-micro text-ink-mute">No options trade is worth it at this forecast.</div>
       )}
 
       <div className="flex flex-wrap gap-1.5">
@@ -227,7 +227,8 @@ export function IdeaCard({
             aria-expanded={open}
             className="self-start text-xs text-accent hover:underline"
           >
-            {open ? 'Hide the reasoning' : 'Why this call'} {open ? '▴' : '▾'}
+            {open ? (o ? 'Hide the trade and reasoning' : 'Hide the reasoning') : o ? 'Options trade and why' : 'Why this call'}{' '}
+            {open ? '▴' : '▾'}
           </button>
           {open && (
             <div className="space-y-1.5 border-t border-line pt-2 text-micro leading-relaxed text-ink-dim">

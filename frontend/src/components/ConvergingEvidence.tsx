@@ -93,7 +93,9 @@ const STANCE_STYLE: Record<string, string> = {
 const STATUS_STYLE: Record<string, string> = {
   proven: 'text-positive',
   unstudied: 'text-ink-dim',
-  no_edge: 'text-ink-mute line-through',
+  // Muted, not struck through: the row already says "tested: doesn't predict
+  // prices", and a strikethrough read as deleted or wrong.
+  no_edge: 'text-ink-mute',
 };
 
 function arrow(d: number): string {

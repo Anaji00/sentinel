@@ -174,7 +174,7 @@ export default function QuantRadarPanel() {
                       aria-pressed={minZScore === z}
                       className={`px-1.5 py-0.5 rounded text-micro font-bold transition-all cursor-pointer ${
                         minZScore === z
-                          ? 'bg-accent text-inset border border-white'
+                          ? 'bg-accent text-inset border border-ink'
                           : 'bg-raised text-ink-dim border border-line-strong'
                       }`}
                     >
@@ -270,7 +270,7 @@ export default function QuantRadarPanel() {
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-bold text-accent uppercase text-micro flex items-center gap-1.5">
-                      <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
+                      <span className="h-1.5 w-1.5 rounded-full bg-info animate-pulse" />
                       {ag.name}
                     </span>
                     <span className="px-1.5 py-0.5 rounded text-micro font-bold bg-accent-dim text-accent border border-line-accent">
@@ -323,7 +323,7 @@ export default function QuantRadarPanel() {
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-2.5">
-              <span className="text-xs font-bold text-ink uppercase">
+              <span className="text-xs font-bold text-ink">
                 {selectedAnomaly.ticker} VOLUME SPIKE INSPECTOR
               </span>
               <button

@@ -348,7 +348,7 @@ export default function BondYieldsChart() {
                 y1="45"
                 x2="600"
                 y2="45"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.5"
               />
@@ -357,7 +357,7 @@ export default function BondYieldsChart() {
                 y1="90"
                 x2="600"
                 y2="90"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.5"
               />
@@ -366,7 +366,7 @@ export default function BondYieldsChart() {
                 y1="135"
                 x2="600"
                 y2="135"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.5"
               />

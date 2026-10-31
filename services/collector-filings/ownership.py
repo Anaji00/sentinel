@@ -38,7 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from shared.utils.ownership import (  # noqa: E402
-    FILER_KEY, HOLDERS_KEY, MCAP_KEY, OWNERSHIP_FILERS, aggregate_by_cusip, iter_infotable,
+    FILER_KEY, HOLDERS_KEY, MCAP_KEY, OWNERSHIP_FILERS, aggregate_by_cusip, index_entries, iter_infotable,
     DEFENSE_PRIMES, OSINT_SECTORS, stake_pct, value_scale,
     CHANGES_KEY, aggregate_changes, holding_changes,
 )
@@ -428,13 +428,14 @@ async def refresh_filer(
         "positions_total": len(positions), "positions_kept": len(kept),
         "portfolio_value_usd": total_value, "infotable_bytes": size, "holdings": kept,
     }), ex=120 * 86400)
+    # The per-company index first, whole, before any graph write: it was
+    # written one company at a time between graph writes, and a produce timeout
+    # part-way left ~100 of ~500 companies indexed per filer.
+    await write_index(raw, filer.filer_id)
     for k in kept:
-        await raw.hset(HOLDERS_KEY.format(ticker=k["ticker"]), filer.filer_id, json.dumps({
-            "filer": filer.name, "shares": k["shares"], "value_usd": k["value_usd"],
-            "pct_outstanding": k["pct_outstanding"], "period": k["period"],
-        }))
-        await raw.expire(HOLDERS_KEY.format(ticker=k["ticker"]), 120 * 86400)
-        if graph is not None:
+        if graph is None:
+            break
+        try:
             await graph.link_entities(
                 filer.filer_id, "HOLDS_STAKE_IN", k["ticker"],
                 properties={"shares": k["shares"], "value_usd": k["value_usd"],
@@ -442,6 +443,9 @@ async def refresh_filer(
                             "source": "13F", "confidence": 0.99},
                 source_label="InstitutionalFiler", target_label="Company",
             )
+        except Exception as e:
+            # One edge lost, not the rest of the filing's.
+            swallowed("collector_filings.ownership.graph_link", e, logger, variant=filer.filer_id)
     if graph is not None and filer.listed_as:
         await graph.link_entities(
             filer.filer_id, "LISTED_AS", filer.listed_as,
@@ -452,6 +456,28 @@ async def refresh_filer(
     logger.info("Ownership: %s %s -- %d positions, %d in universe (%.1f MB table)",
                 filer.name, latest["period"], len(positions), len(kept), size / 1e6)
     return len(kept)
+
+
+async def write_index(raw: Any, filer_id: str) -> int:
+    """Rewrite one filer's entries in the per-company holders index from its
+    stored blob, in a single pipeline. Returns the number of companies written.
+
+    Run after every refresh and once per cycle for every filer, so an index
+    left partial by an interrupted run repairs itself without a new filing.
+    """
+    blob = await raw.get(FILER_KEY.format(filer_id=filer_id))
+    if not blob:
+        return 0
+    entries = index_entries(json.loads(blob))
+    if not entries:
+        return 0
+    async with raw.pipeline(transaction=False) as pipe:
+        for ticker, record in entries:
+            key = HOLDERS_KEY.format(ticker=ticker)
+            pipe.hset(key, filer_id, json.dumps(record))
+            pipe.expire(key, 120 * 86400)
+        await pipe.execute()
+    return len(entries)
 
 
 async def run_forever(producer: Any, redis_client: Any,
@@ -475,6 +501,13 @@ async def run_forever(producer: Any, redis_client: Any,
                         await ensure_baseline(session, sec, raw, cik, resolve, universe, cusip_cache)
                     except Exception as e:
                         swallowed("collector_filings.ownership.refresh", e, logger,
+                                  variant=OWNERSHIP_FILERS[cik].filer_id)
+                    # Separately, so a failed refresh still repairs the index
+                    # from the filing already stored.
+                    try:
+                        await write_index(raw, OWNERSHIP_FILERS[cik].filer_id)
+                    except Exception as e:
+                        swallowed("collector_filings.ownership.write_index", e, logger,
                                   variant=OWNERSHIP_FILERS[cik].filer_id)
             try:
                 n = await publish_flows(producer, raw)

@@ -122,3 +122,22 @@ describe('card visuals', () => {
     expect(optionHeadline(o)).toBe('Call spread: bet on a rise $235/$237.50 · 2026-11-20');
   });
 });
+
+describe('direction and odds without colour', () => {
+  it('marks up and down with a shape', async () => {
+    const { directionMark } = await import('../lib/format');
+    expect(directionMark(1)).toBe('▲');
+    expect(directionMark(-1)).toBe('▼');
+    expect(directionMark(0)).toBe('');
+    expect(directionMark(null)).toBe('');
+    expect(directionMark(Number.NaN)).toBe('');
+  });
+
+  it('puts a near coin flip into words', async () => {
+    const { oddsWords } = await import('../components/ui/ConvictionMeter');
+    expect(oddsWords(0.52)).toBe('about a coin flip');
+    expect(oddsWords(0.56)).toBe('a bit better than even');
+    expect(oddsWords(0.64)).toBe('better than even');
+    expect(oddsWords(0.75)).toBe('strong odds');
+  });
+});

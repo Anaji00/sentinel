@@ -824,7 +824,10 @@ export function CivicWatch() {
   return (
     <div id="civic-top" className="space-y-4 pb-8">
       {/* Map tiles are dimmed to sit inside the dark interface, not glare out of it. */}
-      <style>{`.civic-tiles{filter:brightness(.72) saturate(.75) contrast(1.05)}.leaflet-container{background:var(--bg-inset)}`}</style>
+      {/* Dark tiles in the dark theme: the light basemap was the brightest thing
+          on the page and competed with the dots. Inverting and turning the hue
+          back keeps water blue-ish and land dark, with no second tile source. */}
+      <style>{`.civic-tiles{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.45)}:root[data-theme="light"] .civic-tiles{filter:saturate(.8)}.leaflet-container{background:var(--bg-inset)}`}</style>
 
       <header className="rounded-2xl border border-line bg-raised p-5 space-y-4 bg-[radial-gradient(ellipse_70%_120%_at_0%_0%,var(--accent-dim),transparent)]">
         <div className="flex flex-wrap items-start justify-between gap-4">

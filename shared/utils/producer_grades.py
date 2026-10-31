@@ -186,6 +186,16 @@ def paired_lift_table(rows: Iterable[Tuple[str, str, float]], baseline: Iterable
 
 
 RETIRE_MIN_N = 50
+# Distinct alert days a family needs before a positive verdict counts. Alerts on
+# one day share that day's market: peer decoupling's 443 alerts and its 2.2x
+# "moves more" all came from 29 Oct 2026, one session, and it was flagging.
+MIN_ALERT_DAYS = 10
+
+
+def _enough_days(grades: Dict[str, object], group: str) -> bool:
+    """True when the family fired on MIN_ALERT_DAYS days, or the grades predate the count."""
+    days = grades.get("family_days")
+    return not isinstance(days, dict) or int(days.get(group) or 0) >= MIN_ALERT_DAYS
 
 
 def prior_move(days: Sequence[date], closes: Sequence[float], spy_close: Dict[date, float],
@@ -244,7 +254,8 @@ def follow_tendencies(grades: Optional[Dict[str, object]], min_n: int = RETIRE_M
     out: Dict[str, List[str]] = {}
     for k, label in (("family_follow_1d", "next session"), ("family_follow_5d", "next 5 sessions")):
         for r in (grades or {}).get(k) or []:
-            if isinstance(r, dict) and int(r.get("n") or 0) >= min_n and r.get("verdict") in ("continues", "reverses"):
+            if (isinstance(r, dict) and int(r.get("n") or 0) >= min_n and r.get("verdict") in ("continues", "reverses")
+                    and _enough_days(grades or {}, str(r.get("group")))):
                 verb = "continued" if r["verdict"] == "continues" else "reversed"
                 out.setdefault(str(r["group"]), []).append(
                     f"{verb} the prior session's move over the {label} ({float(r['follow_bp']):+.0f} bp, n {r['n']})")
@@ -282,7 +293,8 @@ def uninformative_rules(grades: Optional[Dict[str, object]], min_n: int = RETIRE
             if isinstance(r, dict) and int(r.get("n") or 0) >= min_n:
                 lifts.setdefault(str(r.get("group")), []).append(str(r.get("verdict")))
     retired |= {g for g, vs in lifts.items() if vs and "beats a headline" not in vs}
-    return retired
+    # One day of alerts is no more evidence against a family than for it.
+    return {g for g in retired if _enough_days(grades, rule_family(g))}
 
 
 def move_flagging_families(grades: Optional[Dict[str, object]], min_n: int = RETIRE_MIN_N) -> set:
@@ -301,7 +313,27 @@ def move_flagging_families(grades: Optional[Dict[str, object]], min_n: int = RET
         return out
 
     usual, lift = verdicts("correlation_families"), verdicts("family_lift")
-    return {g for g, vs in lift.items() if "beats a headline" in vs and "moves more" in usual.get(g, [])}
+    return {g for g, vs in lift.items()
+            if "beats a headline" in vs and "moves more" in usual.get(g, []) and _enough_days(grades, g)}
+
+
+STRONG_LIFT = 1.15
+
+
+def strong_move_families(grades: Optional[Dict[str, object]], min_lift: float = STRONG_LIFT,
+                         min_n: int = RETIRE_MIN_N) -> set:
+    """Move-flagging families whose alerts beat the stock's own headline days by
+    at least min_lift at 1 or 5 sessions. B1's alert risk read every flagging
+    family, and Semantic Convergence (lift 1.03) fires on most of the universe:
+    on 30 Oct 2026, 91 of the book's 179 names traded at half weight."""
+    flagging = move_flagging_families(grades, min_n)
+    strong = set()
+    for k in ("family_lift_1d", "family_lift_5d"):
+        for r in (grades or {}).get(k) or []:
+            if (isinstance(r, dict) and str(r.get("group")) in flagging and r.get("verdict") == "beats a headline"
+                    and float(r.get("lift") or 0.0) >= min_lift and int(r.get("n") or 0) >= min_n):
+                strong.add(str(r["group"]))
+    return strong
 
 
 def is_uninformative(rule_name: str, retired: set) -> bool:
@@ -309,6 +341,6 @@ def is_uninformative(rule_name: str, retired: set) -> bool:
     return rule_name in retired or rule_family(rule_name) in retired
 
 
-__all__ = ["LOOKBACK", "RETIRE_MIN_N", "follow_table", "follow_tendencies", "is_uninformative", "lift_table",
+__all__ = ["LOOKBACK", "RETIRE_MIN_N", "STRONG_LIFT", "follow_table", "follow_tendencies", "is_uninformative", "lift_table",
            "move_flagging_families", "move_ratio", "paired_lift_table", "placebo_rate", "prior_move", "ratio_table",
-           "rule_family", "uninformative_rules"]
+           "rule_family", "strong_move_families", "uninformative_rules"]

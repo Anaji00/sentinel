@@ -206,3 +206,60 @@ def test_only_recent_articles_become_live_events():
     src = (ROOT / "services/correlation/stock_news_scorer.py").read_text(encoding="utf-8")
     assert "LIVE_EVENT_MAX_AGE_HOURS = 6" in src
     assert "if at >= event_cut:" in src and "if at >= live_cut:" not in src
+
+
+def test_the_factor_engine_catches_up_when_a_night_was_missed():
+    """A restart inside the ~4 h nightly run lost it, and the engine then waited
+    for the next night: scores stayed at 27 Oct for two days (30 Oct 2026)."""
+    import asyncio
+    import json
+    from services.agents import factor_engine as fe
+
+    class Raw:
+        def __init__(self, as_of):
+            self.v = json.dumps({"as_of": as_of})
+
+        async def get(self, k):
+            return self.v
+
+    class Db:
+        def __init__(self, n):
+            self.n = n
+
+        async def query_one(self, sql, *a):
+            return {"n": self.n}
+
+    def behind(as_of, n):
+        eng = fe.FactorEngine.__new__(fe.FactorEngine)
+        eng.redis, eng.db = Raw(as_of), Db(n)
+        return asyncio.run(eng._behind())
+
+    assert behind("2026-10-27", 2) is True
+    assert behind("2026-10-29", 1) is False          # the normal state after a nightly run
+    assert behind("not a date", 0) is True           # unreadable: run rather than wait a night
+
+
+def test_a_restated_headline_is_stale_and_skipped():
+    """Tetlock (2011); 14.1% of headlines restated one of the stock's previous
+    ten on 30 Oct 2026, and each was scored again."""
+    from shared.utils import llm_news as ln
+    history = [{"ticker": "AAA", "created_at": "2026-10-29T10:00:00+00:00",
+                "headline": "Acme raises full-year revenue guidance on strong cloud demand"},
+               {"ticker": "BBB", "created_at": "2026-10-29T10:00:00+00:00", "headline": "Acme raises guidance"}]
+    rows = [{"id": 1, "ticker": "AAA", "created_at": "2026-10-29T12:00:00+00:00",
+             "headline": "Acme Raises Full-Year Revenue Guidance On Strong Cloud Demand - Reuters"},
+            {"id": 2, "ticker": "AAA", "created_at": "2026-10-29T12:00:00+00:00",
+             "headline": "Acme names new chief financial officer"},
+            {"id": 3, "ticker": "CCC", "created_at": "2026-10-29T12:00:00+00:00",
+             "headline": "Acme raises full-year revenue guidance on strong cloud demand"}]   # another stock's story
+    assert ln.stale_ids(rows, history) == {1}
+    assert ln.staleness("", ["anything"]) == 0.0
+
+
+def test_each_scored_headline_carries_an_event_type():
+    from shared.utils import llm_news as ln
+    ans = ln.Scores(scores=[ln.Scored(i=0, s=1, e="Earnings"), ln.Scored(i=1, s=-1, e="weather"),
+                            ln.Scored(i=1, s=0, e="merger"), ln.Scored(i=2, s=0)])
+    assert ln.events(ans, 3) == {0: "earnings", 1: "other", 2: "other"}     # off the list, or absent: other
+    assert ln.parse(ans, 3) == {0: 1, 1: -1, 2: 0}
+    assert all(t in ln.SYSTEM for t in ln.EVENT_TYPES)

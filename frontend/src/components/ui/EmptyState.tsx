@@ -42,7 +42,7 @@ export function EmptyState({
       {kind === 'loading' && (
         <span
           aria-hidden="true"
-          className="h-4 w-4 animate-spin rounded-full border-2 border-line-strong border-t-cyan-400"
+          className="h-4 w-4 animate-spin rounded-full border-2 border-line-strong border-t-accent"
         />
       )}
       <p

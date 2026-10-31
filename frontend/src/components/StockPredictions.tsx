@@ -109,7 +109,7 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
 function Progress({ value }: { value: number | null }) {
   if (value == null) return <span className="text-ink-mute">{ABSENT}</span>;
   const pctWidth = Math.max(0, Math.min(100, value * 100));
-  const tone = value >= 1 ? 'bg-emerald-400' : value >= 0 ? 'bg-cyan-400' : 'bg-rose-400';
+  const tone = value >= 1 ? 'bg-positive' : value >= 0 ? 'bg-accent' : 'bg-negative';
   return (
     <div
       className="flex items-center gap-2"
@@ -128,7 +128,8 @@ function Progress({ value }: { value: number | null }) {
   );
 }
 
-export default function StockPredictions() {
+/** `withIdeas` off when the call cards are already on the page (the Calls workspace). */
+export default function StockPredictions({ withIdeas = true }: { withIdeas?: boolean } = {}) {
   const [days, setDays] = useState(30);
   const [filter, setFilter] = useState('');
   const { data, error } = useSWR<PredictionsResponse>(`/predictions/stocks?days=${days}`, fetcher, {
@@ -145,7 +146,7 @@ export default function StockPredictions() {
 
   return (
     <div className="space-y-4 text-xs">
-      <TradeIdeas />
+      {withIdeas && <TradeIdeas />}
       <section className="bg-raised border border-line rounded-xl p-4 space-y-3">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <h2 className="text-sm font-bold text-ink">How the calls have done</h2>

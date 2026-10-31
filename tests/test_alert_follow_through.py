@@ -57,3 +57,49 @@ def test_case_file_alert_fact_carries_tendency_and_old_shape_still_builds():
     (b,) = [f for f in old["facts"] if f["kind"] == "alert"]
     assert "after past alerts the stock reversed the prior session's move" in a["text"]
     assert b["text"] == "Alert: Peer (graded to precede bigger moves)"
+
+
+def test_one_day_of_alerts_earns_no_positive_verdict():
+    lift = [{"group": "Peer", "n": 174, "verdict": "beats a headline"}]
+    usual = [{"group": "Peer", "n": 174, "verdict": "moves more"}]
+    follow = [{"group": "Peer", "n": 174, "follow_bp": -82.0, "verdict": "reverses"}]
+    grades = {"family_lift_1d": lift, "correlation_families_1d": usual, "family_follow_1d": follow}
+    # Grades written before the day count existed keep their old reading.
+    assert pg.move_flagging_families(grades) == {"Peer"} and "Peer" in pg.follow_tendencies(grades)
+    grades["family_days"] = {"Peer": 1}
+    assert pg.move_flagging_families(grades) == set() and pg.follow_tendencies(grades) == {}
+    grades["family_days"] = {"Peer": pg.MIN_ALERT_DAYS}
+    assert pg.move_flagging_families(grades) == {"Peer"} and "Peer" in pg.follow_tendencies(grades)
+
+
+def test_one_day_of_alerts_cannot_retire_a_family_either():
+    grades = {"correlation_families_1d": [{"group": "Peer", "n": 80, "verdict": "no difference"}],
+              "correlations_1d": [{"group": "Peer (Abc)", "n": 60, "verdict": "no difference"}]}
+    assert pg.uninformative_rules(grades) == {"Peer", "Peer (Abc)"}
+    grades["family_days"] = {"Peer": 1}
+    assert pg.uninformative_rules(grades) == set()
+
+
+def test_b1_alert_risk_reads_only_strong_lift_families():
+    usual = [{"group": g, "n": 500, "verdict": "moves more"} for g in ("Block", "Semantic")]
+    lift = [{"group": "Block", "n": 500, "lift": 1.16, "verdict": "beats a headline"},
+            {"group": "Semantic", "n": 5000, "lift": 1.03, "verdict": "beats a headline"}]
+    grades = {"correlation_families_1d": usual, "family_lift_5d": lift,
+              "family_days": {"Block": 30, "Semantic": 30}}
+    assert pg.move_flagging_families(grades) == {"Block", "Semantic"}
+    # Semantic Convergence flags most of the universe on a lift of 1.03; it no
+    # longer halves B1 weights (30 Oct 2026: 91 of 179 names).
+    assert pg.strong_move_families(grades) == {"Block"}
+    assert pg.strong_move_families(None) == set()
+
+
+def test_alert_drift_rows_are_forward_only_and_take_the_prior_sign():
+    from datetime import date
+    from shared.utils import alert_drift as ad
+    fam = "Equity Block & Options Convergence"
+    d0, d1 = date(2026, 10, 29), date(2026, 10, 31)
+    alerts = [("AAA", d1, fam), ("BBB", d1, fam), ("CCC", d1, "Geopolitical Cascade"), ("DDD", d0, fam),
+              ("EEE", d1, fam)]
+    prior = {("AAA", d1): 0.02, ("BBB", d1): -0.01, ("CCC", d1): 0.03, ("DDD", d0): 0.05, ("EEE", d1): None}
+    assert ad.drift_rows(alerts, prior) == [("AAA", d1, 1.0), ("BBB", d1, -1.0)]
+    assert ad.FEATURE in __import__("shared.utils.stock_features", fromlist=["REGISTRY"]).REGISTRY

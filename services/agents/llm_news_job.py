@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import aiohttp
@@ -41,12 +41,16 @@ _UNSCORED_SQL = f"""
     SELECT n.id, n.symbols[1] AS ticker, n.created_at, n.headline FROM stock_news n
     WHERE n.created_at > NOW() - INTERVAL '{LOOKBACK_HOURS} hours' AND cardinality(n.symbols) = 1
       AND n.symbols[1] ~ '^[A-Z]{{1,5}}$'
-      AND NOT EXISTS (SELECT 1 FROM stock_news_llm s WHERE s.news_id = n.id AND s.model = $1)
+      AND NOT EXISTS (SELECT 1 FROM stock_news_llm s WHERE s.news_id = n.id AND s.model IN ($1, $1 || '#stale'))
     ORDER BY n.created_at DESC LIMIT $2
 """
 _INSERT_SQL = """
-    INSERT INTO stock_news_llm (news_id, ticker, created_at, score, model, cutoff)
-    VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (news_id, model) DO NOTHING
+    INSERT INTO stock_news_llm (news_id, ticker, created_at, score, model, cutoff, event_type)
+    VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (news_id, model) DO NOTHING
+"""
+_HISTORY_SQL = """
+    SELECT symbols[1] AS ticker, created_at, headline FROM stock_news
+    WHERE cardinality(symbols) = 1 AND symbols[1] = ANY($1::text[]) AND created_at > $2
 """
 _WINDOW_SQL = f"""
     SELECT ticker, created_at, score FROM stock_news_llm
@@ -95,6 +99,19 @@ class LlmNewsJob:
     async def run_once(self, llm: Any) -> Dict[str, int]:
         scored = requests = 0
         rows = await self.db.query(_UNSCORED_SQL, MODEL, ln.BATCH * MAX_REQUESTS_PER_PASS) or []
+        # Near-repeats of the stock's previous headlines are recorded under the
+        # stale label and not scored (llm_news.stale_ids), so a syndicated
+        # story counts once in the 30-day mean and costs one call.
+        stale = set()
+        if rows:
+            history = await self.db.query(_HISTORY_SQL, sorted({str(r["ticker"]).upper() for r in rows}),
+                                          min(_ts(r["created_at"]) for r in rows) - timedelta(days=3)) or []
+            stale = ln.stale_ids(rows, history)
+            for r in rows:
+                if r["id"] in stale:
+                    await self.db.execute(_INSERT_SQL, int(r["id"]), str(r["ticker"]).upper(), _ts(r["created_at"]),
+                                          0, MODEL + ln.STALE_SUFFIX, self.cutoff, None)
+            rows = [r for r in rows if r["id"] not in stale]
         for k in range(0, len(rows), ln.BATCH):
             batch = rows[k:k + ln.BATCH]
             try:
@@ -108,12 +125,13 @@ class LlmNewsJob:
                 swallowed("agents.llm_news.batch", e, logger)
                 break
             requests += 1
+            kinds = ln.events(answer, len(batch))
             for i, s in ln.parse(answer, len(batch)).items():
                 r = batch[i]
                 await self.db.execute(_INSERT_SQL, int(r["id"]), str(r["ticker"]).upper(), _ts(r["created_at"]), s,
-                                      MODEL, self.cutoff)
+                                      MODEL, self.cutoff, kinds.get(i))
                 scored += 1
-        out = {"scored": scored, "requests": requests}
+        out = {"scored": scored, "requests": requests, "stale_skipped": len(stale)}
         today = datetime.now(timezone.utc).date()
         if self.raw is not None and _s(await self.raw.get(FEATURE_DAY_KEY)) != today.isoformat():
             out["feature_rows"] = await self.write_features(today)

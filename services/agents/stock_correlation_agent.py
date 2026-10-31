@@ -21,9 +21,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator
 
-from services.agents.base import InferenceBatcher, SentinelAgent, SchemaViolationError, InferenceError
+from services.agents.base import (BULLETIN_PREDICTION_HORIZON_HOURS, InferenceBatcher, SentinelAgent,
+                                 SchemaViolationError, InferenceError)
 from shared.utils.equities import asset_class, is_macro_asset, is_valid_primary_equity_async, split_macro_and_equities
 from shared.utils import fact_check
+from shared.utils import sympathy
+from shared.utils.market_cap import is_large_cap
 from shared.kafka import Topics
 from shared.utils.focus import prioritise
 from shared.utils.quote_cache import quote_key
@@ -209,11 +212,12 @@ class DynamicCorrelationAssessment(BaseModel):
     macro_asset: str
     equity_ticker: str
 
+    # The argument before the verdicts: fields are generated in this order.
+    transmission_channel: str
+    agentic_rationale: str
     correlation_type: str  # "INVERSE_MARGIN_PRESSURE", "DECOUPLING", "COMMODITY_SPIKE_EQUITY_DUMP", "FLIGHT_TO_SAFETY"
     detected_covariance: float
     conviction: float
-    transmission_channel: str
-    agentic_rationale: str
     impact_severity: str  # "LOW", "MODERATE", "SEVERE"
     sympathy_movers: List[SympathyMover] = Field(default_factory=list)
     recommended_hedging: List[str] = Field(default_factory=list)
@@ -243,20 +247,28 @@ class DynamicCorrelationBatch(BaseModel):
 
 STOCK_CORR_BATCH_SIZE = int(os.getenv("STOCK_CORR_BATCH_SIZE", "6"))
 STOCK_CORR_BATCH_WAIT_SEC = float(os.getenv("STOCK_CORR_BATCH_WAIT_SEC", "30"))
-STOCK_CORR_SYSTEM = ("You are SENTINEL Stock Correlation & Sympathy Engine. Explain the causal economic mechanisms "
-                     "behind real, computed statistical correlations and identify sympathy transmission paths. "
-                     "Return ONLY raw JSON.")
-
-
-# A stock's measured exposures to macro instruments (sector-derived or
-# statistical; method and window say which).
-_EXPOSURE_CYPHER = """
-    MATCH (e) WHERE toUpper(e.name) = $ticker OR toUpper(e.id) = $ticker
-    MATCH (e)-[r:POSITIVE_EXPOSURE_TO|INVERSE_EXPOSURE_TO|COMMODITY_EXPOSURE]->(m)
-    RETURN coalesce(m.id, m.name) AS macro, type(r) AS rel, r.weight AS weight, r.method AS method,
-           r.window AS window, r.confidence AS confidence
-    LIMIT 25
+STOCK_CORR_SYSTEM = ("You assess how a stock's measured exposure to one macro instrument bears on the stock's next "
+                     "session against the market, and which of its measured sympathy peers would move with it. Use "
+                     "only the data given; a coefficient marked unmeasured is of unknown strength. Write the "
+                     "mechanism and rationale first, then the direction. Most sessions a macro move does not move a "
+                     "stock against the market: answer neutral unless the macro move and the sign of the exposure "
+                     "together give a reason. Name sympathy movers only from the peers listed. Return ONLY raw JSON.")
+_MEASURED_EXPOSURES_SQL = "SELECT macro, beta, t, partial_corr, n FROM macro_exposures WHERE ticker = $1"
+SYMPATHY_PEERS_SHOWN = 5
+_PEERS_SQL = f"SELECT peer, corr, n FROM sympathy_peers WHERE ticker = $1 ORDER BY corr DESC LIMIT {SYMPATHY_PEERS_SHOWN}"
+# The macro instrument's last two closes, from one source: macro_daily_bars
+# (futures, yields, dollar, VIX), else the venue's daily bars (ETFs such as
+# TLT). Mixing sources could set a session against itself.
+_MACRO_CLOSES_SQL = """
+    WITH m AS (SELECT day, close FROM macro_daily_bars WHERE symbol = $1 ORDER BY day DESC LIMIT 2),
+         d AS (SELECT day, close FROM daily_bars WHERE ticker = $1 ORDER BY day DESC LIMIT 2)
+    SELECT close FROM (
+        SELECT day, close FROM m
+        UNION ALL
+        SELECT day, close FROM d WHERE NOT EXISTS (SELECT 1 FROM m)
+    ) b ORDER BY day DESC LIMIT 2
 """
+
 
 
 def macro_exposures(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -355,16 +367,47 @@ class StockCorrelationAgent(SentinelAgent):
         )
 
     async def _macro_exposures(self, ticker: str) -> List[Dict[str, Any]]:
-        """The stock's measured macro exposures from the graph, strongest first
-        (macro_exposures); [] without a graph or on failure."""
-        if not self.neo4j:
+        """The stock's measured macro exposures (macro_exposures table, from
+        shared/utils/macro_exposure.py), strongest first; [] without them.
+
+        Read from the graph, these were sector priors -- CCJ to Brent, WTI and
+        natural gas at weight 1.0 "via sector Energy" -- and ranked first as if
+        measured. A stock with no measured exposure is not assessed."""
+        if not self.db:
             return []
         try:
-            rows = await self.neo4j.query(_EXPOSURE_CYPHER, {"ticker": ticker.upper()})
+            rows = await self.db.query(_MEASURED_EXPOSURES_SQL, ticker.upper()) or []
         except Exception as e:
             swallowed("agents.stock_correlation_agent.exposures", e, logger)
             return []
-        return macro_exposures([dict(r) for r in rows or []])
+        return macro_exposures([{
+            "macro": r["macro"], "rel": "POSITIVE_EXPOSURE_TO" if float(r["beta"]) > 0 else "INVERSE_EXPOSURE_TO",
+            "weight": float(r["partial_corr"]), "method": f"daily OLS with the market, t {float(r['t']):+.1f}",
+            "window": f"{int(r['n'])} sessions",
+        } for r in rows])
+
+    async def _sympathy_peers(self, ticker: str) -> Dict[str, Dict[str, Any]]:
+        """The stock's measured sympathy peers (sympathy_job), strongest first; {} without them."""
+        if not self.db:
+            return {}
+        try:
+            rows = await self.db.query(_PEERS_SQL, ticker.upper()) or []
+        except Exception as e:
+            swallowed("agents.stock_correlation_agent.sympathy_peers", e, logger)
+            return {}
+        return {str(r["peer"]).upper(): dict(r) for r in rows}
+
+    async def _macro_move(self, macro: str) -> Optional[float]:
+        """The macro instrument's last session, close to close; None when no bars are stored."""
+        if not self.db:
+            return None
+        try:
+            rows = await self.db.query(_MACRO_CLOSES_SQL, macro) or []
+        except Exception as e:
+            swallowed("agents.stock_correlation_agent.macro_move", e, logger)
+            return None
+        closes = [float(r["close"]) for r in rows if r["close"]]
+        return closes[0] / closes[1] - 1 if len(closes) >= 2 else None
 
     async def _assess_batch(self, items: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, DynamicCorrelationAssessment]:
         """Assesses every queued pair in one inference; {pair_key: assessment}.
@@ -543,6 +586,11 @@ class StockCorrelationAgent(SentinelAgent):
             # "measured relationship" gate below was then satisfied by the
             # stock's competitor and peer edges, so the model was asked to
             # explain a macro link nobody had measured (29 Oct 2026 review).
+            # Calls only on companies of $1bn and up, checked before any inference.
+            if not await is_large_cap(self.redis, ticker):
+                dropped("agents.stock_correlation_agent.below_min_market_cap",
+                        "company under $1bn: no assessment", logger, variant="below_min_market_cap")
+                return None
             exposures = await self._macro_exposures(ticker)
             exposures = [e for e in exposures if e["macro"] in price_map
                          or await self.redis.raw.exists(quote_key(e["macro"]))]
@@ -634,20 +682,33 @@ class StockCorrelationAgent(SentinelAgent):
                     "describing a relationship as established."
                 )
 
-            user_prompt = f"""
-            Analyze the real-time market relationship between macro asset {target_macro} and equity {target_equity}.
-            Last prices, for context only: {target_macro} ${price_map.get(target_macro, 0):.2f}, {target_equity} ${price_map.get(target_equity, 0):.2f}.
-            Report macro_asset as exactly "{target_macro}" and equity_ticker as exactly "{target_equity}" -- the bare symbol, with no price, no currency and no parentheses.
-            Recent Market Event: {headline}
-            Active Market Universe Tickers: {', '.join(clean_tickers[:15])}
-            {empirical_block}
-            {cross_block}
-
-            Task Requirements:
-            1. {mechanism_task}
-            2. {grounding_task}
-            3. Return an empty sympathy_movers list: this assessment is about the macro relationship only.
-            """
+            # Flush-left: the indentation was ~40 spaces a line of hosted tokens.
+            # The universe tickers are gone (sympathy movers are out of scope),
+            # and the macro's own last move is in: a direction cannot be judged
+            # from an exposure without knowing which way the instrument went.
+            macro_move = await self._macro_move(target_macro)
+            move_line = (f"{target_macro} moved {macro_move * 100:+.2f}% over its last session"
+                         if macro_move is not None else f"{target_macro}'s last-session move: not available")
+            # Sympathy movers come from measurement (sympathy_job); the model
+            # only says which of these this channel would carry, and how.
+            peers = await self._sympathy_peers(target_equity)
+            peer_block = (f"{_nl}- Measured sympathy peers of {target_equity} (the only names allowed as movers):"
+                          f"{_nl}  - " + f"{_nl}  - ".join(sympathy.peer_lines(list(peers.values())))
+                          if peers else f"{_nl}- Measured sympathy peers: none stored")
+            user_prompt = (
+                f"Pair: macro {target_macro}, equity {target_equity}. Report macro_asset as exactly "
+                f'"{target_macro}" and equity_ticker as exactly "{target_equity}".{_nl}'
+                f"- {move_line}; last prices {target_macro} {price_map.get(target_macro, 0):.2f}, "
+                f"{target_equity} {price_map.get(target_equity, 0):.2f}{_nl}"
+                f"- Recent event: {headline}"
+                f"{empirical_block}{peer_block}{cross_block}{_nl}{_nl}"
+                f"Task:{_nl}1. {mechanism_task}{_nl}2. {grounding_task}{_nl}"
+                f"3. expected_direction: up, down or neutral for {target_equity} against the market next session, "
+                f"from the move above and the sign of the exposure; neutral when either is missing or small.{_nl}"
+                "4. sympathy_movers: the listed peers this macro channel would also move, each with direction "
+                "BULLISH or BEARISH and one sentence of reasoning; an empty list when none are listed or none "
+                "share the channel."
+            )
 
             # Batched: several pairs share one inference (_assess_batch). Each
             # pair keeps its own prompt section, which is also what its answer
@@ -659,10 +720,30 @@ class StockCorrelationAgent(SentinelAgent):
 
             if not brief:
                 return None
-            # Macro only: stock-to-stock sympathy is out of scope, and each
-            # mover became a SYMPATHY_MOVER graph edge (842 on 29 Oct) that the
-            # graph then served back as structure.
-            brief.sympathy_movers = []
+            # Movers only from the measured peers. Named freely, each became a
+            # SYMPATHY_MOVER graph edge (842 on 29 Oct, XOM's including MAR and
+            # ABNB) that the graph then served back as structure.
+            off_list = [sm.ticker for sm in brief.sympathy_movers if sm.ticker not in peers]
+            if off_list:
+                dropped("agents.stock_correlation_agent.unmeasured_mover", "sympathy mover not among the measured peers",
+                        logger, detail=", ".join(off_list)[:200])
+            brief.sympathy_movers = [sm for sm in brief.sympathy_movers if sm.ticker in peers]
+            # Each mover with a direction is a forecast too, graded apart from
+            # the agent's own calls (prediction_scoring.SIDE_STRATEGIES), so
+            # its graph edge earns a record and not only a correlation.
+            for sm in brief.sympathy_movers:
+                side = {"BULLISH": "up", "BEARISH": "down"}.get(str(sm.direction).upper())
+                if not side:
+                    continue
+                try:
+                    entry = await self._latest_price(sm.ticker)
+                    if isinstance(entry, (int, float)) and entry > 0:
+                        await self.record_prediction(
+                            ticker=sm.ticker, direction=side, conviction=_as_unit_conviction(sm.conviction),
+                            entry_price=float(entry), time_horizon_hours=BULLETIN_PREDICTION_HORIZON_HOURS,
+                            strategy=f"sympathy:{target_equity}")
+                except Exception as e:
+                    swallowed("agents.stock_correlation_agent.sympathy_forecast", e, logger)
             # Checked against what it was given (shared/utils/fact_check.py):
             # sympathy movers the prompt never named and that are not listed
             # equities are dropped; when most numbers in the rationale are not
@@ -731,13 +812,13 @@ class StockCorrelationAgent(SentinelAgent):
                                     # `coalesce(r.coefficient, r.weight)` hands
                                     # that to a model as a correlation
                                     # coefficient of 95.
-                                    "weight": _as_unit_conviction(sm.conviction),
-                                    "confidence": _as_unit_conviction(sm.conviction),
-                                    # This number came from a language model,
-                                    # not a measurement. The edge validator can
-                                    # now grade SYMPATHY_MOVER, and a grader
-                                    # needs to know which edges were asserted.
-                                    "confidence_basis": "model_asserted",
+                                    # The measured correlation (sympathy_peers),
+                                    # not the model's conviction: the peer is
+                                    # measured, the model only chose it.
+                                    "weight": _as_unit_conviction(float(peers[sm.ticker]["corr"])),
+                                    "confidence": _as_unit_conviction(float(peers[sm.ticker]["corr"])),
+                                    "confidence_basis": "measured_corr",
+                                    "method": f"excess_return_corr_{sympathy.WINDOW}d",
                                     "relationship": sm.relationship,
                                     "direction": sm.direction,
                                     "properties": {

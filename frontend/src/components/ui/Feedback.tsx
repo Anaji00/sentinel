@@ -119,7 +119,7 @@ export function FeedbackProvider({ children }: { children: React.ReactNode }) {
                 type="button"
                 onClick={() => settle(false)}
                 className="rounded-md border border-line px-3 py-1.5 text-xs
-                           text-ink-dim transition-colors hover:bg-white/5
+                           text-ink-dim transition-colors hover:bg-overlay/50
                            focus-visible:ring-1 focus-visible:ring-accent outline-none"
               >
                 Cancel

@@ -39,10 +39,11 @@ OPS = ("raw", "product", "diff", "gate")
 
 
 class Idea(BaseModel):
+    # The economic reason first: fields are generated in this order.
+    rationale: str = Field(default="", max_length=300)
     op: Literal["product", "diff", "gate"]
     a: str
     b: str
-    rationale: str = Field(default="", max_length=300)
 
 
 class Ideas(BaseModel):
@@ -189,7 +190,7 @@ def prompt(family: str, features: Mapping[str, str], board: Sequence[Mapping[str
     feats = "\n".join(f"- {k}: {v}" for k, v in features.items())
     tried = "\n".join(f"- {r['candidate']}: incremental t {r['inc_t']}" for r in board[:30]) or "- none yet"
     user = (f"Features:\n{feats}\n\nAlready tried:\n{tried}\n\n"
-            '{"ideas": [{"op": "product"|"diff"|"gate", "a": "<feature>", "b": "<feature>", "rationale": "..."}]}')
+            '{"ideas": [{"rationale": "the economic reason", "op": "product"|"diff"|"gate", "a": "<feature>", "b": "<feature>"}]}')
     return system, user
 
 

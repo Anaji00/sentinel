@@ -263,7 +263,7 @@ export default function ExplainabilityModal({
                     </div>
                     <div className="w-full bg-raised rounded-full h-2 overflow-hidden border border-line">
                       <div
-                        className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-500"
+                        className="h-full bg-accent rounded-full transition-all duration-500"
                         style={{ width: `${Math.min(100, f.contribution_pct ?? 0)}%` }}
                       />
                     </div>

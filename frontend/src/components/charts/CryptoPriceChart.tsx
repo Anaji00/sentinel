@@ -198,7 +198,7 @@ export default function CryptoPriceChart() {
                 y1="45"
                 x2="600"
                 y2="45"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.8"
               />
@@ -207,7 +207,7 @@ export default function CryptoPriceChart() {
                 y1="90"
                 x2="600"
                 y2="90"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.8"
               />
@@ -216,7 +216,7 @@ export default function CryptoPriceChart() {
                 y1="135"
                 x2="600"
                 y2="135"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.8"
               />

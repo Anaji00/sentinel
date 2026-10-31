@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 
 import { EmptyState } from '../components/ui/EmptyState';
 import { PanelSkeleton } from '../components/ui/Skeleton';
-import { PALETTE, directionColor, readToken } from '../lib/palette';
+import { PALETTE, PALETTE_HEX, directionColor, readToken } from '../lib/palette';
 
 const render = (el: React.ReactElement) => renderToStaticMarkup(el);
 
@@ -80,10 +80,14 @@ describe('one palette, one meaning per colour', () => {
     expect(directionColor(Number.NaN)).toBe(PALETTE.textMuted);
   });
 
+  it('hands out theme-following references with the literal as fallback', () => {
+    expect(PALETTE.accent).toBe(`var(--accent, ${PALETTE_HEX.accent})`);
+  });
+
   it('resolves to the literal when there is no DOM to read a token from', () => {
     // Server render has no getComputedStyle; the compiled value is the fallback
     // rather than an empty string, which would paint nothing.
-    expect(readToken('accent')).toBe(PALETTE.accent);
+    expect(readToken('accent')).toBe(PALETTE_HEX.accent);
   });
 });
 
@@ -94,15 +98,17 @@ describe('the design system is the source of colour', () => {
     // Charts set colour through SVG attributes, which CSS cannot reach, so the
     // values live in two files. Two copies of a value drift -- this is the
     // check that says so. Three different cyans were in use before this.
+    // PALETTE now hands out var() references (so charts follow the light
+    // theme); the literals it falls back to are PALETTE_HEX, checked here.
     const pairs: Array<[string, string]> = [
-      ['--accent', PALETTE.accent],
-      ['--positive', PALETTE.positive],
-      ['--negative', PALETTE.negative],
-      ['--caution', PALETTE.caution],
-      ['--info', PALETTE.info],
-      ['--bg-base', PALETTE.bgBase],
-      ['--bg-raised', PALETTE.bgRaised],
-      ['--text-primary', PALETTE.textPrimary],
+      ['--accent', PALETTE_HEX.accent],
+      ['--positive', PALETTE_HEX.positive],
+      ['--negative', PALETTE_HEX.negative],
+      ['--caution', PALETTE_HEX.caution],
+      ['--info', PALETTE_HEX.info],
+      ['--bg-base', PALETTE_HEX.bgBase],
+      ['--bg-raised', PALETTE_HEX.bgRaised],
+      ['--text-primary', PALETTE_HEX.textPrimary],
     ];
 
     for (const [token, jsValue] of pairs) {

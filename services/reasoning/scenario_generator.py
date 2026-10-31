@@ -59,12 +59,13 @@ logger = logging.getLogger("reasoning.generator")
 # More detailed than agent prompts because scenario synthesis requires broader
 # narrative reasoning across multiple domains simultaneously.
 
-SCENARIO_SYSTEM_PROMPT = """You are SENTINEL, an elite multi-domain intelligence analyst across geopolitics, maritime security, financial microstructure, cyber infrastructure, and military movements.
+SCENARIO_SYSTEM_PROMPT = """You are SENTINEL, an intelligence analyst across geopolitics, maritime security, financial microstructure, cyber infrastructure, and military movements.
 
-You are synthesizing a CONFIRMED ANOMALY CLUSTER — multi-domain correlated signals detected by SENTINEL.
+You are given a CLUSTER: signals a correlation rule matched together. A rule matching is not proof that anything is happening; most clusters have an ordinary explanation.
 
 ANALYTICAL DIRECTIVES:
 - Treat signals as probabilistic indicators; separate causal drivers from background noise.
+- When the signals allow it, one hypothesis is the ordinary one (coincidence, scheduled news, a data artifact), with the probability the evidence gives it.
 - Formulate 3 distinct hypotheses spanning baseline, alternative, and high-impact tail risks.
 - Prioritize cross-domain convergence (e.g. maritime AIS dark + insider options sweep + cyber CVE).
 - Ensure watch/deny signals specify concrete, observable events (entities, tickers, MMSI, locations, thresholds).
@@ -143,6 +144,20 @@ class GeneratedSignal(ResolutionSignal):
 _HORIZONS = frozenset({"immediate", "24h", "72h", "1week", "1month", "unknown"})
 
 
+def as_percent(value: Any) -> int:
+    """A whole percent from what a model writes for one: 45, 45.0, "45%" or a
+    fraction such as 0.45. The 120B wrote non-integers for hypothesis
+    probabilities on 5 of 12 scenarios on 30 Oct 2026; each was rejected
+    whole and re-sent, and the resend hit the per-minute token cap. Anything
+    that is not a number is still rejected."""
+    if isinstance(value, bool):
+        raise ValueError("a probability is a number")
+    x = float(str(value).strip().rstrip("%").strip()) if isinstance(value, str) else float(value)
+    if 0.0 < x < 1.0:
+        x *= 100.0
+    return int(round(min(100.0, max(0.0, x))))
+
+
 class HypothesisOutput(BaseModel):
     label:          str
     probability:    int
@@ -180,6 +195,11 @@ class HypothesisOutput(BaseModel):
         text = str(value or "").strip().lower()
         return text if text in _HORIZONS else "unknown"
 
+    @field_validator("probability", mode="before")
+    @classmethod
+    def _probability_as_percent(cls, value: Any) -> int:
+        return as_percent(value)
+
 
 class ScenarioOutput(BaseModel):
     """
@@ -192,6 +212,11 @@ class ScenarioOutput(BaseModel):
     recommended_monitoring: List[str]
     confidence_overall:     int
     confidence_rationale:   str
+
+    @field_validator("confidence_overall", mode="before")
+    @classmethod
+    def _confidence_as_percent(cls, value: Any) -> int:
+        return as_percent(value)
 
 
 # ── GENERATOR ─────────────────────────────────────────────────────────────────

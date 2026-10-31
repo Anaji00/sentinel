@@ -15,6 +15,7 @@ import { POLL } from './ui/DataProvider';
 import { useDialog } from './ui/useDialog';
 import { SimilarEvents } from './SimilarEvents';
 import { RuleVerdict } from './RuleVerdict';
+import { withinHours } from '../lib/timeWindow';
 
 // Scores arrive null on some rows; a null here crashed the whole view.
 function fixed(value: number | null | undefined, digits: number): string {
@@ -128,7 +129,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     return {
       label: 'AVIATION',
       icon: '',
-      badgeStyle: 'text-blue-400 border-blue-500/40 bg-blue-500/10',
+      badgeStyle: 'text-accent border-accent/40 bg-accent/10',
     };
   }
   if (t.includes('cyber') || t.includes('bgp') || t.includes('breach')) {
@@ -370,7 +371,7 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
     <div className="p-3 rounded-lg bg-raised/80 border border-caution/30 hover:border-caution/30 transition-all space-y-1.5">
       <div className="flex items-center justify-between">
         <span className="font-semibold text-caution text-xs flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping" />
+          <span className="h-2 w-2 rounded-full bg-caution animate-ping" />
           Rule: {c.rule_name}
         </span>
         <span className="px-2 py-0.5 rounded text-micro font-bold bg-caution/10 text-caution border border-caution/30">
@@ -435,7 +436,8 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
 });
 CorrelationCard.displayName = 'CorrelationCard';
 
-export default function IntelligenceFeed() {
+/** `windowHours` narrows the event list to recent reports (the Intel console's slider). */
+export default function IntelligenceFeed({ windowHours }: { windowHours?: number } = {}) {
   const [activeTab, setActiveTab] = useState<'events' | 'scenarios' | 'correlations'>('events');
   const [selectedDomain, setSelectedDomain] = useState<string>('all');
   const [scenarioStatus, setScenarioStatus] = useState<string>('all');
@@ -447,6 +449,9 @@ export default function IntelligenceFeed() {
   // Real-time WebSocket Live Feed connection
   const wsLiveEvents = useLiveEvents(selectedDomain);
 
+  // Every 15 s, not 5: the shared live stream pushes new events as they
+  // happen, so this is a backfill. At 5 s the Intel page polled 116 times a
+  // minute (30 October).
   // Fetch AI Scenarios with dynamic status filter
   const scenarioUrl =
     scenarioStatus === 'all'
@@ -454,26 +459,26 @@ export default function IntelligenceFeed() {
       : `/scenarios?limit=20&status=${encodeURIComponent(scenarioStatus)}`;
 
   const { data: scenarios, error: scenariosError } = useSWR<Scenario[]>(scenarioUrl, fetcher, {
-    refreshInterval: POLL.live,
+    refreshInterval: POLL.standard,
   });
 
   // Fetch Raw Correlation Clusters
   const { data: correlations, error: correlationsError } = useSWR<CorrelationCluster[]>(
     '/correlations?limit=30&min_tier=1',
     fetcher,
-    { refreshInterval: POLL.live },
+    { refreshInterval: POLL.standard },
   );
 
   // Dynamic Event domain fetches
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'tradfi' ? '/events/tradfi?limit=30' : null,
     fetcher,
-    { refreshInterval: POLL.live },
+    { refreshInterval: POLL.standard },
   );
   const { data: cryptoEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'crypto' ? '/events/crypto?limit=30' : null,
     fetcher,
-    { refreshInterval: POLL.live },
+    { refreshInterval: POLL.standard },
   );
   const { data: predictionEvents } = useSWR<NormalizedEvent[]>(
     selectedDomain === 'all' || selectedDomain === 'prediction'
@@ -505,7 +510,7 @@ export default function IntelligenceFeed() {
     if (selectedDomain === 'all' || selectedDomain === 'maritime')
       rawEvents.push(...(maritimeEvents || []));
 
-    const deduped = Array.from(new Map(rawEvents.map((e) => [e.event_id, e])).values());
+    const deduped = withinHours(Array.from(new Map(rawEvents.map((e) => [e.event_id, e])).values()), windowHours);
 
     return deduped
       .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime())
@@ -527,6 +532,7 @@ export default function IntelligenceFeed() {
     maritimeEvents,
     selectedDomain,
     searchQuery,
+    windowHours,
   ]);
 
   const mainTabs: { id: typeof activeTab; label: string; count: number }[] = [
@@ -623,7 +629,7 @@ export default function IntelligenceFeed() {
               louder version of the same words directly beneath the first -- two
               headings, one page, and an accessibility tree with two h1s. */}
           <p className="text-xs text-ink-dim flex items-center gap-2">
-            <span className="h-2.5 w-2.5 rounded-full bg-cyan-400 animate-pulse shadow-panel" />
+            <span className="h-2.5 w-2.5 rounded-full bg-accent animate-pulse shadow-panel" />
             Events, scenarios and correlation clusters, as they arrive.
           </p>
         </div>
@@ -708,7 +714,7 @@ export default function IntelligenceFeed() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {sortedEvents.length === 0 ? (
             <div className="col-span-full p-8 text-center bg-page/60 rounded-xl border border-line/80 text-ink-dim text-xs">
-              <span className="h-2 w-2 rounded-full bg-cyan-400 inline-block animate-ping mr-2" />
+              <span className="h-2 w-2 rounded-full bg-accent inline-block animate-ping mr-2" />
               Waiting for the first event. The stream is connected and quiet, which before the open
               is the correct answer.
             </div>

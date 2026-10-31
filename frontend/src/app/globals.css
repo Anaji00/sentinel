@@ -113,7 +113,9 @@
     --positive: #34d399;
     --caution: #fbbf24;
     --negative: #f87171;
-    --info: #38bdf8;
+    /* Info is a slate, not a blue. Sky (#38bdf8) sat beside the periwinkle
+       accent, so an informational badge read as something to click. */
+    --info: #9cb0c9;
 
     /* Civic watch: who is watching the public, and who profits. Its own hue,
        apart from the accent and from severity, so the platform's second half
@@ -123,7 +125,9 @@
 
     --text-primary: #eef2f8;
     --text-secondary: #a6b3c6;
-    --text-muted: #74829a;
+    /* #74829a measured 4.19:1 on overlays (popovers, dialogs), below the
+       4.5:1 minimum at the 11px it is mostly set in. This is 5.1:1 there. */
+    --text-muted: #8391a8;
 
     /* Elevation through shadow, not glow. */
     /* The `-value` suffix exists because the @theme block above aliases
@@ -158,6 +162,44 @@
     /* Mono is for figures, tickers and identifiers -- things read by column,
        compared digit by digit, or copied exactly. Prose is set in sans. */
     --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  :root {
+    color-scheme: dark;
+  }
+
+  /* The light theme: the same roles, redefined. Every component colours
+     through these tokens (a guard test keeps it that way) and charts take
+     var() references from lib/palette.ts, so this block is the whole theme.
+     Each text and severity colour is at least 4.5:1 on every light surface. */
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg-base: #f3f5f9;
+    --bg-raised: #ffffff;
+    --bg-overlay: #eef1f7;
+    --bg-inset: #e9edf4;
+
+    --border-subtle: rgba(30, 42, 70, 0.12);
+    --border-strong: rgba(30, 42, 70, 0.22);
+    --border-accent: rgba(65, 82, 201, 0.45);
+
+    --accent: #4152c9;
+    --accent-dim: rgba(65, 82, 201, 0.1);
+
+    --positive: #0b7a52;
+    --caution: #8f5b00;
+    --negative: #b42f2f;
+    --info: #52627a;
+
+    --civic: #a21c93;
+    --civic-dim: rgba(162, 28, 147, 0.1);
+
+    --text-primary: #121826;
+    --text-secondary: #3f4b60;
+    --text-muted: #5a667c;
+
+    --shadow-panel-value: 0 1px 2px rgba(15, 23, 42, 0.06), 0 4px 12px rgba(15, 23, 42, 0.06);
+    --shadow-overlay-value: 0 8px 32px rgba(15, 23, 42, 0.18);
   }
 
   body {
@@ -366,3 +408,17 @@
     }
   }
 }
+
+/* A live figure that just changed: a brief tint behind it, green up and red
+   down (useFlash). Motion that marks a real change, which the rule above
+   allows; under reduced motion the animation collapses to nothing. */
+@keyframes flash-up {
+  from { background-color: color-mix(in srgb, var(--positive) 24%, transparent); }
+  to { background-color: transparent; }
+}
+@keyframes flash-down {
+  from { background-color: color-mix(in srgb, var(--negative) 24%, transparent); }
+  to { background-color: transparent; }
+}
+.flash-up { animation: flash-up 900ms ease-out; border-radius: 4px; }
+.flash-down { animation: flash-down 900ms ease-out; border-radius: 4px; }

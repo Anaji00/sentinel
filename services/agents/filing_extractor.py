@@ -54,6 +54,11 @@ _STORED_RANKED_SQL = """
     SELECT ticker FROM factor_scores_daily WHERE horizon = 'monthly'
       AND as_of = (SELECT max(as_of) FROM factor_scores_daily WHERE horizon = 'monthly')
 """
+GUIDANCE_FEATURE = "ev_guidance"
+_UPSERT_FEATURE = """
+    INSERT INTO stock_features_daily (ticker, day, feature, value, source) VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (ticker, day, feature) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source
+"""
 _EVENTS_SQL = """
     INSERT INTO events (event_id, type, source, occurred_at, collected_at, created_at, headline, summary, tags,
                         primary_entity_id, financial_data, anomaly_score, region)
@@ -162,14 +167,32 @@ class FilingExtractor:
         if "2.02" in items:
             exhibit = urls.get(picked["release"] or "")
             passage = fx.guidance_passages(await self._text(session, exhibit)) if exhibit else ""
+            clear = fx.clear_direction(passage) if passage else None
             if not passage:
                 out = {"kind": "guidance", "direction": "none", "evidence": ""}
+            elif clear:
+                # Said outright ("raises full-year guidance"): read by pattern, no model call.
+                out = {"kind": "guidance", "direction": clear[0], "evidence": clear[1][:300], "method": "pattern"}
             elif self._llm_budget():
                 self._llm_calls.append(time.time())
                 got = await llm.infer(fx.GUIDANCE_SYSTEM, passage, fx.Guidance, temperature=0.0)
-                out = {"kind": "guidance", "direction": got.direction, "evidence": got.evidence[:300]}
+                if not fx.grounded(got, passage):
+                    # A guidance change the release does not say is not recorded as one.
+                    dropped("agents.filing_extractor.ungrounded", "guidance quote not in the release", logger,
+                            detail=got.direction)
+                    got = fx.Guidance(evidence="", direction="none")
+                direction = got.direction
+                if not fx.direction_supported(direction, got.evidence):
+                    # Guidance given, no change in the words: recorded as stated.
+                    dropped("agents.filing_extractor.unsupported_change", "a raise or cut the quote does not state",
+                            logger, detail=direction)
+                    direction = "stated"
+                out = {"kind": "guidance", "direction": direction, "evidence": got.evidence[:300], "method": "model"}
             else:
                 return False, None                    # over budget: read next pass
+            # The size of a raise or cut, when the sentence gives the new and prior figures.
+            if out["direction"] in ("raised", "lowered"):
+                out["change_pct"] = fx.change_pct(out["evidence"])
         elif "3.02" in items:
             main = urls.get(picked["body"] or "")
             shares = fx.offered_shares(await self._text(session, main)) if main else None
@@ -212,6 +235,16 @@ class FilingExtractor:
                                   0.6 if out.get("direction") in ("raised", "lowered") or "offering_large" in tags else 0.3)
         except Exception as exc:
             swallowed("agents.filing_extractor.write", exc, logger)
+        # A raise or a cut as a trial feature for the researcher's screen: its
+        # size when the release gives the figures, else +1 / -1.
+        if out["kind"] == "guidance" and out.get("direction") in ("raised", "lowered"):
+            sign = 1.0 if out["direction"] == "raised" else -1.0
+            value = out.get("change_pct") if out.get("change_pct") is not None else sign
+            try:
+                await self.db.execute(_UPSERT_FEATURE, ticker, created.date(), GUIDANCE_FEATURE, float(value),
+                                      fx.EXTRACT_SOURCE)
+            except Exception as exc:
+                swallowed("agents.filing_extractor.feature", exc, logger)
 
 
 __all__ = ["FilingExtractor"]

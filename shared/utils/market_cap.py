@@ -30,7 +30,7 @@ board is sparse until the backfill has run; the alternative is a board that
 makes a claim it cannot support.
 """
 
-from typing import Optional
+from typing import Any, Dict, Iterable, Optional, Set
 
 # A week. Market capitalisation moves with the share price, so this is
 # deliberately stale-tolerant: the gate asks "is this a billion-dollar company",
@@ -159,7 +159,72 @@ async def store_market_cap(
         return
 
 
+# Every stock's best-known capitalisation (USD), rebuilt by market_cap_job: shares
+# outstanding (SEC, else the vendor) times the latest close, or the Finnhub
+# figure above, whichever is larger. The Finnhub cache alone left 324 of the
+# 999 ranked stocks unresolved (HD, CRM, COF among them, 30 Oct 2026), and an
+# SEC share count can cover one class only (BRK.B read $0.78bn), so neither
+# source decides alone. Missing from this hash means unknown, which is not large.
+CAPS_KEY = "sentinel:marketcap:best"
+CAPS_TTL_SEC = 3 * 86400
+
+
+def best_cap(computed: Optional[float], cached: Optional[float]) -> Optional[float]:
+    """The larger of the two estimates: one share class or a stale count can make
+    the computed figure too small, rarely too large."""
+    vals = [v for v in (computed, cached) if v is not None and v > 0]
+    return max(vals) if vals else None
+
+
+async def large_caps(redis_client: Any, min_usd: float = DEFAULT_MIN_MARKET_CAP_USD) -> Optional[Set[str]]:
+    """Tickers whose best-known capitalisation is at least min_usd, or None when
+    the table is missing: a caller must not read that as "every stock qualifies"."""
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        table: Dict[Any, Any] = await raw.hgetall(CAPS_KEY) or {}
+    except Exception:
+        return None
+    if not table:
+        return None
+    out = set()
+    for k, v in table.items():
+        try:
+            if float(v.decode() if isinstance(v, bytes) else v) >= min_usd:
+                out.add((k.decode() if isinstance(k, bytes) else str(k)).upper())
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def is_large_cap(redis_client: Any, ticker: str, min_usd: float = DEFAULT_MIN_MARKET_CAP_USD) -> bool:
+    """True when the stock's best-known capitalisation is at least min_usd; an
+    unknown or unreadable one is False."""
+    try:
+        raw = getattr(redis_client, "raw", redis_client)
+        v = await raw.hget(CAPS_KEY, str(ticker).upper())
+        return v is not None and float(v.decode() if isinstance(v, bytes) else v) >= min_usd
+    except Exception:
+        return False
+
+
+def cap_rows(computed: Dict[str, float], cached: Dict[str, Optional[float]],
+             tickers: Iterable[str]) -> Dict[str, float]:
+    """{ticker: best cap} for every ticker with at least one estimate."""
+    out = {}
+    for t in tickers:
+        b = best_cap(computed.get(t), cached.get(t))
+        if b is not None:
+            out[t] = b
+    return out
+
+
 __all__ = [
+    "CAPS_KEY",
+    "CAPS_TTL_SEC",
+    "best_cap",
+    "cap_rows",
+    "is_large_cap",
+    "large_caps",
     "DEFAULT_MIN_MARKET_CAP_USD",
     "MARKET_CAP_PREFIX",
     "MARKET_CAP_TTL_SEC",

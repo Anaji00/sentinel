@@ -113,7 +113,11 @@ export function TradeIdeas() {
     : [];
 
   return (
-    <section className="rounded-2xl border border-line bg-raised p-4 sm:p-5 space-y-4">
+    // No frame of its own: the cards are the raised objects. A panel around
+    // raised cards drew two borders and two paddings around every card.
+    // Container queries: the cards sit in the Calls workspace's middle column,
+    // about half the window, so window breakpoints laid out four cards in it.
+    <section className="@container space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-head font-semibold text-ink">Today&apos;s calls</h2>
@@ -151,7 +155,7 @@ export function TradeIdeas() {
       {error ? (
         <p className="text-ink-mute">Ideas could not be read.</p>
       ) : !data ? (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 @md:grid-cols-2 @4xl:grid-cols-4">
           {[0, 1, 2, 3].map((n) => (
             <div key={n} className="h-64 rounded-2xl border border-line bg-inset animate-pulse" />
           ))}
@@ -186,7 +190,7 @@ export function TradeIdeas() {
           {h.withheld && (
             <p className="text-xs text-ink-mute">No calls for this holding period. {h.withheld}.</p>
           )}
-          <div className="grid gap-5 lg:grid-cols-2">
+          <div className="grid gap-5 @4xl:grid-cols-2">
             {columns.map((c) => (
               <div key={c.title} className="space-y-3">
                 <div className="flex items-baseline justify-between gap-2">
@@ -200,7 +204,7 @@ export function TradeIdeas() {
                     None for this holding period.
                   </p>
                 ) : (
-                  <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-3 @md:grid-cols-2">
                     {c.ideas.map((i) => (
                       <IdeaCard
                         key={`${i.ticker}-${i.direction}`}

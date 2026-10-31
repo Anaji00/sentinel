@@ -20,25 +20,19 @@ import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard,
   ShieldAlert,
-  TrendingUp,
-  Bitcoin,
-  Map,
   LineChart,
   Gauge,
-  Wallet,
   Search,
   ScrollText,
-  FolderOpen,
   Crosshair,
   Bot,
   FileText,
   BookOpen,
   PanelLeftClose,
   PanelLeftOpen,
-  Zap,
-  Grid3x3,
   Eye,
   Wrench,
+  Landmark,
 } from 'lucide-react';
 
 import { useNav } from './NavContext';
@@ -62,62 +56,35 @@ interface NavGroup {
 
 const NAV_GROUPS: NavGroup[] = [
   {
-    // The platform's two halves start here: markets (Home) and civic watch.
     label: 'Overview',
-    items: [
-      { href: '/', label: 'Home', icon: LayoutDashboard },
-      // Watching the watchers: who surveils the public, and how to push back.
-      // One entry, not five: its sections (#feed, #accountability, #money,
-      // #protect) were five sidebar doors into one page, which already has
-      // its own tabs for them. The command palette still opens each by name.
-      { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
-      { href: '/map', label: 'World Map', icon: Map },
-    ],
+    items: [{ href: '/', label: 'Home', icon: LayoutDashboard }],
   },
   {
-    // What to do today: the calls, the evidence behind them, one stock.
-    label: 'Stocks',
-    items: [
-      // Every agent call on a stock, open and resolved, with its record.
-      { href: '/predictions', label: 'Stock Calls', icon: Crosshair },
-      // Every anomalous ticker with every signal, counted by evidence tier.
-      { href: '/board', label: 'Signal Board', icon: Grid3x3 },
-      // Signals only from families the reaction study has proven.
-      { href: '/signals', label: 'Trade Signals', icon: Zap },
-      // Stored bars, 13F consensus and the covered-call gate: three
-      // unreachable routes answering one question about one symbol.
-      { href: '/ticker', label: 'Look Up a Stock', icon: Search },
-    ],
-  },
-  {
-    // How the calls have done: the portfolio, every source's record, the tests.
-    label: 'Track Record',
-    items: [
-      // Positions, cash and one-day risk, and every source graded on prices.
-      { href: '/book', label: 'Portfolio & Record', icon: Wallet },
-      // Backtests and what drives signals: one page, two views.
-      { href: '/strategies', label: 'Research', icon: Gauge },
-    ],
-  },
-  {
+    // Eleven pages became four: Calls (stock calls, signal board, trade
+    // signals), Markets (markets & economy, crypto, options & flow),
+    // Performance (portfolio & record, research) and Intel below. Each old
+    // address redirects to its view; see next.config.ts.
     label: 'Markets',
     items: [
-      // Charts and the economy: one page, two views.
-      { href: '/charts', label: 'Markets & Economy', icon: LineChart },
-      // Options activity and big-money flow: one page, three views.
-      { href: '/options', label: 'Options & Flow', icon: TrendingUp },
-      { href: '/crypto', label: 'Crypto', icon: Bitcoin },
+      { href: '/calls', label: 'Calls', icon: Crosshair },
+      { href: '/markets', label: 'Markets', icon: LineChart },
+      // Any ticker also opens the stock drawer in place (?t=); this is the full page.
+      { href: '/ticker', label: 'Look Up a Stock', icon: Search },
       { href: '/filings', label: 'Filings & Fund Holdings', icon: FileText },
+      { href: '/performance', label: 'Performance', icon: Gauge },
     ],
   },
   {
     label: 'Intelligence',
     items: [
-      // News & alerts and open-source intel: one page, two views.
-      { href: '/intelligence', label: 'News & Intel', icon: ShieldAlert },
+      // News & intel, the world map and investigations, on one time window.
+      { href: '/intel', label: 'Intel', icon: ShieldAlert },
+      // Who owns the companies, who owns the owners, and who pays whom.
+      { href: '/money', label: 'Follow the Money', icon: Landmark, civic: true },
+      // Watching the watchers: who surveils the public, and how to push back.
+      // One entry, not five: its sections have their own tabs on the page.
+      { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
       { href: '/agents', label: 'AI Analysts', icon: Bot },
-      // Cases and briefs: one page, two views.
-      { href: '/cases', label: 'Investigations', icon: FolderOpen },
     ],
   },
   {

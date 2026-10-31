@@ -148,7 +148,7 @@ export default function MoversBoard() {
         {data?.movers.map((m) => (
           <div
             key={m.ticker}
-            className="px-3.5 py-2 border-b border-white/5 hover:bg-white/[0.02] transition-colors"
+            className="px-3.5 py-2 border-b border-line hover:bg-ink/[0.02] transition-colors"
           >
             <div className="flex items-baseline justify-between gap-2">
               <div className="flex items-baseline gap-2 min-w-0">

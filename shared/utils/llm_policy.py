@@ -25,14 +25,15 @@ from typing import FrozenSet
 # Cut entirely.
 #   adversarial_wargamer:  persona simulations published only to telemetry
 #                          storage; nothing in trading, alerting or the UI reads them.
-#   rule_synthesizer:      writes correlation rules the engine runs live with no
-#                          backtest; its syn_1 fired 28 tier-3 alerts on 5 October.
 #   knowledge_graph_engine: model-extracted entities and triples from news; the
 #                          enrichment tier already maps headlines to tickers,
 #                          sectors and zones deterministically.
+# rule_synthesizer was cut here (its syn_1 fired 28 tier-3 alerts on 5 October,
+# live with no grade) and runs again since 30 Oct 2026: its rules are on
+# probation (shared/utils/rule_probation.py), capped at WATCH and graded on
+# prices before they carry any tier, at most RULE_SYNTH_DAILY_CAP a day.
 DEFAULT_AGENTS_DISABLED = frozenset({
     "adversarial_wargamer",
-    "rule_synthesizer",
     "knowledge_graph_engine",
 })
 

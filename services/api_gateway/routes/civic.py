@@ -20,7 +20,8 @@ import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-from services.api_gateway.dependencies import get_db_optional
+from services.api_gateway.dependencies import get_db_optional, get_redis_optional
+from shared.utils.response_cache import cache_key, cached_json
 from shared.utils import surveillance as sv
 from shared.utils.quiet_failures import swallowed
 from shared.utils.rbac import Role, require_role
@@ -91,9 +92,16 @@ def _plain(r: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/summary")
-async def summary(db=Depends(get_db_optional),
+async def summary(db=Depends(get_db_optional), redis=Depends(get_redis_optional),
                   user: Dict[str, Any] = Depends(require_role(Role.VIEWER))) -> Dict[str, Any]:
-    """Totals: mapped devices by kind and maker; agencies by technology, vendor and state."""
+    """Totals: mapped devices by kind and maker; agencies by technology, vendor and state.
+
+    Cached five minutes: up to 1.3 s to compute, and the totals move daily."""
+    return await cached_json(getattr(redis, "raw", None), cache_key("civic_summary"),
+                             lambda: _summary(db), ttl=300, max_stale=86400)
+
+
+async def _summary(db) -> Dict[str, Any]:
     out: Dict[str, Any] = {"totals": {}}
     if not db:
         return out
@@ -683,8 +691,14 @@ _FEED_CIVIC_SQL = """
 
 @router.get("/feed")
 async def feed(days: int = Query(30, ge=1, le=365), state: Optional[str] = Query(None, min_length=2, max_length=2),
-               db=Depends(get_db_optional),
+               db=Depends(get_db_optional), redis=Depends(get_redis_optional),
                user: Dict[str, Any] = Depends(require_role(Role.VIEWER))) -> Dict[str, Any]:
+    """Cached five minutes per window and state: 2-3 s to compute (30 October)."""
+    return await cached_json(getattr(redis, "raw", None), cache_key("civic_feed", days=days, state=state),
+                             lambda: _feed(days, state, db), ttl=300, max_stale=86400)
+
+
+async def _feed(days: int, state: Optional[str], db) -> Dict[str, Any]:
     """What is changing in surveillance: news about it (precise topics, curated
     civil-liberties sources), and changes in the civic data -- new findings,
     dropped or new Flock portals, drone waivers, federal awards, newly

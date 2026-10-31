@@ -29,31 +29,33 @@ export const Badge: React.FC<BadgeProps> = ({
       bg: 'bg-negative/10',
       text: 'text-negative',
       border: 'border-negative/30',
-      dot: 'bg-rose-500',
+      dot: 'bg-negative',
     },
     success: {
       bg: 'bg-positive/10',
       text: 'text-positive',
       border: 'border-positive/30',
-      dot: 'bg-emerald-400',
+      dot: 'bg-positive',
     },
     warning: {
       bg: 'bg-caution/10',
       text: 'text-caution',
       border: 'border-caution/30',
-      dot: 'bg-amber-400',
+      dot: 'bg-caution',
     },
+    // The info token, not the accent: a blue informational badge read as
+    // something to click.
     info: {
-      bg: 'bg-sky-950/60',
-      text: 'text-sky-400',
-      border: 'border-sky-500/40',
-      dot: 'bg-sky-400',
+      bg: 'bg-info/10',
+      text: 'text-info',
+      border: 'border-info/40',
+      dot: 'bg-info',
     },
     neutral: {
       bg: 'bg-overlay/60',
       text: 'text-ink-dim',
       border: 'border-line-strong/50',
-      dot: 'bg-slate-400',
+      dot: 'bg-ink-mute',
     },
   };
 

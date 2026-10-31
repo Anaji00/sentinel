@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import logging
 from typing import List, Dict, Optional, Any, Union
@@ -18,6 +19,9 @@ from shared.utils.rule_feedback import (
     should_deprecate,
 )
 from shared.utils.quiet_failures import dropped
+from shared.utils import producer_grades as pg
+from shared.utils import rule_probation
+from shared.utils.signal_store import PRODUCER_GRADES_KEY
 from shared.models.correlation_rules import (
     CLAUSE_KEYS,
     is_seed_rule,
@@ -242,6 +246,20 @@ _ONE_OFF_NAME_TOKENS = {
 
 # The active synthetic set is held at this size. See _enforce_rule_ceiling.
 MAX_ACTIVE_SYNTHETIC_RULES = 40
+# A probation rule's life, and how far a graded-in one is extended each prune
+# pass. Seven days (DynamicRule's default) ended every rule before the grader's
+# ten alert days could judge it.
+PROBATION_DAYS = 30
+# Model-written rules a day, across every trigger.
+SYNTH_DAILY_CAP = int(os.getenv("RULE_SYNTH_DAILY_CAP", "6"))
+SYNTH_DAY_KEY = "sentinel:rule_synth:day:{day}"
+# The ranked queue of synthesis contexts, the slot that spaces syntheses, and
+# how many contexts one synthesis reads.
+SYNTH_QUEUE_KEY = "sentinel:rule_synth:queue"
+SYNTH_QUEUE_MAX = 50
+SYNTH_SLOT_KEY = "sentinel:rule_synth:slot"
+SYNTH_SLOT_SEC = int(os.getenv("RULE_SYNTH_SLOT_SEC", str(4 * 3600)))
+SYNTH_CONTEXTS = 4
 
 _FALLBACK_REGIONS = (
     "strait of hormuz", "strait of malacca", "turkish straits", "black sea",
@@ -261,6 +279,28 @@ def _region_in_name(rule_name):
     for r in known:
         if r and str(r).lower() in low:
             return str(r).lower()
+    return None
+
+
+# Upper-case words a pattern's name may carry that are not one instrument.
+_GENERIC_ACRONYMS = {
+    "CPI", "PPI", "GDP", "NFP", "FOMC", "OPEC", "SEC", "ETF", "ETFS", "IPO", "OTC", "FX", "M&A",
+    "US", "USA", "EU", "UK", "AIS", "ADS", "BGP", "DNS", "DEX", "CEX", "AI", "LNG", "API",
+}
+_INSTRUMENT_TOKEN = re.compile(r"^(?:[A-Z]{2,5}|[A-Z]{2,6}(?:USDT|USD|PERP))$")
+
+
+def _instrument_in_name(rule_name):
+    """An instrument a rule name claims ("MSFT", "BTC", "ETHUSDT"), if any.
+
+    A clause can filter on a region but never on one name, so a rule titled for
+    one stock matches every stock: on 30 Oct 2026 "MSFT Headline-Equity Block
+    Convergence" was written with a same_entity join over any headline.
+    """
+    for tok in (rule_name or "").replace("‑", " ").replace("-", " ").split():
+        t = tok.strip(".,:;()&'")
+        if _INSTRUMENT_TOKEN.match(t) and t not in _GENERIC_ACRONYMS:
+            return t
     return None
 
 
@@ -298,6 +338,13 @@ def _is_reusable_rule(rule):
         return (
             "rule_name claims region " + repr(named_region) +
             " but no clause filters on it; it would match everywhere"
+        )
+
+    named_instrument = _instrument_in_name(rname)
+    if named_instrument:
+        return (
+            "rule_name names instrument " + repr(named_instrument) +
+            " but a rule cannot filter on one name; it would match every name"
         )
 
     # A cross-domain clause that declares no join.
@@ -653,8 +700,34 @@ class RuleSynthesizerAgent(SentinelAgent):
             buffer_score = _message_score(message.get("assessment") or {})
         else:
             buffer_score = None
+        # Batched: every trigger's context waits in a ranked queue, and one
+        # synthesis every SYNTH_SLOT_SEC takes the strongest SYNTH_CONTEXTS of
+        # them. The daily cap went to whichever triggers arrived first after
+        # midnight UTC (30 Oct 2026: six by 01:00, then 29 turned away).
+        priority = float(message.get("times_seen") or 0) if message.get("type") == "rule_candidate" \
+            else float(buffer_score or 0.0)
+        await self._enqueue(prompt_context, priority)
+        if await self.redis.raw.exists(SYNTH_SLOT_KEY):
+            dropped("agents.rule_synthesizer.queued", "held in the queue for the next synthesis slot", self.logger)
+            return
         if not await self.capacity_or_defer(message, score=buffer_score):
             return
+        if not await self.redis.raw.set(SYNTH_SLOT_KEY, "1", nx=True, ex=SYNTH_SLOT_SEC):
+            dropped("agents.rule_synthesizer.queued", "another trigger took this synthesis slot", self.logger)
+            return
+        contexts = await self._take(SYNTH_CONTEXTS)
+        if not contexts:
+            dropped("agents.rule_synthesizer.empty_queue", "a synthesis slot with nothing queued", self.logger)
+            return
+        prompt_context = (contexts[0] if len(contexts) == 1 else
+                          "Observations since the last pass, strongest first. Rules may draw on any of them:"
+                          + "".join(f"{chr(10)}{chr(10)}[{i + 1}] {c}" for i, c in enumerate(contexts)))
+        # Counted before the call, so concurrent triggers cannot both pass.
+        day_key = SYNTH_DAY_KEY.format(day=datetime.now(timezone.utc).date().isoformat())
+        if int(await self.redis.raw.incr(day_key)) > SYNTH_DAILY_CAP:
+            dropped("agents.rule_synthesizer.daily_cap", f"over {SYNTH_DAILY_CAP} syntheses today", self.logger)
+            return
+        await self.redis.raw.expire(day_key, 2 * 86400)
 
         observed_types, existing_rules = await _observed_vocabulary(self)
         vocabulary = ", ".join(observed_types) if observed_types else "none measured"
@@ -677,6 +750,9 @@ else can never match and will be rejected:
 DIRECTIVES:
 Synthesize up to 3 correlation rules. A rule earns its place by describing a
 convergence that the listed event types can actually express.
+- Name the pattern, never one company, coin or ticker ("Headline to Options
+  Flow", not "MSFT Headline to Options Flow"): a rule cannot filter on a
+  single name, so it fires for every name.
 - conditions.min_anomaly is required and must be above 0. A rule without one
   fires on every matching event and is noise.
 - correlations must not be empty. An empty list means the rule corroborates
@@ -764,27 +840,42 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
 
                     # The namespace has no ceiling of its own: rule ids are
                     # minted faster than the prune cycle can retire them.
+                    # On probation (shared/utils/rule_probation.py): an id from
+                    # its definition, so rules stop overwriting the prompt's
+                    # example "syn_1"; capped at WATCH by the engine until its
+                    # family is graded; alive long enough to be graded at all.
+                    body = rule.model_dump()
+                    body["rule_id"] = rule_probation.synth_rule_id(body)
+                    if await self.redis.raw.hexists("sentinel:correlation:dynamic_rules", body["rule_id"]):
+                        dropped("agents.rule_synthesizer.duplicate", "an identical rule is already live",
+                                self.logger, detail=body["rule_id"])
+                        continue
+                    body["probation"] = True
+                    body["expires_at"] = int(datetime.now(timezone.utc).timestamp()) + PROBATION_DAYS * 86400
+
+                    # The namespace has no ceiling of its own: rule ids are
+                    # minted faster than the prune cycle can retire them.
                     await self._enforce_rule_ceiling()
 
-                    rule_json = json.dumps(rule.model_dump())
-                    
-                    # Store in HASH mapping rule_id -> rule_json (7-day auto-expiry timestamp included)
-                    await self.redis.raw.hset("sentinel:correlation:dynamic_rules", rule.rule_id, rule_json)
-                    
+                    rule_json = json.dumps(body)
+
+                    # Store in HASH mapping rule_id -> rule_json (expiry timestamp included)
+                    await self.redis.raw.hset("sentinel:correlation:dynamic_rules", body["rule_id"], rule_json)
+
                     # Publish for hot-reloading in correlation engine
                     await self.redis.raw.publish("sentinel:correlation:rule_updates", rule_json)
-                    
-                    self.logger.info(f"Deployed new synthetic rule: {rule.rule_id} - {rule.rule_name}")
-                    
+
+                    self.logger.info(f"Deployed new synthetic rule on probation: {body['rule_id']} - {rule.rule_name}")
+
                     if self._producer:
                         # 1. Publish to RULES_SYNTHESIZED
-                        await self._producer.send(Topics.RULES_SYNTHESIZED, rule.model_dump(), key=rule.rule_id)
+                        await self._producer.send(Topics.RULES_SYNTHESIZED, body, key=body["rule_id"])
 
                         # 2. Emit Telemetry
                         await self._producer.send(Topics.TELEMETRY, {
                             "agent": "rule_synthesizer",
                             "event": "rule_created",
-                            "rule_id": rule.rule_id,
+                            "rule_id": body["rule_id"],
                             "rule_name": rule.rule_name,
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
@@ -917,6 +1008,9 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
                     # the rule hash.
                     swallowed("agents.rule_agent.unparseable_stored_rule", _exc, self.logger)
                 decoded[rid] = rjson
+            # Probation rules are judged on prices, not by a model reading
+            # their names; only what is left goes to the model below.
+            decoded = await self._prune_by_grades(decoded)
             if not decoded:
                 return
             await self.mark_processed("rule_prune_pass", window_seconds=self.PRUNE_COOLDOWN_SEC)
@@ -924,6 +1018,52 @@ Return raw JSON matching the RuleList schema. One complete rule, for shape:
             await self._evaluate_and_prune_rules(decoded, current_context)
         except Exception as e:
             self.logger.warning("Rule prune pass skipped: %s", e)
+
+    async def _enqueue(self, context: str, priority: float) -> None:
+        """Holds one trigger's context for the next synthesis; the queue keeps
+        its SYNTH_QUEUE_MAX strongest, and a repeat only raises its rank."""
+        if not context:
+            return
+        raw = self.redis.raw
+        await raw.zadd(SYNTH_QUEUE_KEY, {context: priority}, gt=True)
+        await raw.zremrangebyrank(SYNTH_QUEUE_KEY, 0, -(SYNTH_QUEUE_MAX + 1))
+        await raw.expire(SYNTH_QUEUE_KEY, 2 * 86400)
+
+    async def _take(self, k: int) -> List[str]:
+        """Removes and returns the k strongest queued contexts."""
+        popped = await self.redis.raw.zpopmax(SYNTH_QUEUE_KEY, k) or []
+        return [m.decode() if isinstance(m, bytes) else str(m) for m, _ in popped]
+
+    async def _prune_by_grades(self, decoded: Dict[str, str]) -> Dict[str, str]:
+        """Remove probation rules the grader retired, extend those it graded in;
+        returns the rules that are not on probation, for the model pass."""
+        rules: Dict[str, Dict[str, Any]] = {}
+        for rid, rjson in decoded.items():
+            try:
+                rules[rid] = json.loads(rjson)
+            except (ValueError, TypeError):
+                continue
+        probation = {rid: r for rid, r in rules.items() if r.get("probation")}
+        if not probation:
+            return decoded
+        try:
+            blob = await self.redis.raw.get(PRODUCER_GRADES_KEY)
+            grades = json.loads(blob) if blob else None
+        except Exception as e:
+            swallowed("agents.rule_agent.grades", e, self.logger)
+            return {rid: v for rid, v in decoded.items() if rid not in probation}
+        for rid in rule_probation.graded_out(probation, grades):
+            await self.redis.raw.hdel("sentinel:correlation:dynamic_rules", rid)
+            await self.redis.raw.publish("sentinel:correlation:rule_updates", json.dumps({"rule_id": rid, "deprecated": True}))
+            self.logger.info("Removed probation rule %s: its family is graded uninformative on prices.", rid)
+        flagging = pg.move_flagging_families(grades)
+        until = int(datetime.now(timezone.utc).timestamp()) + PROBATION_DAYS * 86400
+        for rid, r in probation.items():
+            if pg.rule_family(str(r.get("rule_name") or "")) in flagging and int(r.get("expires_at") or 0) < until:
+                r["expires_at"] = until
+                await self.redis.raw.hset("sentinel:correlation:dynamic_rules", rid, json.dumps(r))
+                await self.redis.raw.publish("sentinel:correlation:rule_updates", json.dumps(r))
+        return {rid: v for rid, v in decoded.items() if rid not in probation}
 
     async def _evaluate_and_prune_rules(self, active_rules: Dict[str, str], current_context: str) -> None:
         """

@@ -7,8 +7,8 @@ validation gates and probability calibration curves before signals are trusted l
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Any, List
+from fastapi import APIRouter, Depends
 from shared.utils.rbac import require_role, Role
 from pydantic import BaseModel, Field, field_validator
 
@@ -20,6 +20,8 @@ from services.reasoning.strategy_backtester import (
 
 logger = logging.getLogger("api-gateway.backtest")
 from shared.utils.rates import risk_free_rate
+from shared.utils.quiet_failures import swallowed
+from shared.utils.response_cache import cache_key, cached_json
 
 router = APIRouter(prefix="/api/v1/backtest", tags=["Strategy Backtesting & Model Validation"])
 
@@ -73,6 +75,12 @@ async def run_strategy_backtest(
         # at a hardcoded 4.5%.
         risk_free=(await risk_free_rate(redis))[0],
     )
+    # The list is cached; drop it so the run just made shows up at once.
+    if redis:
+        try:
+            await redis.raw.delete(cache_key("backtest_results"))
+        except Exception as e:
+            swallowed("api_gateway.routes.backtest.invalidate", e, logger)
     return report
 
 
@@ -80,7 +88,26 @@ async def run_strategy_backtest(
 async def get_all_backtest_results(redis=Depends(get_redis_optional), db=Depends(get_db_optional)):
     """
     Returns the latest backtest performance summaries and validation gate statuses across strategies.
+
+    Cached ten minutes: listing the results scans the whole keyspace, 3.7 s
+    measured on 30 October.
     """
+    return await cached_json(getattr(redis, "raw", None), cache_key("backtest_results"),
+                             lambda: _backtest_results(redis, db), ttl=600, max_stale=86400)
+
+
+# Per-trade detail the summary table never shows: 2.7 MB of the 3.6 MB list
+# across 653 results on 30 October. /results/{strategy_id} still returns it.
+LIST_OMITS = ("recent_trades", "equity_curve")
+
+
+def _summary(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+    return {k: v for k, v in result.items() if k not in LIST_OMITS}
+
+
+async def _backtest_results(redis, db) -> List[Any]:
     results = []
     if redis:
         try:
@@ -107,7 +134,7 @@ async def get_all_backtest_results(redis=Depends(get_redis_optional), db=Depends
             )
             results.append(rep)
 
-    return results
+    return [_summary(r) for r in results]
 
 
 @router.get("/results/{strategy_id}")

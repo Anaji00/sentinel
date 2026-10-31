@@ -220,6 +220,29 @@ MCAP_KEY = "sentinel:mcap_usd:{ticker}"         # USD market cap, from Finnhub's
 FILER_KEY = "sentinel:ownership:filer:{filer_id}"
 
 
+def index_entries(blob: Dict[str, object]) -> List[Tuple[str, Dict[str, object]]]:
+    """(ticker, holder record) for each position in a stored filer blob: what
+    the per-company holders index (HOLDERS_KEY) should hold for this filer.
+
+    The index used to be written one company at a time between graph writes,
+    so a timeout part-way left it covering ~100 of a filer's ~500 companies
+    (Apple, Walmart and Amazon among the missing) while the blob was complete.
+    Deriving it from the blob lets it be rewritten in one go, and repaired.
+    """
+    period = blob.get("period")
+    name = blob.get("name")
+    out: List[Tuple[str, Dict[str, object]]] = []
+    for h in blob.get("holdings") or []:  # type: ignore[union-attr]
+        ticker = str(h.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        out.append((ticker, {
+            "filer": name, "shares": h.get("shares"), "value_usd": h.get("value_usd"),
+            "pct_outstanding": h.get("pct_outstanding"), "period": h.get("period") or period,
+        }))
+    return out
+
+
 async def read_holders(raw, ticker: str) -> Dict[str, Dict[str, object]]:
     """{filer_id: {filer, shares, value_usd, pct_outstanding, period}} for a ticker."""
     import json

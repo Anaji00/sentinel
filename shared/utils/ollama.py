@@ -1255,7 +1255,7 @@ class OllamaClient:
                         raw_text = await self._call_ollama(
                             full_prompt, temperature, active_model,
                             format=(schema_dict if attempt == 0 else "json"),
-                            num_predict=num_predict, exclude_models=visited,
+                            num_predict=num_predict, exclude_models=visited, system=system_prompt,
                         )
                         # Read here, with no await between the call returning and
                         # this line, so nothing else can run in between.
@@ -1426,7 +1426,8 @@ class OllamaClient:
         for attempt in range(max_retries):
             try:
                 async with semaphore:
-                    return await self._call_ollama(full_prompt, temperature, active_model, num_predict=num_predict, exclude_models=visited)
+                    return await self._call_ollama(full_prompt, temperature, active_model, num_predict=num_predict,
+                                                   exclude_models=visited, system=system_prompt)
             except (InferenceError, asyncio.TimeoutError) as inf_err:
                 logger.warning(f"Raw Ollama attempt {attempt+1} ({active_model}) failed/timed out: {inf_err}")
 
@@ -1457,7 +1458,7 @@ class OllamaClient:
                 
         raise InferenceError(f"Raw inference failed after {max_retries} attempts.")
         
-    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[Union[str, dict]] = None, num_predict: Optional[int] = None, exclude_models: Optional[set] = None) -> str:
+    async def _call_ollama(self, prompt: str, temperature: float, active_model: str, format: Optional[Union[str, dict]] = None, num_predict: Optional[int] = None, exclude_models: Optional[set] = None, system: Optional[str] = None) -> str:
         import time as _time
 
         # A hosted route first, when one is configured for this model
@@ -1465,8 +1466,12 @@ class OllamaClient:
         # unavailable, and the local model answers as before; a model named
         # "provider/model" is hosted-only and has no local fallback.
         if hosted_llm.route_for(active_model):
+            # `prompt` is system + user for the local model; a hosted chat
+            # model gets the system part in its own role.
+            user = prompt[len(system):].lstrip("\n") if system and prompt.startswith(system) else prompt
             got = await hosted_llm.complete(self._session, getattr(_tok_rate_redis, "raw", _tok_rate_redis),
-                                            active_model, prompt, temperature, format, num_predict)
+                                            active_model, user, temperature, format, num_predict,
+                                            system=system if user is not prompt else None)
             if got is not None:
                 text, step, usage = got
                 # Read by infer's retry, which raises the budget after a cut-off

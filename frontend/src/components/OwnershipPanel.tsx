@@ -174,7 +174,7 @@ export default function OwnershipPanel() {
           />
           <button
             type="submit"
-            className="px-3 py-1.5 text-xs font-semibold rounded-md bg-sky-500/10 text-sky-300 border border-sky-500/30 hover:bg-sky-500/20"
+            className="px-3 py-1.5 text-xs font-semibold rounded-md bg-accent/10 text-accent border border-accent/30 hover:bg-accent/20"
           >
             {loading ? 'Loading…' : 'Look up'}
           </button>
@@ -208,7 +208,7 @@ export default function OwnershipPanel() {
                 {holders.holders.map((h) => (
                   <tr key={h.filer_id} className="border-t border-line/60">
                     <td className="py-1">
-                      <button onClick={() => openFiler(h.filer_id)} className="text-sky-300 hover:underline text-left">
+                      <button onClick={() => openFiler(h.filer_id)} className="text-accent hover:underline text-left">
                         {h.filer}
                       </button>
                     </td>

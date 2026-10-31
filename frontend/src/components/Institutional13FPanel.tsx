@@ -223,7 +223,7 @@ export const Institutional13FPanel: React.FC = () => {
             href={report.filing_url}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-sky-500/10 text-sky-400 border border-sky-500/30 hover:bg-sky-500/20 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-accent/10 text-accent border border-accent/30 hover:bg-accent/20 transition-colors"
           >
             <span>Primary SEC EDGAR</span>
             <span>↗</span>
@@ -241,7 +241,7 @@ export const Institutional13FPanel: React.FC = () => {
               onClick={() => setSelectedFilerId(f.filer_id)}
               className={`flex flex-col items-start px-3.5 py-2 rounded-lg border text-left whitespace-nowrap transition-all ${
                 isSelected
-                  ? 'bg-sky-600/20 border-sky-500 text-sky-200 shadow-md shadow-sky-500/10'
+                  ? 'bg-accent/20 border-accent text-accent shadow-md shadow-accent/10'
                   : 'bg-page/60 border-line text-ink-dim hover:border-line-strong hover:text-ink'
               }`}
             >
@@ -269,7 +269,7 @@ export const Institutional13FPanel: React.FC = () => {
               <span className="text-micro text-ink-dim font-medium">Report Period</span>
               <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
-            <div className="text-base font-bold text-sky-400 mt-0.5">{report.report_period}</div>
+            <div className="text-base font-bold text-accent mt-0.5">{report.report_period}</div>
           </div>
           <div className="p-3 bg-page/70 border border-line rounded-lg">
             <div className="flex items-center justify-between">
@@ -298,7 +298,7 @@ export const Institutional13FPanel: React.FC = () => {
           onClick={() => setActiveTab('top')}
           className={`px-3 py-1.5 text-xs font-semibold border-b-2 transition-colors ${
             activeTab === 'top'
-              ? 'border-sky-400 text-sky-300'
+              ? 'border-accent text-accent'
               : 'border-transparent text-ink-dim hover:text-ink'
           }`}
         >
@@ -373,7 +373,7 @@ export const Institutional13FPanel: React.FC = () => {
                 >
                   <td className="py-2.5 px-3">
                     <div className="flex items-center gap-2">
-                      <span className="font-bold text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/30">
+                      <span className="font-bold text-accent bg-accent/10 px-1.5 py-0.5 rounded border border-accent/30">
                         {pos.ticker || 'N/A'}
                       </span>
                       <span className="text-ink font-medium">{pos.issuer_name}</span>

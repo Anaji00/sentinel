@@ -11,18 +11,20 @@
  * this codebase's backend audit spent four hundred entries on — a value
  * defined in two places drifts — so the fix is the same one: name it once.
  *
- * These mirror `:root` in globals.css. `readToken` resolves the live computed
- * value where the DOM is available, so a theme change is picked up rather than
- * baked in at build time; the literals are the fallback for server rendering
- * and for tests.
+ * `PALETTE_HEX` mirrors the dark `:root` in globals.css. `PALETTE` hands out
+ * `var(--token, hex)` references instead of the literals: SVG presentation
+ * attributes and inline styles both resolve `var()`, so every chart follows the
+ * light theme with no edit of its own, and the hex inside each reference still
+ * paints if a token were ever missing. `readToken` resolves a computed value
+ * for the few places that need a real colour string.
  */
 
-export const PALETTE = {
+export const PALETTE_HEX = {
   accent: '#8b9dff',
   positive: '#34d399',
   caution: '#fbbf24',
   negative: '#f87171',
-  info: '#38bdf8',
+  info: '#9cb0c9',
   civic: '#e879f9',
 
   bgBase: '#0b0f17',
@@ -32,13 +34,13 @@ export const PALETTE = {
 
   textPrimary: '#eef2f8',
   textSecondary: '#a6b3c6',
-  textMuted: '#74829a',
+  textMuted: '#8391a8',
 
   borderSubtle: 'rgba(160, 174, 200, 0.13)',
   borderStrong: 'rgba(160, 174, 200, 0.24)',
 } as const;
 
-export type PaletteKey = keyof typeof PALETTE;
+export type PaletteKey = keyof typeof PALETTE_HEX;
 
 const CSS_VAR: Record<PaletteKey, string> = {
   accent: '--accent',
@@ -58,6 +60,11 @@ const CSS_VAR: Record<PaletteKey, string> = {
   borderStrong: '--border-strong',
 };
 
+/** Theme-following colour references, `var(--token, hex)`, for SVG and inline styles. */
+export const PALETTE = Object.fromEntries(
+  (Object.keys(PALETTE_HEX) as PaletteKey[]).map((k) => [k, `var(${CSS_VAR[k]}, ${PALETTE_HEX[k]})`]),
+) as Record<PaletteKey, string>;
+
 /**
  * The live value of a token, or the compiled fallback.
  *
@@ -67,12 +74,12 @@ const CSS_VAR: Record<PaletteKey, string> = {
  * sandboxed contexts.
  */
 export function readToken(key: PaletteKey): string {
-  if (typeof window === 'undefined' || !window.getComputedStyle) return PALETTE[key];
+  if (typeof window === 'undefined' || !window.getComputedStyle) return PALETTE_HEX[key];
   try {
     const value = getComputedStyle(document.documentElement).getPropertyValue(CSS_VAR[key]).trim();
-    return value || PALETTE[key];
+    return value || PALETTE_HEX[key];
   } catch {
-    return PALETTE[key];
+    return PALETTE_HEX[key];
   }
 }
 

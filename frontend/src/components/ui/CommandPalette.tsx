@@ -34,30 +34,28 @@ interface Command {
 
 const PAGES: Command[] = [
   { id: 'p:/', label: 'Home', kind: 'page', href: '/' },
-  { id: 'p:/map', label: 'World Map', kind: 'page', href: '/map' },
-  { id: 'p:/signals', label: 'Trade Signals', kind: 'page', href: '/signals' },
-  { id: 'p:/board', label: 'Signal Board', kind: 'page', href: '/board' },
-  { id: 'p:/predictions', label: 'Stock Calls', kind: 'page', href: '/predictions' },
+  { id: 'p:/calls', label: 'Calls', hint: 'Stock calls, the signal board and the evidence', kind: 'page', href: '/calls' },
+  { id: 'p:/calls?view=signals', label: 'Calls: Proven Signals', kind: 'page', href: '/calls?view=signals' },
+  { id: 'p:/calls?view=record', label: 'Calls: How the Calls Did', kind: 'page', href: '/calls?view=record' },
   { id: 'p:/ticker', label: 'Look Up a Stock', kind: 'page', href: '/ticker' },
-  { id: 'p:/book', label: 'Portfolio & Track Record', kind: 'page', href: '/book' },
-  { id: 'p:/charts', label: 'Markets & Economy', kind: 'page', href: '/charts' },
-  { id: 'p:/options', label: 'Options & Flow', kind: 'page', href: '/options' },
-  { id: 'p:/flow', label: 'Big-Money Flow', kind: 'page', href: '/options?view=flow' },
-  { id: 'p:/crypto', label: 'Crypto', kind: 'page', href: '/crypto' },
-  { id: 'p:/macro', label: 'The Economy', kind: 'page', href: '/charts?view=economy' },
+  { id: 'p:/markets', label: 'Markets', hint: 'Prices, with a live tape', kind: 'page', href: '/markets' },
+  { id: 'p:/markets?view=economy', label: 'Markets: The Economy', kind: 'page', href: '/markets?view=economy' },
+  { id: 'p:/markets?view=crypto', label: 'Markets: Crypto', kind: 'page', href: '/markets?view=crypto' },
+  { id: 'p:/markets?view=flow', label: 'Markets: Big-Money Flow', kind: 'page', href: '/markets?view=flow' },
+  { id: 'p:/markets?view=radar', label: 'Markets: Unusual Volume', kind: 'page', href: '/markets?view=radar' },
   { id: 'p:/filings', label: 'Filings & Fund Holdings', kind: 'page', href: '/filings' },
+  { id: 'p:/performance', label: 'Performance', hint: 'The book, the track record, the backtests', kind: 'page', href: '/performance' },
+  { id: 'p:/money', label: 'Follow the Money', hint: 'Who owns the companies, and each other', kind: 'page', href: '/money' },
   { id: 'p:/watch', label: 'Surveillance Map', hint: 'Who is watching your town', kind: 'page', href: '/watch' },
   { id: 'p:/watch#accountability', label: 'Surveillance: Accountability', kind: 'page', href: '/watch#accountability' },
-  { id: 'p:/watch#money', label: 'Surveillance: Follow the Money', kind: 'page', href: '/watch#money' },
+  { id: 'p:/watch#money', label: 'Surveillance: Contracts and Lobbying', kind: 'page', href: '/watch#money' },
   { id: 'p:/watch#protect', label: 'Protect Yourself (privacy plan)', kind: 'page', href: '/watch#protect' },
-  { id: 'p:/intelligence', label: 'News & Intel', kind: 'page', href: '/intelligence' },
-  { id: 'p:/osint', label: 'Open-Source Intel', kind: 'page', href: '/intelligence?view=osint' },
+  { id: 'p:/intel', label: 'Intel', hint: 'The world map and the news feed, together', kind: 'page', href: '/intel' },
+  { id: 'p:/intel?view=osint', label: 'Intel: Open-Source Intel', kind: 'page', href: '/intel?view=osint' },
+  { id: 'p:/intel?view=cases', label: 'Intel: Cases', kind: 'page', href: '/intel?view=cases' },
+  { id: 'p:/intel?view=briefs', label: 'Intel: Briefs', kind: 'page', href: '/intel?view=briefs' },
   { id: 'p:/agents', label: 'AI Analysts', kind: 'page', href: '/agents' },
   { id: 'p:/operations', label: 'Operations', kind: 'page', href: '/operations' },
-  { id: 'p:/cases', label: 'Investigations: Cases', kind: 'page', href: '/cases' },
-  { id: 'p:/reports', label: 'Investigations: Briefs', kind: 'page', href: '/cases?view=briefs' },
-  { id: 'p:/strategies', label: 'Research: Backtests', kind: 'page', href: '/strategies' },
-  { id: 'p:/attribution', label: 'Research: What Drives Signals', kind: 'page', href: '/strategies?view=drivers' },
   { id: 'p:/methodology', label: 'How It Works', kind: 'page', href: '/methodology' },
 ];
 
@@ -116,7 +114,7 @@ export function CommandPalette() {
                 ? String(ev.primary_entity_name)
                 : 'recent activity',
             kind: 'ticker',
-            href: `/charts?symbol=${encodeURIComponent(ticker)}`,
+            href: `/ticker?symbol=${encodeURIComponent(ticker)}`,
           });
         }
       } catch {
@@ -232,7 +230,7 @@ export function CommandPalette() {
                   onMouseEnter={() => setCursor(i)}
                   onClick={() => go(cmd)}
                   className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
-                    active ? 'bg-accent-dim text-cyan-100' : 'text-ink-dim hover:bg-overlay/50'
+                    active ? 'bg-accent-dim text-accent' : 'text-ink-dim hover:bg-overlay/50'
                   }`}
                 >
                   <Icon

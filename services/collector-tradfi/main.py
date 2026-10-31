@@ -2740,7 +2740,9 @@ async def _breadth_backfill(db, raw, backfill_daily_bars, deep_years: int) -> di
     return stats
 
 
-DELISTED_DONE_KEY = "sentinel:daily_bars:delisted_done"
+# v2 (30 Oct 2026): bankrupt OTC roots added, and the model's eleven-year lookback.
+DELISTED_DONE_KEY = "sentinel:daily_bars:delisted_done:v2"
+DELISTED_DEEP_YEARS = int(os.getenv("DELISTED_BARS_YEARS", "11"))
 
 
 async def _delisted_backfill(db, raw, backfill_daily_bars, deep_years: int) -> dict:
@@ -2753,7 +2755,7 @@ async def _delisted_backfill(db, raw, backfill_daily_bars, deep_years: int) -> d
     loaded once. Point in time: a delisted name is ranked only on days it
     traded and cleared the liquidity floor."""
     import aiohttp
-    from shared.utils.asset_universe import delisted_stocks, fetch_assets
+    from shared.utils.asset_universe import bankrupt_roots, delisted_stocks, fetch_assets
 
     if await raw.exists(DELISTED_DONE_KEY):
         return {"skipped": True}
@@ -2761,12 +2763,17 @@ async def _delisted_backfill(db, raw, backfill_daily_bars, deep_years: int) -> d
     secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret} if key and secret else None
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-        active = {str(a.get("symbol") or "").upper() for a in await fetch_assets(session, headers, "active")}
+        active_assets = await fetch_assets(session, headers, "active")
         inactive = await fetch_assets(session, headers, "inactive")
+    active = {str(a.get("symbol") or "").upper() for a in active_assets}
     if not active or not inactive:
         return {"skipped": "asset lists unavailable"}
-    names = delisted_stocks(inactive, active)
-    rep = await backfill_daily_bars(db, names, lookback_days=365 * deep_years + 7)
+    # And bankruptcies, under the exchange ticker they had (bankrupt_roots).
+    names = sorted(set(delisted_stocks(inactive, active))
+                   | set(bankrupt_roots(list(active_assets) + list(inactive), active)))
+    # As far back as the factor model looks, not the five years active names keep.
+    years = max(deep_years, DELISTED_DEEP_YEARS)
+    rep = await backfill_daily_bars(db, names, lookback_days=365 * years + 7)
     await raw.set(DELISTED_DONE_KEY, "1", ex=90 * 86400)
     logger.info("Delisted history: %s delisted stocks requested, %s with bars, %s bars written.",
                 len(names), rep.get("tickers_with_data"), rep.get("bars_written"))
@@ -3162,8 +3169,13 @@ async def refresh_rollups(db, start: datetime, views=ROLLUP_VIEWS) -> None:
     views. Only the hourly and daily views used to be refreshed after a backfill."""
     now_ts = datetime.now(timezone.utc)
     for view in views:
-        end = now_ts - _ROLLUP_END_LAG.get(view, timedelta(hours=1))
-        if start >= end:
+        lag = _ROLLUP_END_LAG.get(view, timedelta(hours=1))
+        end = now_ts - lag
+        # The lag is one bucket, so it is also the bucket width. A window under
+        # two buckets may hold no whole one once aligned, and Timescale refuses
+        # it ("refresh window too small": 28 a day from the settle pass, whose
+        # window opens at 08:00 UTC). The view's own policy covers that span.
+        if end - start < 2 * lag:
             continue
         try:
             await db.execute_without_transaction(

@@ -233,9 +233,9 @@ export default function MethodologyPage() {
         title="How it works"
         description="No black boxes: every formula behind the platform, the assumptions it makes, how its settings were chosen, and what result would prove it wrong."
         related={[
-          { href: '/strategies?view=drivers', label: 'What drives signals' },
-          { href: '/signals', label: 'Trade signals' },
-          { href: '/strategies', label: 'Backtests' },
+          { href: '/performance#years', label: 'What drives signals' },
+          { href: '/calls?view=signals', label: 'Trade signals' },
+          { href: '/performance#years', label: 'Backtests' },
         ]}
       />
 
@@ -254,7 +254,7 @@ export default function MethodologyPage() {
                 onClick={() => setSelectedId(m.id)}
                 className={`flex flex-col items-start p-3 rounded-lg border text-left transition-all ${
                   isSelected
-                    ? 'bg-sky-600/20 border-sky-500 text-sky-200 shadow-md shadow-sky-500/10'
+                    ? 'bg-accent/20 border-accent text-accent shadow-md shadow-accent/10'
                     : 'bg-raised/60 border-line text-ink-dim hover:border-line-strong hover:text-ink'
                 }`}
               >
@@ -287,7 +287,7 @@ export default function MethodologyPage() {
 
           {/* Mathematical Formula Card */}
           <div className="flex flex-col gap-2 p-4 bg-page/90 border border-line rounded-lg">
-            <span className="text-xs font-semibold text-sky-400 flex items-center gap-1.5">
+            <span className="text-xs font-semibold text-accent flex items-center gap-1.5">
               <span>∑</span>
               <span>The formula (for specialists)</span>
             </span>
@@ -327,7 +327,7 @@ export default function MethodologyPage() {
                   {current.parameters.map((p, i) => (
                     <tr key={i} className="hover:bg-overlay/30">
                       <td className="p-2.5 font-semibold text-ink">{p.name}</td>
-                      <td className="p-2.5 font-mono text-sky-400">{p.symbol}</td>
+                      <td className="p-2.5 font-mono text-accent">{p.symbol}</td>
                       <td className="p-2.5 font-mono text-positive">{p.default_value}</td>
                       <td className="p-2.5 text-ink-dim">{p.calibration_method}</td>
                     </tr>

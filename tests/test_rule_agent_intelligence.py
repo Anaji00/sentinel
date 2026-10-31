@@ -69,8 +69,11 @@ def test_a_rule_naming_nothing_is_not_rejected_here():
 
 def test_the_rejection_is_wired_into_the_write_path():
     source = (ROOT / "services/agents/rule_agent.py").read_text(encoding="utf-8")
-    write = source[source.index("hset(\"sentinel:correlation:dynamic_rules\", rule.rule_id"):]
-    before = source[:source.index("hset(\"sentinel:correlation:dynamic_rules\", rule.rule_id")]
+    # The write keys on body["rule_id"] since 30 Oct 2026: the id comes from the
+    # rule's definition (rule_probation.synth_rule_id), not the model's name.
+    anchor = "hset(\"sentinel:correlation:dynamic_rules\", body[\"rule_id\"]"
+    write = source[source.index(anchor):]
+    before = source[:source.index(anchor)]
     assert "_unknown_event_types(rule)" in before, "validation does not run before the write"
     assert "continue" in before
 

@@ -26,7 +26,8 @@ from shared.broker.alpaca import AlpacaBroker
 from shared.broker.base import OrderSide, OrderStatus, OrderType
 from shared.utils import auto_trade as at
 from shared.utils import model_portfolio as mp
-from shared.utils.quiet_failures import swallowed
+from shared.utils import market_cap as mc
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.auto_trader")
 
@@ -57,7 +58,9 @@ _PRICES_SQL = """
 # 2026) are its own to close, not a stranger's to leave alone.
 _MANAGED_SQL = "SELECT DISTINCT symbol FROM auto_trade_orders"
 # The book's names with an alert in the last ALERT_RISK_DAYS, and the rule that fired.
-ALERT_RISK_DAYS = 7
+# Three days, not seven (30 Oct 2026): the graded lift is a 1- and 5-session
+# effect, and a week of alerts covered half the book.
+ALERT_RISK_DAYS = 3
 _RECENT_ALERTS_SQL = f"""
     SELECT DISTINCT primary_entity_id AS ticker, rule_name FROM correlations
     WHERE detected_at > NOW() - INTERVAL '{ALERT_RISK_DAYS} days' AND primary_entity_id = ANY($1::text[])
@@ -187,7 +190,15 @@ class AutoTrader:
         # Picks only, checked daily so a stored book drops funds too: a fund
         # held from an earlier book gets a target of zero and is closed.
         stocks = await self._stocks()
-        book = {**book, "long": at.picks_only(book["long"], stocks), "short": at.picks_only(book["short"], stocks)}
+        # Companies of $1bn and up only (30 Oct 2026); a name that falls out is
+        # closed like any other dropped from the book. Without the table there
+        # is no trading today: unknown size is not a pass.
+        large = await mc.large_caps(self.raw)
+        if not large:
+            dropped("agents.auto_trader.no_market_caps", "no market-cap table; nothing traded today", logger)
+            return {"day": str(today), "orders": 0, "skipped": "no market-cap table"}
+        allowed = (stocks & large) if stocks is not None else large
+        book = {**book, "long": at.picks_only(book["long"], allowed), "short": at.picks_only(book["short"], allowed)}
         weights = at.target_weights(book["long"], book["short"], leg_fraction(),
                                     weights=await self._risk_weights(list(book["long"]) + list(book["short"])))
         account = await self.broker.get_account()
@@ -299,7 +310,7 @@ class AutoTrader:
     async def _risk_weights(self, names: List[str]) -> Optional[Dict[str, float]]:
         """Smaller weights for names with a recent alert from a family graded to
         precede bigger-than-usual moves, on both bars (producer_grades.
-        move_flagging_families). None -- equal weight -- when the scale is 1,
+        strong_move_families). None -- equal weight -- when the scale is 1,
         there are no grades, or the lookup fails: a missing risk input must not
         stop the book trading."""
         scale = alert_risk_scale()
@@ -309,7 +320,9 @@ class AutoTrader:
             from shared.utils import producer_grades as pg
             from shared.utils.signal_store import PRODUCER_GRADES_KEY
             blob = await self.raw.get(PRODUCER_GRADES_KEY)
-            families = pg.move_flagging_families(json.loads(blob) if blob else None)
+            # Only the families with a strong graded lift (producer_grades.
+            # strong_move_families): every flagging family put 91 of 179 names at half weight.
+            families = pg.strong_move_families(json.loads(blob) if blob else None)
             if not families:
                 return None
             rows = await self.db.query(_RECENT_ALERTS_SQL, [str(n).upper() for n in names]) or []

@@ -68,7 +68,8 @@ class Customers(BaseModel):
     customers: List[Named] = Field(default_factory=list, max_length=10)
 
 
-EXTRACT_SYSTEM = ("From the passage of a company's annual report, list each customer it NAMES as a share of its revenue "
+EXTRACT_SYSTEM = ("From the numbered passages of one company's annual report, list each customer they NAME as a share "
+                  "of its revenue "
                   "or sales, with the percentage. Skip anonymous ones (Customer A, one customer). Copy names exactly as "
                   'written. Answer in JSON only: {"customers": [{"name": "...", "pct": 21.0}]}.')
 
@@ -118,14 +119,49 @@ def variants(name: str) -> List[str]:
     return out
 
 
+def pct_in(pct: float, passage: str) -> bool:
+    """The percentage is written in the passage ("21%", "21.0 %", "21 percent")."""
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", passage):
+        if abs(float(m.group(1)) - float(pct)) < 0.05:
+            return True
+    return False
+
+
 def grounded(found: Sequence[Mapping[str, object]], passage: str) -> List[Tuple[str, Optional[float]]]:
-    """The model's names that appear verbatim in the passage and are not anonymous."""
+    """The model's names that appear verbatim in the passage and are not
+    anonymous; a share of revenue only when the passage states that number."""
     out = []
     for c in found:
         n = clean(str(c.get("name") or ""))
         if n and n in passage:
             pct = c.get("pct")
-            out.append((n, float(pct) if isinstance(pct, (int, float)) else None))
+            ok = isinstance(pct, (int, float)) and pct_in(float(pct), passage)
+            out.append((n, float(pct) if ok else None))
+    return out
+
+
+PROPAGATED = {"llm_news_30": "cust_news_30", "fil_change": "cust_fil_change"}
+
+
+def propagated_rows(links: Mapping[str, Sequence[Tuple[date, str, float]]], values: Mapping[Tuple[str, str], float],
+                    day: date) -> List[Tuple[str, date, str, float]]:
+    """(supplier, day, feature, value): each PROPAGATED feature of a supplier's
+    customers in its latest filing, weighted by share of revenue (equal when
+    unstated), for customers that have the value. A June 2026 preprint finds
+    10-K text signals carried along supply chains predict returns where a
+    firm's own do not (t -2.64); a trial, as cust_mom_21 is for prices."""
+    out: List[Tuple[str, date, str, float]] = []
+    for supplier, ls in links.items():
+        filed = [f for f, _, _ in ls if f <= day]
+        if not filed:
+            continue
+        latest = max(filed)
+        custs = [(c, w if w and w > 0 else 1.0) for f, c, w in ls if f == latest]
+        for src, feat in PROPAGATED.items():
+            pairs = [(values[(c, src)], w) for c, w in custs if (c, src) in values]
+            if pairs:
+                total = sum(w for _, w in pairs)
+                out.append((supplier, day, feat, round(sum(v * w for v, w in pairs) / total, 6)))
     return out
 
 
@@ -158,5 +194,5 @@ def momentum_rows(supplier: str, links: Sequence[Tuple[date, str, float]],
     return out
 
 
-__all__ = ["Customers", "EXTRACT_SYSTEM", "FEATURE", "candidates", "clean", "grounded", "momentum_rows", "passages",
+__all__ = ["Customers", "EXTRACT_SYSTEM", "FEATURE", "candidates", "clean", "grounded", "momentum_rows", "passages", "pct_in", "PROPAGATED", "propagated_rows",
            "variants"]

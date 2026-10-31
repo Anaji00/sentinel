@@ -23,11 +23,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-from services.agents.base import InferenceShed, SentinelAgent
+from services.agents.base import InferenceBatcher, InferenceShed, SentinelAgent
 from shared.kafka import Topics
 from shared.utils import analyst as an
 from shared.utils import case_file as cf
 from shared.utils import gpr
+from shared.utils import hosted_llm
+from shared.utils.market_cap import is_large_cap
 from shared.utils.kalshi_consensus import KALSHI_CONSENSUS_KEY
 from shared.utils import producer_grades as pg
 from shared.utils.signal_store import PRODUCER_GRADES_KEY
@@ -41,6 +43,8 @@ QDRANT_COLLECTION = "sentinel_events_v2"
 VIEWS_KEY = "sentinel:analyst:views"           # the latest views, newest first, for the dashboard
 DAY_KEY = "sentinel:analyst:day:{day}"         # a set of tickers analysed today
 CASE_FACTS_MAX = 10                            # case-file facts added to the prompt
+BATCH_SIZE = 6                                 # stocks per hosted call
+BATCH_WAIT_SEC = 60.0
 
 _CLOSES_SQL = "SELECT close FROM daily_bars WHERE ticker = $1 ORDER BY day DESC LIMIT 22"
 _STORED_RANK_SQL = """
@@ -54,8 +58,17 @@ _NEWS_SQL = """
 
 
 class AnalystAgent(SentinelAgent):
+    _batcher: Optional[InferenceBatcher] = None       # set for a hosted model; None samples one stock at a time
+
     def __init__(self, agent_name: str = "analyst_agent", input_topics: Optional[List[str]] = None, **kwargs: Any):
         super().__init__(agent_name=agent_name, input_topics=input_topics or [Topics.CORRELATIONS], **kwargs)
+        # Stocks arriving together share each sample's call on a hosted model
+        # (the shadow): its views came in clusters, 15 between 10:12 and 10:57
+        # on 30 Oct. Not on the local model, which batches worse.
+        self._batcher = (
+            InferenceBatcher(name=f"{agent_name}_views", flush_fn=self._sample_batch, max_items=BATCH_SIZE,
+                             max_wait_sec=BATCH_WAIT_SEC, logger=self.logger)
+            if hosted_llm.is_hosted(self.model) else None)
 
     @property
     def output_topic(self) -> str:
@@ -66,19 +79,23 @@ class AnalystAgent(SentinelAgent):
         # engine's play, not this. The view lives in the predictions table
         # (graded) and in VIEWS_KEY (shown).
         if await self.analyse(message) is None:
-            dropped("agents.analyst_agent.handle", "not analysed: no ranked stock, seen today, over the daily cap, "
-                    "or no grounded answer", self.logger)
+            dropped("agents.analyst_agent.handle", "not analysed: under $1bn, no ranked stock, seen today, over the "
+                    "daily cap, or no grounded answer", self.logger)
 
     async def analyse(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ticker = str(message.get("primary_entity_id") or "").upper()
         if not _TICKER.match(ticker):
             return None
+        if not await is_large_cap(self.redis, ticker):
+            return None                       # calls only on companies of $1bn and up (market_cap.is_large_cap)
         raw = self.redis.raw
         # The daily cap went to the first alerts to arrive, whatever their
         # family; most families are graded uninformative against prices, so
         # those are skipped and the budget goes to families that carry signal.
         if pg.is_uninformative(str(message.get("rule_name") or ""), await self._retired(raw)):
             return None
+        if (message.get("metrics_summary") or {}).get("probation"):
+            return None                       # a model-written rule not yet graded (rule_probation)
         rank = await self._rank(raw, ticker)
         if rank is None:
             return None                       # not a stock the model ranks: nothing to anchor on
@@ -101,23 +118,15 @@ class AnalystAgent(SentinelAgent):
                 for r in await self.db.query(_NEWS_SQL, ticker) or []]
         similar = await self._similar(str(message.get("trigger_event_id") or ""))
         alert = str(message.get("summary_headline") or message.get("rule_name") or "an alert")[:200]
-        fact_lines = an.facts(ticker, rank, "monthly", moves, news, similar, alert,
+        # The rank is not a fact here: it is the prior an.combine applies to the
+        # answer. Shown as well, it led most rationales and was counted twice;
+        # telling the model not to count it again did not stop that (30 Oct 2026).
+        fact_lines = an.facts(ticker, None, "monthly", moves, news, similar, alert,
                               await self._context(raw) + await self._case_facts(raw, ticker))
-        system, user = an.prompt(ticker, fact_lines)
-
-        samples: List[Dict[str, Any]] = []
-        for _ in range(SAMPLES):
-            try:
-                view = await self._execute_with_telemetry(message, system, user, schema=an.AnalystView,
-                                                          temperature=0.7, model=self.model, num_predict=300)
-            except InferenceShed:
-                break
-            except Exception as e:
-                swallowed("agents.analyst.sample", e, self.logger)
-                continue
-            v = view.model_dump() if hasattr(view, "model_dump") else dict(view or {})
-            if an.verified(v, len(fact_lines)):
-                samples.append(v)
+        if self._batcher is not None:
+            samples = await self._batcher.submit(ticker, {"message": message, "facts": fact_lines}) or []
+        else:
+            samples = await self._samples(message, ticker, fact_lines)
         got = an.combine(samples, an.prior_from_percentile(rank))
         if got is None:
             return None
@@ -134,6 +143,54 @@ class AnalystAgent(SentinelAgent):
             await raw.ltrim(VIEWS_KEY, 0, 199)
         except Exception as e:
             swallowed("agents.analyst.views", e, self.logger)
+        return out
+
+    async def _samples(self, message: Dict[str, Any], ticker: str, fact_lines: List[str]) -> List[Dict[str, Any]]:
+        """SAMPLES answers for one stock, each kept only if it cites facts it was given."""
+        system, user = an.prompt(ticker, fact_lines)
+        samples: List[Dict[str, Any]] = []
+        for _ in range(SAMPLES):
+            try:
+                view = await self._execute_with_telemetry(message, system, user, schema=an.AnalystView,
+                                                          temperature=0.7, model=self.model, num_predict=300)
+            except InferenceShed:
+                break
+            except Exception as e:
+                swallowed("agents.analyst.sample", e, self.logger)
+                continue
+            v = view.model_dump() if hasattr(view, "model_dump") else dict(view or {})
+            if an.verified(v, len(fact_lines)):
+                samples.append(v)
+        return samples
+
+    async def _sample_batch(self, items: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+        """SAMPLES answers for each queued stock, one call per sample for all of
+        them; {ticker: verified samples}. One stock alone is asked as before."""
+        if not items:
+            return {}
+        if len(items) == 1:
+            ticker, item = items[0]
+            return {ticker: await self._samples(item["message"], ticker, item["facts"])}
+        facts = {t: item["facts"] for t, item in items}
+        system, user = an.batch_prompt(list(facts.items()))
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in facts}
+        for _ in range(SAMPLES):
+            try:
+                batch = await self._execute_with_telemetry(items[0][1]["message"], system, user, schema=an.AnalystBatch,
+                                                           temperature=0.7, model=self.model,
+                                                           num_predict=200 + 220 * len(items))
+            except InferenceShed:
+                break
+            except Exception as e:
+                swallowed("agents.analyst.batch_sample", e, self.logger)
+                continue
+            seen = set()
+            for view in (batch.views if batch else []):
+                t = str(view.ticker).upper()
+                v = view.model_dump()
+                if t in facts and t not in seen and an.verified(v, len(facts[t])):
+                    seen.add(t)
+                    out[t].append(v)
         return out
 
     async def _case_facts(self, raw: Any, ticker: str) -> List[str]:

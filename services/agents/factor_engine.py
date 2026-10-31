@@ -30,6 +30,7 @@ import numpy as np
 from shared.utils import factor_model as fm
 from shared.utils import fundamentals_pit as fpit
 from shared.utils.asset_universe import load_asset_meta
+from shared.utils.quiet_failures import swallowed
 from shared.utils.signal_store import FACTOR_REPORT_KEY, FACTOR_SCORES_KEY, factor_scores_key
 
 logger = logging.getLogger("agent.factor_engine")
@@ -43,7 +44,13 @@ CANDIDATES = tuple(
 # monthly ranker's walk-forward went from 44 to 101 months, IC t 2.00 -> 3.12,
 # net Sharpe 0.79 -> 1.01, through the 2018, 2020 and 2022 drawdowns.
 LOOKBACK_YEARS = int(os.getenv("FACTOR_LOOKBACK_YEARS", "11"))
-FIRST_RUN_DELAY_SEC = 60     # when no report exists yet; otherwise the nightly slot
+FIRST_RUN_DELAY_SEC = 60     # when no report exists yet, or it is behind; otherwise the nightly slot
+# A nightly run scores through the day before, so one completed session after
+# its as_of is normal; two means a night was missed.
+CATCH_UP_SESSIONS = 2
+_SESSIONS_AFTER_SQL = """
+    SELECT count(DISTINCT day) AS n FROM daily_bars WHERE ticker = 'SPY' AND day > $1::date AND day < CURRENT_DATE
+"""
 RUN_HOUR_UTC = 22            # after the close, after the day's bars land
 RESULT_TTL_SEC = 3 * 86400
 LOAD_BATCH = 150             # tickers per panel query
@@ -258,7 +265,7 @@ class FactorEngine:
 
     async def run(self) -> None:
         raw = getattr(self.redis, "raw", self.redis)
-        if await raw.exists(FACTOR_REPORT_KEY):
+        if await raw.exists(FACTOR_REPORT_KEY) and not await self._behind():
             await asyncio.sleep(self._seconds_to_next_run())
         else:
             await asyncio.sleep(FIRST_RUN_DELAY_SEC)
@@ -269,6 +276,27 @@ class FactorEngine:
             except Exception as exc:
                 logger.error("Factor model run failed: %s", exc, exc_info=True)
             await asyncio.sleep(self._seconds_to_next_run())
+
+    async def _behind(self) -> bool:
+        """The stored scores miss CATCH_UP_SESSIONS or more completed sessions.
+
+        A run takes about four hours from 22:00 UTC, and a restart inside it
+        loses it: the engine saw a report and waited for the next night. On
+        29 Oct 2026 the container was recreated at 23:41, and the scores stayed
+        at 27 Oct for two days. Missing data reads as behind: a run is safer
+        than another day of stale ranks."""
+        try:
+            report = json.loads(await getattr(self.redis, "raw", self.redis).get(FACTOR_REPORT_KEY) or "{}")
+            as_of = date.fromisoformat(str(report.get("as_of"))[:10])
+            row = await self.db.query_one(_SESSIONS_AFTER_SQL, as_of)
+        except Exception as exc:
+            swallowed("agents.factor_engine.behind", exc, logger)
+            return True
+        missed = int((row or {}).get("n") or 0)
+        if missed >= CATCH_UP_SESSIONS:
+            logger.info("Factor scores are as of %s, %s sessions behind: running now.", as_of, missed)
+            return True
+        return False
 
     @staticmethod
     def _seconds_to_next_run(now: Optional[datetime] = None) -> float:
@@ -631,6 +659,13 @@ async def main() -> None:
     from services.agents.comention_job import CoMentionJob
     from services.agents.case_file_job import CaseFileJob
     from services.agents.activist_13d_job import Activist13DJob
+    from services.agents.macro_bars_job import MacroBarsJob
+    from services.agents.sympathy_job import SympathyJob
+    from services.agents.alert_drift_job import AlertDriftJob
+    from services.agents.market_cap_job import MarketCapJob
+    from services.agents.filing_change_job import FilingChangeJob
+    from services.agents.extract_audit_job import ExtractAuditJob
+    from services.agents.comment_letter_job import CommentLetterJob
 
     from services.agents.news_model_refit import NewsModelRefit
 
@@ -660,7 +695,21 @@ async def main() -> None:
                          # One structured file of facts per stock for the agents to share.
                          CaseFileJob(db, redis).run(),
                          # Activist intent from 13D Item 4 (Brav et al. 2008).
-                         Activist13DJob(db, redis).run())
+                         Activist13DJob(db, redis).run(),
+                         # Daily closes for macro instruments: yields, futures, dollar, VIX.
+                         MacroBarsJob(db, redis).run(),
+                         # Measured sympathy peers, net of SPY, for the stock correlation agent.
+                         SympathyJob(db, redis).run(),
+                         # Trial feature: the direction alerts were followed in (alert_drift).
+                         AlertDriftJob(db, redis).run(),
+                         # Every stock's best-known capitalisation: calls are kept to $1bn and up.
+                         MarketCapJob(db, redis).run(),
+                         # How much each 10-K / 10-Q changed from the comparable one (Lazy Prices).
+                         FilingChangeJob(db, redis).run(),
+                         # Weekly: a second model's agreement with each extractor.
+                         ExtractAuditJob(db, redis).run(),
+                         # Replies to SEC comment letters, read for topic and restatement (trial feature).
+                         CommentLetterJob(db, redis).run())
 
 
 __all__ = ["FactorEngine"]

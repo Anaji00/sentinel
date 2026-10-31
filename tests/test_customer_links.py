@@ -32,7 +32,9 @@ def test_the_models_names_must_be_in_the_passage() -> None:
     p = "Revenue from Lowe's Companies and The Home Depot together was 31% of net sales."
     got = cl.grounded([{"name": "Lowe's Companies", "pct": 16}, {"name": "Menards", "pct": 15},
                        {"name": "Customer B", "pct": 11}], p)
-    assert got == [("Lowe's Companies", 16.0)]
+    # The name is in the passage; the 16% is not (the passage gives 31% for the
+    # two together), so since 30 Oct 2026 the share is dropped, not believed.
+    assert got == [("Lowe's Companies", None)]
 
 
 def test_customer_momentum_follows_the_latest_filing() -> None:
@@ -45,3 +47,14 @@ def test_customer_momentum_follows_the_latest_filing() -> None:
     assert [r[1] for r in rows] == [date(2025, 4, 1)]              # none before filing, none once it is stale
     expected = 0.5 * (1.001 ** 21 - 1)
     assert abs(rows[0][3] - expected) < 1e-6 and rows[0][2] == cl.FEATURE
+
+
+def test_customers_signals_carry_to_suppliers_by_revenue_share() -> None:
+    d0, d1 = date(2025, 2, 1), date(2026, 2, 1)
+    links = {"SUP": [(d0, "OLD", 50.0), (d1, "AAA", 30.0), (d1, "BBB", 10.0)]}
+    values = {("AAA", "llm_news_30"): 0.5, ("BBB", "llm_news_30"): -0.5, ("OLD", "llm_news_30"): 1.0,
+              ("BBB", "fil_change"): 0.01}
+    rows = {(f, v) for _, _, f, v in cl.propagated_rows(links, values, date(2026, 10, 30))}
+    # The latest filing's customers only (OLD dropped), weighted 30:10.
+    assert rows == {("cust_news_30", 0.25), ("cust_fil_change", 0.01)}
+    assert cl.propagated_rows(links, values, date(2024, 1, 1)) == []            # no filing yet

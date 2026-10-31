@@ -63,6 +63,11 @@ _LINKS_SQL = """
 """
 _CLOSES_SQL = "SELECT ticker, day, close FROM daily_bars WHERE ticker = ANY($1::text[]) AND day >= $2 ORDER BY ticker, day"
 _SESSIONS_SQL = "SELECT day FROM daily_bars WHERE ticker = 'SPY' AND day >= $1 ORDER BY day"
+_LATEST_SQL = """
+    SELECT DISTINCT ON (ticker, feature) ticker, feature, value FROM stock_features_daily
+    WHERE feature = ANY($1::text[]) AND ticker = ANY($2::text[]) AND day > CURRENT_DATE - 120
+    ORDER BY ticker, feature, day DESC
+"""
 _UPSERT_FEATURE = """
     INSERT INTO stock_features_daily (ticker, day, feature, value, source) VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (ticker, day, feature) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source
@@ -141,20 +146,27 @@ class CustomerLinksJob:
             return -1
         text = await asyncio.to_thread(fx.text_of, html)
         found: List[Tuple[str, Optional[float], str, Optional[str]]] = []
+        unread: List[str] = []
         for p in cl.passages(text):
             hits = [(n, pct, "pattern", await self._resolve(n)) for n, pct in cl.candidates(p)]
             hits = [h for h in hits if h[3] and h[3] != ticker]
             if hits:
                 found += hits
-            elif "customer" in p.lower() and self._llm_budget():
-                self._llm_calls.append(time.time())
-                try:
-                    got = await llm.infer(cl.EXTRACT_SYSTEM, p, schema=cl.Customers, temperature=0.0, model=MODEL,
-                                          num_predict=200)
-                    found += [(n, pct, "model", await self._resolve(n))
-                              for n, pct in cl.grounded(got.model_dump()["customers"], p)]
-                except Exception as e:
-                    swallowed("agents.customer_links.extract", e, logger)
+            elif "customer" in p.lower():
+                unread.append(p)
+        # One call for a filing's passages the patterns could not read: they
+        # went one call each (130 calls on 29 Oct). Names are still grounded
+        # verbatim in the passages they came from.
+        if unread and self._llm_budget():
+            self._llm_calls.append(time.time())
+            batch = "\n\n".join(f"[{i + 1}] {p}" for i, p in enumerate(unread))
+            try:
+                got = await llm.infer(cl.EXTRACT_SYSTEM, batch, schema=cl.Customers, temperature=0.0, model=MODEL,
+                                      num_predict=200 + 100 * len(unread))
+                found += [(n, pct, "model", await self._resolve(n))
+                          for n, pct in cl.grounded(got.model_dump()["customers"], "\n".join(unread))]
+            except Exception as e:
+                swallowed("agents.customer_links.extract", e, logger)
         seen = set()
         for name, pct, method, tick in found:
             if (tick or name) in seen:
@@ -222,6 +234,10 @@ class CustomerLinksJob:
             p.append(float(r["close"]))
         sessions = [r["day"] for r in await self.db.query(_SESSIONS_SQL, since) or []]
         rows = [(*x, SOURCE) for s, ls in links.items() for x in cl.momentum_rows(s, ls, closes, sessions)]
+        # Customers' headline read and filing change carried to suppliers (trial), today's only.
+        latest = {(str(r["ticker"]), str(r["feature"])): float(r["value"])
+                  for r in await self.db.query(_LATEST_SQL, sorted(cl.PROPAGATED), customers) or []}
+        rows += [(*x, SOURCE) for x in cl.propagated_rows(links, latest, date.today())]
         for k in range(0, len(rows), 5000):
             await self.db.execute_many(_UPSERT_FEATURE, rows[k:k + 5000])
         return len(rows)

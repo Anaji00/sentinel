@@ -301,7 +301,7 @@ export default function OperationsConsole() {
               ) : (
                 <>
                   {data.topics.map((t) => (
-                    <div key={t.topic} className="px-3.5 py-2 border-b border-white/5">
+                    <div key={t.topic} className="px-3.5 py-2 border-b border-line">
                       <div className="flex items-baseline justify-between gap-2">
                         {/* The topic name is the control. Replay was the only
                           thing an operator could do here, and it was offered
@@ -424,7 +424,7 @@ export default function OperationsConsole() {
               ) : (
                 <>
                   {data.candidates.map((c) => (
-                    <div key={c.pair_id} className="px-3.5 py-2 border-b border-white/5">
+                    <div key={c.pair_id} className="px-3.5 py-2 border-b border-line">
                       <div className="text-micro text-ink leading-snug">
                         <div className="truncate">{c.a}</div>
                         <div className="text-ink-mute">vs</div>
@@ -469,7 +469,7 @@ export default function OperationsConsole() {
                                 '/api/v1/attribution/entities/merge-candidates?limit=25',
                               )
                             }
-                            className="text-micro uppercase px-2 py-0.5 rounded border border-line-strong text-ink-dim hover:bg-white/5 disabled:opacity-40"
+                            className="text-micro uppercase px-2 py-0.5 rounded border border-line-strong text-ink-dim hover:bg-overlay/50 disabled:opacity-40"
                           >
                             Different
                           </button>
@@ -551,7 +551,7 @@ export default function OperationsConsole() {
               ) : (
                 <>
                   {data.bands.map((b) => (
-                    <div key={b.band} className="border-b border-white/5 px-3.5 py-2">
+                    <div key={b.band} className="border-b border-line px-3.5 py-2">
                       <div className="flex items-baseline justify-between gap-2 text-micro">
                         <span className="font-mono text-ink">{b.band}</span>
                         <span className="text-ink-mute tabular-nums">{b.surfaced} surfaced</span>
@@ -586,7 +586,7 @@ export default function OperationsConsole() {
                   {data.entries.map((e, i) => (
                     <div
                       key={`${e.correlation_id}-${i}`}
-                      className="border-b border-white/5 px-3.5 py-2"
+                      className="border-b border-line px-3.5 py-2"
                     >
                       <div className="flex items-baseline justify-between gap-2 text-micro">
                         <span className="truncate font-mono text-ink">
@@ -622,7 +622,7 @@ export default function OperationsConsole() {
               ) : (
                 <>
                   {data.rules.map((r) => (
-                    <div key={r.rule_id} className="px-3.5 py-2 border-b border-white/5">
+                    <div key={r.rule_id} className="px-3.5 py-2 border-b border-line">
                       <div className="flex items-baseline justify-between gap-2">
                         <span className="text-ink text-micro truncate">{r.rule_id}</span>
                         {r.needs_review && (

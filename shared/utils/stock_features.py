@@ -54,6 +54,21 @@ REGISTRY: Dict[str, Feature] = {
                                                  "activist purpose (Brav, Jiang, Partnoy & Thomas 2008)"),
     "llm_news_30": Feature(4, "llm_news", "Mean of a hosted language model's good/bad/unclear read of the stock's "
                                           "headlines over 30 days (Lopez-Lira & Tang); scored forward only"),
+    "ev_guidance": Feature(60, "filing_extract", "An earnings release that raises (+) or cuts (-) the company's own "
+                                                 "guidance: the change in the guided figure when stated, else +1 / -1"),
+    "ev_comment_letter": Feature(90, "comment_letters", "A reply to an SEC comment letter: 1 agreeing to restate or "
+                                                         "amend, 0.5 a substantive accounting topic, 0.25 disclosure "
+                                                         "only (Ryans 2021)"),
+    "cust_news_30": Feature(4, "customer_links", "Customers' llm_news_30, weighted by share of revenue (supply-chain "
+                                                 "propagation, trial)"),
+    "cust_fil_change": Feature(4, "customer_links", "Customers' latest fil_change, weighted by share of revenue (trial)"),
+    "text_peer_mom_21": Feature(4, "sympathy", "Mean 21-session return of the company's text-based peers, from 10-K "
+                                               "business descriptions (Hoberg & Phillips 2018, text-based industry momentum)"),
+    "fil_change": Feature(100, "filing_change", "One minus the cosine similarity of this 10-K / 10-Q to the comparable filing "
+                                                "before it (Cohen, Malloy & Nguyen 2020, Lazy Prices)"),
+    "fil_change_risk": Feature(100, "filing_change", "The same for the 10-K's risk-factor section (Item 1A) alone"),
+    "ev_alert_drift_5": Feature(5, "alert_drift", "Sign of the session before an alert from a family graded to "
+                                                  "continue it over five sessions; forward from 30 Oct 2026"),
 }
 
 EIGHT_K_FEATURES = {"3.02": "ev_8k_dilution", "3.01": "ev_8k_delisting_notice", "2.06": "ev_8k_impairment",

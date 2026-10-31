@@ -112,6 +112,28 @@ def delisted_stocks(inactive: Any, active_symbols: set) -> list:
     return sorted(set(out))
 
 
+def bankrupt_roots(assets: Any, active_symbols: set) -> list:
+    """The exchange tickers of companies now quoted over the counter in
+    bankruptcy: an OTC common stock whose symbol ends in Q (SIVBQ, NKLAQ) was
+    listed under the symbol without it, and the venue still serves that
+    history (SIVB to 9 Mar 2023). delisted_stocks misses them -- the asset
+    list carries only the Q symbol, on OTC, often still active -- so the worst
+    outcomes, the ones survivorship hides, were the ones left out. A root that
+    trades today is skipped: a reused ticker would splice two companies; a
+    root the venue has no bars for costs one empty request."""
+    out = set()
+    for a in assets or []:
+        sym = str(a.get("symbol") or "").upper()
+        if a.get("exchange") != "OTC" or len(sym) != 5 or not sym.endswith("Q") or not sym.isalpha():
+            continue
+        if classify(str(a.get("name") or "")) != "stock":
+            continue
+        root = sym[:-1]
+        if root not in active_symbols:
+            out.add(root)
+    return sorted(out)
+
+
 async def fetch_assets(session: Any, headers: Optional[Dict[str, str]], status: str) -> list:
     if not headers:
         return []
@@ -125,6 +147,7 @@ async def fetch_assets(session: Any, headers: Optional[Dict[str, str]], status: 
 
 
 __all__ = [
+    "bankrupt_roots",
     "ASSET_META_KEY", "LISTED_EXCHANGES", "classify", "compact", "delisted_stocks", "fetch_assets",
     "load_asset_meta", "refresh_asset_meta",
 ]

@@ -13,9 +13,10 @@
 
 import React, { useMemo, useState } from 'react';
 import Link from 'next/link';
+import { StockLink } from './StockDrawer';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
-import { ABSENT, formatAge, formatNumber } from '../lib/format';
+import { ABSENT, directionMark, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { rankWords } from '../lib/ideas';
 import { LoadingLines } from './ui/Skeleton';
@@ -94,9 +95,9 @@ export interface MatrixDoc {
 
 const STATUS_STYLE: Record<string, string> = {
   proven: 'border-positive/30 text-positive',
-  supported: 'border-sky-400/60 text-sky-200',
+  supported: 'border-accent/60 text-accent',
   published: 'border-caution/30 text-caution',
-  no_edge: 'border-line text-ink-mute line-through',
+  no_edge: 'border-line text-ink-mute',
   context: 'border-line text-ink-dim',
 };
 const GROUP_ORDER = ['events', 'model', 'fundamentals', 'price', 'options', 'short', 'insider', 'filings', 'news', 'execution'];
@@ -175,12 +176,14 @@ function EvidenceBar({ r }: { r: BoardRow }) {
   const total = parts.reduce((s, p) => s + p.n, 0);
   if (!total) return <div className="h-1.5 rounded-full bg-inset" aria-hidden />;
   return (
-    <div
-      className="flex h-1.5 overflow-hidden rounded-full bg-inset gap-px"
-      role="img"
-      aria-label={parts.filter((p) => p.n).map((p) => `${p.n} ${p.label}`).join(', ')}
-    >
-      {parts.map((p) => (p.n ? <div key={p.label} className={p.cls} style={{ flex: p.n }} /> : null))}
+    // Up votes fill from the ▲ end, down votes from the ▼ end, so the split
+    // reads without telling green from red.
+    <div className="flex items-center gap-1" role="img" aria-label={parts.filter((p) => p.n).map((p) => `${p.n} ${p.label}`).join(', ')}>
+      <span aria-hidden className="text-micro leading-none text-positive">▲</span>
+      <div className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-inset gap-px">
+        {parts.map((p) => (p.n ? <div key={p.label} className={p.cls} style={{ flex: p.n }} /> : null))}
+      </div>
+      <span aria-hidden className="text-micro leading-none text-negative">▼</span>
     </div>
   );
 }
@@ -192,6 +195,7 @@ function Spotlight({ rows, side }: { rows: BoardRow[]; side: 1 | -1 }) {
     <div className="space-y-2 min-w-0">
       <div>
         <h3 className={`text-sm font-semibold ${up ? 'text-positive' : 'text-negative'}`}>
+          <span aria-hidden>{directionMark(side)} </span>
           {up ? 'Strongest bullish' : 'Strongest bearish'}
         </h3>
         <p className="text-micro text-ink-mute">Higher confidence and the most votes, among stocks over $5 that are cheap to trade.</p>
@@ -203,10 +207,10 @@ function Spotlight({ rows, side }: { rows: BoardRow[]; side: 1 | -1 }) {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           {rows.map((r) => (
-            <Link
+            <StockLink
               key={r.ticker}
-              href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
-              className={`group rounded-xl border border-line bg-inset/60 p-3 space-y-2 border-t-2 hover:border-line-strong ${
+              ticker={r.ticker}
+              className={`group block rounded-xl border border-line bg-raised p-3 space-y-2 border-t-2 hover:border-line-strong ${
                 up ? 'border-t-positive/60' : 'border-t-negative/60'
               }`}
               title={r.why}
@@ -229,11 +233,12 @@ function Spotlight({ rows, side }: { rows: BoardRow[]; side: 1 | -1 }) {
               <div className="flex items-center justify-between gap-2 text-micro">
                 <span className="truncate text-ink-dim">{triggerWords(r.triggers)}</span>
                 <span className={`font-mono shrink-0 ${up ? 'text-positive' : 'text-negative'}`}>
+                  <span aria-hidden>{directionMark(side)} </span>
                   {formatNumber(Math.abs(r.net), { decimals: 0 })} of {formatNumber(r.votes, { decimals: 0 })}{' '}
                   {up ? 'say up' : 'say down'}
                 </span>
               </div>
-            </Link>
+            </StockLink>
           ))}
         </div>
       )}
@@ -279,6 +284,7 @@ export function MatrixList({ doc }: { doc: MatrixDoc }) {
                     <span
                       className={`font-mono ${s.direction > 0 ? 'text-positive' : s.direction < 0 ? 'text-negative' : 'text-ink'}`}
                     >
+                      {directionMark(s.direction) && <span aria-hidden>{directionMark(s.direction)} </span>}
                       {s.shown ?? s.display}
                     </span>
                     <span className={`px-1 rounded border text-[10px] ${STATUS_STYLE[s.status] ?? ''}`}>
@@ -403,7 +409,9 @@ export function SignalBoard() {
   );
 
   return (
-    <section className="bg-raised border border-line rounded-2xl p-4 sm:p-5 space-y-5 text-xs">
+    // No frame of its own, as on Stock calls: the cards, tiles and table are
+    // the raised objects, so the section is laid on the page.
+    <section className="space-y-5 text-xs">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h2 className="text-head font-semibold text-ink">Stocks doing something unusual</h2>
@@ -420,7 +428,7 @@ export function SignalBoard() {
               { n: tally.bear, label: 'lean down', tone: 'text-negative' },
               { n: tally.proven, label: 'backed by tested patterns', tone: 'text-accent' },
             ].map((s) => (
-              <div key={s.label} className="rounded-xl border border-line bg-inset px-3 py-2 min-w-[84px]">
+              <div key={s.label} className="rounded-xl border border-line bg-raised px-3 py-2 min-w-[84px]">
                 <div className={`font-mono text-lead leading-none ${s.tone}`}>{formatNumber(s.n, { decimals: 0 })}</div>
                 <div className="mt-1 text-micro text-ink-mute">{s.label}</div>
               </div>
@@ -483,14 +491,14 @@ export function SignalBoard() {
                 </li>
               </ul>
               <p>
-                Green votes say up, red say down. Signals marked &ldquo;Tested: doesn&apos;t work&rdquo; or &ldquo;Background&rdquo; are shown
+                Green (▲) votes say up, red (▼) say down. Signals marked &ldquo;Tested: doesn&apos;t work&rdquo; or &ldquo;Background&rdquo; are shown
                 when you open a row and never counted. A verdict is a lean, not a forecast: even the best signals here are right
                 only somewhat more often than not.
               </p>
             </div>
           </details>
 
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto rounded-xl border border-line bg-raised">
             <table className="w-full text-left">
               <thead className="text-micro text-ink-mute">
                 <tr className="border-b border-line">

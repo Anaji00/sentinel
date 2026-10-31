@@ -6,6 +6,7 @@ import { NavProvider } from '../../components/ui/NavContext';
 import { FeedbackProvider } from '../../components/ui/Feedback';
 import { TimeZoneProvider } from '../../components/ui/TimeZoneContext';
 import { DataProvider } from '../../components/ui/DataProvider';
+import { StockDrawer } from '../../components/StockDrawer';
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -15,6 +16,11 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           <FeedbackProvider>
             <div className="flex h-screen w-full bg-page text-ink overflow-hidden">
               <CommandPalette />
+              {/* Any page's ?t=TICKER opens the stock drawer over it. useSearchParams
+                  needs a Suspense boundary under the app router. */}
+              <React.Suspense fallback={null}>
+                <StockDrawer />
+              </React.Suspense>
               <Sidebar />
               <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                 <Header />

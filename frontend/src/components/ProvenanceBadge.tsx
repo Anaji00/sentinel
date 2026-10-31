@@ -46,7 +46,7 @@ export const ProvenanceBadge: React.FC<ProvenanceBadgeProps> = ({
       Mark = IconRadar;
       break;
     case 'computed_deterministic':
-      badgeStyle = 'bg-sky-500/15 text-sky-400 border-sky-500/40';
+      badgeStyle = 'bg-accent/15 text-accent border-accent/40';
       label = isSynthetic ? 'Simulated' : 'Calculated';
       Mark = isSynthetic ? IconSimulated : IconMethodology;
       break;

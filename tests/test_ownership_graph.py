@@ -146,3 +146,81 @@ def test_a_multi_class_stake_falls_back_to_market_value():
 
 def test_a_stake_that_rounds_to_zero_does_not_fail_the_filer():
     assert own.stake_pct(shares=10, value_usd=1_000.0, shares_out=10_000_000_000, market_cap_usd=1e12) == 0.0
+
+
+# ── the per-company index is whole, and repairs itself ──────────────────────
+#
+# Live on 30 October each filer's blob held ~500 companies but the holders
+# index ~105: it was written one company at a time between graph writes, and a
+# produce timeout part-way stopped it, every run. Apple, Walmart and Amazon had
+# no holders, and the /money lookup answered "no tracked owners" for them.
+
+def test_index_entries_cover_every_holding_in_the_blob():
+    blob = {"name": "Vanguard Group", "period": "2026-06-30", "holdings": [
+        {"ticker": "aapl", "shares": 10, "value_usd": 100, "pct_outstanding": 9.1},
+        {"ticker": "WMT", "shares": 5, "value_usd": 50, "pct_outstanding": None, "period": "2026-03-31"},
+        {"ticker": "", "shares": 1, "value_usd": 1},
+    ]}
+    entries = own.index_entries(blob)
+    assert [t for t, _ in entries] == ["AAPL", "WMT"]
+    assert entries[0][1] == {"filer": "Vanguard Group", "shares": 10, "value_usd": 100,
+                             "pct_outstanding": 9.1, "period": "2026-06-30"}
+    assert entries[1][1]["period"] == "2026-03-31"
+
+
+class _Pipe:
+    def __init__(self, store):
+        self.store, self.ops = store, []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def hset(self, key, field, value):
+        self.ops.append(("hset", key, field, value))
+
+    def expire(self, key, ttl):
+        self.ops.append(("expire", key, ttl))
+
+    async def execute(self):
+        for op in self.ops:
+            if op[0] == "hset":
+                self.store.setdefault(op[1], {})[op[2]] = op[3]
+
+
+class _Raw:
+    def __init__(self, blob):
+        self.blob, self.store, self.pipes = blob, {}, []
+
+    async def get(self, key):
+        return self.blob
+
+    def pipeline(self, transaction=False):
+        pipe = _Pipe(self.store)
+        self.pipes.append(pipe)
+        return pipe
+
+
+def test_write_index_rewrites_every_company_in_one_pipeline():
+    job = _job()
+    holdings = [{"ticker": f"T{i}", "shares": i, "value_usd": i, "pct_outstanding": 1.0} for i in range(500)]
+    raw = _Raw(json.dumps({"name": "Vanguard Group", "period": "2026-06-30", "holdings": holdings}))
+    n = asyncio.run(job.write_index(raw, "VANGUARD"))
+    assert n == 500 and len(raw.pipes) == 1
+    assert len(raw.store) == 500
+    assert json.loads(raw.store[own.HOLDERS_KEY.format(ticker="T499")]["VANGUARD"])["filer"] == "Vanguard Group"
+
+
+def test_write_index_without_a_blob_writes_nothing():
+    raw = _Raw(None)
+    assert asyncio.run(_job().write_index(raw, "VANGUARD")) == 0
+    assert raw.pipes == []
+
+
+def test_a_graph_failure_cannot_stop_the_index():
+    src = (ROOT / "services/collector-filings/ownership.py").read_text(encoding="utf-8")
+    body = src[src.index("async def refresh_filer"):src.index("async def write_index")]
+    assert body.index("await write_index(raw, filer.filer_id)") < body.index("graph.link_entities")
+    assert "collector_filings.ownership.graph_link" in body

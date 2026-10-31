@@ -106,7 +106,7 @@ const ACTION_TONE: Record<Order['action'], string> = {
   BUY: 'border-positive/30 text-positive',
   SELL: 'border-caution/30 text-caution',
   SHORT: 'border-negative/30 text-negative',
-  COVER: 'border-sky-500/50 text-sky-200',
+  COVER: 'border-accent/50 text-accent',
 };
 
 const pct = (v: number | null | undefined, signed = false) =>
@@ -130,7 +130,7 @@ function RelativeLine({ nav }: { nav: PortfolioData['nav'] }) {
       <polyline
         fill="none"
         strokeWidth={1.5}
-        className={last >= 1 ? 'stroke-emerald-400' : 'stroke-rose-400'}
+        className={last >= 1 ? 'stroke-positive' : 'stroke-negative'}
         points={rel.map((v, k) => `${x(k)},${y(v)}`).join(' ')}
       />
     </svg>
@@ -246,8 +246,8 @@ export function ModelPortfolio() {
             </div>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-            <Holdings title="Bought" rows={data.holdings.long} tone="border-emerald-500/40 text-emerald-200" />
-            <Holdings title="Bet against (avoid, or sell if you own them)" rows={data.holdings.short} tone="border-rose-500/40 text-rose-200" />
+            <Holdings title="Bought" rows={data.holdings.long} tone="border-positive/40 text-positive" />
+            <Holdings title="Bet against (avoid, or sell if you own them)" rows={data.holdings.short} tone="border-negative/40 text-negative" />
           </div>
           {latest && (
             <div className="space-y-1">

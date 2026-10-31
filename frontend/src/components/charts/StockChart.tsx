@@ -124,7 +124,7 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
 
           <button
             onClick={() => mutate()}
-            className="p-1.5 rounded bg-overlay hover:bg-slate-700 text-ink-dim transition"
+            className="p-1.5 rounded bg-overlay hover:bg-overlay text-ink-dim transition"
             title="Refresh series"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isValidating ? 'animate-spin' : ''}`} />

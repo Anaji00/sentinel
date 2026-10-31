@@ -5,8 +5,11 @@ import dynamic from 'next/dynamic';
 import { PanelSkeleton } from '@/components/ui/Skeleton';
 
 /**
- * Client islands for the options view. See intelligence/islands.tsx for why
- * these live outside the page component.
+ * Client islands for the Markets page's options and flow views.
+ *
+ * `next/dynamic` with `ssr: false` may only be called from a Client Component.
+ * Isolating it here keeps the page a Server Component, so the heading and
+ * layout render on the server while only the live panels hydrate.
  */
 const QuantRadarPanel = dynamic(() => import('@/components/QuantRadarPanel'), {
   loading: () => <PanelSkeleton title="Loading options radar…" />,

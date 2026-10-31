@@ -158,8 +158,9 @@ def test_cyber_is_gone_from_the_interface():
     stay (see below); nothing in the interface claims a cyber view exists."""
     src = ROOT / "frontend" / "src"
     assert not (src / "components" / "CyberIntelligencePanel.tsx").exists()
+    # The intelligence page and its island merged into /intel and IntelConsole.
     for rel in ("components/ui/Sidebar.tsx", "components/ui/CommandPalette.tsx",
-                "app/(dashboard)/intelligence/page.tsx", "app/(dashboard)/intelligence/islands.tsx"):
+                "app/(dashboard)/intel/page.tsx", "components/IntelConsole.tsx"):
         text = (src / rel).read_text(encoding="utf-8")
         assert "Cyber" not in text and "view=cyber" not in text, rel
 

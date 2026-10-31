@@ -7,19 +7,42 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.resolve(__dirname),
   },
-  // Pages folded into others keep their old addresses working: each old
-  // page is now a view (?view=) of the page that absorbed it.
+  // Pages folded into others keep their old addresses working. Eleven pages
+  // became four (Calls, Markets, Performance, Intel); each old page is now a
+  // view of the one that absorbed it. A rule with `has: view` passes the old
+  // ?view= through (redirects keep the query) and must come before the bare
+  // rule for the same source, because the first match wins.
   async redirects() {
     return [
-      { source: "/flow", destination: "/options?view=flow", permanent: false },
-      { source: "/osint", destination: "/intelligence?view=osint", permanent: false },
-      { source: "/macro", destination: "/charts?view=economy", permanent: false },
-      { source: "/reports", destination: "/cases?view=briefs", permanent: false },
-      { source: "/attribution", destination: "/strategies?view=drivers", permanent: false },
+      { source: "/predictions", destination: "/calls?view=record", permanent: false },
+      { source: "/board", destination: "/calls", permanent: false },
+      { source: "/signals", destination: "/calls?view=signals", permanent: false },
+      { source: "/charts", destination: "/markets", permanent: false },
+      { source: "/crypto", destination: "/markets?view=crypto", permanent: false },
+      { source: "/options", has: [{ type: "query", key: "view" }], destination: "/markets", permanent: false },
+      { source: "/options", destination: "/markets?view=flow", permanent: false },
+      { source: "/book", destination: "/performance", permanent: false },
+      { source: "/strategies", destination: "/performance#years", permanent: false },
+      { source: "/intelligence", has: [{ type: "query", key: "view", value: "osint" }], destination: "/intel", permanent: false },
+      { source: "/intelligence", destination: "/intel?view=console", permanent: false },
+      { source: "/map", destination: "/intel", permanent: false },
+      { source: "/cases", has: [{ type: "query", key: "view" }], destination: "/intel", permanent: false },
+      { source: "/cases", destination: "/intel?view=cases", permanent: false },
+      { source: "/flow", destination: "/markets?view=flow", permanent: false },
+      { source: "/osint", destination: "/intel?view=osint", permanent: false },
+      { source: "/macro", destination: "/markets?view=economy", permanent: false },
+      { source: "/reports", destination: "/intel?view=briefs", permanent: false },
+      { source: "/attribution", destination: "/performance#years", permanent: false },
     ];
   },
   async headers() {
     return [
+      {
+        // Browsers already revalidate a worker script, but an intermediate
+        // cache holding an old sw.js would pin phones to old caching rules.
+        source: "/sw.js",
+        headers: [{ key: "Cache-Control", value: "no-cache, no-store, must-revalidate" }],
+      },
       {
         source: "/:path*",
         headers: [

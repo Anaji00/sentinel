@@ -69,9 +69,10 @@ function RankBar({ percentile }: { percentile: number }) {
   );
 }
 
-export function TickerHero() {
+/** `symbol` overrides the page's ?symbol=, so the stock drawer can show the same header. */
+export function TickerHero({ symbol }: { symbol?: string } = {}) {
   const params = useSearchParams();
-  const t = (params?.get('symbol') || '').trim().toUpperCase().slice(0, 10);
+  const t = (symbol || params?.get('symbol') || '').trim().toUpperCase().slice(0, 10);
   // Daily closes from the same history the model reads, oldest first, so the
   // chart, the price and the call on the card all agree.
   const history = useSWR<ClosesResponse>(
@@ -117,7 +118,10 @@ export function TickerHero() {
   const e = model.data?.entry;
 
   return (
-    <section className="grid gap-4 rounded-2xl border border-line bg-raised p-4 sm:p-5 lg:grid-cols-[1.3fr_1fr_1.2fr]">
+    // A container query, not a window breakpoint: the same header shows full
+    // width on /ticker and in the 560px stock drawer.
+    <div className="@container">
+    <section className="grid gap-4 rounded-2xl border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1.3fr_1fr_1.2fr]">
       <div className="space-y-2 min-w-0">
         <div className="flex items-baseline gap-2">
           <h2 className="font-mono text-lead font-semibold text-ink">{t}</h2>
@@ -234,13 +238,14 @@ export function TickerHero() {
               The model only calls the strongest and weakest names in each industry. Everything it
               knows about {t} is below.
             </p>
-            <Link href="/predictions" className="text-xs text-accent hover:underline">
+            <Link href="/calls" className="text-xs text-accent hover:underline">
               See today&apos;s calls &rarr;
             </Link>
           </div>
         )}
       </div>
     </section>
+    </div>
   );
 }
 

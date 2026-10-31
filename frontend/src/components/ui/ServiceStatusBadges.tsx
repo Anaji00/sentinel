@@ -33,7 +33,7 @@ const TONE: Record<Health, string> = {
   healthy: 'bg-positive/10 border-positive/30 text-positive',
   degraded: 'bg-caution/10 border-caution/30 text-caution',
   down: 'bg-negative/10 border-negative/30 text-negative',
-  unknown: 'bg-slate-700/20 border-line-strong/40 text-ink-dim',
+  unknown: 'bg-overlay/40 border-line-strong/40 text-ink-dim',
 };
 
 const LABEL: Record<Health, string> = {

@@ -17,9 +17,9 @@ export default function FilingsPage() {
         title="Filings & fund holdings"
         description="Company filings as they reach the SEC (big events, ownership stakes, insider sales), what the largest funds own each quarter, and who controls each company."
         related={[
-          { href: '/options', label: 'Big-money flow' },
+          { href: '/markets?view=flow', label: 'Big-money flow' },
           { href: '/ticker', label: 'Look up a stock' },
-          { href: '/board', label: 'Signal board' },
+          { href: '/calls', label: 'Signal board' },
         ]}
       />
 

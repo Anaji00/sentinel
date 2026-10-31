@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Query
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_client
+from shared.utils.response_cache import cache_key, cached_json
 from shared.utils.conflict_zones import (
     NAV_WARNINGS_KEY, ZONE_LIVE_KEY, ZONES, ConflictZone,
     keyword_regex,
@@ -276,6 +277,15 @@ async def conflict_exposure(
     redis_client=Depends(get_redis_client),
     user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
 ) -> Dict[str, Any]:
+    """Instruments ranked by how much the conflict zones bear on them.
+
+    Cached two minutes per window: 1.9 s to compute (30 October).
+    """
+    return await cached_json(getattr(redis_client, "raw", None), cache_key("conflict_exposure", hours=hours, limit=limit),
+                             lambda: _conflict_exposure(hours, limit, db, redis_client, user), ttl=120, max_stale=3600)
+
+
+async def _conflict_exposure(hours: int, limit: int, db, redis_client, user: Dict[str, Any]) -> Dict[str, Any]:
     """Instruments ranked by how much the conflict zones bear on them.
 
     Each row names the zones and why, how often zone-tagged news and

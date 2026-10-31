@@ -39,6 +39,18 @@ export const DISPLAY_LOCALE = 'en-US';
 /** Rendered in place of any value that is absent, unmeasured, or not finite. */
 export const ABSENT = '—';
 
+/**
+ * ▲ for up, ▼ for down, nothing for flat or unknown.
+ *
+ * Direction was carried by green against red alone in the call cards and the
+ * signal board, which about one man in twelve cannot tell apart. The mark goes
+ * beside the colour, never instead of it.
+ */
+export function directionMark(direction: number | null | undefined): string {
+  if (direction == null || !Number.isFinite(direction) || direction === 0) return '';
+  return direction > 0 ? '▲' : '▼';
+}
+
 /** True when a value is a real, finite number safe to display. */
 export function isPresent(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);

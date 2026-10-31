@@ -25,6 +25,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { IconLock } from './icons';
 import SystemHealthHUD from '../SystemHealthHUD';
+import { ThemeToggle } from './ThemeToggle';
 import { useTelemetryStore } from '../../lib/store';
 import { AccountProfileModal } from '../AccountProfileModal';
 import { useNav } from './NavContext';
@@ -110,12 +111,12 @@ export const Header: React.FC = () => {
       ? 'tone-negative'
       : 'tone-caution';
   const streamDot = isConnected
-    ? 'bg-emerald-400'
+    ? 'bg-positive'
     : streamIdle
       ? 'bg-ink-mute'
       : authRequired
-        ? 'bg-rose-400'
-        : 'bg-amber-400';
+        ? 'bg-negative'
+        : 'bg-caution';
 
   return (
     <header
@@ -134,7 +135,7 @@ export const Header: React.FC = () => {
           className="md:hidden -ml-1 flex h-8 w-8 items-center justify-center rounded-md
                      text-ink-dim hover:text-ink hover:bg-overlay/60
                      transition-colors outline-none focus-visible:ring-1
-                     focus-visible:ring-cyan-400/60"
+                     focus-visible:ring-accent/60"
         >
           <Menu className="h-4 w-4" />
         </button>
@@ -221,6 +222,8 @@ export const Header: React.FC = () => {
             ))}
           </select>
         </label>
+
+        <ThemeToggle />
 
         <SystemHealthHUD />
 

@@ -161,7 +161,7 @@ export default function CryptoAnalytics() {
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-caution font-bold text-xs uppercase flex items-center gap-1">
+                      <span className="text-caution font-bold text-xs flex items-center gap-1">
                         {cd.pair || e.primary_entity_name || e.entity_name || 'Crypto Asset'}
                       </span>
                       <span
@@ -283,7 +283,7 @@ export default function CryptoAnalytics() {
                 <span className="text-lg">
                   <IconSignal className="inline-block shrink-0" />
                 </span>
-                <span className="font-bold text-caution uppercase tracking-wider">
+                <span className="font-bold text-caution">
                   Derivatives and order flow
                 </span>
               </div>

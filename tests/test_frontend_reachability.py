@@ -59,10 +59,12 @@ def test_priority_domains_appear_in_the_navigation():
     sidebar = (FRONTEND / "components/ui/Sidebar.tsx").read_text(encoding="utf-8")
     # /graph is deliberately absent: the knowledge-graph view was removed from
     # the product. Its backend and Neo4j remain, feeding the agent swarm.
-    for route in ("/filings", "/intelligence"):
+    # /intelligence became a view of /intel (with the world map and investigations);
+    # its old address redirects there, so the navigation names the new page.
+    for route in ("/filings", "/intel"):
         assert route in sidebar, f"{route} is missing from the navigation"
-    # Open-source intel is a view of /intelligence, and /osint redirects there.
-    intel = (FRONTEND / "app/(dashboard)/intelligence/page.tsx").read_text(encoding="utf-8")
+    # Open-source intel is a view of /intel, and /osint redirects there.
+    intel = (FRONTEND / "app/(dashboard)/intel/page.tsx").read_text(encoding="utf-8")
     assert "OsintThreatMatrix" in intel, "open-source intel is no longer reachable"
     config = (FRONTEND.parent / "next.config.ts").read_text(encoding="utf-8")
     assert '"/osint"' in config, "old /osint links no longer resolve"
@@ -88,7 +90,7 @@ def test_the_badge_renders_nothing_when_corroboration_does_not_apply():
 
 def test_the_client_type_matches_what_the_backend_emits():
     """A field renamed on one side and not the other renders undefined."""
-    from shared.utils.corroboration import CorroborationAssessment, CorroborationTracker
+    from shared.utils.corroboration import CorroborationTracker
 
     tracker = CorroborationTracker()
     emitted = set(tracker.observe("a claim about a thing", source="s", now=0).to_dict())

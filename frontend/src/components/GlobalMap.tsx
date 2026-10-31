@@ -14,6 +14,7 @@ import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { NormalizedEvent } from '../lib/types';
 import { useLiveEvents } from '../lib/useLiveEvents';
+import { withinHours } from '../lib/timeWindow';
 import { PALETTE } from '../lib/palette';
 import { IconClose } from './ui/icons';
 import { POLL } from './ui/DataProvider';
@@ -390,12 +391,12 @@ const StaticWorldBase = React.memo(function StaticWorldBase() {
           <Geography
             key={geo.rsmKey}
             geography={geo}
-            fill="#0f172a"
-            stroke="#1e293b"
+            fill="var(--bg-raised)"
+            stroke="var(--border-strong)"
             strokeWidth={0.5}
             style={{
               default: { outline: 'none' },
-              hover: { fill: '#1e293b', outline: 'none' },
+              hover: { fill: 'var(--bg-overlay)', outline: 'none' },
               pressed: { outline: 'none' },
             }}
           />
@@ -405,7 +406,8 @@ const StaticWorldBase = React.memo(function StaticWorldBase() {
   );
 });
 
-export default function GlobalMap() {
+/** `windowHours` keeps only ships and aircraft reported recently (the Intel console's slider). */
+export default function GlobalMap({ windowHours }: { windowHours?: number } = {}) {
   // The `d3-selection` polyfill that stood here patched nothing.
   //
   // It added `selection.prototype.interrupt` to whatever `import('d3-selection')`
@@ -431,7 +433,8 @@ export default function GlobalMap() {
     // handful of vessels a day never appears on the map at all.
     '/events/maritime?limit=250&region_spread=3',
     fetcher,
-    { refreshInterval: POLL.live },
+    // A backfill behind the live stream, which pushes positions as they arrive.
+    { refreshInterval: POLL.standard },
   );
   const { data: aviationEvents } = useSWR<NormalizedEvent[]>(
     '/events/aviation?limit=80&region_spread=2',
@@ -513,8 +516,11 @@ export default function GlobalMap() {
     ];
   }, [conflict]);
 
+  // Every 15 s, not 5: the shared live stream pushes new events as they
+  // happen, so this is a backfill. At 5 s the Intel page polled 116 times a
+  // minute (30 October).
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>('/events/tradfi?limit=40', fetcher, {
-    refreshInterval: POLL.live,
+    refreshInterval: POLL.standard,
   });
 
   // Layer Toggles State
@@ -561,8 +567,8 @@ export default function GlobalMap() {
       );
     });
     const merged = [...liveMaritime, ...(maritimeEvents || [])];
-    return Array.from(new Map(merged.map((e) => [e.event_id, e])).values());
-  }, [wsLiveEvents, maritimeEvents]);
+    return withinHours(Array.from(new Map(merged.map((e) => [e.event_id, e])).values()), windowHours);
+  }, [wsLiveEvents, maritimeEvents, windowHours]);
 
   const { vessels, tankersCount } = useMemo(() => {
     const vesselMap = new Map<string, MapVessel>();
@@ -698,8 +704,8 @@ export default function GlobalMap() {
       );
     });
     const merged = [...liveAviation, ...(aviationEvents || [])];
-    return Array.from(new Map(merged.map((e) => [e.event_id, e])).values());
-  }, [wsLiveEvents, aviationEvents]);
+    return withinHours(Array.from(new Map(merged.map((e) => [e.event_id, e])).values()), windowHours);
+  }, [wsLiveEvents, aviationEvents, windowHours]);
 
   const flights = useMemo(() => {
     const flightMap = new Map<string, MapFlight>();
@@ -807,7 +813,7 @@ export default function GlobalMap() {
   // remove. The cyber domain is retired from the platform altogether.
 
   return (
-    <div className="w-full h-full bg-inset relative overflow-hidden text-white rounded-xl border border-cyan-500/20 shadow-panel">
+    <div className="w-full h-full bg-inset relative overflow-hidden text-ink rounded-xl border border-accent/20 shadow-panel">
       {/* Top Bar Navigation & Multi-Domain Layer Toggles */}
       <div className="absolute top-3 left-3 right-3 z-10 bg-page/90 px-3.5 py-2 rounded-lg border border-accent/30 text-xs flex flex-wrap items-center justify-between gap-2 shadow-2xl">
         <div className="flex items-center gap-2">
@@ -824,7 +830,7 @@ export default function GlobalMap() {
             }}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showVessels && !tankersOnly
-                ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50'
+                ? 'bg-positive/20 text-positive border-positive/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -837,8 +843,8 @@ export default function GlobalMap() {
             }}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               tankersOnly
-                ? 'bg-amber-500/30 text-amber-300 border-amber-500/60 glow-amber'
-                : 'bg-raised text-amber-400/70 border-line'
+                ? 'bg-caution/30 text-caution border-caution/60 glow-amber'
+                : 'bg-raised text-caution/70 border-line'
             }`}
           >
             TANKERS ({liveVessels?.tankers ?? tankersCount})
@@ -850,8 +856,8 @@ export default function GlobalMap() {
             }}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               darkOnly
-                ? 'bg-fuchsia-500/30 text-fuchsia-300 border-fuchsia-500/60'
-                : 'bg-raised text-fuchsia-300/70 border-line'
+                ? 'bg-civic/30 text-civic border-civic/60'
+                : 'bg-raised text-civic/70 border-line'
             }`}
           >
             DARK ({liveVessels?.dark ?? 0})
@@ -860,7 +866,7 @@ export default function GlobalMap() {
             onClick={() => setShowZones(!showZones)}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showZones
-                ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                ? 'bg-negative/20 text-negative border-negative/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -870,7 +876,7 @@ export default function GlobalMap() {
             onClick={() => setShowWarnings(!showWarnings)}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showWarnings
-                ? 'bg-orange-500/20 text-orange-300 border-orange-500/50'
+                ? 'bg-caution/20 text-caution border-caution/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -880,7 +886,7 @@ export default function GlobalMap() {
             onClick={() => setShowFlights(!showFlights)}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showFlights
-                ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
+                ? 'bg-accent/20 text-accent border-accent/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -890,7 +896,7 @@ export default function GlobalMap() {
             onClick={() => setShowExchanges(!showExchanges)}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showExchanges
-                ? 'bg-purple-500/20 text-purple-300 border-purple-500/50'
+                ? 'bg-info/20 text-info border-info/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -900,7 +906,7 @@ export default function GlobalMap() {
             onClick={() => setShowChokepoints(!showChokepoints)}
             className={`px-2 py-0.5 rounded border transition-all cursor-pointer font-bold ${
               showChokepoints
-                ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
+                ? 'bg-caution/20 text-caution border-caution/50'
                 : 'bg-raised text-ink-mute border-line'
             }`}
           >
@@ -922,8 +928,8 @@ export default function GlobalMap() {
       {/* Object Inspector Drawer Modal */}
       {selectedObject && (
         <div className="absolute top-14 left-3 z-20 bg-page/95 border border-accent/50 p-4 rounded-xl max-w-sm text-xs shadow-2xl space-y-2.5">
-          <div className="flex items-center justify-between border-b border-cyan-500/30 pb-2">
-            <span className="font-bold text-accent uppercase tracking-wide">
+          <div className="flex items-center justify-between border-b border-accent/30 pb-2">
+            <span className="font-bold text-accent">
               {selectedObject.type === 'vessel' &&
                 (selectedObject.data.isTanker ? 'TANKER INSPECTOR' : 'VESSEL INSPECTOR')}
               {selectedObject.type === 'flight' && 'AIRSPACE FLIGHT INSPECTOR'}
@@ -941,7 +947,7 @@ export default function GlobalMap() {
             <button
               onClick={() => setSelectedObject(null)}
               aria-label="Close"
-              className="text-ink-dim hover:text-white font-bold text-xs bg-overlay px-2 py-0.5 rounded cursor-pointer"
+              className="text-ink-dim hover:text-ink font-bold text-xs bg-overlay px-2 py-0.5 rounded cursor-pointer"
             >
               <IconClose />
             </button>
@@ -950,39 +956,39 @@ export default function GlobalMap() {
           {selectedObject.type === 'vessel' && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                NAME: <span className="text-white font-bold">{selectedObject.data.name}</span>
+                NAME: <span className="text-ink font-bold">{selectedObject.data.name}</span>
               </div>
               <div>
                 TYPE:{' '}
-                <span className="text-amber-300 font-bold">{selectedObject.data.vessel_type}</span>
+                <span className="text-caution font-bold">{selectedObject.data.vessel_type}</span>
               </div>
               <div>
-                MMSI: <span className="text-cyan-400 font-mono">{selectedObject.data.mmsi}</span>
+                MMSI: <span className="text-accent font-mono">{selectedObject.data.mmsi}</span>
               </div>
               <div>
                 POSITION:{' '}
-                <span className="text-white font-bold">
+                <span className="text-ink font-bold">
                   {selectedObject.data.lat.toFixed(4)}, {selectedObject.data.lon.toFixed(4)}
                 </span>
               </div>
               <div>
                 REGION:{' '}
-                <span className="text-emerald-400">{selectedObject.data.region ?? ABSENT}</span>
+                <span className="text-positive">{selectedObject.data.region ?? ABSENT}</span>
               </div>
               {selectedObject.data.approximatePosition && (
-                <div className="text-amber-400">
+                <div className="text-caution">
                   POSITION IS THE REGION CENTROID &mdash; the vessel reported none.
                 </div>
               )}
               <div>
                 SPEED:{' '}
-                <span className="text-emerald-400 font-bold">
+                <span className="text-positive font-bold">
                   {selectedObject.data.speed ?? ABSENT} knots
                 </span>
               </div>
               <div>
                 ANOMALY SCORE:{' '}
-                <span className="text-rose-400 font-bold">
+                <span className="text-negative font-bold">
                   {(selectedObject.data.anomaly || 0).toFixed(2)}
                 </span>
               </div>
@@ -993,46 +999,46 @@ export default function GlobalMap() {
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
                 NAME:{' '}
-                <span className="text-white font-bold">{selectedLiveVessel.name ?? ABSENT}</span>
+                <span className="text-ink font-bold">{selectedLiveVessel.name ?? ABSENT}</span>
               </div>
               <div>
                 TYPE:{' '}
-                <span className="text-amber-300 font-bold">
+                <span className="text-caution font-bold">
                   {selectedLiveVessel.vessel_type ?? ABSENT}
                 </span>
               </div>
               <div>
-                MMSI: <span className="text-cyan-400 font-mono">{selectedLiveVessel.mmsi}</span>
+                MMSI: <span className="text-accent font-mono">{selectedLiveVessel.mmsi}</span>
               </div>
               <div>
                 POSITION:{' '}
-                <span className="text-white font-bold">
+                <span className="text-ink font-bold">
                   {selectedLiveVessel.lat.toFixed(4)}, {selectedLiveVessel.lon.toFixed(4)}
                 </span>
               </div>
               <div>
                 REGION:{' '}
-                <span className="text-emerald-400">{selectedLiveVessel.region ?? ABSENT}</span>
+                <span className="text-positive">{selectedLiveVessel.region ?? ABSENT}</span>
               </div>
               <div>
                 SPEED:{' '}
-                <span className="text-emerald-400 font-bold">
+                <span className="text-positive font-bold">
                   {selectedLiveVessel.speed != null ? `${selectedLiveVessel.speed} knots` : ABSENT}
                 </span>
               </div>
               <div>
                 LAST REPORT:{' '}
-                <span className="text-white">
+                <span className="text-ink">
                   {selectedLiveVessel.age_seconds != null
                     ? `${formatNumber(selectedLiveVessel.age_seconds / 3600, { decimals: 1 })}h ago`
                     : ABSENT}
                 </span>
               </div>
               {selectedLiveVessel.sanctioned && (
-                <div className="text-rose-400 font-bold">On a sanctions list.</div>
+                <div className="text-negative font-bold">On a sanctions list.</div>
               )}
               {selectedLiveVessel.dark && (
-                <div className="text-fuchsia-300">
+                <div className="text-civic">
                   Transponder silent longer than is normal for this area. Drawn at its last reported
                   position.
                 </div>
@@ -1043,14 +1049,14 @@ export default function GlobalMap() {
           {selectedWarning && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                ID: <span className="text-white font-bold font-mono">{selectedWarning.id}</span>
+                ID: <span className="text-ink font-bold font-mono">{selectedWarning.id}</span>
               </div>
               <div>
-                AREA: <span className="text-amber-300 font-bold">{selectedWarning.area}</span>
+                AREA: <span className="text-caution font-bold">{selectedWarning.area}</span>
               </div>
               <div>
                 KIND:{' '}
-                <span className={selectedWarning.military ? 'text-rose-400 font-bold' : 'text-ink'}>
+                <span className={selectedWarning.military ? 'text-negative font-bold' : 'text-ink'}>
                   {selectedWarning.military ? 'Military or hazardous operations' : 'General'}
                 </span>
               </div>
@@ -1065,7 +1071,7 @@ export default function GlobalMap() {
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
                 CALLSIGN:{' '}
-                <span className="text-cyan-300 font-bold">{selectedObject.data.callsign}</span>
+                <span className="text-accent font-bold">{selectedObject.data.callsign}</span>
               </div>
               <div>
                 ICAO24: <span className="text-ink-dim font-mono">{selectedObject.data.icao24}</span>
@@ -1073,13 +1079,13 @@ export default function GlobalMap() {
               {/* Computed and dropped before: a flight drawn at its region's
                   centroid looked like a reported position. */}
               {selectedObject.data.approximatePosition && (
-                <div className="text-amber-400">
+                <div className="text-caution">
                   POSITION IS THE REGION CENTROID &mdash; the aircraft reported none.
                 </div>
               )}
               <div>
                 ALTITUDE:{' '}
-                <span className="text-emerald-400 font-bold">
+                <span className="text-positive font-bold">
                   {selectedObject.data.altitude_ft != null
                     ? `${formatNumber(selectedObject.data.altitude_ft, { decimals: 0 })} ft`
                     : ABSENT}
@@ -1087,7 +1093,7 @@ export default function GlobalMap() {
               </div>
               <div>
                 SPEED:{' '}
-                <span className="text-emerald-400 font-bold">
+                <span className="text-positive font-bold">
                   {selectedObject.data.speed_kts ?? ABSENT} knots
                 </span>
               </div>
@@ -1096,7 +1102,7 @@ export default function GlobalMap() {
                 <span
                   className={
                     selectedObject.data.isEmergency
-                      ? 'text-rose-400 font-bold animate-pulse'
+                      ? 'text-negative font-bold animate-pulse'
                       : 'text-ink-dim'
                   }
                 >
@@ -1105,13 +1111,13 @@ export default function GlobalMap() {
               </div>
               <div>
                 ORIGIN COUNTRY:{' '}
-                <span className="text-amber-300">
+                <span className="text-caution">
                   {selectedObject.data.origin_country ?? ABSENT}
                 </span>
               </div>
               <div>
                 ANOMALY SCORE:{' '}
-                <span className="text-rose-400 font-bold">
+                <span className="text-negative font-bold">
                   {(selectedObject.data.anomaly || 0).toFixed(2)}
                 </span>
               </div>
@@ -1122,7 +1128,7 @@ export default function GlobalMap() {
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
                 EXCHANGE:{' '}
-                <span className="text-purple-300 font-bold">
+                <span className="text-info font-bold">
                   {selectedObject.data.name} ({selectedObject.data.symbol})
                 </span>
               </div>
@@ -1143,7 +1149,7 @@ export default function GlobalMap() {
                   {selectedObject.data.keyTickers.map((t: string) => (
                     <span
                       key={t}
-                      className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 text-micro font-bold"
+                      className="px-1.5 py-0.5 rounded bg-info/20 text-info border border-info/40 text-micro font-bold"
                     >
                       {t}
                     </span>
@@ -1156,32 +1162,32 @@ export default function GlobalMap() {
           {selectedObject.type === 'radar' && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                REGION: <span className="text-white font-bold">{selectedObject.data.region}</span>
+                REGION: <span className="text-ink font-bold">{selectedObject.data.region}</span>
               </div>
               <div>
                 CELL CENTRE:{' '}
-                <span className="text-white font-bold">
+                <span className="text-ink font-bold">
                   {selectedObject.data.lat.toFixed(4)}, {selectedObject.data.lon.toFixed(4)}
                 </span>
               </div>
               <div>
                 TARGET DENSITY:{' '}
-                <span className="text-violet-300 font-bold">{selectedObject.data.density}</span>
+                <span className="text-info font-bold">{selectedObject.data.density}</span>
               </div>
               <div>
                 IMAGED:{' '}
-                <span className="text-emerald-400">{selectedObject.data.observedOn ?? ABSENT}</span>
+                <span className="text-positive">{selectedObject.data.observedOn ?? ABSENT}</span>
               </div>
               {selectedObject.data.aisChecked && (
                 <div>
                   AIS HULLS IN CELL, SAME DAYS:{' '}
-                  <span className="text-white font-bold">
+                  <span className="text-ink font-bold">
                     {selectedObject.data.aisVessels ?? ABSENT}
                   </span>
                 </div>
               )}
               {selectedObject.data.noAis && (
-                <div className="text-fuchsia-300 font-bold">
+                <div className="text-civic font-bold">
                   Radar return with no AIS vessel in this cell over the same days: a likely hull not
                   transmitting.
                 </div>
@@ -1193,7 +1199,7 @@ export default function GlobalMap() {
               )}
               {/* Said on every one of these, because a reader who takes a radar
                   cell for a vessel count will draw conclusions it cannot carry. */}
-              <div className="text-amber-400 pt-1">
+              <div className="text-caution pt-1">
                 Sentinel-1 SAR. This is water returning like metal, not a vessel count &mdash; no
                 MMSI, no name, and two hulls close together read as one.
               </div>
@@ -1203,11 +1209,11 @@ export default function GlobalMap() {
           {selectedObject.type === 'chokepoint' && (
             <div className="space-y-1 text-micro text-ink-dim">
               <div>
-                LOCATION: <span className="text-white font-bold">{selectedObject.data.name}</span>
+                LOCATION: <span className="text-ink font-bold">{selectedObject.data.name}</span>
               </div>
               <div>
                 RISK TIER:{' '}
-                <span className="text-amber-400 font-bold">{selectedObject.data.risk}</span>
+                <span className="text-caution font-bold">{selectedObject.data.risk}</span>
               </div>
               <div>
                 COORDINATES:{' '}
@@ -1297,14 +1303,14 @@ export default function GlobalMap() {
 
       {/* Conflict zones: the list, or one zone's detail. */}
       {showZones && conflict && conflict.zones.length > 0 && (
-        <div className="absolute top-14 right-3 z-20 bg-page/95 border border-rose-500/40 p-3 rounded-xl w-80 max-h-[calc(100%-8rem)] overflow-y-auto text-xs shadow-2xl">
+        <div className="absolute top-14 right-3 z-20 bg-page/95 border border-negative/40 p-3 rounded-xl w-80 max-h-[calc(100%-8rem)] overflow-y-auto text-xs shadow-2xl">
           {selectedZone ? (
             <ConflictZoneDetail zone={selectedZone} onBack={() => setSelectedZoneId(null)} />
           ) : (
             <>
               <button
                 onClick={() => setZonePanelOpen(!zonePanelOpen)}
-                className="w-full flex items-center justify-between font-bold text-rose-300 uppercase tracking-wide text-micro cursor-pointer"
+                className="w-full flex items-center justify-between font-bold text-negative uppercase tracking-wide text-micro cursor-pointer"
               >
                 <span>Conflict zones &middot; news 24h</span>
                 <span>{zonePanelOpen ? '−' : '+'}</span>
@@ -1318,7 +1324,7 @@ export default function GlobalMap() {
                         onClick={() => setZonePanelTab(tab)}
                         className={`px-2 py-0.5 rounded border cursor-pointer font-bold uppercase ${
                           zonePanelTab === tab
-                            ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                            ? 'bg-negative/20 text-negative border-negative/50'
                             : 'bg-raised text-ink-mute border-line'
                         }`}
                       >
@@ -1345,7 +1351,7 @@ export default function GlobalMap() {
             type="button"
             aria-expanded={chokeOpen}
             onClick={() => setChokeOpen(!chokeOpen)}
-            className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold uppercase tracking-wide hover:text-ink"
+            className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold hover:text-ink"
           >
             <span>Chokepoints &middot; last {chokepointStatus.window_hours}h</span>
             <span aria-hidden>{chokeOpen ? '−' : '+'}</span>
@@ -1360,16 +1366,16 @@ export default function GlobalMap() {
                       className={
                         'h-1.5 w-1.5 rounded-full ' +
                         (!c.observed
-                          ? 'bg-rose-500'
+                          ? 'bg-negative'
                           : c.ais_silent
-                            ? 'bg-amber-400'
-                            : 'bg-emerald-400')
+                            ? 'bg-caution'
+                            : 'bg-positive')
                       }
                     />
                     <span className={c.observed ? '' : 'text-ink-dim'}>{c.region}</span>
                   </span>
                   <span
-                    className={'font-mono ' + (c.observed ? 'text-emerald-300' : 'text-rose-400')}
+                    className={'font-mono ' + (c.observed ? 'text-positive' : 'text-negative')}
                   >
                     {/* Not observed and quiet are different claims. */}
                     {instruments.length > 0 ? instruments.join('+') : 'no coverage'}
@@ -1387,7 +1393,7 @@ export default function GlobalMap() {
           type="button"
           aria-expanded={legendOpen}
           onClick={() => setLegendOpen(!legendOpen)}
-          className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold uppercase tracking-wide hover:text-ink"
+          className="flex w-full items-center justify-between gap-3 text-ink-dim font-semibold hover:text-ink"
         >
           <span>Legend</span>
           <span aria-hidden>{legendOpen ? '−' : '+'}</span>
@@ -1396,27 +1402,27 @@ export default function GlobalMap() {
           <>
             <div className="flex items-center gap-2">
               <span className="h-1.5 w-1.5 rounded-full bg-caution animate-pulse" />
-              <span className="text-amber-300 font-bold"> Tankers ({tankersCount})</span>
+              <span className="text-caution font-bold"> Tankers ({tankersCount})</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="h-1.5 w-1.5 rounded-full bg-positive animate-pulse" />
               <span>Total Vessels ({liveVessels?.count ?? vessels.length})</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full border border-fuchsia-400" />
-              <span className="text-fuchsia-300 font-bold"> Dark ({liveVessels?.dark ?? 0})</span>
+              <span className="h-1.5 w-1.5 rounded-full border border-civic" />
+              <span className="text-civic font-bold"> Dark ({liveVessels?.dark ?? 0})</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
-              <span className="text-rose-300 font-bold"> Sanctioned</span>
+              <span className="h-1.5 w-1.5 rounded-full bg-negative" />
+              <span className="text-negative font-bold"> Sanctioned</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
-              <span className="text-cyan-300 font-bold"> Flights ({flights.length})</span>
+              <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+              <span className="text-accent font-bold"> Flights ({flights.length})</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
-              <span className="text-purple-300 font-bold">
+              <span className="h-1.5 w-1.5 rounded-full bg-info animate-pulse" />
+              <span className="text-info font-bold">
                 {' '}
                 Financial Exchanges ({FINANCIAL_EXCHANGES.length})
               </span>
@@ -1596,7 +1602,7 @@ export default function GlobalMap() {
                     <circle
                       r={4}
                       fill={PALETTE.negative}
-                      stroke="#ffffff"
+                      stroke="var(--bg-base)"
                       strokeWidth={1}
                       className="cursor-pointer"
                     />
@@ -1662,7 +1668,7 @@ export default function GlobalMap() {
                     <circle
                       r={3.5}
                       fill={PALETTE.caution}
-                      stroke="#ffffff"
+                      stroke="var(--bg-base)"
                       strokeWidth={1}
                       className="cursor-pointer"
                     />
@@ -1693,7 +1699,7 @@ export default function GlobalMap() {
                     <circle
                       r={3}
                       fill={PALETTE.positive}
-                      stroke="#ffffff"
+                      stroke="var(--bg-base)"
                       strokeWidth={1}
                       className="cursor-pointer"
                     />

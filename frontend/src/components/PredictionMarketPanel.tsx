@@ -151,7 +151,7 @@ export default function PredictionMarketPanel() {
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-accent font-bold text-xs uppercase flex items-center gap-1">
+                      <span className="text-accent font-bold text-xs flex items-center gap-1">
                         {pd.ticker || e.primary_entity_name || 'Prediction Contract'}
                       </span>
                       <span className="text-micro text-ink-dim bg-page px-1.5 py-0.5 rounded border border-line">
@@ -174,8 +174,8 @@ export default function PredictionMarketPanel() {
                       <span className="text-negative">NO: {noProb}</span>
                     </div>
                     <div className="w-full h-1.5 bg-page rounded-full overflow-hidden flex border border-line">
-                      <div className="bg-emerald-400 h-full" style={{ width: `${yesPct ?? 0}%` }} />
-                      <div className="bg-rose-500 h-full" style={{ width: `${noPct ?? 0}%` }} />
+                      <div className="bg-positive h-full" style={{ width: `${yesPct ?? 0}%` }} />
+                      <div className="bg-negative h-full" style={{ width: `${noPct ?? 0}%` }} />
                     </div>
                   </div>
 
@@ -213,7 +213,7 @@ export default function PredictionMarketPanel() {
                 <span className="text-lg">
                   <IconTarget className="inline-block shrink-0" />
                 </span>
-                <span className="font-bold text-accent uppercase tracking-wider">
+                <span className="font-bold text-accent">
                   Contract detail
                 </span>
               </div>

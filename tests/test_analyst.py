@@ -1,6 +1,8 @@
 """The analyst's arithmetic: priors from the model's rank, ensembles, and citation checks."""
 
 import pathlib
+
+import pytest
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -84,6 +86,11 @@ class _Raw:
     async def ltrim(self, key: str, a: int, b: int) -> None:
         return None
 
+    async def hget(self, key: str, field: str) -> Optional[str]:
+        # Every test stock is a $10bn company: calls are kept to $1bn and up
+        # since 30 Oct 2026 (market_cap.is_large_cap), and unknown is not large.
+        return "1e10"
+
 
 class _Db:
     async def query(self, sql: str, *args: Any) -> List[Dict[str, Any]]:
@@ -127,8 +134,11 @@ _MSG = {"primary_entity_id": "NVDA", "trigger_event_id": "e1", "summary_headline
 
 
 def test_the_agent_grounds_samples_and_records_one_graded_forecast() -> None:
-    good = {"direction": "up", "probability": 0.7, "cited": ["F2"], "rationale": "rank"}
-    uncited = {"direction": "down", "probability": 0.9, "cited": [], "rationale": "vibes"}
+    # The model answers {rationale, cited, p_beat} since 30 Oct 2026: one
+    # probability of beating the market instead of a direction plus a chance
+    # the direction is right, which could be read either way.
+    good = {"p_beat": 0.7, "cited": ["F2"], "rationale": "rank"}
+    uncited = {"p_beat": 0.1, "cited": [], "rationale": "vibes"}
     a = _agent([good, uncited, good], {"NVDA": {"percentile": 0.9}})
     out = asyncio.run(a.analyse(_MSG))
     assert out is not None and out["samples"] == 2                    # the uncited answer was dropped
@@ -150,7 +160,7 @@ def test_the_agent_skips_unranked_stocks_and_stops_when_the_budget_sheds() -> No
 
 
 def test_when_the_live_ranks_lapse_the_last_stored_rank_is_the_prior() -> None:
-    good = {"direction": "up", "probability": 0.6, "cited": ["F2"], "rationale": ""}
+    good = {"p_beat": 0.6, "cited": ["F2"], "rationale": ""}            # the {rationale, cited, p_beat} shape
     a = _agent([good, good, good], {})
     out = asyncio.run(a.analyse(_MSG))
     assert out is not None and out["rank"] == 0.1 and abs(out["prior"] - 0.34) < 1e-9
@@ -167,3 +177,38 @@ def test_market_context_comes_last_and_only_when_it_matters() -> None:
     assert asyncio.run(a._context(a.redis.raw)) == []
     a.redis.raw.kv[gpr.LATEST_KEY] = __import__("json").dumps({**calm, "z": 2.1, "elevated": True})
     assert "elevated" in asyncio.run(a._context(a.redis.raw))[0]
+
+
+def test_p_beat_is_read_directly_and_the_old_shape_still_parses():
+    assert an.p_up({"p_beat": 0.3}) == 0.3                       # 30% chance of beating, unambiguous
+    assert an.p_up({"p_beat": "junk"}) == 0.5
+    assert an.p_up({"direction": "down", "probability": 0.7}) == pytest.approx(0.3)
+    fields = list(an.AnalystView.model_fields)
+    assert fields.index("rationale") < fields.index("p_beat")    # the argument is written before the number
+
+
+def test_a_hosted_analyst_samples_several_stocks_per_call():
+    import asyncio
+    from services.agents.analyst_agent import AnalystAgent
+
+    agent = AnalystAgent.__new__(AnalystAgent)
+    calls = []
+
+    async def fake(message, system, user, schema=None, **kw):
+        calls.append(user)
+        return an.AnalystBatch(views=[
+            an.BatchView(ticker="AAA", rationale="F1 says so", cited=["F1"], p_beat=0.6),
+            an.BatchView(ticker="BBB", rationale="F3 only", cited=["F3"], p_beat=0.4),   # BBB has two facts: dropped
+            an.BatchView(ticker="ZZZ", rationale="F1", cited=["F1"], p_beat=0.9)])       # not asked: ignored
+
+    agent._execute_with_telemetry = fake
+    agent.model = "groq/openai/gpt-oss-120b"
+    items = [("AAA", {"message": {}, "facts": ["F1. a"]}), ("BBB", {"message": {}, "facts": ["F1. b", "F2. c"]})]
+    out = asyncio.run(agent._sample_batch(items))
+    assert len(calls) == an_samples() and "STOCK AAA" in calls[0] and "STOCK BBB" in calls[0]
+    assert len(out["AAA"]) == an_samples() and out["BBB"] == []
+
+
+def an_samples():
+    from services.agents import analyst_agent
+    return analyst_agent.SAMPLES

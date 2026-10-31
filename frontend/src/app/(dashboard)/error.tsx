@@ -49,7 +49,7 @@ export default function DashboardError({
 
         <button
           onClick={reset}
-          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-negative/30 bg-negative/10 px-3 py-2 text-micro font-bold text-negative transition-colors hover:bg-negative/10 focus:outline-none focus:ring-2 focus:ring-rose-400"
+          className="mt-4 inline-flex items-center gap-2 rounded-lg border border-negative/30 bg-negative/10 px-3 py-2 text-micro font-bold text-negative transition-colors hover:bg-negative/10 focus:outline-none focus:ring-2 focus:ring-negative"
         >
           <RotateCw className="h-3.5 w-3.5" />
           RETRY

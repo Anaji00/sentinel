@@ -36,11 +36,12 @@ _ITEM5 = re.compile(r"item\s*5\s*[\.:\-–—]?\s*interest\s+in\s+securities", r
 
 
 class Intent(BaseModel):
+    # The quote first, so the verdicts are read off a sentence already written.
+    quote: str = Field(default="", max_length=400, description="the sentence of Item 4 that shows the intent, verbatim")
     activist: bool = Field(description="true if the filer states an intent to influence the company, "
                                        "false for investment-only boilerplate")
     intents: List[str] = Field(default_factory=list, max_length=6)
     hostile: bool = False
-    quote: str = Field(default="", max_length=400, description="the sentence of Item 4 that shows the intent, verbatim")
 
 
 SYSTEM = ("You read Item 4 (Purpose of Transaction) of a Schedule 13D. Decide whether the filer states an intent to "

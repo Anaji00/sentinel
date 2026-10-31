@@ -23,10 +23,11 @@ Pure: headlines in, prompt out; answers in, scores out; scores in, feature out.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 FEATURE = "llm_news_30"
 WINDOW_DAYS = 30
@@ -34,15 +35,27 @@ MIN_HEADLINES = 2            # a stock's mean over fewer is too noisy to publish
 BATCH = 20
 MAX_HEADLINE_CHARS = 240
 
+EVENT_TYPES = ("earnings", "guidance", "merger", "regulatory", "litigation", "management", "contract", "offering",
+               "analyst", "product", "other")
+
 SYSTEM = ("You are a financial expert with stock recommendation experience. For each numbered headline, answer "
           "whether it is good news (1), bad news (-1) or unclear (0) for the named company's stock price in the "
-          "short term. Judge the headline alone. Answer in JSON only: "
-          '{"scores": [{"i": 0, "s": 1}, ...]} with one entry per headline.')
+          "short term, and what kind of event it reports: " + ", ".join(EVENT_TYPES) + ". Judge the headline alone. "
+          'Answer in JSON only: {"scores": [{"i": 0, "s": 1, "e": "earnings"}, ...]} with one entry per headline.')
 
 
 class Scored(BaseModel):
     i: int = Field(ge=0, le=BATCH - 1)
     s: int = Field(ge=-1, le=1)
+    # The event type, read in the same call (Li, Qiao & Zheng 2025: effects
+    # differ by type). Anything off the list is "other".
+    e: str = "other"
+
+    @field_validator("e", mode="before")
+    @classmethod
+    def _event(cls, v: object) -> str:
+        t = str(v or "").strip().lower()
+        return t if t in EVENT_TYPES else "other"
 
 
 class Scores(BaseModel):
@@ -61,6 +74,15 @@ def parse(answer: Scores, n: int) -> Dict[int, int]:
     for s in answer.scores:
         if 0 <= s.i < n and s.i not in out:
             out[s.i] = s.s
+    return out
+
+
+def events(answer: Scores, n: int) -> Dict[int, str]:
+    """{index: event type}, as parse keeps scores."""
+    out: Dict[int, str] = {}
+    for s in answer.scores:
+        if 0 <= s.i < n and s.i not in out:
+            out[s.i] = s.e
     return out
 
 
@@ -95,5 +117,51 @@ def parse_cutoffs(spec: str) -> Dict[str, str]:
     return out
 
 
-__all__ = ["BATCH", "FEATURE", "MIN_HEADLINES", "SYSTEM", "Scored", "Scores", "WINDOW_DAYS", "cutoff_of",
-           "feature_rows", "parse", "parse_cutoffs", "prompt"]
+# A headline restating one of the stock's previous ten is stale (Tetlock, RFS
+# 2011: stale news moves prices less, and that move reverses). On 30 Oct 2026
+# 14.1% of single-ticker headlines restated one at a token overlap of 0.4 or
+# more, and the 120B scored 1,208 of them in a week: a syndicated story counted
+# several times in the 30-day mean. Stale ones are skipped, not scored.
+STALE_AT = 0.4
+PREVIOUS = 10
+STALE_SUFFIX = "#stale"          # the model label a skipped headline is recorded under
+_WORD = re.compile(r"[a-z0-9]+")
+_STOP = frozenset("the a an of to in on for and or with at by from as is are be its it this that new says said".split())
+
+
+def tokens(headline: str) -> frozenset:
+    return frozenset(w for w in _WORD.findall((headline or "").lower()) if w not in _STOP and len(w) > 2)
+
+
+def staleness(headline: str, previous: Iterable[str]) -> float:
+    """The highest token overlap (Jaccard) with any of the earlier headlines."""
+    t = tokens(headline)
+    if not t:
+        return 0.0
+    best = 0.0
+    for p in previous:
+        q = tokens(p)
+        if q:
+            best = max(best, len(t & q) / len(t | q))
+    return best
+
+
+def stale_ids(rows: Sequence[Mapping[str, object]], history: Sequence[Mapping[str, object]]) -> set:
+    """Ids of the rows (id, ticker, created_at, headline) that restate one of the
+    same ticker's PREVIOUS earlier headlines in `history` (ticker, created_at, headline)."""
+    by: Dict[str, List[Tuple[object, str]]] = {}
+    for h in history:
+        by.setdefault(str(h["ticker"]).upper(), []).append((h["created_at"], str(h["headline"])))
+    for v in by.values():
+        v.sort(key=lambda x: str(x[0]))
+    out = set()
+    for r in rows:
+        earlier = [h for at, h in by.get(str(r["ticker"]).upper(), []) if str(at) < str(r["created_at"])]
+        if staleness(str(r["headline"]), earlier[-PREVIOUS:]) >= STALE_AT:
+            out.add(r["id"])
+    return out
+
+
+__all__ = ["BATCH", "EVENT_TYPES", "FEATURE", "MIN_HEADLINES", "PREVIOUS", "STALE_AT", "STALE_SUFFIX", "SYSTEM", "Scored", "Scores",
+           "WINDOW_DAYS", "cutoff_of", "events", "feature_rows", "parse", "parse_cutoffs", "prompt", "stale_ids", "staleness",
+           "tokens"]

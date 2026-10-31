@@ -10,8 +10,8 @@ export default function AgentsPage() {
         title="AI analysts"
         description="Small AI models, running on this machine, that each watch one area and make calls. Every call is scored when the outcome is known."
         related={[
-          { href: '/predictions', label: 'Stock calls' },
-          { href: '/intelligence', label: 'News & intel' },
+          { href: '/calls', label: 'Stock calls' },
+          { href: '/intel', label: 'News & intel' },
         ]}
       />
       {/* Bounded rather than h-full. The page stacks two sections, and a

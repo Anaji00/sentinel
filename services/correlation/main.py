@@ -94,6 +94,7 @@ from shared.utils.backpressure import is_under_pressure
 from shared.utils.instrument_reach import exposure_tags
 from shared.utils.metrics import MetricsCollector
 from shared.utils.rule_feedback import deprecated_by_evidence
+from shared.utils import rule_probation
 from shared.utils.counterparty import is_null_address
 from shared.models.events import event_domain
 
@@ -1146,6 +1147,12 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     alert_tier = _tier_after_grades(
                         rule.get("rule_name", "Dynamic AI Rule"), alert_tier,
                         await _retired_rules(getattr(store, "_redis", None)))
+                    # A model-written rule fires and is graded, but at WATCH and
+                    # marked, until its family is graded to precede moves.
+                    _flagging = await _flagging_families(getattr(store, "_redis", None))
+                    _probation = rule_probation.on_probation(rule, _flagging)
+                    alert_tier = AlertTier(rule_probation.capped_tier(
+                        alert_tier.value, rule, _flagging, [t.value for t in _TIER_ORDER]))
 
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
@@ -1189,6 +1196,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                             "independent_support": round(
                                 _independent_support(supporting_events), 2
                             ),
+                            "probation": _probation,
                             "recurrence_count": _recurrence,
                             "rule_recurrence_count": _rule_recurrence,
                             "recurrence_factor": _recur_factor,
@@ -1466,7 +1474,7 @@ _TIER_ORDER = [
 # fires and is stored, but no higher than ALERT, so the top tiers are kept for
 # rules that have shown they precede something.
 _GRADES_TTL_SEC = 3600
-_GRADES_CACHE: Dict[str, Any] = {"at": 0.0, "retired": set()}
+_GRADES_CACHE: Dict[str, Any] = {"at": 0.0, "retired": set(), "flagging": set()}
 GRADED_CEILING = "ALERT"
 
 
@@ -1474,16 +1482,24 @@ async def _retired_rules(redis_client) -> set:
     if time.time() - _GRADES_CACHE["at"] < _GRADES_TTL_SEC:
         return _GRADES_CACHE["retired"]
     retired: set = set()
+    flagging: set = set()
     try:
-        from shared.utils.producer_grades import uninformative_rules
+        from shared.utils.producer_grades import move_flagging_families, uninformative_rules
         from shared.utils.signal_store import PRODUCER_GRADES_KEY
         blob = await redis_client.raw.get(PRODUCER_GRADES_KEY) if redis_client is not None else None
         if blob:
-            retired = uninformative_rules(json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")))
+            grades = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
+            retired, flagging = uninformative_rules(grades), move_flagging_families(grades)
     except Exception as e:
         swallowed("correlation.producer_grades", e, logger)
-    _GRADES_CACHE.update(at=time.time(), retired=retired)
+    _GRADES_CACHE.update(at=time.time(), retired=retired, flagging=flagging)
     return retired
+
+
+async def _flagging_families(redis_client) -> set:
+    """Families graded to precede bigger moves; read with the retired set."""
+    await _retired_rules(redis_client)
+    return _GRADES_CACHE["flagging"]
 
 
 def _tier_after_grades(rule_name: str, declared: "AlertTier", retired: set) -> "AlertTier":

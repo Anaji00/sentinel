@@ -169,10 +169,10 @@ export default function FeatureFlagManager() {
             isMasterActive ? handleResetKillSwitch('MASTER') : handleTripKillSwitch('MASTER')
           }
           disabled={processingFlag === 'MASTER'}
-          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl font-bold uppercase tracking-wider text-xs border transition-all cursor-pointer shadow-lg ${
+          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl font-bold text-xs border transition-all cursor-pointer shadow-lg ${
             isMasterActive
               ? 'bg-positive/10 text-positive border-positive/30 hover:bg-positive/10'
-              : 'bg-negative/10 text-negative border-negative/30 hover:bg-negative/10 hover:shadow-rose-500/20'
+              : 'bg-negative/10 text-negative border-negative/30 hover:bg-negative/10 hover:shadow-negative/20'
           }`}
         >
           <AlertOctagon className="w-4 h-4" />
@@ -202,7 +202,7 @@ export default function FeatureFlagManager() {
               key={key}
               className={`p-4 rounded-xl border transition-all space-y-3 ${
                 isKilled
-                  ? 'bg-page/40 border-rose-950/60 text-ink-dim'
+                  ? 'bg-page/40 border-negative/30 text-ink-dim'
                   : 'bg-raised/40 border-line/80 hover:border-line-strong/80 text-ink'
               }`}
             >
@@ -236,7 +236,7 @@ export default function FeatureFlagManager() {
                     disabled={flag.kill_switched || isMasterActive || processingFlag === key}
                     className={`px-2.5 py-1 rounded-lg border text-micro font-bold uppercase transition-all cursor-pointer ${
                       flag.enabled
-                        ? 'bg-overlay text-ink-dim border-line-strong hover:bg-slate-700'
+                        ? 'bg-overlay text-ink-dim border-line-strong hover:bg-overlay'
                         : 'bg-positive/10 text-positive border-positive/30 hover:bg-positive/10'
                     }`}
                   >

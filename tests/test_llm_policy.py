@@ -22,7 +22,10 @@ def test_the_stock_tier_runs_by_default(monkeypatch) -> None:
     # The quant engine runs; its model-written advisory is retired on its graded
     # record (Brier 0.283 over 280 calls, -26 bp a call; llm_policy.py).
     assert llm_disabled_for("quant_trading_engine")
-    assert agent_disabled("adversarial_wargamer") and agent_disabled("rule_synthesizer")
+    assert agent_disabled("adversarial_wargamer")
+    # Runs again since 30 Oct 2026, its rules on probation (rule_probation.py)
+    # rather than live at the tier the model chose.
+    assert not agent_disabled("rule_synthesizer")
     assert llm_disabled_for("radar_agent") and llm_disabled_for("macro_intelligence_engine")
 
 

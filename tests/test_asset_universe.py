@@ -62,3 +62,16 @@ def test_delisted_stocks_exclude_reused_tickers_and_non_stocks() -> None:
         {"symbol": "PINK", "exchange": "OTC", "name": "Pink Co Common Stock"},
     ]
     assert delisted_stocks(inactive, active_symbols={"SC"}) == ["CIVI"]
+
+
+def test_bankrupt_roots_recover_the_exchange_ticker() -> None:
+    from shared.utils.asset_universe import bankrupt_roots
+    assets = [
+        {"symbol": "SIVBQ", "exchange": "OTC", "name": "SVB Financial Group Common Stock"},
+        {"symbol": "NKLAQ", "exchange": "OTC", "name": "Nikola Corporation Common Stock"},
+        {"symbol": "AAPLQ", "exchange": "OTC", "name": "Fake Common Stock"},            # root trades today: reuse
+        {"symbol": "XYZQ", "exchange": "OTC", "name": "Short Common Stock"},             # four letters: no root
+        {"symbol": "ABCDQ", "exchange": "NYSE", "name": "Listed Common Stock"},          # not OTC
+        {"symbol": "EFGHQ", "exchange": "OTC", "name": "Some Fund ETF"},                 # not a stock
+    ]
+    assert bankrupt_roots(assets, {"AAPL"}) == ["NKLA", "SIVB"]

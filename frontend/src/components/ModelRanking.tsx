@@ -299,8 +299,8 @@ export function ModelRanking() {
             );
           })()}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <RankList title="Strongest ranks" rows={data?.top ?? []} tone="text-emerald-300" />
-            <RankList title="Weakest ranks" rows={data?.bottom ?? []} tone="text-rose-300" />
+            <RankList title="Strongest ranks" rows={data?.top ?? []} tone="text-positive" />
+            <RankList title="Weakest ranks" rows={data?.bottom ?? []} tone="text-negative" />
           </div>
           <p className="text-micro text-ink-mute">
             {formatNumber(rep.universe, { decimals: 0 })} stocks

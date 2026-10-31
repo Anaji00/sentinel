@@ -156,7 +156,7 @@ function BranchingRatios({ ratios }: { ratios: Record<string, number> }) {
         return (
           <li key={pair} className="flex items-center gap-2">
             <span className="w-32 shrink-0 truncate text-micro text-ink-dim">{pair}</span>
-            <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-white/5">
+            <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-overlay/50">
               <span
                 className="absolute inset-y-0 left-0 rounded-full"
                 style={{

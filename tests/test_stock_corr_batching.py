@@ -78,8 +78,15 @@ def test_the_pair_is_the_stocks_measured_macro_exposure_not_a_rotation():
     assert "no_macro_exposure" in body
 
 
-def test_no_stock_to_stock_edges_or_sympathy_movers():
+def test_no_stock_to_stock_edges_and_only_measured_sympathy_movers():
     src = (ROOT / "services/agents/stock_correlation_agent.py").read_text(encoding="utf-8")
     body = src.split("async def handle_message")[1]
-    assert "COMPETES_WITH" not in body and "brief.sympathy_movers = []" in body
-    assert "COMPETES_WITH" not in src.split("_EXPOSURE_CYPHER = ")[1].split('"""')[1]
+    # Sympathy movers returned on 30 Oct 2026 at the user's request, but only
+    # from measured peers (sympathy_peers): a model-named mover is dropped, and
+    # an edge carries the measured correlation, not the model's conviction.
+    assert "COMPETES_WITH" not in body
+    assert "if sm.ticker in peers]" in body and '"confidence_basis": "measured_corr"' in body
+    assert '"model_asserted"' not in body
+    # Exposures come from the measured table since 30 Oct 2026; the graph's
+    # exposure edges were sector priors at weight 1.0.
+    assert "_EXPOSURE_CYPHER" not in src and "FROM macro_exposures" in src

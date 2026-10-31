@@ -109,7 +109,7 @@ function PortfolioCard() {
   return (
     <Card
       title="Your model portfolio vs the S&P 500"
-      href="/book"
+      href="/performance"
       cta="See every holding and trade"
     >
       {!data ? (
@@ -191,7 +191,7 @@ function SignalsCard() {
     .sort((a, b) => Math.abs(b.lean) - Math.abs(a.lean))
     .slice(0, 6);
   return (
-    <Card title="Strongest evidence today" href="/board" cta="Open the signal board">
+    <Card title="Strongest evidence today" href="/calls" cta="Open the signal board">
       {!data ? (
         <LoadingLines />
       ) : rows.length === 0 ? (
@@ -225,7 +225,7 @@ function SignalsCard() {
 const SHORTCUTS: [string, string, string][] = [
   ['/watch', 'Look up your town', 'Cameras, agencies and the rules they follow'],
   ['/ticker', 'Look up a stock', 'Prices, fund holders and every signal'],
-  ['/signals', 'Trade signals', 'Only patterns proven on years of data'],
+  ['/calls?view=signals', 'Trade signals', 'Only patterns proven on years of data'],
   ['/watch#protect', 'Protect yourself', 'A privacy plan in two minutes'],
 ];
 

@@ -118,3 +118,19 @@ def test_minute_history_loads_each_name_once_and_retries_a_failed_chunk(monkeypa
     asyncio.run(M._load_minute_history(None, Raw(), ["AAA", "BBB", "BAD", "CCC"]))
     assert calls == [["BBB", "BAD"], ["CCC"]]          # AAA was loaded before
     assert marked == {"CCC"}                           # the failed chunk retries next pass
+
+
+def test_a_rollup_refresh_shorter_than_two_buckets_is_left_to_the_policy() -> None:
+    """The settle pass opens its window at 08:00 UTC; at 09:15 the hourly view's
+    window was 08:00-08:15 and Timescale refused it, 28 times on 30 Oct 2026."""
+    from datetime import timedelta
+    calls = []
+
+    class Db:
+        async def execute_without_transaction(self, sql, params, timeout=None):
+            calls.append(sql.split("'")[1])
+
+    start = datetime.now(timezone.utc) - timedelta(minutes=75)
+    asyncio.run(M.refresh_rollups(Db(), start, views=("tradfi_bars_5m", "tradfi_bars_15m", "tradfi_bars_30m",
+                                                    "tradfi_bars_1h")))
+    assert calls == ["tradfi_bars_5m", "tradfi_bars_15m"]

@@ -75,9 +75,9 @@ interface SwarmIntelligence {
 }
 
 const STATUS_TONE: Record<string, string> = {
-  HEALTHY: 'bg-emerald-400',
-  DEGRADED: 'bg-amber-400',
-  OFFLINE: 'bg-rose-500',
+  HEALTHY: 'bg-positive',
+  DEGRADED: 'bg-caution',
+  OFFLINE: 'bg-negative',
 };
 
 function Stat({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
@@ -181,7 +181,7 @@ export default function AgentSwarmTelemetry() {
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <span
-                    className={`h-2 w-2 rounded-full shrink-0 ${STATUS_TONE[ag.status] || 'bg-slate-600'}`}
+                    className={`h-2 w-2 rounded-full shrink-0 ${STATUS_TONE[ag.status] || 'bg-ink-mute'}`}
                     title={ag.status}
                   />
                   <span className="text-xs text-ink truncate">{ag.name?.replace(/_/g, ' ')}</span>

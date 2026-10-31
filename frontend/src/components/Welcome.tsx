@@ -24,7 +24,7 @@ const CHOICES: { focus: Focus; title: string; text: string; go?: string; tone: s
     focus: 'stocks',
     title: 'Today’s stock calls',
     text: 'What to buy and what to bet against, how likely each is to work, and how much to put in.',
-    go: '/predictions',
+    go: '/calls',
     tone: 'border-accent/40 hover:border-accent',
   },
   {

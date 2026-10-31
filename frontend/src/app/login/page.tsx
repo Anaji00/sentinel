@@ -122,15 +122,15 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen w-full bg-page text-ink flex flex-col items-center justify-center relative overflow-hidden select-none p-4">
       {/* A soft accent wash for depth. */}
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-cyan-950/30 via-page to-page" />
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-accent/10 via-page to-page" />
       <div className="absolute -top-40 -left-40 w-96 h-96 bg-accent-dim rounded-full blur-3xl pointer-events-none" />
-      <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-accent/10 rounded-full blur-3xl pointer-events-none" />
 
       {/* Main Glass Card */}
       <div className="relative w-full max-w-md bg-raised/90 border border-accent/40 rounded-3xl p-8 z-10 space-y-6">
         {/* Brand Header */}
         <div className="text-center space-y-2">
-          <div className="inline-flex h-14 w-14 rounded-2xl bg-gradient-to-br from-cyan-950 to-slate-950 border border-accent/60 items-center justify-center mb-2">
+          <div className="inline-flex h-14 w-14 rounded-2xl bg-accent-dim border border-accent/60 items-center justify-center mb-2">
             <span className="text-accent font-black text-2xl tracking-tighter drop-">S</span>
           </div>
           <h1 className="text-xl font-semibold text-ink">Welcome back to Sentinel</h1>
@@ -189,11 +189,11 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={isLoading || isSuccess}
-            className="w-full py-3.5 mt-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-ink font-semibold text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+            className="w-full py-3.5 mt-2 rounded-xl bg-accent hover:brightness-110 text-page font-semibold text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2"
           >
             {isLoading ? (
               <span className="flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-white animate-ping" />
+                <span className="h-2 w-2 rounded-full bg-ink animate-ping" />
                 Signing in…
               </span>
             ) : isSuccess ? (

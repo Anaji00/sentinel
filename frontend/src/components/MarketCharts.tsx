@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import { describeApiError } from '@/lib/api';
 import { fetcher } from '@/lib/api';
 import { Tabs } from '@/components/ui/Tabs';
+import { flashClass, useFlash } from '@/components/ui/useFlash';
 import {
   Maximize2,
   X,
@@ -165,6 +166,7 @@ function AssetSparklineCard({
   const hasData = data && data.length > 0;
   const latestPoint = hasData ? data[data.length - 1] : null;
   const firstPoint = hasData ? data[0] : null;
+  const flash = useFlash(latestPoint?.price);
 
   const priceChange = latestPoint && firstPoint ? latestPoint.price - firstPoint.price : 0;
   const pctChange = firstPoint && firstPoint.price > 0 ? (priceChange / firstPoint.price) * 100 : 0;
@@ -235,7 +237,7 @@ function AssetSparklineCard({
       <div className="flex items-baseline justify-between my-2">
         {hasData ? (
           <>
-            <div className="text-xl font-extrabold text-ink">
+            <div className={`text-xl font-extrabold text-ink px-1 -mx-1 ${flashClass(flash)}`}>
               ${latestPoint?.price ? formatNumber(latestPoint.price, { decimals: 2 }) : '0.00'}
             </div>
             <div
@@ -252,7 +254,7 @@ function AssetSparklineCard({
           </>
         ) : (
           <div className="flex items-center gap-2 py-1">
-            <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping" />
+            <span className="h-2 w-2 rounded-full bg-caution animate-ping" />
             <span className="text-xs font-bold text-caution uppercase tracking-wider animate-pulse">
               Waiting for the stream…
             </span>
@@ -273,7 +275,7 @@ function AssetSparklineCard({
               y1="30"
               x2="400"
               y2="30"
-              stroke="#1e293b"
+              stroke="var(--border-strong)"
               strokeDasharray="3 3"
               strokeWidth="0.5"
             />
@@ -282,7 +284,7 @@ function AssetSparklineCard({
               y1="60"
               x2="400"
               y2="60"
-              stroke="#1e293b"
+              stroke="var(--border-strong)"
               strokeDasharray="3 3"
               strokeWidth="0.5"
             />
@@ -291,7 +293,7 @@ function AssetSparklineCard({
               y1="90"
               x2="400"
               y2="90"
-              stroke="#1e293b"
+              stroke="var(--border-strong)"
               strokeDasharray="3 3"
               strokeWidth="0.5"
             />
@@ -313,7 +315,7 @@ function AssetSparklineCard({
                 cx={pt.x}
                 cy={pt.y}
                 r={hoverIndex === idx ? 5 : 2}
-                fill={hoverIndex === idx ? '#ffffff' : trendColor}
+                fill={hoverIndex === idx ? 'var(--text-primary)' : trendColor}
                 className="cursor-pointer transition-all"
                 onMouseEnter={() => setHoverIndex(idx)}
               />
@@ -349,7 +351,7 @@ function AssetSparklineCard({
           </>
         ) : (
           <span className="text-caution/90 font-bold uppercase tracking-widest text-micro flex items-center gap-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-ping" />
+            <span className="h-1.5 w-1.5 rounded-full bg-caution animate-ping" />
             No recent events stored
           </span>
         )}
@@ -657,7 +659,7 @@ export default function MarketCharts() {
                     <button
                       key={tf}
                       onClick={() => setTimeframe(tf)}
-                      className={`px-3 py-1 rounded-lg font-bold text-xs transition-colors cursor-pointer ${timeframe === tf ? 'bg-cyan-500 text-slate-950' : 'text-ink-dim hover:text-ink'}`}
+                      className={`px-3 py-1 rounded-lg font-bold text-xs transition-colors cursor-pointer ${timeframe === tf ? 'bg-accent text-page' : 'text-ink-dim hover:text-ink'}`}
                     >
                       {tf}
                     </button>
@@ -789,7 +791,7 @@ export default function MarketCharts() {
                           y1="75"
                           x2="1000"
                           y2="75"
-                          stroke="#1e293b"
+                          stroke="var(--border-strong)"
                           strokeDasharray="4 4"
                           strokeWidth="0.5"
                         />
@@ -798,7 +800,7 @@ export default function MarketCharts() {
                           y1="150"
                           x2="1000"
                           y2="150"
-                          stroke="#1e293b"
+                          stroke="var(--border-strong)"
                           strokeDasharray="4 4"
                           strokeWidth="0.5"
                         />
@@ -807,7 +809,7 @@ export default function MarketCharts() {
                           y1="225"
                           x2="1000"
                           y2="225"
-                          stroke="#1e293b"
+                          stroke="var(--border-strong)"
                           strokeDasharray="4 4"
                           strokeWidth="0.5"
                         />

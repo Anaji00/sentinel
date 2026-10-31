@@ -17,7 +17,7 @@ import logging
 import re
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends, WebSocket, WebSocketDisconnect
-from services.api_gateway.dependencies import get_db, get_redis_client, verify_websocket_api_key
+from services.api_gateway.dependencies import get_db, verify_websocket_api_key
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("api-gateway.events")
@@ -434,9 +434,6 @@ async def get_event_detail(
 
 
 # ── REAL-TIME WEBSOCKET LIVE FEED ─────────────────────────────────────────────
-
-from fastapi import WebSocket, WebSocketDisconnect
-import json
 
 @router.websocket("/ws/live-feed")
 async def websocket_live_feed(websocket: WebSocket, min_anomaly: float = Query(0.0)):

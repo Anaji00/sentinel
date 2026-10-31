@@ -34,6 +34,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from shared.utils.ollama import DEFAULT_MODEL
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.equities import is_macro_asset, is_major_crypto
+from shared.utils.market_cap import is_large_cap
 from shared.utils.quote_cache import parse_quote, quote_key
 
 # SPY's last minute bar at or before a moment: the market's price when a
@@ -178,6 +180,21 @@ class AgentPrediction(BaseModel):
 
 # A coin flip's Brier score on a yes/no call: the bar an agent's record must beat.
 COIN_FLIP_BRIER = 0.25
+
+# Strategies whose claims are graded apart from the agent's own record: their
+# outcomes write only the strategy card, and the resolved row is stored under
+# "<agent>.<label>", so neither the consensus weight nor the inference budget
+# moves on them. Sympathy movers (30 Oct 2026) are the stock correlation
+# agent's second claim per assessment, about other stocks.
+SIDE_STRATEGIES = {"sympathy:": "sympathy"}
+
+
+def side_label(strategy: Optional[str]) -> Optional[str]:
+    """The label a side claim is graded under, or None for the agent's own calls."""
+    for prefix, label in SIDE_STRATEGIES.items():
+        if strategy and str(strategy).startswith(prefix):
+            return label
+    return None
 
 
 def consensus_weight_for(brier_score: float, resolved: Optional[int] = None) -> float:
@@ -343,6 +360,15 @@ class PredictionScoringMixin:
         count, and it double-weights the scorecard that the consensus engine
         reads -- an agent repeating itself would outrank one that was right.
         """
+        # Calls only on companies of at least $1bn (30 Oct 2026). Macro
+        # instruments and crypto are not company stocks and are not gated; an
+        # unknown capitalisation is not large (market_cap.is_large_cap).
+        if prediction_kind == "price" and not is_macro_asset(ticker) and not is_major_crypto(ticker) \
+                and not await is_large_cap(self.redis, ticker):
+            dropped(f"agents.{self.name}.below_min_market_cap", "a call on a company under $1bn; not recorded",
+                    self.logger, detail=str(ticker))
+            return ""
+
         # An entry price that is not this ticker's price is not a prediction.
         #
         # Under the model-written advisory a play could name a peer while its
@@ -509,7 +535,8 @@ class PredictionScoringMixin:
         strategy/regime partition. Without the partitioned write the conditional
         cards would stay permanently empty and always fall back to global.
         """
-        await self._apply_outcome(self._scorecard_key(), prediction_correct, conviction)
+        if not side_label(strategy):
+            await self._apply_outcome(self._scorecard_key(), prediction_correct, conviction)
 
         if strategy:
             regime = await self.current_regime()
@@ -912,7 +939,7 @@ class PredictionScoringMixin:
                 float(pred.conviction),
                 datetime.fromisoformat(pred.created_at)
                 if isinstance(pred.created_at, str) else pred.created_at,
-                str(self.name),
+                str(self.name) + (f".{side_label(pred.strategy)}" if side_label(pred.strategy) else ""),
                 str(pred.ticker),
                 canonical_direction(pred.direction) or str(pred.direction or ""),
                 float(pred.entry_price or 0.0),

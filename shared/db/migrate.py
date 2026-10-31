@@ -2484,6 +2484,84 @@ MIGRATIONS = [
             CALL refresh_continuous_aggregate('tradfi_bars_4h', NULL, NOW() - INTERVAL '4 hours');
         """,
         "transactional": False
+    },
+    {
+        "version": "0077_macro_bars_and_sympathy_peers",
+        "sql": """
+            -- Daily closes for macro instruments the stock bars never carry:
+            -- Treasury par yields (US02Y, US10Y, US30Y, from Treasury.gov) and
+            -- futures, the dollar and VIX (Yahoo's chart API). Exposure edges
+            -- point at 11 futures and only CL=F and GC=F had any stored bars
+            -- (9 sessions each); US10Y had none anywhere. A yield's close is
+            -- the yield in percent, not a price.
+            CREATE TABLE IF NOT EXISTS macro_daily_bars (
+                symbol  TEXT NOT NULL,
+                day     DATE NOT NULL,
+                close   DOUBLE PRECISION NOT NULL,
+                source  TEXT NOT NULL,
+                PRIMARY KEY (symbol, day)
+            );
+            -- Measured sympathy peers (shared/utils/sympathy.py): stocks whose
+            -- daily moves net of SPY tracked each other over 120 sessions.
+            -- Rebuilt nightly; the stock correlation agent picks movers only
+            -- from here, where the model used to name them.
+            CREATE TABLE IF NOT EXISTS sympathy_peers (
+                ticker  TEXT NOT NULL,
+                peer    TEXT NOT NULL,
+                corr    DOUBLE PRECISION NOT NULL,
+                n       INTEGER NOT NULL,
+                as_of   DATE NOT NULL,
+                PRIMARY KEY (ticker, peer)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0078_macro_exposures",
+        "sql": """
+            -- Measured exposures of stocks to macro instruments
+            -- (shared/utils/macro_exposure.py): the instrument's term in a
+            -- daily regression with the market, |t| >= 3 over 252 sessions.
+            -- The graph's exposure edges were sector priors at weight 1.0;
+            -- the stock correlation agent reads these instead.
+            CREATE TABLE IF NOT EXISTS macro_exposures (
+                ticker        TEXT NOT NULL,
+                macro         TEXT NOT NULL,
+                beta          DOUBLE PRECISION NOT NULL,
+                t             DOUBLE PRECISION NOT NULL,
+                partial_corr  DOUBLE PRECISION NOT NULL,
+                n             INTEGER NOT NULL,
+                as_of         DATE NOT NULL,
+                PRIMARY KEY (ticker, macro)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0079_headline_event_type",
+        "sql": """
+            -- The kind of event each scored headline reports, from a fixed list
+            -- (shared/utils/llm_news.EVENT_TYPES), read in the same call as its
+            -- good/bad score: return effects differ by event type (Li, Qiao &
+            -- Zheng 2025). Null for headlines scored before 30 Oct 2026.
+            ALTER TABLE stock_news_llm ADD COLUMN IF NOT EXISTS event_type TEXT;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0080_text_peers",
+        "sql": """
+            -- Peers from 10-K business descriptions (shared/utils/text_peers.py),
+            -- after Hoberg & Phillips' text-based industries; rebuilt nightly.
+            CREATE TABLE IF NOT EXISTS text_peers (
+                ticker  TEXT NOT NULL,
+                peer    TEXT NOT NULL,
+                sim     DOUBLE PRECISION NOT NULL,
+                as_of   DATE NOT NULL,
+                PRIMARY KEY (ticker, peer)
+            );
+        """,
+        "transactional": True
     }
 ]
 

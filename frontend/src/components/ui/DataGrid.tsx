@@ -95,7 +95,7 @@ const Value: React.FC<{ path: string; value: unknown }> = ({ path, value }) => {
         className={`px-1.5 py-0.5 rounded text-micro font-bold tracking-wider border ${
           value
             ? 'bg-positive/10 text-positive border-positive/30'
-            : 'bg-slate-700/20 text-ink-dim border-line-strong/40'
+            : 'bg-overlay/40 text-ink-dim border-line-strong/40'
         }`}
       >
         {value ? 'TRUE' : 'FALSE'}

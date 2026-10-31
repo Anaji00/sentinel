@@ -170,7 +170,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 bg-page/80 border-b border-line">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-ink font-bold text-lg">
+            <div className="h-10 w-10 rounded-xl bg-accent-dim border border-line-accent flex items-center justify-center text-accent font-bold text-lg">
               {initials}
             </div>
             <div>
@@ -183,7 +183,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
           <button
             onClick={onClose}
             aria-label="Close account panel"
-            className="text-ink-dim hover:text-ink transition-colors text-lg px-2 rounded focus:outline-none focus:ring-2 focus:ring-cyan-400"
+            className="text-ink-dim hover:text-ink transition-colors text-lg px-2 rounded focus:outline-none focus:ring-2 focus:ring-accent"
           >
             <IconClose />
           </button>
@@ -200,7 +200,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
             <button
               key={key}
               onClick={() => setActiveTab(key)}
-              className={`px-4 py-2.5 text-micro font-bold tracking-wider transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-cyan-400 ${
+              className={`px-4 py-2.5 text-micro font-bold tracking-wider transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-accent ${
                 activeTab === key
                   ? 'text-accent border-b-2 border-line-accent bg-raised/40'
                   : 'text-ink-mute hover:text-ink-dim'
@@ -229,7 +229,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
           {error && (
             <div className="p-3 bg-negative/10 border border-negative/30 rounded-xl text-micro text-negative">
               {error} —{' '}
-              <button onClick={load} className="underline hover:text-rose-100">
+              <button onClick={load} className="underline hover:text-negative">
                 retry
               </button>
             </div>
@@ -238,17 +238,17 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
           {activeTab === 'overview' && (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
-                <Field label="Signed in as" value={email ?? ABSENT} tone="text-white" />
+                <Field label="Signed in as" value={email ?? ABSENT} tone="text-ink" />
                 <Field
                   label="Authorization role"
                   value={identity.role ? formatSymbol(identity.role) : ABSENT}
-                  tone="text-purple-400"
+                  tone="text-info"
                   hint="Determines which endpoints this session may call"
                 />
                 <Field
                   label="Active swarm agents"
                   value={loading ? '…' : formatNumber(platform?.activeAgents, { decimals: 0 })}
-                  tone="text-emerald-400"
+                  tone="text-positive"
                   hint={
                     platform && Object.keys(platform.reportingTiers).length > 0
                       ? Object.entries(platform.reportingTiers)
@@ -263,7 +263,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 <Field
                   label="Monitored equities"
                   value={loading ? '…' : formatNumber(platform?.watchlistCount, { decimals: 0 })}
-                  tone="text-cyan-400"
+                  tone="text-accent"
                   hint="Active watchlist size"
                 />
               </div>
@@ -374,7 +374,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                           )}`
                         : ABSENT
                   }
-                  tone="text-cyan-400"
+                  tone="text-accent"
                   hint="Components not deployed in this run mode are excluded"
                 />
               </div>
@@ -416,7 +416,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 <button
                   onClick={load}
                   disabled={loading}
-                  className="px-2 py-1 border border-line-strong rounded hover:text-ink hover:border-slate-500 transition-colors disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-cyan-400"
+                  className="px-2 py-1 border border-line-strong rounded hover:text-ink hover:border-line-strong transition-colors disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-accent"
                 >
                   {loading ? 'REFRESHING…' : 'REFRESH'}
                 </button>

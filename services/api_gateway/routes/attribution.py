@@ -18,7 +18,7 @@ Two capabilities the platform lacked, exposed where a person can act on them:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
 from shared.utils.rbac import require_role, Role
 from services.api_gateway.audit_actions import record_admin_action
+from shared.utils.response_cache import cache_key, cached_json
 from shared.utils.entity_resolution import (
     canonical_key,
     record_alias,
@@ -42,6 +43,7 @@ router = APIRouter(prefix="/api/v1/attribution", tags=["Signal Attribution & Ent
 async def get_signal_attribution(
     lookback_days: int = Query(90, ge=7, le=365),
     db=Depends(get_db_optional),
+    redis=Depends(get_redis_optional),
 ):
     """Each signal's measured lift over the base rate.
 
@@ -54,9 +56,18 @@ async def get_signal_attribution(
     samples and 0.04 on nine thousand are opposite findings that look alike in
     a table. When there is too little history the response says so rather than
     returning zeros, which would be indistinguishable from a measured null.
+
+    Cached an hour, and served stale for up to two days while it refreshes:
+    computing it walks 90 days of outcomes and took 13.2 s on every visit to
+    Performance.
     """
     from services.reasoning.signal_attribution import attribute_signals
-    return await attribute_signals(db, lookback_days=lookback_days)
+    return await cached_json(
+        getattr(redis, "raw", None),
+        cache_key("attribution_signals", lookback_days=lookback_days),
+        lambda: attribute_signals(db, lookback_days=lookback_days),
+        ttl=3600, max_stale=2 * 86400,
+    )
 
 
 class AliasRequest(BaseModel):

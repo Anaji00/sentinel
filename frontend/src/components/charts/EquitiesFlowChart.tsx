@@ -249,10 +249,10 @@ export default function EquitiesFlowChart() {
             <div className="flex items-center justify-between text-micro text-ink-dim mb-2 font-bold uppercase">
               <span className="flex items-center gap-3">
                 <span className="flex items-center gap-1 text-accent">
-                  <span className="h-2 w-2 rounded-full bg-cyan-400" /> SPY RELATIVE %
+                  <span className="h-2 w-2 rounded-full bg-accent" /> SPY RELATIVE %
                 </span>
                 <span className="flex items-center gap-1 text-positive">
-                  <span className="h-2 w-2 rounded-full bg-emerald-400" /> QQQ RELATIVE %
+                  <span className="h-2 w-2 rounded-full bg-positive" /> QQQ RELATIVE %
                 </span>
               </span>
               <span>
@@ -268,7 +268,7 @@ export default function EquitiesFlowChart() {
                 y1="90"
                 x2="600"
                 y2="90"
-                stroke="#334155"
+                stroke="var(--border-strong)"
                 strokeDasharray="4 4"
                 strokeWidth="1"
               />
@@ -277,7 +277,7 @@ export default function EquitiesFlowChart() {
                 y1="45"
                 x2="600"
                 y2="45"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.8"
               />
@@ -286,7 +286,7 @@ export default function EquitiesFlowChart() {
                 y1="135"
                 x2="600"
                 y2="135"
-                stroke="#1e293b"
+                stroke="var(--border-strong)"
                 strokeDasharray="3 3"
                 strokeWidth="0.8"
               />

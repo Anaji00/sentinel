@@ -116,7 +116,7 @@ export default function SubscriptionPanel() {
         <div className="flex items-center gap-3">
           <span
             className={`text-xs font-mono font-bold uppercase tracking-widest px-2 py-1 rounded ${
-              status.has_pro ? 'bg-positive/10 text-positive' : 'bg-slate-600/30 text-ink-dim'
+              status.has_pro ? 'bg-positive/10 text-positive' : 'bg-overlay/60 text-ink-dim'
             }`}
           >
             {status.has_pro ? 'Pro' : 'Free'}
@@ -151,7 +151,7 @@ export default function SubscriptionPanel() {
             <button
               onClick={() => go('checkout')}
               disabled={busy}
-              className="px-4 py-2 rounded bg-emerald-500 text-slate-950 text-sm font-bold hover:bg-emerald-400 disabled:opacity-50"
+              className="px-4 py-2 rounded bg-positive text-page text-sm font-bold hover:bg-positive disabled:opacity-50"
             >
               {busy ? 'Opening Stripe…' : 'Upgrade to Pro'}
             </button>

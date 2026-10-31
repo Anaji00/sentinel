@@ -418,6 +418,25 @@ def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
         mock_redis = AsyncMock()
         mock_prod = AsyncMock()
         agent.redis = mock_redis
+        # First synthesis of the day, and no identical rule live yet.
+        mock_redis.raw.incr = AsyncMock(return_value=1)
+        mock_redis.raw.hexists = AsyncMock(return_value=False)
+        # The slot is free and the queue hands back this trigger's context
+        # (contexts are batched per slot since 30 Oct 2026).
+        mock_redis.raw.exists = AsyncMock(return_value=0)
+        mock_redis.raw.set = AsyncMock(return_value=True)
+        queued = {}
+
+        async def _zadd(key, mapping, gt=False):
+            queued.update(mapping)
+
+        async def _zpopmax(key, k):
+            out = list(queued.items())[:k]
+            queued.clear()
+            return out
+
+        mock_redis.raw.zadd = _zadd
+        mock_redis.raw.zpopmax = _zpopmax
         agent._producer = mock_prod
         agent.logger = MagicMock()
 
@@ -455,17 +474,20 @@ def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
             }
         })
 
-        # 1. Stored in Redis with 7-day auto-expiry
+        # 1. Stored in Redis on probation (30 Oct 2026): an id from the rule's
+        # definition rather than the model's, and PROBATION_DAYS of life, since
+        # seven days ended every rule before the grader could judge it.
         assert mock_redis.raw.hset.call_count == 1
         stored_json = json.loads(mock_redis.raw.hset.call_args[0][2])
-        assert stored_json["rule_id"] == "syn_energy_defense_01"
-        assert stored_json["expires_at"] > time.time() + 6 * 86400
+        assert stored_json["rule_id"].startswith("syn_") and stored_json["rule_id"] != "syn_energy_defense_01"
+        assert stored_json["probation"] is True
+        assert stored_json["expires_at"] > time.time() + 29 * 86400
 
         # 2. Emitted to Topics.RULES_SYNTHESIZED
         prod_calls = [c[0] for c in mock_prod.send.call_args_list]
         rule_synth_calls = [c for c in prod_calls if c[0] == Topics.RULES_SYNTHESIZED]
         assert len(rule_synth_calls) == 1
-        assert rule_synth_calls[0][1]["rule_id"] == "syn_energy_defense_01"
+        assert rule_synth_calls[0][1]["rule_id"] == stored_json["rule_id"]
 
         # 3. No graph edge from a rule's tags.
         #

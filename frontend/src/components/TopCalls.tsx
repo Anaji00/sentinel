@@ -74,7 +74,7 @@ export function TopCalls({ count = 4 }: { count?: number }) {
             </Chip>
           )}
           <Link
-            href="/predictions"
+            href="/calls"
             className="rounded-full bg-accent px-3 py-1 text-micro font-semibold text-page hover:opacity-90"
           >
             See all calls &rarr;

@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from shared.utils import forecast_skill as fs
 from shared.utils import paper_ledger as pl
 from shared.utils import producer_grades as pg
 from shared.utils import score_calibration as scal
@@ -176,6 +177,12 @@ _PLACEBO_SQL = """
       AND (upper(primary_entity_id) = upper($1) OR upper(primary_entity_name) = upper($1)) LIMIT 1
 """
 _UP = {"long", "up", "bullish"}
+# Resolved directional calls, for each agent's skill against chance (forecast_skill).
+_RESOLVED_CALLS_SQL = f"""
+    SELECT agent_name, direction, outcome_correct, confidence FROM agent_predictions
+    WHERE resolved_at IS NOT NULL AND occurred_at > NOW() - INTERVAL '{PRODUCER_WINDOW_DAYS} days'
+      AND outcome_correct IS NOT NULL AND lower(direction) IN ('long', 'up', 'bullish', 'short', 'down', 'bearish')
+"""
 HEADLINE_DAYS = "(headline days, no alert)"     # the reference row in family_follow_*
 
 
@@ -291,6 +298,10 @@ class Grader:
             follow += [(HEADLINE_DAYS, prior(r["ticker"], r["at"]),
                         (ratio(r["ticker"], r["at"], k) or (None, None))[1]) for r in news_only]
             out[f"family_follow_{k}d"] = pg.follow_table(follow)
+        days: Dict[str, set] = defaultdict(set)
+        for r in corr:
+            days[pg.rule_family(str(r["rule_name"]))].add(str(r["at"])[:10])
+        out["family_days"] = {g: len(v) for g, v in days.items()}
         out["correlations"] = out["correlations_5d"]
         signed: Dict[str, List[float]] = defaultdict(list)
         for r in calls:
@@ -300,6 +311,16 @@ class Grader:
                 sign = 1 if str(r["direction"]).lower() in _UP else -1
                 signed[str(r["agent_name"])].append(sign * got[1])
         out["agent_calls"] = {a: tr.summarize(v) for a, v in signed.items()}
+        # Each agent's hit rate beside the hits its own mix of calls would score
+        # by chance in the same outcomes (Heidke), and its stated probability
+        # against the base rate (Brier skill).
+        resolved: Dict[str, List[fs.Call]] = defaultdict(list)
+        for r in await self.db.query(_RESOLVED_CALLS_SQL) or []:
+            up = str(r["direction"]).lower() in _UP
+            right = bool(r["outcome_correct"])
+            conf = float(r["confidence"]) if r["confidence"] is not None else None
+            resolved[str(r["agent_name"])].append((up, up == right, conf))
+        out["agent_skill"] = {a: fs.skill(v) for a, v in resolved.items()}
         claims: Dict[str, Tuple[List[bool], List[bool]]] = defaultdict(lambda: ([], []))
         for r in await self.db.query(_CLAIMS_SQL) or []:
             hits, placebo = claims[str(r["agent_name"])]

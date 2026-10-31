@@ -103,7 +103,7 @@ export function ConflictZoneDetail({
     <div className="space-y-1 text-micro text-ink-dim">
       <div className="flex items-start justify-between gap-2">
         <div>
-          <div className="text-white font-bold text-xs">{zone.name}</div>
+          <div className="text-ink font-bold text-xs">{zone.name}</div>
           <div className="pt-1 flex items-center gap-2 flex-wrap">
             <StatusBadge zone={zone} />
             <span>{zone.prior === 'active' ? 'Standing: active war' : 'Standing: flashpoint'}</span>
@@ -112,7 +112,7 @@ export function ConflictZoneDetail({
         <button
           onClick={onBack}
           aria-label="Back to zone list"
-          className="text-ink-dim hover:text-white font-bold bg-overlay px-2 py-0.5 rounded cursor-pointer"
+          className="text-ink-dim hover:text-ink font-bold bg-overlay px-2 py-0.5 rounded cursor-pointer"
         >
           <IconClose />
         </button>
@@ -120,7 +120,7 @@ export function ConflictZoneDetail({
 
       <Section title="News intensity (GDELT, all languages)">
         <div>
-          <span className="text-white font-bold">{formatNumber(zone.news_volume_24h, { decimals: 0 })}</span>{' '}
+          <span className="text-ink font-bold">{formatNumber(zone.news_volume_24h, { decimals: 0 })}</span>{' '}
           articles in 24h &middot; {trendText(zone)}
         </div>
         <Sparkline series={zone.volume_series} />
@@ -149,17 +149,17 @@ export function ConflictZoneDetail({
                 className={
                   'font-bold font-mono ' +
                   (r.kind === 'instrument'
-                    ? 'text-cyan-300'
+                    ? 'text-accent'
                     : r.kind === 'chokepoint'
-                      ? 'text-amber-300'
-                      : 'text-purple-300')
+                      ? 'text-caution'
+                      : 'text-info')
                 }
               >
                 {r.target}
               </span>{' '}
               <span className="text-ink-mute">({r.kind})</span> <span className="text-ink">{r.why}</span>
               {r.latest_move && (
-                <div className="pl-3 text-emerald-300">
+                <div className="pl-3 text-positive">
                   Latest move {formatAge(r.latest_move.occurred_at)} ago: {r.latest_move.headline ?? ABSENT}
                 </div>
               )}
@@ -178,7 +178,7 @@ export function ConflictZoneDetail({
             {activity.map(([type, n]) => (
               <div key={type} className="flex justify-between">
                 <span>{ACTIVITY_LABELS[type] ?? type}</span>
-                <span className="text-white font-mono">{formatNumber(n, { decimals: 0 })}</span>
+                <span className="text-ink font-mono">{formatNumber(n, { decimals: 0 })}</span>
               </div>
             ))}
           </div>
@@ -190,7 +190,7 @@ export function ConflictZoneDetail({
           <ul className="space-y-1">
             {zone.nav_warnings.slice(0, 6).map((w) => (
               <li key={w.id}>
-                <span className={w.military ? 'text-rose-400 font-bold' : 'text-amber-300'}>{w.id}</span>{' '}
+                <span className={w.military ? 'text-negative font-bold' : 'text-caution'}>{w.id}</span>{' '}
                 <span className="text-ink">{w.area}</span>
                 <div className="text-ink-mute whitespace-pre-line line-clamp-3">{w.text}</div>
               </li>
@@ -241,7 +241,7 @@ export function ConflictExposureList({ instruments }: { instruments: ExposedInst
       {instruments.map((i) => (
         <li key={i.symbol} className="border-b border-line pb-1.5">
           <div className="flex items-center justify-between gap-2">
-            <span className="font-mono font-bold text-cyan-300">{i.symbol}</span>
+            <span className="font-mono font-bold text-accent">{i.symbol}</span>
             <span className="font-mono text-ink-dim">{formatNumber(i.score, { decimals: 2 })}</span>
           </div>
           <div className="flex flex-wrap gap-1 pt-0.5">
@@ -266,7 +266,7 @@ export function ConflictExposureList({ instruments }: { instruments: ExposedInst
             </div>
           )}
           {i.latest_move && (
-            <div className="text-emerald-300">
+            <div className="text-positive">
               {formatAge(i.latest_move.occurred_at)} ago: {i.latest_move.headline ?? ABSENT}
             </div>
           )}

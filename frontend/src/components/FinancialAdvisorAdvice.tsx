@@ -402,12 +402,12 @@ export default function FinancialAdvisorAdvice() {
                 style={{ width: `${a.target_weight_pct}%` }}
                 className={`h-full border-r border-line transition-all ${
                   i === 0
-                    ? 'bg-cyan-500'
+                    ? 'bg-accent'
                     : i === 1
-                      ? 'bg-purple-500'
+                      ? 'bg-info'
                       : i === 2
-                        ? 'bg-emerald-500'
-                        : 'bg-amber-500'
+                        ? 'bg-positive'
+                        : 'bg-caution'
                 }`}
                 title={`${a.ticker}: ${a.target_weight_pct}% Target Weight`}
               />
@@ -419,12 +419,12 @@ export default function FinancialAdvisorAdvice() {
                 <span
                   className={`h-1.5 w-1.5 rounded-full ${
                     i === 0
-                      ? 'bg-cyan-400'
+                      ? 'bg-accent'
                       : i === 1
-                        ? 'bg-purple-400'
+                        ? 'bg-info'
                         : i === 2
-                          ? 'bg-emerald-400'
-                          : 'bg-amber-400'
+                          ? 'bg-positive'
+                          : 'bg-caution'
                   }`}
                 />
                 <span>
@@ -439,7 +439,7 @@ export default function FinancialAdvisorAdvice() {
         <div className="p-2.5 rounded-xl bg-inset border border-line text-xs space-y-1">
           <div className="flex items-center justify-between text-accent font-bold text-micro">
             <span className="flex items-center gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
+              <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping" />
               Risk mandate
             </span>
             <span className="text-positive text-micro">Sized at quarter-Kelly</span>
@@ -628,7 +628,7 @@ export default function FinancialAdvisorAdvice() {
               </div>
               <button
                 onClick={() => setSelectedPlay(null)}
-                className="text-ink-dim hover:text-ink font-bold text-xs bg-overlay hover:bg-slate-700 px-2.5 py-1 rounded-lg cursor-pointer"
+                className="text-ink-dim hover:text-ink font-bold text-xs bg-overlay hover:bg-overlay px-2.5 py-1 rounded-lg cursor-pointer"
               >
                 CLOSE
               </button>
@@ -702,7 +702,7 @@ export default function FinancialAdvisorAdvice() {
             {/* Moving Average Distance Breakdown Grid */}
             <div className="p-3 bg-page border border-line rounded-xl space-y-2 text-micro">
               <div className="flex items-center justify-between">
-                <span className="text-accent font-bold uppercase">
+                <span className="text-accent font-bold">
                   Distance from moving averages
                 </span>
                 <span className="px-2 py-0.5 rounded text-micro font-bold bg-accent-dim text-accent">
@@ -746,7 +746,7 @@ export default function FinancialAdvisorAdvice() {
             {/* GARCH Volatility Cone Tranche Exits */}
             {selectedPlay.volatility_cone && (
               <div className="p-3 bg-page rounded-xl border border-caution/30 space-y-1.5 text-micro">
-                <div className="flex items-center justify-between text-caution font-bold uppercase">
+                <div className="flex items-center justify-between text-caution font-bold">
                   <span>GARCH(1,1) VOLATILITY CONE TRANCHE EXITS</span>
                   <span>
                     COND VOL:{' '}
@@ -819,7 +819,7 @@ export default function FinancialAdvisorAdvice() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => handleExecuteOrder(selectedPlay)}
-                  className="flex-1 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 font-extrabold text-xs hover:from-emerald-400 hover:to-teal-300 transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2"
+                  className="flex-1 py-3 rounded-xl bg-positive text-page font-extrabold text-xs hover:brightness-110 transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2"
                 >
                   <span>
                     <IconSignal className="inline-block shrink-0" />

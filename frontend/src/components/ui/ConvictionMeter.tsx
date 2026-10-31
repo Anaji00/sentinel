@@ -14,6 +14,14 @@ export function edgeShare(p: number): number {
   return Math.max(0, Math.min(1, (p - 0.5) / 0.25));
 }
 
+/** The odds in words, so 52% reads as nearly a coin flip rather than as a bar. */
+export function oddsWords(p: number): string {
+  if (p < 0.53) return 'about a coin flip';
+  if (p < 0.6) return 'a bit better than even';
+  if (p < 0.7) return 'better than even';
+  return 'strong odds';
+}
+
 export function ConvictionMeter({
   p,
   label = 'Chance it goes our way',
@@ -27,8 +35,11 @@ export function ConvictionMeter({
     <div className="space-y-1">
       <div className="flex items-baseline justify-between text-micro">
         <span className="text-ink-mute">{label}</span>
-        <span className="font-mono text-ink">
-          {p == null ? ABSENT : `${formatNumber(p * 100, { decimals: 0 })}%`}
+        <span className="text-ink-dim">
+          {p != null && <span className="mr-1.5">{oddsWords(p)}</span>}
+          <span className="font-mono text-ink">
+            {p == null ? ABSENT : `${formatNumber(p * 100, { decimals: 0 })}%`}
+          </span>
         </span>
       </div>
       <div
