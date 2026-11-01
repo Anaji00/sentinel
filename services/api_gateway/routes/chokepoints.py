@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 
-from services.api_gateway.dependencies import get_db, get_redis_client
+from services.api_gateway.dependencies import get_db, get_redis_client, get_redis_optional
 from shared.utils.chokepoints import SAR_AIS_CHECK_AREAS, SAR_TERMINALS, grid_key
 from shared.utils.quiet_failures import swallowed
 
@@ -212,3 +212,15 @@ async def get_chokepoint_status(
         "unobserved_by_any_instrument": unobserved,
         "radar_areas": radar_areas,
     }
+
+
+@router.get("/flows")
+async def get_oil_flows(redis=Depends(get_redis_optional)) -> Dict[str, Any]:
+    """Daily oil-flow measures per site against their own history, the
+    episodes, their lead-lag with Brent and EIA, and what each site can be
+    measured with (services/agents/oil_flow_job.py)."""
+    from services.agents.oil_flow_job import REPORT_KEY
+
+    raw = getattr(redis, "raw", redis) if redis is not None else None
+    blob = await raw.get(REPORT_KEY) if raw is not None else None
+    return json.loads(blob) if blob else {"generated_at": None, "series": [], "episodes": []}

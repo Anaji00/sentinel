@@ -46,3 +46,15 @@ def test_every_call_path_is_gated():
     assert "is_large_cap(self.redis, ticker)" in src["services/agents/stock_correlation_agent.py"]
     assert "mc.large_caps(self.raw)" in src["services/agents/sympathy_job.py"]
     assert "mc.large_caps(self.raw)" in src["services/agents/auto_trader.py"]
+
+
+def test_a_readable_event_id_maps_to_the_uuid_the_events_writer_stores():
+    """A correlation triggered by shortvol_NXPI_20261030_e3a1ae failed its insert
+    (30 Oct 2026); both writers now share one mapping, so the ids still join."""
+    import uuid
+    from services.enrichment.db_writer import _as_uuid
+    from shared.utils.event_identity import as_uuid
+    rid = "shortvol_NXPI_20261030_e3a1ae"
+    assert as_uuid(rid) == _as_uuid(rid) == str(uuid.uuid5(uuid.NAMESPACE_DNS, rid))
+    real = str(uuid.uuid4())
+    assert as_uuid(real) == real

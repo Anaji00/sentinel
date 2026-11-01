@@ -404,3 +404,15 @@ async def get_portfolio_risk_metrics(redis = Depends(get_redis_optional)):
             model_name="deterministic_risk_engine",
         ).model_dump(),
     }
+
+
+@router.get("/exposure")
+async def get_book_exposure(redis=Depends(get_redis_optional)):
+    """The traded book's net exposure to the market, rates, oil, metals and the
+    dollar, as its move for a standard shock, against a limit
+    (services/agents/exposure_lens_job.py)."""
+    from services.agents.exposure_lens_job import REPORT_KEY
+
+    raw = getattr(redis, "raw", redis) if redis is not None else None
+    blob = await raw.get(REPORT_KEY) if raw is not None else None
+    return json.loads(blob) if blob else {"generated_at": None, "rows": []}

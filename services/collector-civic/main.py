@@ -231,6 +231,7 @@ PORTAL_BATCH = 200
 # portal is marked departed from it (EyesOnFlock listed 1,528 on 10 Oct 2026).
 MIN_PORTALS_FOR_DEPARTURES = 1200
 _XLSX_LINK = re.compile(r'href="([^"]+participatingAgencies[^"]*\.xlsx)"', re.I)
+_DOWNLOAD_LINK = re.compile(r'href="([^"]*(?:file-download/download/public/\d+|\.xlsx)[^"]*)"', re.I)
 
 _287G_UPSERT_SQL = """
     INSERT INTO ice_287g_agreements (state, agency, agency_type, county, support_type, signed, moa, updated_at)
@@ -303,16 +304,30 @@ def parse_287g(rows: List[List[Optional[str]]]) -> List[Tuple]:
     return out
 
 
+def link_287g(page: str) -> Optional[str]:
+    """The participating-agencies spreadsheet's link: by its file name, or,
+    since ICE moved it behind a generic download URL (Oct 2026), the first
+    download link in the page's "287(g) Participating Agencies" section."""
+    m = _XLSX_LINK.search(page or "")
+    if m:
+        return m.group(1)
+    i = (page or "").find('id="participating"')
+    if i < 0:
+        return None
+    m = _DOWNLOAD_LINK.search(page, i, i + 5000)
+    return m.group(1) if m else None
+
+
 async def ice_287g_pass(db, session: aiohttp.ClientSession) -> Tuple[int, int]:
     """ICE's 287(g) participating-agency spreadsheet (its file name carries
     the update date, so the link is read from the page each pass)."""
     async with session.get(ICE_287G_PAGE) as resp:
         resp.raise_for_status()
         page = await resp.text()
-    m = _XLSX_LINK.search(page)
-    if not m:
+    link = link_287g(page)
+    if not link:
         raise RuntimeError("287(g) spreadsheet link not found on ICE's page")
-    url = m.group(1) if m.group(1).startswith("http") else "https://www.ice.gov" + m.group(1)
+    url = link if link.startswith("http") else "https://www.ice.gov" + link
     async with session.get(url) as resp:
         resp.raise_for_status()
         out = parse_287g(read_rows(await resp.read()))

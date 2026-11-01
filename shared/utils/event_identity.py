@@ -62,3 +62,20 @@ def derive_event_id(parent_id: Any, *discriminators: Any) -> str:
         )
     parts = [str(parent_id or "")] + [str(d) for d in discriminators]
     return str(uuid.uuid5(SENTINEL_EVENT_NAMESPACE, "|".join(parts)))
+
+
+def as_uuid(value: object) -> str:
+    """A UUID string, deterministically derived when the value is not one.
+
+    Several producers mint readable identifiers (shortvol_NXPI_20261030_e3a1ae,
+    fda_..., macro_...) and several columns are typed uuid. A UUID passes
+    through; anything else maps through uuid5 under NAMESPACE_DNS, the mapping
+    the events writer has always used, so a correlation's trigger id still
+    joins to the stored event. A correlation whose trigger id was readable
+    failed its insert and was lost (30 Oct 2026).
+    """
+    try:
+        uuid.UUID(str(value))
+        return str(value)
+    except (ValueError, TypeError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))

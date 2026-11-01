@@ -2562,6 +2562,46 @@ MIGRATIONS = [
             );
         """,
         "transactional": True
+    },
+    {
+        "version": "0081_oil_flow",
+        "sql": """
+            -- A durable ship registry: identity, class and draught lived only in
+            -- Redis for ten days (3,252 ships of the 21,051 seen), so a flow index
+            -- could not tell a tanker from a tug a fortnight later.
+            CREATE TABLE IF NOT EXISTS vessel_registry (
+                mmsi         TEXT PRIMARY KEY,
+                name         TEXT,
+                vessel_type  TEXT,
+                imo          TEXT,
+                draught      DOUBLE PRECISION,
+                max_draught  DOUBLE PRECISION,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            -- Daily oil-flow measures per site (shared/utils/oil_flow.py): radar
+            -- target density, gate transits, tankers in port and their laden
+            -- share, dark and ship-to-ship activity.
+            CREATE TABLE IF NOT EXISTS oil_flow_daily (
+                day     DATE NOT NULL,
+                site    TEXT NOT NULL,
+                metric  TEXT NOT NULL,
+                value   DOUBLE PRECISION NOT NULL,
+                n       INTEGER,
+                source  TEXT NOT NULL,
+                PRIMARY KEY (day, site, metric)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0082_vessel_registry_min_draught",
+        "sql": """
+            -- A laden call needs the ship's own range: a VLCC at 11 m is in
+            -- ballast and an Aframax at 11 m is loaded, so one draught alone
+            -- says nothing until both ends of the range have been seen.
+            ALTER TABLE vessel_registry ADD COLUMN IF NOT EXISTS min_draught DOUBLE PRECISION;
+        """,
+        "transactional": True
     }
 ]
 

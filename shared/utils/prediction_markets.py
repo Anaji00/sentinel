@@ -87,6 +87,11 @@ EXCLUDED_MARKET_TERMS = frozenset({
 OFF_DOMAIN_SLUG = re.compile(
     r"^(?:lol|cs2|mlb|nfl|nba|nhl|epl|uwcl|lec|cfb|val|itf|scoc|crickcl|aut|per\d|el\d|tur\d|"
     r"jap|egy|qat|por|cze|lal|sec|mgc|big\d)-"
+    # A league code with a division digit (chi2-, kor1-, bra2-): Chinese Super
+    # League totals passed the sweep on "China" in their title and led the
+    # tracked list on 31 Oct 2026, though the slug-only prune rejected them.
+    r"|^[a-z]{3}\d-"
+    r"|team-total|-total-\d|-spread-|both-teams-to-score|-btts|corners"
     r"|rushing-yards|halftime|moneyline|first-half|-nrfi|exact-score"
     r"|highest-temperature|will-it-rain|where-will-it-rain",
     re.I,

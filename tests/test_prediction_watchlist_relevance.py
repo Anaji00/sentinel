@@ -145,3 +145,12 @@ def test_election_cycle_and_altcoin_markets_are_out(slug):
 @pytest.mark.parametrize("slug", ["will-bitcoin-reach-150k-in-2026", "fed-decision-in-october"])
 def test_the_collected_crypto_and_rates_stay_in(slug):
     assert slug_is_relevant(slug)
+
+
+def test_a_football_total_titled_china_is_still_off_domain():
+    """Chinese Super League totals passed the sweep on "China" in their title
+    and led the tracked list on 31 Oct 2026."""
+    from shared.utils.prediction_markets import is_relevant_market
+    assert not is_relevant_market({"slug": "chi2-fos-nip-2026-10-31-team-total-away-2pt5", "title": "China Super League"})
+    assert not is_relevant_market({"slug": "kor1-uls-pha-2026-11-01-total-2pt5", "question": "Korea: total goals"})
+    assert is_relevant_market({"slug": "will-china-invade-taiwan-in-2026", "question": "Will China invade Taiwan?"})

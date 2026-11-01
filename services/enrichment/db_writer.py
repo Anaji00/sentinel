@@ -1,24 +1,13 @@
 import logging 
-import uuid
 from datetime import datetime
 from shared.models import NormalizedEvent
+from shared.utils.event_identity import as_uuid
 
 logger = logging.getLogger("enrichment.db")
 
-def _as_uuid(value) -> str:
-    """A UUID string, deterministically derived when the value is not one.
-
-    Several producers mint readable identifiers and several columns are typed
-    uuid. Rather than each caller knowing which is which, anything that is
-    already a UUID passes through and anything else is mapped through uuid5 --
-    stable, so the same input always yields the same UUID and any join on it
-    still holds.
-    """
-    try:
-        uuid.UUID(str(value))
-        return str(value)
-    except (ValueError, TypeError, AttributeError):
-        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))
+# One mapping for every writer (shared/utils/event_identity.as_uuid), so a
+# readable id stored here joins to the same UUID wherever else it is written.
+_as_uuid = as_uuid
 
 
 class DBWriter:

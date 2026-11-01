@@ -211,3 +211,14 @@ def test_immigration_searches_are_flagged_where_the_law_restricts_them() -> None
 
 def test_departures_need_a_full_pass() -> None:
     assert _collector().MIN_PORTALS_FOR_DEPARTURES >= 1000
+
+
+def test_the_287g_spreadsheet_link_is_found_behind_ices_download_url():
+    """ICE replaced the ParticipatingAgencies*.xlsx link with a generic download
+    URL in Oct 2026, and the pass failed nine times a day on "link not found"."""
+    page = ('<h3 id="participating">287(g) Participating Agencies</h3><p>As of October 30, 2026</p>'
+            '<a class="usa-button" href="https://www.ice.gov/file-download/download/public/210012">Download</a>')
+    civic = _collector()
+    assert civic.link_287g(page) == "https://www.ice.gov/file-download/download/public/210012"
+    assert civic.link_287g('<a href="/doclib/287gMOA/ParticipatingAgencies1.xlsx">x</a>').endswith(".xlsx")
+    assert civic.link_287g("<p>nothing here</p>") is None

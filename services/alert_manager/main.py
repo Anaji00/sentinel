@@ -318,7 +318,7 @@ class AlertManager:
                         logger.error(f"Telegram {resp.status}: {(await resp.text())[:200]}")
                         return False
             except Exception as e:
-                logger.error(f"Telegram error on attempt {attempt+1}: {e}")
+                logger.error(f"Telegram error on attempt {attempt+1}: {type(e).__name__}: {e}")
                 if attempt < 2:
                     await asyncio.sleep(2)
         return False

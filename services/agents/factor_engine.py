@@ -666,6 +666,9 @@ async def main() -> None:
     from services.agents.filing_change_job import FilingChangeJob
     from services.agents.extract_audit_job import ExtractAuditJob
     from services.agents.comment_letter_job import CommentLetterJob
+    from services.agents.source_health_job import SourceHealthJob
+    from services.agents.exposure_lens_job import ExposureLensJob
+    from services.agents.oil_flow_job import OilFlowJob
 
     from services.agents.news_model_refit import NewsModelRefit
 
@@ -709,7 +712,12 @@ async def main() -> None:
                          # Weekly: a second model's agreement with each extractor.
                          ExtractAuditJob(db, redis).run(),
                          # Replies to SEC comment letters, read for topic and restatement (trial feature).
-                         CommentLetterJob(db, redis).run())
+                         CommentLetterJob(db, redis).run(),
+                         # Each data source against its own rhythm: ok, thin, silent or retired.
+                         SourceHealthJob(db, redis).run(),
+                         # B1's net sensitivity to rates, oil, metals, the dollar and the market.
+                         ExposureLensJob(db, redis).run(),
+                         OilFlowJob(db, redis).run())
 
 
 __all__ = ["FactorEngine"]

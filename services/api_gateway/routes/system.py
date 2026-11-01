@@ -113,6 +113,17 @@ async def get_system_metrics_json(redis=Depends(get_redis_optional)):
         "circuit_breakers": all_breakers(),
     }
 
+@router.get("/sources")
+async def get_source_health(redis=Depends(get_redis_optional)):
+    """Each data source judged against its own rhythm: ok, thin, silent, or
+    retired with the reason (services/agents/source_health_job.py)."""
+    import json as _json
+    from services.agents.source_health_job import REPORT_KEY
+
+    raw = getattr(redis, "raw", redis) if redis is not None else None
+    blob = await raw.get(REPORT_KEY) if raw is not None else None
+    return _json.loads(blob) if blob else {"generated_at": None, "counts": {}, "sources": []}
+
 @router.get("/liveness")
 async def get_mechanism_liveness(redis=Depends(get_redis_optional)):
     """Which declared mechanisms have run, how often, and when they last did.

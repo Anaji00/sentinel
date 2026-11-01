@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from shared.db import get_timescale
+from shared.utils.event_identity import as_uuid
 from shared.utils.metrics import MetricsCollector
 from shared.utils.tasks import safe_create_task
 from shared.utils.equities import instrument_aliases, instrument_identity
@@ -690,8 +691,8 @@ class EventStore:
                 cluster.rule_name,
                 tier_int,
                 cluster.detected_at,
-                cluster.trigger_event_id,
-                cluster.supporting_event_ids,
+                as_uuid(cluster.trigger_event_id) if cluster.trigger_event_id else None,
+                [as_uuid(e) for e in (cluster.supporting_event_ids or [])],
                 cluster.entity_ids,
                 cluster.description,
                 cluster.tags,

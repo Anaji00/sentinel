@@ -33,6 +33,12 @@ NOT_A_UI_SURFACE = {
     # and poll its status is not built yet.
     "/api/v1/scenarios/request",
     "/api/v1/scenarios/request/{request_id}",
+    # The book's exposure lens (31 Oct 2026): read by people and agents through
+    # the API until a dashboard panel shows it.
+    "/api/v1/portfolio/exposure",
+    # Oil-flow indices (31 Oct 2026): API first, for people and the agents,
+    # until the chokepoint panel charts them.
+    "/api/v1/chokepoints/flows",
     # Single-interaction write for API clients; the console batches through
     # /feedback/interaction/batch instead of one POST per row.
     "/api/v1/feedback/interaction",
