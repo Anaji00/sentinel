@@ -46,13 +46,11 @@ Contradictions are detected when:
   - A "thesis" and a "regime_change" bulletin conflict
 """
 
-import asyncio
 import json
 import logging
 import time
-import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from collections import defaultdict
 from shared.utils.entity_resolution import resolve_entity
 

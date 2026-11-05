@@ -313,7 +313,9 @@ def test_news_enricher_routine_and_threat_scoring():
 def test_fetch_ofac_keywords_mocked():
     async def run_test():
         sample_sdn_csv = '101,"VALKYRIE ENTERPRISES", "vessel", "IRAN"\n102,"SOVCOMFLOT TANKER", "vessel", "RUSSIA"'
-        sample_alt_csv = '201, 101, "aka", "VALKYRIE SHIPPING"'
+        # ent_num first, as Treasury's alt.csv has it. This mock had the alias's own
+        # number first, the same mistake as the parser, so the two agreed.
+        sample_alt_csv = '101, 201, "aka", "VALKYRIE SHIPPING"'
 
         # Mocked at the guarded boundary rather than at aiohttp.
         #

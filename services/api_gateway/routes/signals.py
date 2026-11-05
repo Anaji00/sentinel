@@ -257,7 +257,7 @@ _FRESHNESS_SQL = {
     "live bars": ("SELECT max(time) FROM tradfi_bars WHERE time > NOW() - INTERVAL '7 days'", 300),
     "daily history": ("SELECT max(day)::timestamptz FROM daily_bars WHERE day > CURRENT_DATE - 14", 3 * 86400),
     "option chains": ("SELECT max(updated_at) FROM option_daily WHERE day > CURRENT_DATE - 7", 3600),
-    "option sweeps": ("SELECT max(created_at) FROM events WHERE type = 'options_flow' AND created_at > NOW() - INTERVAL '7 days'", 3600),
+    "large option prints": ("SELECT max(created_at) FROM events WHERE type = 'options_flow' AND created_at > NOW() - INTERVAL '7 days'", 3600),
     "short interest": ("SELECT max(settlement_date)::timestamptz FROM short_interest", 30 * 86400),
     "filings": ("SELECT max(created_at) FROM events WHERE type = 'filing' AND created_at > NOW() - INTERVAL '7 days'", 6 * 3600),
     "insider trades": ("SELECT max(created_at) FROM events WHERE type = 'insider_trade' AND created_at > NOW() - INTERVAL '7 days'", 24 * 3600),

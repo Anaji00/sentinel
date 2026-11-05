@@ -158,7 +158,10 @@ ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-POLL_INTERVAL = 30  # 30 seconds for live streaming market updates
+# Was 30 until 4 Nov 2026. Forecasts and exposures read daily closes and discovery reads
+# 5-minute rollups. The exception counts ticks: the macro engine's pair correlation keeps
+# 300, about five hours now rather than two and a half, and needs 30 before it speaks.
+POLL_INTERVAL = 60
 
 
 async def fetch_alpaca_quotes(tickers: list) -> dict:

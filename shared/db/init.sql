@@ -450,9 +450,11 @@ FROM tradfi_bars
 GROUP BY ticker, time_bucket('30 days', time)
 WITH NO DATA;
 
+-- The live policy is migration 0076's. This file runs on every enrichment start,
+-- and a policy with other offsets is an error, not a skip (crash loop, 31 Oct 2026).
 SELECT add_continuous_aggregate_policy('tradfi_bars_1mth',
     start_offset => INTERVAL '365 days',
-    end_offset => INTERVAL '30 days',
+    end_offset => INTERVAL '1 month',
     schedule_interval => INTERVAL '1 day',
     if_not_exists => TRUE);
 

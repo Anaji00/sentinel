@@ -28,6 +28,7 @@ Usage:
 
 import math
 import logging
+import threading
 from collections import deque
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -94,6 +95,11 @@ class RRCFDetector:
         self.shingle_size = shingle_size
         self._index = 0
 
+        # Scoring runs in the default executor, so two batches for one domain
+        # could interleave here: "deque mutated during iteration" dropped the
+        # batch to a flat 0.5 (4 Nov 2026), and two threads cutting one tree is
+        # corruption. One writer at a time; reentrant because warm() calls insert().
+        self._lock = threading.RLock()
         # Shingle buffer: stores the last `shingle_size` raw points
         self._shingle_buffer: deque = deque(maxlen=shingle_size)
         # How many times a corrupted tree has been replaced. Surfaced rather
@@ -147,6 +153,10 @@ class RRCFDetector:
         Returns:
             Anomaly score ∈ [0, 1]. Higher = more anomalous.
         """
+        with self._lock:
+            return self._insert_locked(point)
+
+    def _insert_locked(self, point: np.ndarray) -> float:
         point = np.asarray(point, dtype=np.float64)
         self._recent_points.append(point)
 
@@ -366,11 +376,14 @@ class RRCFDetector:
 
     def insert_batch(self, points: List[np.ndarray]) -> List[float]:
         """Insert multiple points sequentially, return list of scores."""
-        return [self.insert(p) for p in points]
+        with self._lock:
+            return [self.insert(p) for p in points]
 
     def export_points(self) -> List[List[float]]:
         """The recent raw points, oldest first, as plain floats."""
-        return [[float(v) for v in p] for p in self._recent_points]
+        # A snapshot, not the lock: this runs on the event loop, which must not
+        # wait for a batch to finish.
+        return [[float(v) for v in p] for p in tuple(self._recent_points)]
 
     def warm(self, points: List[List[float]]) -> int:
         """Replays saved points so a restarted detector does not start cold.

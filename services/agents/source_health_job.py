@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from shared.utils import source_health as sh
@@ -27,9 +27,13 @@ _SQL = f"""
     WITH recent AS (
         SELECT source, type, occurred_at FROM events
         WHERE occurred_at > NOW() - INTERVAL '{sh.BASELINE_DAYS} days' AND occurred_at <= NOW()
+    ), outages AS (
+        SELECT * FROM unnest($1::timestamptz[], $2::timestamptz[]) AS o(starts, ends)
     ), gaps AS (
         SELECT source, type,
-               max(EXTRACT(EPOCH FROM occurred_at - prev) / 3600) AS max_gap_h
+               max(GREATEST(0, EXTRACT(EPOCH FROM occurred_at - prev)
+                    - COALESCE((SELECT sum(EXTRACT(EPOCH FROM LEAST(o.ends, occurred_at) - GREATEST(o.starts, prev)))
+                                FROM outages o WHERE o.starts < occurred_at AND o.ends > prev), 0)) / 3600) AS max_gap_h
         FROM (SELECT source, type, occurred_at,
                      lag(occurred_at) OVER (PARTITION BY source, type ORDER BY occurred_at) AS prev FROM recent) g
         GROUP BY source, type
@@ -37,6 +41,7 @@ _SQL = f"""
         SELECT source, type, min(n) AS min_day, count(*) AS n_days FROM (
             SELECT source, type, date(occurred_at) AS d, count(*) AS n FROM recent
             WHERE occurred_at < date_trunc('day', NOW()) AND occurred_at >= date_trunc('day', NOW()) - INTERVAL '{sh.BASELINE_DAYS - 1} days'
+              AND NOT EXISTS (SELECT 1 FROM outages o WHERE o.starts < date(occurred_at) + 1 AND o.ends > date(occurred_at))
             GROUP BY 1, 2, 3) x GROUP BY source, type
     ), totals AS (
         SELECT source, type, max(occurred_at) AS last_seen,
@@ -47,6 +52,10 @@ _SQL = f"""
     )
     SELECT t.*, g.max_gap_h, d.min_day, d.n_days FROM totals t
     LEFT JOIN gaps g USING (source, type) LEFT JOIN days d USING (source, type)
+"""
+_HOURLY_SQL = f"""
+    SELECT date_trunc('hour', occurred_at) AS h, count(*) AS n FROM events
+    WHERE occurred_at > NOW() - INTERVAL '{sh.BASELINE_DAYS} days' AND occurred_at <= NOW() GROUP BY 1
 """
 
 
@@ -72,13 +81,20 @@ class SourceHealthJob:
 
     async def run_once(self) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
-        rows = [{**dict(r), "last_seen": _ts(r["last_seen"]) if r["last_seen"] else None}
-                for r in await self.db.query(_SQL) or []]
+        this_hour = now.replace(minute=0, second=0, microsecond=0)
+        windows = sh.outage_windows({_ts(r["h"]): float(r["n"]) for r in await self.db.query(_HOURLY_SQL) or []},
+                                    this_hour - timedelta(days=sh.BASELINE_DAYS), this_hour - timedelta(hours=1))
+        lost_days = {(w0 + timedelta(hours=i)).date() for w0, w1 in windows
+                     for i in range(int((w1 - w0).total_seconds() // 3600))}
+        full_days = max(1, sh.BASELINE_DAYS - 1 - len(lost_days))
+        rows = [{**dict(r), "last_seen": _ts(r["last_seen"]) if r["last_seen"] else None, "full_days": full_days}
+                for r in await self.db.query(_SQL, [w[0] for w in windows], [w[1] for w in windows]) or []]
         assessed = sh.assess(rows, now)
         counts: Dict[str, int] = {}
         for a in assessed:
             counts[str(a["status"])] = counts.get(str(a["status"]), 0) + 1
-        rep = {"generated_at": now.isoformat(), "counts": counts, "sources": assessed}
+        rep = {"generated_at": now.isoformat(), "counts": counts, "sources": assessed,
+               "outages": [{"start": w0.isoformat(), "end": w1.isoformat()} for w0, w1 in windows]}
         await self.raw.set(REPORT_KEY, json.dumps(rep, default=str))
         before = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
                   for k, v in (await self.raw.hgetall(STATE_KEY) or {}).items()}

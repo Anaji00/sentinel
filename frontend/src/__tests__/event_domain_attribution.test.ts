@@ -35,14 +35,14 @@ describe('event domain attribution', () => {
 
   it('still labels a genuine equity event as tradfi', () => {
     const e = row({ type: 'market_anomaly', primary_entity_id: 'NVDA', domain: 'tradfi' });
-    expect(domainMetaFor(e).label).toBe('TRADFI');
+    expect(domainMetaFor(e).label).toBe('MARKETS');
   });
 
   it('falls back to the payload when the server sends no domain', () => {
     const crypto = row({ crypto_data: { pair: 'BTC-USDT-SWAP' } });
     expect(domainMetaFor(crypto).label).toBe('CRYPTO');
     const equity = row({ financial_data: { ticker: 'NVDA' } });
-    expect(domainMetaFor(equity).label).toBe('TRADFI');
+    expect(domainMetaFor(equity).label).toBe('MARKETS');
   });
 
   it('prefers crypto when a row somehow carries both payloads', () => {
@@ -53,13 +53,14 @@ describe('event domain attribution', () => {
   it('reproduces the original defect without a declared domain or payload', () => {
     // Nothing to go on but the type: this is the case the server now prevents.
     const e = row({ primary_entity_id: 'BCHUSDT' });
-    expect(domainMetaFor(e).label).toBe('TRADFI');
+    expect(domainMetaFor(e).label).toBe('MARKETS');
   });
 });
 
 describe('source attribution', () => {
   it('reports the real collector', () => {
-    expect(getCleanSource(row({ source: 'coinbase_candles' }))).toBe('coinbase_candles');
+    // Shown with spaces since the wording pass; still the real collector, never a guessed vendor.
+    expect(getCleanSource(row({ source: 'coinbase_candles' }))).toBe('coinbase candles');
   });
 
   it('invents nothing when the row carries no source', () => {

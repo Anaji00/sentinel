@@ -1,11 +1,13 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import useSWR from 'swr';
 import { apiClient, describeApiError, fetcher } from '../lib/api';
 import { useLiveEvents } from '../lib/useLiveEvents';
 import { NormalizedEvent, Scenario } from '../lib/types';
 import { resolveEventDomain } from '../lib/domain';
+import { companyNewsTone, entityLabel, type NewsTone } from '../lib/eventBadge';
 import { recordInteraction } from '../lib/interactions';
 import { DataGrid } from './ui/DataGrid';
 import { decodeEntities, formatPercent } from '../lib/format';
@@ -100,7 +102,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
   ) {
     return {
       label: 'CRYPTO',
-      icon: '₿',
+      icon: '',
       badgeStyle: 'text-caution border-caution/30 bg-caution/10',
     };
   }
@@ -113,21 +115,21 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
   }
   if (t.includes('funding')) {
     return {
-      label: 'FUTURES FEE',
+      label: 'FUNDING RATE',
       icon: '',
       badgeStyle: 'text-accent border-line-accent bg-accent-dim',
     };
   }
   if (t.includes('vessel') || t.includes('maritime') || t.includes('ais')) {
     return {
-      label: 'MARITIME',
+      label: 'SHIPS',
       icon: '',
       badgeStyle: 'text-accent border-line-accent bg-accent-dim',
     };
   }
   if (t.includes('flight') || t.includes('aviation') || t.includes('adsb')) {
     return {
-      label: 'AVIATION',
+      label: 'FLIGHTS',
       icon: '',
       badgeStyle: 'text-accent border-accent/40 bg-accent/10',
     };
@@ -147,7 +149,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
     t.includes('market')
   ) {
     return {
-      label: 'TRADFI',
+      label: 'MARKETS',
       icon: '',
       badgeStyle: 'text-positive border-positive/30 bg-positive/10',
     };
@@ -158,7 +160,7 @@ export function getDomainMeta(type: string): { label: string; icon: string; badg
 // Helper to derive clean source name
 export function getCleanSource(e: NormalizedEvent): string {
   if (e.source && e.source !== 'unknown' && !e.source.startsWith('Event')) {
-    return e.source;
+    return e.source.replace(/_/g, ' ');
   }
   // Nothing, rather than a guess. This used to name a vendor per domain --
   // "AlphaVantage Feed" for TRADFI, "CoinGecko On-Chain" for CRYPTO,
@@ -191,14 +193,13 @@ function formatEnglishHeadline(e: NormalizedEvent): string {
   if (e.prediction_market_data?.question) {
     const pm = e.prediction_market_data;
     const sideStr = pm.outcome ? `(${pm.outcome})` : '';
-    const qUpper = (pm.question || '').toUpperCase();
-    return `PREDICTION MARKET: ${qUpper}${sideStr}`;
+    return `Prediction market: ${pm.question} ${sideStr}`.trim();
   }
 
   const entityName = e.primary_entity_name || e.entity_name || e.primary_entity?.name || '';
-  const regionStr = e.region ? `in ${e.region}` : '';
+  const regionStr = e.region ? ` in ${e.region}` : '';
 
-  return `${getDomainMeta(e.type).label} Intelligence Event: ${entityName || 'Target'}${regionStr}`;
+  return `${entityName || `${getDomainMeta(e.type).label.toLowerCase()} event`}${regionStr}`;
 }
 
 // Red is kept for the rare event: at 0.75 nearly every ship report in the feed
@@ -212,18 +213,18 @@ const getScoreBadge = (score: number) => {
   if (score >= SCORE_CRITICAL)
     return (
       <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-negative/15 text-negative border border-negative/40">
-        CRITICAL {score.toFixed(2)}
+        Very unusual {score.toFixed(2)}
       </span>
     );
   if (score >= SCORE_ELEVATED)
     return (
       <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-caution/10 text-caution border border-caution/30">
-        ELEVATED {score.toFixed(2)}
+        Unusual {score.toFixed(2)}
       </span>
     );
   return (
     <span className="px-2 py-0.5 rounded text-micro font-mono text-ink-mute border border-line">
-      ROUTINE {score.toFixed(2)}
+      Routine {score.toFixed(2)}
     </span>
   );
 };
@@ -271,13 +272,28 @@ function CorroborationBadge({ e }: { e: NormalizedEvent }) {
   );
 }
 
+const NewsToneBadge = ({ reading }: { reading: NewsTone }) => (
+  <span
+    title="How positive or negative the wording is, as read by an AI trained on financial news. It does not say how much the story matters."
+    className={`px-2 py-0.5 rounded text-micro font-mono border border-line ${
+      reading.label === 'Positive tone'
+        ? 'text-positive'
+        : reading.label === 'Negative tone'
+          ? 'text-negative'
+          : 'text-ink-mute'
+    }`}
+  >
+    {reading.label}
+  </span>
+);
+
 const EventRow = React.memo(
   ({ e, onClick }: { e: NormalizedEvent; onClick: (e: NormalizedEvent) => void }) => {
     const domainMeta = domainMetaFor(e);
     const sourceName = getCleanSource(e);
     const title = formatEnglishHeadline(e);
-    const entityName =
-      e.primary_entity_name || e.entity_name || e.primary_entity?.name || 'Unknown Entity';
+    const entityName = entityLabel(e);
+    const newsTone = companyNewsTone(e);
 
     const fd = e.financial_data || {};
     const cd = e.crypto_data || {};
@@ -336,7 +352,7 @@ const EventRow = React.memo(
               </span>
             )}
           </div>
-          {getScoreBadge(e.anomaly_score)}
+          {newsTone ? <NewsToneBadge reading={newsTone} /> : getScoreBadge(e.anomaly_score)}
         </div>
 
         <p className="text-xs text-ink font-sans font-semibold line-clamp-2 group-hover:text-ink transition-colors leading-snug">
@@ -351,7 +367,11 @@ const EventRow = React.memo(
 
         <div className="mt-2 flex items-center justify-between text-micro text-ink-dim pt-1 border-t border-line/60">
           <span>
-            Entity: <span className="text-caution font-bold">{entityName}</span>
+            {entityName && (
+              <>
+                About: <span className="text-caution font-bold">{entityName}</span>
+              </>
+            )}
           </span>
           <span>
             <ClockTime value={e.occurred_at} />
@@ -551,10 +571,10 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
   // and not the UI is still visible to the person using it.
   const domainTabs = [
     { id: 'all', label: 'All' },
-    { id: 'tradfi', label: 'TradFi' },
+    { id: 'tradfi', label: 'Markets' },
     { id: 'crypto', label: 'Crypto' },
     { id: 'prediction', label: 'Prediction' },
-    { id: 'maritime', label: 'AIS' },
+    { id: 'maritime', label: 'Ships' },
   ];
 
   const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
@@ -630,18 +650,22 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
               headings, one page, and an accessibility tree with two h1s. */}
           <p className="text-xs text-ink-dim flex items-center gap-2">
             <span className="h-2.5 w-2.5 rounded-full bg-accent animate-pulse shadow-panel" />
-            Events, scenarios and correlation clusters, as they arrive.
+            Events, scenarios and groups of related events, as they arrive.
           </p>
         </div>
 
         {/* Search & Filter Inputs */}
         <div className="flex items-center gap-2">
-          <input
+          <Input
+            label="Search events, tickers and entities"
+            hideLabel
+            size="sm"
+            containerClassName="w-48"
+            className="font-mono"
             type="text"
             placeholder="Search events, tickers, entities..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-page border border-line text-xs text-ink focus:outline-none focus:border-line-accent font-mono w-48 md:w-64"
           />
         </div>
       </div>
@@ -761,7 +785,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
                   <span>
                     Entity:{' '}
                     <span className="text-caution font-bold">
-                      {s.primary_entity_name || 'Multi-Entity'}
+                      {s.primary_entity_name || 'Several subjects'}
                     </span>
                   </span>
                   <span>
@@ -852,36 +876,42 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">SOURCE:</span>{' '}
+                  <span className="text-ink-dim">Source:</span>{' '}
                   <span className="text-accent font-bold block">
                     {getCleanSource(selectedEvent) || 'unattributed'}
                   </span>
                 </div>
+                {companyNewsTone(selectedEvent) ? (
+                  <div>
+                    <span className="text-ink-dim">Tone of the wording:</span>{' '}
+                    <span className="text-ink font-bold block">
+                      {companyNewsTone(selectedEvent)?.label}
+                    </span>
+                  </div>
+                ) : (
+                  <div>
+                    <span className="text-ink-dim">Anomaly score:</span>{' '}
+                    <span className="text-caution font-bold block">
+                      {fixed(selectedEvent.anomaly_score, 2)}
+                    </span>
+                  </div>
+                )}
                 <div>
-                  <span className="text-ink-dim">Anomaly score:</span>{' '}
-                  <span className="text-caution font-bold block">
-                    {fixed(selectedEvent.anomaly_score, 2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-ink-dim">TIMESTAMP:</span>{' '}
+                  <span className="text-ink-dim">Time:</span>{' '}
                   <span className="text-ink block">
                     {new Date(selectedEvent.occurred_at).toUTCString()}
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">Primary entity:</span>{' '}
+                  <span className="text-ink-dim">About:</span>{' '}
                   <span className="text-positive font-bold block">
-                    {selectedEvent.primary_entity_name ||
-                      selectedEvent.entity_name ||
-                      selectedEvent.primary_entity?.name ||
-                      'N/A'}
+                    {entityLabel(selectedEvent) || 'N/A'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">REGION:</span>{' '}
+                  <span className="text-ink-dim">Region:</span>{' '}
                   <span className="text-accent font-bold block">
-                    {selectedEvent.region || 'GLOBAL'}
+                    {selectedEvent.region || 'Global'}
                   </span>
                 </div>
               </div>
@@ -962,7 +992,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
               </div>
 
               <div>
-                <span className="text-accent font-bold block mb-1">HEADLINE:</span>
+                <span className="text-accent font-bold block mb-1">Headline:</span>
                 <h3 className="text-sm font-bold text-ink font-sans">
                   {selectedScenario.headline}
                 </h3>
@@ -970,7 +1000,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
 
               {selectedScenario.primary_entity_name && (
                 <div>
-                  <span className="text-ink-dim block mb-0.5">Primary entity:</span>
+                  <span className="text-ink-dim block mb-0.5">About:</span>
                   <span className="text-caution font-bold">
                     {selectedScenario.primary_entity_name}
                   </span>

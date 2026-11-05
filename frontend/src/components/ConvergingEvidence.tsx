@@ -190,7 +190,7 @@ export function ConvergingEvidence() {
                   {STANCE_WORD[d.stance] ?? d.stance}
                 </span>
                 <Link
-                  href={`/ticker?symbol=${encodeURIComponent(d.instrument)}`}
+                  href={`?t=${encodeURIComponent(d.instrument)}`}
                   className="font-mono font-bold text-ink hover:text-accent hover:underline"
                 >
                   {d.instrument}

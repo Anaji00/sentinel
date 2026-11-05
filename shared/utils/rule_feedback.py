@@ -21,7 +21,9 @@ the readers cannot drift apart the way `sentinel:watched:equities` did.
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from shared.utils.quiet_failures import swallowed
@@ -30,6 +32,8 @@ logger = logging.getLogger("shared.rule_feedback")
 
 # Per-rule verdict counters, written by the gateway's /feedback route.
 RULE_FEEDBACK_KEY = "sentinel:feedback:rule"
+# Rules their record retired. No TTL: only reinstate_rule clears an entry.
+RETIRED_RULES_KEY = "sentinel:correlation:retired_rules"
 
 # The metric the correlation engine increments when a rule fires.
 RULE_FIRED_METRIC_PREFIX = "correlation_rule_fired:"
@@ -163,12 +167,41 @@ async def deprecated_by_evidence(redis: Any, rule_id: str) -> bool:
         same window.
 
     Reading the record itself is what makes the decision hold wherever the
-    rule comes from. The record carries a TTL that each verdict refreshes, so
-    a rule that stops firing stops being judged and returns once its record
-    ages out -- deprecation by evidence, not for ever.
+    rule comes from. The record carries a TTL that each verdict refreshes, so a
+    retired rule stops being judged and its record ages out. Until 5 Nov 2026 the
+    rule came back then, with nobody having looked: Chokepoint AIS Evasion
+    returned at 882 alerts. Retirement is now remembered until reinstate_rule.
     """
     record = await feedback_for_rule(redis, rule_id)
-    return should_deprecate(int(record.get("total") or 0), int(record.get("negative") or 0))
+    if should_deprecate(int(record.get("total") or 0), int(record.get("negative") or 0)):
+        await _remember_retirement(redis, rule_id, record)
+        return True
+    return await _retirement_on_file(redis, rule_id)
+
+
+async def _remember_retirement(redis: Any, rule_id: str, record: Dict[str, Any]) -> None:
+    try:
+        await getattr(redis, "raw", redis).hsetnx(RETIRED_RULES_KEY, rule_id, json.dumps(
+            {"total": record.get("total"), "negative": record.get("negative"),
+             "at": datetime.now(timezone.utc).isoformat()}))
+    except Exception as exc:
+        swallowed("shared.rule_feedback.remember_retirement", exc, logger, detail=rule_id)
+
+
+async def _retirement_on_file(redis: Any, rule_id: str) -> bool:
+    try:
+        return await getattr(redis, "raw", redis).hexists(RETIRED_RULES_KEY, rule_id) in (True, 1)
+    except Exception as exc:
+        swallowed("shared.rule_feedback.retirement_on_file", exc, logger, detail=rule_id)
+        return False
+
+
+async def reinstate_rule(redis: Any, rule_id: str) -> None:
+    """A person's decision to let a retired rule back: clears the retirement and the
+    record behind it. The rule installs at the correlation engine's next restart."""
+    raw = getattr(redis, "raw", redis)
+    await raw.hdel(RETIRED_RULES_KEY, rule_id)
+    await raw.delete(f"{RULE_FEEDBACK_KEY}:{rule_id}")
 
 
 async def firing_counts(redis: Any) -> Dict[str, int]:

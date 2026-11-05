@@ -16,18 +16,12 @@ import logging
 from typing import Any, Dict, Optional
 from shared.utils.agent_conclusions import (
     AGENT_CORRELATION_ANALYSIS_PREFIX,
-    HAWKES_BRANCHING_RATIOS_KEY,
-    MACRO_INVERSE_CORRELATION_PREFIX,
-    MACRO_RATES_REGIME_KEY,
-    MACRO_SPREAD_2Y10Y_KEY,
-    TRADFI_BACKFILL_REPORT_KEY,
 )
 import os
 import sys
 import re
 import time
 from datetime import datetime, timezone
-import aiohttp
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,13 +49,12 @@ MAX_CITED_EVENTS = 10
 
 from shared.kafka import SentinelConsumer, SentinelProducer, Topics
 from shared.models import CorrelationCluster, AlertTier
-from shared.db import get_timescale, get_redis, get_neo4j
+from shared.db import get_timescale, get_redis
 
 from services.reasoning.context_builder    import ContextBuilder
 from services.reasoning.scenario_generator import ScenarioGenerator
 from services.reasoning.scenario_tracker   import ScenarioTracker
 from services.reasoning.pattern_library    import PatternLibrary
-from shared.utils.ollama import OllamaClient
 from shared.utils.freshness import is_stale
 
 # Reasoning is slower by nature than correlation -- a scenario is minutes of
@@ -339,7 +332,7 @@ async def process_cluster(cluster: CorrelationCluster, db, redis_client, produce
                 "primary_entity_id": str(scenario.correlation_id),
                 "primary_entity_name": scenario.headline or "Strategic Intelligence Scenario",
                 "entity_name": scenario.headline or "Strategic Intelligence Scenario",
-                "headline": f"🧠 STRATEGIC SCENARIO: {scenario.headline}",
+                "headline": f"Scenario: {scenario.headline}",
                 "summary": str(scenario.significance or scenario.confidence_rationale or "Synthesis complete."),
                 "anomaly_score": float((scenario.confidence_overall or 80) / 100.0),
                 "region": "GLOBAL",

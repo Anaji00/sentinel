@@ -92,6 +92,27 @@ def aggressor(price: float, bid: Optional[float], ask: Optional[float], trade_at
     return None
 
 
+def side_miss_reason(bid: Optional[float], ask: Optional[float], trade_at: Optional[datetime],
+                     quote_at: Optional[datetime], max_lag_sec: float = QUOTE_MAX_LAG_SEC,
+                     stale_lag_sec: float = STALE_QUOTE_MAX_LAG_SEC) -> str:
+    """Why aggressor() returned None for a print against this quote."""
+    if not bid or not ask or ask < bid or trade_at is None or quote_at is None:
+        return "no_quote"
+    lag = abs((quote_at - trade_at).total_seconds())
+    if lag > stale_lag_sec:
+        return "quote_too_old"
+    return "inside_stale_quote" if lag > max_lag_sec else "at_midpoint"
+
+
+def poll_capture_weight(gap_sec: Optional[float], period_sec: float) -> float:
+    """The chance a poll of unknown phase sees a trade through latestTrade, which
+    shows it only until the contract's next trade. `gap_sec` is the time until that
+    trade, None when there was no later one."""
+    if gap_sec is None:
+        return 1.0
+    return min(1.0, max(0.0, gap_sec) / period_sec)
+
+
 class QuoteTape:
     """Each active contract's quotes as the poller saw them, for a while.
 
@@ -147,4 +168,5 @@ def opened(oi_before: Optional[int], oi_after: Optional[int], size: float) -> Op
 
 
 __all__ = ["QuoteTape", "STALE_QUOTE_MAX_LAG_SEC", "INTRINSIC_HEAVY", "MIN_EXTRINSIC_USD", "PENDING_MAX_AGE_DAYS",
-           "PENDING_OI_KEY", "aggressor", "extrinsic_premium", "intrinsic", "intrinsic_share", "opened"]
+           "PENDING_OI_KEY", "aggressor", "extrinsic_premium", "intrinsic", "intrinsic_share", "opened",
+           "poll_capture_weight", "side_miss_reason"]

@@ -1,6 +1,10 @@
 'use client';
 
 import React from 'react';
+import { Button } from './Button';
+import { useSWRConfig } from 'swr';
+import { spinnerState } from '../../lib/dataHealth';
+import { useFailingSources } from '../../lib/useDataHealth';
 
 interface SkeletonProps {
   className?: string;
@@ -87,14 +91,20 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
  */
 export const LoadingLines: React.FC<{ lines?: number; label?: string }> = ({ lines = 3, label = 'Loading' }) => {
   const [patienceSpent, setPatienceSpent] = React.useState(false);
+  const failing = useFailingSources();
+  const { mutate } = useSWRConfig();
   React.useEffect(() => {
     const t = setTimeout(() => setPatienceSpent(true), PATIENCE_MS);
     return () => clearTimeout(t);
   }, []);
-  if (patienceSpent) {
+  const state = spinnerState(failing, patienceSpent);
+  if (state !== 'loading') {
     return (
-      <p className="text-micro text-caution/90" role="status">
-        Still waiting for the server after {PATIENCE_MS / 1000} seconds; it may be unreachable.
+      <p className="text-micro text-caution" role="status">
+        {state === 'failed' ? 'Could not load this yet.' : 'This is taking longer than usual.'}{' '}
+        <Button variant="link" type="button" onClick={() => void mutate(() => true)} className="underline hover:text-ink">
+          Try again
+        </Button>
       </p>
     );
   }

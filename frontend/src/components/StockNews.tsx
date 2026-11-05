@@ -78,7 +78,7 @@ function MoverList({ title, rows, tone }: { title: string; rows: Mover[]; tone: 
         <ul className="space-y-1">
           {rows.map((m) => (
             <li key={m.ticker} className="min-w-0">
-              <a href={`/ticker?symbol=${encodeURIComponent(m.ticker)}`} className="font-semibold text-ink hover:underline">
+              <a href={`?t=${encodeURIComponent(m.ticker)}`} className="font-semibold text-ink hover:underline">
                 {m.ticker}
               </a>
               <span className="text-micro text-ink-mute">

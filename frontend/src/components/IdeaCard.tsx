@@ -7,6 +7,7 @@
  */
 
 import React, { useState } from 'react';
+import { Button } from './ui/Button';
 import { ABSENT, directionMark, formatNumber } from '../lib/format';
 import {
   expectedMove,
@@ -221,15 +222,14 @@ export function IdeaCard({
 
       {!compact && (
         <>
-          <button
+          <Button variant="link"
             type="button"
             onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            className="self-start text-xs text-accent hover:underline"
+            aria-expanded={open} className="self-start text-xs"
           >
             {open ? (o ? 'Hide the trade and reasoning' : 'Hide the reasoning') : o ? 'Options trade and why' : 'Why this call'}{' '}
             {open ? '▴' : '▾'}
-          </button>
+          </Button>
           {open && (
             <div className="space-y-1.5 border-t border-line pt-2 text-micro leading-relaxed text-ink-dim">
               <p>{plainIdea(i, days, i.forecast?.expected_excess_bps ?? fallbackBps, validated)}</p>

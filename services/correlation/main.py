@@ -222,6 +222,69 @@ _TIER_DEMOTION = {
 }
 
 
+# Rules about waters, not ships: one alert per region per window, and no higher
+# than ELEVATED until they are graded. Each ship was its own alert, 882 on 4 Nov
+# when the first rule returned, named after ships with no stock to grade against.
+# Its verdict record had retired it at 33 negative of 34; the record ages out after
+# 30 days, so these rules return by themselves.
+EPISODE_RULES = {
+    "rule_maritime_chokepoint_evasion": 6 * 3600,
+    "rule_physical_disruption_repricing": 6 * 3600,
+}
+EPISODE_MAX_TIER = AlertTier.ELEVATED
+EPISODE_KEY = "sentinel:correlation:episode:{rule}:{region}"
+# What the last window withheld, read by the next alert for that region.
+EPISODE_REPEATS_KEY = "sentinel:correlation:episode_repeats:{rule}:{region}"
+EPISODE_REPEATS_TTL_SEC = 7 * 86400
+
+
+def _episode_region(region: Optional[str]) -> str:
+    return (region or "unknown").strip().lower().replace(" ", "_")
+
+
+async def _prior_episode_repeats(redis_client, rule_id: str, region: Optional[str]) -> int:
+    """How many firings the region's last window withheld, reported once. A new
+    alert is the first moment that count is known and can be read."""
+    if rule_id not in EPISODE_RULES or redis_client is None:
+        return 0
+    key = EPISODE_REPEATS_KEY.format(rule=rule_id, region=_episode_region(region))
+    try:
+        value = await redis_client.raw.get(key)
+        if value is None:
+            return 0
+        await redis_client.raw.delete(key)
+        return int(value)
+    except Exception as e:
+        swallowed("correlation.episode_repeats", e, logger, detail=rule_id)
+        return 0
+
+
+async def _episode_is_open(redis_client, rule_id: str, region: Optional[str]) -> bool:
+    """Whether this rule already alerted for this region inside its window. The
+    repeat is counted on the open episode. Failing to check lets the alert through."""
+    window = EPISODE_RULES.get(rule_id)
+    if not window or redis_client is None:
+        return False
+    region_key = _episode_region(region)
+    key = EPISODE_KEY.format(rule=rule_id, region=region_key)
+    try:
+        if await redis_client.raw.set(key, 1, ex=window, nx=True):
+            return False
+        total = await redis_client.raw.incr(key)
+        await redis_client.raw.set(EPISODE_REPEATS_KEY.format(rule=rule_id, region=region_key), int(total) - 1,
+                                   ex=EPISODE_REPEATS_TTL_SEC)
+        return True
+    except Exception as e:
+        swallowed("correlation.episode", e, logger, detail=rule_id)
+        return False
+
+
+def _capped_for_episode(rule_id: str, tier: AlertTier) -> AlertTier:
+    if rule_id in EPISODE_RULES and tier in (AlertTier.CRITICAL, AlertTier.INTELLIGENCE):
+        return EPISODE_MAX_TIER
+    return tier
+
+
 async def _tier_after_frequency(redis_client, rule_id: str, declared: AlertTier) -> AlertTier:
     """The declared tier, demoted one step if this rule is over its budget.
 
@@ -714,9 +777,8 @@ async def _reconcile_shipped_rules(redis_client) -> None:
             # Absent because its record retired it, not because it was never
             # installed. Reinstalling here undid the verdict on every restart:
             # rule_maritime_chokepoint_evasion was deprecated at 33 negative
-            # of 34 and would have been back after the next deploy. The
-            # record ages out 30 days after its last verdict, and the rule
-            # returns then.
+            # of 34 and would have been back after the next deploy. Retirement
+            # outlasts the record since 5 Nov 2026: only reinstate_rule undoes it.
             logger.info(
                 "Not reinstalling shipped rule %s: its verdict record deprecated it.",
                 rule_id,
@@ -1057,6 +1119,11 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     # the gateway's /metrics through the bind below.
                     _rule_id = str(rule.get("rule_id") or rule.get("id") or "unknown")
 
+                    if await _episode_is_open(getattr(store, "_redis", None), _rule_id, event.region):
+                        dropped("correlation.episode_repeat", "region already alerted in this window", logger,
+                                detail=_rule_id)
+                        continue
+
                     # Is this the first time, or the fortieth?
                     _recurrence = await _recurrence_count(store, _rule_id, entity_id)
                     # And how often the rule itself has fired, on anything.
@@ -1093,6 +1160,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         str(rule.get("rule_id") or rule.get("id") or "unknown"),
                         alert_tier,
                     )
+                    alert_tier = _capped_for_episode(_rule_id, alert_tier)
                     entity_name = (event.primary_entity.name or entity_id) if event.primary_entity else "UNKNOWN"
 
                     # Extract rich context from supporting events
@@ -1154,6 +1222,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                     alert_tier = AlertTier(rule_probation.capped_tier(
                         alert_tier.value, rule, _flagging, [t.value for t in _TIER_ORDER]))
 
+                    _prior_repeats = await _prior_episode_repeats(getattr(store, "_redis", None), _rule_id, event.region)
                     cluster = CorrelationCluster(
                         trace_id=event.trace_id,
                         rule_id=rule.get("rule_id", "DYN_UNKNOWN"),
@@ -1173,10 +1242,12 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         summary_headline=(
                             f"{rule.get('rule_name', rule.get('rule_id'))}: {entity_name} "
                             f"[matched: {', '.join(sorted(domains_triggered)) or 'none'}]"
+                            + (f" (+{_prior_repeats} more in this region's last window)" if _prior_repeats else "")
                         ),
                         supporting_headlines=supporting_headlines,
                         metrics_summary={
                             "supporting_event_count": len(supporting_events),
+                            "episode_prior_repeats": _prior_repeats,
                             # What backed the trigger's own score, read by the
                             # reasoning budget's ranking.
                             "evidence_coverage": evidence_coverage(event),

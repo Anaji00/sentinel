@@ -103,6 +103,8 @@ def test_the_book_is_kept_between_rebalances_and_rebuilt_after(monkeypatch) -> N
         return {"LOW": ["stock", True, True], "HI": ["stock", True, True]}
 
     monkeypatch.setattr(asset_universe, "load_asset_meta", meta)
+    # Two scores stand for a full set here; the thin-score guard has its own test below.
+    monkeypatch.setattr(tr.at, "MIN_SCORES_TO_REBUILD", 1)
     held = {"rebalanced_on": "2026-10-01", "long": ["OLD"], "short": []}
     scores = {"HI": {"percentile": 0.95}, "LOW": {"percentile": 0.03}}
     store = {tr.BOOK_KEY: json.dumps(held), factor_scores_key("monthly"): json.dumps(scores)}
@@ -163,3 +165,18 @@ def test_positions_from_an_earlier_book_are_the_traders_own() -> None:
     # And a managed name the new book does not hold is closed.
     plans = at.plan_orders({"NEW": 2.0}, {"OLD": 5.0, "NEW": 0.0}, managed={"OLD"}, prices={"OLD": 10.0, "NEW": 10.0})
     assert ("OLD", "sell", 5.0, "close") in [(p.symbol, p.side, p.qty, p.reason) for p in plans]
+
+
+def test_a_thin_score_set_keeps_the_book(monkeypatch) -> None:
+    """94 scores would have rebuilt B1 as about 9 longs and 9 shorts."""
+    import json
+
+    from shared.utils.signal_store import factor_scores_key
+
+    held = {"rebalanced_on": "2026-10-01", "long": ["OLD"], "short": ["OLDER"]}
+    scores = {f"T{i}": {"percentile": i / 94} for i in range(94)}
+    store = {tr.BOOK_KEY: json.dumps(held), factor_scores_key("monthly"): json.dumps(scores)}
+    trader = tr.AutoTrader(_BookDb(since=21), None, broker=_Broker(True))
+    trader.raw = _Raw(store)
+    assert asyncio.run(trader._book(date(2026, 10, 30))) == held
+    assert json.loads(store[tr.BOOK_KEY]) == held

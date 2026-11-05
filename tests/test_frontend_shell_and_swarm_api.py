@@ -135,7 +135,8 @@ def test_the_swarm_endpoint_reports_emptiness_honestly():
 def test_navigation_is_grouped_not_a_flat_list_of_thirteen():
     src = _src(SIDEBAR)
     assert "NAV_GROUPS" in src
-    for group in ("Overview", "Markets", "Intelligence", "Reference"):
+    # "Watch" was "Intelligence" until 4 Nov 2026: a wording change, the grouping is the point.
+    for group in ("Overview", "Markets", "Watch", "Reference"):
         assert f"label: '{group}'" in src
 
 

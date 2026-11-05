@@ -23,6 +23,7 @@ from shared.utils import market_cap as mc
 from shared.utils import sympathy as sy
 from shared.utils import text_peers as tp
 from shared.utils.asset_universe import load_asset_meta
+from shared.utils.auto_trade import MIN_SCORES_TO_REBUILD
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agent.sympathy")
@@ -31,9 +32,13 @@ INTERVAL_SEC = 3600
 RUN_HOUR_UTC = 23                         # after the nightly model and the day's bars
 DAY_KEY = "sentinel:sympathy:day"
 
-_UNIVERSE_SQL = """
+# The latest full ranking, not the latest date. This job replaces its tables, and on
+# 4 Nov 2026 a 94-name run cut them from 1,233 exposures and 7,663 peers to 131 and 423.
+_UNIVERSE_SQL = f"""
     SELECT DISTINCT ticker FROM factor_scores_daily
-    WHERE horizon = 'monthly' AND as_of = (SELECT max(as_of) FROM factor_scores_daily WHERE horizon = 'monthly')
+    WHERE horizon = 'monthly' AND as_of = (
+        SELECT as_of FROM factor_scores_daily WHERE horizon = 'monthly'
+        GROUP BY as_of HAVING count(*) >= {MIN_SCORES_TO_REBUILD} ORDER BY as_of DESC LIMIT 1)
 """
 _BARS_SQL = "SELECT ticker, day, close FROM daily_bars WHERE ticker = ANY($1::text[]) AND day >= $2 ORDER BY ticker, day"
 # One statement: upsert today's set, then delete every pair it did not touch.

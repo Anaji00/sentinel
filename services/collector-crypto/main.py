@@ -18,6 +18,9 @@ import os
 import sys
 import time
 import websockets
+
+GEO_REFUSAL_STATUS = (403, 451)
+VENUE_REFUSED_RETRY_SEC = 6 * 3600
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
@@ -28,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from shared.kafka import SentinelProducer, Topics
+from shared.utils.quiet_failures import dropped
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
@@ -907,15 +911,18 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
     """
     import aiohttp
     ASSETS = ["BTC", "ETH"]
+    venue_refused = False
     logger.info("⚡ Cross-Exchange Funding & Basis Divergence Engine Online.")
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 # 1. Fetch Binance Funding Rates
+                venue_refused = False
                 binance_rates = {}
                 try:
                     async with session.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10) as resp:
+                        venue_refused |= resp.status in GEO_REFUSAL_STATUS
                         if resp.status == 200:
                             data = await resp.json()
                             for item in data:
@@ -933,6 +940,7 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
                 bybit_rates = {}
                 try:
                     async with session.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10) as resp:
+                        venue_refused |= resp.status in GEO_REFUSAL_STATUS
                         if resp.status == 200:
                             b_data = await resp.json()
                             for item in b_data.get("result", {}).get("list", []):
@@ -986,7 +994,11 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
         except Exception as e:
             logger.debug(f"Cross exchange divergence loop notice: {e}")
 
-        await asyncio.sleep(60)
+        # Both venues refuse this host's location, so this engine has never had
+        # a pair to compare. Ask again a few times a day rather than every minute.
+        if venue_refused:
+            dropped("collector_crypto.divergence", "venue_geo_blocked", logger)
+        await asyncio.sleep(VENUE_REFUSED_RETRY_SEC if venue_refused else 60)
 
 
 # ── ORCHESTRATION ─────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ Sources:
  1. Finnhub (Equities WS - Regular Hours 09:30-16:00 ET)
  2. Alpaca (Stock Snapshots REST - Extended Hours Pre-Market 04:00-09:30 ET & After-Hours 16:00-20:00 ET)
  3. SEC EDGAR (Form 4 Insider Trading Atom RSS)
- 4. Alpaca (Options Flow & Snapshot Sweeps)
+ 4. Alpaca (Options Flow & Large Prints from Snapshots)
  5. Finnhub (Earnings Calendar REST & Watchlist Auto-Injection)
 
 Dynamic: Watchlists are driven entirely by Redis (`sentinel:watched:equities`)
@@ -1532,6 +1532,12 @@ _declare("options.open_interest.resolved",
 # the bought and opening option families have data only for these.
 _declare("options.side.classified", "an option print was read as bought or sold from its quote")
 _declare("options.side.unknown", "an option print's quote was too old, or the print sat inside it")
+# Why, since two thirds of prints went unread even at the 60-second setting, whose
+# tape holds a quote within a minute of every print on a contract it covers.
+_declare("options.side.unknown.no_tape", "the contract had no quote on the tape when its print arrived")
+_declare("options.side.unknown.quote_too_old", "the nearest quote on the tape was over five minutes from the print")
+_declare("options.side.unknown.inside_stale_quote", "the nearest quote was one to five minutes off and the print sat inside it")
+_declare("options.side.unknown.at_midpoint", "the print sat exactly on a fresh quote's midpoint")
 _declare("options.open_interest.asked",
          "a contract cleared the size gate and open interest was requested")
 
@@ -1773,7 +1779,16 @@ async def _options_opening_loop(session, producer: SentinelProducer, redis_clien
         await asyncio.sleep(30 * 60)
 
 
-OPTIONS_POLL_SLEEP_SEC = 60
+# The free feed's trades are 15 minutes late, so a shorter sleep buys no freshness; it
+# buys coverage. latestTrade shows a trade only until the contract's next one: replayed
+# against the full trade history of nine sessions (5 Nov 2026), on contracts with a
+# stored print, a 163-second cycle catches 12-17% fewer prints than the 84-second cycle
+# a 60-second sleep gives, and a 313-second cycle 25-33% fewer. The tape's quotes must
+# also sit close to the prints they classify: a midpoint read needs one within 60
+# seconds, which at this cycle roughly three prints in four have. 300 was set on 4 Nov
+# and replaced with this on 5 Nov before it saw a session. Compare with
+# scripts/options_poll_compare.py.
+OPTIONS_POLL_SLEEP_SEC = int(os.getenv("OPTIONS_POLL_SLEEP_SEC", "150"))
 
 
 async def poll_options(producer: SentinelProducer, redis_client):
@@ -1965,6 +1980,11 @@ async def poll_options(producer: SentinelProducer, redis_client):
                                     else:
                                         side = ofl.aggressor(price, quote.get("bp"), quote.get("ap"), trade_at, quote_at)
                                     _fired("options.side.classified" if side else "options.side.unknown")
+                                    if not side:
+                                        if then is None:
+                                            _fired("options.side.unknown.no_tape")
+                                        else:
+                                            _fired("options.side.unknown." + ofl.side_miss_reason(then[0], then[1], trade_at, then[2]))
                                     greeks_val = snapshot.get("greeks") or {}
                                     iv_val = snapshot.get("impliedVolatility") if snapshot.get("impliedVolatility") is not None else snapshot.get("implied_volatility")
                                     oi_val = snapshot.get("openInterest") if snapshot.get("openInterest") is not None else snapshot.get("open_interest")
@@ -2038,16 +2058,13 @@ async def poll_options(producer: SentinelProducer, redis_client):
                 # code took, not what the collector saw.
                 logger.info(
                     "⏱️ Options Poller Heartbeat: Checked %s equity tickers | "
-                    "Sweeps published: %s | Contracts seen: %s%s",
+                    "Large prints published: %s | Contracts seen: %s%s",
                     len(symbols[:50]), total_sweeps, contracts_seen,
                     f" | fallback map: {len(_last_option_trade)}" if _last_option_trade else "",
                 )
             except Exception as e:
                 logger.error(f"Error in Options flow collector: {e}", exc_info=True)
 
-            # Every minute, not every five: the tape's quotes must sit close to
-            # the prints they classify. Fifty snapshot calls a minute against the
-            # account's two hundred.
             await asyncio.sleep(OPTIONS_POLL_SLEEP_SEC)
 
 
@@ -3383,6 +3400,8 @@ async def main():
     # (services/collector-tradfi/short_data.py).
     from short_data import run_forever as _short_data_forever
     short_data_task = safe_create_task(_short_data_forever(), name="short-data")
+    from sec_holdings import run_forever as _sec_holdings_forever
+    sec_holdings_task = safe_create_task(_sec_holdings_forever(), name="sec-holdings")
     # Finnhub's earnings calendar and surprises, kept (earnings_estimates.py).
     from earnings_estimates import run_forever as _estimates_forever
     estimates_task = safe_create_task(_estimates_forever(), name="earnings-estimates")
@@ -3425,6 +3444,7 @@ async def main():
         live_focus_task.cancel()
         option_stream_task.cancel()
         short_data_task.cancel()
+        sec_holdings_task.cancel()
         stock_news_task.cancel()
         option_history_task.cancel()
         cboe_chains_task.cancel()

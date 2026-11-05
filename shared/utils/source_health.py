@@ -12,8 +12,8 @@ silences are listed here with their reason. Pure.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Dict, List, Mapping, Optional, Sequence
+from datetime import datetime, timedelta
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 BASELINE_DAYS = 14
 MIN_GAP_H = 6.0             # never flag a source quieter than this
@@ -22,9 +22,21 @@ GAP_MULTIPLE = 4.0          # silent after this many average gaps (no gap histor
 GAP_MULTIPLE_OF_LONGEST = 1.25   # silent past the longest normal gap, with this much room
 THIN_SHARE = 0.3            # a day under this share of the quietest normal day is thin
 THIN_MIN_DAILY = 20.0       # sources rarer than this a day are judged on silence alone
+# The platform being down is not a source being quiet. An hour with under this
+# share of the median hour's events, for at least this many hours running, is an
+# outage: left out of every source's baseline, or a four-day shutdown would teach
+# each source that five days of silence is normal for the next two weeks.
+OUTAGE_SHARE = 0.05
+OUTAGE_MIN_HOURS = 2
 
-# Event types and sources off on purpose, with the reason. Matched on type or on source.
+# Silence that is expected, with the reason: off on purpose, or a source that is
+# quiet by nature. Matched on type or on source.
 RETIRED: Dict[str, str] = {
+    "ownership_changes": "published once per 13F quarter, after the filing deadline",
+    "sec_edgar_13f": "13Fs cluster at the quarterly deadlines",
+    "openfda": "a handful of recalls a month",
+    "cnbc_finance": "shares URLs with cnbc_world, whose earlier poll is credited with the story",
+    "krebs_security": "cyber retired; a news feed left running",
     "flight_position": "aviation is an anomaly feed: emergency squawks only (collector-adsb)",
     "vessel_static": "routine identity reports held out of events by enrichment",
     "crypto_transfer": "on-chain whales off by default (ONCHAIN_WHALES=0)",
@@ -33,6 +45,31 @@ RETIRED: Dict[str, str] = {
     "vulnerability": "cyber collectors retired",
     "infrastructure_degraded": "cyber collectors retired",
 }
+
+
+def outage_windows(hourly: Mapping[datetime, float], first: datetime, last: datetime) -> List[Tuple[datetime, datetime]]:
+    """(start, end) of each outage between the whole hours `first` and `last`,
+    from events per hour across all sources; an hour missing from `hourly` had none."""
+    hours: List[datetime] = []
+    h = first
+    while h <= last:
+        hours.append(h)
+        h += timedelta(hours=1)
+    counts = sorted(float(hourly.get(x, 0.0)) for x in hours)
+    if not counts:
+        return []
+    floor = OUTAGE_SHARE * counts[len(counts) // 2]
+    out: List[Tuple[datetime, datetime]] = []
+    start: Optional[datetime] = None
+    for x in hours + [last + timedelta(hours=1)]:
+        low = x <= last and float(hourly.get(x, 0.0)) <= floor
+        if low and start is None:
+            start = x
+        elif not low and start is not None:
+            if (x - start) >= timedelta(hours=OUTAGE_MIN_HOURS):
+                out.append((start, x))
+            start = None
+    return out
 
 
 def assess(rows: Sequence[Mapping[str, object]], now: datetime,
@@ -60,7 +97,7 @@ def assess(rows: Sequence[Mapping[str, object]], now: datetime,
         # A day with no events does not appear in the per-day counts, so a
         # source with any empty day in its baseline (a weekend) has a quietest
         # day of zero, and is never called thin for a quiet day.
-        full_days = BASELINE_DAYS - 1
+        full_days = int(r.get("full_days") or BASELINE_DAYS - 1)
         quietest = float(r.get("min_day") or 0) if int(r.get("n_days") or full_days) >= full_days else 0.0
         row: Dict[str, object] = {"source": source, "type": etype, "per_day": round(daily, 1), "last_24h": int(n_24h),
                                   "hours_since": round(hours, 1) if hours is not None else None,
@@ -79,4 +116,4 @@ def assess(rows: Sequence[Mapping[str, object]], now: datetime,
     return sorted(out, key=lambda x: (order[str(x["status"])], -float(x["per_day"])))  # type: ignore[arg-type]
 
 
-__all__ = ["BASELINE_DAYS", "RETIRED", "assess"]
+__all__ = ["BASELINE_DAYS", "RETIRED", "assess", "outage_windows"]

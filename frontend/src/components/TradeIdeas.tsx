@@ -230,7 +230,7 @@ export function TradeIdeas() {
                   .map((c) => (
                     <Link
                       key={`${c.ticker}-${c.direction}`}
-                      href={`/ticker?symbol=${encodeURIComponent(c.ticker)}`}
+                      href={`?t=${encodeURIComponent(c.ticker)}`}
                       title={c.reasons.slice(0, 2).join('; ')}
                       className={`rounded-full px-2 py-0.5 font-mono ${
                         c.direction > 0
@@ -299,7 +299,7 @@ export function TradeIdeas() {
             {(showAllEvents ? data!.intraday : data!.intraday.slice(0, EVENT_CHIPS)).map((s) => (
               <Link
                 key={s.id}
-                href={`/ticker?symbol=${encodeURIComponent(s.instrument)}`}
+                href={`?t=${encodeURIComponent(s.instrument)}`}
                 title={(s.families ?? []).join(', ')}
                 className={`rounded-full border px-2.5 py-1 text-micro font-mono ${
                   s.direction === 'long'

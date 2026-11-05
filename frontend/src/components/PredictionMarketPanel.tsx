@@ -1,7 +1,10 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatCurrency, formatNumber, formatPercent } from '../lib/format';
 import { Card } from './ui/Card';
@@ -30,7 +33,7 @@ export default function PredictionMarketPanel() {
   // which is still focusable and now invisible under the backdrop.
   const dialog = useDialog(Boolean(selectedEvent), () => setSelectedEvent(null), 'Contract detail');
 
-  const { data: predEvents } = useSWR<NormalizedEvent[]>('/events/prediction?limit=100', fetcher, {
+  const { data: predEvents, error: predError, mutate: retryPred } = useSWR<NormalizedEvent[]>('/events/prediction?limit=100', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -111,12 +114,16 @@ export default function PredictionMarketPanel() {
 
         {/* Search Bar */}
         <div className="relative">
-          <input
+          <Input
+            label="Search prediction markets"
+            hideLabel
+            size="sm"
+            containerClassName="w-full"
+            className="font-mono"
             type="text"
             placeholder="Search prediction contract, ticker, or catalyst..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-inset border border-line rounded-xl px-3.5 py-2 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-line-accent font-mono transition-colors"
           />
         </div>
 
@@ -190,6 +197,8 @@ export default function PredictionMarketPanel() {
                 </div>
               );
             })
+          ) : failedWithout(predError, predEvents) ? (
+            <PanelError what="prediction markets" onRetry={() => void retryPred()} />
           ) : (
             <div className="p-8 text-center border border-dashed border-line rounded-xl text-ink-dim text-xs">
               No matching prediction market contracts found.
@@ -243,7 +252,7 @@ export default function PredictionMarketPanel() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">SOURCE:</span>{' '}
+                  <span className="text-ink-dim">Source:</span>{' '}
                   <span className="text-accent font-bold block">{selectedEvent.source}</span>
                 </div>
                 <div>
@@ -253,7 +262,7 @@ export default function PredictionMarketPanel() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">TIMESTAMP:</span>{' '}
+                  <span className="text-ink-dim">Time:</span>{' '}
                   <span className="text-ink block">
                     {new Date(selectedEvent.occurred_at).toUTCString()}
                   </span>

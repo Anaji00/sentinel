@@ -24,6 +24,7 @@
  */
 
 import React from 'react';
+import { Button } from './ui/Button';
 import useSWR from 'swr';
 import { describeApiError, fetcher } from '../lib/api';
 import { useDialog } from './ui/useDialog';
@@ -121,7 +122,7 @@ function SubsystemRow({ s, outbound }: { s: Subsystem; outbound?: boolean }) {
 
 export const DataSovereigntyModal: React.FC = () => {
   const [isOpen, setIsOpen] = React.useState(false);
-  const dialog = useDialog(isOpen, () => setIsOpen(false), 'Data sovereignty');
+  const dialog = useDialog(isOpen, () => setIsOpen(false), 'Where your data goes');
 
   // Only while it is open. This is a static manifest describing how the
   // deployment is put together, not a live figure, so polling it on every
@@ -153,7 +154,7 @@ export const DataSovereigntyModal: React.FC = () => {
       >
         <IconShield className="shrink-0" />
         <span>
-          Data sovereignty
+          Where your data goes
           {data ? `: ${formatNumber(data.sovereignty_score_pct, { decimals: 0 })}% local` : ''}
         </span>
       </button>
@@ -171,19 +172,18 @@ export const DataSovereigntyModal: React.FC = () => {
               <div className="flex items-center gap-2.5">
                 <IconShield className="text-accent" size={20} />
                 <div>
-                  <h2 className="text-head font-semibold">Data sovereignty</h2>
+                  <h2 className="text-head font-semibold">Where your data goes</h2>
                   <p className="text-micro text-ink-mute">
-                    {data?.architecture_model ?? 'Reading the manifest…'}
+                    {data?.architecture_model ?? 'Checking…'}
                   </p>
                 </div>
               </div>
-              <button
+              <Button variant="ghost" size="icon"
                 onClick={() => setIsOpen(false)}
-                aria-label="Close"
-                className="cursor-pointer rounded p-1 text-ink-dim hover:text-ink"
+                aria-label="Close" className="cursor-pointer"
               >
                 <IconClose />
-              </button>
+              </Button>
             </div>
 
             {error ? (

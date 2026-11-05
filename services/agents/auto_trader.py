@@ -18,7 +18,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
@@ -67,8 +67,24 @@ _RECENT_ALERTS_SQL = f"""
       AND rule_id IS DISTINCT FROM 'USER_SCENARIO_REQUEST'
 """
 _LOG_SQL = """
-    INSERT INTO auto_trade_orders (day, portfolio, symbol, side, qty, reason, order_id, status, error)
-    VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9)
+    INSERT INTO auto_trade_orders (day, portfolio, symbol, side, qty, reason, order_id, status, error, ref_price)
+    VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+"""
+# Orders whose outcome is not yet on record, once their session is over. Read only
+# from the venue: this path places nothing and decides nothing.
+FILLS_PER_PASS = 100
+FILL_GAP_SEC = 0.4
+FILLS_AFTER = time(16, 5)
+_UNCHECKED_FILLS_SQL = """
+    SELECT id, order_id, qty FROM auto_trade_orders
+    WHERE order_id IS NOT NULL AND fill_status IS NULL AND day <= $1::date
+    ORDER BY id LIMIT $2
+"""
+_FILL_SQL = "UPDATE auto_trade_orders SET filled_qty = $2, fill_price = $3, fill_status = $4, fill_checks = fill_checks + 1 WHERE id = $1"
+_FILL_MISS_SQL = """
+    UPDATE auto_trade_orders SET fill_checks = fill_checks + 1,
+        fill_status = CASE WHEN fill_checks + 1 >= $2 THEN 'unknown' END
+    WHERE id = $1
 """
 # Safety (shared/utils/auto_trade.py): the halt flag, the book's equity record,
 # SPY's latest close, and 20-session average dollar volume per name.
@@ -166,7 +182,32 @@ class AutoTrader:
                     logger.info("Auto-trader: %s", out)
             except Exception as exc:
                 logger.error("Auto-trader failed: %s", exc, exc_info=True)
+            try:
+                await self.record_fills()
+            except Exception as exc:
+                swallowed("agents.auto_trader.record_fills", exc, logger)
             await asyncio.sleep(INTERVAL_SEC)
+
+    async def record_fills(self, now: Optional[datetime] = None) -> int:
+        """Store what finished orders did. Today's wait for the close, since a day
+        order can still fill; one the venue will not describe is parked as unknown."""
+        now = now or datetime.now(NY)
+        last_day = now.date() if now.time() >= FILLS_AFTER else now.date() - timedelta(days=1)
+        stored = 0
+        for r in await self.db.query(_UNCHECKED_FILLS_SQL, last_day, FILLS_PER_PASS) or []:
+            order = await self.broker.get_order_status(str(r["order_id"]))
+            if order is None:
+                dropped("agents.auto_trader.fill_unread", "the venue did not describe an order", logger,
+                        detail=str(r["order_id"]))
+                await self.db.execute(_FILL_MISS_SQL, r["id"], at.FILL_MAX_CHECKS)
+            else:
+                await self.db.execute(_FILL_SQL, r["id"], order.filled_qty, order.filled_avg_price,
+                                      at.fill_outcome(float(r["qty"]), order.filled_qty))
+                stored += 1
+            await asyncio.sleep(FILL_GAP_SEC)
+        if stored:
+            logger.info("Auto-trader: recorded %s order outcomes", stored)
+        return stored
 
     async def _done(self, today: date) -> bool:
         if self.raw is None:
@@ -354,6 +395,10 @@ class AutoTrader:
                if isinstance(v, dict) and v.get("percentile") is not None}
         if not pct:
             return stored
+        if len(pct) < at.MIN_SCORES_TO_REBUILD:
+            dropped("agents.auto_trader.thin_scores", "too few model scores to rebuild the book; book kept", logger,
+                    detail=f"{len(pct)} of at least {at.MIN_SCORES_TO_REBUILD}")
+            return stored
         meta = await load_asset_meta(self.raw)
         borrowable = {t for t, m in meta.items() if len(m) > 2 and m[1] and m[2]}
         borrowable -= {str(r["ticker"]).upper() for r in await self.db.query(_FEES_SQL) or []
@@ -381,10 +426,10 @@ class AutoTrader:
                 order = await self.broker.submit_order(plan.symbol, plan.qty, side)
         except Exception as exc:
             await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
-                                  None, "rejected", str(exc)[:500])
+                                  None, "rejected", str(exc)[:500], ref)
             return False
         await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
-                              order.order_id, "submitted", None)
+                              order.order_id, "submitted", None, ref)
         if plan.reason == "flip-close":
             await self._await_fill(order.order_id)
         return True

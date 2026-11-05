@@ -29,6 +29,8 @@ const nextConfig: NextConfig = {
       { source: "/cases", has: [{ type: "query", key: "view" }], destination: "/intel", permanent: false },
       { source: "/cases", destination: "/intel?view=cases", permanent: false },
       { source: "/flow", destination: "/markets?view=flow", permanent: false },
+      { source: "/ticker", has: [{ type: "query", key: "symbol", value: "(?<symbol>[A-Za-z0-9.-]{1,10})" }], destination: "/calls?t=:symbol", permanent: false },
+      { source: "/ticker", destination: "/calls", permanent: false },
       { source: "/osint", destination: "/intel?view=osint", permanent: false },
       { source: "/macro", destination: "/markets?view=economy", permanent: false },
       { source: "/reports", destination: "/intel?view=briefs", permanent: false },

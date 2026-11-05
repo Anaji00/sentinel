@@ -46,7 +46,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 try:
     from conflict import run_conflict_monitor
@@ -97,7 +97,8 @@ FEEDS = [
     ("wsj_markets",     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",      "financial",  0.92),
     ("cnbc_world",      "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "financial", 0.85),
     ("cnbc_finance",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "financial", 0.88),
-    ("yahoo_finance",   "https://finance.yahoo.com/news/rssindex",            "financial",  0.85),
+    # /news/rssindex has answered 404 since 23 Sep 2026 (about 1,000 headlines a day lost).
+    ("yahoo_finance",   "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^DJI,^IXIC,^RUT&region=US&lang=en-US", "financial",  0.85),
     ("zerohedge",       "https://feeds.feedburner.com/zerohedge/feed",        "financial",  0.60),
 
     ("seekingalpha_currents", "https://seekingalpha.com/market_currents.xml", "financial", 0.80),   # 86%
@@ -141,7 +142,6 @@ FEEDS = [
     ("schneier",        "https://www.schneier.com/feed/atom/",                 "cyber",      0.95),
 
     # ─── EXPANDED OFFICIAL ───
-    ("euro_parliament", "https://www.europarl.europa.eu/rss/doc/top-stories/en.xml", "official", 0.98),
 
     # ─── CIVIL LIBERTIES & SURVEILLANCE (the civic watch feed, shared/utils/watch_feed.py) ───
     # Names match watch_feed.CIVIC_SOURCES: these join the feed whole.
@@ -255,7 +255,7 @@ async def poll_feed(
             # Non-200 responses are expected occasionally (maintenance, blocks).
             # We log debug only to avoid spamming logs with transient errors.
             if resp.status != 200:
-                logger.debug(f"{feed_name}: HTTP {resp.status}")
+                dropped("collector_news.feed", f"http_{resp.status}", logger, detail=feed_name)
                 return 0
 
             content = await resp.text(errors='ignore')

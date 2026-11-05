@@ -115,7 +115,7 @@ def explain(s: Dict[str, Any]) -> str:
                     f"{look}. This decides whether to buy or sell options, not which way the stock goes.")
         except (TypeError, ValueError, IndexError):
             return "Compares option prices with the stock's real movement; it decides buy-or-sell options, not direction."
-    if name.startswith("sweep premium"):
+    if name.startswith(("large print premium", "sweep premium")):   # the old name, in dossiers already stored
         return f"Large option trades: {disp} more call than put money in five days. Our testing found these do not predict direction."
     if name == "days to cover":
         when = disp.split("(", 1)[1].rstrip(")") if "(" in disp else ""
@@ -207,7 +207,8 @@ EVERYDAY_NAME = {
     "IV skew (OTM put - ATM call)": "Price of crash protection",
     "call - put IV spread": "Which way option traders lean",
     "implied / realised vol": "Expected swings vs actual swings",
-    "sweep premium, calls - puts, 5d": "Big options bets, last 5 days",
+    "large print premium, calls - puts, 5d": "Big options trades, last 5 days",
+    "sweep premium, calls - puts, 5d": "Big options trades, last 5 days",
     "days to cover": "Days for short sellers to buy back",
     "short interest change": "Change in short selling",
     "open-market net, 90d (plans excluded)": "Insiders' own buying and selling, 90 days",

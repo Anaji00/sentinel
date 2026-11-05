@@ -7,6 +7,7 @@
  */
 
 import React, { useState } from 'react';
+import { Input } from './ui/Input';
 import Link from 'next/link';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
@@ -56,12 +57,14 @@ function AddStock({ onAdd }: { onAdd: (t: string) => void }) {
         setV('');
       }}
     >
-      <input
+      <Input
+        label="Follow a stock"
+        hideLabel
+        size="sm"
+        containerClassName="min-w-0 flex-1"
         value={v}
         onChange={(e) => setV(e.target.value)}
         placeholder="Add a ticker, e.g. NVDA"
-        aria-label="Follow a stock"
-        className="min-w-0 flex-1 rounded-md border border-line bg-page px-2.5 py-1.5 text-xs text-ink placeholder:text-ink-mute focus:border-accent outline-none"
       />
       <button type="submit" className="rounded-md border border-line px-2.5 py-1.5 text-xs text-accent hover:bg-overlay">
         Follow
@@ -100,7 +103,7 @@ function MyStocks() {
               {rows.map(({ t, call, row }) => (
                 <li key={t} className="flex items-center justify-between gap-3 py-2">
                   <div className="min-w-0">
-                    <Link href={`/ticker?symbol=${encodeURIComponent(t)}`} className="font-mono font-semibold text-ink hover:text-accent">
+                    <Link href={`?t=${encodeURIComponent(t)}`} className="font-mono font-semibold text-ink hover:text-accent">
                       {t}
                     </Link>
                     <div className="truncate text-micro text-ink-mute">{row?.name ?? ''}</div>

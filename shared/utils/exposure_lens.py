@@ -45,13 +45,15 @@ def lens(net: Mapping[str, float], market_beta: float, coverage: Mapping[str, in
     return rows
 
 
-def book_weights(longs: Sequence[str], shorts: Sequence[str]) -> Dict[str, float]:
-    """Equal weight within each leg, +1 long and -1 short in total (B1's construction)."""
+def book_weights(longs: Sequence[str], shorts: Sequence[str], leg: float) -> Dict[str, float]:
+    """Equal weight within each leg, `leg` of the capital on each side (B1's
+    construction). Required, not defaulted: at +1 and -1 the lens reported twice the
+    account's exposure until 4 Nov 2026 (beta 0.68 for a book holding half a side)."""
     w: Dict[str, float] = {}
     for t in longs:
-        w[t.upper()] = w.get(t.upper(), 0.0) + 1.0 / len(longs)
+        w[t.upper()] = w.get(t.upper(), 0.0) + leg / len(longs)
     for t in shorts:
-        w[t.upper()] = w.get(t.upper(), 0.0) - 1.0 / len(shorts)
+        w[t.upper()] = w.get(t.upper(), 0.0) - leg / len(shorts)
     return w
 
 

@@ -18,6 +18,7 @@
  */
 
 import React from 'react';
+import { pairLabel } from '../lib/agentNames';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { PALETTE } from '../lib/palette';
@@ -39,6 +40,7 @@ interface KeyedRow {
 interface Conclusions {
   rates_regime: Record<string, unknown> | string | null;
   hawkes_branching_ratios: Record<string, number> | null;
+  prominent_filers?: { cik: string; name: string }[];
   tradfi_backfill: Record<string, unknown> | string | null;
   yield_spread_2y10y_bps: SpreadSeries | null;
   inverse_correlations: KeyedRow[];
@@ -155,7 +157,7 @@ function BranchingRatios({ ratios }: { ratios: Record<string, number> }) {
         const excited = value > 1.0;
         return (
           <li key={pair} className="flex items-center gap-2">
-            <span className="w-32 shrink-0 truncate text-micro text-ink-dim">{pair}</span>
+            <span className="w-40 shrink-0 truncate text-micro text-ink-dim" title={pair}>{pairLabel(pair)}</span>
             <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-overlay/50">
               <span
                 className="absolute inset-y-0 left-0 rounded-full"
@@ -190,7 +192,7 @@ function BranchingRatios({ ratios }: { ratios: Record<string, number> }) {
  * two conventions.
  */
 function Facts({ value }: { value: unknown }) {
-  if (value == null) return <Absent why="Key absent — the engine has not written one" />;
+  if (value == null) return <Absent why="Nothing stored yet" />;
   if (typeof value === 'string') {
     return <p className="text-micro leading-relaxed text-ink-dim">{value}</p>;
   }
@@ -206,18 +208,18 @@ export default function AgentConclusions() {
     return (
       <EmptyState
         kind="error"
-        title="Could not read the agent tier's conclusions"
-        detail="These are stored by the macro engine, the correlation service and the filings collector. Unreachable is not the same as unwritten."
+        title="Could not read what the analysts concluded"
+        detail="The service holding them did not answer, so this says nothing about whether there are any."
       />
     );
   }
   if (isLoading || !data) {
-    return <EmptyState kind="loading" title="Reading stored conclusions…" />;
+    return <EmptyState kind="loading" title="Loading conclusions…" />;
   }
 
   return (
     <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
-      <Card title="Rates regime" note="macro engine">
+      <Card title="Interest rates" note="Economy and rates">
         <Facts value={data.rates_regime} />
       </Card>
 
@@ -232,15 +234,19 @@ export default function AgentConclusions() {
         )}
       </Card>
 
-      <Card title="Cross-domain excitation" note="Hawkes branching ratios">
+      <Card title="How events set off other events" note="last 7 days">
+        <p className="mb-2 text-micro leading-relaxed text-ink-mute">
+          0.50 means each event tends to set off half of one more of the next kind. Above 1.00 a
+          chain would keep feeding itself.
+        </p>
         {data.hawkes_branching_ratios ? (
           <BranchingRatios ratios={data.hawkes_branching_ratios} />
         ) : (
-          <Absent why="The correlation service has not persisted a fit" />
+          <Absent why="No measurement stored yet" />
         )}
       </Card>
 
-      <Card title="Inverse correlations" note={`${data.inverse_correlations?.length ?? 0} pairs`}>
+      <Card title="Moving in opposite directions" note={`${data.inverse_correlations?.length ?? 0} pairs`}>
         {data.inverse_correlations?.length ? (
           <ul className="space-y-0.5">
             {data.inverse_correlations.slice(0, 8).map((r) => (
@@ -255,8 +261,8 @@ export default function AgentConclusions() {
       </Card>
 
       <Card
-        title="Agent correlation analysis"
-        note={`${data.correlation_analysis?.length ?? 0} agents`}
+        title="Stock relationship analysis"
+        note={`${data.correlation_analysis?.length ?? 0} stored`}
       >
         {data.correlation_analysis?.length ? (
           <ul className="space-y-0.5">
@@ -267,25 +273,25 @@ export default function AgentConclusions() {
             ))}
           </ul>
         ) : (
-          <Absent why="Nothing cached — the agent publishes to a topic instead" />
+          <Absent why="Nothing stored; this analyst passes its results straight on" />
         )}
       </Card>
 
-      <Card title="Historical backfill" note="last run">
+      <Card title="Price history download" note="last run">
         <Facts value={data.tradfi_backfill} />
       </Card>
 
       <Card
-        title="Prominent 13F filers"
-        note={data.prominent_ciks ? `${data.prominent_ciks.length} CIKs` : undefined}
+        title="Large funds we follow"
+        note={data.prominent_filers ? `${data.prominent_filers.length} funds` : undefined}
       >
-        {data.prominent_ciks?.length ? (
+        {data.prominent_filers?.length ? (
           <p className="text-micro leading-relaxed text-ink-dim">
-            {data.prominent_ciks.slice(0, 24).join(',')}
-            {data.prominent_ciks.length > 24 && `+${data.prominent_ciks.length - 24}`}
+            {data.prominent_filers.slice(0, 24).map((f) => f.name).join(', ')}
+            {data.prominent_filers.length > 24 && ` and ${data.prominent_filers.length - 24} more`}
           </p>
         ) : (
-          <Absent why="The filings collector has not curated a set" />
+          <Absent why="No list stored yet" />
         )}
       </Card>
     </div>

@@ -1,9 +1,10 @@
 'use client';
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Input } from '@/components/ui/Input';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import AuthShell, { buttonClass, fieldClass } from '@/components/AuthShell';
+import AuthShell, { buttonClass } from '@/components/AuthShell';
 
 type State = 'working' | 'confirmed' | 'failed' | 'missing';
 
@@ -87,14 +88,15 @@ function VerifyInner() {
           </p>
         ) : (
           <form onSubmit={resend} className="space-y-3">
-            <input
+            <Input
+              label="Email address"
+              hideLabel
+              size="lg"
               type="email"
               required
               value={resendEmail}
               onChange={(e) => setResendEmail(e.target.value)}
-              className={fieldClass}
               placeholder="you@example.com"
-              aria-label="Email address"
             />
             <button type="submit" className={buttonClass}>
               Send a new link

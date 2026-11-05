@@ -124,7 +124,7 @@ class StockNewsScorer:
             eid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"alpaca-news:{r['id']}"))
             if at >= event_cut:
                 live.append((eid, sn.EVENT_SOURCE, at, datetime.now(timezone.utc), str(r["headline"]), ev["tags"],
-                             ev["tone"], ev["symbols"][0], fd, min(1.0, abs(ev["tone"]))))
+                             ev["tone"], ev["symbols"][0], fd, sn.EVENT_ANOMALY_SCORE))
             else:
                 history.append((eid, sn.EVENT_SOURCE, at, str(r["headline"]), ev["tags"], ev["tone"], ev["symbols"][0],
                                 fd))

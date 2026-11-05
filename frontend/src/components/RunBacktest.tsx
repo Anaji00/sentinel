@@ -14,6 +14,7 @@
  */
 
 import React from 'react';
+import { Button } from './ui/Button';
 import { mutate as globalMutate } from 'swr';
 import { apiClient, describeApiError } from '../lib/api';
 import { useFeedback } from './ui/Feedback';
@@ -89,13 +90,12 @@ export function RunBacktest() {
           >
             <div className="flex items-center justify-between border-b border-line pb-3">
               <h2 className="text-head font-semibold">Run a backtest</h2>
-              <button
+              <Button variant="ghost" size="icon"
                 onClick={() => setOpen(false)}
-                aria-label="Close"
-                className="cursor-pointer rounded p-1 text-ink-dim hover:text-ink"
+                aria-label="Close" className="cursor-pointer"
               >
                 <IconClose />
-              </button>
+              </Button>
             </div>
 
             <label className="block space-y-1">

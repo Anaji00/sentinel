@@ -246,7 +246,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                   hint="Determines which endpoints this session may call"
                 />
                 <Field
-                  label="Active swarm agents"
+                  label="AI analysts running"
                   value={loading ? '…' : formatNumber(platform?.activeAgents, { decimals: 0 })}
                   tone="text-positive"
                   hint={
@@ -269,11 +269,11 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
               </div>
 
               <div className="p-4 bg-raised/50 border border-line rounded-xl">
-                <h4 className="text-xs font-bold text-ink-dim">DEPLOYMENT</h4>
+                <h4 className="text-xs font-bold text-ink-dim">Where it runs</h4>
                 <p className="text-micro text-ink-dim mt-1 leading-relaxed">
-                  Self-hosted single-node deployment. All inference runs locally; no telemetry
-                  leaves this host. Agent tiers run behind an opt-in profile, so a tier reporting as
-                  not deployed reflects the current run mode rather than a fault.
+                  On one machine you control. All AI runs on it, and no usage data leaves it. The AI
+                  analysts are an optional part of the setup, so a group shown as not deployed is
+                  switched off rather than broken.
                 </p>
               </div>
             </div>

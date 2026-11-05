@@ -23,6 +23,7 @@ import React from 'react';
 import { SWRConfig } from 'swr';
 import { usePathname, useRouter } from 'next/navigation';
 import { ApiError } from '../../lib/api';
+import { recordFailure, recordSuccess } from '../../lib/dataHealth';
 
 /**
  * How often anything polls, by how fast the thing underneath actually moves.
@@ -54,7 +55,12 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
   const redirecting = React.useRef(false);
 
   const onError = React.useCallback(
-    (error: unknown) => {
+    (error: unknown, key?: string) => {
+      // Which sources are failing, for the shared spinner and the strip at the top of the page.
+      // Not 401 (the redirect below handles it) and not 404 (often "nothing collected yet").
+      if (typeof key === 'string' && !(error instanceof ApiError && (error.isUnauthenticated || error.isMissing))) {
+        recordFailure(key);
+      }
       if (!(error instanceof ApiError) || !error.isUnauthenticated) return;
       if (redirecting.current) return;
       // Already on an auth screen: the login form's own 401 is how it reports
@@ -75,6 +81,7 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
     <SWRConfig
       value={{
         onError,
+        onSuccess: (_data: unknown, key: string) => recordSuccess(key),
         // A failed request retries, but not forever and not fast. The default
         // is five attempts on an exponential backoff; what matters here is the
         // exclusion below.

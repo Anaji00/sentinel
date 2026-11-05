@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { Input } from '@/components/ui/Input';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useSession } from '@/components/ui/SessionContext';
@@ -142,28 +143,26 @@ export default function LoginPage() {
         {/* Authentication Form */}
         <form onSubmit={handleSubmit} className="space-y-4 text-xs">
           <div>
-            <label className="text-xs text-ink-dim font-medium">
-              Email
-            </label>
-            <input
+            <Input
+              label="Email"
+              size="lg"
               type="email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-ink outline-none transition-colors"
               placeholder="you@example.com"
+              onChange={(e) => setEmail(e.target.value)}
               required
+              autoComplete="email"
             />
           </div>
           <div>
-            <label className="text-xs text-ink-dim font-medium">
-              Password
-            </label>
-            <input
+            <Input
+              label="Password"
+              size="lg"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full mt-1.5 bg-page/90 border border-line focus:border-accent rounded-xl px-4 py-3 text-ink outline-none transition-colors"
               required
+              autoComplete="current-password"
             />
           </div>
 

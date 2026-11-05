@@ -1,7 +1,10 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
@@ -106,7 +109,7 @@ export default function QuantRadarPanel() {
   const [minZScore, setMinZScore] = useState<number>(3.0);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  const { data: radarData } = useSWR<RadarResponse>('/radar/anomalies', fetcher, {
+  const { data: radarData, error: radarError, mutate: retryRadar } = useSWR<RadarResponse>('/radar/anomalies', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -207,12 +210,16 @@ export default function QuantRadarPanel() {
 
             {/* Search Input */}
             <div className="relative">
-              <input
+              <Input
+                label="Find a stock by ticker or company name"
+                hideLabel
+                size="sm"
+                containerClassName="w-full"
+                className="font-mono"
                 type="text"
                 placeholder="Find a stock by ticker or company name…"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-inset border border-line rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-accent/60 font-mono transition-colors"
               />
             </div>
 
@@ -249,6 +256,8 @@ export default function QuantRadarPanel() {
                     </div>
                   );
                 })
+              ) : failedWithout(radarError, radarData) ? (
+                <PanelError what="the volume scan" onRetry={() => void retryRadar()} />
               ) : (
                 <div className="p-6 text-center border border-dashed border-line rounded-lg text-ink-dim text-xs">
                   Nothing is trading this far above its normal right now.
@@ -351,7 +360,7 @@ export default function QuantRadarPanel() {
                 </span>
               </div>
               <div>
-                <span className="text-ink-dim">REGION:</span>{' '}
+                <span className="text-ink-dim">Region:</span>{' '}
                 <span className="text-positive">{selectedAnomaly.region}</span>
               </div>
               <div>

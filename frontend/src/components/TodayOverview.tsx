@@ -12,6 +12,8 @@
 import React, { useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
 import { PALETTE } from '../lib/palette';
@@ -99,7 +101,7 @@ function Card({
 }
 
 function PortfolioCard() {
-  const { data } = useSWR<PortfolioData>('/predictions/model-portfolio', fetcher);
+  const { data, error, mutate } = useSWR<PortfolioData>('/predictions/model-portfolio', fetcher);
   const s = data?.summary;
   const nav = data?.nav ?? [];
   const all = nav.flatMap((n) => [n.nav, n.spy_nav]);
@@ -113,7 +115,11 @@ function PortfolioCard() {
       cta="See every holding and trade"
     >
       {!data ? (
-        <LoadingLines />
+        failedWithout(error, data) ? (
+          <PanelError inline what="the model portfolio" onRetry={() => void mutate()} />
+        ) : (
+          <LoadingLines />
+        )
       ) : (
         <div className="space-y-3">
           <div className="flex items-end gap-6">
@@ -185,7 +191,7 @@ function PortfolioCard() {
 }
 
 function SignalsCard() {
-  const { data } = useSWR<{ board: BoardRow[] }>('/signals/matrix', fetcher);
+  const { data, error, mutate } = useSWR<{ board: BoardRow[] }>('/signals/matrix', fetcher);
   const rows = (data?.board ?? [])
     .filter((r) => r.confidence === 'higher' || r.confidence === 'moderate')
     .sort((a, b) => Math.abs(b.lean) - Math.abs(a.lean))
@@ -193,7 +199,11 @@ function SignalsCard() {
   return (
     <Card title="Strongest evidence today" href="/calls" cta="Open the signal board">
       {!data ? (
-        <LoadingLines />
+        failedWithout(error, data) ? (
+          <PanelError inline what="today's evidence" onRetry={() => void mutate()} />
+        ) : (
+          <LoadingLines />
+        )
       ) : rows.length === 0 ? (
         <p className="text-xs text-ink-mute">
           Nothing with enough evidence today. Quiet days are normal.
@@ -203,7 +213,7 @@ function SignalsCard() {
           {rows.map((r) => (
             <li key={r.ticker} className="flex items-center justify-between gap-3 text-xs">
               <Link
-                href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
+                href={`?t=${encodeURIComponent(r.ticker)}`}
                 className="min-w-0 hover:text-accent"
               >
                 <span className="symbol text-ink">{r.ticker}</span>{' '}
@@ -224,7 +234,7 @@ function SignalsCard() {
 
 const SHORTCUTS: [string, string, string][] = [
   ['/watch', 'Look up your town', 'Cameras, agencies and the rules they follow'],
-  ['/ticker', 'Look up a stock', 'Prices, fund holders and every signal'],
+  ['/calls', 'Look up a stock', 'Prices, fund holders and every signal'],
   ['/calls?view=signals', 'Trade signals', 'Only patterns proven on years of data'],
   ['/watch#protect', 'Protect yourself', 'A privacy plan in two minutes'],
 ];

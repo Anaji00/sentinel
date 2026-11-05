@@ -7,6 +7,7 @@ import { FeedbackProvider } from '../../components/ui/Feedback';
 import { TimeZoneProvider } from '../../components/ui/TimeZoneContext';
 import { DataProvider } from '../../components/ui/DataProvider';
 import { StockDrawer } from '../../components/StockDrawer';
+import { DataHealthStrip } from '../../components/ui/DataHealthStrip';
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -27,7 +28,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                 {/* Padding scales with the viewport. A flat p-4 spent 32 of the 39
               pixels this app used to be left with on a narrow screen. */}
                 <main className="flex-1 overflow-y-auto p-2 sm:p-4 lg:p-6">
-                  <div className="max-w-[1920px] mx-auto h-full flex flex-col">{children}</div>
+                  <div className="max-w-[1920px] mx-auto h-full flex flex-col">
+                    <DataHealthStrip />
+                    {children}
+                  </div>
                 </main>
               </div>
             </div>

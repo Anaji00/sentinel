@@ -2602,6 +2602,109 @@ MIGRATIONS = [
             ALTER TABLE vessel_registry ADD COLUMN IF NOT EXISTS min_draught DOUBLE PRECISION;
         """,
         "transactional": True
+    },
+    {
+        "version": "0083_notifications",
+        "sql": """
+            -- The inbox: one row per thing told to one person. `owner` is the
+            -- identity user_preferences is keyed by; the unique key is what
+            -- stops a retried or overlapping run telling them twice.
+            CREATE TABLE IF NOT EXISTS notifications (
+                id          BIGSERIAL PRIMARY KEY,
+                owner       TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                ticker      TEXT,
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL DEFAULT '',
+                url         TEXT NOT NULL DEFAULT '',
+                dedupe_key  TEXT NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                read_at     TIMESTAMPTZ,
+                emailed_at  TIMESTAMPTZ,
+                UNIQUE (owner, dedupe_key)
+            );
+            CREATE INDEX IF NOT EXISTS notifications_owner_time ON notifications (owner, created_at DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0084_company_news_score_is_not_tone",
+        "sql": """
+            -- These scores were abs(tone), so every row read 0.90 or more; see
+            -- EVENT_ANOMALY_SCORE in shared/utils/stock_news.py. The tone stays
+            -- in financial_data and sentiment.
+            UPDATE events SET anomaly_score = 0.5
+            WHERE source = 'alpaca_news' AND type = 'headline' AND anomaly_score <> 0.5;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0085_fails_and_fund_holdings",
+        "sql": """
+            -- SEC bulk sets (shared/utils/sec_holdings.py). A fund files in one
+            -- quarter's zip only, so a month spans quarters: readers sum them.
+            CREATE TABLE IF NOT EXISTS fails_to_deliver (
+                settle_day DATE NOT NULL,
+                ticker     TEXT NOT NULL,
+                cusip      TEXT NOT NULL,
+                quantity   BIGINT NOT NULL,
+                price      DOUBLE PRECISION,
+                PRIMARY KEY (settle_day, ticker)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fails_ticker ON fails_to_deliver (ticker, settle_day DESC);
+            CREATE TABLE IF NOT EXISTS fund_holdings_monthly (
+                quarter      TEXT NOT NULL,
+                report_month DATE NOT NULL,
+                ticker       TEXT NOT NULL,
+                positions    INTEGER NOT NULL,
+                shares       DOUBLE PRECISION NOT NULL,
+                value_usd    DOUBLE PRECISION NOT NULL,
+                first_public DATE NOT NULL,
+                PRIMARY KEY (quarter, report_month, ticker)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fund_holdings_ticker ON fund_holdings_monthly (ticker, report_month DESC);
+            CREATE TABLE IF NOT EXISTS sec_bulk_files (
+                name        TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                rows_stored INTEGER,
+                loaded_at   TIMESTAMPTZ,
+                last_error  TEXT
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0086_auto_trade_fills",
+        "sql": """
+            -- What each order actually did. ref_price is the live price at the
+            -- decision, null on orders from before this. Paper fills ignore
+            -- liquidity, so the gap to it is a floor on the real cost.
+            ALTER TABLE auto_trade_orders
+                ADD COLUMN IF NOT EXISTS ref_price DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS filled_qty DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS fill_price DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS fill_status TEXT,
+                ADD COLUMN IF NOT EXISTS fill_checks INTEGER NOT NULL DEFAULT 0;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0087_cusip_tickers",
+        "sql": """
+            -- Each CUSIP's latest symbol. Asking fails_to_deliver for this scans
+            -- 13.9M rows and timed out, which stopped the N-PORT load.
+            CREATE TABLE IF NOT EXISTS cusip_tickers (
+                cusip    TEXT PRIMARY KEY,
+                ticker   TEXT NOT NULL,
+                last_day DATE NOT NULL
+            );
+            INSERT INTO cusip_tickers (cusip, ticker, last_day)
+            SELECT DISTINCT ON (cusip) cusip, ticker, settle_day FROM fails_to_deliver
+            ORDER BY cusip, settle_day DESC
+            ON CONFLICT (cusip) DO NOTHING;
+        """,
+        "transactional": True
     }
 ]
 

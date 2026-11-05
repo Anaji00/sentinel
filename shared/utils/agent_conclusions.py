@@ -40,3 +40,14 @@ __all__ = [
     "TRADFI_BACKFILL_REPORT_KEY",
     "AGENT_CORRELATION_ANALYSIS_PREFIX",
 ]
+
+
+def scorecard_scope(key: str) -> str:
+    """What a scorecard key covers: "" overall, else "strategy / regime".
+
+    sentinel:agents:scorecard:{agent}:{strategy}:{regime}, either part "any". The
+    panel listed each of these under the agent's name alone, so one analyst read
+    as many identical rows.
+    """
+    parts = str(key).split(":")[4:]
+    return " / ".join(p for p in parts if p and p != "any")

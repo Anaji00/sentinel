@@ -2,6 +2,8 @@
 
 import React from 'react';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { directionMark, formatNumber } from '../lib/format';
 import { TAPE_KEY, tapeRows, type TapePoint, type TapeRow } from '../lib/tape';
@@ -29,7 +31,7 @@ function Quote({ row }: { row: TapeRow }) {
 
 /** A strip of live prices pinned above every Markets view. */
 export function LiveTape() {
-  const { data } = useSWR<{ series: Record<string, TapePoint[]> }>(TAPE_KEY, fetcher, { refreshInterval: POLL.live });
+  const { data, error, mutate } = useSWR<{ series: Record<string, TapePoint[]> }>(TAPE_KEY, fetcher, { refreshInterval: POLL.live });
   const rows = tapeRows(data?.series);
   return (
     <div
@@ -44,7 +46,11 @@ export function LiveTape() {
         Live
       </span>
       {rows.length === 0 ? (
-        <span className="text-xs text-ink-mute">Waiting for prices…</span>
+        failedWithout(error, data) ? (
+          <PanelError inline what="prices" onRetry={() => void mutate()} />
+        ) : (
+          <span className="text-xs text-ink-mute">Waiting for prices…</span>
+        )
       ) : (
         rows.map((r) => <Quote key={r.symbol} row={r} />)
       )}

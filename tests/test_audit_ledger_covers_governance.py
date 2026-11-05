@@ -58,6 +58,10 @@ NOT_GOVERNANCE = {
     # The person's own followed stocks and town: private settings, not
     # governance, and a person's town in an admin-served ledger would expose it.
     "me.py": "a person's own settings (followed stocks, their town); private, changes no platform state",
+    # A person asks for the bull and bear case on a stock. The POST starts a background
+    # job and stores its answer for six hours; it is capped per person and per host, and
+    # changes nothing anybody could later dispute.
+    "stock_thesis.py": "writes a cached AI answer for one stock; spends capped inference, changes no configuration, access or data",
 }
 
 

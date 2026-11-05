@@ -75,3 +75,48 @@ def test_bankrupt_roots_recover_the_exchange_ticker() -> None:
         {"symbol": "EFGHQ", "exchange": "OTC", "name": "Some Fund ETF"},                 # not a stock
     ]
     assert bankrupt_roots(assets, {"AAPL"}) == ["NKLA", "SIVB"]
+
+
+def test_a_lapsed_asset_list_is_fetched_not_read_as_empty(monkeypatch):
+    """An empty list means no filter to every reader, so funds would be ranked and traded."""
+    import asyncio
+    import json as _json
+
+    from shared.utils import asset_universe as au
+
+    class Raw:
+        def __init__(self):
+            self.store = {}
+
+        async def get(self, k):
+            return self.store.get(k)
+
+    raw = Raw()
+
+    async def refreshed(r, session, headers):
+        assert headers["APCA-API-KEY-ID"] == "k"
+        r.store[au.ASSET_META_KEY] = _json.dumps({"AAPL": ["stock", True, True, "Apple"]})
+        return 1
+
+    monkeypatch.setattr(au, "refresh_asset_meta", refreshed)
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    assert asyncio.run(au.load_asset_meta(raw)) == {"AAPL": ["stock", True, True, "Apple"]}
+
+
+def test_without_keys_the_asset_list_stays_empty_and_makes_no_call(monkeypatch):
+    import asyncio
+
+    from shared.utils import asset_universe as au
+
+    class Raw:
+        async def get(self, k):
+            return None
+
+    async def never(*a):
+        raise AssertionError("no keys, no call")
+
+    monkeypatch.setattr(au, "refresh_asset_meta", never)
+    for name in ("ALPACA_API_KEY", "APCA_API_KEY_ID", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET", "APCA_API_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    assert asyncio.run(au.load_asset_meta(Raw())) == {}

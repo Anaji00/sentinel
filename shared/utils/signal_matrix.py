@@ -265,9 +265,9 @@ def options_signals(m: Matrix, live: Dict[str, Any], daily: Sequence[Dict[str, A
                      "option chain", "Goyal & Saretto 2009: drives the option structure, not the stock's direction", as_of))
     net = sweeps.get("call", 0.0) - sweeps.get("put", 0.0)
     if sweeps:
-        m.add(Signal(g, "sweep premium, calls - puts, 5d", net, f"${net / 1e6:+.2f}M",
-                     1 if net > 0 else -1 if net < 0 else 0, "no_edge", "option sweeps",
-                     "measured here on 5 October: sweeps carried no edge", as_of))
+        m.add(Signal(g, "large print premium, calls - puts, 5d", net, f"${net / 1e6:+.2f}M",
+                     1 if net > 0 else -1 if net < 0 else 0, "no_edge", "large option prints",
+                     "measured here on 5 October: large prints carried no edge", as_of))
 
 
 def short_signals(m: Matrix, si: Sequence[Dict[str, Any]], as_of: Optional[str]) -> None:

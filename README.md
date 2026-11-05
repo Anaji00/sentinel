@@ -131,7 +131,7 @@ Sentinel is composed of **35 modular services & containers** orchestrated via Do
   - **Signal Governance & Kill Switch Panel**: Real-time feature flag toggles, rollout percentage sliders, and emergency signal kill switches.
   - **`/intelligence` (News & Intel)**: Two views of one page: the multi-domain live event feed (`?view=feed`, red reserved for scores of 0.9 and up) and the open-source threat matrix (`?view=osint`; the old `/osint` redirects here).
   - **`/agents` (AI Analysts)**: The analysts' roster, what they have concluded, and their bulletins in plain words.
-  - **`/options` (Options & Flow)**: Big-money block trades and options sweeps (default view; the old `/flow` redirects here), the unusual-volume radar (`?view=radar`), and index flow (`?view=indices`).
+  - **`/options` (Options & Flow)**: Big-money block trades and large option prints (default view; the old `/flow` redirects here), the unusual-volume radar (`?view=radar`), and index flow (`?view=indices`).
   - **`/crypto`**: Crypto perpetuals, funding rates, and volume spikes.
   - **`/charts` (Markets & Economy)**: Two views: Prices (multi-asset cards, each line coloured by its own direction) and Economy (`?view=economy`: the yield curve, oil stockpiles and prediction markets; `/macro` redirects here).
   - **`/cases` (Investigations)**: Cases and Briefs as two views (`/reports` redirects to `?view=briefs`).
@@ -274,7 +274,7 @@ The rules that keep it tradable:
   *supported* passes all but that one. Only these vote.
 
 **Reaction study** (`shared/utils/reaction_study.py`). Every event family (8-K items,
-insider clusters, sweeps, news families, earnings reactions…) is tested against what the
+insider clusters, large option prints, news families, earnings reactions…) is tested against what the
 instrument did next, net of SPY, with a winsorised t-test and Benjamini-Hochberg
 false-discovery control at q ≤ 0.10, against a size-matched ETF (SPY, IJH, IJR or IWC by the
 stock's dollar volume) so small-cap drift does not pass for an edge. A family whose result

@@ -9,6 +9,8 @@
  */
 
 import React, { useState } from 'react';
+import { Input } from './ui/Input';
+import { Button } from './ui/Button';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { oversightLine, type OversightLaw } from './CivicOversight';
@@ -235,13 +237,12 @@ function RecordsRequestDraft({ slug }: { slug: string }) {
   );
   if (!open) {
     return (
-      <button
-        type="button"
-        className="text-micro text-accent hover:underline"
+      <Button variant="link"
+        type="button" className="text-micro"
         onClick={() => setOpen(true)}
       >
         Draft a public-records request to this agency
-      </button>
+      </Button>
     );
   }
   if (!data) return <p className="text-micro text-ink-mute">Drafting…</p>;
@@ -254,9 +255,8 @@ function RecordsRequestDraft({ slug }: { slug: string }) {
         className="w-full h-48 bg-base border border-line rounded p-2 font-mono text-micro"
       />
       <div className="flex flex-wrap gap-3 text-micro">
-        <button
+        <Button variant="link"
           type="button"
-          className="text-accent hover:underline"
           onClick={async () => {
             try {
               await navigator.clipboard.writeText(`${data.subject}\n\n${data.body}`);
@@ -267,7 +267,7 @@ function RecordsRequestDraft({ slug }: { slug: string }) {
           }}
         >
           {copied ? 'Copied' : 'Copy letter'}
-        </button>
+        </Button>
         <a
           href={data.file_with}
           target="_blank"
@@ -966,11 +966,14 @@ function DataBrokers() {
           </button>
         ))}
       </div>
-      <input
+      <Input
+        label="Find a broker"
+        hideLabel
+        size="sm"
+        containerClassName="w-full"
         value={q}
         onChange={(e) => setQ(e.target.value)}
         placeholder="Find a broker"
-        className="w-full bg-base border border-line rounded px-2 py-0.5 text-micro"
       />
       <ul className="space-y-1 max-h-72 overflow-y-auto">
         {data.brokers.map((b) => (

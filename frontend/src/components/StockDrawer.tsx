@@ -6,10 +6,12 @@
  * A ticker used to be a link to /ticker, which threw away the page you were
  * reading. The drawer shows the same header and evidence over the current
  * page, keeps its own address (so it can be shared or bookmarked) and closes
- * back to exactly where you were. /ticker stays as the full-page version.
+ * back to exactly where you were. "Full detail" holds what the Look Up a Stock
+ * page used to: candles, fund holders, options and surveillance business.
  */
 
 import React from 'react';
+import { Button } from './ui/Button';
 import Link from 'next/link';
 import useSWR from 'swr';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
@@ -18,8 +20,21 @@ import { formatNumber } from '../lib/format';
 import { shortName, type HoldersResponse } from '../lib/money';
 import { TickerEvidence } from './ConvergingEvidence';
 import { TickerHero } from './TickerHero';
+import dynamic from 'next/dynamic';
+import { Disclosure } from './ui/Disclosure';
 import { IconClose } from './ui/icons';
+import { LoadingLines } from './ui/Skeleton';
+import RelatedStocks from './RelatedStocks';
+import ThesisPanel from './ThesisPanel';
+import WhatChanged from './WhatChanged';
+import TickerSurveillance from './TickerSurveillance';
 import { useDialog } from './ui/useDialog';
+
+// Loaded when someone asks for it: the drawer is mounted on every page.
+const TickerInspector = dynamic(() => import('./TickerInspector'), {
+  ssr: false,
+  loading: () => <LoadingLines />,
+});
 
 /** The `t` search parameter, cleaned: letters, digits, dot and dash, at most ten. */
 export function drawerTicker(raw: string | null | undefined): string {
@@ -53,6 +68,7 @@ function Owners({ ticker }: { ticker: string }) {
 
 function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
   const dialog = useDialog(true, onClose, `${ticker} details`);
+  const [detail, setDetail] = React.useState(false);
   return (
     <div className="fixed inset-0 z-50 bg-black/60" {...dialog.overlayProps}>
       <div
@@ -60,9 +76,13 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
         {...dialog.panelProps}
       >
         <div className="flex items-center justify-between gap-3">
-          <Link href={`/ticker?symbol=${encodeURIComponent(ticker)}`} className="text-xs text-accent hover:underline">
-            Open the full page
-          </Link>
+          <Button variant="link"
+            type="button"
+            onClick={() => setDetail((v) => !v)}
+            aria-expanded={detail} className="text-xs"
+          >
+            {detail ? 'Hide full detail' : 'Full detail: prices, funds, options'}
+          </Button>
           <button
             type="button"
             onClick={onClose}
@@ -73,8 +93,19 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
           </button>
         </div>
         <TickerHero symbol={ticker} />
-        <Owners ticker={ticker} />
-        <TickerEvidence ticker={ticker} />
+        <WhatChanged ticker={ticker} />
+        <ThesisPanel ticker={ticker} />
+        <Disclosure variant="row" label={`More about ${ticker}`} hint="owners, patterns, related stocks" storageKey="drawer:more">
+          <Owners ticker={ticker} />
+          <TickerEvidence ticker={ticker} />
+          <RelatedStocks ticker={ticker} />
+        </Disclosure>
+        {detail && (
+          <>
+            <TickerSurveillance symbol={ticker} />
+            <TickerInspector symbol={ticker} embedded />
+          </>
+        )}
       </div>
     </div>
   );

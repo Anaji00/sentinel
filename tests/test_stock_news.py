@@ -42,6 +42,15 @@ def test_a_strong_single_stock_article_becomes_a_family_observation() -> None:
     assert [(o.family, o.instrument, o.direction) for o in sf.observations(row)] == [("stock_news_negative", "MU", -1)]
 
 
+def test_an_articles_anomaly_score_is_not_its_tone() -> None:
+    """Scored by abs(tone) behind a 0.9 tone filter, every article outranked real
+    anomalies: all five of the agents' top anomalies on 4 Nov 2026 were headlines."""
+    src = (ROOT / "services/correlation/stock_news_scorer.py").read_text(encoding="utf-8")
+    assert "sn.EVENT_ANOMALY_SCORE" in src and 'abs(ev["tone"])' not in src
+    # Below the bands that mean "unusual", above what context readers require.
+    assert 0.4 <= sn.EVENT_ANOMALY_SCORE < 0.65
+
+
 def test_the_news_fade_counts_only_positive_articles_from_its_registration() -> None:
     ev = sn.event_row({"symbols": ["MU"]}, 0.97, 0.01)
     assert ev["side"] == "positive"

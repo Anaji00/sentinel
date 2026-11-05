@@ -43,6 +43,17 @@ class Town(BaseModel):
         return v
 
 
+class NotifyPrefs(BaseModel):
+    """What a person wants to be told about the stocks they follow. Each kind
+    is on until turned off; email is off until turned on."""
+
+    call: bool = True
+    signal: bool = True
+    filing: bool = True
+    holders: bool = True
+    email_digest: bool = False
+
+
 class Preferences(BaseModel):
     tickers: List[str] = Field(default_factory=list)
     town: Optional[Town] = None
@@ -50,6 +61,7 @@ class Preferences(BaseModel):
     focus: Literal["stocks", "civic", "both"] = "both"
     # Whether the first-visit welcome has been answered.
     welcomed: bool = False
+    notify: NotifyPrefs = Field(default_factory=NotifyPrefs)
 
     @field_validator("tickers")
     @classmethod
@@ -125,3 +137,70 @@ async def patch_preferences(patch: Dict[str, Any], request: Request, db=Depends(
     # JSON string inside the JSON column).
     await db.execute(_PUT_SQL, owner, prefs.model_dump())
     return {"saved": True, **prefs.model_dump()}
+
+
+# ── The inbox ────────────────────────────────────────────────────────────────
+#
+# Written by services/alert_manager/notifications_job.py. Every query is scoped
+# by the verified owner: one account can neither read nor mark another's.
+
+INBOX_LIMIT = 50
+
+
+class Notification(BaseModel):
+    id: int
+    kind: str
+    ticker: Optional[str] = None
+    title: str
+    body: str
+    url: str
+    created_at: str
+    read: bool
+
+
+class Inbox(BaseModel):
+    unread: int
+    items: List[Notification]
+
+
+class MarkRead(BaseModel):
+    """Which rows to mark read: the listed ids, or everything."""
+
+    ids: List[int] = Field(default_factory=list, max_length=INBOX_LIMIT)
+    all: bool = False
+
+
+_UNREAD_SQL = "SELECT count(*) AS n FROM notifications WHERE owner = $1 AND read_at IS NULL"
+_INBOX_SQL = """
+    SELECT id, kind, ticker, title, body, url, created_at, read_at FROM notifications
+    WHERE owner = $1 ORDER BY created_at DESC, id DESC LIMIT $2
+"""
+
+
+@router.get("/notifications", response_model=Inbox)
+async def get_notifications(request: Request, db=Depends(get_db_optional)) -> Inbox:
+    owner = owner_key(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Notifications unavailable.")
+    unread = await db.query_one(_UNREAD_SQL, owner)
+    rows = await db.query(_INBOX_SQL, owner, INBOX_LIMIT)
+    return Inbox(unread=int((unread or {}).get("n") or 0), items=[
+        Notification(id=r["id"], kind=r["kind"], ticker=r["ticker"], title=r["title"], body=r["body"], url=r["url"],
+                     created_at=str(r["created_at"]), read=r["read_at"] is not None)
+        for r in rows or []
+    ])
+
+
+@router.post("/notifications/read")
+async def mark_notifications_read(req: MarkRead, request: Request, db=Depends(get_db_optional)) -> Dict[str, bool]:
+    owner = owner_key(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Notifications unavailable.")
+    if req.all:
+        await db.execute("UPDATE notifications SET read_at = NOW() WHERE owner = $1 AND read_at IS NULL", owner)
+    elif req.ids:
+        await db.execute(
+            "UPDATE notifications SET read_at = NOW() WHERE owner = $1 AND id = ANY($2::bigint[]) AND read_at IS NULL",
+            owner, req.ids,
+        )
+    return {"ok": True}

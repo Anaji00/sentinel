@@ -44,6 +44,14 @@ def deterministic_radar_decision(ticker: str, z_score: float, notional_usd: floa
     )
 
 
+def radar_bulletin_summary(ticker: str, z_score: float, notional_usd: float) -> str:
+    """The line a person reads. The rule and its thresholds stay in the payload's rationale."""
+    return (
+        f"{ticker} moved to closer watch: trading volume is {z_score:.1f} standard deviations from normal, "
+        f"with ${notional_usd / 1e6:.2f}M traded in a minute."
+    )
+
+
 class RadarBatchDecision(BaseModel):
     """Many verdicts from one inference.
 
@@ -192,7 +200,7 @@ class RadarAgent(SentinelAgent):
             f"{len(items)} primary US-listed instruments.\n\n"
             f"CANDIDATES\n{candidates}\n\n"
             "For EACH candidate decide whether the flow warrants active high-frequency "
-            "tracking. Look for 'smart money' sweeps: size that is large relative to that "
+            "tracking. Look for 'smart money' prints: size that is large relative to that "
             "instrument's own regime, not merely large in dollars. Judge each on its own "
             "metrics -- these are unrelated instruments and a verdict on one says nothing "
             "about another.\n\n"
@@ -568,7 +576,6 @@ class RadarAgent(SentinelAgent):
         # ─── AGENTIC REASONING ───
         # ─── CROSS-DOMAIN QUANT REGIME METRICS ───
         from shared.utils import quant_calc
-        import numpy as np
 
         closes, tf_label = await self._fetch_close_history(ticker)
 
@@ -606,7 +613,6 @@ class RadarAgent(SentinelAgent):
         self.logger.info(f"🔍 Evaluating anomaly for {ticker} | Z-Score: {z_score:.2f} | Flow: ${notional_usd / 1e6:.2f}M | {regime_str}")
         entity_context = await self.fetch_entity_context(ticker)
         cross_context = await self.get_cross_agent_context(ticker=ticker, limit=2)
-        cross_block = f"\nCross-Agent Intelligence:\n{cross_context}\n" if cross_context else ""
         
         try:
             # Queued rather than dispatched. The batcher answers this ticker
@@ -663,7 +669,7 @@ class RadarAgent(SentinelAgent):
                 # has spent its time removing.
                 await self.publish_bulletin(
                     bulletin_type="thesis",
-                    summary=f"{ticker} escalated to primary surveillance: {decision.rationale}",
+                    summary=radar_bulletin_summary(ticker, z_score, notional_usd),
                     ticker=ticker,
                     conviction=min(1.0, max(0.0, z_score / 10.0)),
                     expected_direction="neutral",

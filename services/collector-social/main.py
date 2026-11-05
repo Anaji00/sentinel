@@ -14,6 +14,7 @@ Deduplication via Redis sorted set with timestamp score and TTL.
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ from shared.kafka import SentinelProducer, Topics
 from shared.models import RawEvent
 from shared.db import get_redis
 from shared.utils.heartbeat import start_heartbeat_task
+from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.reddit_feed import parse_reddit_atom
 from shared.utils.collector_metrics import CollectorMetrics
 from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
@@ -68,6 +71,12 @@ REDDIT_SUBREDDITS = [
     ("energy", "energy", 0.70),
     ("commodities", "commodities", 0.70),
 ]
+
+REDDIT_USER_AGENT = "python:sentinel-market-intel:v1.0 (personal research)"
+_reddit_turn = itertools.count()
+# No default: nitter.net has answered 410 Gone to every feed, and an empty bridge
+# was six failed calls a minute for nothing.
+TWITTER_BRIDGE = os.getenv("TWITTER_RSS_BRIDGE_URL", "").rstrip("/")
 
 # ── CURATED X/TWITTER BREAKING HANDLES ────────────────────────────────────────
 TWITTER_HANDLES = [
@@ -186,26 +195,29 @@ async def poll_reddit_subreddit(
     category: str,
     reliability: float,
 ) -> int:
-    """Polls recent submissions from a subreddit via public JSON API."""
-    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=15"
-    headers = {"User-Agent": "Sentinel-Intelligence-Collector/1.0"}
+    """Polls recent submissions from a subreddit's public Atom feed.
+
+    The JSON endpoint has answered 403 since 29 Oct 2026, and every refusal
+    returned 0 uncounted. The feed answers a User-Agent in the form Reddit's rules
+    ask for; a burst across subreddits gets a 429, hence one subreddit a cycle."""
+    url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit=15"
+    headers = {"User-Agent": REDDIT_USER_AGENT}
     new_count = 0
 
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
+                dropped("collector_social.reddit", f"http_{resp.status}", logger, detail=subreddit)
                 return 0
-            data = await resp.json()
+            feed = await resp.text()
 
-        posts = data.get("data", {}).get("children", [])
-        for p in posts:
-            p_data = p.get("data", {})
-            post_id = p_data.get("id")
-            title = p_data.get("title", "").strip()
-            selftext = p_data.get("selftext", "").strip()
-            permalink = p_data.get("permalink", "")
-            author = p_data.get("author", "anonymous")
-            created_utc = p_data.get("created_utc", time.time())
+        for p_data in parse_reddit_atom(feed):
+            post_id = p_data["id"]
+            title = p_data["title"]
+            selftext = p_data["selftext"]
+            permalink = p_data["permalink"]
+            author = p_data["author"]
+            created_utc = p_data["created_utc"]
 
             if not post_id or not title:
                 continue
@@ -240,7 +252,7 @@ async def poll_reddit_subreddit(
             new_count += 1
 
     except Exception as e:
-        logger.debug(f"Reddit poll notice for r/{subreddit}: {e}")
+        swallowed("collector_social.reddit", e, logger, detail=subreddit)
 
     return new_count
 
@@ -260,8 +272,7 @@ async def poll_twitter_handle(
     Gracefully defers if upstream endpoints are unreachable or unconfigured.
     """
     new_count = 0
-    bridge_base = os.getenv("TWITTER_RSS_BRIDGE_URL", "https://nitter.net")
-    url = f"{bridge_base}/{handle}/rss"
+    url = f"{TWITTER_BRIDGE}/{handle}/rss"
 
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -328,11 +339,12 @@ async def collect_social_cycle(
     for channel, cat, rel in TELEGRAM_CHANNELS:
         tasks.append(poll_telegram_channel(session, producer, dedup, channel, cat, rel))
 
-    for sub, cat, rel in REDDIT_SUBREDDITS:
-        tasks.append(poll_reddit_subreddit(session, producer, dedup, sub, cat, rel))
+    sub, cat, rel = REDDIT_SUBREDDITS[next(_reddit_turn) % len(REDDIT_SUBREDDITS)]
+    tasks.append(poll_reddit_subreddit(session, producer, dedup, sub, cat, rel))
 
-    for handle, cat, rel in TWITTER_HANDLES:
-        tasks.append(poll_twitter_handle(session, producer, dedup, handle, cat, rel))
+    if TWITTER_BRIDGE:
+        for handle, cat, rel in TWITTER_HANDLES:
+            tasks.append(poll_twitter_handle(session, producer, dedup, handle, cat, rel))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     total_new = sum(r for r in results if isinstance(r, int))

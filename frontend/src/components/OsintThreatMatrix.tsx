@@ -2,6 +2,8 @@
 
 import React, { useState } from 'react';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { decodeEntities, formatPercent } from '../lib/format';
@@ -35,7 +37,7 @@ export default function OsintThreatMatrix() {
   const [selectedTheater, setSelectedTheater] = useState<string>('ALL');
   const [onlySanctions, setOnlySanctions] = useState<boolean>(false);
 
-  const { data } = useSWR<OsintItem[]>('/api/v1/events/news?limit=30', fetcher, {
+  const { data, error: newsError, mutate: retryNews } = useSWR<OsintItem[]>('/api/v1/events/news?limit=30', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -131,6 +133,7 @@ export default function OsintThreatMatrix() {
 
       {/* Stream List */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {failedWithout(newsError, data) && <PanelError what="the news feed" onRetry={() => void retryNews()} />}
         {filteredEvents.map((item) => (
           <div
             key={item.id}

@@ -29,6 +29,9 @@ from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
     ownership,
+    stock_changes,
+    stock_peers,
+    stock_thesis,
     me,
     auth,
     oidc,
@@ -203,6 +206,9 @@ app.include_router(portfolio.router)
 app.include_router(reports.router)
 app.include_router(filings.router)
 app.include_router(ownership.router)
+app.include_router(stock_peers.router)
+app.include_router(stock_changes.router)
+app.include_router(stock_thesis.router)
 app.include_router(methodology.router)
 app.include_router(sovereignty.router)
 app.include_router(search.router)

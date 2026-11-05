@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from datetime import date
-from typing import List, Mapping, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,9 +28,19 @@ import pandas as pd
 WINDOW = 252
 MIN_OBS = 150
 MIN_T = 3.0
+BASELINE_MIN_MOVE = 0.002     # under 0.2% on the session, the baseline makes no call
 YIELDS = ("US02Y", "US2Y", "US10Y", "US30Y")
 
 ExposureRow = Tuple[str, str, float, float, float, int]   # (ticker, macro, beta, t, partial corr, sessions)
+
+
+def exposure_direction(exposure: Optional[float], move: Optional[float], min_move: float = BASELINE_MIN_MOVE) -> Optional[str]:
+    """The no-model call: the sign of measured exposure (beta or partial correlation,
+    same sign) x the macro's last move. None when either is missing or the move is too
+    small to say anything. Pure."""
+    if exposure is None or move is None or not exposure or abs(move) < min_move:
+        return None
+    return "up" if exposure * move > 0 else "down"
 
 
 def changes(symbol: str, rows: Sequence[Tuple[date, float]]) -> pd.Series:

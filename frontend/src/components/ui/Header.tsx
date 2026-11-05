@@ -26,11 +26,13 @@ import { usePathname } from 'next/navigation';
 import { IconLock } from './icons';
 import SystemHealthHUD from '../SystemHealthHUD';
 import { ThemeToggle } from './ThemeToggle';
+import { NotificationBell } from './NotificationBell';
 import { useTelemetryStore } from '../../lib/store';
 import { AccountProfileModal } from '../AccountProfileModal';
 import { useNav } from './NavContext';
 import { TIMEZONES, useTimeZone } from './TimeZoneContext';
 import { useSession } from './SessionContext';
+import { HeaderSearch } from './HeaderSearch';
 
 /** Initials for the avatar, from whatever the session actually gives us. */
 function initialsFor(email?: string | null): string {
@@ -186,10 +188,11 @@ export const Header: React.FC = () => {
 
       {/* Controls */}
       <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+        <HeaderSearch />
         <span
           className="hidden xl:flex items-center gap-1 text-micro text-ink-mute border border-line
                      rounded px-1.5 py-1"
-          title="Open the command palette"
+          title="Open the command palette, which also finds pages"
         >
           {isMac ? <Command className="h-3 w-3" /> : <span className="font-medium">Ctrl</span>}
           <span className="font-medium">K</span>
@@ -222,6 +225,9 @@ export const Header: React.FC = () => {
             ))}
           </select>
         </label>
+
+        {/* Only once signed in: the inbox belongs to an account. */}
+        {status !== 'loading' && status !== 'anonymous' && <NotificationBell />}
 
         <ThemeToggle />
 

@@ -110,11 +110,11 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'options', label: 'Options' },
 ];
 
-export default function TickerInspector() {
+export default function TickerInspector({ symbol, embedded = false }: { symbol?: string; embedded?: boolean } = {}) {
   // ?symbol=NVDA opens the inspector on that name, so every ticker on the
   // stock pages links straight here instead of being retyped.
   const searchParams = useSearchParams();
-  const linked = (searchParams?.get('symbol') || '').trim().toUpperCase().slice(0, 10);
+  const linked = (symbol ?? searchParams?.get('symbol') ?? '').trim().toUpperCase().slice(0, 10);
   const [input, setInput] = React.useState(linked);
   const [ticker, setTicker] = React.useState(linked);
   const [lastLinked, setLastLinked] = React.useState(linked);
@@ -171,6 +171,7 @@ export default function TickerInspector() {
       </div>
 
       <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-line px-3.5 py-2.5">
+        {!embedded && (<>
         <label className="sr-only" htmlFor="inspect-ticker">
           Ticker
         </label>
@@ -192,6 +193,7 @@ export default function TickerInspector() {
         >
           Look up
         </button>
+        </>)}
         {ticker && (
           <Tabs
             className="ml-auto"
@@ -233,7 +235,7 @@ export default function TickerInspector() {
             {tab === 'happening' && (
               <>
                 {/* ── what set it off, in the last three days ─────────── */}
-                <TickerEvidence ticker={ticker} />
+                {!embedded && <TickerEvidence ticker={ticker} />}
                 <StockNews ticker={ticker} />
               </>
             )}

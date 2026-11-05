@@ -53,6 +53,10 @@ EXEMPT = {
     # not platform governance, and writing a person's town into a ledger served
     # to admins would expose where they live -- the privacy plan's reason again.
     "me": "a person's own settings (followed stocks, their town); private, changes no platform state",
+    # A person asks for the bull and bear case on a stock. The POST starts a background
+    # job and stores its answer for six hours; it is capped per person and per host, and
+    # changes nothing anybody could later dispute.
+    "stock_thesis": "writes a cached AI answer for one stock; spends capped inference, changes no configuration, access or data",
 }
 
 

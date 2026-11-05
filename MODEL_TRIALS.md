@@ -31,6 +31,12 @@ exists in the README.
 One amendment, made before any O1 result: at the user's direction memory was dropped as a constraint
 (O1 originally also required a peak under 2.0 GB), and the model service's limit was raised to 6 GB.
 
+## Gate policy, recorded 4 Nov 2026
+
+The deflated-Sharpe gate stays as coded: variance across every candidate at the horizon, trials counted as candidates x horizons (12), bar 0.95. It is not changed to get a pass. Under other readings the monthly model scored 0.96 (sampling noise only, 12 trials), 0.89 (41 trials) and 0.35 (live variance, 41 trials), so any later change is written here first and applied whichever way it cuts.
+
+While the account is paper, B1 keeps rebalancing on unvalidated scores as the forward test. The gate must pass before any real capital. The trader keeps the old book when fewer than 800 names are scored.
+
 ## Results (monthly, out of sample)
 
 | Trial | Months tested | Rank IC | IC t | Positive folds | Net per month | Net Sharpe | Buys vs market after beta | Shorts | Net beta | Verdict |

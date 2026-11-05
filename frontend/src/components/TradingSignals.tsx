@@ -10,8 +10,11 @@
  */
 
 import React, { useMemo, useState } from 'react';
+import { Button } from './ui/Button';
 import Link from 'next/link';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { familyName, horizonWords } from '../lib/signalNames';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatAge, formatNumber } from '../lib/format';
@@ -253,7 +256,7 @@ function GroupCard({ g }: { g: SignalGroup }) {
         {(open ? g.signals : g.signals.slice(0, SHOWN)).map((s) => (
           <Link
             key={s.id}
-            href={`/ticker?symbol=${encodeURIComponent(s.instrument)}`}
+            href={`?t=${encodeURIComponent(s.instrument)}`}
             title={`${formatNumber(s.probability * 100, { decimals: 0 })}% likely · raised ${formatAge(s.created_at)} ago`}
             className="rounded-md border border-line bg-inset px-2 py-0.5 font-mono text-micro text-ink hover:border-line-accent hover:text-accent"
           >
@@ -269,9 +272,9 @@ function GroupCard({ g }: { g: SignalGroup }) {
         <span>
           Latest raised {formatAge(g.signals.reduce((m, s) => (s.created_at > m ? s.created_at : m), lead.created_at))} ago
         </span>
-        <button type="button" onClick={() => setOpen(!open)} className="text-accent hover:underline">
+        <Button variant="link" type="button" onClick={() => setOpen(!open)}>
           {open ? 'Hide the evidence' : 'Show the evidence'}
-        </button>
+        </Button>
       </div>
 
       {open && (
@@ -315,7 +318,7 @@ const STUDY_FILTERS: { key: string; label: string; match: (v: string) => boolean
 ];
 
 export default function TradingSignals() {
-  const { data } = useSWR<SignalsResponse>('/signals', fetcher, { refreshInterval: POLL.standard });
+  const { data, error: signalsError, mutate: retrySignals } = useSWR<SignalsResponse>('/signals', fetcher, { refreshInterval: POLL.standard });
   const { data: study } = useSWR<StudyResponse>('/signals/study', fetcher, { refreshInterval: POLL.slow });
   const [allCells, setAllCells] = useState(false);
   const [studyFilter, setStudyFilter] = useState('proven');
@@ -387,7 +390,9 @@ export default function TradingSignals() {
         </p>
       </section>
 
-      {active === 0 ? (
+      {failedWithout(signalsError, data) ? (
+        <PanelError what="the live signals" onRetry={() => void retrySignals()} />
+      ) : active === 0 ? (
         <section className="rounded-2xl border border-dashed border-line p-5 text-ink-mute">
           No live signals.{' '}
           {proven === 0

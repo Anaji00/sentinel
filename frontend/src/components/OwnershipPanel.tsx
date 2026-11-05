@@ -1,6 +1,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { Input } from './ui/Input';
+import { Button } from './ui/Button';
 import { IconDocument } from './ui/icons';
 import { formatNumber } from '../lib/format';
 
@@ -159,18 +161,22 @@ export default function OwnershipPanel() {
             load(ticker.trim().toUpperCase(), compareTo.trim().toUpperCase());
           }}
         >
-          <input
+          <Input
+            label="Ticker"
+            hideLabel
+            containerClassName="w-24"
+            className="uppercase"
             value={ticker}
             onChange={(e) => setTicker(e.target.value)}
-            aria-label="Ticker"
-            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-ink uppercase"
           />
           <span className="text-xs text-ink-dim">vs</span>
-          <input
+          <Input
+            label="Compare with ticker"
+            hideLabel
+            containerClassName="w-24"
+            className="uppercase"
             value={compareTo}
             onChange={(e) => setCompareTo(e.target.value)}
-            aria-label="Compare with ticker"
-            className="w-24 px-2 py-1.5 text-sm rounded-md bg-page border border-line text-ink uppercase"
           />
           <button
             type="submit"
@@ -208,9 +214,9 @@ export default function OwnershipPanel() {
                 {holders.holders.map((h) => (
                   <tr key={h.filer_id} className="border-t border-line/60">
                     <td className="py-1">
-                      <button onClick={() => openFiler(h.filer_id)} className="text-accent hover:underline text-left">
+                      <Button variant="link" onClick={() => openFiler(h.filer_id)} className="text-left">
                         {h.filer}
-                      </button>
+                      </Button>
                     </td>
                     <td className="text-right text-ink">{pct(h.pct_outstanding)}</td>
                     <td className="text-right">{usd(h.value_usd)}</td>

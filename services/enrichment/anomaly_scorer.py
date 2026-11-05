@@ -21,7 +21,7 @@ from shared.utils.model_registry import (
     ModelRegistry, ConformalScoreCalibrator, validate_training_data,
 )
 
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple
 from shared.utils.quiet_failures import swallowed
 
 # The maritime gap distribution, mirroring the aviation detector's.
@@ -40,7 +40,7 @@ _VESSEL_SCORE_CEILING = 0.92
 
 
 # Imported rather than retyped, and from `shared` rather than from the
-# maritime enricher: that enricher imports `lift_score` from this module,
+# maritime enricher: that enricher imports `breakdown_from_score` from this module,
 # so the two cannot import each other. A key convention shared by two
 # modules belongs in neither of them.
 from shared.utils.watchlists import WATCHED_VESSELS_KEY
@@ -309,6 +309,11 @@ DRIFT_FAR_CEILING = 0.25
 DRIFT_FAR_WARN = 0.12
 
 
+# Saved points a detector can no longer use. Maritime went from eight inputs to
+# five when flag, region and status came out (4 Nov 2026).
+DETECTOR_POINT_WIDTH = {"maritime": 5}
+
+
 class DynamicAnomalyScorer:
     def __init__(self, redis_client, hawkes_tracker: Optional[HawkesIntensityTracker] = None, neo4j_client=None):
         if redis_client is None:
@@ -457,6 +462,15 @@ class DynamicAnomalyScorer:
                 points = json.loads(value)
             except (TypeError, ValueError) as exc:
                 swallowed("enrichment.anomaly_scorer.restore_unparseable", exc, logger, detail=name)
+                continue
+            # Replaying points of another width would break the live stream, which
+            # warm() cannot see: it only checks the saved points against each other.
+            want = DETECTOR_POINT_WIDTH.get(name)
+            if want is not None and points and len(points[0]) != want:
+                swallowed(
+                    "enrichment.anomaly_scorer.restore_old_width",
+                    ValueError(f"{name}: {len(points[0])} != {want}"), logger, variant="old_width",
+                )
                 continue
             restored[name] = await loop.run_in_executor(None, detector.warm, points)
         return restored

@@ -17,7 +17,7 @@ const GlobalMap = dynamic(() => import('./GlobalMap'), {
   ssr: false,
 });
 const IntelligenceFeed = dynamic(() => import('./IntelligenceFeed'), {
-  loading: () => <PanelSkeleton title="Loading intelligence stream…" />,
+  loading: () => <PanelSkeleton title="Loading the feed…" />,
   ssr: false,
 });
 

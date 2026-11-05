@@ -1,7 +1,10 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
@@ -35,7 +38,7 @@ export default function CryptoAnalytics() {
     'Derivatives detail',
   );
 
-  const { data: cryptoEvents } = useSWR<NormalizedEvent[]>('/events/crypto?limit=100', fetcher, {
+  const { data: cryptoEvents, error: cryptoError, mutate: retryCrypto } = useSWR<NormalizedEvent[]>('/events/crypto?limit=100', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -116,12 +119,16 @@ export default function CryptoAnalytics() {
 
         {/* Search Bar */}
         <div className="relative">
-          <input
+          <Input
+            label="Filter crypto activity"
+            hideLabel
+            size="sm"
+            containerClassName="w-full"
+            className="font-mono"
             type="text"
             placeholder="Filter by pair (BTCUSDT), funding rate, OFI, or exchange..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-inset border border-caution/30 rounded-xl px-3.5 py-2 text-xs text-ink placeholder:text-ink-mute focus:outline-none focus:border-caution/30 font-mono transition-colors"
           />
         </div>
 
@@ -260,6 +267,8 @@ export default function CryptoAnalytics() {
                 </div>
               );
             })
+          ) : failedWithout(cryptoError, cryptoEvents) ? (
+            <PanelError what="crypto activity" onRetry={() => void retryCrypto()} />
           ) : (
             <div className="p-8 text-center border border-dashed border-caution/30 rounded-xl text-ink-dim text-xs">
               No matching crypto events found.
@@ -313,7 +322,7 @@ export default function CryptoAnalytics() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">SOURCE:</span>{' '}
+                  <span className="text-ink-dim">Source:</span>{' '}
                   <span className="text-caution font-bold block">{selectedEvent.source}</span>
                 </div>
                 <div>
@@ -323,7 +332,7 @@ export default function CryptoAnalytics() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-ink-dim">TIMESTAMP:</span>{' '}
+                  <span className="text-ink-dim">Time:</span>{' '}
                   <span className="text-ink block">
                     {new Date(selectedEvent.occurred_at).toUTCString()}
                   </span>

@@ -137,7 +137,7 @@ export default function SubscriptionPanel() {
 
         {!status.has_pro && (
           <ul className="text-sm text-ink-dim space-y-1 pl-4 list-disc">
-            <li>Agent swarm reasoning over live events</li>
+            <li>AI analysts reading live events</li>
             <li>Generated scenario briefs</li>
             <li>Agent-authored analysis</li>
             <li>Unlimited backtest runs</li>

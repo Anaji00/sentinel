@@ -9,7 +9,7 @@ export function TickerChip({ vendor }: { vendor: string | null | undefined }) {
   if (!c) return null;
   return (
     <Link
-      href={`/ticker?symbol=${c.ticker}`}
+      href={`?t=${c.ticker}`}
       title={`${c.name} is publicly traded: see its stock`}
       onClick={(e) => e.stopPropagation()}
       className="ml-1.5 inline-flex rounded border border-accent/40 px-1 font-mono text-micro text-accent hover:bg-accent-dim"

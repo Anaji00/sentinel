@@ -305,11 +305,18 @@ def _options_premium_score(premium: float) -> float:
 
 
 def _options_headline(ticker: str, option_type: str, premium: float, aggressor: Optional[str] = None) -> str:
-    """A large options trade in words: who paid how much for which bet."""
-    bet = {"CALL": "calls (a bet it rises)", "PUT": "puts (a bet it falls)"}.get(option_type, "options")
+    """A large options trade in words: who paid how much for which bet. Only a buyer's
+    bet is the option's own: a seller gains if the move does not come, and a print with
+    no read side says nothing about which of those it was."""
     size = f"${premium / 1e6:.1f}M" if premium >= 1e6 else f"${premium / 1e3:.0f}k"
-    who = "A buyer paid" if aggressor == "buy" else "A seller took" if aggressor == "sell" else "Someone traded"
-    return f"{ticker}: {who} {size} for {bet}"
+    kind = {"CALL": "calls", "PUT": "puts"}.get(option_type, "options")
+    if aggressor == "buy":
+        bet = {"CALL": " (a bet it rises)", "PUT": " (a bet it falls)"}.get(option_type, "")
+        return f"{ticker}: A buyer paid {size} for {kind}{bet}"
+    if aggressor == "sell":
+        bet = {"CALL": " (gains if it stays below the strike)", "PUT": " (gains if it stays above the strike)"}.get(option_type, "")
+        return f"{ticker}: A seller collected {size} for {kind}{bet}"
+    return f"{ticker}: Someone traded {size} of {kind} (buyer or seller not known)"
 
 
 def _otm_percentage(strike, underlying_price, option_type) -> "Optional[float]":
@@ -1206,7 +1213,7 @@ class TradFiEnricher:
         )
 
         summary_str = (
-            f"Institutional Market Intelligence for {ticker}: {direction_str} of ${notional:,.2f} at ${price:.2f} ({volume:,.0f} shares). "
+            f"{ticker}: {direction_str} of ${notional:,.2f} at ${price:.2f} ({volume:,.0f} shares). "
             f"{micro_str} "
             f"Anomaly Score: {anomaly:.2f}."
         )
@@ -2018,7 +2025,13 @@ class TradFiEnricher:
         # Dividing rather than multiplying: the same absolute size is *more*
         # notable in a thin session, not less. Bounded at 1.0 so a thin-session
         # sweep cannot exceed the scale.
-        _session_depth = session_liquidity_factor(asset_class="equities")
+        #
+        # The session the print happened in, not the one this poll read it in. The
+        # feed runs 15 minutes late, so a 15:50 print processed at 16:06 was divided
+        # by the after-hours 0.10: over 14 days to 4 Nov 2026, prints from 15:00-16:00
+        # scored a median 0.50 processed after the close and 0.145 before it, and
+        # those 35 prints held 6 of the hour's 7 scores of 0.7 or more.
+        _session_depth = session_liquidity_factor(raw.occurred_at, asset_class="equities")
         if 0 < _session_depth < 1.0:
             base_score = min(FALLBACK_MAX_SCORE, base_score / _session_depth)
         lift_spent = 0.0
@@ -2423,10 +2436,10 @@ class TradFiEnricher:
 
         if event_type == EventType.EARNINGS_SURPRISE:
             surprise_str = f"{eps_surprise_pct:+.1f}%" if eps_surprise_pct is not None else "N/A"
-            headline = f"📊 EARNINGS {'BEAT' if direction == 'beat' else 'MISS' if direction == 'miss' else 'INLINE'} | {ticker} | EPS: {eps_actual} vs Est {eps_estimate} ({surprise_str})"
+            headline = f"Earnings {'beat' if direction == 'beat' else 'miss' if direction == 'miss' else 'in line'} | {ticker} | EPS: {eps_actual} vs Est {eps_estimate} ({surprise_str})"
         else:
             session_label = {"bmo": "Pre-Market", "amc": "After-Close", "dmh": "During Hours"}.get(session, session.upper() if session else "TBD")
-            headline = f"📅 EARNINGS UPCOMING | {ticker} | Date: {report_date} ({session_label}) | Est EPS: {eps_estimate}"
+            headline = f"Earnings upcoming | {ticker} | Date: {report_date} ({session_label}) | Est EPS: {eps_estimate}"
 
         entity = Entity(id=ticker, type=EntityType.COMPANY, name=ticker)
 
@@ -2486,7 +2499,7 @@ class TradFiEnricher:
             tags.extend(["material_event", "ground_truth"])
 
         anomaly = _filing_form_score(form_type, is_8k, items)
-        headline = p.get("title") or f"📄 SEC FILING: {company_name} ({ticker}) filed Form {form_type}"
+        headline = p.get("title") or f"SEC filing: {company_name} ({ticker}) filed Form {form_type}"
         summary = p.get("summary") or f"SEC filing {form_type} for {company_name} ({ticker}) on {f_date}."
 
         entity = Entity(id=ticker or company_name, type=EntityType.COMPANY, name=company_name)
@@ -2579,7 +2592,7 @@ class TradFiEnricher:
         direction = "surging" if (change_pct or 0) > 0 else "falling"
         corridor = p.get("corridor")
         headline = (
-            f"🚢 FREIGHT {direction.upper()}: {index_name} "
+            f"Freight {direction.lower()}: {index_name} "
             f"{current:,.0f}" + (f" ({change_pct:+.1f}%)" if change_pct is not None else "")
         )
 
@@ -2655,7 +2668,7 @@ class TradFiEnricher:
         # the only party the filing itself names. Leading with it is both more
         # accurate and stable; the principals stay available as the descriptive
         # field they actually are.
-        headline = f"🏛️ 13F REPORT: {filer_name} filed portfolio for {period}"
+        headline = f"13F report: {filer_name} filed portfolio for {period}"
         summary = (
             f"Institutional 13F-HR filing by {filer_name}. "
             f"Total Portfolio Value: ${total_val/1e9:.2f}B across {pos_count} holdings. "

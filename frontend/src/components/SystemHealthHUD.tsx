@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { Button } from './ui/Button';
 import useSWR from 'swr';
 import { ABSENT } from '../lib/format';
 import { apiClient, fetcher } from '../lib/api';
@@ -172,13 +173,12 @@ export default function SystemHealthHUD() {
                 <IconRadar className="text-accent" size={16} />
                 <span className="text-head font-semibold">Platform health</span>
               </div>
-              <button
+              <Button variant="ghost" size="icon"
                 onClick={() => setIsOpen(false)}
-                aria-label="Close"
-                className="cursor-pointer rounded p-1 text-ink-dim hover:text-ink"
+                aria-label="Close" className="cursor-pointer"
               >
                 <IconClose />
-              </button>
+              </Button>
             </div>
 
             <div className="grid grid-cols-2 gap-2">
@@ -229,12 +229,12 @@ export default function SystemHealthHUD() {
             <div className="space-y-1.5 rounded-lg border border-line bg-page p-3">
               <span className="stat-label flex items-center gap-1.5">
                 {metricsData ? <IconCheck /> : <IconAlert />}
-                Telemetry
+                Service metrics
               </span>
               <div className="max-h-32 overflow-y-auto">
                 {/* Rendered even when absent, so "no telemetry" is stated
                     rather than shown as a missing section. */}
-                <DataGrid data={metricsData ?? {}} emptyLabel="No telemetry reported" />
+                <DataGrid data={metricsData ?? {}} emptyLabel="No metrics reported" />
               </div>
             </div>
 

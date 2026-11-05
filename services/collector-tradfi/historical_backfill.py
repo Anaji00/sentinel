@@ -119,6 +119,8 @@ SEAM_GUARD_MINUTES = int(os.getenv("ALPACA_BACKFILL_SEAM_GUARD_MIN", "30"))
 # Politeness between pages. The data API is rate limited per key and a backfill
 # is not urgent work.
 INTER_REQUEST_SLEEP_SEC = float(os.getenv("ALPACA_BACKFILL_SLEEP_SEC", "0.35"))
+WRITE_CHUNK_ROWS = 2000
+DAILY_WRITE_RETRY_SEC = 5.0
 
 _INSERT_SQL = """
     INSERT INTO tradfi_bars (ticker, time, open, high, low, close, volume, session, source)
@@ -430,17 +432,25 @@ async def backfill_daily_bars(
                             float(b.get("l") or close), close, float(b.get("v") or 0.0), DAILY_SOURCE,
                         ))
                 if rows:
-                    try:
-                        executemany = getattr(db_client, "execute_many", None) or getattr(db_client, "executemany", None)
-                        if callable(executemany):
-                            await executemany(_DAILY_INSERT_SQL, rows)
-                        else:
-                            for row in rows:
-                                await db_client.execute(_DAILY_INSERT_SQL, *row)
-                        report["bars_written"] += len(rows)
-                    except Exception as e:
-                        report["errors"].append(f"write {batch[0]}..: {e}")
-                        logger.error("Daily bar write failed: %s", e)
+                    # Sorted so two writers overlapping on a day take row locks in
+                    # one order; 30 Oct 2026 lost a page to "deadlock detected".
+                    rows.sort(key=lambda r: (r[0], r[1]))
+                    for attempt in range(2):
+                        try:
+                            executemany = getattr(db_client, "execute_many", None) or getattr(db_client, "executemany", None)
+                            if callable(executemany):
+                                await executemany(_DAILY_INSERT_SQL, rows)
+                            else:
+                                for row in rows:
+                                    await db_client.execute(_DAILY_INSERT_SQL, *row)
+                            report["bars_written"] += len(rows)
+                            break
+                        except Exception as e:
+                            if attempt == 0:
+                                await asyncio.sleep(DAILY_WRITE_RETRY_SEC)
+                                continue
+                            report["errors"].append(f"write {batch[0]}..: {type(e).__name__}: {e}")
+                            logger.error("Daily bar write failed: %s: %s", type(e).__name__, e)
                 if not page_token:
                     break
                 await asyncio.sleep(INTER_REQUEST_SLEEP_SEC)
@@ -456,22 +466,25 @@ async def backfill_daily_bars(
 
 
 async def _write_rows(db_client, rows: List[tuple]) -> int:
-    """Upsert bars, preferring a batched executemany where the client offers one."""
-    if not rows:
-        return 0
-    try:
-        executemany = getattr(db_client, "execute_many", None) or getattr(db_client, "executemany", None)
-        if callable(executemany):
-            await executemany(_INSERT_SQL, rows)
-            return len(rows)
-        written = 0
-        for row in rows:
-            await db_client.execute(_INSERT_SQL, *row)
-            written += 1
-        return written
-    except Exception as e:
-        # Loud, unlike the debug-level handler the live bar writer uses. A
-        # backfill that silently writes nothing looks exactly like a backfill
-        # that was never needed.
-        logger.error("Backfill insert failed for %s rows: %s", len(rows), e)
-        return 0
+    """Upsert bars, preferring a batched executemany where the client offers one.
+
+    In chunks, each its own transaction: 10,000 rows at once outlast the pool's
+    60 s statement timeout while the database is catching up (4 Nov 2026), and
+    the whole batch was lost for one timeout."""
+    written = 0
+    executemany = getattr(db_client, "execute_many", None) or getattr(db_client, "executemany", None)
+    for k in range(0, len(rows), WRITE_CHUNK_ROWS):
+        chunk = rows[k:k + WRITE_CHUNK_ROWS]
+        try:
+            if callable(executemany):
+                await executemany(_INSERT_SQL, chunk)
+            else:
+                for row in chunk:
+                    await db_client.execute(_INSERT_SQL, *row)
+            written += len(chunk)
+        except Exception as e:
+            # Loud, unlike the debug-level handler the live bar writer uses. A
+            # backfill that silently writes nothing looks exactly like a backfill
+            # that was never needed. By type too: a timeout's message is empty.
+            logger.error("Backfill insert failed for %s rows: %s: %s", len(chunk), type(e).__name__, e)
+    return written

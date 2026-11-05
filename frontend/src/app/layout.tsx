@@ -5,7 +5,7 @@ import { ServiceWorkerRegistrar } from '@/components/ServiceWorkerRegistrar';
 import { THEME_BOOT } from '@/lib/theme';
 
 export const metadata: Metadata = {
-  title: 'Sentinel — markets and civic watch',
+  title: 'Sentinel: markets and civic watch',
   description:
     'Stock signals graded on real prices, and a public map of who is watching your town.',
   applicationName: 'Sentinel',

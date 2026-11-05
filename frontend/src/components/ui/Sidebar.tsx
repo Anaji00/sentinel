@@ -22,7 +22,6 @@ import {
   ShieldAlert,
   LineChart,
   Gauge,
-  Search,
   ScrollText,
   Crosshair,
   Bot,
@@ -69,13 +68,12 @@ const NAV_GROUPS: NavGroup[] = [
       { href: '/calls', label: 'Calls', icon: Crosshair },
       { href: '/markets', label: 'Markets', icon: LineChart },
       // Any ticker also opens the stock drawer in place (?t=); this is the full page.
-      { href: '/ticker', label: 'Look Up a Stock', icon: Search },
       { href: '/filings', label: 'Filings & Fund Holdings', icon: FileText },
       { href: '/performance', label: 'Performance', icon: Gauge },
     ],
   },
   {
-    label: 'Intelligence',
+    label: 'Watch',
     items: [
       // News & intel, the world map and investigations, on one time window.
       { href: '/intel', label: 'Intel', icon: ShieldAlert },

@@ -10,6 +10,7 @@
  */
 
 import React from 'react';
+import { Button } from './ui/Button';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
@@ -106,9 +107,9 @@ export function CivicOversight({ onOpenPortal }: { onOpenPortal: (slug: string) 
                 Source
               </a>
               {l.portals.map((p) => (
-                <button key={p.slug} type="button" onClick={() => onOpenPortal(p.slug)} className="text-accent hover:underline">
+                <Button variant="link" key={p.slug} type="button" onClick={() => onOpenPortal(p.slug)}>
                   Its Flock page{p.cameras ? ` (${p.cameras} cameras)` : ''}
-                </button>
+                </Button>
               ))}
             </div>
           </li>

@@ -116,7 +116,7 @@ def test_insider_buying_and_buy_flow_outweigh_the_models_short() -> None:
         _sig("insider", "insider clusters, 90d", 1, "published", "3"),
         _sig("insider", "open-market net, 90d (plans excluded)", 1, "published", "$+2.10M"),
         _sig("events", "block buy accumulation", 1, "published"),
-        _sig("options", "sweep premium, calls - puts, 5d", 1, "no_edge"),   # measured no edge: counts 0
+        _sig("options", "large print premium, calls - puts, 5d", 1, "no_edge"),   # measured no edge: counts 0
     ]
     bal = rc.evidence_balance(signals)
     assert bal["bull"] == 3.0 and bal["bear"] == 0.0

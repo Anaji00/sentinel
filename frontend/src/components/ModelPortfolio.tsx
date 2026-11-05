@@ -148,7 +148,7 @@ function Holdings({ title, rows, tone }: { title: string; rows: Holding[]; tone:
         {shown.map((r) => (
           <Link
             key={r.ticker}
-            href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
+            href={`?t=${encodeURIComponent(r.ticker)}`}
             title={r.percentile != null ? `ranks above ${formatNumber(r.percentile * 100, { decimals: 0 })}% of stocks` : 'no longer ranked'}
             className={`px-1.5 py-0.5 rounded border font-mono ${tone} hover:underline`}
           >
@@ -261,7 +261,7 @@ export function ModelPortfolio() {
                       {ACTION_TEXT[o.action]}
                     </span>
                     <Link
-                      href={`/ticker?symbol=${encodeURIComponent(o.ticker)}`}
+                      href={`?t=${encodeURIComponent(o.ticker)}`}
                       className="shrink-0 font-mono font-bold text-ink hover:text-accent hover:underline"
                     >
                       {o.ticker}

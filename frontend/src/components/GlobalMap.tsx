@@ -11,6 +11,7 @@ import {
 } from 'react-simple-maps';
 import { PanZoomGroup } from './map/PanZoomGroup';
 import useSWR from 'swr';
+import { vesselTypeLabel } from '../lib/agentNames';
 import { fetcher } from '../lib/api';
 import { NormalizedEvent } from '../lib/types';
 import { useLiveEvents } from '../lib/useLiveEvents';
@@ -660,7 +661,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
         lat,
         lon,
         isTanker,
-        vessel_type: d.vessel_type || (isTanker ? 'Oil / Gas Tanker' : 'Cargo Vessel'),
+        vessel_type: (d.vessel_type && vesselTypeLabel(d.vessel_type)) || (isTanker ? 'Oil / Gas Tanker' : 'Cargo Vessel'),
         anomaly: e.anomaly_score ?? 0.0,
         approximatePosition,
         // 12.4 knots, 'Underway Using Engine' and 'International Shipping Lane'

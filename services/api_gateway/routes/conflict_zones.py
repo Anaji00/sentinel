@@ -34,6 +34,7 @@ from shared.utils.conflict_zones import (
 from shared.utils.maritime_behaviour import could_have_left_coverage, is_tanker
 from shared.utils.quiet_failures import swallowed
 from shared.utils.rbac import Role, require_role
+from shared.utils.sanctions import sanctions_strength
 from shared.utils.vessel_feeds import VIIRS_DETECTIONS_KEY
 from shared.utils.ownership import holders_line, read_holders
 
@@ -405,7 +406,7 @@ async def _build_vessels(db, redis_client) -> Dict[str, Any]:
             "region": pos.get("region"),
             "vessel_type": vtype,
             "tanker": is_tanker(vtype, info.get("name")),
-            "sanctioned": bool(info.get("flags")),
+            "sanctioned": sanctions_strength(info.get("flags")) in ("identified", "listed"),
             "age_seconds": round(now - float(epoch)) if epoch is not None else None,
             "dark": is_dark,
         })

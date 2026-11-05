@@ -13,7 +13,6 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import aiohttp
@@ -50,7 +49,7 @@ async def _send_telegram_alert(session: aiohttp.ClientSession, topic: str, error
         return
 
     msg = (
-        f"🚨 *SENTINEL DLQ ALERT*\n\n"
+        f"*Sentinel: events failed to process*\n\n"
         f"Pipeline failure on topic: `{topic}`\n"
         f"*Error*: `{error[:250]}...`\n\n"
         f"Check the `failed_events` DB table for full payload."

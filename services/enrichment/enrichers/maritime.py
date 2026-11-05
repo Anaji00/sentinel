@@ -15,14 +15,14 @@ import time
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import dropped, swallowed
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
  
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, VesselData
 from shared.utils.source_scorecard import baseline_reliability
 from shared.utils.regions import (
-    classify_region, decode_nav_status, decode_vessel_type, is_restricted_nav_status,
+    classify_region, decode_nav_status, decode_vessel_type, is_restricted_nav_status, vessel_type_label,
 )
-from shared.utils.sanctions import check_sanctions, mmsi_to_country
+from shared.utils.sanctions import check_sanctions, mmsi_to_country, sanctions_strength
 
 # The vessel watchlist the news scorer reads and nothing wrote.
 #
@@ -39,12 +39,12 @@ from shared.utils.maritime_behaviour import (
     sts_is_reportable,
     sts_pair,
 )
-from shared.utils.regions import classify_region, routine_band_score
+from shared.utils.vessel_score import entered_restricted, position_score
 from shared.utils.chokepoints import (
     AIS_CELL_INDEX_SINCE_KEY, AIS_CELL_KEY, AIS_CELL_TTL_SEC, ais_cell, in_ais_check_area,
 )
 from shared.utils.osint_bridges import region_exposure_tags, vessel_exposure_tags
-from services.enrichment.anomaly_scorer import breakdown_from_score, lift_score
+from services.enrichment.anomaly_scorer import breakdown_from_score
  
 logger = logging.getLogger("enrichment.maritime")
  
@@ -95,6 +95,16 @@ AIS_COG_UNAVAILABLE = 360.0
 # helper existed for it at all; the detector happens to be robust to the value,
 # which is why it was never noticed.
 AIS_SOG_UNAVAILABLE = 102.3
+
+
+# What a ship's flags let a headline say. None of them establishes that this hull
+# is sanctioned: the list is matched on names, and the flag state is only a country.
+_FLAG_NOTES = {
+    "identified": " — its MMSI or IMO is on the sanctions list",
+    "listed": " — name matches a sanctions-list entry",
+    "similar": " — name resembles a sanctions-list entry",
+    "flag_state": " — registered in a high-risk flag state",
+}
 
 
 def _ais_sog(value):
@@ -735,29 +745,20 @@ class MaritimeEnricher:
         speeds_list = []
         headings_list = []
         timestamps_list = []
-        extra_features_list = []
         for (raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel in zip(parsed, vessels):
-            from shared.utils.regions import get_region_sensitivity_multiplier
-            reg_mult = get_region_sensitivity_multiplier(region) if region else 1.0
-            # Matched on the AIS code, not on prose in the display label.
-            # The old test asked whether "not under command" appeared in
-            # "notundercommand" and it never did, so status 2 -- a vessel that
-            # cannot manoeuvre -- raised nothing. Three of the four terms were
-            # single words and matched by luck.
-            nav_anomaly = 1.0 if is_restricted_nav_status(nav_code) else 0.0
-            is_sanctioned = 1.0 if vessel.get("flags") else 0.0
-            
             entities.append(mmsi)
             lats_list.append(lat)
             lons_list.append(lon)
             speeds_list.append(speed)
             headings_list.append(heading)
             timestamps_list.append((raw.occurred_at or datetime.now(timezone.utc)).timestamp())
-            extra_features_list.append([float(is_sanctioned), float(reg_mult), float(nav_anomaly)])
-            
+
+        # Motion only. Flag, region and status went in here too, and an input that
+        # is 1 for a few ships marks them as outliers however they move: replayed
+        # through this detector, identical motion scored 0.91 flagged, 0.44 not.
         scores = await self.scorer.score_kinematic_event_batch(
             entities, lats_list, lons_list, speeds_list, headings_list,
-            timestamps_list, extra_features_list,
+            timestamps_list,
             domain="maritime",
         )
         
@@ -782,22 +783,30 @@ class MaritimeEnricher:
         pipe = self.redis.raw.pipeline()
         for idx, ((raw, payload, meta, mmsi, pos, lat, lon, speed, heading, nav_status, nav_code, region), vessel, score_dict) in enumerate(zip(parsed, vessels, scores)):
             raw_anomaly = score_dict.get("score", 0.0)
-            is_watched, f_boost = check_results[idx]
-            w_boost = 0.15 if is_watched else 0.0
+            is_watched, _ = check_results[idx]
 
-            flags = vessel.get("flags", [])
+
             vtype = vessel.get("vessel_type", "Unknown")
             vname = (vessel.get("name") or meta.get("ShipName") or "").upper()
+            # From the list in force. The cached flags can be ten days old, and a ship
+            # reporting no name has only its MMSI. The cache is corrected in passing
+            # for the readers that use it, with no new key and no new lifetime.
+            flags = check_sanctions(vname, mmsi, imo=vessel.get("imo") or "")
+            if flags != (vessel.get("flags") or []):
+                vessel = {**vessel, "flags": flags}
+                pipe.set(f"vessel:info:{mmsi}", json.dumps(vessel, default=str), keepttl=True, xx=True)
             if vtype == "Unknown" or not vtype:
                 if any(k in vname for k in ("TANKER", "OIL", "CRUDE", "PETRO", "LNG", "LPG", "CHEM")):
                     vtype = "Tanker"
 
-            is_sanctioned = bool(flags)
-            # By code, not by prose in the label -- see the note at the
-            # nav_anomaly assignment above.
-            is_emergency_nav = is_restricted_nav_status(nav_code)
+            strength = sanctions_strength(flags)
+            is_identified = strength == "identified"
+            is_listed = is_identified or strength == "listed"
+            # By code, not by prose in the label: the old test asked whether "not
+            # under command" appeared in "notundercommand", and it never did.
+            is_restricted = is_restricted_nav_status(nav_code)
 
-            # A flagged vessel joins the vessel watchlist.
+            # A vessel whose name is on the list joins the vessel watchlist.
             #
             # `anomaly_scorer` reads `sentinel:watched:vessels` at two sites --
             # it is how a vessel named in a headline earns the same boost a
@@ -810,42 +819,20 @@ class MaritimeEnricher:
             # from a list somebody has to maintain: a sanctioned or flagged hull
             # is exactly the vessel whose mention in the news should carry
             # weight. The same key and the same zset `check_watchlist` reads.
-            if is_sanctioned and getattr(self, "redis", None) is not None:
+            if is_listed and getattr(self, "redis", None) is not None:
                 safe_create_task(
                     self._watch_vessel(mmsi, vname),
                     name="watch-flagged-vessel",
                 )
 
-            # ROUTINE TELEMETRY GUARD:
-            # Routine pings are held below the alerting band -- but *ordered*
-            # within it, which `min(ROUTINE_CEILING, score * 0.3)` was not.
-            #
-            # That expression clamps to exactly the ceiling for any score at or
-            # above 0.5, so 291 of 1,204 consecutive enriched events -- 205
-            # aircraft over the Mediterranean and 86 vessels in the South China
-            # Sea, Taiwan Strait, Black Sea and Turkish Straits -- carried the
-            # identical 0.15. Within the watched geographies the system could
-            # not rank one contact above another, and the region's own
-            # sensitivity, which the platform measures, reached the number not
-            # at all.
-            #
-            # Compressed into the band instead of clamped to its top, and scaled
-            # by the region multiplier so a contact in a chokepoint outranks one
-            # in open water without either leaving the routine band.
-            if not is_sanctioned and not is_emergency_nav and not is_watched:
-                anomaly = routine_band_score(raw_anomaly, region)
-            else:
-                # Headroom lift, not addition -- the same composition every
-                # other enricher uses. `min(1.0, a + b)` has no notion of how
-                # much room is left, so any boosted event above ~0.85 lands on
-                # the ceiling and stops being distinguishable from one at 0.99.
-                #
-                # Only the *composition* is shared. The base score, the
-                # features behind it and the weights below stay this domain's
-                # own: what counts as anomalous differs by domain, how boosts
-                # combine does not.
-                anomaly = lift_score(raw_anomaly, w_boost)
-                anomaly = lift_score(anomaly, f_boost, w_boost)
+            # Routine pings are held below the alerting band but ordered within it,
+            # and status raises a report only as far as position_score allows.
+            previous = previous_positions.get(mmsi) or {}
+            anomaly = position_score(
+                raw_anomaly, region, listed=is_listed, identified=is_identified, watched=bool(is_watched),
+                restricted=is_restricted,
+                entered=entered_restricted(previous, nav_code),
+            )
 
             observed_at = (raw.occurred_at or datetime.now(timezone.utc))
 
@@ -857,7 +844,6 @@ class MaritimeEnricher:
             # fact besides: a transfer is not "these two are close", it is
             # "these two have been stopped together for hours", and that cannot
             # be recovered from a single report.
-            previous = previous_positions.get(mmsi) or {}
             was_stopped = float(previous.get("speed") or 99.0) <= STS_MAX_SPEED_KNOTS
             now_stopped = (speed is not None) and float(speed) <= STS_MAX_SPEED_KNOTS
             stationary_since = (
@@ -872,6 +858,7 @@ class MaritimeEnricher:
                     "region": region, "speed": speed, "ts": observed_at.isoformat(),
                     "epoch": observed_at.timestamp(),
                     "stationary_since": stationary_since,
+                    "nav_code": nav_code,
                 }),
                 ex = 172800
             )
@@ -1010,18 +997,15 @@ class MaritimeEnricher:
         # not complain, and the value is a plausible integer, so the emergency
         # flag was simply wrong rather than absent.
         for (raw, meta, mmsi, lat, lon, speed, heading, nav_status, nav_code, region, vessel, flags, vtype, anomaly, breakdown) in results:
-            is_sanctioned = bool(flags)
-            # By code, not by prose in the label -- see the note at the
-            # nav_anomaly assignment above.
-            is_emergency_nav = is_restricted_nav_status(nav_code)
+            flag_note = _FLAG_NOTES.get(sanctions_strength(flags), "")
+            is_restricted = is_restricted_nav_status(nav_code)
             is_watched = bool(anomaly > 0.15)
             
             headline_str = (
-                f"{vtype or 'Vessel'} '{vessel.get('name') or meta.get('ShipName') or f'MMSI:{mmsi}'}' "
+                f"{vessel_type_label(vtype)} '{vessel.get('name') or meta.get('ShipName') or f'MMSI:{mmsi}'}' "
                 f"{nav_status.lower() if nav_status else 'transiting'} in {region or 'unknown waters'}"
-                + (" — sanctioned/flagged vessel" if is_sanctioned else "")
-                + (" — emergency navigation status" if is_emergency_nav else "")
-            ) if (is_sanctioned or is_emergency_nav or is_watched) else None
+                + flag_note
+            ) if (flag_note or is_restricted or is_watched) else None
 
             final_events.append(NormalizedEvent(
                 event_id = raw.event_id, trace_id = raw.trace_id,
@@ -1100,11 +1084,10 @@ class MaritimeEnricher:
         length_m = _ais_length(s)
         eta = _ais_eta(s)
         
-        flags = check_sanctions(name, mmsi)
-        if imo:
-            # A hull that has changed MMSI keeps its IMO, which is the whole
-            # reason the field is worth carrying on this platform.
-            flags = list(dict.fromkeys(list(flags or []) + list(check_sanctions(name, imo) or [])))
+        # A hull that has changed MMSI keeps its IMO, which is the whole reason the
+        # field is worth carrying. It used to go in the MMSI slot, where its first
+        # three digits were read as a country.
+        flags = check_sanctions(name, mmsi, imo=imo or "")
 
         # The IMO travels with the cached identity, so a later position report
         # -- which carries no static block at all -- can be joined to the hull
@@ -1163,8 +1146,13 @@ class MaritimeEnricher:
             tags.append(region.lower().replace(" ", "_"))
         if vtype and vtype != "Unknown":
             tags.append(vtype.lower())
-        if any("sanctioned" in f for f in flags):
+        strength = sanctions_strength(flags)
+        if strength in ("identified", "listed"):
             tags.append("sanctions_risk")
+        elif strength == "similar":
+            tags.append("sanctions_name_similar")
+        elif strength == "flag_state":
+            tags.append("high_risk_flag_state")
         # What this vessel bears on, in instruments: the bridge from a ship to
         # a stock. See shared/utils/osint_bridges.py.
         tags += vessel_exposure_tags(region, vtype)

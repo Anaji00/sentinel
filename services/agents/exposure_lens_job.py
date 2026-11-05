@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
-from services.agents.auto_trader import BOOK_KEY
+from services.agents.auto_trader import BOOK_KEY, leg_fraction
 from shared.utils import exposure_lens as el
 from shared.utils.quiet_failures import swallowed
 
@@ -76,7 +76,8 @@ class ExposureLensJob:
         longs, shorts = list(book.get("long") or []), list(book.get("short") or [])
         if not longs or not shorts:
             return {"rows": []}
-        weights = el.book_weights(longs, shorts)
+        leg = leg_fraction()
+        weights = el.book_weights(longs, shorts, leg)
         names = sorted(weights)
         betas = [dict(r) for r in await self.db.query(_BETAS_SQL, names) or []]
         net = el.net_exposures(weights, betas)
@@ -93,7 +94,7 @@ class ExposureLensJob:
             logger.warning("B1 exposure over its limit: %s", next(r for r in rows if r["instrument"] == f))
         self._flagged = set(flagged)
         rep = {"generated_at": datetime.now(timezone.utc).isoformat(), "rebalanced_on": book.get("rebalanced_on"),
-               "names": len(names), "market_beta": beta, "flagged": flagged, "limit": el.LIMIT, "rows": rows}
+               "names": len(names), "leg_fraction": leg, "market_beta": beta, "flagged": flagged, "limit": el.LIMIT, "rows": rows}
         await self.raw.set(REPORT_KEY, json.dumps(rep, default=str))
         return rep
 

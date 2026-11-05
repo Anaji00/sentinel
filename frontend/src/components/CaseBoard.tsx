@@ -21,6 +21,7 @@
  */
 
 import React from 'react';
+import { Button } from './ui/Button';
 import useSWR, { mutate as globalMutate } from 'swr';
 import { apiClient, describeApiError, fetcher } from '../lib/api';
 import { Card } from './ui/Card';
@@ -166,13 +167,12 @@ function NewCaseDialog({ open, onClose }: { open: boolean; onClose: () => void }
       >
         <div className="flex items-center justify-between border-b border-line pb-3">
           <h2 className="text-head font-semibold">Open a case</h2>
-          <button
+          <Button variant="ghost" size="icon"
             onClick={onClose}
-            aria-label="Close"
-            className="cursor-pointer rounded p-1 text-ink-dim hover:text-ink"
+            aria-label="Close" className="cursor-pointer"
           >
             <IconClose />
-          </button>
+          </Button>
         </div>
 
         <label className="block space-y-1">

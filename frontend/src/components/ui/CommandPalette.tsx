@@ -34,10 +34,9 @@ interface Command {
 
 const PAGES: Command[] = [
   { id: 'p:/', label: 'Home', kind: 'page', href: '/' },
-  { id: 'p:/calls', label: 'Calls', hint: 'Stock calls, the signal board and the evidence', kind: 'page', href: '/calls' },
+  { id: 'p:/calls', label: 'Calls', hint: 'Stock calls, the signal board, and look up any stock', kind: 'page', href: '/calls' },
   { id: 'p:/calls?view=signals', label: 'Calls: Proven Signals', kind: 'page', href: '/calls?view=signals' },
   { id: 'p:/calls?view=record', label: 'Calls: How the Calls Did', kind: 'page', href: '/calls?view=record' },
-  { id: 'p:/ticker', label: 'Look Up a Stock', kind: 'page', href: '/ticker' },
   { id: 'p:/markets', label: 'Markets', hint: 'Prices, with a live tape', kind: 'page', href: '/markets' },
   { id: 'p:/markets?view=economy', label: 'Markets: The Economy', kind: 'page', href: '/markets?view=economy' },
   { id: 'p:/markets?view=crypto', label: 'Markets: Crypto', kind: 'page', href: '/markets?view=crypto' },
@@ -114,7 +113,7 @@ export function CommandPalette() {
                 ? String(ev.primary_entity_name)
                 : 'recent activity',
             kind: 'ticker',
-            href: `/ticker?symbol=${encodeURIComponent(ticker)}`,
+            href: `/calls?t=${encodeURIComponent(ticker)}`,
           });
         }
       } catch {

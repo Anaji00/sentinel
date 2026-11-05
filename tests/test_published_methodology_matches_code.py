@@ -91,3 +91,67 @@ def test_the_false_calibration_claim_stays_corrected():
     rolling backtests', against a backtester run on 300 five-minute bars."""
     body = re.sub(r"#[^\n]*", "", SRC)          # strip the comments recording it
     assert "5-year rolling backtests" not in body
+
+
+# -- the page a reader actually sees ------------------------------------------
+#
+# Every correction above landed on the endpoint while /methodology rendered its
+# own hardcoded copy, so readers went on seeing the 5-year backtest, the EM fit
+# and the 15% cap. These tests were green throughout.
+
+PAGE = (ROOT / "frontend" / "src" / "app" / "(dashboard)" / "methodology" / "page.tsx").read_text(encoding="utf-8")
+
+
+def test_the_page_renders_the_catalog_rather_than_its_own_copy():
+    assert "'/methodology'" in PAGE and "`/methodology/${selectedId}`" in PAGE
+    assert not re.search(r"(calibration_method|validation_gate|formula_\w+)\s*:\s*\n?\s*['\"`]", PAGE), (
+        "page.tsx holds methodology content again; it belongs in routes/methodology.py"
+    )
+
+
+def _entry(key):
+    from services.api_gateway.routes.methodology import METHODOLOGY_CATALOG
+
+    return METHODOLOGY_CATALOG[key]
+
+
+def test_every_entry_can_be_read_without_latex():
+    from services.api_gateway.routes.methodology import METHODOLOGY_CATALOG
+
+    for key, m in METHODOLOGY_CATALOG.items():
+        assert m.plain.strip(), key
+        assert m.formula_plain.strip() and "\\" not in m.formula_plain, key
+
+
+def test_the_published_delta_is_the_one_the_engine_passes():
+    """It published a window of [0.20, 0.35]; the engine asks for one delta."""
+    engine = (ROOT / "services" / "agents" / "quant_trading_engine.py").read_text(encoding="utf-8")
+    call = engine[engine.index("generate_covered_call_recommendation("):]
+    passed = re.search(r"target_delta=([\d.]+)", call[:500])
+    assert passed, "the engine no longer passes target_delta to this call"
+    delta = next(p for p in _entry("covered_call_optimization").parameters if p.name == "Target Delta")
+    assert float(delta.default_value) == float(passed.group(1))
+
+
+def test_the_covered_call_claims_describe_what_runs():
+    """A Brent solver, live SOFR and a 6% yield gate, none of which this path has."""
+    from shared.utils import quant_calc
+
+    entry = _entry("covered_call_optimization")
+    text = " ".join([*entry.assumptions, entry.validation_gate, *[p.default_value for p in entry.parameters]])
+    assert "Brent" not in text
+    assert "6%" not in text and "15%" not in text
+    assert "Live NY Fed SOFR" not in text
+    assert f"{quant_calc.DEFAULT_RISK_FREE_RATE:.1%}" in text or quant_calc.DEFAULT_RISK_FREE_RATE != 0.045
+    engine = (ROOT / "services" / "agents" / "quant_trading_engine.py").read_text(encoding="utf-8")
+    call = engine[engine.index("generate_covered_call_recommendation("):]
+    assert re.search(r"\br=", call[: call.index(")")]) is None, (
+        "the engine now passes a rate to this call, so the catalog's fixed-rate claim is out of date"
+    )
+
+
+def test_the_hawkes_decay_is_published_as_fitted():
+    """It published a fixed 3600-second half-life; HawkesMLE fits beta."""
+    params = {p.name: p for p in _entry("hawkes_point_process").parameters}
+    assert params["Decay Rate"].is_learned
+    assert "3600" not in params["Decay Rate"].default_value

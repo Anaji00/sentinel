@@ -3,6 +3,8 @@
 import Link from 'next/link';
 import React, { useState } from 'react';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import type { NormalizedEvent } from '../lib/types';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
@@ -10,12 +12,13 @@ import { formatNumber } from '../lib/format';
 import { IconFlow } from './ui/icons';
 import { ClockTime } from './ui/ClockTime';
 import { POLL } from './ui/DataProvider';
+import { TRADE_SIDE_LABEL, tradeSide, tradeSideMethod, type TradeSide } from '../lib/tradeSide';
 
 interface FlowItem {
   id: string;
   ticker: string;
   type: string; // "SWEEP", "BLOCK", "DARK_POOL"
-  side: string; // "BUY", "SELL", "NEUTRAL"
+  side: TradeSide;
   notional_usd: number;
   price: number;
   size_shares: number;
@@ -44,7 +47,7 @@ interface RawFlowFinancials {
 export default function DarkPoolFlowPanel() {
   const [filterType, setFilterType] = useState<string>('ALL');
 
-  const { data } = useSWR<NormalizedEvent[]>('/api/v1/events/tradfi?limit=40&types=equity_block,options_flow', fetcher, {
+  const { data, error: flowError, mutate: retryFlow } = useSWR<NormalizedEvent[]>('/api/v1/events/tradfi?limit=40&types=equity_block,options_flow', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -81,8 +84,7 @@ export default function DarkPoolFlowPanel() {
       id: e.event_id,
       ticker: fd.ticker || e.primary_entity_name || e.primary_entity_id || '—',
       type: e.type === 'options_flow' ? 'SWEEP' : 'BLOCK',
-      // No feed here reports the aggressor, so an unknown side says so.
-      side: String(fd.side || fd.direction || '—').toUpperCase(),
+      side: tradeSide(e.tags),
       notional_usd: notional,
       price,
       size_shares: volume,
@@ -113,14 +115,11 @@ export default function DarkPoolFlowPanel() {
           </div>
           <div>
             <h2 className="text-sm font-semibold text-ink flex items-center gap-2">
-              Big trades as they print
-              <span className="px-2 py-0.5 rounded text-micro bg-positive/10 text-positive border border-positive/30">
-                Live
-              </span>
+              Big trades
             </h2>
             <p className="text-micro text-ink-dim">
-              Stock trades of $200K or more, well above the stock&apos;s usual size, and big options bets placed across
-              several exchanges at once
+              Stock trades of $200K or more, well above the stock&apos;s usual size, and large option prints. Options
+              run about 15 minutes late, and not every print is caught.
             </p>
           </div>
         </div>
@@ -155,6 +154,7 @@ export default function DarkPoolFlowPanel() {
 
       {/* Table List */}
       <div className="flex-1 overflow-y-auto p-4">
+        {failedWithout(flowError, data) && <PanelError what="large trades" onRetry={() => void retryFlow()} />}
         <table className="w-full text-left text-xs border-collapse">
           <thead>
             <tr className="text-micro text-ink-mute border-b border-line">
@@ -171,7 +171,7 @@ export default function DarkPoolFlowPanel() {
             {filteredFlows.map((item) => (
               <tr key={item.id} className="hover:bg-raised/60 transition-colors">
                 <td className="py-2.5">
-                  <Link href={`/ticker?symbol=${encodeURIComponent(item.ticker)}`} className="font-mono font-semibold text-ink hover:text-accent">
+                  <Link href={`?t=${encodeURIComponent(item.ticker)}`} className="font-mono font-semibold text-ink hover:text-accent">
                     {item.ticker}
                   </Link>
                 </td>
@@ -186,6 +186,7 @@ export default function DarkPoolFlowPanel() {
                 </td>
                 <td>
                   <span
+                    title={tradeSideMethod(item.type === 'SWEEP')}
                     className={`px-2 py-0.5 rounded-full text-micro font-semibold ${
                       item.side === 'BUY'
                         ? 'bg-positive/10 text-positive border border-positive/30'
@@ -194,7 +195,7 @@ export default function DarkPoolFlowPanel() {
                           : 'border border-line text-ink-mute'
                     }`}
                   >
-                    {item.side}
+                    {TRADE_SIDE_LABEL[item.side]}
                   </span>
                 </td>
                 <td className="font-mono font-semibold text-ink">

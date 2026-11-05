@@ -18,6 +18,8 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Input } from './ui/Input';
+import { Button } from './ui/Button';
 import useSWR from 'swr';
 import { useSearchParams } from 'next/navigation';
 import { usePreferences } from '../lib/preferences';
@@ -321,23 +323,21 @@ function AgencyStory({
 
       <Step n={3} title="Is it by the rules?">
         {card.portal_slug ? (
-          <button
+          <Button variant="link"
             type="button"
-            onClick={() => onOpenPortal(card.portal_slug!, 'Flock page')}
-            className="text-xs text-accent hover:underline text-left"
+            onClick={() => onOpenPortal(card.portal_slug!, 'Flock page')} className="text-xs text-left"
           >
             They publish a Flock page. See what it says, checked against {card.state}{' '}law &rarr;
-          </button>
+          </Button>
         ) : (
           <p className="text-xs text-ink-mute">They don&apos;t publish a Flock transparency page we can check.</p>
         )}
-        <button
+        <Button variant="link"
           type="button"
-          onClick={() => onExplore('accountability', 'findings', card.state)}
-          className="block text-xs text-accent hover:underline"
+          onClick={() => onExplore('accountability', 'findings', card.state)} className="block text-xs"
         >
           Everything flagged in {card.state}{' '}&rarr;
-        </button>
+        </Button>
       </Step>
 
       <Step n={4} title="Who gets a say">
@@ -348,17 +348,17 @@ function AgencyStory({
         <ul className="text-xs text-ink-dim list-disc pl-4 space-y-1">
           {card.portal_slug && (
             <li>
-              <button type="button" onClick={() => onOpenPortal(card.portal_slug!, 'Records request')} className="text-accent hover:underline">
+              <Button variant="link" type="button" onClick={() => onOpenPortal(card.portal_slug!, 'Records request')}>
                 Draft a public-records request
-              </button>{' '}
+              </Button>{' '}
               (you send it yourself).
             </li>
           )}
           <li>Speak at a council meeting when surveillance contracts come up for renewal.</li>
           <li>
-            <button type="button" onClick={() => onExplore('protect', 'plan', card.state)} className="text-accent hover:underline">
+            <Button variant="link" type="button" onClick={() => onExplore('protect', 'plan', card.state)}>
               Make your own privacy plan
-            </button>
+            </Button>
             .
           </li>
         </ul>
@@ -485,7 +485,10 @@ function PlaceFinder({
   }, [q, agencies]);
   return (
     <div className="relative w-full max-w-md">
-      <input
+      <Input
+        label="Search a place or agency"
+        hideLabel
+        containerClassName="w-full"
         type="search"
         value={q}
         onChange={(e) => {
@@ -495,8 +498,6 @@ function PlaceFinder({
         onFocus={() => setOpen(true)}
         onBlur={() => window.setTimeout(() => setOpen(false), 150)}
         placeholder="Search a town, county or police department…"
-        aria-label="Search a place or agency"
-        className="w-full rounded-lg border border-line-strong bg-inset px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:border-accent outline-none"
       />
       {open && matches.length > 0 && (
         <ul className="absolute z-[1000] mt-1 w-full rounded-lg border border-line-strong bg-overlay shadow-overlay overflow-hidden">

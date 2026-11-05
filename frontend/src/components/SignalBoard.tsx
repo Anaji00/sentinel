@@ -12,6 +12,7 @@
  */
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import Link from 'next/link';
 import { StockLink } from './StockDrawer';
 import useSWR from 'swr';
@@ -465,12 +466,13 @@ export function SignalBoard() {
                 <input type="checkbox" checked={onlyCounted} onChange={(e) => setOnlyCounted(e.target.checked)} />
                 Only well-tested evidence
               </label>
-              <input
+              <Input
+                label="Filter tickers"
+                hideLabel
+                containerClassName="w-52"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 placeholder="Ticker, name or industry"
-                aria-label="Filter tickers"
-                className="bg-page border border-line rounded-md px-2.5 py-1.5 text-ink w-52"
               />
             </div>
           </div>
@@ -523,7 +525,7 @@ export function SignalBoard() {
                     >
                       <td className="py-2">
                         <Link
-                          href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
+                          href={`?t=${encodeURIComponent(r.ticker)}`}
                           onClick={(e) => e.stopPropagation()}
                           className="font-mono font-semibold text-ink hover:text-accent hover:underline"
                         >

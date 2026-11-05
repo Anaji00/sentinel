@@ -618,7 +618,7 @@ class CryptoEnricher:
         direction = "positive" if funding_rate > 0 else "negative"
         annualized_carry = abs(funding_rate) * 3 * 365 * 100  # 8h periods * 365 days * 100%
         headline = (
-            f"⚡ FUNDING RATE EXTREME ({direction}) | {asset} | "
+            f"Funding rate extreme ({direction}) | {asset} | "
             f"Rate: {funding_rate:.6f} ({annualized_carry:.1f}% annualized) | "
             f"Basis: {basis_bps:.2f}bps"
         )
@@ -813,7 +813,7 @@ class CryptoEnricher:
         anomaly = min(FALLBACK_MAX_SCORE, math.tanh(abs(oi_z) / OI_ANOMALY_SCALE))
         direction = "surging" if oi_z > 0 else "collapsing"
         headline = (
-            f"📊 OPEN INTEREST {direction.upper()} | {asset} | "
+            f"Open interest {direction} | {asset} | "
             f"OI: {oi_value:,.0f} | Z-Score: {oi_z:.2f}"
         )
 

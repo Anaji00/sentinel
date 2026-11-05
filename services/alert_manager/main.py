@@ -32,6 +32,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 
 from services.alert_manager.formatters.telegram import format_correlation, format_scenario, format_intel_brief
 from services.alert_manager.formatters.webhook import format_generic
+from services.alert_manager import notifications_job
 from shared.utils.tasks import safe_create_task
 from shared.utils.logging import setup_sentinel_logging
 
@@ -357,6 +358,8 @@ async def main():
 
         # §1.1 Universal heartbeat — silent alert pipeline death is catastrophic
         hb_task = safe_create_task(start_heartbeat_task(redis_client, "alert_manager"))
+        # Each person's inbox for the stocks they follow (no model is called).
+        notify_task = safe_create_task(notifications_job.run_forever(redis_client, db_client), name="notifications")
         try:
             while True:
                 batches = await consumer.get_batch(timeout_ms=1000)
@@ -391,6 +394,7 @@ async def main():
             pass
         finally:
             hb_task.cancel()
+            notify_task.cancel()
             await consumer.close()
 
 if __name__ == "__main__":

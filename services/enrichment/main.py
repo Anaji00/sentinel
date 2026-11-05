@@ -4,7 +4,6 @@ from shared.utils.conflict_zones import region_zone_tags
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 import json
@@ -25,7 +24,8 @@ logger = setup_sentinel_logging("enrichment", level=getattr(logging, os.getenv("
 from shared.utils.quiet_failures import swallowed, heartbeat_line as quiet_heartbeat_line
 from shared.kafka import SentinelProducer, SentinelConsumer, Topics
 from shared.models import RawEvent, NormalizedEvent, CrossDomainSignal
-from shared.models.events import event_domain as canonical_domain
+from shared.utils.display_text import plain_headline
+from shared.utils.regions import vessel_type_label
 from shared.models.events import resolve_event_domain
 from shared.utils.metrics import MetricsCollector
 from shared.db import get_redis, get_timescale, get_neo4j
@@ -180,30 +180,31 @@ def _ms_to_kts(ms: Optional[float]) -> float:
 def apply_display_text(e) -> None:
     """Fills in a human-readable headline and summary when either is missing."""
     ent_name = e.primary_entity.name if (e.primary_entity and e.primary_entity.name) else (e.primary_entity.id if e.primary_entity else str(e.type))
+    e.headline = plain_headline(e.headline)
 
     # 1. Headline clarity enforcement
     if not e.headline or len(e.headline) < 5 or e.headline.startswith("UNKNOWN"):
         if e.financial_data and e.financial_data.ticker:
             fd = e.financial_data
             p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
-            e.headline = f"📈 TRADFI MARKET EVENT: {fd.ticker}{p_str} (Anomaly: {e.anomaly_score:.2f})"
+            e.headline = f"{fd.ticker}{p_str}: market event"
         elif e.crypto_data and e.crypto_data.pair:
             cd = e.crypto_data
-            e.headline = f"₿ CRYPTO MARKET EVENT: {cd.pair} @ ${cd.price:.2f} (Anomaly: {e.anomaly_score:.2f})"
+            e.headline = f"{cd.pair} @ ${cd.price:.2f}: crypto market event"
         elif e.prediction_market_data:
             pm = e.prediction_market_data
-            e.headline = f"🎯 PREDICTION MARKET EVENT: {pm.question or pm.ticker} ({pm.outcome})"
+            e.headline = f"Prediction market: {pm.question or pm.ticker} ({pm.outcome})"
         elif e.vessel_data:
             vd = e.vessel_data
-            e.headline = f"🚢 MARITIME AIS FIX: {ent_name} (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}"
+            e.headline = f"Ship position: {ent_name} (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}"
         elif e.flight_data:
             fl = e.flight_data
-            e.headline = f"✈️ AVIATION ADSB FIX: Flight {fl.callsign or ent_name} (ICAO: {fl.icao24}) @ {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f}ft"
+            e.headline = f"Flight position: {fl.callsign or ent_name} (ICAO: {fl.icao24}) @ {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f}ft"
         elif e.security_data:
             sec = e.security_data
-            e.headline = f"🔐 CYBER THREAT DETECTED: {sec.cve_id or ent_name} ({_cvss_severity(sec.cvss_score)})"
+            e.headline = f"Security alert: {sec.cve_id or ent_name} ({_cvss_severity(sec.cvss_score)})"
         else:
-            e.headline = f"🎯 SENTINEL INTELLIGENCE EVENT: {ent_name} [{e.source}]"
+            e.headline = f"{ent_name} ({e.source})"
 
     # 2. Executive summary clarity enforcement
     if not e.summary or len(e.summary) < 15:
@@ -211,26 +212,26 @@ def apply_display_text(e) -> None:
             fd = e.financial_data
             p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
             vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {fd.volume:,.0f} shares/contracts." if fd.premium_usd else ""
-            e.summary = f"Institutional Market Intelligence for {fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
+            e.summary = f"{fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}."
         elif e.crypto_data and e.crypto_data.pair:
             cd = e.crypto_data
             fr_str = f" Perpetual funding rate: {cd.funding_rate*100:.4f}%." if cd.funding_rate is not None else ""
-            e.summary = f"Cryptocurrency Intelligence for {cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}. Provenance tags: {', '.join(e.tags or [])}."
+            e.summary = f"{cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}."
         elif e.prediction_market_data:
             pm = e.prediction_market_data
             pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)
-            e.summary = f"Prediction Market Intelligence for contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Prediction market contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
         elif e.vessel_data:
             vd = e.vessel_data
-            e.summary = f"AIS Maritime position fix for {vd.vessel_type or 'Vessel'} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Ship position for {vessel_type_label(vd.vessel_type)} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."
         elif e.flight_data:
             fl = e.flight_data
-            e.summary = f"ADS-B Aviation position fix for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f} ft, Ground speed: {_ms_to_kts(fl.velocity_ms):,.0f} knots. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Flight position for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f} ft, Ground speed: {_ms_to_kts(fl.velocity_ms):,.0f} knots. Anomaly score: {e.anomaly_score:.2f}."
         elif e.security_data:
             sec = e.security_data
-            e.summary = f"Cyber Threat Intelligence disclosure for {sec.cve_id or ent_name}. Severity: {_cvss_severity(sec.cvss_score)}, Vector: {sec.exposure_type or 'Network'}. Target org: {sec.affected_org or 'Unknown'}. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Security disclosure for {sec.cve_id or ent_name}. Severity: {_cvss_severity(sec.cvss_score)}, Vector: {sec.exposure_type or 'Network'}. Target org: {sec.affected_org or 'Unknown'}. Anomaly score: {e.anomaly_score:.2f}."
         else:
-            e.summary = f"Sentinel Multi-Domain Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}. Provenance tags: {', '.join(e.tags or [])}."
+            e.summary = f"Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}."
 
 
 # How often the detectors' recent points are saved. A restart loses at most
@@ -675,32 +676,17 @@ async def _ofac_sync_loop():
     
     Downloads real Treasury SDN & ALT CSV lists from treasury.gov and updates Aho-Corasick automaton.
     """
-    from shared.utils.sanctions import rebuild_sanctions_from_list, SANCTIONED_KEYWORDS
-    from services.enrichment.ofac_sync import fetch_ofac_keywords
-    import json
+    from services.enrichment.ofac_sync import sync_once
 
     while True:
+        logger.info("Starting OFAC sanctions sync from US Treasury SDN list...")
         try:
-            logger.info("Starting OFAC sanctions sync from US Treasury SDN list...")
-            fetched_keywords = await fetch_ofac_keywords()
-            if fetched_keywords:
-                all_keywords = list(set(SANCTIONED_KEYWORDS + fetched_keywords))
-                rebuild_sanctions_from_list(all_keywords)
-                logger.info(f"OFAC sanctions sync complete. Total entities in automaton: {len(all_keywords)}")
-                
-                try:
-                    redis = await get_redis()
-                    await redis.raw.set("sentinel:config:sanctions", json.dumps({"keywords": all_keywords}))
-                    await redis.raw.publish("sentinel:config:updates", "ofac_rebuild")
-                except Exception as re:
-                    logger.debug(f"Redis OFAC broadcast skipped: {re}")
-            else:
-                logger.warning("OFAC download returned 0 keywords. Retaining baseline SANCTIONED_KEYWORDS.")
-                rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
+            current = await sync_once()
         except Exception as e:
-            logger.error(f"OFAC sync failed: {e}. Retaining baseline SANCTIONED_KEYWORDS.")
-            rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
-        await asyncio.sleep(86_400)  # 24 hours
+            swallowed("enrichment.ofac_sync_loop", e, logger)
+            current = False
+        # A failure tries again within the hour rather than leaving the list a day older.
+        await asyncio.sleep(86_400 if current else 3_600)
 
 # Tags that exempt an event from the fan-out floor, whatever it scored.
 #

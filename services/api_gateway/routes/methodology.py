@@ -10,7 +10,7 @@ data dependencies, and Z-score calibration gates for all Sentinel signals.
 from shared.utils.rbac import require_role, Role
 from typing import Dict, List, Optional, Any
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/v1/methodology", tags=["Mathematical Methodology & Whitepaper"])
 
@@ -35,10 +35,14 @@ class MethodologyParameter(BaseModel):
 class SignalMethodology(BaseModel):
     id: str
     name: str
+    # What it does, for someone who has never met the maths.
+    plain: str
     category: str
     epistemic_tier: str
     description: str
     formula_latex: str
+    # The same formula as readable text: the page has no LaTeX renderer.
+    formula_plain: str
     assumptions: List[str]
     parameters: List[MethodologyParameter]
     data_inputs: List[str]
@@ -59,54 +63,81 @@ class SignalMethodology(BaseModel):
 METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
     "covered_call_optimization": SignalMethodology(
         id="covered_call_optimization",
-        name="Covered Call Overlay Optimization",
+        name="Covered Call Overlay",
+        plain=(
+            "If you own a stock, you can sell someone the right to buy it from you at a higher price and keep "
+            "the fee. After an unusually strong rally, this works out which price to offer on a 30-day contract, "
+            "so that there is roughly a 30% chance of having to sell."
+        ),
         category="Derivatives & Options",
         epistemic_tier="Deterministic Closed-Form",
-        description="Selects optimal out-of-the-money (OTM) strike prices that maximize annualized option yield while bounding upside assignment probability.",
+        description=(
+            "Finds the strike whose Black-Scholes delta is 0.30 on a 30-day call, offered only when the stock's "
+            "z-score is at least +2.5. It solves for one fixed delta; it does not search for the highest yield."
+        ),
         formula_latex=r"C(S, K, T) = S \cdot N(d_1) - K \cdot e^{-r T} \cdot N(d_2), \quad d_1 = \frac{\ln(S/K) + (r + \sigma^2/2)T}{\sigma \sqrt{T}}, \quad d_2 = d_1 - \sigma \sqrt{T}",
+        formula_plain="C(S, K, T) = S · N(d1) - K · e^(-rT) · N(d2),  where d1 = [ln(S/K) + (r + σ²/2)T] / (σ√T),  d2 = d1 - σ√T",
         assumptions=[
             "Geometric Brownian Motion for underlying asset price",
             "Frictionless market with continuous hedging",
-            "Implied volatility solved via Brent-Dekker root finding on market bid/ask midpoints",
+            # Was "solved via Brent-Dekker root finding on market bid/ask
+            # midpoints". Nothing on this path solves for volatility: it is
+            # handed one, and iv_source on the result says which of these it was.
+            "Volatility is the implied volatility from a recent large option print when there is one, then the stock's "
+            "recent realised volatility, then a flat 30%; each recommendation records which it used",
         ],
         parameters=[
             MethodologyParameter(
-                name="Delta Target Window",
+                name="Target Delta",
                 symbol=r"\Delta",
-                description="Target delta range for short call strike selection",
-                default_value="[0.20, 0.35]",
+                description="Delta the short call's strike is solved for",
+                default_value="0.30",
                 # Was "Empirically calibrated to maximize risk-adjusted Sharpe
                 # over 5-year rolling backtests". The backtester is invoked with
                 # timeframe="5m" and limit=BACKTEST_REFRESH_BARS=300 -- 1,500
                 # minutes, under four trading days -- and "5-year" appeared
                 # nowhere else in the codebase. It described a process that did
                 # not exist, on an endpoint that required no authentication.
-                calibration_method=(
-                    "Hand-set defaults, validated against a rolling short-horizon "
-                    "backtest over the available bar history; not yet calibrated "
-                    "over a multi-year sample"
-                ),
+                # The window [0.20, 0.35] and the "validated against a backtest"
+                # that replaced it had nothing behind them either: the engine
+                # passes target_delta=0.30 and no backtest result reaches it.
+                calibration_method="Hand-set and fixed; not fitted to any sample",
             ),
             MethodologyParameter(
                 name="Risk-Free Rate",
                 symbol=r"r",
-                description="Annualized SOFR benchmark risk-free rate",
-                default_value="Live NY Fed SOFR",
-                calibration_method="Queried dynamically from nyfed_sofr feed in Redis",
+                description="Annualized risk-free rate used to price the call",
+                # Not live SOFR. The engine reads SOFR for its Sharpe ratios, but
+                # never passes it to generate_covered_call_recommendation, whose
+                # `r` therefore stays at DEFAULT_RISK_FREE_RATE.
+                default_value="4.5% (RISK_FREE_RATE setting)",
+                calibration_method="Fixed setting; the live NY Fed SOFR reading is not used in this calculation",
             ),
         ],
-        data_inputs=["tradfi:equity_quote", "alpaca_options:chain", "nyfed_sofr:rate"],
-        validation_gate="Backtested over historical CAGG bars; signal rejected if annualized yield < 6% or drawdown > 15%",
-        validation_gate_impl="services.reasoning.strategy_backtester:StrategyBacktester.backtest_strategy",
+        data_inputs=["tradfi:equity_quote", "option_flow:large_print_iv", "quant_engine:ewma_volatility"],
+        # Was "rejected if annualized yield < 6% or drawdown > 15%". The
+        # backtester has neither limit, and its verdict does not reach this
+        # recommendation. What runs is the rally gate.
+        validation_gate=(
+            "Offered only when the stock's z-score is at least +2.5 and the covered-calls switch is on. "
+            "It is not required to pass a backtest."
+        ),
+        validation_gate_impl="shared.utils.quant_calc:generate_covered_call_recommendation",
         falsifiability_condition="Realized return underperforms passive buy-and-hold across 3 consecutive expiration cycles.",
     ),
     "granger_causality": SignalMethodology(
         id="granger_causality",
         name="Pairwise Bivariate Granger Causality",
+        plain=(
+            "Checks whether moves in one thing (say, oil) tend to come before moves in another (say, airline "
+            "stocks), more often than chance would allow. It shows which tends to move first, not that one "
+            "causes the other."
+        ),
         category="Statistical Discovery",
         epistemic_tier="Statistical Empirical",
         description="Tests whether historical lagged returns of Series X improve the autoregressive forecast accuracy of Series Y beyond Y's own history.",
         formula_latex=r"Y_t = c + \sum_{i=1}^p \alpha_i Y_{t-i} + \sum_{j=1}^p \beta_j X_{t-j} + \epsilon_t, \quad F = \frac{(RSS_R - RSS_U)/p}{RSS_U / (T - 2p - 1)}",
+        formula_plain="Y_t = c + Σ(α_i · Y_{t-i}) + Σ(β_j · X_{t-j}) + ε_t,  F = [(RSS_R - RSS_U)/p] / [RSS_U / (T - 2p - 1)]",
         assumptions=[
             "Stationary time series (verified via Augmented Dickey-Fuller test)",
             "Linear lag dependencies up to maximum lag order p",
@@ -117,14 +148,17 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
                 name="P-Value Significance Cutoff",
                 symbol=r"\alpha",
                 description="Maximum acceptable p-value under null hypothesis H0: beta_1 = ... = beta_p = 0",
-                default_value="0.05",
-                calibration_method="ThresholdCalibrationHarness rolling 95th percentile",
+                default_value="0.05, unless recalibrated",
+                calibration_method=(
+                    "Read from the thresholds ThresholdCalibrationHarness stores; each sweep's tests are then "
+                    "corrected together with Benjamini-Hochberg"
+                ),
             ),
             MethodologyParameter(
                 name="Lag Horizon",
                 symbol=r"p",
-                description="Optimal lag order determined by Akaike Information Criterion (AIC)",
-                default_value="selected per pair",
+                description="Lag order chosen by the Bayesian Information Criterion (BIC)",
+                default_value="selected per pair, up to 3",
                 # BIC, not AIC. The lag was chosen by the smallest p-value over
                 # the grid until this audit replaced it -- selection over a
                 # family reported as a single test, measured at 12.5% false
@@ -135,28 +169,36 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
             ),
         ],
         data_inputs=["tradfi_bars:continuous_aggregates", "graph_topology:candidate_pairs"],
-        validation_gate="Candidate edges must pass rolling 30-day Granger F-test with p < 0.05 before ingestion as GRANGER_CAUSES edges.",
+        validation_gate="Candidate edges must pass a rolling 30-day Granger F-test, after false-discovery correction at the current cutoff, before ingestion as GRANGER_CAUSES edges.",
         validation_gate_impl="shared.utils.quant_calc:granger_causality",
         falsifiability_condition="Out-of-sample directional predictive accuracy drops below 50% across a 20-period test window.",
     ),
     "hawkes_point_process": SignalMethodology(
         id="hawkes_point_process",
-        name="Mutually Exciting Hawkes Cross-Domain Contagion",
-        category="Cross-Domain Epistemic",
+        name="Hawkes Event Contagion",
+        plain=(
+            "Some events set off more events: a port closure, then a sell-off, then more alerts. This measures "
+            "how strongly one burst of events makes the next more likely, and how fast that fades."
+        ),
+        category="Cross-Market Events",
         epistemic_tier="Stochastic Process",
         description="Quantifies self- and mutually-exciting jump clustering across maritime chokepoint events, geopolitical news, and market volatility.",
-        formula_latex=r"\lambda_i(t) = \mu_i + \sum_{j=1}^M \sum_{t_k < t} \alpha_{ij} \cdot e^{-\beta_{ij}(t - t_k)}",
+        formula_latex=r"\lambda_i(t) = \mu_i + \sum_{j=1}^M \sum_{t_k < t} \alpha_{ij} \cdot e^{-\beta(t - t_k)}",
+        formula_plain="λ_i(t) = μ_i + Σ_j Σ_{t_k < t} α_{ij} · e^(-β · (t - t_k))",
         assumptions=[
             "Temporal point process with exponential memory decay kernels",
             "Spectral radius of branching matrix ||Alpha|| < 1 to guarantee subcritical stability",
         ],
         parameters=[
             MethodologyParameter(
-                name="Decay Half-Life",
-                symbol=r"t_{1/2}",
-                description="Temporal half-life of cross-domain excitation memory",
-                default_value="3600 seconds (1 hour)",
-                calibration_method="Maximum likelihood estimation on empirical multi-domain event bursts",
+                name="Decay Rate",
+                symbol=r"\beta",
+                description="How fast the effect of an event fades; one rate shared by every domain",
+                # Was "Decay Half-Life, 3600 seconds". No such constant exists:
+                # HawkesMLE fits beta along with the rest.
+                default_value="fitted; no fixed default",
+                calibration_method="L-BFGS-B maximum likelihood, refit on the last 168 hours of events",
+                is_learned=True,
             ),
             MethodologyParameter(
                 name="Branching Ratio",
@@ -189,17 +231,21 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
     "parametric_var_cvar": SignalMethodology(
         id="parametric_var_cvar",
         name="Parametric Value at Risk (VaR) & Expected Shortfall (CVaR)",
+        plain=(
+            'Answers "how much could this lose on a bad day?": the loss a portfolio should only exceed about one '
+            "day in twenty, and the average loss on the very worst days (about one in a hundred)."
+        ),
         category="Risk & Governance",
         epistemic_tier="Deterministic Closed-Form",
         description=(
             "Computes 1-Day 95% Parametric VaR and 99% Gaussian Expected Shortfall "
             "from the L2 norm of position weights and a measured daily volatility. "
-            "It said \"using an empirical covariance matrix\"; there is no covariance "
-            "matrix in this platform, and the implementation assumes zero correlation "
-            "between positions -- which is what sqrt(sum(w^2)) encodes, and which "
-            "understates risk for a long equity book."
+            "Note that there is no covariance matrix in this platform: the implementation "
+            "assumes zero correlation between positions, which is what sqrt(sum(w^2)) "
+            "encodes, and which understates risk for a long equity book."
         ),
         formula_latex=r"\text{VaR}_{\alpha} = Z_{\alpha} \cdot \sigma_P \cdot V_P, \quad \text{CVaR}_{\alpha} = \frac{\phi(Z_{\alpha})}{1 - \alpha} \cdot \sigma_P \cdot V_P",
+        formula_plain="VaR_α = Z_α · σ_P · V_P,  CVaR_α = [φ(Z_α) / (1 - α)] · σ_P · V_P",
         assumptions=[
             "Multivariate normal distribution of asset log returns over 1-day horizon",
             "Linear portfolio valuation with constant position weights over the holding period",
@@ -241,11 +287,22 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
     ),
     "half_kelly_position_sizing": SignalMethodology(
         id="half_kelly_position_sizing",
-        name="Half-Kelly Optimal Capital Sizing",
+        name="Half-Kelly Capital Sizing",
+        plain=(
+            "Decides how much to put into each trade idea. It uses a well-known formula for the best size, then "
+            "deliberately bets half of that, because the formula assumes we know the odds exactly, and we never do."
+        ),
         category="Quantitative Strategy",
         epistemic_tier="Deterministic Closed-Form",
-        description="Calculates fraction of portfolio equity to allocate to high-conviction trade setups while reducing drawdown variance by half.",
+        # "while reducing drawdown variance by half" was not a property of
+        # half-Kelly, and the paper book is equal-weight: only the quant engine's
+        # plays reach kelly_criterion.
+        description=(
+            "Calculates the fraction of portfolio equity for one of the quant engine's trade ideas: half the "
+            "Kelly fraction, capped. The paper auto-trader's book is equal-weight and does not use it."
+        ),
         formula_latex=r"K^* = \frac{p \cdot b - q}{b}, \quad K_{\text{alloc}} = \min\left(K_{\text{max}}, 0.5 \cdot K^*\right)",
+        formula_plain="K* = (p · b - q) / b,  K_alloc = min(K_max, 0.5 · K*)",
         assumptions=[
             "Logarithmic utility maximization (growth-optimal)",
             "Known win probability p and risk/reward payoff ratio b",
@@ -270,7 +327,7 @@ METHODOLOGY_CATALOG: Dict[str, SignalMethodology] = {
             ),
         ],
         data_inputs=["quant_engine:win_rate", "quant_engine:risk_reward_ratio", "broker:account_equity"],
-        validation_gate="Allocation rejected if calculated Kelly fraction <= 0 or expected value EV <= 0.",
+        validation_gate="An idea whose Kelly fraction comes out at or below zero is sized at zero.",
         validation_gate_impl="shared.utils.quant_calc:kelly_criterion",
         falsifiability_condition="Realized strategy win rate drops below break-even threshold 1/(1+b).",
     ),

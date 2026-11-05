@@ -186,7 +186,11 @@ COIN_FLIP_BRIER = 0.25
 # "<agent>.<label>", so neither the consensus weight nor the inference budget
 # moves on them. Sympathy movers (30 Oct 2026) are the stock correlation
 # agent's second claim per assessment, about other stocks.
-SIDE_STRATEGIES = {"sympathy:": "sympathy"}
+# The exposure baseline (4 Nov 2026) is the same pairs' answer with no model: what
+# the agent has to beat for its direction call to be worth a slot.
+# The evidence baseline (5 Nov 2026) is the two stored signals with a measured
+# next-session reading, also with no model.
+SIDE_STRATEGIES = {"sympathy:": "sympathy", "baseline:": "baseline", "evidence:": "evidence"}
 
 
 def side_label(strategy: Optional[str]) -> Optional[str]:

@@ -10,27 +10,37 @@ This implements the Control Plane for the In-Memory Aho-Corasick Automaton.
 import asyncio
 import json
 import logging
-import os
 import csv
+from datetime import datetime, timezone
 from io import StringIO
-import aiohttp
 
 # We use the shared Redis client connection logic
 from shared.db import get_redis
 
 logging.basicConfig(level=logging.INFO)
-from shared.utils.sanctions import is_usable_keyword, OFAC_MATCHABLE_TYPES
+from shared.utils import sanctions
+from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.sanctions import (
+    OFAC_MATCHABLE_TYPES, SANCTIONED_KEYWORDS, build_vessel_index, is_usable_keyword, sync_is_plausible,
+)
 from shared.utils.http_client import guarded_request
 
 logger = logging.getLogger("ofac_sync")
 
+SANCTIONS_KEY = "sentinel:config:sanctions"
 OFAC_SDN_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 OFAC_ALT_URL = "https://www.treasury.gov/ofac/downloads/alt.csv"
 
 async def fetch_ofac_keywords():
+    """The usable names and aliases on Treasury's lists."""
+    keywords, _ = await fetch_ofac_lists()
+    return keywords
+
+
+async def fetch_ofac_lists():
     """
     Downloads the official SDN and ALT (aliases) lists from the US Treasury.
-    Returns a list of unique names/keywords.
+    Returns (unique names/keywords, vessel index), or ([], {}) unless both arrive.
     """
     keywords = set()
     # The SDN uid of every row kept, so aliases can be filtered to the same set.
@@ -84,6 +94,9 @@ async def fetch_ofac_keywords():
                 kept_uids.add(row[0].strip())
     else:
         logger.error("Failed to fetch the OFAC SDN list; keeping the previous keyword set.")
+        return [], {}
+
+    sdn_text = text
 
     # Aliases, restricted to the entries kept above, behind the same breaker.
     alt_text = await guarded_request(
@@ -93,15 +106,18 @@ async def fetch_ofac_keywords():
     )
     if alt_text is not None:
         text = alt_text
-        # OFAC ALT CSV format: uid, ent_num, alt_type, alt_name, alt_remarks
+        # OFAC ALT CSV format: ent_num, alt_num, alt_type, alt_name, alt_remarks.
+        # The owner is column 0. Column 1 is the alias's own number, and reading
+        # it as the owner dropped 9,794 company and vessel aliases and let in
+        # 1,214 aliases of people (measured on the 4 Nov 2026 file).
         reader = csv.reader(StringIO(text))
         for row in reader:
             if len(row) <= 3 or not row[3]:
                 continue
             # ent_num ties the alias back to its SDN entry. An alias of
             # an individual is still an individual.
-            ent_num = row[1].strip() if len(row) > 1 else ""
-            if ent_num and ent_num not in kept_uids:
+            ent_num = row[0].strip()
+            if ent_num not in kept_uids:
                 skipped_individual += 1
                 continue
             name = row[3].strip(strip_chars).lower()
@@ -109,12 +125,62 @@ async def fetch_ofac_keywords():
                 skipped_short += 1
                 continue
             keywords.add(name)
+    else:
+        # All or nothing: names without their aliases would silently replace a
+        # complete list with a partial one.
+        logger.error("Failed to fetch the OFAC alias list; keeping the previous keyword set.")
+        return [], {}
 
     logger.info(
         "OFAC sync: %d usable keywords; dropped %d individual-typed and %d too short to identify.",
         len(keywords), skipped_individual, skipped_short,
     )
-    return list(keywords)
+    vessels = build_vessel_index(sdn_text, alt_text)
+    logger.info("OFAC vessels: %d by IMO, %d by MMSI, %d short names.",
+                len(vessels["imo"]), len(vessels["mmsi"]), len(vessels["names"]))
+    return list(keywords), vessels
+
+async def sync_once() -> bool:
+    """One sync. True when a current list is in force, False to try again soon.
+
+    A failure must not touch the list in force. It used to rebuild from the 31
+    built-in terms, so one Treasury timeout dropped 13,000 names for up to a day
+    while the log said the previous set was being kept. A process with only the
+    built-in terms loads the last good list from Redis instead.
+    """
+    try:
+        fetched, vessels = await fetch_ofac_lists()
+    except Exception as exc:
+        swallowed("enrichment.ofac_sync.fetch", exc, logger)
+        fetched, vessels = [], {}
+    redis = await get_redis()
+    if not sync_is_plausible(len(fetched), len(sanctions._active_keywords)):
+        dropped("enrichment.ofac_sync", "implausible_download", logger, detail=str(len(fetched)))
+        if len(sanctions._active_keywords) <= len(SANCTIONED_KEYWORDS):
+            try:
+                blob = await redis.raw.get(SANCTIONS_KEY)
+                saved = json.loads(blob) if blob else {}
+                stored = saved.get("keywords")
+                if stored:
+                    sanctions.rebuild_sanctions_from_list(stored)
+                    sanctions.set_vessel_index(saved.get("vessels"))
+                    logger.warning("OFAC download failed; loaded %d stored keywords.", len(stored))
+            except Exception as exc:
+                swallowed("enrichment.ofac_sync.restore", exc, logger)
+        return False
+    all_keywords = list(set(SANCTIONED_KEYWORDS + fetched))
+    sanctions.rebuild_sanctions_from_list(all_keywords)
+    sanctions.set_vessel_index(vessels)
+    logger.info("OFAC sanctions sync complete. Total entities in automaton: %d", len(all_keywords))
+    try:
+        await redis.raw.set(SANCTIONS_KEY, json.dumps({
+            "keywords": all_keywords, "vessels": vessels, "synced_at": datetime.now(timezone.utc).isoformat(),
+        }))
+        await redis.raw.publish("sentinel:config:updates", "ofac_rebuild")
+    except Exception as exc:
+        swallowed("enrichment.ofac_sync.store", exc, logger)
+    return True
+
 
 async def sync_ofac_to_cluster():
     """

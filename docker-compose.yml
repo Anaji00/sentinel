@@ -549,7 +549,7 @@ services:
       resources:
         limits:
           cpus: '0.5'
-          memory: 384M
+          memory: 512M  # 384M until 5 Nov 2026; tradfi now also reads the SEC bulk sets
     depends_on:
       kafka:
         condition: service_healthy

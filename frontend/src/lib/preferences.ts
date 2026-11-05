@@ -8,6 +8,7 @@
 
 import useSWR from 'swr';
 import { apiClient, fetcher } from './api';
+import type { NotifyPrefs } from './notifications';
 
 export interface MyTown {
   agency: string;
@@ -22,6 +23,7 @@ export interface Preferences {
   town: MyTown | null;
   focus: Focus;
   welcomed: boolean;
+  notify?: NotifyPrefs;
 }
 
 export const PREFERENCES_KEY = '/me/preferences';

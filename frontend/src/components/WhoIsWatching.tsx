@@ -8,9 +8,12 @@
  */
 
 import React, { useState } from 'react';
+import { Input } from './ui/Input';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatCompact, formatNumber } from '../lib/format';
 import { TickerChip } from './ui/TickerChip';
@@ -82,8 +85,8 @@ export function WhoIsWatching() {
   const [town, setTown] = useState('');
   const { data: summary } = useSWR<CivicSummary>('/civic/summary', fetcher);
   const { data: legal } = useSWR<LegalTotals>('/civic/legal?limit=1', fetcher);
-  const { data: money } = useSWR<{ totals: MoneyTotal[] }>('/civic/money?limit=1', fetcher);
-  const { data: feed } = useSWR<{ items: FeedItem[] }>('/civic/feed?days=7', fetcher);
+  const { data: money, error: moneyError, mutate: retryMoney } = useSWR<{ totals: MoneyTotal[] }>('/civic/money?limit=1', fetcher);
+  const { data: feed, error: feedError } = useSWR<{ items: FeedItem[] }>('/civic/feed?days=7', fetcher);
 
   const vehicles = asCount(legal?.totals?.vehicles);
   const vendors = topVendors(money?.totals);
@@ -113,13 +116,14 @@ export function WhoIsWatching() {
           </p>
         </div>
         <form onSubmit={go} className="flex w-full max-w-sm gap-2" role="search">
-          <input
+          <Input
+            label="Look up your town"
+            hideLabel
+            containerClassName="min-w-0 flex-1"
             type="search"
             value={town}
             onChange={(e) => setTown(e.target.value)}
             placeholder="Your town or police department"
-            aria-label="Look up your town"
-            className="min-w-0 flex-1 rounded-lg border border-line-strong bg-page px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:border-civic outline-none"
           />
           <button type="submit" className="rounded-lg bg-civic px-3 py-2 text-sm font-semibold text-page hover:opacity-90">
             Look up
@@ -156,7 +160,11 @@ export function WhoIsWatching() {
         <div className="space-y-2">
           <h3 className="text-sm font-semibold text-ink">Who profits</h3>
           {vendors.length === 0 ? (
-            <LoadingLines />
+            failedWithout(moneyError, money) ? (
+              <PanelError inline what="contract totals" onRetry={() => void retryMoney()} />
+            ) : (
+              <LoadingLines />
+            )
           ) : (
             <ul className="space-y-1.5">
               {vendors.map((v) => (
@@ -182,7 +190,7 @@ export function WhoIsWatching() {
         <div className="space-y-2">
           <h3 className="text-sm font-semibold text-ink">This week</h3>
           {latest.length === 0 ? (
-            <p className="text-micro text-ink-mute">{feed ? 'A quiet week.' : 'Reading…'}</p>
+            <p className="text-micro text-ink-mute">{feed ? 'A quiet week.' : feedError ? "Could not load this week's items." : 'Reading…'}</p>
           ) : (
             <ul className="space-y-1.5">
               {latest.map((i, n) => (

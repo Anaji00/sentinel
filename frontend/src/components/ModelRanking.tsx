@@ -121,7 +121,7 @@ function RankList({ title, rows, tone }: { title: string; rows: Ranked[]; tone: 
             className="flex items-center justify-between gap-2 border-b border-line/60 pb-0.5"
           >
             <Link
-              href={`/ticker?symbol=${encodeURIComponent(r.ticker)}`}
+              href={`?t=${encodeURIComponent(r.ticker)}`}
               className="font-mono font-bold text-ink hover:text-accent hover:underline"
             >
               {r.ticker}

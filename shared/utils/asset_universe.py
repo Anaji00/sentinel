@@ -14,11 +14,19 @@ distressed microcaps that Alpaca marks unshortable. Both are screened here.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from typing import Any, Dict, Optional
 
+import aiohttp
+
+from shared.utils.quiet_failures import swallowed
+
+logger = logging.getLogger("shared.asset_universe")
+
 ASSET_META_KEY = "sentinel:equities:asset_meta"
-ASSET_META_TTL_SEC = 2 * 86400
+ASSET_META_TTL_SEC = 14 * 86400         # a listing changes slowly; a stopped platform must not lose it
 ALPACA_ASSET_URLS = (
     "https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity",
     "https://api.alpaca.markets/v2/assets?status=active&asset_class=us_equity",
@@ -71,14 +79,35 @@ def compact(assets: Any) -> Dict[str, list]:
     return out
 
 
-async def load_asset_meta(raw: Any) -> Dict[str, list]:
-    blob = await raw.get(ASSET_META_KEY)
+def _decode_meta(blob: Any) -> Dict[str, list]:
     if not blob:
         return {}
     try:
         return json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
     except (ValueError, AttributeError):
         return {}
+
+
+async def load_asset_meta(raw: Any) -> Dict[str, list]:
+    """The cached asset list, fetched if the cache has lapsed.
+
+    An empty list means "no filter" to every reader: funds pass the model's mask
+    and the auto-trader's stock check. Only the recommendation engine refreshed
+    it, and only with a model report in hand, so after a stop longer than the
+    cache's life (4 Nov 2026) the model loaded 11,201 columns and ranked funds."""
+    meta = _decode_meta(await raw.get(ASSET_META_KEY))
+    if meta:
+        return meta
+    key = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        return {}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            await refresh_asset_meta(raw, session, {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
+    except Exception as e:
+        swallowed("utils.asset_universe.refresh", e, logger)
+    return _decode_meta(await raw.get(ASSET_META_KEY))
 
 
 async def refresh_asset_meta(raw: Any, session: Any, headers: Optional[Dict[str, str]]) -> int:

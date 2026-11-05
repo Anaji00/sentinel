@@ -6,16 +6,8 @@ Uses MarkdownV2 formatting.
 """
 
 import re
-from typing import Optional
-from shared.models import CorrelationCluster, Scenario, AlertTier
+from shared.models import CorrelationCluster, Scenario
 
-TIER_EMOJI = {
-    AlertTier.WATCH:        "👁",
-    AlertTier.ALERT:        "⚠️",
-    AlertTier.ELEVATED:     "🚨",
-    AlertTier.INTELLIGENCE: "🔴",
-    AlertTier.CRITICAL:     "🔥",
-}
 
 def _escape(text: str) -> str:
     """Escape special chars for Telegram MarkdownV2 plain text."""
@@ -31,21 +23,8 @@ def _escape_code(text: str) -> str:
 
 def format_correlation(cluster: CorrelationCluster) -> str:
     """Format a CorrelationCluster as a Telegram alert message."""
-    emoji = TIER_EMOJI.get(cluster.alert_tier, "❓")
     tier = cluster.alert_tier.name
 
-    domain_emoji = ""
-    tags_lower = [t.lower() for t in cluster.tags]
-    if any(t in tags_lower for t in ["maritime", "vessel", "vessel_dark", "vessel_sts", "vessel_spoof"]):
-        domain_emoji = "🚢 "
-    elif any(t in tags_lower for t in ["aviation", "flight", "aircraft", "flight_dark", "flight_anomaly"]):
-        domain_emoji = "✈️ "
-    elif any(t in tags_lower for t in ["tradfi", "equity", "options", "financial", "equity_block", "market_candle"]):
-        domain_emoji = "💰 "
-    elif any(t in tags_lower for t in ["cyber", "ransomware", "bgp", "bgp_anomaly", "breach_detected"]):
-        domain_emoji = "🔐 "
-    elif any(t in tags_lower for t in ["crypto", "wallet", "crypto_trade", "crypto_liquidation"]):
-        domain_emoji = "₿ "
 
     anomaly_str = ""
     for tag in cluster.tags:
@@ -56,24 +35,24 @@ def format_correlation(cluster: CorrelationCluster) -> str:
     anomaly_suffix = f" \\(Anomaly: {_escape(anomaly_str)}\\)" if anomaly_str else ""
 
     lines = [
-        f"{emoji} {domain_emoji}*\\[{_escape(tier)}\\] {_escape(cluster.rule_name)}*{anomaly_suffix}",
+        f"*\\[{_escape(tier)}\\] {_escape(cluster.rule_name)}*{anomaly_suffix}",
         "",
         _escape(cluster.description),
         "",
-        f"🏷 Tags: `{_escape_code(', '.join(cluster.tags[:6]))}`",
-        f"📅 {_escape(cluster.detected_at.strftime('%Y-%m-%d %H:%M UTC'))}",
-        f"🆔 `{_escape_code(cluster.correlation_id[:8])}`",
+        f"Tags: `{_escape_code(', '.join(cluster.tags[:6]))}`",
+        f"Time: {_escape(cluster.detected_at.strftime('%Y-%m-%d %H:%M UTC'))}",
+        f"ID: `{_escape_code(cluster.correlation_id[:8])}`",
     ]
 
     if cluster.entity_ids:
-        lines.append(f"👥 Entities: `{_escape_code(', '.join(cluster.entity_ids[:3]))}`")
+        lines.append(f"Entities: `{_escape_code(', '.join(cluster.entity_ids[:3]))}`")
 
     return "\n".join(lines)
 
 def format_scenario(scenario: Scenario) -> str:
     """Format a Scenario as a Telegram intelligence briefing."""
     lines = [
-        f"💡 *INTELLIGENCE ASSESSMENT*",
+        "*Assessment*",
         "",
         f"*{_escape(scenario.headline)}*",
         "",
@@ -113,24 +92,23 @@ def format_intel_brief(brief: dict) -> str:
     b = brief.get("brief", {})
     headline = b.get("headline_summary", "Intel Brief")
     severity = brief.get("computed_severity", b.get("severity", 3))
-    sev_emoji = "🚨" if severity >= 3 else "ℹ️"
     agent_name = brief.get("agent", "news_intel")
     
     lines = [
-        f"{sev_emoji} *INTELLIGENCE BRIEF \\(Severity: {severity}/5\\)*",
-        f"🤖 Agent: `{_escape_code(agent_name)}`",
+        f"*Brief \\(Severity: {severity}/5\\)*",
+        f"Analyst: `{_escape_code(agent_name)}`",
         "",
         f"*{_escape(headline)}*",
         "",
-        f"📂 *Catalyst:* {_escape(b.get('catalyst_type', 'unknown'))}",
-        f"📍 *Theater:* {_escape(b.get('geopolitical_theater', 'unknown'))}",
+        f"*Catalyst:* {_escape(b.get('catalyst_type', 'unknown'))}",
+        f"*Region:* {_escape(b.get('geopolitical_theater', 'unknown'))}",
         "",
     ]
     
     if b.get("geographic_hotspots"):
-        lines.append(f"🌍 *Hotspots:* {_escape(', '.join(b['geographic_hotspots']))}")
+        lines.append(f"*Hotspots:* {_escape(', '.join(b['geographic_hotspots']))}")
     if b.get("financial_instruments_affected"):
-        lines.append(f"💰 *Affected Assets:* `{_escape_code(', '.join(b['financial_instruments_affected']))}`")
+        lines.append(f"*Affected Assets:* `{_escape_code(', '.join(b['financial_instruments_affected']))}`")
         
     entities = b.get("entities", [])
     if entities:

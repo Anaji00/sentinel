@@ -2,6 +2,8 @@
 
 import React, { useState, useMemo } from 'react';
 import useSWR from 'swr';
+import { failedWithout } from '../lib/dataHealth';
+import { PanelError } from './ui/PanelError';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
 import { Badge } from './ui/Badge';
@@ -135,7 +137,7 @@ export default function FinancialAdvisorAdvice() {
     }
   }, [toastMessage]);
 
-  const { data, isLoading } = useSWR<AdviceResponse>('/financial/advice', fetcher, {
+  const { data, isLoading, error: adviceError, mutate: retryAdvice } = useSWR<AdviceResponse>('/financial/advice', fetcher, {
     refreshInterval: POLL.live,
   });
 
@@ -485,6 +487,8 @@ export default function FinancialAdvisorAdvice() {
             <div className="text-center py-8 text-ink-mute animate-pulse">
               Computing multi-factor quant signals...
             </div>
+          ) : failedWithout(adviceError, data) ? (
+            <PanelError what="trade signals" onRetry={() => void retryAdvice()} />
           ) : filteredPlays.length === 0 ? (
             <div className="text-center py-6 text-ink-mute">
               No active signals matching filter criteria.

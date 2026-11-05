@@ -23,7 +23,7 @@ first, because a position can be in both "Strait of Hormuz" AND
 import os
 import logging
 import json
-from typing import Optional, Tuple
+from typing import Optional
 import numpy as np
 
 logger = logging.getLogger("shared.regions")
@@ -326,6 +326,27 @@ def decode_vessel_type(type_code: int) -> str:
     else:
         return f"Unknown({type_code})"
     
+
+# The stored category is read as a key (is_tanker, tags, exposure), so it stays as
+# it is and this is only how a person reads it. AIS codes with no category mean the
+# ship sent nothing useful, and "Unknown(16)" tells a reader only that.
+_VESSEL_TYPE_LABELS = {
+    "CargoVessel": "Cargo ship",
+    "Fishing": "Fishing vessel",
+    "Military": "Military vessel",
+    "Passenger": "Passenger ship",
+    "SpecialCraft": "Special craft",
+    "WIG": "Wing-in-ground craft",
+}
+
+
+def vessel_type_label(vessel_type: Optional[str]) -> str:
+    """A stored vessel category as words."""
+    value = str(vessel_type or "")
+    if not value or value.startswith("Unknown"):
+        return "Ship"
+    return _VESSEL_TYPE_LABELS.get(value, value)
+
 
 # AIS navigational statuses that mean the vessel cannot freely manoeuvre.
 #

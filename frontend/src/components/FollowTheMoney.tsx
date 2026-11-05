@@ -83,7 +83,7 @@ function Hero({ o }: { o: OwnershipOverview }) {
         </h1>
         <p className="max-w-2xl text-base text-ink-dim">
           Vanguard is the single largest shareholder of {vanguard} of {c.companies} companies, BlackRock of{' '}
-          {blackrock} more. Their money is mostly yours: index funds in retirement accounts. They vote it.
+          {blackrock} more. Much of that sits in index funds, including people&apos;s retirement accounts, and these firms usually vote the shares.
         </p>
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -203,8 +203,8 @@ function Rivals({ rivals }: { rivals: OwnershipOverview['rivals'] }) {
           </div>
           <div className="font-mono text-lead font-semibold text-ink tabular">{pct1(r.common_pct)}</div>
           <p className="text-sm text-ink-dim">
-            of each company is held by the same {r.shared_holders} institutions. The two compete for customers; their
-            owners win either way.
+            of each company is held by the same {r.shared_holders} institutions, so these competitors share many of
+            their largest shareholders.
           </p>
           <span className="block h-2 rounded-full bg-inset">
             <span className="block h-full rounded-full bg-civic" style={{ width: pctWidth(r.common_pct) }} />

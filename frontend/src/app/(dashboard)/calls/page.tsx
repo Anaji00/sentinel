@@ -1,6 +1,7 @@
 import React from 'react';
 import CallsWorkspace from '@/components/CallsWorkspace';
 import SignalBoard from '@/components/SignalBoard';
+import StockSearch from '@/components/StockSearch';
 import StockNews from '@/components/StockNews';
 import StockPredictions from '@/components/StockPredictions';
 import { FreshnessStrip } from '@/components/TrackRecord';
@@ -29,13 +30,14 @@ export default async function CallsPage({
     <div className="h-full w-full space-y-5 overflow-y-auto p-2">
       <PageHeader
         title="Calls"
-        description="Every stock with unusual activity, the model's call on it, and the evidence behind both. Pick a stock on the left to see why it is moving."
+        description="Every stock with unusual activity, the model's call on it, and the evidence behind both. Pick a stock on the left, or look up any other one below, to see why it is moving."
         related={[
           { href: '/performance', label: 'Performance' },
           { href: '/markets', label: 'Markets' },
           { href: '/methodology', label: 'How it works' },
         ]}
       />
+      <StockSearch />
       <CallsWorkspace />
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-5">
         <h2 className="text-head font-semibold text-ink">{view.label}</h2>

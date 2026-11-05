@@ -11,8 +11,9 @@ from shared.utils.agent_conclusions import (
     TRADFI_BACKFILL_REPORT_KEY,
 )
 
+from shared.utils.agent_conclusions import scorecard_scope
 from shared.utils.filings_keys import PROMINENT_CIKS_KEY
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from services.api_gateway.dependencies import get_db, get_redis_client, require_pro
 from shared.utils.agent_conclusions import PREDICTIONS_KEY_PATTERN
 from shared.utils.heartbeat import get_all_heartbeats_status
@@ -185,11 +186,13 @@ async def get_swarm_intelligence(redis=Depends(get_redis_client), db=Depends(get
     scorecards = []
     try:
         keys = await _scan("sentinel:agents:scorecard:*", 60)
-        for blob in (await raw.mget(keys) if keys else []):
+        for key, blob in zip(keys, await raw.mget(keys) if keys else []):
             if not blob:
                 continue
             try:
-                scorecards.append(json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")))
+                card = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8"))
+                card["scope"] = scorecard_scope(key.decode() if isinstance(key, bytes) else str(key))
+                scorecards.append(card)
             except (ValueError, TypeError):
                 continue
     except Exception as e:
@@ -394,6 +397,13 @@ async def get_agent_conclusions(redis=Depends(get_redis_client)):
         if members is not None:
             out["prominent_ciks"] = sorted(
                 (m.decode() if isinstance(m, bytes) else str(m)) for m in members
+            )
+            # Names beside the numbers: a CIK means nothing to a reader. A fund not in
+            # the curated table still shows, by its number.
+            from services.api_gateway.routes.filings import PROMINENT_FILERS
+            out["prominent_filers"] = sorted(
+                ({"cik": c, "name": (PROMINENT_FILERS.get(c) or {}).get("name") or c} for c in out["prominent_ciks"]),
+                key=lambda f: f["name"],
             )
     except Exception as _exc:
         swallowed("api_gateway.routes.agents.conclusions.ciks", _exc, logger)

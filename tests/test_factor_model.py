@@ -480,3 +480,61 @@ def test_the_two_sided_ranker_and_the_two_model_average_learn_an_order() -> None
         pred = fm._predict(name, est, test)
         assert pred.shape == (per,) and np.all(np.isfinite(pred))
         assert fm._spearman(pred, truth) > 0.5, name
+
+
+def test_a_read_timeout_is_retried_and_a_lasting_one_still_fails() -> None:
+    import asyncio
+
+    from services.agents.factor_engine import _PatientReads
+
+    class Db:
+        calls = 0
+
+        def __init__(self, fail_first: int) -> None:
+            self.fail_first = fail_first
+
+        async def query(self, sql: str, *params: object) -> list:
+            self.calls += 1
+            if self.calls <= self.fail_first:
+                raise asyncio.TimeoutError()
+            return [{"sql": sql}]
+
+        async def execute(self, sql: str) -> str:
+            return "written once"
+
+    db = Db(fail_first=2)
+    patient = _PatientReads(db, attempts=4, wait_sec=0)
+    assert asyncio.run(patient.query("q")) == [{"sql": "q"}] and db.calls == 3
+    assert asyncio.run(patient.execute("w")) == "written once"       # writes are not retried
+
+    down = Db(fail_first=99)
+    try:
+        asyncio.run(_PatientReads(down, attempts=4, wait_sec=0).query("q"))
+    except asyncio.TimeoutError:
+        assert down.calls == 4
+    else:
+        raise AssertionError("a timeout that lasts must fail the run")
+
+
+def test_a_session_still_being_written_is_not_ranked() -> None:
+    """95 names in the newest session published 94 scores over the usual 1,000."""
+    from datetime import date, timedelta
+
+    import numpy as np
+
+    from shared.utils import factor_model as fm
+
+    T, N = 30, 200
+    dates = [date(2026, 9, 1) + timedelta(days=i) for i in range(T)]
+    close = np.full((T, N), 10.0)
+    close[-1, 95:] = np.nan
+    panel = fm.Panel(dates, [f"T{i}" for i in range(N)], close, close.copy(), close.copy(),
+                     {"by_day": np.zeros((T, N)), "by_name": np.zeros(N), "_tradable": np.ones((T, N), dtype=bool)})
+    done = fm.complete_sessions(panel)
+    assert done.dates == dates[:-1] and done.close.shape == (T - 1, N)
+    assert done.extra["by_day"].shape == (T - 1, N) and done.extra["by_name"].shape == (N,)
+    assert "_tradable" not in done.extra                       # the cached mask had the dropped row
+
+    close[-1, :] = 10.0
+    close[-1, 180:] = np.nan                                   # a normal day's missing names
+    assert fm.complete_sessions(panel) is panel

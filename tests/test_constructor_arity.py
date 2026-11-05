@@ -51,9 +51,11 @@ from check_constructor_arity import scan  # noqa: E402
 # Moved by fifteen on 1 October, when the watched-wallet floor was documented
 # above them. Re-read: Binance_Liquidations and Binance_FundingRates, both
 # subscribed through the stream URL, so neither sends a post-connect frame.
+# Moved by four on 4 November, when the venue-refusal constants went in above
+# them. Re-read: the same two streams, still subscribed through the URL.
 ALLOWED = {
-    ("services", "collector-crypto", "main.py", 228),
-    ("services", "collector-crypto", "main.py", 363),
+    ("services", "collector-crypto", "main.py", 232),
+    ("services", "collector-crypto", "main.py", 367),
 }
 
 

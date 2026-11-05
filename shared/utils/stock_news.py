@@ -20,7 +20,7 @@ company-tagged articles a day.
 from __future__ import annotations
 
 import bisect
-from datetime import date, datetime, time
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,12 @@ MAX_EVENT_SYMBOLS = 2                 # an article about one or two stocks, not 
 # measures exactly what fires live; strict enough to keep the study's load in
 # bounds: at 0.8 FinBERT passed 27% of single-stock articles, at 0.9 about 11%.
 STRONG_TONE = 0.9
+# An article's anomaly score: nothing here measures how unusual it is. This was
+# abs(tone), so every event scored 0.90 or more by construction, and on 4 Nov
+# 2026 all 5 "top ML anomalies" in the agents' world state and all 10 headlines
+# in the scenario context were these. 0.5 sits with ordinary news (median 0.55)
+# and clears the correlation rules' floors, none of which is above it.
+EVENT_ANOMALY_SCORE = 0.5
 NY = ZoneInfo("America/New_York")
 FEATURE_WINDOWS = (5, 21)
 
@@ -118,5 +124,5 @@ def event_row(r: Mapping[str, Any], positive: float, negative: float) -> Optiona
             "symbols": syms, "side": side}
 
 
-__all__ = ["BACKFILL_START", "DAILY_SQL", "EVENT_SOURCE", "FEATURE_WINDOWS", "MAX_EVENT_SYMBOLS", "NEWS_TABLE",
+__all__ = ["BACKFILL_START", "DAILY_SQL", "EVENT_ANOMALY_SCORE", "EVENT_SOURCE", "FEATURE_WINDOWS", "MAX_EVENT_SYMBOLS", "NEWS_TABLE",
            "NEWS_URL", "STRONG_TONE", "daily_features", "event_row", "parse_item", "tone"]

@@ -40,7 +40,7 @@ const BondYieldsChart = dynamic(() => import('./charts/BondYieldsChart'), {
  * presets and one for the toggles, and they had already drifted: the preset
  * list carried a `charts` entry that the `all` reset did not restore. */
 const PANELS = [
-  { key: 'intelligence', label: 'Intelligence', Icon: IconFlow },
+  { key: 'intelligence', label: 'Events', Icon: IconFlow },
   { key: 'radar', label: 'Radar', Icon: IconRadar },
   { key: 'movers', label: 'Movers', Icon: IconUp },
   { key: 'advisor', label: 'Portfolio', Icon: IconTarget },

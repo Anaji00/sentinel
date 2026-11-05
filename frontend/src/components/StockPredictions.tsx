@@ -11,6 +11,7 @@
  */
 
 import React, { useMemo, useState } from 'react';
+import { Input } from './ui/Input';
 import Link from 'next/link';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
@@ -88,7 +89,7 @@ function pct(v: number | null | undefined, digits = 0): string {
 export function TickerLink({ ticker }: { ticker: string }) {
   return (
     <Link
-      href={`/ticker?symbol=${encodeURIComponent(ticker)}`}
+      href={`?t=${encodeURIComponent(ticker)}`}
       className="font-mono font-bold text-ink hover:text-accent underline-offset-2 hover:underline"
     >
       {ticker}
@@ -233,12 +234,15 @@ export default function StockPredictions({ withIdeas = true }: { withIdeas?: boo
       <section className="bg-raised border border-line rounded-xl p-4 space-y-2">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <h3 className="font-bold text-ink">Open calls</h3>
-          <input
+          <Input
+            label="Filter open calls"
+            hideLabel
+            size="sm"
+            containerClassName="w-44"
+            className="font-mono"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter ticker or agent"
-            aria-label="Filter open calls"
-            className="w-44 rounded-md border border-line bg-page px-2 py-1 font-mono text-micro text-ink outline-none focus:border-line-accent"
           />
         </div>
         {open.length === 0 ? (

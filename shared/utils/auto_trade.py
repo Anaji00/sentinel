@@ -40,6 +40,10 @@ INDEX_FUNDS = frozenset({"SPY", "QQQ", "IWM", "DIA", "VOO", "IVV", "VTI", "RSP",
 B1_LONG = (0.90, 0.99)
 B1_SHORT_MAX = 0.10
 REBALANCE_SESSIONS = 21
+# Fewer scores than this and the book is kept. A run that loaded while the newest
+# session was being written scored 94 names (4 Nov 2026), which would have rebuilt
+# B1 as about 9 longs and 9 shorts. The model ranks about 1,000.
+MIN_SCORES_TO_REBUILD = 800
 
 # Orders worth less than this are not sent: they cost more in attention than
 # they move the book.
@@ -153,6 +157,23 @@ def target_shares(weights: Mapping[str, float], equity: float, prices: Mapping[s
     for t, q in whole_share_leg({t: -w * equity for t, w in ok.items() if w < 0}, prices).items():
         out[t] = -float(q)
     return out
+
+
+FILL_MAX_CHECKS = 5
+
+
+def fill_outcome(qty: float, filled_qty: float) -> str:
+    """How a finished order ended, from what filled."""
+    if filled_qty <= 0:
+        return "unfilled"
+    return "filled" if filled_qty >= qty * 0.999 else "partial"
+
+
+def slippage_bps(side: str, fill: Optional[float], ref: Optional[float]) -> Optional[float]:
+    """Cost against the decision price in basis points, positive when worse."""
+    if not fill or not ref or fill <= 0 or ref <= 0:
+        return None
+    return (fill / ref - 1.0) * 1e4 if side == "buy" else (1.0 - fill / ref) * 1e4
 
 
 def unplaced(weights: Mapping[str, float], shares: Mapping[str, float]) -> List[str]:

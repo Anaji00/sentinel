@@ -114,7 +114,7 @@ def test_format_scenario_markdown_validity():
 
     msg = format_scenario(scenario)
 
-    assert "*INTELLIGENCE ASSESSMENT*" in msg
+    assert "*Assessment*" in msg  # plain wording since 4 Nov 2026
     assert "87%" in msg
     assert "Electronic Warfare Testing" in msg
     assert "• BGP route anomalies" in msg

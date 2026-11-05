@@ -14,7 +14,10 @@ Phase 2: replace keyword matching with full OFAC SDN list sync
 
 import logging
 import math
+import csv
 import re
+from difflib import SequenceMatcher
+from io import StringIO
 from typing import List
 
 logger = logging.getLogger("shared.sanctions")
@@ -128,6 +131,27 @@ _active_keywords: List[str] = list(SANCTIONED_KEYWORDS)
 # its place. Held as a set so the length rule can exempt exactly these.
 _CURATED = {k.lower() for k in SANCTIONED_KEYWORDS}
 
+# How few keywords a sync can return before it is treated as a failed download
+# rather than a shorter list. The real file gave 13,381 on 4 Nov 2026.
+MIN_PLAUSIBLE_SYNC = 5000
+
+
+def sync_is_plausible(new_count: int, current_count: int = 0) -> bool:
+    """Whether a downloaded list may replace the one in force."""
+    return new_count >= MIN_PLAUSIBLE_SYNC and new_count >= current_count // 2
+
+
+def _hit_is_evidence(keyword: str, name_lower: str) -> bool:
+    """Whether a boundary-checked hit says anything about this name.
+
+    A curated term is unambiguous and a multi-word entry is distinctive, so both
+    count wherever they appear. A single word off the synced list counts only as
+    the whole name: `alexandra` and `brilliance` are real SDN vessels, and that
+    says nothing about ALEXANDRA MAERSK or STRAITS BRILLIANCE.
+    """
+    k = keyword.lower()
+    return k in _CURATED or " " in k or k == name_lower
+
 
 def is_usable_keyword(kw: str) -> bool:
     """Can this keyword identify a sanctioned party on its own?
@@ -158,23 +182,11 @@ def is_usable_keyword(kw: str) -> bool:
 # limited to four. The loop has to see the whole list and must not touch most
 # of it.
 #
-# Two exhaustive cases, so the filter is a bound rather than a guess.
-# token_set_ratio takes the best of three difflib comparisons built from the
-# two token sets:
-#
-#   no shared token -> the shared part is empty, the first two comparisons are
-#       0, and the score is the plain ratio of the two joined token strings.
-#       difflib's ratio is 2*M/T with M <= the shorter string, so
-#       2*min(la,lb)/(la+lb) is an upper bound that depends only on lengths.
-#   a shared token  -> one side's tokens may be a subset of the other's, which
-#       scores 100 at any length ("sovcomflot" inside "sovcomflot shipping
-#       ltd"), so no length bound holds and the pair must be scored.
-#
-# So: everything sharing a token, plus everything inside the length window.
-# Nothing else can reach the threshold, and the index makes both lookups O(1).
+# The score is the ratio of the two token-sorted strings, which is 2*M/T with M
+# no longer than the shorter string, so 2*min(la,lb)/(la+lb) is an upper bound that
+# depends only on lengths. Nothing outside that window can reach the threshold.
 _fuzzy_terms: List[str] = []          # keyword, by index
 _fuzzy_joined: List[str] = []         # its tokens, sorted and rejoined
-_fuzzy_by_token: dict = {}            # token -> [index, ...]
 _fuzzy_by_len: dict = {}              # len(joined) -> [index, ...]
 
 # Names repeat constantly on this platform -- the same vessel reports a position
@@ -187,8 +199,8 @@ _fuzzy_cache: dict = {}
 
 
 def _build_fuzzy_index(keywords: List[str]) -> None:
-    global _fuzzy_terms, _fuzzy_joined, _fuzzy_by_token, _fuzzy_by_len
-    terms, joined, by_token, by_len = [], [], {}, {}
+    global _fuzzy_terms, _fuzzy_joined, _fuzzy_by_len
+    terms, joined, by_len = [], [], {}
     for kw in keywords:
         k = (kw or "").strip().lower()
         if len(k) < MIN_SYNCED_KEYWORD_LEN:
@@ -200,29 +212,74 @@ def _build_fuzzy_index(keywords: List[str]) -> None:
         idx = len(terms)
         terms.append(kw)
         joined.append(j)
-        for t in toks:
-            by_token.setdefault(t, []).append(idx)
         by_len.setdefault(len(j), []).append(idx)
-    _fuzzy_terms, _fuzzy_joined, _fuzzy_by_token, _fuzzy_by_len = terms, joined, by_token, by_len
+    _fuzzy_terms, _fuzzy_joined, _fuzzy_by_len = terms, joined, by_len
     _fuzzy_cache.clear()
 
 
-def _fuzzy_candidates(name_tokens: set, joined_len: int, threshold: float) -> set:
-    """Indices of keywords that could reach `threshold` for this name."""
+def _fuzzy_candidates(joined_len: int, threshold: float) -> set:
+    """Indices of keywords that could reach `threshold` (0-100) for this name."""
     out = set()
-    for t in name_tokens:
-        hits = _fuzzy_by_token.get(t)
-        if hits:
-            out.update(hits)
     if joined_len > 0 and _fuzzy_by_len:
-        # 2*min(a,b)/(a+b) >= thr, solved for b on each side of a.
-        lo = int(math.ceil(threshold * joined_len / (2.0 - threshold)))
-        hi = int(math.floor(joined_len * (2.0 - threshold) / threshold))
+        # 2*min(a,b)/(a+b) >= thr, solved for b on each side of a. As a fraction:
+        # this was handed 92, which made the window empty, so until 4 Nov 2026 only
+        # names sharing a whole word with an entry were ever compared at all.
+        thr = threshold / 100.0
+        lo = int(math.ceil(thr * joined_len / (2.0 - thr)))
+        hi = int(math.floor(joined_len * (2.0 - thr) / thr))
         for L in range(max(lo, 1), hi + 1):
             hits = _fuzzy_by_len.get(L)
             if hits:
                 out.update(hits)
     return out
+
+
+# Sanctioned vessels by what identifies the hull. Treasury's vessel rows carry an
+# IMO on 1,553 of 1,568 and an MMSI on 833 (4 Nov 2026), and a name match cannot see
+# a renamed ship: 470132000 is listed as WHALES DIAMOND and sails as SPEARFISH ANN 2.
+#
+# `names` holds the vessel names too short for the keyword list. They count only as
+# a ship's whole name, and only as a name: 73 of 8,785 real ships shared one, among
+# them ATLAS, DIAMOND and FORTUNE, so it is flagged without a sanctions claim.
+_IMO_RE = re.compile(r"\bIMO\s*(\d{7})\b", re.IGNORECASE)
+_MMSI_RE = re.compile(r"\bMMSI\s*(\d{9})\b", re.IGNORECASE)
+_vessel_index: dict = {"imo": {}, "mmsi": {}, "names": set()}
+
+
+def build_vessel_index(sdn_csv: str, alt_csv: str = "") -> dict:
+    """{"imo": {id: name}, "mmsi": {id: name}, "names": [short names]} from Treasury's files.
+
+    SDN columns: ent_num, name, type, program, title, call sign, vessel type, tonnage,
+    GRT, flag, owner, remarks. ALT columns: ent_num, alt_num, alt_type, alt_name.
+    """
+    def clean(value: str) -> str:
+        return value.strip(' "\'').lower()
+
+    imo, mmsi, names, owners = {}, {}, set(), set()
+    for row in csv.reader(StringIO(sdn_csv or "")):
+        if len(row) <= 2 or clean(row[2]) != "vessel":
+            continue
+        owners.add(row[0].strip())
+        name = clean(row[1])
+        remarks = row[11] if len(row) > 11 else ""
+        imo.update({x: name for x in _IMO_RE.findall(remarks)})
+        mmsi.update({x: name for x in _MMSI_RE.findall(remarks)})
+        if name and not is_usable_keyword(name):
+            names.add(name)
+    for row in csv.reader(StringIO(alt_csv or "")):
+        if len(row) > 3 and row[0].strip() in owners:
+            alias = clean(row[3])
+            if alias and not is_usable_keyword(alias):
+                names.add(alias)
+    return {"imo": imo, "mmsi": mmsi, "names": sorted(names)}
+
+
+def set_vessel_index(index: dict) -> None:
+    """Put a built index in force, as one swap."""
+    global _vessel_index
+    index = index or {}
+    _vessel_index = {"imo": dict(index.get("imo") or {}), "mmsi": dict(index.get("mmsi") or {}),
+                     "names": set(index.get("names") or [])}
 
 
 def _matches_on_boundary(haystack: str, needle: str, end_index: int) -> bool:
@@ -326,46 +383,32 @@ FUZZY_MATCH_THRESHOLD = 92.0
 # the Treasury file, with nothing anywhere saying the capability was off.
 #
 # Implemented on difflib rather than by adding the dependency: CLAUDE.md's rule
-# is that a third-party package is not added where the standard library serves,
-# and token_set_ratio is twenty lines over SequenceMatcher. rapidfuzz is still
-# preferred when it is present, because it is the faster implementation of the
-# same number.
-def _difflib_token_set_ratio(a: str, b: str) -> float:
-    """rapidfuzz.fuzz.token_set_ratio, on the standard library.
+# is that a third-party package is not added where the standard library serves.
+#
+# Whole names, compared token-sorted. This was token_set_ratio, which gives 100 to
+# any name contained in an entry, so ANASTASIA matched "ignatova, anastasia
+# mikhailovna" and UNISTREAM matched a bank. The exact path already handles a
+# complete entry inside a longer name; this path is for spelling variants.
+def _closest_entry(joined_name: str):
+    """(keyword, score 0-100) of the entry nearest this token-sorted name.
 
-    Tokenise both sides, score the shared tokens against each side's full token
-    set, and take the best of the three comparisons. This is what makes
-    "sovcomflot shipping ltd" and "sovcomflot" a 100 rather than a 61 -- the
-    extra tokens on one side do not penalise a complete match on the other.
+    Called only for a name not seen before, and it can be offered thousands of
+    entries, so one matcher is reused and each entry must first pass difflib's two
+    cheap upper bounds, the same order difflib.get_close_matches uses.
     """
-    from difflib import SequenceMatcher
-
-    ta, tb = set(a.split()), set(b.split())
-    if not ta or not tb:
-        return 0.0
-    shared = sorted(ta & tb)
-    rest_a, rest_b = sorted(ta - tb), sorted(tb - ta)
-
-    t0 = " ".join(shared)
-    t1 = (t0 + " " + " ".join(rest_a)).strip()
-    t2 = (t0 + " " + " ".join(rest_b)).strip()
-
-    def r(x: str, y: str) -> float:
-        return SequenceMatcher(None, x, y).ratio() * 100.0
-
-    return max(r(t0, t1), r(t0, t2), r(t1, t2))
+    best_kw, best = None, FUZZY_MATCH_THRESHOLD / 100.0
+    matcher = SequenceMatcher(None, "", joined_name, autojunk=False)
+    for idx in _fuzzy_candidates(len(joined_name), FUZZY_MATCH_THRESHOLD):
+        matcher.set_seq1(_fuzzy_joined[idx])
+        if matcher.real_quick_ratio() < best or matcher.quick_ratio() < best:
+            continue
+        score = matcher.ratio()
+        if score >= best:
+            best_kw, best = _fuzzy_terms[idx], score
+    return best_kw, best * 100.0
 
 
-try:
-    from rapidfuzz import fuzz as _rapidfuzz
-
-    def token_set_ratio(a: str, b: str) -> float:
-        return float(_rapidfuzz.token_set_ratio(a, b))
-
-    FUZZY_BACKEND = "rapidfuzz"
-except ImportError:
-    token_set_ratio = _difflib_token_set_ratio
-    FUZZY_BACKEND = "difflib"
+FUZZY_BACKEND = "difflib"
 
 # Always true now. Kept as a name because callers and tests read it, and
 # because a future backend that genuinely cannot load should say so here
@@ -389,19 +432,19 @@ async def fetch_and_sync_ofac_sdn_list():
     Downloads and updates OFAC SDN list keywords into memory via Treasury CSV streams.
     """
     try:
-        from services.enrichment.ofac_sync import fetch_ofac_keywords
-        keywords = await fetch_ofac_keywords()
-        if keywords:
+        from services.enrichment.ofac_sync import fetch_ofac_lists
+        keywords, vessels = await fetch_ofac_lists()
+        if sync_is_plausible(len(keywords or []), len(_active_keywords)):
             all_keywords = list(set(SANCTIONED_KEYWORDS + keywords))
             rebuild_sanctions_from_list(all_keywords)
+            set_vessel_index(vessels)
             logger.info(f"✅ OFAC SDN list synced successfully. Total entities: {len(all_keywords)}")
             return all_keywords
     except Exception as e:
         logger.warning(f"OFAC SDN dynamic sync skipped (offline/timeout): {e}")
-    rebuild_sanctions_from_list(SANCTIONED_KEYWORDS)
-    return SANCTIONED_KEYWORDS
+    return list(_active_keywords)
 
-def check_sanctions(name: str, mmsi: str = "") -> List[str]:
+def check_sanctions(name: str, mmsi: str = "", imo: str = "") -> List[str]:
     """
     Return list of flag strings for a vessel/aircraft/entity.
     Checks name against known sanctioned keywords (via Aho-Corasick & fuzzy ratio)
@@ -410,9 +453,21 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
     Returns empty list if no flags.
     """
     flags = []
+    # Before the name, which a ship need not report: the identifiers are the evidence.
+    for kind, value in (("mmsi", str(mmsi or "").strip()), ("imo", str(imo or "").strip())):
+        listed_as = _vessel_index[kind].get(value)
+        if listed_as:
+            if "sanctioned_ofac" not in flags:
+                flags.append("sanctioned_ofac")
+            flags.append(f"sanctioned_id:{kind}:{value}:{listed_as}")
+
     name_lower = (name or "").strip().lower()
     if not name_lower:
         return flags
+
+    # Only for a ship, which is what passing an identifier says.
+    if (mmsi or imo) and name_lower in _vessel_index["names"]:
+        flags.append(f"vessel_name_match:{name_lower}")
 
     # Every candidate hit is collected and the longest one wins. Breaking on the
     # first match recorded whichever term the automaton reached first, so a
@@ -426,17 +481,20 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
         for end_index, (insert_order, original_value) in _automaton.iter(name_lower):
             if not _matches_on_boundary(name_lower, original_value.lower(), end_index):
                 continue
+            if not _hit_is_evidence(original_value, name_lower):
+                continue
             if matched_kw is None or len(original_value) > len(matched_kw):
                 matched_kw = original_value
     else:
         # Fallback slow path, held to the same two rules and the same universe.
         for kw in _active_keywords:
-            if re.search(rf"(?<![0-9a-z]){re.escape(kw.lower())}(?![0-9a-z])", name_lower):
+            if re.search(rf"(?<![0-9a-z]){re.escape(kw.lower())}(?![0-9a-z])", name_lower) and _hit_is_evidence(kw, name_lower):
                 if matched_kw is None or len(kw) > len(matched_kw):
                     matched_kw = kw
 
     if matched_kw:
-        flags.append("sanctioned_ofac")
+        if "sanctioned_ofac" not in flags:
+            flags.append("sanctioned_ofac")
         flags.append(f"sanctioned_kw:{matched_kw}")
 
     # Fuzzy matching only where an exact match did not trigger, and only for
@@ -451,13 +509,8 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
         if cached is not None:
             best_kw, best_score = cached
         else:
-            name_tokens = set(name_lower.split())
-            joined_len = len(" ".join(sorted(name_tokens)))
-            best_kw, best_score = None, 0.0
-            for idx in _fuzzy_candidates(name_tokens, joined_len, FUZZY_MATCH_THRESHOLD):
-                score = token_set_ratio(name_lower, _fuzzy_terms[idx].lower())
-                if score > best_score:
-                    best_kw, best_score = _fuzzy_terms[idx], score
+            joined_name = " ".join(sorted(set(name_lower.split())))
+            best_kw, best_score = _closest_entry(joined_name)
             if len(_fuzzy_cache) >= _FUZZY_CACHE_MAX:
                 _fuzzy_cache.clear()
             _fuzzy_cache[name_lower] = (best_kw, best_score)
@@ -466,7 +519,8 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
         # which is the same arbitrary-provenance defect the exact path above
         # was already repaired for.
         if best_kw is not None and best_score >= FUZZY_MATCH_THRESHOLD:
-            flags.append("sanctioned_ofac")
+            if "sanctioned_ofac" not in flags:
+                flags.append("sanctioned_ofac")
             flags.append(f"sanctioned_fuzzy:{best_kw}")
 
     prefix = (mmsi or "")[:3]
@@ -476,6 +530,25 @@ def check_sanctions(name: str, mmsi: str = "") -> List[str]:
         flags.append("sanctions_adjacent_flag_state")
 
     return flags
+
+def sanctions_strength(flags) -> str:
+    """How much a ship's flags actually say: 'listed', 'similar', 'flag_state' or ''.
+
+    All of them used to read as "sanctioned". 'identified' is the ship's own MMSI or
+    IMO on the list; 'listed' is the name matching a list entry; 'similar' is a close
+    spelling or a short listed name; 'flag_state' is only the country in the MMSI.
+    """
+    joined = [str(f) for f in flags or []]
+    if any(f.startswith("sanctioned_id") for f in joined):
+        return "identified"
+    if any(f.startswith("sanctioned_kw") for f in joined):
+        return "listed"
+    if any(f.startswith(("sanctioned_fuzzy", "vessel_name_match")) for f in joined):
+        return "similar"
+    if "sanctions_adjacent_flag_state" in joined:
+        return "flag_state"
+    return ""
+
 
 def mmsi_to_country(mmsi: str) -> str:
     """Return ISO 3166-1 alpha-2 country code for an MMSI, or empty string."""

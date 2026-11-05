@@ -24,6 +24,7 @@ import useSWR from 'swr';
 import { Activity, AlertTriangle, Bot, GitBranch, Scale } from 'lucide-react';
 import { fetcher } from '../lib/api';
 import { Card } from './ui/Card';
+import { agentName, agentTier, scopeLabel } from '../lib/agentNames';
 import { formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 
@@ -66,6 +67,7 @@ interface SwarmIntelligence {
   }>;
   scorecards: Array<{
     agent_name: string;
+    scope?: string;
     predictions_made?: number;
     predictions_correct?: number;
     consensus_weight?: number;
@@ -113,12 +115,12 @@ export default function AgentSwarmTelemetry() {
           <Bot className="h-4 w-4 text-accent" />
           <div>
             <h2 className="panel-title">The AI analysts</h2>
-            <p className="text-micro text-ink-mute">Liveness and current conclusions</p>
+            <p className="text-micro text-ink-mute">Whether each one is running, and what they have concluded</p>
           </div>
         </div>
         <div className="text-micro text-ink-dim tabular-nums">
           {procError ? (
-            <span className="text-negative">telemetry unavailable</span>
+            <span className="text-negative">status unavailable</span>
           ) : processes ? (
             <span>
               <strong className="text-ink">{online}</strong> of {agents.length} healthy
@@ -134,29 +136,29 @@ export default function AgentSwarmTelemetry() {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Stat label="Open predictions" value={swarm ? swarm.open_predictions : '—'} />
           <Stat
-            label="Scorecards"
+            label="Track records"
             value={swarm ? swarm.scorecards.length : '—'}
             hint={swarm && swarm.scorecards.length === 0 ? 'none resolved yet' : undefined}
           />
           <Stat
-            label="Paired forecasts"
+            label="Checked against market odds"
             value={swarm ? swarm.calibration.paired_forecasts : '—'}
-            hint={swarm ? `${swarm.calibration.resolved} resolved` : undefined}
+            hint={swarm ? `${swarm.calibration.resolved} settled` : undefined}
           />
-          <Stat label="Contradictions" value={cons ? cons.contradictions : '—'} />
+          <Stat label="Disagreements" value={cons ? cons.contradictions : '—'} />
         </div>
 
         {cons && (
           <div className="mt-3 flex items-start gap-2 text-micro leading-relaxed">
             <GitBranch className="h-3.5 w-3.5 text-ink-mute mt-0.5 shrink-0" />
-            <p className="text-ink-dim">{cons.summary || 'No consensus report published yet.'}</p>
+            <p className="text-ink-dim">{cons.summary?.replace('single-agent only:', 'seen by one analyst only:') || 'No consensus report published yet.'}</p>
           </div>
         )}
 
         {cons && cons.stale_agents.length > 0 && (
           <div className="mt-2 flex items-center gap-2 text-micro text-caution">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>Context drift: {cons.stale_agents.join(',')}</span>
+            <span>Working from old data: {cons.stale_agents.map(agentName).join(', ')}</span>
           </div>
         )}
       </div>
@@ -167,8 +169,8 @@ export default function AgentSwarmTelemetry() {
         {agents.length === 0 && (
           <div className="p-6 text-center text-xs text-ink-mute">
             {!processes && !procError
-              ? 'Reading the roster…'
-              : processes?.agents?.[0]?.detail || 'No agent roster reported.'}
+              ? 'Checking the analysts…'
+              : processes?.agents?.[0]?.detail || 'No analysts reported.'}
           </div>
         )}
 
@@ -184,7 +186,7 @@ export default function AgentSwarmTelemetry() {
                     className={`h-2 w-2 rounded-full shrink-0 ${STATUS_TONE[ag.status] || 'bg-ink-mute'}`}
                     title={ag.status}
                   />
-                  <span className="text-xs text-ink truncate">{ag.name?.replace(/_/g, ' ')}</span>
+                  <span className="text-xs text-ink truncate" title={ag.name ?? undefined}>{agentName(ag.name)}</span>
                 </div>
                 <div className="flex items-center gap-3 text-micro text-ink-mute shrink-0 tabular-nums">
                   {typeof ag.processed === 'number' && (
@@ -200,7 +202,7 @@ export default function AgentSwarmTelemetry() {
                   <span className="px-1.5 py-0.5 rounded bg-overlay/80 text-ink-dim">
                     {ag.model || 'model unreported'}
                   </span>
-                  <span className="uppercase tracking-wide">{ag.tier}</span>
+                  <span>{agentTier(ag.tier)}</span>
                 </div>
               </div>
             </li>
@@ -210,13 +212,13 @@ export default function AgentSwarmTelemetry() {
         {swarm && swarm.bulletins.length > 0 && (
           <div className="border-t border-line">
             <div className="px-4 py-2 flex items-center gap-2 text-micro uppercase tracking-wider text-ink-mute">
-              <Activity className="h-3 w-3" /> Open bulletins
+              <Activity className="h-3 w-3" /> Latest notes
             </div>
             <ul className="divide-y divide-line/70">
               {swarm.bulletins.slice(0, 8).map((b, i) => (
                 <li key={i} className="px-4 py-2 text-micro">
                   <div className="flex items-center gap-2 text-ink-mute">
-                    <span className="text-accent">{b.agent_name?.replace(/_/g, ' ')}</span>
+                    <span className="text-accent" title={b.agent_name}>{agentName(b.agent_name)}</span>
                     <span>·</span>
                     <span>{b.bulletin_type}</span>
                     {b.ticker && <span className="text-ink-dim">{b.ticker}</span>}
@@ -236,12 +238,15 @@ export default function AgentSwarmTelemetry() {
             <ul className="divide-y divide-line/70">
               {swarm.scorecards.map((s) => (
                 <li
-                  key={s.agent_name}
+                  key={`${s.agent_name}:${s.scope ?? ''}`}
                   className="px-4 py-2 flex items-center justify-between text-micro"
                 >
-                  <span className="text-ink-dim">{s.agent_name?.replace(/_/g, ' ')}</span>
+                  <span className="min-w-0 truncate text-ink-dim" title={s.agent_name}>
+                    {agentName(s.agent_name)}
+                    <span className="text-ink-mute"> · {scopeLabel(s.scope)}</span>
+                  </span>
                   <span className="text-ink-mute tabular-nums">
-                    {s.predictions_correct ?? 0}/{s.predictions_made ?? 0} · weight{''}
+                    {s.predictions_correct ?? 0} of {s.predictions_made ?? 0} right · weight{' '}
                     {(s.consensus_weight ?? 0).toFixed(2)}
                   </span>
                 </li>

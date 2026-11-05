@@ -28,9 +28,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from shared.utils import factor_model as fm
+from shared.utils.auto_trade import MIN_SCORES_TO_REBUILD
 from shared.utils import fundamentals_pit as fpit
 from shared.utils.asset_universe import load_asset_meta
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.signal_store import FACTOR_REPORT_KEY, FACTOR_SCORES_KEY, factor_scores_key
 
 logger = logging.getLogger("agent.factor_engine")
@@ -54,6 +55,8 @@ _SESSIONS_AFTER_SQL = """
 RUN_HOUR_UTC = 22            # after the close, after the day's bars land
 RESULT_TTL_SEC = 3 * 86400
 LOAD_BATCH = 150             # tickers per panel query
+READ_ATTEMPTS = 4
+READ_RETRY_WAIT_SEC = 30.0
 
 # Only names that can ever be ranked: a ticker with fewer bars than the model's
 # history requirement would occupy a panel column and never be scored.
@@ -239,9 +242,31 @@ _FINRA_SQL = """
 """
 
 
+class _PatientReads:
+    """The pool's 60 s statement timeout, retried for reads. The run makes hundreds
+    of chunked reads and the first timeout lost all of them: on 4 Nov 2026, with
+    the database catching up after an outage, one fundamentals chunk failed the
+    night's catch-up and left the platform without scores until the next slot."""
+
+    def __init__(self, db: Any, attempts: int = READ_ATTEMPTS, wait_sec: float = READ_RETRY_WAIT_SEC):
+        self._db, self._attempts, self._wait = db, attempts, wait_sec
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._db, name)
+
+    async def query(self, sql: str, *params: Any) -> Any:
+        for attempt in range(self._attempts - 1):
+            try:
+                return await self._db.query(sql, *params)
+            except asyncio.TimeoutError as exc:
+                swallowed("agents.factor_engine.read_timeout", exc, logger, detail=f"attempt {attempt + 1}")
+                await asyncio.sleep(self._wait)
+        return await self._db.query(sql, *params)
+
+
 class FactorEngine:
     def __init__(self, db: Any, redis_client: Any):
-        self.db = db
+        self.db = _PatientReads(db)
         self.redis = redis_client
 
     async def _fundamentals(self, dates: List[date], tickers: List[str], since: date) -> Dict[str, Any]:
@@ -413,7 +438,7 @@ class FactorEngine:
             # Shortable and easy to borrow today; names gone from the list
             # (delisted) are not assumed lendable.
             panel.extra["borrowable"] = np.array([bool(t in meta and meta[t][1] and meta[t][2]) for t in tickers])
-        return panel
+        return fm.complete_sessions(panel)
 
     async def run_once(self) -> Dict[str, Any]:
         panel = await self._panel()
@@ -484,6 +509,14 @@ class FactorEngine:
             )
         except Exception as e:
             logger.warning("Model run not archived: %s", e)
+        # A thin run reports and is archived, but its scores replace nothing: on
+        # 3 Nov 2026 94 names became the latest ranking, and every reader of the
+        # latest date took that as the universe. The last full set stays stored.
+        if len(scores) < MIN_SCORES_TO_REBUILD:
+            dropped("agents.factor_engine.thin_scores", "too few scores to publish; the stored set stands", logger,
+                    detail=f"{len(scores)} of at least {MIN_SCORES_TO_REBUILD}")
+            return {"universe": report["universe"], "tradable": report.get("tradable"), "scored": len(scores),
+                    "scores_withheld": 1}
         await raw.set(FACTOR_SCORES_KEY, json.dumps(scores), ex=RESULT_TTL_SEC)
         for h, sc in horizon_scores.items():
             await raw.set(factor_scores_key(h), json.dumps(sc), ex=RESULT_TTL_SEC)

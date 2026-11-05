@@ -87,6 +87,14 @@ def _financial_facts(evt: dict) -> str:
         except (TypeError, ValueError) as _exc:
             swallowed("reasoning.context_builder._financial_facts", _exc, logger)
 
+    # Who initiated the trade, inferred at enrichment. Without it a sale at the bid
+    # and a purchase at the offer read the same; absent when no side could be read.
+    tags = evt.get("tags") or []
+    if "buyer_initiated" in tags or "aggressor_buy" in tags:
+        parts.append("buyer-initiated (inferred)")
+    elif "seller_initiated" in tags or "aggressor_sell" in tags:
+        parts.append("seller-initiated (inferred)")
+
     return f" [{'; '.join(parts)}]" if parts else ""
 
 
