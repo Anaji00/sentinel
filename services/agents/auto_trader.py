@@ -335,7 +335,11 @@ class AutoTrader:
         weights = at.cap_weights(weights, _setting("AUTO_TRADE_MAX_NAME_WEIGHT", 0.03))
         target = at.target_shares(weights, equity, prices)
         plans = at.plan_orders(target, held, managed, prices)
-        adv = {str(r["ticker"]).upper(): float(r["adv"] or 0.0)
+        plans, skipped = at.without_unshortable(plans, await self._unshortable())
+        for p in skipped:
+            dropped("agents.auto_trader.unshortable", "a short was not opened: the venue marks the name unshortable",
+                    logger, detail=f"{p.symbol} {p.reason}")
+        adv ={str(r["ticker"]).upper(): float(r["adv"] or 0.0)
                for r in await self.db.query(_ADV_SQL, [p.symbol for p in plans]) or []}
         participation = _setting("AUTO_TRADE_MAX_ADV_SHARE", 0.01)
         plans = [at.liquidity_capped(p, prices.get(p.symbol, 0.0), adv.get(p.symbol), participation) for p in plans]
@@ -407,6 +411,19 @@ class AutoTrader:
             swallowed("agents.auto_trader.asset_meta", exc, logger)
             return None
         return {t.upper() for t, m in meta.items() if m and m[0] == "stock"} or None
+
+    async def _unshortable(self) -> Set[str]:
+        """Symbols the venue's asset list currently marks not shortable; empty when the list is unavailable (the venue
+        then refuses the order itself, as before)."""
+        if self.raw is None:
+            return set()
+        try:
+            from shared.utils.asset_universe import load_asset_meta
+            meta = await load_asset_meta(self.raw)
+        except Exception as exc:
+            swallowed("agents.auto_trader.asset_meta", exc, logger)
+            return set()
+        return {t.upper() for t, m in meta.items() if len(m) > 1 and not m[1]}
 
     async def _freeze_alert_weights(self, book: Dict[str, Any]) -> Dict[str, Any]:
         """The book with its alert-based weights fixed at the rebuild. A book without them (new, or stored before this

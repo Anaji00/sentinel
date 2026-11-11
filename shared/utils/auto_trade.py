@@ -263,6 +263,19 @@ def plan_orders(target: Mapping[str, float], held: Mapping[str, float], managed:
     return first + then
 
 
+def without_unshortable(plans: Sequence[Plan], unshortable: Set[str]) -> Tuple[List[Plan], List[Plan]]:
+    """(kept, skipped): orders that would open or add to a short on a name the venue marks unshortable are skipped.
+    Closes, trims and flip-closes are never skipped; a name the venue says nothing about is not in `unshortable`."""
+    kept: List[Plan] = []
+    skipped: List[Plan] = []
+    for p in plans:
+        if p.side == "sell" and p.reason in ("open", "add", "flip-open") and p.symbol.upper() in unshortable:
+            skipped.append(p)
+        else:
+            kept.append(p)
+    return kept, skipped
+
+
 # ── Safety: per-name caps, liquidity, limit prices, halts ────────────────────
 #
 # FIA and CFTC guidance for automated trading: a kill switch that stops new
@@ -328,6 +341,6 @@ def execution_halt(sent: int, failed: int, max_fail_share: float, min_orders: in
     return None
 
 
-__all__ = ["B1_LONG", "B1_SHORT_MAX", "REBALANCE_SESSIONS", "b1_book", "rebalance_due", "INDEX_FUNDS", "MIN_ORDER_USD", "Plan", "plan_orders", "target_shares", "target_weights", "unplaced",
+__all__ = ["B1_LONG", "B1_SHORT_MAX", "REBALANCE_SESSIONS", "b1_book", "rebalance_due", "INDEX_FUNDS", "MIN_ORDER_USD", "Plan", "plan_orders", "without_unshortable", "target_shares", "target_weights", "unplaced",
            "whole_share_leg", "alert_risk_weights", "cap_weights", "execution_halt", "limit_price", "liquidity_capped", "picks_only",
            "safety_halts"]
