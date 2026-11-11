@@ -134,11 +134,16 @@ def compare(preds: Sequence[PredRow], industry: np.ndarray, beta: Optional[np.nd
                 m = float(market[row])
                 if not (np.isfinite(bl) and np.isfinite(bs) and np.isfinite(m)) or bl <= 0:
                     continue
+                # `r` is a stock's return relative to SPY and `m` SPY's log return, so a leg's own
+                # simple return is (1 + relative) * (1 + SPY) - 1.
+                spy = math.expm1(m)
+                leg_l = (1.0 + float(r[long_pos].mean())) * (1.0 + spy) - 1.0
+                leg_s = (1.0 + float(r[short_pos].mean())) * (1.0 + spy) - 1.0
                 if name == "beta_neutral":
                     k = bs / bl
-                    rets.append(float(k * (r[long_pos].mean() + m) - (r[short_pos].mean() + m)))
+                    rets.append(float(k * leg_l - leg_s))
                 else:
-                    rets.append(float(bs * m - (r[short_pos].mean() + m)))
+                    rets.append(float(bs * spy - leg_s))
                 betas.append(0.0)              # hedged to the short leg's beta by construction
             else:
                 rets.append(float(r[long_pos].mean() - r[short_pos].mean()))
@@ -521,6 +526,12 @@ def run(panel: Any, model_name: str, horizon_models: Optional[Dict[str, str]] = 
     preds: List[PredRow] = []
     picks: List[Tuple[int, int, int, float, float]] = []
     fm.walk_forward(panel, model_name, spec=spec, feats=feats, collect=picks, collect_preds=preds)
+    # The walk-forward collects log excess returns. A book earns the simple return, and averaging logs
+    # credits a short with half its variance (MODEL_TRIALS.md, 5 Nov 2026), so every book and the sizing
+    # layer are scored on simple returns. The calibration and regime IC below keep the log values (ranks are unchanged).
+    log_preds = preds
+    preds = [(i, c, p, np.expm1(r)) for i, c, p, r in log_preds]
+    picks = [(i, j, s, pr, math.expm1(f)) for i, j, s, pr, f in picks]
     industry = panel.extra.get("industry")
     if industry is None:
         industry = np.full(len(panel.tickers), -1)
@@ -546,12 +557,12 @@ def run(panel: Any, model_name: str, horizon_models: Optional[Dict[str, str]] = 
         res["meta_sized"] = ml.walk_forward(P, X, cost=2 * cost, horizon=spec.horizon, embargo=spec.embargo)
         # The classifier on all of it, for the trade ideas once runs confirm it.
         res["meta_model"] = ml.fit_final(P, X, 2 * cost)
-        res["ic_by_regime"] = ic_by_regime(preds, panel.close[:, panel.tickers.index("SPY")])
+        res["ic_by_regime"] = ic_by_regime(log_preds, panel.close[:, panel.tickers.index("SPY")])
         if eq_labels is not None:
             res["equity_regime"] = by_equity_regime(preds, eq_labels, er.MULTIPLIER, spec.horizon, cost)
     # How far the forecasts run, not only which way: each horizon's raw
     # Grinold-Kahn alpha against what followed (shared/utils/expected_returns.py).
-    res["alpha_calibration"] = {"monthly": alpha_calibration(panel, preds, spec.horizon)}
+    res["alpha_calibration"] = {"monthly": alpha_calibration(panel, log_preds, spec.horizon)}
     others = dict(horizon_models or {})
     others.setdefault("weekly", model_name)
     for h in ("weekly", "daily"):

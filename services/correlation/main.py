@@ -69,6 +69,7 @@ async def _calibrated(redis_client, raw_confidence: float):
 
 from shared.models.events import Domain, EventType
 from shared.models.correlation_rules import (
+    max_distinct_clauses,
     CONVERGENCE_TYPE_TARGET,
     JOIN_KEYS,
     SEED_RULE_KEY,
@@ -189,7 +190,7 @@ def _assert_rules_can_see_their_evidence(rules) -> None:
         )
 
 
-RULE_DEFINITION_VERSION = 9
+RULE_DEFINITION_VERSION = 10   # 10: rule_physical_disruption_repricing no longer lists macro_release, which its move filter can never admit
 
 # What each tier is allowed to claim, per hour, before it stops being that tier.
 #
@@ -566,7 +567,7 @@ SHIPPED_RULES = [
         # less than equities, and a threshold set for a stock would silence the
         # rule on exactly the markets it is about.
         "correlations": [{
-            "event_types": ["supply_chain_metric", "price_anomaly", "macro_release", "market_anomaly"],
+            "event_types": ["supply_chain_metric", "price_anomaly", "market_anomaly"],
             "hours": 96, "min_anomaly": 0.25, "min_abs_move_pct": 1.5,
             "shared_tags": True,
         }],
@@ -910,6 +911,8 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                 # claim, it is a different claim -- and it is published under the
                 # name of the first.
                 matched_clauses = 0
+                # The events each matched clause selected, so one event cannot be counted for two.
+                clause_hit_ids: list = []
                 declared_clauses = len(rule.get("correlations", []) or [])
                 # Per-clause type breadth, for the single-clause-many-types case.
                 breadth_by_clause = []
@@ -998,6 +1001,7 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
 
                     if hits:
                         matched_clauses += 1
+                        clause_hit_ids.append({str(h.get("event_id")) for h in hits})
                         # How many of the clause's own declared types actually
                         # appeared, not merely that the clause matched at all.
                         #
@@ -1101,6 +1105,13 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                         "convergence, so not published.",
                         rule.get("rule_id", "unknown"), declared_clauses, matched_clauses,
                     )
+                    continue
+
+                if supporting_events and declared_clauses > 1 and max_distinct_clauses(clause_hit_ids) < required_clauses:
+                    # Two clauses answered by the same event are one observation, not a convergence.
+                    MetricsCollector.increment("correlation_rule_held_shared_evidence_total")
+                    logger.debug("Rule %s matched %d clauses on fewer distinct events than it needs; not published.",
+                                 rule.get("rule_id", "unknown"), matched_clauses)
                     continue
 
                 if len(supporting_events) > 0:

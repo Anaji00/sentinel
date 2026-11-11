@@ -403,7 +403,7 @@ async def track_record(
     Ideas by horizon; the board by its net vote and by which tier carried it --
     the test of whether the board's votes predict anything, published as it
     accumulates rather than asserted."""
-    from shared.utils.track_record import bucket_of, day_clustered_t, summarize
+    from shared.utils.track_record import IDEA_OVERLAP_DAYS, bucket_of, day_clustered_t, direction_skill, summarize
 
     out: Dict[str, Any] = {"ideas": {}, "board": {}, "pending": {}}
     if not db:
@@ -421,8 +421,13 @@ async def track_record(
     by_h: Dict[str, List[float]] = {}
     for r in ideas:
         by_h.setdefault(str(r["horizon"]), []).append(r["signed_excess"])
-    out["ideas"] = {h: summarize(v) for h, v in by_h.items()}
-    out["ideas"]["all"] = summarize([r["signed_excess"] for r in ideas])
+    called: Dict[str, List[Tuple[Any, Any]]] = {}
+    for r in ideas:
+        called.setdefault(str(r["horizon"]), []).append((r["direction"], r["signed_excess"], r["day"]))
+    # Additive: the hit rate beside what chance alone would give for the same mix of long and short calls.
+    out["ideas"] = {h: {**summarize(v), **direction_skill(called.get(h, []), IDEA_OVERLAP_DAYS.get(h, 5))} for h, v in by_h.items()}
+    out["ideas"]["all"] = {**summarize([r["signed_excess"] for r in ideas]),
+                           **direction_skill([(r["direction"], r["signed_excess"], r["day"]) for r in ideas], 5)}
     def dated(rows: List[Tuple[Any, float]], overlap: int) -> Dict[str, Any]:
         # Row t counts every stock-day as independent; t_days counts days.
         return {**summarize([x for _, x in rows]), **day_clustered_t(rows, overlap)}

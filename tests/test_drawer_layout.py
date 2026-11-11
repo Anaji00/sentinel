@@ -1,7 +1,7 @@
 """The stock drawer opens short: the essentials first, the rest folded and loaded only when opened.
 
-It had grown to seven sections and about ten requests on open. Nothing was removed: owners, patterns and
-related stocks sit under one "More about" row, and the secondary measures sit under "more measures".
+It had grown to seven sections and about ten requests on open. Nothing was removed: owners and related
+stocks sit under one "More about" row, and the secondary measures sit under "more measures".
 """
 from pathlib import Path
 
@@ -19,10 +19,11 @@ def test_the_essentials_come_first_and_the_rest_is_folded() -> None:
     assert order == sorted(order), "hero, what changed, bull and bear, then the folded section"
     start, end = drawer.index('<Disclosure variant="row"'), drawer.index("</Disclosure>")
     folded = drawer[start:end]
-    for part in ("<Owners", "<TickerEvidence", "<RelatedStocks"):
+    for part in ("<Owners", "<SourceFacts", "<RelatedStocks"):
         assert part in folded, f"{part} should sit under More about"
     for part in ("<TickerHero", "<WhatChanged", "<ThesisPanel"):
         assert part not in folded, f"{part} should stay visible"
+    assert "<TickerEvidence" not in drawer, "the 3-day evidence lives inside What changed, not as a second copy"
 
 
 def test_a_folded_section_is_not_rendered_or_fetched_until_opened() -> None:
@@ -38,8 +39,9 @@ def test_what_changed_keeps_trades_visible_and_folds_the_secondary_measures() ->
     changed = _read("components/WhatChanged.tsx")
     fold_start = changed.index('<Disclosure label="more measures"')
     fold = changed[fold_start:changed.index("</Disclosure>")]
-    for label in ('label="Options"', 'label="Short sellers"', 'label="Moves with"'):
+    for label in ('label="Options"', 'label="Short sellers"', 'label="Moves with"', 'label="Pattern read, last 3 days"'):
         assert label in fold, label
+    assert "<TickerEvidence ticker={ticker} bare />" in fold
     for label in ('label="Price"', 'label="Model rank"', 'label="Large trades"', 'label="Recent items"'):
         assert label in changed and label not in fold, f"{label} stays visible"
     assert "slice(0, 4)" in changed and "Show all" in changed

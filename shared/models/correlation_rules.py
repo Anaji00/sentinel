@@ -22,7 +22,7 @@ ignores and the reader cannot require one the writer has no way to send.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence, Set
 
 # ── What a clause may contain ───────────────────────────────────────────────
 
@@ -175,7 +175,32 @@ def trigger_event_types(rule: Any) -> Sequence[str]:
     return []
 
 
+def max_distinct_clauses(hit_sets: Sequence[Set[str]]) -> int:
+    """How many clauses can each be given an event of their own.
+
+    One event is one observation. A clause listing `market_anomaly` and another
+    listing it too would both match a single `market_anomaly`, and a rule
+    declaring two things would fire on one fact. This is a maximum matching between
+    clauses and the events each selected; the sets are small, so a plain augmenting
+    path search is enough.
+    """
+    owner: Dict[str, int] = {}
+
+    def assign(clause: int, seen: Set[str]) -> bool:
+        for event in hit_sets[clause]:
+            if event in seen:
+                continue
+            seen.add(event)
+            if event not in owner or assign(owner[event], seen):
+                owner[event] = clause
+                return True
+        return False
+
+    return sum(assign(c, set()) for c in range(len(hit_sets)))
+
+
 __all__ = [
+    "max_distinct_clauses",
     "CLAUSE_KEYS",
     "SEED_RULE_KEY",
     "CONVERGENCE_TYPE_TARGET",

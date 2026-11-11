@@ -9,6 +9,7 @@ leveraged funds, synthetic option yield ETFs, volatility ETNs, and derivatives.
 """
 
 import re
+from datetime import datetime
 from typing import Dict, List, Set, Tuple, Any, Optional
 from shared.utils.quiet_failures import swallowed
 
@@ -693,6 +694,10 @@ def parse_occ_option_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return None
     ticker, date_str, type_char, strike_str = m.groups()
     expiry = f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
+    try:
+        datetime.strptime(expiry, "%Y-%m-%d")      # 2026-13-01 and 2026-02-30 match the shape and name no day
+    except ValueError:
+        return None
     option_type = "CALL" if type_char.upper() == "C" else "PUT"
     strike = float(strike_str) / 1000.0
     return {

@@ -14,7 +14,8 @@ export type ButtonSize = 'sm' | 'md' | 'icon';
 const BUTTON_BASE = 'transition-colors disabled:cursor-not-allowed disabled:opacity-50';
 
 const VARIANT: Record<ButtonVariant, string> = {
-  primary: 'inline-flex items-center justify-center gap-1.5 rounded-md bg-accent font-semibold text-page hover:brightness-110',
+  primary:
+    'inline-flex items-center justify-center gap-1.5 rounded-md bg-accent font-semibold text-page shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] hover:brightness-110 active:brightness-95',
   secondary:
     'inline-flex items-center justify-center gap-1.5 rounded-lg border border-line-accent bg-accent-dim font-semibold text-accent enabled:hover:border-accent',
   outline:

@@ -1125,6 +1125,11 @@ PAYLOAD_MOVE_FIELDS = (
     ("supply_chain_data", ("change_14d_pct",)),
 )
 
+# Event types with no price move, by the mapping above. A clause that selects on
+# `min_abs_move_pct` can never admit one, so listing it there only makes the rule
+# look wider than it is (rule_physical_disruption_repricing did, until 5 Nov 2026).
+MOVE_BLIND_TYPES = frozenset({"macro_release"})
+
 
 def move_pct_sql(alias: str = "") -> str:
     """The same mapping as a SQL expression, for reads that go to Postgres.

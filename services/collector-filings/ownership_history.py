@@ -1,14 +1,14 @@
 """
 services/collector-filings/ownership_history.py
 
-Five years of institutional flows, so the reaction study can judge them.
+Institutional flows back to 2016, so the reaction study can judge them.
 
 The live loop (ownership.py) compares each tracked manager's latest 13F with
 the one before, and publishes an accumulation or distribution when three or
 more of the six active managers in FLOW_FILERS move the same way
 (shared/utils/ownership.py). It has only seen this autumn's filings, so both
 families sat at "insufficient data". Here every original 13F-HR those six
-filed in the last HISTORY_YEARS is read once (holdings cached in Redis, so a
+filed since FIRST_PERIOD is read once (holdings cached in Redis, so a
 restart resumes), consecutive quarters are compared the same way, and each
 flow goes into the study's archive stamped at the end of the day the last of
 the six filed for that quarter: the earliest moment every vote was public.
@@ -44,9 +44,13 @@ from shared.utils.sec_rate import sec_slot  # noqa: E402
 logger = logging.getLogger("collector.filings.ownership_history")
 
 SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "Sentinel-Intelligence-Platform/1.0 research@sentinel.local")}
-HISTORY_YEARS = 5
+# Daily prices begin in January 2016. The first period read is the quarter before
+# it, so the first flow is the one to 31 March 2016.
+FIRST_PERIOD = "2015-12-31"
 HOLDINGS_KEY = "sentinel:ownership:history:{cik}:{period}"     # one filing's {ticker: shares}
-DONE_KEY = "sentinel:ownership:history:done"
+# The five-year pass finished under "...:history:done"; its flows are re-derived
+# here (same ids, so skipped on conflict) and its cached holdings are reused.
+DONE_KEY = "sentinel:ownership:history:done:from2016"
 NY = ZoneInfo("America/New_York")
 _ARCHIVE_SQL = """
     INSERT INTO signal_event_archive (event_id, type, source, created_at, occurred_at, headline, summary, tags,
@@ -150,7 +154,7 @@ async def run_once(resolve: Callable[[str, Optional[str]], Optional[str]]) -> in
     raw = getattr(await get_redis(), "raw", None)
     if await raw.get(DONE_KEY):
         return 0
-    since = (date.today() - timedelta(days=365 * HISTORY_YEARS + 120)).isoformat()
+    since = FIRST_PERIOD
     per_period: Dict[str, Dict[str, Tuple[str, Dict[str, float]]]] = {}
     cusip_cache: Dict[str, Optional[str]] = {}
     async with aiohttp.ClientSession() as session, aiohttp.ClientSession(headers=SEC_HEADERS) as sec:

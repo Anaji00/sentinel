@@ -14,13 +14,18 @@ the 8-K families read history and live filings identically.
 
 One request per company, paced under SEC's fair-access limit, and each company
 is done once (Redis set), so a restart resumes rather than refetches.
+
+The main submissions file lists only a company's most recent ~1,000 filings;
+the rest sit in the older pages named under filings.files, same columns at the
+top level. The window opens at HISTORY_START (the first daily price bar), and a
+company's older pages are fetched only when they reach back into the window.
 """
 from __future__ import annotations
 
 import asyncio
 import re
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from shared.utils.quiet_failures import swallowed
@@ -29,7 +34,17 @@ from shared.utils.sec_rate import sec_slot
 logger = logging.getLogger("collector_filings.history")
 
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:0>10}.json"
-HISTORY_YEARS = 5
+SUBMISSIONS_PAGE_URL = "https://data.sec.gov/submissions/{name}"
+# Daily prices begin on 4 January 2016, so history before it could not be measured.
+HISTORY_START = datetime(2016, 1, 1, tzinfo=timezone.utc)
+# Tickers finished for this window. The earlier set (five years, recent filings
+# only) is left alone: its companies are fetched again for the older pages, and
+# the rows they already archived are skipped on conflict.
+DEEP_DONE_SUFFIX = ":from2016"
+# A company whose older pages keep failing is parked after this many passes.
+MAX_ATTEMPTS = 3
+# Dealer-bank filers run to a hundred pages; past this a company is cut short and counted.
+MAX_PAGES_PER_COMPANY = 400
 # SEC asks for no more than ten requests a second.
 REQUEST_SPACING_SEC = 0.15
 
@@ -53,25 +68,46 @@ def _accepted(raw: str) -> Optional[datetime]:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
+def older_page_names(submissions: Dict[str, Any], since: datetime) -> List[str]:
+    """Names of the older submissions pages that reach into the window. Pure."""
+    cutoff = since.date().isoformat()
+    names = []
+    for f in ((submissions or {}).get("filings") or {}).get("files") or []:
+        name = str(f.get("name") or "")
+        if name and str(f.get("filingTo") or "9999-12-31") >= cutoff:
+            names.append(name)
+    return names
+
+
 def eight_k_rows(
     ticker: str,
     company: str,
     submissions: Dict[str, Any],
     descriptions: Dict[str, str],
     since: datetime,
+    older_pages: Iterable[Dict[str, Any]] = (),
 ) -> List[tuple]:
-    """Archive rows for every 8-K accepted since `since`. Pure."""
+    """Archive rows for every 8-K accepted since `since`, from the recent
+    filings and any older pages (same columns, at the top level). Pure."""
     recent = ((submissions or {}).get("filings") or {}).get("recent") or {}
-    forms = recent.get("form") or []
+    rows: List[tuple] = []
+    for page in [recent, *older_pages]:
+        rows.extend(_page_rows(ticker, company, page or {}, descriptions, since))
+    return rows
+
+
+def _page_rows(ticker: str, company: str, page: Dict[str, Any], descriptions: Dict[str, str],
+               since: datetime) -> List[tuple]:
+    forms = page.get("form") or []
     rows: List[tuple] = []
     for i, form in enumerate(forms):
         if form != "8-K":
             continue
         try:
-            accepted = _accepted(recent["acceptanceDateTime"][i])
-            accession = recent["accessionNumber"][i]
-            items_raw = recent.get("items", [""] * len(forms))[i] or ""
-            filed = recent.get("filingDate", [""] * len(forms))[i] or ""
+            accepted = _accepted(page["acceptanceDateTime"][i])
+            accession = page["accessionNumber"][i]
+            items_raw = page.get("items", [""] * len(forms))[i] or ""
+            filed = page.get("filingDate", [""] * len(forms))[i] or ""
         except (KeyError, IndexError):
             continue
         if accepted is None or accepted < since:
@@ -102,13 +138,15 @@ async def backfill_8k_history(
     tickers_to_cik: Dict[str, str],
     descriptions: Dict[str, str],
     done_key: str,
-    years: int = HISTORY_YEARS,
+    since: datetime = HISTORY_START,
+    extra_spacing_sec: float = 0.0,
 ) -> Dict[str, int]:
-    """8-K history for every ticker not yet done. Returns counts."""
+    """8-K history since `since` for every ticker not yet done. Returns counts."""
     raw = getattr(redis_client, "raw", redis_client)
+    done_key = done_key + DEEP_DONE_SUFFIX
+    attempts_key = done_key + ":attempts"
     done = {(m.decode() if isinstance(m, bytes) else str(m)) for m in (await raw.smembers(done_key) or [])}
-    since = datetime.now(timezone.utc) - timedelta(days=365 * years)
-    stats = {"companies": 0, "filings": 0, "errors": 0}
+    stats = {"companies": 0, "filings": 0, "pages": 0, "errors": 0, "truncated": 0}
     for ticker, cik in sorted(tickers_to_cik.items()):
         if ticker in done or not cik:
             continue
@@ -124,19 +162,42 @@ async def backfill_8k_history(
                     await raw.sadd(done_key, ticker)   # nothing to fetch; do not retry forever
                     continue
                 payload = await resp.json(content_type=None)
-            rows = eight_k_rows(ticker, payload.get("name") or ticker, payload, descriptions, since)
-            for row in rows:
-                await db.execute(_INSERT_SQL, *row)
+            names = older_page_names(payload, since)
+            if len(names) > MAX_PAGES_PER_COMPANY:
+                stats["truncated"] += 1
+                names = names[:MAX_PAGES_PER_COMPANY]
+            pages: List[Dict[str, Any]] = []
+            complete = True
+            for name in names:
+                await sec_slot()
+                async with session.get(SUBMISSIONS_PAGE_URL.format(name=name), headers=headers) as presp:
+                    if presp.status != 200:
+                        if presp.status == 429:
+                            logger.warning("SEC throttled the history backfill; pausing a minute.")
+                            await asyncio.sleep(60)
+                        stats["errors"] += 1
+                        complete = False
+                        break
+                    pages.append(await presp.json(content_type=None))
+                stats["pages"] += 1
+                await asyncio.sleep(REQUEST_SPACING_SEC + extra_spacing_sec)
+            rows = eight_k_rows(ticker, payload.get("name") or ticker, payload, descriptions, since, pages)
+            for i in range(0, len(rows), 500):
+                await db.execute_many(_INSERT_SQL, rows[i:i + 500])
             stats["companies"] += 1
             stats["filings"] += len(rows)
-            await raw.sadd(done_key, ticker)
+            if complete:
+                await raw.sadd(done_key, ticker)
+            elif int(await raw.hincrby(attempts_key, ticker, 1)) >= MAX_ATTEMPTS:
+                logger.warning("8-K history for %s parked after %s incomplete passes.", ticker, MAX_ATTEMPTS)
+                await raw.sadd(done_key, ticker)
         except Exception as e:
             stats["errors"] += 1
             swallowed("collector_filings.history.company", e, logger, detail=ticker)
-        await asyncio.sleep(REQUEST_SPACING_SEC)
+        await asyncio.sleep(REQUEST_SPACING_SEC + extra_spacing_sec)
     if stats["companies"]:
-        logger.info("EDGAR 8-K history: %s companies, %s filings archived, %s errors.",
-                    stats["companies"], stats["filings"], stats["errors"])
+        logger.info("EDGAR 8-K history: %s companies, %s filings archived from %s pages, %s errors, %s truncated.",
+                    stats["companies"], stats["filings"], stats["pages"], stats["errors"], stats["truncated"])
     return stats
 
 
@@ -222,4 +283,5 @@ def universe_ciks(cik_to_ticker: Dict[str, str], tickers: Iterable[str]) -> Dict
     return {t.upper(): inverse[t.upper()] for t in tickers if t and t.upper() in inverse}
 
 
-__all__ = ["backfill_8k_history", "backfill_profiles", "eight_k_rows", "profile_row", "universe_ciks"]
+__all__ = ["HISTORY_START", "backfill_8k_history", "backfill_profiles", "eight_k_rows", "older_page_names",
+           "profile_row", "universe_ciks"]

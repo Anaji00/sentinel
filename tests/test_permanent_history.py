@@ -145,3 +145,18 @@ def test_the_study_reads_filings_before_its_one_year_window() -> None:
     assert deep, "no deep pass over filings"
     start, end, _t, step = deep[0]
     assert (end - start).days >= se.HISTORY_LOOKBACK_DAYS - se.STUDY_LOOKBACK_DAYS - 1 and step == 30
+
+
+def test_headline_is_studied_deep_and_one_hour_never_reads_daily_points():
+    """Headline families (country/sector news, zone moves, stock news) reach the
+    archive's whole span at the daily horizons; the 1h horizon stays on intraday."""
+    import inspect
+    import services.agents.signal_engine as se
+
+    assert "headline" in se.DEEP_HISTORY_TYPES
+    assert "insider_cluster" in se.DEEP_HISTORY_TYPES  # G3 rebuilt clusters, 2016 on
+    # The archive's headlines start in Sept 2019; the window must reach past it.
+    assert se.HISTORY_LOOKBACK_DAYS >= 7 * 365 + 120
+    src = inspect.getsource(se.SignalEngine.run_study)
+    assert "use = series if h >= timedelta(days=1) else intraday" in src
+    assert "bench = matched[e.known_at] if h >= timedelta(days=1) else bench_intraday" in src

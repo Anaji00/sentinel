@@ -18,6 +18,7 @@ import { ABSENT, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { rankWords } from '../lib/ideas';
 import { LoadingLines } from './ui/Skeleton';
+import { Term } from './ui/Term';
 
 interface ModelReport {
   model: string;
@@ -179,7 +180,7 @@ export function ModelRanking() {
               rep.validated ? 'border-positive/30 text-positive' : 'border-caution/30 text-caution'
             }`}
           >
-            {rep.validated ? `Validated · ${rep.chosen}` : 'Not validated'}
+            {rep.validated ? `Validated · ${rep.chosen}` : 'Not validated: deflated Sharpe needs 0.95'}
           </span>
         )}
       </div>
@@ -224,18 +225,26 @@ export function ModelRanking() {
               <thead className="text-ink-mute">
                 <tr className="border-b border-line">
                   <th className="py-1">Model</th>
-                  <th className="text-right">Mean IC</th>
-                  <th className="text-right">IC t</th>
+                  <th className="text-right">
+                    <Term word="ic">Mean IC</Term>
+                  </th>
+                  <th className="text-right">
+                    <Term word="t-statistic">IC t</Term>
+                  </th>
                   <th className="text-right">Folds +</th>
                   <th className="text-right">L/S net bps</th>
-                  <th className="text-right">Net Sharpe</th>
+                  <th className="text-right">
+                    <Term word="sharpe">Net Sharpe</Term>
+                  </th>
                   <th
                     className="text-right"
                     title="Probability the Sharpe is real after correcting for the number of models tried (Bailey and Lopez de Prado). The gate needs 0.95."
                   >
-                    Deflated
+                    <Term word="deflated sharpe">Deflated (needs 0.95)</Term>
                   </th>
-                  <th className="text-right">Turnover</th>
+                  <th className="text-right">
+                    <Term word="turnover">Turnover</Term>
+                  </th>
                   <th className="pl-3">Verdict</th>
                 </tr>
               </thead>
@@ -310,6 +319,11 @@ export function ModelRanking() {
             · {formatNumber(rep.trading_days, { decimals: 0 })} trading days
             {rep.trials != null ? ` · deflated across ${rep.trials} trials` : ''} · as of{' '}
             {rep.as_of} · computed {formatAge(rep.generated_at)} ago. {rep.caveats.join('; ')}.
+          </p>
+          <p className="text-micro text-ink-mute">
+            Sharpe is scored on the return a position actually earns since 5 Nov 2026; earlier figures were higher and are not
+            comparable. Models whose scores sit within about 0.20 of each other cannot be told apart: that gap is inside the
+            noise between runs, so the order above is not a ranking of which is better.
           </p>
         </>
       )}

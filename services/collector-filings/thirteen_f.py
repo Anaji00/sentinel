@@ -58,14 +58,18 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
     "0001067983": {
         "id": "berkshire_hathaway",
         "name": "Berkshire Hathaway Inc",
-        "manager": "Warren Buffett",
+        # Greg Abel became CEO on 1 Jan 2026; Warren Buffett stays chairman. Checked 6 Nov 2026
+        # (board announcement, widely reported). One outlet says Buffett is now chairman emeritus: unconfirmed.
+        "manager": "Greg Abel / Warren Buffett (chair)",
         "cik": "0001067983",
         "style": "Deep Value / Long Horizon",
     },
     "0001350694": {
         "id": "bridgewater",
         "name": "Bridgewater Associates, LP",
-        "manager": "Ray Dalio / Bob Prince",
+        # Ray Dalio has fully exited the firm. Bob Prince is co-CIO and chairs the board, beside co-CIOs
+        # Greg Jensen and Karen Karniol-Tambour. Checked 6 Nov 2026.
+        "manager": "Bob Prince / Greg Jensen / Karen Karniol-Tambour",
         "cik": "0001350694",
         "style": "Global Macro / Risk Parity",
     },
@@ -88,6 +92,8 @@ PROMINENT_FILERS: Dict[str, Dict[str, Any]] = {
         "name": "Renaissance Technologies LLC",
         # Jim Simons died in May 2024. Removed rather than left to be
         # asserted in a headline about a 2026 filing.
+        # Peter Brown is CEO; David Lippe was named co-CEO, but the date was not confirmed on 6 Nov 2026,
+        # so only the CEO who is certain is named.
         "manager": "Peter Brown",
         "cik": "0001037389",
         "style": "Quantitative Systematic",

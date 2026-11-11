@@ -2705,6 +2705,14 @@ MIGRATIONS = [
             ON CONFLICT (cusip) DO NOTHING;
         """,
         "transactional": True
+    },
+    {
+        "version": "0088_auto_trade_client_order_id",
+        "sql": """
+            -- Finds an order whose response was lost; status 'unknown' means just that.
+            ALTER TABLE auto_trade_orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+        """,
+        "transactional": True
     }
 ]
 

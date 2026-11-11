@@ -75,3 +75,35 @@ def test_archive_rows_keep_opportunistic_trades_and_routine_buys() -> None:
     rows = mod._archive_rows(trades, classes, date(2020, 1, 1))
     assert [r[0] for r in rows] == ["f345:A1:111:P"]                         # routine buy kept, routine sale not
     assert "insider_routine" in rows[0][5] and rows[0][6] == "AAPL"
+
+
+def _loader():
+    spec = importlib.util.spec_from_file_location("insider_loader", ROOT / "services" / "collector-filings" / "insider_history.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_quarter_bounds_and_the_deep_windows() -> None:
+    m = _loader()
+    assert m.quarter_bounds(2016, 1) == (date(2016, 1, 1), date(2016, 4, 1))
+    assert m.quarter_bounds(2020, 4) == (date(2020, 10, 1), date(2021, 1, 1))
+    assert m.ARCHIVE_START == date(2016, 1, 1) and m.LOAD_START == (2013, 1)
+    # Three prior years of trades exist for every quarter archived.
+    assert ih.quarters(m.ARCHIVE_START, m.LOAD_START)[0] == (2013, 1) and ih.quarters(m.ARCHIVE_START, m.LOAD_START)[-1] == (2015, 4)
+    qs = m.archive_quarters(date(2026, 11, 7))
+    assert qs[0] == (2016, 1) and qs[-1] == (2021, 4) and len(qs) == 24     # up to the quarter of 1 Nov 2021
+    assert m.archive_quarters(date(2026, 2, 3))[-1] == (2021, 1)
+
+
+def test_table_rows_become_trades_with_their_stored_classes() -> None:
+    m = _loader()
+    row = {"accession": "A1", "line": "1", "owner_cik": "111", "filed": date(2017, 3, 3), "traded": date(2017, 3, 1),
+           "issuer_cik": "5", "ticker": "AAPL", "owner_name": "Cook", "relationship": "Officer", "title": "CEO",
+           "code": "P", "shares": 10, "price": None, "planned": None, "insider_class": "routine"}
+    trades, current = m.trades_from_rows([row])
+    assert trades[0].price is None and trades[0].planned is False and trades[0].shares == 10.0
+    assert current == {("A1", "1", "111"): "routine"}
+    rows = m._archive_rows(trades, {("A1", "1", "111"): "routine"}, m.ARCHIVE_START)
+    assert rows and rows[0][0] == "f345:A1:111:P"                           # a 2017 purchase now reaches the archive
+    assert m._archive_rows(trades, {("A1", "1", "111"): "routine"}, date(2018, 1, 1)) == []

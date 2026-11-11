@@ -535,7 +535,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
   const [showZones, setShowZones] = useState(true);
   const [showWarnings, setShowWarnings] = useState(true);
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
-  const [zonePanelOpen, setZonePanelOpen] = useState(true);
+  const [zonePanelOpen, setZonePanelOpen] = useState(false);
   const [chokeOpen, setChokeOpen] = useState(true);
   const [legendOpen, setLegendOpen] = useState(false);
   const [zonePanelTab, setZonePanelTab] = useState<'zones' | 'exposed'>('zones');
@@ -823,7 +823,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
         </div>
 
         {/* Layer Control Buttons */}
-        <div className="flex items-center gap-1 text-micro overflow-x-auto">
+        <div className="flex flex-wrap items-center gap-1 text-micro">
           <button
             onClick={() => {
               setShowVessels(true);
@@ -1304,7 +1304,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
 
       {/* Conflict zones: the list, or one zone's detail. */}
       {showZones && conflict && conflict.zones.length > 0 && (
-        <div className="absolute top-14 right-3 z-20 bg-page/95 border border-negative/40 p-3 rounded-xl w-80 max-h-[calc(100%-8rem)] overflow-y-auto text-xs shadow-2xl">
+        <div className="absolute top-24 right-3 z-20 bg-page/95 border border-negative/40 p-3 rounded-xl w-80 max-h-[calc(100%-9rem)] overflow-y-auto text-xs shadow-2xl">
           {selectedZone ? (
             <ConflictZoneDetail zone={selectedZone} onBack={() => setSelectedZoneId(null)} />
           ) : (

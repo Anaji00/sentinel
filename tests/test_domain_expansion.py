@@ -268,13 +268,15 @@ def test_filings_api_gateway_routes():
     filers = res_prominent.json()
     assert len(filers) >= 6
     manager_names = [f["manager_name"] for f in filers]
-    assert any("Buffett" in m for m in manager_names)
+    # Greg Abel has been Berkshire's CEO since 1 Jan 2026; Buffett remains chairman. The roster names both.
+    assert any("Abel" in m and "Buffett" in m for m in manager_names)
+    assert not any("Dalio" in m for m in manager_names), "Dalio has fully exited Bridgewater"
 
     # 3. 13F portfolio detail for Berkshire Hathaway
     res_berkshire = client.get("/api/v1/filings/13f/berkshire_hathaway", cookies=cookies)
     assert res_berkshire.status_code == 200
     berkshire_data = res_berkshire.json()
-    assert berkshire_data["manager_name"] == "Warren Buffett"
+    assert "Abel" in berkshire_data["manager_name"]
     assert "total_portfolio_value_usd" in berkshire_data
 
     # 4. Consensus for ticker

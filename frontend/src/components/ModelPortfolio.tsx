@@ -14,6 +14,10 @@ import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { LoadingLines } from './ui/Skeleton';
+import { Disclosure } from './ui/Disclosure';
+import { Term } from './ui/Term';
+import { Updated } from './ui/Updated';
+import { portfolioVerdict, type VerdictTone } from '../lib/portfolioVerdict';
 
 interface Order {
   decided_on: string;
@@ -109,6 +113,10 @@ const ACTION_TONE: Record<Order['action'], string> = {
   COVER: 'border-accent/50 text-accent',
 };
 
+const TILE_TERM: Record<string, string> = { 'How far it strays': 'tracking error', 'Reward for that risk': 'information ratio' };
+
+const VERDICT_TONE: Record<VerdictTone, string> = { positive: 'text-positive', negative: 'text-negative', neutral: 'text-ink' };
+
 const pct = (v: number | null | undefined, signed = false) =>
   v == null ? ABSENT : `${formatNumber(v, { decimals: 2, signed })}%`;
 
@@ -164,27 +172,15 @@ function Holdings({ title, rows, tone }: { title: string; rows: Holding[]; tone:
 export function ModelPortfolio() {
   const { data, error } = useSWR<PortfolioData>('/predictions/model-portfolio', fetcher, { refreshInterval: POLL.slow });
   const s = data?.summary;
+  const verdict = portfolioVerdict(s?.excess_pct, s?.sessions);
   const latest = data?.orders.length ? data.orders[0].decided_on : null;
   const latestOrders = (data?.orders ?? []).filter((o) => o.decided_on === latest);
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
-      <h2 className="font-bold text-ink text-sm">Model portfolio: can it beat the S&amp;P 500?</h2>
-      <p className="text-ink-dim">
-        A pretend portfolio, run as if it were real. Most of it sits in an S&amp;P 500 fund. On top of that it buys
-        the stocks our model likes best in each industry and bets against the ones it likes least (only stocks that
-        are easy to bet against), each side about{' '}
-        {data ? formatNumber(data.design.overlay_gross * 100, { decimals: 0 }) : '30'}% of the portfolio. Because the
-        buys and the bets against roughly cancel out the market&apos;s ups and downs, anything it earns beyond the
-        S&amp;P 500 comes from picking the right stocks. It reshuffles every{' '}
-        {data?.design.rebalance_sessions ?? 21}{' '}trading days and only drops a stock once it falls well out of favour.
-        Every trade is filled at the next morning&apos;s opening price, after trading costs and fees.
-      </p>
-      <p className="text-micro text-ink-mute">
-        Why it works this way: tested on 2023–26 data the model had never seen, its buys on their own only beat the
-        S&amp;P 500 by holding riskier stocks. Its picks to avoid were the reliable part: they trailed the market by
-        about 2.5% a month. Together they earned about 1.9% a month more than the S&amp;P 500 while barely moving with
-        it, but that is only 32 months of evidence, so this portfolio is the live test. Not financial advice.
-      </p>
+    <section className="bg-raised border border-line rounded-xl p-5 space-y-4 text-xs">
+      <div className="flex flex-wrap items-baseline gap-x-3">
+        <h2 className="font-semibold text-ink text-head">Model portfolio</h2>
+        <Updated source="/predictions/model-portfolio" pollMs={60_000} />
+      </div>
       {error ? (
         <p className="text-ink-mute">The portfolio could not be read.</p>
       ) : !data ? (
@@ -193,36 +189,44 @@ export function ModelPortfolio() {
         <p className="text-ink-mute">The first orders are placed after the next model run.</p>
       ) : (
         <>
-          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <div className="text-micro uppercase tracking-[0.08em] text-ink-mute">Is it beating the market?</div>
+              <div className={`mt-1 text-lead font-semibold ${VERDICT_TONE[verdict.tone]}`}>{verdict.word}</div>
+              <div className="mt-0.5 text-xs text-ink-dim">{verdict.note}</div>
+            </div>
+            <div className="flex items-end gap-5 font-mono">
+              <div>
+                <div className={`text-display font-semibold leading-none ${VERDICT_TONE[verdict.tone]}`}>
+                  {pct(s?.excess_pct, true)}
+                </div>
+                <div className="mt-1 text-micro text-ink-mute">versus the S&amp;P 500</div>
+              </div>
+              <div className="text-xs text-ink-dim">
+                <div>
+                  Portfolio <span className="text-ink">{pct(s?.return_pct, true)}</span>
+                </div>
+                <div>
+                  S&amp;P 500 <span className="text-ink">{pct(s?.spy_return_pct, true)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-2">
             {[
-              ['Portfolio', pct(s?.return_pct, true), ''],
-              ['S&P 500', pct(s?.spy_return_pct, true), ''],
-              ['Ahead of the S&P 500', pct(s?.excess_pct, true), ''],
               ['How far it strays', pct(s?.tracking_error_pct), 'Tracking error: how much its daily results differ from the S&P 500, a year'],
               ['Reward for that risk', s?.info_ratio != null ? formatNumber(s.info_ratio, { decimals: 2 }) : ABSENT, 'Information ratio: gain over the S&P 500 per unit of straying; above 0.5 is good'],
               ['Days ahead', s?.ahead_share != null ? `${formatNumber(s.ahead_share * 100, { decimals: 0 })}%` : ABSENT, 'Share of trading days it finished ahead of the S&P 500'],
               ['Worst stretch behind', pct(s?.worst_vs_spy_pct), 'The furthest it has fallen behind the S&P 500 from a high point'],
             ].map(([k, v, hint]) => (
-              <div key={k} className="rounded border border-line px-2 py-1" title={hint || undefined}>
-                <div className="text-micro text-ink-mute">{k}</div>
+              <div key={k} className="rounded border border-line px-2 py-1" title={TILE_TERM[k] ? undefined : hint || undefined}>
+                <div className="text-micro text-ink-mute">
+                  <Term word={TILE_TERM[k] ?? ''}>{k}</Term>
+                </div>
                 <div className="font-mono text-ink">{v}</div>
               </div>
             ))}
           </div>
-          {data.sizing && (
-            <div className="rounded border border-line px-3 py-2 text-micro text-ink-dim">
-              <span className="text-ink">How big the stock bets are</span>: {sizingLine(data.sizing)}
-            </div>
-          )}
-          {Object.entries(data.shadows ?? {}).map(([k, sh]) => (
-            <div key={k} className="rounded border border-dashed border-line px-3 py-2 text-micro text-ink-dim">
-              <span className="text-ink">{SHADOW_LABEL[k] ?? k}</span>: {SHADOW_TEXT[k] ?? ''} Tracked beside the
-              main portfolio, using the same model.{' '}
-              {sh.summary.sessions > 0
-                ? `Since ${sh.started_on}: ${pct(sh.summary.return_pct, true)} against SPY ${pct(sh.summary.spy_return_pct, true)} (${pct(sh.summary.excess_pct, true)} ahead) over ${sh.summary.sessions} trading day${sh.summary.sessions === 1 ? '' : 's'}.`
-                : 'Its first orders fill at the next open.'}
-            </div>
-          ))}
           <div className="flex flex-wrap items-center gap-3">
             <RelativeLine nav={data.nav} />
             <div className="text-micro text-ink-mute space-y-0.5">
@@ -245,6 +249,40 @@ export function ModelPortfolio() {
               )}
             </div>
           </div>
+          <Disclosure label="how this portfolio works" hint="and why it is built this way" storageKey="perf:how">
+            <div className="space-y-3">
+              <p className="text-ink-dim">
+                A pretend portfolio, run as if it were real. Most of it sits in an S&amp;P 500 fund. On top of that it buys
+                the stocks our model likes best in each industry and bets against the ones it likes least (only stocks that
+                are easy to bet against), each side about{' '}
+                {data ? formatNumber(data.design.overlay_gross * 100, { decimals: 0 }) : '30'}% of the portfolio. Because the
+                buys and the bets against roughly cancel out the market&apos;s ups and downs, anything it earns beyond the
+                S&amp;P 500 comes from picking the right stocks. It reshuffles every{' '}
+                {data?.design.rebalance_sessions ?? 21}{' '}trading days and only drops a stock once it falls well out of favour.
+                Every trade is filled at the next morning&apos;s opening price, after trading costs and fees.
+              </p>
+              <p className="text-micro text-ink-mute">
+                Why it works this way: tested on 2023–26 data the model had never seen, its buys on their own only beat the
+                S&amp;P 500 by holding riskier stocks. Its picks to avoid were the reliable part: they trailed the market by
+                about 2.5% a month. Together they earned about 1.9% a month more than the S&amp;P 500 while barely moving with
+                it, but that is only 32 months of evidence, so this portfolio is the live test. Not financial advice.
+              </p>
+          {data.sizing && (
+                <div className="rounded border border-line px-3 py-2 text-micro text-ink-dim">
+                  <span className="text-ink">How big the stock bets are</span>: {sizingLine(data.sizing)}
+                </div>
+              )}
+              {Object.entries(data.shadows ?? {}).map(([k, sh]) => (
+                <div key={k} className="rounded border border-dashed border-line px-3 py-2 text-micro text-ink-dim">
+                  <span className="text-ink">{SHADOW_LABEL[k] ?? k}</span>: {SHADOW_TEXT[k] ?? ''} Tracked beside the
+                  main portfolio, using the same model.{' '}
+                  {sh.summary.sessions > 0
+                    ? `Since ${sh.started_on}: ${pct(sh.summary.return_pct, true)} against SPY ${pct(sh.summary.spy_return_pct, true)} (${pct(sh.summary.excess_pct, true)} ahead) over ${sh.summary.sessions} trading day${sh.summary.sessions === 1 ? '' : 's'}.`
+                    : 'Its first orders fill at the next open.'}
+                </div>
+              ))}
+            </div>
+          </Disclosure>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
             <Holdings title="Bought" rows={data.holdings.long} tone="border-positive/40 text-positive" />
             <Holdings title="Bet against (avoid, or sell if you own them)" rows={data.holdings.short} tone="border-negative/40 text-negative" />

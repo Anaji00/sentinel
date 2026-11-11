@@ -301,7 +301,26 @@ def _options_premium_score(premium: float) -> float:
         # in 24 hours, the largest ceiling cluster on the platform.
         return FALLBACK_MAX_SCORE
     span = math.log10(OPTIONS_PREMIUM_REFERENCE_USD) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)
-    return round((math.log10(value) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)) / span, 4)
+    return min(FALLBACK_MAX_SCORE, round((math.log10(value) - math.log10(OPTIONS_PREMIUM_FLOOR_USD)) / span, 4))
+
+
+def _finite_or_none(value) -> "Optional[float]":
+    """A finite number, or None. A feed's "N/A", "1,000" and NaN are unknown, not a reason to lose the print."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _valid_expiry(value) -> "Optional[str]":
+    """An ISO date naming a real day, or None."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
 
 
 def _options_headline(ticker: str, option_type: str, premium: float, aggressor: Optional[str] = None) -> str:
@@ -1965,13 +1984,18 @@ class TradFiEnricher:
         if not ticker: return None
         
         option_symbol = p.get("option_symbol", "")
-        price = float(p.get("price", 0.0))
-        volume = float(p.get("volume", 0.0))
-        premium = float(p.get("premium_usd", 0.0))
-        
+        try:
+            price, volume, premium = float(p.get("price", 0.0)), float(p.get("volume", 0.0)), float(p.get("premium_usd", 0.0))
+        except (TypeError, ValueError):
+            price = volume = premium = float("nan")
+        if not all(math.isfinite(x) and x >= 0 for x in (price, volume, premium)):
+            dropped("enrichment.options_flow.unreadable", "an option print had a price, size or premium that is not a number", logger,
+                    detail=ticker)
+            return None
+
         option_type = p.get("option_type")
-        strike = p.get("strike")
-        expiry = p.get("expiry")
+        strike = _finite_or_none(p.get("strike"))
+        expiry = _valid_expiry(p.get("expiry"))
         if (not option_type or strike is None or not expiry) and option_symbol:
             from shared.utils.equities import parse_occ_option_symbol
             parsed = parse_occ_option_symbol(option_symbol)
@@ -1988,8 +2012,9 @@ class TradFiEnricher:
 
         # The underlying's last price, if the platform has one.
         underlying_spot = await self._underlying_spot(ticker)
-        implied_volatility = float(p["implied_volatility"]) if p.get("implied_volatility") is not None else None
-        open_interest = int(p["open_interest"]) if p.get("open_interest") is not None else None
+        implied_volatility = _finite_or_none(p.get("implied_volatility"))
+        open_interest = _finite_or_none(p.get("open_interest"))
+        open_interest = int(open_interest) if open_interest is not None and open_interest >= 0 else None
         
         # Watchlist & Frequency boost
         is_watched = await self.scorer.check_watchlist(ticker, "equities")

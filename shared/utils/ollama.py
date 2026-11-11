@@ -1465,13 +1465,14 @@ class OllamaClient:
         # (shared/utils/hosted_llm.py). None means every hosted step was
         # unavailable, and the local model answers as before; a model named
         # "provider/model" is hosted-only and has no local fallback.
-        if hosted_llm.route_for(active_model):
+        site = _usage_site() if hosted_llm.is_hosted(active_model) else ""
+        if hosted_llm.route_for(active_model, site):
             # `prompt` is system + user for the local model; a hosted chat
             # model gets the system part in its own role.
             user = prompt[len(system):].lstrip("\n") if system and prompt.startswith(system) else prompt
             got = await hosted_llm.complete(self._session, getattr(_tok_rate_redis, "raw", _tok_rate_redis),
                                             active_model, user, temperature, format, num_predict,
-                                            system=system if user is not prompt else None)
+                                            system=system if user is not prompt else None, site=site)
             if got is not None:
                 text, step, usage = got
                 # Read by infer's retry, which raises the budget after a cut-off

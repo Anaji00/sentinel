@@ -244,6 +244,19 @@ class AlpacaBroker(BrokerInterface):
             async with session.delete(f"{self.base_url}/orders/{order_id}", timeout=10) as resp:
                 return resp.status in (200, 204)
 
+    async def get_order_by_client_id(self, client_order_id: str) -> Optional[Order]:
+        """The order sent under this id, or None when the venue has none."""
+        if not self.api_key or not self.secret_key:
+            return None
+
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            async with session.get(f"{self.base_url}/orders:by_client_order_id",
+                                   params={"client_order_id": client_order_id}, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                order_id = (await resp.json()).get("id")
+        return await self.get_order_status(order_id) if order_id else None
+
     async def get_order_status(self, order_id: str) -> Optional[Order]:
         if not self.api_key or not self.secret_key:
             return None

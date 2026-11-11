@@ -12,7 +12,7 @@
 import React, { useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
-import { directionMark, formatNumber } from '../lib/format';
+import { directionMark } from '../lib/format';
 import { TickerEvidence } from './ConvergingEvidence';
 import { StockLink } from './StockDrawer';
 import TradeIdeas from './TradeIdeas';
@@ -44,6 +44,27 @@ const CONFIDENCE_RANK: Record<string, number> = { higher: 0, moderate: 1, low: 2
 
 export type Tier = 'all' | 'proven' | 'model';
 
+/** The board's confidence in words a reader can act on. */
+export function confidenceWords(c: BoardRow['confidence'] | string | null | undefined): string {
+  switch (c) {
+    case 'higher':
+      return 'strong evidence';
+    case 'moderate':
+      return 'some evidence';
+    case 'low':
+      return 'weak evidence';
+    default:
+      return '';
+  }
+}
+
+/** "7 of 7 signals point down": net votes over all votes, said out loud. */
+export function votesWords(net: number, votes: number): string {
+  const n = Math.abs(Math.round(net));
+  const v = Math.round(votes);
+  return `${n} of ${v} signal${v === 1 ? '' : 's'} point${v === 1 && n === 1 ? 's' : ''} ${net > 0 ? 'up' : 'down'}`;
+}
+
 /** Strongest leans first: confidence, then how lopsided the votes are. */
 export function rankBoard(rows: BoardRow[], tier: Tier = 'all'): BoardRow[] {
   return rows
@@ -69,17 +90,20 @@ function UnusualList({ selected, onSelect }: { selected: string | null; onSelect
   return (
     <section aria-label="Unusual activity" className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-line bg-raised">
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2.5">
-        <h2 className="text-sm font-semibold text-ink">Unusual activity</h2>
-        <label className="sr-only" htmlFor="calls-tier">Evidence</label>
+        <div>
+          <h2 className="text-sm font-semibold text-ink">Stocks to look at</h2>
+          <p className="text-micro text-ink-mute">Strongest evidence first</p>
+        </div>
+        <label className="sr-only" htmlFor="calls-tier">Which evidence to count</label>
         <select
           id="calls-tier"
           value={tier}
           onChange={(e) => setTier(e.target.value as Tier)}
           className="rounded-md border border-line bg-inset px-2 py-1 text-xs text-ink-dim"
         >
-          <option value="all">All evidence</option>
-          <option value="model">Model or proven</option>
-          <option value="proven">Proven only</option>
+          <option value="all">Count everything</option>
+          <option value="model">Tested evidence only</option>
+          <option value="proven">Proven evidence only</option>
         </select>
       </div>
       {error ? (
@@ -108,11 +132,10 @@ function UnusualList({ selected, onSelect }: { selected: string | null; onSelect
                     <span className="block truncate text-micro text-ink-mute">{r.name ?? ''}</span>
                   </span>
                   <span className="shrink-0 text-right">
-                    <span className={`block font-mono text-xs ${up ? 'text-positive' : 'text-negative'}`}>
-                      {directionMark(r.net)} {formatNumber(Math.abs(r.net), { decimals: 0 })} of{' '}
-                      {formatNumber(r.votes, { decimals: 0 })}
+                    <span className={`block text-xs ${up ? 'text-positive' : 'text-negative'}`}>
+                      {directionMark(r.net)} {votesWords(r.net, r.votes)}
                     </span>
-                    <span className="block text-micro text-ink-mute">{r.confidence ?? ''}</span>
+                    <span className="block text-micro text-ink-mute">{confidenceWords(r.confidence)}</span>
                   </span>
                 </button>
               </li>

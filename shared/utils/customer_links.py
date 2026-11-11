@@ -57,6 +57,11 @@ _ANON = re.compile(r"^(?:customer|customers|one|two|three|no|each|any|our|this|t
                    r"government|federal|department|cost|gross|operating|research|selling|general|income|"
                    r"cleaning|consumer|services|service|software|hardware|wireless|data|cloud|retail)\b", re.I)
 _ANON_TAIL = re.compile(r"\b(?:Customer|Distributor|Client|Party)\s+[A-Z0-9]\b|\bcustomers?$", re.I)
+# Phrases and headings the pattern read as companies (7 Nov 2026 audit of 267 stored links, 16% wrong: "On" became On Holding
+# for 12 links, "People", "Outdoor", "Senior Notes", "Northern California Region").
+_GENERIC_NAMES = {"On", "People", "Outdoor", "Freedom", "Gravity", "Intelligent Edge", "Senior Notes"}
+_GENERIC_TAIL = re.compile(r"\b(?:Regions?|Notes|Markets|Businesses|Segment)$")
+_AND_ITS = re.compile(r"\s+and\s+(?:its|their|certain|other)\b.*$", re.I)
 
 
 class Named(BaseModel):
@@ -85,9 +90,17 @@ def passages(text: str) -> List[str]:
     return out
 
 
+def several(name: str) -> bool:
+    """A comma list of companies ("Target, Walmart, Amazon"), which would resolve to the first
+    and credit it with the whole share. A trailing "Inc" or "Corp" is not a second company."""
+    parts = [p.strip() for p in name.split(",")]
+    return sum(1 for p in parts if p and p.upper() not in _SUFFIX and p.upper().rstrip(".") not in _SUFFIX) > 1
+
+
 def clean(name: str) -> Optional[str]:
-    n = _LEAD.sub("", name.strip(" ,.;")).strip(" ,")
-    if len(n) < 2 or _ANON.match(n) or _ANON_TAIL.search(n):
+    n = _AND_ITS.sub("", _LEAD.sub("", name.strip(" ,.;"))).strip(" ,")
+    if (len(n) < 2 or _ANON.match(n) or _ANON_TAIL.search(n) or n in _GENERIC_NAMES or _GENERIC_TAIL.search(n)
+            or several(n)):
         return None
     return n
 
@@ -195,4 +208,4 @@ def momentum_rows(supplier: str, links: Sequence[Tuple[date, str, float]],
 
 
 __all__ = ["Customers", "EXTRACT_SYSTEM", "FEATURE", "candidates", "clean", "grounded", "momentum_rows", "passages", "pct_in", "PROPAGATED", "propagated_rows",
-           "variants"]
+           "several", "variants"]

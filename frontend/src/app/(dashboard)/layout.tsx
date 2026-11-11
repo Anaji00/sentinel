@@ -8,6 +8,7 @@ import { TimeZoneProvider } from '../../components/ui/TimeZoneContext';
 import { DataProvider } from '../../components/ui/DataProvider';
 import { StockDrawer } from '../../components/StockDrawer';
 import { DataHealthStrip } from '../../components/ui/DataHealthStrip';
+import { ShortcutsSheet } from '../../components/ui/ShortcutsSheet';
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -17,6 +18,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           <FeedbackProvider>
             <div className="flex h-screen w-full bg-page text-ink overflow-hidden">
               <CommandPalette />
+              <ShortcutsSheet />
               {/* Any page's ?t=TICKER opens the stock drawer over it. useSearchParams
                   needs a Suspense boundary under the app router. */}
               <React.Suspense fallback={null}>

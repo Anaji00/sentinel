@@ -2,7 +2,8 @@
 
 import React, { useState, useEffect } from 'react';
 import { ProvenanceBadge, type ProvenanceType } from './ProvenanceBadge';
-import { formatNumber, formatPercent } from '../lib/format';
+import { formatCurrency, formatNumber, formatPercent } from '../lib/format';
+import { reportPositions, reportValueUsd } from '../lib/thirteenF';
 import { IconDocument } from './ui/icons';
 import { LoadingLines } from './ui/Skeleton';
 
@@ -34,6 +35,9 @@ interface FilerSummary {
 }
 
 interface PortfolioReport extends FilerSummary {
+  /** The detail route's names for the totals; FilerSummary's are the list route's. */
+  total_portfolio_value_usd?: number;
+  total_positions_count?: number;
   new_positions: Position[];
   exited_positions: Position[];
   increased_positions: Position[];
@@ -112,6 +116,9 @@ export const Institutional13FPanel: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Switching manager clears the old one's companies at once and ignores a slower earlier answer,
+    // so one manager's holdings are never shown under another's name.
+    let cancelled = false;
     async function fetchFilerData() {
       if (!selectedFilerId) {
         setLoading(false);
@@ -119,11 +126,13 @@ export const Institutional13FPanel: React.FC = () => {
       }
       setLoading(true);
       setLoadError(null);
+      setReport(null);
       try {
         const res = await fetch(`/api/proxy/api/v1/filings/13f/${selectedFilerId}`);
+        if (cancelled) return;
         if (res.ok) {
           const data = await res.json();
-          setReport(data);
+          if (!cancelled) setReport(data);
         } else {
           // No invented holdings.
           //
@@ -138,14 +147,25 @@ export const Institutional13FPanel: React.FC = () => {
           setLoadError(`Could not load 13F data (HTTP ${res.status}).`);
         }
       } catch (err) {
-        console.error('Error fetching 13F:', err);
+        if (!cancelled) {
+          console.error('Error fetching 13F:', err);
+          setLoadError('Could not reach the 13F service. Try again.');
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     }
 
     fetchFilerData();
-  }, [selectedFilerId, filers]);
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFilerId]);
+
+  // The tab belongs to the manager being looked at: a new manager starts on their top holdings.
+  useEffect(() => {
+    setActiveTab('top');
+  }, [selectedFilerId]);
 
   const renderBadge = (changeType: string, changePct: number) => {
     switch (changeType) {
@@ -239,14 +259,19 @@ export const Institutional13FPanel: React.FC = () => {
             <button
               key={f.filer_id}
               onClick={() => setSelectedFilerId(f.filer_id)}
-              className={`flex flex-col items-start px-3.5 py-2 rounded-lg border text-left whitespace-nowrap transition-all ${
+              aria-pressed={isSelected}
+              className={`flex shrink-0 flex-col items-start px-3.5 py-2 rounded-lg border text-left whitespace-nowrap transition-all ${
                 isSelected
                   ? 'bg-accent/20 border-accent text-accent shadow-md shadow-accent/10'
                   : 'bg-page/60 border-line text-ink-dim hover:border-line-strong hover:text-ink'
               }`}
             >
-              <span className="text-xs font-bold text-ink">{f.manager_name}</span>
-              <span className="text-micro text-ink-dim">{f.filer_name.slice(0, 22)}</span>
+              <span className="max-w-[14rem] truncate text-xs font-bold text-ink" title={f.manager_name}>
+                {f.manager_name}
+              </span>
+              <span className="max-w-[14rem] truncate text-micro text-ink-dim" title={f.filer_name}>
+                {f.filer_name}
+              </span>
             </button>
           );
         })}
@@ -261,7 +286,7 @@ export const Institutional13FPanel: React.FC = () => {
               <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-positive mt-0.5">
-              ${(report.total_value_usd / 1e9).toFixed(2)}B
+              {formatCurrency(reportValueUsd(report), { decimals: 2 })}
             </div>
           </div>
           <div className="p-3 bg-page/70 border border-line rounded-lg">
@@ -277,7 +302,7 @@ export const Institutional13FPanel: React.FC = () => {
               <ProvenanceBadge sourceType={provenanceOf(report)} />
             </div>
             <div className="text-base font-bold text-ink mt-0.5">
-              {report.holdings_count} positions
+              {reportPositions(report) != null ? `${formatNumber(reportPositions(report), { decimals: 0 })} positions` : '—'}
             </div>
           </div>
           <div className="p-3 bg-page/70 border border-line rounded-lg">
@@ -352,7 +377,7 @@ export const Institutional13FPanel: React.FC = () => {
           <thead>
             <tr className="border-b border-line text-ink-dim font-semibold bg-page/40">
               <th className="py-2.5 px-3">Ticker / Company</th>
-              <th className="py-2.5 px-3">Market Value ($M)</th>
+              <th className="py-2.5 px-3">Market value</th>
               <th className="py-2.5 px-3">Shares</th>
               <th className="py-2.5 px-3">Weight</th>
               <th className="py-2.5 px-3">QoQ Action</th>
@@ -368,19 +393,19 @@ export const Institutional13FPanel: React.FC = () => {
             ) : (
               activePositions.map((pos, idx) => (
                 <tr
-                  key={`${pos.ticker || pos.cusip || idx}`}
+                  key={`${activeTab}-${pos.cusip || pos.ticker || 'position'}-${idx}`}
                   className="hover:bg-overlay/30 transition-colors"
                 >
                   <td className="py-2.5 px-3">
                     <div className="flex items-center gap-2">
-                      <span className="font-bold text-accent bg-accent/10 px-1.5 py-0.5 rounded border border-accent/30">
-                        {pos.ticker || 'N/A'}
-                      </span>
+                      {pos.ticker && (
+                        <span className="font-bold text-accent bg-accent/10 px-1.5 py-0.5 rounded border border-accent/30">{pos.ticker}</span>
+                      )}
                       <span className="text-ink font-medium">{pos.issuer_name}</span>
                     </div>
                   </td>
                   <td className="py-2.5 px-3 font-semibold text-positive">
-                    ${(pos.market_value_usd / 1e6).toFixed(2)}M
+                    {formatCurrency(pos.market_value_usd, { decimals: 2 })}
                   </td>
                   <td className="py-2.5 px-3 text-ink-dim">
                     {formatNumber(pos.shares, { decimals: 0 })}

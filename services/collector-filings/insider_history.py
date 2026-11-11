@@ -39,7 +39,11 @@ SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "Sentinel-Intelligence-
 DONE_KEY = "sentinel:history:form345:done"
 PASS_SEC = 24 * 3600
 FIRST_DELAY_SEC = 20 * 60
-ARCHIVE_YEARS = 5
+# The archive opens with the first daily price bar. Classifying a trade needs three
+# years of the insider's earlier trades, so trades are loaded from 2013.
+ARCHIVE_START = date(2016, 1, 1)
+LOAD_START = (2013, 1)
+ARCHIVED_KEY = "sentinel:history:form345:archived2016"   # quarters re-classified and archived from the table
 
 _INSERT_SQL = f"""
     INSERT INTO {ih.INSIDER_TABLE} (accession, line, owner_cik, filed, traded, issuer_cik, ticker, owner_name,
@@ -114,8 +118,59 @@ async def load_quarter(db: Any, session: aiohttp.ClientSession, year: int, q: in
         await db.execute_many(_INSERT_SQL, [
             (t.accession, t.line, t.owner_cik, t.filed, t.traded, t.issuer_cik, t.ticker, t.owner_name,
              t.relationship, t.title, t.code, t.shares, t.price, t.planned) for t in trades[i:i + 2000]])
+    return await classify_and_archive(db, trades, year, q)
+
+
+def quarter_bounds(year: int, q: int) -> Tuple[date, date]:
+    """First day of the quarter and of the next one."""
+    return date(year, 3 * q - 2, 1), date(year + (q == 4), 1 if q == 4 else 3 * q + 1, 1)
+
+
+def archive_quarters(today: date) -> List[Tuple[int, int]]:
+    """Quarters whose zips were loaded when the archive began five years back
+    from `today`, so only part of them (or none) was archived: from the
+    archive's start to the quarter holding that day. The table pass redoes them."""
+    window_start = date(today.year - 5, today.month, 1)
+    return ih.quarters(quarter_bounds(window_start.year, (window_start.month - 1) // 3 + 1)[1],
+                       (ARCHIVE_START.year, (ARCHIVE_START.month - 1) // 3 + 1))
+
+
+def trades_from_rows(rows: List[Dict[str, Any]]) -> Tuple[List[ih.Trade], Dict[Tuple[str, str, str], Optional[str]]]:
+    """Trades, and their stored classes, from insider_transactions rows."""
+    trades, current = [], {}
+    for r in rows:
+        t = ih.Trade(accession=r["accession"], line=r["line"], filed=r["filed"], traded=r["traded"],
+                     issuer_cik=r["issuer_cik"], ticker=r["ticker"], owner_cik=r["owner_cik"],
+                     owner_name=r["owner_name"], relationship=r["relationship"], title=r["title"],
+                     code=r["code"], shares=float(r["shares"]), price=float(r["price"]) if r["price"] else None,
+                     planned=bool(r["planned"]))
+        trades.append(t)
+        current[(t.accession, t.line, t.owner_cik)] = r.get("insider_class")
+    return trades, current
+
+
+_TABLE_SQL = f"""
+    SELECT accession, line, owner_cik, filed, traded, issuer_cik, ticker, owner_name, relationship, title, code,
+           shares, price, planned, insider_class
+    FROM {ih.INSIDER_TABLE} WHERE filed >= $1::date AND filed < $2::date
+"""
+
+
+async def reprocess_quarter(db: Any, year: int, q: int) -> Tuple[int, int]:
+    """Classify and archive a quarter already in insider_transactions, no network.
+    (trades, archived)."""
+    start, end = quarter_bounds(year, q)
+    trades, current = trades_from_rows(await db.query(_TABLE_SQL, start, end) or [])
+    return await classify_and_archive(db, trades, year, q, current)
+
+
+async def classify_and_archive(db: Any, trades: List[ih.Trade], year: int, q: int,
+                               current: Optional[Dict[Tuple[str, str, str], Optional[str]]] = None
+                               ) -> Tuple[int, int]:
+    """Classify a quarter's trades against the earlier ones in the table, store
+    the classes that changed, and archive them from ARCHIVE_START."""
     owners = sorted({t.owner_cik for t in trades})
-    q_end = date(year + (q == 4), 1 if q == 4 else 3 * q + 1, 1)
+    q_end = quarter_bounds(year, q)[1]
     prior: Dict[str, List[date]] = defaultdict(list)
     for i in range(0, len(owners), 5000):
         for r in await db.query(_PRIOR_SQL, owners[i:i + 5000], date(year - ih.CLASSIFY_YEARS - 1, 1, 1), q_end) or []:
@@ -124,11 +179,11 @@ async def load_quarter(db: Any, session: aiohttp.ClientSession, year: int, q: in
     for t in trades:
         classes[(t.accession, t.line, t.owner_cik)] = ih.classify(
             t.traded, [d for d in prior.get(t.owner_cik, []) if d < t.traded], t.planned)
-    updates = [(a, ln, o, c) for (a, ln, o), c in classes.items() if c]
+    updates = [(a, ln, o, c) for (a, ln, o), c in classes.items()
+               if c and (current is None or current.get((a, ln, o)) != c)]
     for i in range(0, len(updates), 5000):
         await db.execute_many(_CLASS_SQL, updates[i:i + 5000])
-    today = datetime.now(timezone.utc).date()
-    archive = _archive_rows(trades, classes, date(today.year - ARCHIVE_YEARS, today.month, 1))
+    archive = _archive_rows(trades, classes, ARCHIVE_START)
     for i in range(0, len(archive), 2000):
         await db.execute_many(_ARCHIVE_SQL, archive[i:i + 2000])
     return len(trades), len(archive)
@@ -143,7 +198,8 @@ async def run_forever() -> None:
             raw = getattr(redis, "raw", redis)
             done = {x.decode() if isinstance(x, bytes) else x for x in await raw.smembers(DONE_KEY) or []}
             async with aiohttp.ClientSession() as session:
-                for year, q in ih.quarters(datetime.now(timezone.utc).date()):
+                today = datetime.now(timezone.utc).date()
+                for year, q in ih.quarters(today, LOAD_START):
                     tag = f"{year}q{q}"
                     if tag in done:
                         continue
@@ -153,6 +209,19 @@ async def run_forever() -> None:
                         break
                     await raw.sadd(DONE_KEY, tag)
                     logger.info("Insider history %s: %s open-market trades, %s archived", tag, *out)
+            # Quarters loaded before the archive reached back to 2016 (and before
+            # 2013-15 gave 2016-18 their three prior years): classify and archive
+            # them from the table, oldest first, once each.
+            done = {x.decode() if isinstance(x, bytes) else x for x in await raw.smembers(DONE_KEY) or []}
+            archived = {x.decode() if isinstance(x, bytes) else x for x in await raw.smembers(ARCHIVED_KEY) or []}
+            prior_loaded = all(f"{y}q{n}" in done for y, n in ih.quarters(ARCHIVE_START, LOAD_START))
+            for year, q in archive_quarters(today) if prior_loaded else []:
+                tag = f"{year}q{q}"
+                if tag in archived or tag not in done:
+                    continue
+                out = await reprocess_quarter(db, year, q)
+                await raw.sadd(ARCHIVED_KEY, tag)
+                logger.info("Insider history %s re-archived from table: %s trades, %s archived", tag, *out)
         except Exception as e:
             swallowed("collector_filings.insider_history", e, logger)
         await asyncio.sleep(PASS_SEC)

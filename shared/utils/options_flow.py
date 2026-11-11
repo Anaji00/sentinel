@@ -27,7 +27,8 @@ and measured beside the old premium-sized sweeps.
 from __future__ import annotations
 
 import bisect
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 PENDING_OI_KEY = "sentinel:options:pending_oi"     # prints awaiting next-morning open interest
@@ -47,7 +48,7 @@ PENDING_MAX_AGE_DAYS = 4
 
 def intrinsic(option_type: str, strike: Optional[float], spot: Optional[float]) -> Optional[float]:
     """Per-share intrinsic value, or None without strike and spot."""
-    if strike is None or spot is None or spot <= 0:
+    if strike is None or spot is None or not (math.isfinite(float(strike)) and math.isfinite(float(spot))) or spot <= 0:
         return None
     if str(option_type).upper().startswith("C"):
         return max(0.0, spot - float(strike))
@@ -58,7 +59,7 @@ def extrinsic_premium(price: float, size: float, option_type: str, strike: Optio
                       spot: Optional[float]) -> Optional[float]:
     """Dollars paid above intrinsic value across the print (100 shares a contract)."""
     iv = intrinsic(option_type, strike, spot)
-    if iv is None or price <= 0:
+    if iv is None or not math.isfinite(price) or price <= 0 or not math.isfinite(size) or size <= 0:
         return None
     return max(0.0, price - iv) * size * 100.0
 
@@ -79,6 +80,11 @@ def aggressor(price: float, bid: Optional[float], ask: Optional[float], trade_at
     never against a crossed quote."""
     if not bid or not ask or ask < bid or trade_at is None or quote_at is None:
         return None
+    # A timestamp with no zone is read as UTC, as the collector reads one: mixing the two raised TypeError.
+    if trade_at.tzinfo is None:
+        trade_at = trade_at.replace(tzinfo=timezone.utc)
+    if quote_at.tzinfo is None:
+        quote_at = quote_at.replace(tzinfo=timezone.utc)
     lag = abs((quote_at - trade_at).total_seconds())
     if lag > stale_lag_sec:
         return None

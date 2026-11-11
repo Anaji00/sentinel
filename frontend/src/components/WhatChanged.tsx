@@ -27,6 +27,7 @@ import {
 } from '../lib/whatChanged';
 import { ClockTime } from './ui/ClockTime';
 import { Disclosure } from './ui/Disclosure';
+import { TickerEvidence } from './ConvergingEvidence';
 import { POLL } from './ui/DataProvider';
 import { LoadingLines } from './ui/Skeleton';
 
@@ -151,6 +152,10 @@ export default function WhatChanged({ ticker }: { ticker: string }) {
             ) : (
               <Missing label="links to oil, rates or other markets" status={s.macro_links} />
             )}
+          </Part>
+
+          <Part label="Pattern read, last 3 days">
+            <TickerEvidence ticker={ticker} bare />
           </Part>
 
           </Disclosure>

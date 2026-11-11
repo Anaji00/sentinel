@@ -28,12 +28,16 @@ import {
   FileText,
   BookOpen,
   PanelLeftClose,
+  Keyboard,
   PanelLeftOpen,
   Eye,
   Wrench,
   Landmark,
+  Network,
 } from 'lucide-react';
 
+import { Button } from './Button';
+import { OPEN_SHORTCUTS_EVENT } from './ShortcutsSheet';
 import { useNav } from './NavContext';
 import { useSession } from './SessionContext';
 
@@ -79,6 +83,8 @@ const NAV_GROUPS: NavGroup[] = [
       { href: '/intel', label: 'Intel', icon: ShieldAlert },
       // Who owns the companies, who owns the owners, and who pays whom.
       { href: '/money', label: 'Follow the Money', icon: Landmark, civic: true },
+      // Who is linked to whom: companies, ships, flags and places, and how two are joined.
+      { href: '/connections', label: 'Connections', icon: Network },
       // Watching the watchers: who surveils the public, and how to push back.
       // One entry, not five: its sections have their own tabs on the page.
       { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
@@ -228,12 +234,12 @@ export function Sidebar() {
                                   text-sm transition-colors outline-none
                                   focus-visible:ring-1 focus-visible:ring-accent/60 ${
                                     active
-                                      ? 'bg-accent-dim text-ink'
+                                      ? 'bg-gradient-to-r from-accent-dim to-transparent text-ink'
                                       : 'text-ink-dim hover:bg-overlay/50 hover:text-ink'
                                   }`}
                       >
                         {active && (
-                          <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-r bg-accent" />
+                          <span className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r bg-accent shadow-[0_0_8px_var(--accent)]" />
                         )}
                         <Icon
                           className={`h-4 w-4 shrink-0 ${
@@ -259,6 +265,15 @@ export function Sidebar() {
           ))}
         </nav>
 
+        <Button
+          variant="ghost"
+          onClick={() => window.dispatchEvent(new Event(OPEN_SHORTCUTS_EVENT))}
+          title="Keyboard shortcuts (press ?)"
+          className="w-full justify-start! gap-3 rounded-none border-t border-line px-4 py-2.5 text-xs text-ink-mute hover:bg-overlay/40"
+        >
+          <Keyboard className="h-4 w-4" aria-hidden />
+          <span className={expanded ? '' : 'max-md:inline hidden'}>Shortcuts</span>
+        </Button>
         <button
           type="button"
           onClick={toggle}

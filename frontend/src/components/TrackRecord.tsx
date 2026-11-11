@@ -12,8 +12,9 @@ import { fetcher } from '../lib/api';
 import { ABSENT, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { LoadingLines } from './ui/Skeleton';
+import { HIT_RATE_CAUTION, TOO_FEW, skillLine, tooFewToGrade, type SkillFields } from '../lib/trackWords';
 
-interface Summary {
+interface Summary extends SkillFields {
   n: number;
   hit_rate: number | null;
   mean_bps: number | null;
@@ -43,10 +44,23 @@ interface Freshness {
 const BUCKETS = ['strong bear (net <= -3)', 'bear (-2..-1)', 'none (0)', 'bull (1..2)', 'strong bull (net >= 3)'];
 
 function Row({ label, s }: { label: string; s?: Summary }) {
+  // Trade-idea rows carry a chance-adjusted verdict; it decides what is said, not the row count.
+  const line = skillLine(s, label);
+  const graded = line != null && s?.skill_verdict !== 'too few';
   return (
     <tr className="border-b border-line/60">
       <td className="py-0.5 text-ink-dim">{label}</td>
       <td className="text-right font-mono">{s?.n ?? 0}</td>
+      {line != null ? (
+        <td colSpan={3} className={`text-right text-micro ${graded ? 'text-ink-dim' : 'text-ink-mute'}`}>
+          {line}
+        </td>
+      ) : tooFewToGrade(s?.n) ? (
+        <td colSpan={3} className="text-right text-micro text-ink-mute">
+          {TOO_FEW}
+        </td>
+      ) : (
+        <>
       <td className="text-right font-mono">{s?.hit_rate != null ? `${formatNumber(s.hit_rate * 100, { decimals: 0 })}%` : ABSENT}</td>
       <td
         className={`text-right font-mono ${
@@ -63,6 +77,8 @@ function Row({ label, s }: { label: string; s?: Summary }) {
           ? formatNumber((s?.t_days !== undefined ? s.t_days : s?.t) as number, { decimals: 2 })
           : ABSENT}
       </td>
+        </>
+      )}
     </tr>
   );
 }
@@ -72,7 +88,7 @@ const Head = ({ first, mean }: { first: string; mean: string }) => (
     <tr className="border-b border-line">
       <th className="py-1 text-left">{first}</th>
       <th className="text-right">Calls</th>
-      <th className="text-right">Right</th>
+      <th className="text-right" title="Share of calls that beat the S&P 500. Chance alone would give about half, so read it beside that, not on its own.">Right (chance: about half)</th>
       <th className="text-right">{mean}</th>
       <th className="text-right" title="t-statistic: above 2 means unlikely to be luck">Not luck?</th>
     </tr>
@@ -106,6 +122,9 @@ export function TrackRecord() {
         Every trade idea graded over its horizon from the price it was given at, and every signal-board row graded one
         and five sessions on, all net of SPY. If the board&apos;s votes carry information, strong-bull rows beat strong-bear
         rows and the signed tiers sit above zero. Published as it accumulates; nothing here is asserted in advance.
+      </p>
+      <p role="note" className="rounded-lg border border-line px-3 py-2 text-micro text-ink-mute">
+        {HIT_RATE_CAUTION}
       </p>
       {error ? (
         <p className="text-ink-mute">The track record could not be read.</p>
@@ -233,8 +252,8 @@ export function PaperLedger() {
                   <tr key={h} className="border-b border-line/60">
                     <td className="py-0.5 text-ink-dim">{h}</td>
                     <td className="text-right font-mono">{r?.n ?? 0}</td>
-                    <td className="text-right font-mono">
-                      {r?.hit_rate != null ? `${formatNumber(r.hit_rate * 100, { decimals: 0 })}%` : ABSENT}
+                    <td className="text-right font-mono" title={tooFewToGrade(r?.n) ? TOO_FEW : undefined}>
+                      {tooFewToGrade(r?.n) ? <span className="text-micro text-ink-mute">too few</span> : r?.hit_rate != null ? `${formatNumber(r.hit_rate * 100, { decimals: 0 })}%` : ABSENT}
                     </td>
                     <td
                       className={`text-right font-mono ${
@@ -370,6 +389,9 @@ export function ProducerGrades() {
         alert told you nothing about what came next. Agent calls are scored after the market&apos;s own move; claims about
         ships and aircraft are compared with simply assuming yesterday&apos;s activity continues.
       </p>
+      <p role="note" className="rounded-lg border border-line px-3 py-2 text-micro text-ink-mute">
+        As of 30 Oct 2026 no forecasting agent had beaten chance. {HIT_RATE_CAUTION}
+      </p>
       {error ? (
         <p className="text-ink-mute">The grades could not be read.</p>
       ) : !data ? (
@@ -404,6 +426,12 @@ export function ProducerGrades() {
                   <tr key={a} className="border-b border-line/60">
                     <td className="py-0.5 text-ink-dim">{a.replace(/_/g, ' ')}</td>
                     <td className="text-right font-mono">{p.n}</td>
+                    {tooFewToGrade(p.n) ? (
+                      <td colSpan={3} className="text-right text-micro text-ink-mute">
+                        {TOO_FEW}
+                      </td>
+                    ) : (
+                      <>
                     <td className="text-right font-mono">
                       {p.hit_rate != null ? `${formatNumber(p.hit_rate * 100, { decimals: 0 })}%` : ABSENT}
                     </td>
@@ -417,6 +445,8 @@ export function ProducerGrades() {
                     >
                       {p.skill != null ? `${p.skill > 0 ? '+' : ''}${formatNumber(p.skill * 100, { decimals: 0 })} pts` : ABSENT}
                     </td>
+                      </>
+                    )}
                   </tr>
                 ))}
               </tbody>

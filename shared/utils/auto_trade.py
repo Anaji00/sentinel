@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 # Funds that hold the market rather than pick from it.
 INDEX_FUNDS = frozenset({"SPY", "QQQ", "IWM", "DIA", "VOO", "IVV", "VTI", "RSP", "SPLG", "QQQM"})
@@ -160,6 +160,21 @@ def target_shares(weights: Mapping[str, float], equity: float, prices: Mapping[s
 
 
 FILL_MAX_CHECKS = 5
+
+
+def client_order_id(portfolio: str, day: Any, symbol: str, side: str, reason: str) -> str:
+    """The same order on the same day has the same id, under Alpaca's 128 characters."""
+    return f"{portfolio}-{day}-{symbol}-{side}-{reason}"[:128]
+
+
+def order_failure_status(exc: BaseException) -> str:
+    """What a failed submit means. 'rejected' only when the venue answered and
+    refused; 'duplicate' when it already holds this id; otherwise 'unknown', since
+    a timed-out order may be live."""
+    text = str(exc)
+    if "submit_order failed" not in text:
+        return "unknown"
+    return "duplicate" if "client_order_id" in text and "unique" in text else "rejected"
 
 
 def fill_outcome(qty: float, filled_qty: float) -> str:

@@ -162,10 +162,23 @@ def mode() -> str:
     return os.getenv("LLM_HOSTED_MODE", "off").strip().lower()
 
 
-def route_for(local_model: str) -> List[str]:
+def fallback_chain(model: str, site: str = "") -> List[str]:
+    """Other hosted steps a hosted-only `model` may fall to when it is cooling or full.
+
+    Only for the call sites named in LLM_FALLBACK_SITES (comma-separated prefixes of the
+    usage-meter site, e.g. "scenario_generator"). A caller whose answers are stored or graded
+    per model (headline scores with one training cutoff, the analyst shadow) is left off that
+    list, so its series never mixes models. LLM_FALLBACKS="step=step,step;..." names the chain."""
+    sites = [s.strip() for s in os.getenv("LLM_FALLBACK_SITES", "").split(",") if s.strip()]
+    if not site or not any(site.startswith(s) for s in sites):
+        return []
+    return [s for s in parse_routes(os.getenv("LLM_FALLBACKS", "")).get(model, []) if s != model]
+
+
+def route_for(local_model: str, site: str = "") -> List[str]:
     """The hosted steps to try for a local model, in order; empty when off."""
     if is_hosted(local_model):
-        return [local_model]
+        return [local_model] + fallback_chain(local_model, site)
     if mode() != "on":
         return []
     return parse_routes(os.getenv("LLM_ROUTES", "")).get(local_model, [])
@@ -307,11 +320,12 @@ async def has_capacity(raw: Any, local_model: str, tokens: int = 1000, reserve: 
 
 async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_model: str, prompt: str,
                    temperature: float, fmt: Optional[Union[str, dict]],
-                   max_tokens: Optional[int], system: Optional[str] = None) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+                   max_tokens: Optional[int], system: Optional[str] = None,
+                   site: str = "") -> Optional[Tuple[str, str, Dict[str, Any]]]:
     """(text, step, usage) from the first hosted step that answers, or None when
     the route is empty or every step is unavailable (no key, cooling, over
-    quota, 429, error). Never retries a step."""
-    steps = route_for(local_model)
+    quota, 429, error). Never retries a step. `site` is the caller, for fallback_chain."""
+    steps = route_for(local_model, site)
     if not steps:
         return None
     quotas = parse_quotas(os.getenv("LLM_QUOTAS", ""))
@@ -365,5 +379,5 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
             await sess.close()
 
 
-__all__ = ["PROVIDERS", "Quota", "complete", "estimate_tokens", "is_hosted", "mode", "over_quota", "parse_quotas",
+__all__ = ["PROVIDERS", "Quota", "complete", "estimate_tokens", "fallback_chain", "is_hosted", "mode", "over_quota", "parse_quotas",
            "parse_routes", "reply_text", "request_body", "route_for", "usage_as_ollama", "windows"]

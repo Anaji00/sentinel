@@ -331,6 +331,18 @@ class FactorEngine:
             nxt += timedelta(days=1)
         return (nxt - now).total_seconds()
 
+    async def _incumbents(self) -> Dict[str, str]:
+        """Each horizon's model from the last stored run, so a close call tonight does not flip it
+        (shared/utils/model_choice.py). Empty if unreadable, which restores the plain best-of-the-night pick."""
+        try:
+            from shared.utils.model_choice import incumbents_from_report
+
+            rows = await self.db.query("SELECT report FROM factor_model_runs ORDER BY run_at DESC LIMIT 1")
+            return incumbents_from_report(rows[0]["report"]) if rows else {}
+        except Exception as exc:
+            swallowed("agents.factor_engine.incumbents", exc, logger)
+            return {}
+
     async def _panel(self) -> Optional[fm.Panel]:
         """The daily-bar panel, filled straight into arrays a batch at a time.
 
@@ -451,7 +463,8 @@ class FactorEngine:
         # 2,344 of this service's 2,432 MB (18 Oct 2026) and could not take the
         # option features; the subset reproduces the full panel's results
         # (monthly ridge IC 0.0675, t 2.34, on both).
-        result = await asyncio.to_thread(fm.run_panel, fm.tradable_subset(panel), CANDIDATES, fm.DEFAULT_HORIZONS)
+        result = await asyncio.to_thread(fm.run_panel, fm.tradable_subset(panel), CANDIDATES, fm.DEFAULT_HORIZONS,
+                                         await self._incumbents())
         if not result.get("skipped"):
             # Before the report is published, so the portfolio's next decision
             # is sized by tonight's gauge.

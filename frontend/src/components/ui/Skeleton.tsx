@@ -32,6 +32,9 @@ export const Skeleton: React.FC<SkeletonProps> = ({ className = '', height, widt
  */
 const PATIENCE_MS = 12_000;
 
+/** After this long a wait is noticed, so the placeholder says in words what it is waiting for. */
+const CAPTION_MS = 1_000;
+
 /**
  * The placeholder shown while a panel's data or code is in flight.
  *
@@ -91,11 +94,16 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loading�
  */
 export const LoadingLines: React.FC<{ lines?: number; label?: string }> = ({ lines = 3, label = 'Loading' }) => {
   const [patienceSpent, setPatienceSpent] = React.useState(false);
+  const [noticed, setNoticed] = React.useState(false);
   const failing = useFailingSources();
   const { mutate } = useSWRConfig();
   React.useEffect(() => {
     const t = setTimeout(() => setPatienceSpent(true), PATIENCE_MS);
-    return () => clearTimeout(t);
+    const c = setTimeout(() => setNoticed(true), CAPTION_MS);
+    return () => {
+      clearTimeout(t);
+      clearTimeout(c);
+    };
   }, []);
   const state = spinnerState(failing, patienceSpent);
   if (state !== 'loading') {
@@ -109,10 +117,13 @@ export const LoadingLines: React.FC<{ lines?: number; label?: string }> = ({ lin
     );
   }
   return (
-    <div className="space-y-2 animate-pulse" role="status" aria-label={label}>
-      {Array.from({ length: lines }, (_, i) => (
-        <Skeleton key={i} height="12px" width={i === lines - 1 ? '60%' : '100%'} />
-      ))}
+    <div className="space-y-2" role="status" aria-label={label}>
+      {noticed && <p className="text-micro text-ink-mute">{label.replace(/(\.\.\.|…)$/, '')}…</p>}
+      <div className="space-y-2 animate-pulse">
+        {Array.from({ length: lines }, (_, i) => (
+          <Skeleton key={i} height="12px" width={i === lines - 1 ? '60%' : '100%'} />
+        ))}
+      </div>
     </div>
   );
 };

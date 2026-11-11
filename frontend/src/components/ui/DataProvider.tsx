@@ -24,6 +24,7 @@ import { SWRConfig } from 'swr';
 import { usePathname, useRouter } from 'next/navigation';
 import { ApiError } from '../../lib/api';
 import { recordFailure, recordSuccess } from '../../lib/dataHealth';
+import { recordUpdate } from '../../lib/freshness';
 
 /**
  * How often anything polls, by how fast the thing underneath actually moves.
@@ -81,7 +82,10 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
     <SWRConfig
       value={{
         onError,
-        onSuccess: (_data: unknown, key: string) => recordSuccess(key),
+        onSuccess: (_data: unknown, key: string) => {
+          recordSuccess(key);
+          recordUpdate(key);
+        },
         // A failed request retries, but not forever and not fast. The default
         // is five attempts on an exponential backoff; what matters here is the
         // exclusion below.

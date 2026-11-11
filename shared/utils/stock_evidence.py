@@ -141,10 +141,12 @@ def evidence_direction(cp_rank: Optional[float], short_rank: Optional[float], mi
 
 
 def next_session(today: date) -> date:
-    """The next weekday. Exchange holidays are not known here, so a report after one
-    can read as a session late; that errs towards making the call."""
+    """The next day the exchange is open, by the platform's holiday table. Beyond the
+    table's last year every weekday counts as a session."""
+    from shared.utils.market_session import _is_market_holiday
+
     d = today + timedelta(days=1)
-    while d.weekday() >= 5:
+    while d.weekday() >= 5 or _is_market_holiday(d):
         d += timedelta(days=1)
     return d
 
@@ -251,7 +253,8 @@ def known_citations(cited: Iterable[str], card: Sequence[Mapping[str, str]]) -> 
 
 
 def capped_conviction(value: float) -> float:
-    return min(float(value), MAX_FORECAST_CONVICTION)
+    v = float(value)
+    return min(max(v, 0.0), MAX_FORECAST_CONVICTION) if math.isfinite(v) else 0.0
 
 
 __all__ = ["EVIDENCE_MIN_EDGE", "MAX_FORECAST_CONVICTION", "build_card", "capped_conviction", "card_lines", "change_text", "citations",

@@ -18,13 +18,14 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { fetcher } from '../lib/api';
 import { formatNumber } from '../lib/format';
 import { shortName, type HoldersResponse } from '../lib/money';
-import { TickerEvidence } from './ConvergingEvidence';
 import { TickerHero } from './TickerHero';
 import dynamic from 'next/dynamic';
 import { Disclosure } from './ui/Disclosure';
 import { IconClose } from './ui/icons';
 import { LoadingLines } from './ui/Skeleton';
+import FirstLook from './FirstLook';
 import RelatedStocks from './RelatedStocks';
+import SourceFacts from './SourceFacts';
 import ThesisPanel from './ThesisPanel';
 import WhatChanged from './WhatChanged';
 import TickerSurveillance from './TickerSurveillance';
@@ -70,9 +71,9 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
   const dialog = useDialog(true, onClose, `${ticker} details`);
   const [detail, setDetail] = React.useState(false);
   return (
-    <div className="fixed inset-0 z-50 bg-black/60" {...dialog.overlayProps}>
+    <div className="fade-in fixed inset-0 z-50 bg-black/60" {...dialog.overlayProps}>
       <div
-        className="absolute inset-y-0 right-0 flex w-full max-w-[560px] flex-col gap-4 overflow-y-auto border-l border-line-strong bg-raised p-5 shadow-overlay"
+        className="drawer-in absolute inset-y-0 right-0 flex w-full max-w-[560px] flex-col gap-4 overflow-y-auto border-l border-line-strong bg-raised p-5 shadow-overlay"
         {...dialog.panelProps}
       >
         <div className="flex items-center justify-between gap-3">
@@ -92,12 +93,13 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
             <IconClose />
           </button>
         </div>
+        <FirstLook />
         <TickerHero symbol={ticker} />
         <WhatChanged ticker={ticker} />
         <ThesisPanel ticker={ticker} />
-        <Disclosure variant="row" label={`More about ${ticker}`} hint="owners, patterns, related stocks" storageKey="drawer:more">
+        <Disclosure variant="row" label={`More about ${ticker}`} hint="owners, facts, related stocks" storageKey="drawer:more">
           <Owners ticker={ticker} />
-          <TickerEvidence ticker={ticker} />
+          <SourceFacts ticker={ticker} />
           <RelatedStocks ticker={ticker} />
         </Disclosure>
         {detail && (

@@ -1,5 +1,6 @@
 import React from 'react';
 import AutoTradePanel from '@/components/AutoTradePanel';
+import BookExposure from '@/components/BookExposure';
 import ModelPortfolio from '@/components/ModelPortfolio';
 import { ModelHealth } from '@/components/ModelHealth';
 import PaperTradingBook from '@/components/PaperTradingBook';
@@ -47,6 +48,7 @@ export default function PerformancePage() {
       />
       <Band id="today" title="Today" sub="The model's book against the S&P 500, the auto-trader, and your own paper trades">
         <ModelPortfolio />
+        <BookExposure />
         <AutoTradePanel />
         <PortfolioLab />
         <ModelHealth />

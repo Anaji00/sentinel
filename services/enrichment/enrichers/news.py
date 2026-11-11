@@ -52,7 +52,7 @@ GOV_COUNTRY_KEYWORDS = {
 # Dynamic Stock Ticker & Cashtag Extractor Pattern:
 # Matches $NVDA, (AAPL), [TSLA], NASDAQ: MSFT, NYSE: BABA, etc.
 RE_TICKER_EXTRACT = re.compile(
-    r"\b\$([A-Z]{1,5})\b|\((?:NASDAQ|NYSE|AMEX|INDEX):\s*([A-Z]{1,5})\)|\b(?:NASDAQ|NYSE|AMEX):\s*([A-Z]{1,5})\b|\(([A-Z]{1,5})\)|\[([A-Z]{1,5})\]",
+    r"(?<![A-Za-z0-9_])\$([A-Z]{1,5})\b|\((?:NASDAQ|NYSE|AMEX|INDEX):\s*([A-Z]{1,5})\)|\b(?:NASDAQ|NYSE|AMEX):\s*([A-Z]{1,5})\b|\(([A-Z]{1,5})\)|\[([A-Z]{1,5})\]",
     re.IGNORECASE
 )
 
@@ -337,7 +337,10 @@ class NewsEnricher:
         # and the cashtag path above still catches $aapl and (NASDAQ: msft)
         # regardless of case. Single letters are excluded: a lone capital in
         # prose is an initial far more often than it is Agilent.
-        for word in combined_text[:400].split():
+        letters = [ch for ch in combined_text[:400] if ch.isalpha()]
+        # In a headline written in capitals, case carries no information, so ERA and END are only words.
+        shouting = len(letters) >= 12 and sum(ch.isupper() for ch in letters) / len(letters) > 0.7
+        for word in ([] if shouting else combined_text[:400].split()):
             token = word.strip("$,.():;[]{}'\"")
             if not token.isupper() or len(token) < 2:
                 continue

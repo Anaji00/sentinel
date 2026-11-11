@@ -248,7 +248,7 @@ export function TodayOverview() {
     <div className="space-y-4">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-lead font-semibold text-ink">{hello}</h1>
+          <h1 className="text-display font-semibold leading-tight text-ink">{hello}</h1>
           <p className="text-sm text-ink-mute">
             {today ? `${today} · ` : ''}Here&apos;s what matters today.
           </p>

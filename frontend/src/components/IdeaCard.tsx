@@ -74,12 +74,12 @@ export function IdeaCard({
   const o = i.option;
   return (
     <article
-      className={`group relative flex flex-col gap-3 rounded-2xl border bg-raised p-4 transition-colors hover:border-line-accent ${
-        long ? 'border-positive/20' : 'border-negative/20'
+      className={`lift wash group relative flex flex-col gap-3 overflow-hidden rounded-2xl border bg-raised p-4 hover:border-line-accent ${
+        long ? 'border-positive/25 text-positive' : 'border-negative/25 text-negative'
       }`}
     >
       <div
-        className={`absolute inset-x-0 top-0 h-0.5 rounded-t-2xl ${long ? 'bg-positive/60' : 'bg-negative/60'}`}
+        className={`absolute inset-x-0 top-0 h-[3px] ${long ? 'bg-positive' : 'bg-negative'}`}
         aria-hidden
       />
       <header className="flex items-start justify-between gap-2">
@@ -148,14 +148,14 @@ export function IdeaCard({
       {!compact && (
         <div className="grid grid-cols-3 gap-2 rounded-xl bg-inset px-3 py-2">
           <Stat
-            label="Most to put in"
+            label="Suggested size"
             value={
               sized ? `${formatNumber((f?.stock_weight ?? 0) * 100, { decimals: 1 })}%` : 'skip'
             }
             tone={sized ? undefined : 'warn'}
           />
           <Stat
-            label="Trading cost"
+            label="Cost to trade"
             value={
               f?.cost_bps != null ? `${formatNumber(f.cost_bps / 100, { decimals: 2 })}%` : ABSENT
             }

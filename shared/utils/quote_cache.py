@@ -62,7 +62,7 @@ def parse_quote(raw) -> Optional[float]:
     """
     if raw is None:
         return None
-    text = raw if isinstance(raw, str) else raw.decode("utf-8")
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
     try:
         quote = json.loads(text)
     except (ValueError, TypeError):
@@ -90,4 +90,4 @@ def parse_quote(raw) -> Optional[float]:
     else:
         return None
 
-    return value if value > 0 else None
+    return value if 0 < value < float("inf") else None

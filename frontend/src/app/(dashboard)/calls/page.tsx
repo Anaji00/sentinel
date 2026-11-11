@@ -4,6 +4,7 @@ import SignalBoard from '@/components/SignalBoard';
 import StockSearch from '@/components/StockSearch';
 import StockNews from '@/components/StockNews';
 import StockPredictions from '@/components/StockPredictions';
+import { CallsHeadline } from '@/components/PageHeadlines';
 import { FreshnessStrip } from '@/components/TrackRecord';
 import TradingSignals from '@/components/TradingSignals';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -30,13 +31,14 @@ export default async function CallsPage({
     <div className="h-full w-full space-y-5 overflow-y-auto p-2">
       <PageHeader
         title="Calls"
-        description="Every stock with unusual activity, the model's call on it, and the evidence behind both. Pick a stock on the left, or look up any other one below, to see why it is moving."
+        description="Stocks where something unusual is happening, what the model thinks of each, and the evidence behind it. Pick one on the left, or look up any stock below, to see why it is moving."
         related={[
           { href: '/performance', label: 'Performance' },
           { href: '/markets', label: 'Markets' },
           { href: '/methodology', label: 'How it works' },
         ]}
       />
+      <CallsHeadline />
       <StockSearch />
       <CallsWorkspace />
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-5">

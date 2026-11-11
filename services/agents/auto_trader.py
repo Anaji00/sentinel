@@ -67,9 +67,15 @@ _RECENT_ALERTS_SQL = f"""
       AND rule_id IS DISTINCT FROM 'USER_SCENARIO_REQUEST'
 """
 _LOG_SQL = """
-    INSERT INTO auto_trade_orders (day, portfolio, symbol, side, qty, reason, order_id, status, error, ref_price)
-    VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    INSERT INTO auto_trade_orders (day, portfolio, symbol, side, qty, reason, order_id, status, error, ref_price, client_order_id)
+    VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 """
+_UNKNOWN_ORDERS_SQL = """
+    SELECT id, client_order_id FROM auto_trade_orders
+    WHERE status = 'unknown' AND order_id IS NULL AND fill_status IS NULL AND client_order_id IS NOT NULL AND day <= $1::date
+    ORDER BY id LIMIT $2
+"""
+_RESOLVE_UNKNOWN_SQL = "UPDATE auto_trade_orders SET order_id = $2, status = 'submitted' WHERE id = $1"
 # Orders whose outcome is not yet on record, once their session is over. Read only
 # from the venue: this path places nothing and decides nothing.
 FILLS_PER_PASS = 100
@@ -194,6 +200,7 @@ class AutoTrader:
         now = now or datetime.now(NY)
         last_day = now.date() if now.time() >= FILLS_AFTER else now.date() - timedelta(days=1)
         stored = 0
+        await self._resolve_unknown(last_day)
         for r in await self.db.query(_UNCHECKED_FILLS_SQL, last_day, FILLS_PER_PASS) or []:
             order = await self.broker.get_order_status(str(r["order_id"]))
             if order is None:
@@ -411,6 +418,9 @@ class AutoTrader:
 
     async def _send(self, today: date, plan: at.Plan, ref: Optional[float] = None) -> bool:
         side = OrderSide.BUY if plan.side == "buy" else OrderSide.SELL
+        # Stable per day and purpose: a re-run after a crash cannot send it twice,
+        # and an order whose response was lost can be found again.
+        cid = at.client_order_id(self.portfolio, today, plan.symbol, plan.side, plan.reason)
         try:
             # A marketable limit no worse than AUTO_TRADE_LIMIT_OFFSET from the
             # live price, so a thin book cannot fill an order anywhere. A
@@ -421,18 +431,51 @@ class AutoTrader:
             if ref and ref > 0 and plan.reason != "flip-close":
                 order = await self.broker.submit_order(
                     plan.symbol, plan.qty, side, order_type=OrderType.LIMIT,
-                    limit_price=at.limit_price(plan.side, ref, _setting("AUTO_TRADE_LIMIT_OFFSET", 0.005)))
+                    limit_price=at.limit_price(plan.side, ref, _setting("AUTO_TRADE_LIMIT_OFFSET", 0.005)),
+                    client_order_id=cid)
             else:
-                order = await self.broker.submit_order(plan.symbol, plan.qty, side)
+                order = await self.broker.submit_order(plan.symbol, plan.qty, side, client_order_id=cid)
         except Exception as exc:
-            await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
-                                  None, "rejected", str(exc)[:500], ref)
-            return False
+            # Only the venue's own refusal is a rejection. A timeout or dropped
+            # connection says nothing about whether the order is live.
+            status = at.order_failure_status(exc)
+            if status == "duplicate":
+                await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
+                                      None, status, str(exc)[:500], ref, cid)
+                return True         # already sent earlier today, and already on record
+            order = None
+            if status == "unknown":
+                order = await self._find_order(cid)
+            if order is None:
+                dropped("agents.auto_trader.order_failed", "an order was not confirmed", logger,
+                        detail=f"{plan.symbol} {status}")
+                await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
+                                      None, status, str(exc)[:500], ref, cid)
+                return False
         await self.db.execute(_LOG_SQL, today, self.portfolio, plan.symbol, plan.side, plan.qty, plan.reason,
-                              order.order_id, "submitted", None, ref)
+                              order.order_id, "submitted", None, ref, cid)
         if plan.reason == "flip-close":
             await self._await_fill(order.order_id)
         return True
+
+    async def _find_order(self, cid: str) -> Any:
+        """The venue's order for a client id, or None if absent or unreadable."""
+        try:
+            return await self.broker.get_order_by_client_id(cid)
+        except Exception as exc:
+            swallowed("agents.auto_trader.find_order", exc, logger, detail=cid)
+            return None
+
+    async def _resolve_unknown(self, last_day: date) -> None:
+        """Orders whose response was lost: on record if the venue has them; parked
+        after FILL_MAX_CHECKS, once the session is over and none can still arrive."""
+        for r in await self.db.query(_UNKNOWN_ORDERS_SQL, last_day, FILLS_PER_PASS) or []:
+            order = await self._find_order(str(r["client_order_id"]))
+            if order is not None:
+                await self.db.execute(_RESOLVE_UNKNOWN_SQL, r["id"], order.order_id)
+            else:
+                await self.db.execute(_FILL_MISS_SQL, r["id"], at.FILL_MAX_CHECKS)
+            await asyncio.sleep(FILL_GAP_SEC)
 
     async def _await_fill(self, order_id: str) -> None:
         """A side change opens only once the close has filled."""

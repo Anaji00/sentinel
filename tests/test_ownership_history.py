@@ -53,3 +53,12 @@ def test_issuer_kind_separates_foreign_filers_and_partnerships() -> None:
     row = h.profile_row("TSM", "1046179", {**p("TSMC", ["20-F"]), "sic": "3674", "sicDescription": "Semis",
                                            "stateOfIncorporation": "F5"})
     assert row[-2:] == ("foreign", "F5")
+
+
+def test_the_window_reaches_2016_and_resumes_under_its_own_key() -> None:
+    m = _mod()
+    assert m.FIRST_PERIOD == "2015-12-31"                                   # first flow: the quarter to 31 Mar 2016
+    assert m.DONE_KEY.endswith(":from2016") and m.DONE_KEY != "sentinel:ownership:history:done"
+    out = m.flows({"2015-12-31": {n: ("2016-02-10", {"AAA": 1.0}) for n in ("FMR LLC", "T. Rowe Price Associates", "Wellington Management Group")},
+                   "2016-03-31": {n: ("2016-05-12", {"AAA": 9.0}) for n in ("FMR LLC", "T. Rowe Price Associates", "Wellington Management Group")}})
+    assert [(f["period"], f["ticker"]) for f in out] == [("2016-03-31", "AAA")]

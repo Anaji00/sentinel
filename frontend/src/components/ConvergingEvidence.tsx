@@ -229,7 +229,8 @@ export function ConvergingEvidence() {
   );
 }
 
-export function TickerEvidence({ ticker }: { ticker: string }) {
+/** `bare` drops the box and title, for when it sits inside another panel (the drawer's What changed). */
+export function TickerEvidence({ ticker, bare = false }: { ticker: string; bare?: boolean }) {
   const { data, error } = useSWR<DossierResponse>(
     ticker ? `/signals/dossier/${encodeURIComponent(ticker)}?hours=72` : null,
     fetcher,
@@ -237,9 +238,9 @@ export function TickerEvidence({ ticker }: { ticker: string }) {
   );
   const d = data?.dossier;
   return (
-    <div className="rounded-lg border border-line p-3 space-y-1">
+    <div className={bare ? 'space-y-1' : 'rounded-lg border border-line p-3 space-y-1'}>
       <div className="flex items-center justify-between gap-2">
-        <span className="stat-label">What happened, last 3 days</span>
+        <span className={bare ? 'sr-only' : 'stat-label'}>What happened, last 3 days</span>
         {d && (
           <span className={`px-2 py-0.5 rounded-full border text-micro font-semibold ${STANCE_STYLE[d.stance]}`}>
             {STANCE_WORD[d.stance] ?? d.stance}

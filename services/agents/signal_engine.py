@@ -66,9 +66,14 @@ LIVE_INTERVAL_SEC = 60
 # accrues, up to this.
 STUDY_LOOKBACK_DAYS = int(os.getenv("SIGNAL_STUDY_LOOKBACK_DAYS", "365"))
 # Event types with years of point-in-time history in the archive (EDGAR 8-Ks,
-# stamped at acceptance), studied that far back at the daily horizons.
-HISTORY_LOOKBACK_DAYS = int(os.getenv("SIGNAL_STUDY_HISTORY_DAYS", str(5 * 365 + 30)))
-DEEP_HISTORY_TYPES = ["filing", "earnings_reaction", "insider_trade", "thirteen_f"]
+# stamped at acceptance; headlines, including Alpaca stock news, from Sept 2019),
+# studied that far back at the daily horizons. Headline families come from
+# keyword rules (shared/utils/headline_mapping.py) and FinBERT, not a generative
+# model, so old headlines carry no memory of later prices. The default reaches
+# past the archive's start; the archive, not this, bounds the span.
+HISTORY_LOOKBACK_DAYS = int(os.getenv("SIGNAL_STUDY_HISTORY_DAYS", str(10 * 365 + 30)))
+DEEP_HISTORY_TYPES = ["filing", "earnings_reaction", "insider_trade", "thirteen_f", "headline",
+                     "insider_cluster"]
 ARCHIVE_INTERVAL_SEC = 3600
 # Tape families (volume spikes, blocks) touch ~1,500 tickers with a few
 # episodes each. Every instrument any other family points at is studied; the

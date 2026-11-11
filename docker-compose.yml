@@ -1296,7 +1296,12 @@ services:
           #
           # 1G since the factor model moved to its own service (factor-model):
           # measured 480MiB on 7 October without it, so ~2x headroom remains.
-          memory: 1G
+          #
+          # 3G from 7 November 2026: the signal study now reads ten years of EDGAR
+          # events and headlines back to 2019 (SIGNAL_STUDY_HISTORY_DAYS=3995); it
+          # ran at 817MiB of 1G on the five-year window and the container had
+          # restarted three times under heavy reads.
+          memory: 3G
     depends_on:
       kafka:
         condition: service_healthy

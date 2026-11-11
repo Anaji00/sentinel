@@ -28,8 +28,8 @@ export function PageHeader({ title, description, related = [], children }: PageH
   return (
     <header className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
       <div className="min-w-0 space-y-1">
-        <h1 className="text-lead font-semibold text-ink leading-tight">{title}</h1>
-        <p className="text-sm text-ink-dim max-w-3xl">{description}</p>
+        <h1 className="text-display font-semibold text-ink leading-tight">{title}</h1>
+        <p className="line-clamp-3 max-w-3xl text-sm text-ink-dim">{description}</p>
         {related.length > 0 && (
           <nav aria-label="Related pages" className="flex flex-wrap items-center gap-1.5 pt-1">
             <span className="text-micro text-ink-mute">Related:</span>

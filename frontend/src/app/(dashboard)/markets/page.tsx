@@ -3,8 +3,12 @@ import { BondYieldsChartIsland, MarketChartsIsland, PredictionMarketPanelIsland 
 import { CryptoAnalyticsIsland, CryptoPriceChartIsland } from '../crypto/islands';
 import { EquitiesFlowIsland, QuantRadarIsland } from '../options/islands';
 import DarkPoolFlowPanel from '@/components/DarkPoolFlowPanel';
+import ChipPrices from '@/components/ChipPrices';
+import CommodityBoard from '@/components/CommodityBoard';
 import { LiveTape } from '@/components/LiveTape';
+import { MarketsHeadline } from '@/components/PageHeadlines';
 import { OilStocks } from '@/components/OilStocks';
+import OilRoutes from '@/components/OilRoutes';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { pickView, ViewTabs, type View } from '@/components/ui/ViewTabs';
 
@@ -19,6 +23,8 @@ const VIEWS: View[] = [
   { key: 'crypto', label: 'Crypto', hint: "Bitcoin's price, futures funding, open interest and large transfers" },
   { key: 'flow', label: 'Big-money trades', hint: 'Block trades of $200k or more and large option prints' },
   { key: 'radar', label: 'Unusual volume', hint: 'Over 11,000 stocks swept for unusual volume and options orders' },
+  { key: 'commodities', label: 'Commodities', hint: 'Oil, gas, metals, grains, coffee, cattle and lumber, with the stocks each helps or hurts' },
+  { key: 'chips', label: 'Chips & GPUs', hint: 'Memory-chip spot prices and what it costs to rent a GPU' },
   { key: 'indices', label: 'Index flow', hint: 'How the S&P 500 and Nasdaq 100 are moving today' },
 ];
 
@@ -31,6 +37,10 @@ const DESCRIPTION: Record<string, string> = {
   flow: 'Unusually large trades: block trades, and large option prints from a feed about 15 minutes late.',
   radar: 'A radar sweeping over 11,000 stocks for unusual volume and options orders.',
   indices: 'How the S&P 500 and Nasdaq 100 are moving today.',
+  commodities:
+    'Oil, gas, metals, grains, coffee, cocoa, sugar, livestock and lumber: price, how each moved over a day, week, month and year, and the stocks each helps or hurts.',
+  chips:
+    'Memory-chip spot prices (DRAM, NAND flash, graphics memory) and what it costs to rent a GPU by the hour, with the stocks each one helps or hurts.',
 };
 
 export default async function MarketsPage({
@@ -52,11 +62,13 @@ export default async function MarketsPage({
       >
         <ViewTabs base="/markets" views={VIEWS} active={view.key} />
       </PageHeader>
+      <MarketsHeadline />
       {view.key === 'prices' && <MarketChartsIsland />}
       {view.key === 'economy' && (
         <>
           <BondYieldsChartIsland />
           <OilStocks />
+          <OilRoutes />
           <div className="min-h-[450px]">
             <PredictionMarketPanelIsland />
           </div>
@@ -81,6 +93,8 @@ export default async function MarketsPage({
         </div>
       )}
       {view.key === 'indices' && <EquitiesFlowIsland />}
+      {view.key === 'commodities' && <CommodityBoard />}
+      {view.key === 'chips' && <ChipPrices />}
     </div>
   );
 }

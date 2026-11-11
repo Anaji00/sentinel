@@ -162,7 +162,7 @@ export const Header: React.FC = () => {
       </div>
 
       {/* Measured state */}
-      <div className="hidden lg:flex items-center gap-4 text-micro min-w-0">
+      <div className="hidden 2xl:flex items-center gap-4 text-micro min-w-0">
         <span
           className="flex items-center gap-1.5 whitespace-nowrap"
           title={

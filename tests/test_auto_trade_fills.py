@@ -33,6 +33,8 @@ class _DB:
         self.asked = None
 
     async def query(self, sql, *args):
+        if sql == tr._UNKNOWN_ORDERS_SQL:
+            return []
         self.asked = args[0]
         return [{"id": 1, "order_id": "a", "qty": 2.0}, {"id": 2, "order_id": "b", "qty": 2.0}]
 

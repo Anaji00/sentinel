@@ -31,6 +31,7 @@ from services.api_gateway.routes import (
     ownership,
     stock_changes,
     stock_peers,
+    chip_prices,
     stock_thesis,
     me,
     auth,
@@ -207,6 +208,7 @@ app.include_router(reports.router)
 app.include_router(filings.router)
 app.include_router(ownership.router)
 app.include_router(stock_peers.router)
+app.include_router(chip_prices.router)
 app.include_router(stock_changes.router)
 app.include_router(stock_thesis.router)
 app.include_router(methodology.router)

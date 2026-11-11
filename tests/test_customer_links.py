@@ -28,6 +28,22 @@ def test_names_followed_by_a_share_of_revenue_are_candidates() -> None:
     assert cl.variants("United Parcel Service")[-1] == "United Parcel"          # never the bare "United"
 
 
+def test_headings_and_lists_are_not_taken_for_one_company() -> None:
+    """7 Nov 2026 audit: 44 of 267 stored links were wrong. Each name below was stored against a ticker."""
+    for bad in ("On", "People", "Outdoor", "Freedom", "Gravity", "Intelligent Edge", "Senior Notes", "Emerging Markets",
+                "Northern California Region", "Target, Walmart", "Target, Walmart, Amazon",
+                "Abbott Laboratories, Boston Scientific", "TJX Companies, Ross Stores, The Home Depot"):
+        assert cl.clean(bad) is None, bad
+    for good in ("Walmart Stores, Inc", "Philip Morris International, Inc", "Apple", "Qualcomm", "Procter & Gamble",
+                 "Southern Company", "ON Semiconductor", "Johnson and Johnson", "Coca-Cola Europacific Partners"):
+        assert cl.clean(good) == good, good
+    assert cl.clean("Amazon.com, Inc. and its affiliates") == "Amazon.com, Inc."          # the tail is not a second company
+    assert cl.several("Target, Walmart") and not cl.several("Walmart, Inc.") and not cl.several("Walmart Stores, Inc, Corp")
+    # The model path uses the same gate.
+    p = "Sales to On and People each accounted for 20% of net revenue."
+    assert cl.grounded([{"name": "On", "pct": 20}, {"name": "People", "pct": 20}], p) == []
+
+
 def test_the_models_names_must_be_in_the_passage() -> None:
     p = "Revenue from Lowe's Companies and The Home Depot together was 31% of net sales."
     got = cl.grounded([{"name": "Lowe's Companies", "pct": 16}, {"name": "Menards", "pct": 15},

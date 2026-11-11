@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from shared.utils.conflict_zones import REGION_ZONES, escalation_direction
 from shared.utils.headline_mapping import conflict_polarity, map_headline
 from shared.utils.osint_bridges import text_exposure_tags
+from shared.utils.ticker_hygiene import clean_all, clean_symbols
 
 # Sentiment past which a headline counts as clearly positive or negative.
 SENTIMENT_THRESHOLD = 0.3
@@ -202,7 +203,7 @@ def _tags(row: Dict[str, Any]) -> List[str]:
 
 
 def _exposed(row: Dict[str, Any]) -> List[str]:
-    return [t[len("exposes:"):] for t in _tags(row) if t.startswith("exposes:")]
+    return clean_all(t[len("exposes:"):] for t in _tags(row) if t.startswith("exposes:"))
 
 
 def _zones(row: Dict[str, Any]) -> List[str]:
@@ -243,9 +244,10 @@ def _known_at(row: Dict[str, Any]) -> Optional[datetime]:
 
 
 def _ticker(row: Dict[str, Any]) -> Optional[str]:
-    t = _fd(row).get("ticker") or row.get("primary_entity_id")
-    t = str(t or "").strip().upper()
-    return t or None
+    # The first tradable symbol of the field: "HEI, HEI.A" is one issuer, not an instrument named "HEI, HEI.A",
+    # and "NONE" / "N/A" are filings that name no listing.
+    syms = clean_symbols(str(_fd(row).get("ticker") or row.get("primary_entity_id") or ""))
+    return syms[0] if syms else None
 
 
 def observations(row: Dict[str, Any]) -> List[Observation]:

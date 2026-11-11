@@ -4,7 +4,7 @@ import React, { useState, useMemo } from 'react';
 import useSWR from 'swr';
 import { describeApiError } from '@/lib/api';
 import { fetcher } from '@/lib/api';
-import { Tabs } from '@/components/ui/Tabs';
+import { Button } from '@/components/ui/Button';
 import { flashClass, useFlash } from '@/components/ui/useFlash';
 import {
   Maximize2,
@@ -206,7 +206,9 @@ function AssetSparklineCard({
   return (
     <div
       onClick={() => onExpand(config)}
-      className="group relative bg-raised border border-line hover:border-line-accent rounded-2xl p-4 transition-all duration-200 cursor-pointer hover: overflow-hidden font-mono flex flex-col justify-between"
+      className={`lift wash group relative bg-raised border border-line hover:border-line-accent rounded-2xl p-4 cursor-pointer overflow-hidden font-mono flex flex-col justify-between ${
+        hasData ? (pctChange >= 0 ? 'text-positive' : 'text-negative') : ''
+      }`}
     >
       {/* Top Header & Expand Icon */}
       <div className="flex items-start justify-between">
@@ -237,11 +239,11 @@ function AssetSparklineCard({
       <div className="flex items-baseline justify-between my-2">
         {hasData ? (
           <>
-            <div className={`text-xl font-extrabold text-ink px-1 -mx-1 ${flashClass(flash)}`}>
+            <div className={`text-lead font-bold leading-none text-ink px-1 -mx-1 ${flashClass(flash)}`}>
               ${latestPoint?.price ? formatNumber(latestPoint.price, { decimals: 2 }) : '0.00'}
             </div>
             <div
-              className={`text-xs font-black flex items-center gap-0.5 ${pctChange >= 0 ? 'text-positive' : 'text-negative'}`}
+              className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-bold ${pctChange >= 0 ? 'bg-positive/15 text-positive' : 'bg-negative/15 text-negative'}`}
             >
               {pctChange >= 0 ? (
                 <TrendingUp className="w-3 h-3" />
@@ -272,27 +274,9 @@ function AssetSparklineCard({
           >
             <line
               x1="0"
-              y1="30"
-              x2="400"
-              y2="30"
-              stroke="var(--border-strong)"
-              strokeDasharray="3 3"
-              strokeWidth="0.5"
-            />
-            <line
-              x1="0"
               y1="60"
               x2="400"
               y2="60"
-              stroke="var(--border-strong)"
-              strokeDasharray="3 3"
-              strokeWidth="0.5"
-            />
-            <line
-              x1="0"
-              y1="90"
-              x2="400"
-              y2="90"
               stroke="var(--border-strong)"
               strokeDasharray="3 3"
               strokeWidth="0.5"
@@ -346,7 +330,7 @@ function AssetSparklineCard({
             {activeHover ? (
               <span className="text-accent font-bold">${activeHover.price.toFixed(2)}</span>
             ) : (
-              <span className="text-ink-mute">Click to expand</span>
+              <span aria-hidden />
             )}
           </>
         ) : (
@@ -600,7 +584,22 @@ export default function MarketCharts() {
 
   return (
     <div className="flex w-full flex-col gap-5 text-ink">
-      <Tabs className="self-start" tabs={categoryTabs} activeTab={activeTab} onChange={setActiveTab} />
+      {/* A filter on the charts below, not a second navigation: quiet chips under the view tabs. */}
+      <div role="group" aria-label="Show markets" className="flex flex-wrap items-center gap-1.5 font-sans">
+        <span className="mr-1 text-micro uppercase tracking-[0.08em] text-ink-mute">Show</span>
+        {categoryTabs.map((t) => (
+          <Button
+            key={t.id}
+            variant={activeTab === t.id ? 'secondary' : 'outline'}
+            size="sm"
+            pressed={activeTab === t.id}
+            onClick={() => setActiveTab(t.id)}
+            className="rounded-full"
+          >
+            {t.label}
+          </Button>
+        ))}
+      </div>
 
       {/* The yield curve leads the Economy view; here it shows under Bonds
           only, so the two views do not open on the same panel. */}
@@ -611,17 +610,28 @@ export default function MarketCharts() {
       )}
 
       {/* Multi-Asset Sparklines Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-        {filteredRegistry.map((asset) => (
-          <AssetSparklineCard
-            key={asset.symbol}
-            config={asset}
-            data={seriesMap[asset.symbol] || []}
-            feedError={marketError}
-            onExpand={(config) => setExpandedAsset(config)}
-          />
+      {/* Everything: thirteen look-alike cards read as one wall, so under "Everything" they sit in labelled groups. */}
+      {(activeTab === 'all'
+        ? categoryTabs.filter((t) => t.id !== 'all').map((t) => ({ title: t.label, assets: filteredRegistry.filter((a) => a.category === t.id) }))
+        : [{ title: null as string | null, assets: filteredRegistry }]
+      )
+        .filter((g) => g.assets.length > 0)
+        .map((g) => (
+          <section key={g.title ?? 'one'} aria-label={g.title ?? 'Markets'} className="space-y-3">
+            {g.title && <h2 className="font-sans text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">{g.title}</h2>}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {g.assets.map((asset) => (
+                <AssetSparklineCard
+                  key={asset.symbol}
+                  config={asset}
+                  data={seriesMap[asset.symbol] || []}
+                  feedError={marketError}
+                  onExpand={(config) => setExpandedAsset(config)}
+                />
+              ))}
+            </div>
+          </section>
         ))}
-      </div>
 
       {/* CLICK-TO-EXPAND LARGEST COMPONENT MODAL VIEW */}
       {expandedAsset && (

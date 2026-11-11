@@ -13,6 +13,7 @@ import { ABSENT, formatNumber } from '../lib/format';
 import { LABEL, pickTopCalls, type Recommendations } from '../lib/ideas';
 import { IdeaCard } from './IdeaCard';
 import { POLL } from './ui/DataProvider';
+import { Updated } from './ui/Updated';
 
 const REGIME_WORD: Record<string, string> = {
   calm: 'Calm market',
@@ -109,7 +110,7 @@ export function TopCalls({ count = 4 }: { count?: number }) {
       )}
       {data?.as_of && (
         <p className="text-micro text-ink-mute">
-          From the model as of {data.as_of ?? ABSENT}. Not financial advice.
+          From the model as of {data.as_of ?? ABSENT}. Not financial advice. <Updated source="/predictions/recommendations" />
         </p>
       )}
     </section>

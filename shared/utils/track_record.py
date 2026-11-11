@@ -57,6 +57,44 @@ def summarize(signed: Iterable[float]) -> Dict[str, Any]:
     }
 
 
+# Trading days a horizon's outcomes overlap with the next day's, so consecutive idea days are not independent.
+IDEA_OVERLAP_DAYS = {"daily": 1, "intraday": 1, "weekly": 5, "events": 5, "options": 5, "monthly": 21}
+
+
+def direction_skill(rows: Iterable[Tuple[Any, ...]], overlap: int = 1) -> Dict[str, Any]:
+    """What the same mix of long and short calls would have scored by luck, beside what they scored.
+
+    `rows` are (direction, signed excess, day) as a trade idea is graded: 1 for long, -1 for short, and a
+    positive signed excess when the call beat the market in the direction called. A hit rate above 50%
+    can be nothing more than leaning the way the week went, so the chance rate is the hit rate a
+    forecaster calling the same share long and short would get in the same outcomes
+    (shared/utils/forecast_skill.py). Calls that tied the market, and rows with no direction, are left out.
+
+    Ideas are logged for many stocks on the same day, and a five-day outcome shares four days with
+    the next day's, so the rows are far from independent: 339 weekly ideas sat on 18 days, about four
+    independent weeks. The significance is therefore stated on independent periods (days divided by the
+    overlap), not rows, and under 20 of those the verdict is "too few" whatever the row count.
+    """
+    from shared.utils.forecast_skill import MIN_N, skill
+
+    calls, days = [], set()
+    for row in rows:
+        direction, signed = row[0], row[1]
+        if direction not in (1, -1) or signed is None or not math.isfinite(float(signed)) or float(signed) == 0:
+            continue
+        calls.append((direction == 1, float(signed) * direction > 0, None))
+        days.add(row[2] if len(row) > 2 else len(days))
+    s = skill(calls)
+    n = s["n"]
+    independent = len(days) / max(1, overlap) if days else 0.0
+    z = s["z"]
+    if z is not None and n and independent:
+        z = round(z * math.sqrt(min(1.0, independent / n)), 2)       # the same excess over chance, on the sample it really has
+    verdict = "too few" if independent < MIN_N else ("skill" if z is not None and z >= 2 else ("worse than chance" if z is not None and z <= -2 else "none"))
+    return {"n_called": n, "n_days": len(days), "n_independent": round(independent, 1), "hit_called": s["hit"],
+            "chance_hit": s["chance_hit"], "heidke": s["heidke"], "heidke_z": z, "skill_verdict": verdict}
+
+
 def day_clustered_t(dated: Iterable[Tuple[date, float]], overlap: int = 1) -> Dict[str, Any]:
     """The t-statistic with one observation per day, not per row.
 
@@ -106,4 +144,4 @@ def bucket_of(net: float) -> str:
     return "strong bull (net >= 3)"
 
 
-__all__ = ["NET_BUCKETS", "bucket_of", "day_clustered_t", "forward_close", "grade", "summarize"]
+__all__ = ["NET_BUCKETS", "bucket_of", "IDEA_OVERLAP_DAYS", "day_clustered_t", "direction_skill", "forward_close", "grade", "summarize"]

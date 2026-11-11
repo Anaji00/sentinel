@@ -3,6 +3,7 @@ import CaseBoard from '@/components/CaseBoard';
 import IntelConsole from '@/components/IntelConsole';
 import OsintThreatMatrix from '@/components/OsintThreatMatrix';
 import ReportBuilder from '@/components/ReportBuilder';
+import { IntelHeadline } from '@/components/PageHeadlines';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { pickView, ViewTabs, type View } from '@/components/ui/ViewTabs';
 
@@ -46,6 +47,7 @@ export default async function IntelPage({
       >
         <ViewTabs base="/intel" views={VIEWS} active={view.key} />
       </PageHeader>
+      {view.key === 'console' && <IntelHeadline />}
       {view.key === 'console' && <IntelConsole />}
       {view.key === 'osint' && <OsintThreatMatrix />}
       {view.key === 'cases' && <CaseBoard />}

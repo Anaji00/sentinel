@@ -15,6 +15,7 @@
  * ended up meaning different things in different panels.
  */
 @theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --color-accent: var(--accent);
   --color-accent-dim: var(--accent-dim);
   --color-positive: var(--positive);
@@ -205,11 +206,15 @@
   body {
     background-color: var(--bg-base);
     color: var(--text-primary);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-family: var(--font-inter), system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "cv11", "ss01";
     overflow: hidden;
     /* One faint gradient for depth. The 32px grid overlay it replaced added
        texture behind every table row and made small type harder to read. */
-    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(139, 157, 255, 0.07), transparent);
+    background-image:
+      radial-gradient(ellipse 75% 50% at 50% -14%, color-mix(in srgb, var(--accent) 16%, transparent), transparent),
+      radial-gradient(ellipse 45% 35% at 100% 100%, color-mix(in srgb, var(--civic) 5%, transparent), transparent);
+    background-attachment: fixed;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
@@ -233,10 +238,12 @@
   /* ── Panel: the single container primitive ──────────────────────────────── */
 
   .panel {
-    background: var(--bg-raised);
+    /* A lit top edge and a faint top-down tint: the surface reads as raised
+       rather than as a flat rectangle, with no blur and no glow. */
+    background: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3%, var(--bg-raised)), var(--bg-raised) 40%);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius);
-    box-shadow: var(--shadow-panel);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent), var(--shadow-panel);
   }
 
   /* Hover is a hint of interactivity, not an event. */
@@ -279,6 +286,10 @@
     letter-spacing: 0.08em;
     color: var(--text-muted);
   }
+
+  /* Titles: tighter, so the eye lands on them first. */
+  h1 { letter-spacing: -0.025em; font-weight: 650; }
+  h2, h3 { letter-spacing: -0.01em; }
 
   .stat-value {
     font-family: var(--font-mono);
@@ -326,9 +337,9 @@
      tone here, not by a halo. */
 
   .glass-panel {
-    background: var(--bg-raised);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3%, var(--bg-raised)), var(--bg-raised) 40%);
     border: 1px solid var(--border-subtle);
-    box-shadow: var(--shadow-panel);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent), var(--shadow-panel);
     /* No backdrop-filter: sixteen blurred layers cost frame time and take
        contrast away from the text on top of them. */
   }
@@ -344,6 +355,33 @@
 }
 
 @layer utilities {
+  /* Every raised surface gets the same lit edge and tint as .panel, so the
+     many cards written as `bg-raised` match the ones that use the class.
+     Elements that are not containers (inputs, chips) are left flat. */
+  :where(section, article, aside, div).bg-raised {
+    background-image: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3.5%, transparent), transparent 45%);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent);
+  }
+
+  /* A card that opens something lifts a little under the pointer. */
+  .lift {
+    transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+  }
+  .lift:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-overlay);
+  }
+
+  /* A coloured wash from the top of a card, for a direction (up, down) or a state.
+     The colour comes from the element's own `color`, so a tone class sets it. */
+  .wash {
+    background-image: linear-gradient(180deg, color-mix(in srgb, currentColor 9%, transparent), transparent 55%);
+  }
+  /* On white the same percentage reads as pink or mint, so the light theme uses less. */
+  :root[data-theme="light"] .wash {
+    background-image: linear-gradient(180deg, color-mix(in srgb, currentColor 4%, transparent), transparent 50%);
+  }
+
   /* Scrollbars recede until the region is hovered. */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -408,6 +446,19 @@
     }
   }
 }
+
+/* The stock drawer slides in from its edge and its backdrop fades, so opening
+   reads as a place arriving rather than a jump. Reduced motion collapses it. */
+@keyframes drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.drawer-in { animation: drawer-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+.fade-in { animation: fade-in 180ms ease-out; }
 
 /* A live figure that just changed: a brief tint behind it, green up and red
    down (useFlash). Motion that marks a real change, which the rule above

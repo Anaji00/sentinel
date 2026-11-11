@@ -1,5 +1,6 @@
 'use client';
 
+import WhatIf from './WhatIf';
 import React, { useMemo, useState } from 'react';
 import { Input } from './ui/Input';
 import useSWR from 'swr';
@@ -749,6 +750,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
       )}
 
       {/* TAB CONTENT: AI Scenarios */}
+      {activeTab === 'scenarios' && <WhatIf />}
       {activeTab === 'scenarios' && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {!scenarios || scenarios.length === 0 ? (

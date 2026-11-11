@@ -115,6 +115,16 @@ Sentinel is composed of **35 modular services & containers** orchestrated via Do
 - **ContextBuilder**: Non-exclusion bidirectional 3-hop graph traversal capturing statistical, structural, and regulatory relationships with recency decay weighting.
 - **Consensus Engine**: Subjective logic opinion fusion ($b, d, u, a$) across multi-agent predictions.
 - **LLM Reasoning Swarm (`agents-heavy` & `agents-fast`)**:
+  - **Hosted inference first, local last** (`shared/utils/hosted_llm.py`): free Groq and Gemini tiers sit in
+    front of Ollama behind the same client, so about 95% of calls (roughly 450 calls and 0.7M tokens a day)
+    run hosted. Each hosted model has its own client-side bucket (`LLM_QUOTAS`: requests and tokens a
+    minute and a day); a full bucket or a 429 skips to the next step and is never retried. The binding limit
+    is tokens a minute (8,000 on Groq), not calls a day, so bursts spill to local calls of 3 minutes each.
+    The small-model route (`LLM_ROUTES`) is gpt-oss-20b, Groq qwen3.8-27b, Gemini 3.5 and 3.1 flash-lite,
+    then gpt-oss-safeguard-20b. A hosted-only model (`provider/model`) may fall to other hosted steps
+    (`LLM_FALLBACKS`) only for the call sites in `LLM_FALLBACK_SITES` (scenarios); headline scores and the
+    analyst shadow stay on one model so their series never mix. Keys are in `.env` only. See
+    `reports/Free LLM providers.md` for the providers checked and their limits.
   - **One model, both tiers (`qwen2.5:3b`)**: a single model stays resident in Ollama (`OLLAMA_MAX_LOADED_MODELS=1`); `agents-heavy` and `agents-fast` differ in what they are asked, not which model answers. Reasoning writes scenarios only for INTELLIGENCE-tier clusters and above, and not for correlation rules that grading against prices has shown carry no information (see the Stock Research Pipeline).
 
 ### 5. API Gateway & Tactical Radar Dashboard (`frontend` & `services/api_gateway`)
@@ -270,6 +280,15 @@ The rules that keep it tradable:
   illiquidity) were removed — 29 inputs, mean monthly net Sharpe 0.68 → 0.97, IC t 2.40 → 3.34, better on
   every offset. Gross profitability added nothing. The paper account now holds only the model's extremes
   (book B1: bottom tenth short, 90th–99th percentile long, equal weight).
+- **Books scored on simple returns** (5–6 November; [MODEL_TRIALS.md](MODEL_TRIALS.md)): the Sharpe figures
+  above averaged log returns, which credit a volatile short with half its variance. Walk-forward now
+  scores every book, and from 6 November the portfolio lab (B2–B6, sizing, regime gauge), on simple returns.
+  B1's best estimate is a net Sharpe near 0.40 on eight calendars (0.32 on four fresh ones), with no
+  alpha beyond known factors shown (t 1.36); none of the models passes the 0.95 gate. The nightly
+  choice among near-equal models keeps the incumbent unless a challenger leads by 0.10
+  (`shared/utils/model_choice.py`). The lab's first simple-return report is due after the 6–7 November
+  run. RB1, a plain momentum-minus-volatility rule against B1, is registered and not yet run. Price
+  history cannot go back further on the free feed (it starts 4 January 2016).
 - **Evidence tiers**: *validated* passes every gate including the deflated Sharpe;
   *supported* passes all but that one. Only these vote.
 
@@ -289,6 +308,27 @@ over five (t −5.6, the held-out half agreeing), the opposite of its prior. So 
 traded. Instead `stock_news_fade` was registered on 18 October: positive news, expected
 down, judged only on articles from that date (`NEWS_FADE_REGISTERED`), so history cannot
 vote for it.
+
+**Where the study stands (7 November 2026; [reports/Event backtest scope.md](reports/Event%20backtest%20scope.md)).**
+212 family-and-horizon cells over 282,171 episodes: 16 proven, 95 no edge, 86 short of the 20 independent
+units, 9 unmeasurable, 5 contradicting their prior. The nine unmeasurable cells are 30-day cells of families
+under 30 days old, not a price problem (`reports/Unmeasurable signals.md`). Gaps being closed: headlines are
+now read back to 2019 and the EDGAR families to 2016 instead of five years (the archive's 8-K, Form 4 and 13F
+backfill is running), proven cells are being re-scored on liquid, borrowable names (the large 30-day moves
+in dilution and delisting notices look like micro-caps that cannot be shorted) and checked for stability by
+half-year and market regime. Kaggle price or news sets were rejected: survivorship, and models remember
+prices before their training cutoff, so LLM-derived signals are judged forward only.
+
+**Connections audit (7 November 2026; [reports/Intelligence audit.md](reports/Intelligence%20audit.md),
+`scripts/audit_connections.py`).** Tested on the last 120 sessions with the rules written first. Sympathy
+peers (rebuilt out of sample) and 10-K text peers co-move well beyond the same industry (+0.29 and +0.11 in
+correlation); 10-K customer links do not (−0.01, 76 suppliers). None of them leads: peers' next-day and
+next-week moves do not follow a stock's own move, even after a 4% company-specific move on its own news
+(|t| below 2 in every cell, none above the bar of 3). So connections describe exposure and risk, not what moves
+next. A precision check found 16% of the 267 stored customer links wrong ("On" read as On Holding, lists of
+several companies read as one) and 9% on lines with no price data; `shared/utils/customer_links.py` now rejects
+those names and the 44 wrong rows and 14 graph edges were removed. Cleaning did not restore a price signal, so
+customer links stay a fact for the case file.
 
 Option flow is studied as bought calls and puts (prints above the quote's midpoint with
 $50k+ of extrinsic premium, deep in-the-money prints set aside) and as opening trades

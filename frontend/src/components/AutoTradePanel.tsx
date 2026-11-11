@@ -12,6 +12,8 @@ import { fetcher } from '../lib/api';
 import { ABSENT, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { LoadingLines } from './ui/Skeleton';
+import { Updated } from './ui/Updated';
+import { orderCounts, orderStatusWords } from '../lib/trackWords';
 
 interface AutoOrder {
   day: string;
@@ -69,6 +71,7 @@ export default function AutoTradePanel() {
     <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
       <div className="flex flex-wrap items-baseline gap-2">
         <h2 className="font-bold text-ink text-sm">Positions taken automatically</h2>
+        <Updated source="/predictions/auto-trade" pollMs={60_000} />
         {data && (
           <span
             className={`px-2 py-0.5 rounded-full border text-micro font-semibold ${
@@ -83,8 +86,9 @@ export default function AutoTradePanel() {
       <p className="text-ink-dim">
         Only the model&apos;s strongest calls, traded in a paper brokerage account: half the money in the stocks it ranks
         in its 90th to 99th percentile, half betting against its bottom tenth, equal amounts each, rebuilt every month
-        and no index fund. This beat holding the top and bottom fifth in eleven years of testing. Up and down days for
-        the market roughly cancel out, so the result is the stock picking alone. Paper money only.
+        and no index fund. Paper account only. The best estimate for this book is a Sharpe near 0.4 across eight test
+        calendars, with no edge beyond known factors shown. Real money would need the validation gate passed and 24 months
+        of forward record, so the account&apos;s gain or loss against the S&amp;P 500 is not evidence that it works.
       </p>
       {error ? (
         <p className="text-ink-mute">The auto-trader could not be read.</p>
@@ -93,6 +97,12 @@ export default function AutoTradePanel() {
       ) : (
         <>
           <p className="text-ink">{autoTradeLine(data)}</p>
+          {orderCounts(data.orders).unconfirmed > 0 && (
+            <p role="status" className="text-micro text-ink-dim">
+              {orderCounts(data.orders).unconfirmed} order{orderCounts(data.orders).unconfirmed === 1 ? '' : 's'} not
+              confirmed yet and being checked: the broker did not answer in time, so they may still be live.
+            </p>
+          )}
           {data.account && (
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               {[
@@ -134,6 +144,22 @@ export default function AutoTradePanel() {
                 ))}
               </tbody>
             </table>
+          )}
+          {data.orders.some((o) => o.status === 'unknown') && (
+            <details className="text-micro text-ink-mute">
+              <summary className="cursor-pointer">Orders not confirmed yet</summary>
+              <ul className="mt-1 space-y-0.5">
+                {data.orders
+                  .filter((o) => o.status === 'unknown')
+                  .slice(0, 15)
+                  .map((o) => (
+                    <li key={`${o.symbol}-${o.submitted_at}`}>
+                      {o.symbol} {o.side} {formatNumber(o.qty, { decimals: 2 })}, {formatAge(o.submitted_at)} ago:{' '}
+                      {orderStatusWords(o.status).text}
+                    </li>
+                  ))}
+              </ul>
+            </details>
           )}
           {data.orders.some((o) => o.status === 'rejected') && (
             <details className="text-micro text-ink-mute">

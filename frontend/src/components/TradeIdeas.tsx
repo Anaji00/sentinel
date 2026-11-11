@@ -57,7 +57,7 @@ function BetsMeter({ bets, of }: { bets: number | null | undefined; of: number }
   return (
     <span
       className="inline-flex items-center gap-1.5 text-micro text-ink-mute"
-      title="Stocks that tend to move together count as one bet"
+      title="Stocks that tend to rise and fall together count as one bet, so this is how many truly separate bets the picks amount to"
     >
       <span className="inline-block h-1.5 w-16 rounded-full bg-inset overflow-hidden">
         <span
@@ -65,7 +65,7 @@ function BetsMeter({ bets, of }: { bets: number | null | undefined; of: number }
           style={{ width: `${share * 100}%` }}
         />
       </span>
-      really {bets != null ? formatNumber(bets, { decimals: 1 }) : ABSENT} separate bets of {of}
+      {of} picks, but they move together: like {bets != null ? formatNumber(bets, { decimals: 1 }) : ABSENT} independent bets
     </span>
   );
 }
