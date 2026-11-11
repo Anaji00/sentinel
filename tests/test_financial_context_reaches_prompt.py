@@ -70,7 +70,9 @@ def test_a_headlined_event_still_gets_its_facts():
     """The defect: the headline branch returned early and the payload was
     never consulted."""
     source = (ROOT / "services" / "reasoning" / "context_builder.py").read_text(encoding="utf-8")
-    block = source.split("detail = str(headline)[:60]")[1][:900]
+    # The anchor moved with the headline being sanitised (11 Nov 2026: ingested text is stripped of injection forms
+    # where it is collected); the property under test, that the headline branch still reaches _financial_facts, is unchanged.
+    block = source.split("detail = sanitize_untrusted(headline, max_chars=60)")[1][:900]
     assert "_financial_facts(evt)" in block
 
 

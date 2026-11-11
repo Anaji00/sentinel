@@ -36,7 +36,8 @@ if str(ROOT) not in sys.path:
 
 from shared.db import get_redis, get_timescale  # noqa: E402
 from shared.utils.ownership import (  # noqa: E402
-    FLOW_FILERS, OWNERSHIP_FILERS, aggregate_by_cusip, aggregate_changes, holding_changes, iter_infotable,
+    FLOW_FILERS, OWNERSHIP_FILERS, SPLIT_DATES_KEY, aggregate_by_cusip, aggregate_changes, holding_changes, iter_infotable,
+    published_flow_keys, split_tickers_in, unpublished_flows,
 )
 from shared.utils.quiet_failures import swallowed  # noqa: E402
 from shared.utils.sec_rate import sec_slot  # noqa: E402
@@ -57,6 +58,10 @@ _ARCHIVE_SQL = """
                                       sentiment, primary_entity_id, financial_data, region)
     VALUES ($1, 'thirteen_f', 'ownership_changes', $2, $2, $3, $4, $5, NULL, $6, $7::jsonb, NULL)
     ON CONFLICT DO NOTHING
+"""
+_PUBLISHED_SQL = """
+    SELECT primary_entity_id AS ticker, tags FROM signal_event_archive
+    WHERE type = 'thirteen_f' AND ('institutional_accumulation' = ANY(tags) OR 'institutional_distribution' = ANY(tags))
 """
 
 
@@ -120,10 +125,12 @@ async def _holdings(session: aiohttp.ClientSession, sec: aiohttp.ClientSession, 
     return shares
 
 
-def flows(per_period: Dict[str, Dict[str, Tuple[str, Dict[str, float]]]]) -> List[Dict[str, Any]]:
+def flows(per_period: Dict[str, Dict[str, Tuple[str, Dict[str, float]]]],
+          splits: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
     """Flows per period from {period: {filer name: (filed, {ticker: shares})}}:
     each period compared with the filer's previous one, aggregated across
-    filers exactly as the live loop does, stamped when the last filed."""
+    filers exactly as the live loop does, stamped when the last filed. `splits` (ticker -> ISO ex-dates) removes the
+    tickers whose share count a split changed between the two quarter ends."""
     periods = sorted(per_period)
     out: List[Dict[str, Any]] = []
     for prev_p, p in zip(periods, periods[1:]):
@@ -138,7 +145,7 @@ def flows(per_period: Dict[str, Dict[str, Tuple[str, Dict[str, float]]]]) -> Lis
         if not filed:
             continue
         last = max(filed)
-        for ticker, row in aggregate_changes(changes).items():
+        for ticker, row in aggregate_changes(changes, split_tickers=split_tickers_in(splits, prev_p, p)).items():
             if row["flow"]:
                 out.append({"period": p, "ticker": ticker, "flow": row["flow"], "known": last,
                             "names": row["buyers"] if row["flow"] > 0 else row["sellers"]})
@@ -171,8 +178,9 @@ async def run_once(resolve: Callable[[str, Optional[str]], Optional[str]]) -> in
                     per_period.setdefault(f["period"], {})[filer.name] = (f["filed"], h)
             logger.info("Ownership history: %s, %s quarters", filer.name,
                         sum(1 for v in per_period.values() if filer.name in v))
+    splits = {(k.decode() if isinstance(k, bytes) else k): json.loads(v) for k, v in (await raw.hgetall(SPLIT_DATES_KEY) or {}).items()}
     rows = []
-    for fl in flows(per_period):
+    for fl in flows(per_period, splits):
         kind = "institutional_accumulation" if fl["flow"] > 0 else "institutional_distribution"
         verb = "added to or opened" if fl["flow"] > 0 else "cut or exited"
         rows.append((str(uuid.uuid5(uuid.NAMESPACE_URL, f"13f-flow:{fl['period']}:{fl['ticker']}")), _known_at(fl["known"]),
@@ -180,6 +188,12 @@ async def run_once(resolve: Callable[[str, Optional[str]], Optional[str]]) -> in
                      ", ".join(fl["names"]) + ". 13F long positions as filed.",
                      [kind, f"exposes:{fl['ticker']}", f"period:{fl['period']}"], fl["ticker"], {"ticker": fl["ticker"]}))
     db = await get_timescale()
+    # A quarter the live path already archived is not archived again: the two use different event ids.
+    published = published_flow_keys(await db.query(_PUBLISHED_SQL) or [])
+    kept = unpublished_flows(rows, published)
+    if len(kept) != len(rows):
+        logger.info("Ownership history: %s flows already archived by the live path, left out", len(rows) - len(kept))
+    rows = kept
     for i in range(0, len(rows), 1000):
         await db.execute_many(_ARCHIVE_SQL, rows[i:i + 1000])
     await raw.set(DONE_KEY, datetime.now(timezone.utc).isoformat())

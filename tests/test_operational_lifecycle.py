@@ -299,6 +299,8 @@ def test_integrations_endpoint_is_registered():
     from services.api_gateway.routes.main import app
 
     paths = {r.path for r in app.routes if hasattr(r, "path")}
+    # See tests/test_innovation_layer.py: included routers are not in `app.routes`, but are in the OpenAPI paths.
+    paths.update(app.openapi().get("paths", {}))
     assert "/api/v1/integrations" in paths
     assert "/api/v1/integrations/execution" in paths
 

@@ -103,3 +103,13 @@ def test_a_leg_without_greeks_is_judged_at_the_forecast_volatility() -> None:
     near = oe.Quote("C95", "C", 95.0, "2026-11-20", 3.0, 3.2)
     got = oe.candidates(1, [deep, near], 93.0, 34 / 365, 0.3, 0.45)
     assert got and all(lg["strike"] == 95.0 for c in got for lg in c["legs"])
+
+
+def test_tail_probabilities_from_the_at_the_money_level_and_none_for_bad_input() -> None:
+    from shared.utils.option_ev import tail_probabilities
+    p = tail_probabilities(100.0, 30 / 365, 0.60, 0.20)             # a 60%-vol stock, a 20% move in a month
+    assert p is not None and abs(p["up"] - 0.1259) < 0.002 and abs(p["down"] - 0.1129) < 0.002   # lognormal: in percent terms the right tail is the larger
+    calm = tail_probabilities(100.0, 30 / 365, 0.15, 0.20)
+    assert calm is not None and calm["up"] < 0.001 and calm["down"] < 0.001
+    for bad in ((0, .1, .3, .1), (100, 0, .3, .1), (100, .1, 0, .1), (100, .1, .3, 0), (100, .1, .3, 1.0), (100, .1, float("nan"), .1)):
+        assert tail_probabilities(*bad) is None

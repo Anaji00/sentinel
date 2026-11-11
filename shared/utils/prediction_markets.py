@@ -132,3 +132,36 @@ def is_relevant_market(market: Dict[str, Any]) -> bool:
 def slug_is_relevant(slug: str) -> bool:
     """`is_relevant_market` for a caller that holds only the slug."""
     return is_relevant_market({"slug": slug})
+
+
+def devig(prices):
+    """Prices of a field with exactly one winner, scaled to sum to 1 (proportional de-vig), or None.
+
+    A market's quoted prices add to more than 1 by its overround, so each price overstates its outcome. Only for
+    fields of mutually exclusive outcomes: independent contracts have no reason to add to 1, and scaling them would
+    invent a constraint. None for a missing, negative or non-finite price, or a field summing to nothing."""
+    import math as _m
+    try:
+        xs = [float(p) for p in prices]
+    except (TypeError, ValueError):
+        return None
+    if len(xs) < 2 or any((not _m.isfinite(x)) or x < 0 for x in xs):
+        return None
+    total = sum(xs)
+    return [x / total for x in xs] if total > 0 else None
+
+
+def shrink_to_prior(price, volume, prior=0.5, strength=2000.0):
+    """A price pulled toward `prior` in proportion to how little has traded: (v*price + k*prior) / (v + k).
+
+    A contract that has traded $50 quotes a price that means little; $200,000 means a lot. `strength` is the volume
+    (USD) at which the price and the prior weigh equally; 2,000 is a starting value to be calibrated against resolved
+    markets, not a measured one. None when the price or volume is unusable."""
+    import math as _m
+    try:
+        p, v = float(price), float(volume)
+    except (TypeError, ValueError):
+        return None
+    if not (_m.isfinite(p) and _m.isfinite(v)) or not 0.0 <= p <= 1.0 or v < 0 or strength <= 0:
+        return None
+    return (v * p + strength * prior) / (v + strength)

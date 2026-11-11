@@ -26,6 +26,7 @@ import numpy as np
 
 from shared.db import get_timescale
 from shared.utils import news_model as nm
+from shared.utils.champion_gate import challenger_may_replace
 from shared.utils.headline_mapping import map_headline
 from shared.utils.quiet_failures import swallowed
 from shared.utils.vector_index import EVENT_COLLECTION
@@ -147,7 +148,21 @@ async def run_once(soft_correlator: Any, redis_client: Any) -> Dict[str, Any]:
             report["weights"] = [round(float(w), 7) for w in await asyncio.to_thread(nm.ridge, X, y)]
     else:
         report.update(days=0, mean_ic=None, t=None, validated=False, note="fewer than 500 samples")
-    await getattr(redis_client, "raw", redis_client).set(nm.NEWS_MODEL_KEY, json.dumps(report))
+    raw = getattr(redis_client, "raw", redis_client)
+    champion = await raw.get(nm.NEWS_MODEL_KEY)
+    try:
+        champ = json.loads(champion) if champion else {}
+    except ValueError:
+        champ = {}
+    if champ.get("validated") and champ.get("weights"):
+        replace, why = challenger_may_replace(champ.get("mean_ic"), champ.get("t"), report.get("mean_ic"), bool(report.get("validated")))
+        if not replace:
+            # The live weights stay; the challenger's numbers are kept beside them so the held-over run is visible.
+            champ["challenger"] = {k: report.get(k) for k in ("generated_at", "samples", "days", "mean_ic", "t", "validated")} | {"held_over": why}
+            await raw.set(nm.NEWS_MODEL_KEY, json.dumps(champ))
+            logger.info("News model: champion kept (%s)", why)
+            return report
+    await raw.set(nm.NEWS_MODEL_KEY, json.dumps(report))
     logger.info("News model: %s samples, %s test days, IC %s (t %s), validated %s", report.get("samples"),
                 report.get("days"), report.get("mean_ic"), report.get("t"), report.get("validated"))
     return report
@@ -161,7 +176,10 @@ async def run_forever(soft_correlator: Any, redis_client: Any) -> None:
             prior = await raw.get(nm.NEWS_MODEL_KEY)
             age = None
             if prior:
-                ran = json.loads(prior).get("generated_at")
+                stored = json.loads(prior)
+                # A held-over challenger counts as a run, or a champion older than a week reruns every 6 hours.
+                stamps = [s for s in (stored.get("generated_at"), (stored.get("challenger") or {}).get("generated_at")) if s]
+                ran = max(stamps, key=datetime.fromisoformat) if stamps else None
                 age = datetime.now(timezone.utc) - datetime.fromisoformat(ran) if ran else None
             if soft_correlator._client is not None and (age is None or age > timedelta(days=EVERY_DAYS)):
                 await run_once(soft_correlator, redis_client)

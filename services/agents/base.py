@@ -335,7 +335,9 @@ BUDGET_WEIGHT_TTL_SEC = 600
 # graded record yet; any other agent gets the default. HOSTED_SHARES overrides
 # ("agent=calls,...").
 HOSTED_CALLS_PER_AGENT_HOUR = int(os.getenv("HOSTED_CALLS_PER_AGENT_HOUR", "4"))
-DEFAULT_HOSTED_SHARES = {"analyst_shadow": 12, "analyst_agent": 12, "stock_correlation_agent": 6}
+DEFAULT_HOSTED_SHARES = {"analyst_shadow": 12, "analyst_agent": 12, "stock_correlation_agent": 6,
+                         # the hosted wargamer: a daily cap of 150 (WARGAMER_DAILY_CAP) binds before 8 an hour would
+                         "adversarial_wargamer_v2_hosted": 8}
 # Agents that may use a hosted model's whole quota; the rest leave
 # HOSTED_RESERVE of every limit for them and for the headline scorer, which
 # stopped at 08:32 on 29 Oct when one agent had spent the day's allowance.

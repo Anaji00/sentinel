@@ -196,3 +196,12 @@ def test_each_episode_is_measured_against_the_index_of_its_own_size() -> None:
     # Before day 25 only the small volumes are known; after, the large ones count.
     assert rs.trailing_dollar_volume(dv, 86400.0 * 25) == 1e6
     assert rs.trailing_dollar_volume(dv, 86400.0 * 30, n=5) == 1e9
+
+
+def test_a_cell_whose_family_is_younger_than_the_horizon_says_too_young_not_missing_prices() -> None:
+    young = rs.evaluate_cell("fresh_family", "30d", [], 40, first_episode_age_days=12.0)
+    assert young.verdict == "unmeasurable" and "too young" in young.reason and "12 days old" in young.reason and "needs 30" in young.reason
+    old = rs.evaluate_cell("old_family", "30d", [], 40, first_episode_age_days=400.0)
+    assert old.verdict == "unmeasurable" and old.reason == "no price history around these episodes"
+    unknown_age = rs.evaluate_cell("x", "1d", [], 5)
+    assert unknown_age.reason == "no price history around these episodes"

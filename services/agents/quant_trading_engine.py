@@ -307,7 +307,13 @@ class FinancialAdviceBrief(BaseModel):
 from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils import tradable_cells
 from shared.utils.rates import risk_free_rate
+
+# One peer-link alert per ticker per cooldown. NVDA produced 56 identical ones in 48 hours (9 to 11 Nov 2026), and
+# the same text for 675 tickers, which buried the real divergence on 9 Nov (reports/Divergence alert.md).
+PEER_ALERT_KEY = "sentinel:quant:peer_alert:{ticker}"
+PEER_ALERT_COOLDOWN_SEC = 6 * 3600
 
 
 # ── CONSOLIDATED QUANT TRADING ENGINE ──────────────────────────────────────────
@@ -520,7 +526,7 @@ class QuantTradingEngine(SentinelAgent):
             # claim, not a measurement of this pair's lead-lag.
             for p in discovery.peer_tickers[:4]:
                 if (p.verification == "granger_supported" and p.discovery_confidence >= 0.65
-                        and await is_valid_primary_equity_async(p.ticker)):
+                        and await is_valid_primary_equity_async(p.ticker, redis_client=self.redis)):
                     await self.redis.raw.zadd(WATCHED_EQUITIES_KEY, mapping={p.ticker: time.time()})
 
             closes, _, _ = await self._fetch_prices(ticker)
@@ -578,7 +584,9 @@ class QuantTradingEngine(SentinelAgent):
             }
 
             # Register discovered high-confidence peers in ontology/graph pipelines and emit CorrelationCluster
-            high_conf_peers = [p for p in discovery.peer_tickers if p.discovery_confidence >= 0.65]
+            # Stocks only: the graph's candidates included SPY and TLT, which are not peers of anything.
+            high_conf_peers = [p for p in discovery.peer_tickers
+                               if p.discovery_confidence >= 0.65 and await is_valid_primary_equity_async(p.ticker, redis_client=self.redis)]
             # Only what this engine measured goes back to the graph: a Granger
             # lead it just tested. The candidates themselves came from the
             # graph, and the proposal shape -- {source_entity, relationship:
@@ -604,7 +612,7 @@ class QuantTradingEngine(SentinelAgent):
                     key=peer.ticker,
                 )
 
-            if high_conf_peers:
+            if high_conf_peers and await self._peer_alert_due(ticker):
                 peer_ids = [p.ticker for p in high_conf_peers]
                 corr_cluster = CorrelationCluster(
                     rule_id="QUANT_PEER_DECOUPLING",
@@ -616,7 +624,9 @@ class QuantTradingEngine(SentinelAgent):
                     alert_tier=AlertTier.ALERT,
                     primary_domain="financial",
                     confidence_score=float(high_conf_peers[0].discovery_confidence),
-                    summary_headline=f"Peer Decoupling Detected: {ticker} vs {', '.join(peer_ids[:3])}",
+                    # What this is: peers found by graph and Granger tests, not a measured divergence (that is
+                    # services/agents/divergence_watch.py). The old headline claimed a decoupling it never measured.
+                    summary_headline=f"Peer link found: {ticker} with {', '.join(peer_ids[:3])}",
                     supporting_headlines=[f"{p.ticker}: {p.rationale}" for p in high_conf_peers[:3]],
                     metrics_summary={
                         "catalyst_category": discovery.catalyst_category,
@@ -631,7 +641,7 @@ class QuantTradingEngine(SentinelAgent):
                     supporting_event_ids=[],
                     entity_ids=[ticker] + peer_ids,
                     entity_names=[ticker] + peer_ids,
-                    description=f"QuantTradingEngine discovered cointegrated peer correlation for {ticker} with {', '.join(peer_ids)}. Catalyst: {discovery.catalyst_category}",
+                    description=f"QuantTradingEngine found peers for {ticker}: {', '.join(peer_ids)} (graph candidates that passed a lag test on hourly bars). Catalyst: {discovery.catalyst_category}. This does not say the stock is moving against them.",
                     tags=["quant_peer_discovery", f"ticker:{ticker}"] + [f"peer:{p}" for p in peer_ids],
                 )
                 # Persisted before it is published, as every correlation-service
@@ -660,6 +670,14 @@ class QuantTradingEngine(SentinelAgent):
         except (SchemaViolationError, InferenceError, Exception) as e:
             logger.error(f"Quant peer discovery failed for {ticker}: {e}")
             return None
+
+    async def _peer_alert_due(self, ticker: str) -> bool:
+        """True once per ticker per PEER_ALERT_COOLDOWN_SEC; a Redis failure lets the alert through and is counted."""
+        try:
+            return bool(await self.redis.raw.set(PEER_ALERT_KEY.format(ticker=ticker), "1", nx=True, ex=PEER_ALERT_COOLDOWN_SEC))
+        except Exception as exc:
+            swallowed("agents.quant.peer_alert_cooldown", exc, logger)
+            return True
 
     # ── SUB-ENGINE 3: FINANCIAL ADVISORY & RISK SIGNALS ─────────────────────
 
@@ -1493,7 +1511,7 @@ MEASURED SIZING INPUTS:
             if not blob:
                 return set()
             cells = json.loads(blob if isinstance(blob, str) else blob.decode("utf-8")).get("cells", [])
-            return {c.get("family") for c in cells if c.get("verdict") == "proven" and c.get("family")}
+            return {c.get("family") for c in tradable_cells.gate_cells(cells) if c.get("verdict") == "proven" and c.get("family")}
         except Exception as e:
             swallowed("agents.quant_trading_engine.proven_families", e, logger)
             return set()
@@ -2000,8 +2018,13 @@ MEASURED SIZING INPUTS:
             return []
 
         try:
-            cov = np.cov(np.array([r[-width:] for r in returns], dtype=np.float64))
-            cov_matrix = np.atleast_2d(cov).tolist()
+            window = [r[-width:] for r in returns]
+            # Shrunk toward a scaled identity (Ledoit-Wolf): a sample covariance of this few observations is noisy and the
+            # model inverts it. The sample estimate is the fallback when the shrunk one cannot be computed.
+            cov_matrix = quant_calc.shrunk_covariance(window)
+            if cov_matrix is None:
+                dropped("agents.quant_trading_engine.bl_covariance_shrinkage", "shrinkage unavailable; sample covariance used", logger)
+                cov_matrix = np.atleast_2d(np.cov(np.array(window, dtype=np.float64))).tolist()
         except Exception as _exc:
             swallowed("agents.quant_trading_engine._bl_covariance", _exc, logger)
             return []

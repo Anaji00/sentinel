@@ -52,7 +52,9 @@ def test_no_reference_to_a_field_or_enum_member_that_does_not_exist():
 
 # Entry points that exist for operators and are deliberately not compose
 # services. Each is annotated in its own file as not being the live path.
-ALLOWED_ENTRYPOINTS = 3
+# Four since 11 Nov 2026: services/agents/supervisor.py, services/api_gateway/debug_check.py, services/enrichment/ofac_sync.py and
+# services/collector-filings/deep_history_backfill.py (the G2 one-off, resumable, run by hand with `docker exec`; its header says so).
+ALLOWED_ENTRYPOINTS = 4
 
 
 def test_unreachable_entry_points_do_not_grow():

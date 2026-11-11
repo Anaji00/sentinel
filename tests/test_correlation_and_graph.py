@@ -457,7 +457,9 @@ def test_rule_synthesizer_agent_produces_governed_proposals_and_expiry():
                         event_types=["market_anomaly"],
                         hours=48,
                         min_anomaly=0.6,
-                        tags=["LMT"],
+                        # "energy" since 11 Nov 2026: a rule named for a market theme must filter on it in a clause
+                        # (services/agents/rule_agent.py _THEME_WORDS), so this fixture now does.
+                        tags=["LMT", "energy"],
                     )
                 ],
                 alert_tier="ALERT",

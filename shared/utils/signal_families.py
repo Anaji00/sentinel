@@ -313,9 +313,9 @@ def observations(row: Dict[str, Any]) -> List[Observation]:
 
     if etype == "supply_chain_metric":
         region = str(row.get("region") or "")
-        if "radar_no_ais" in tags:
-            for sym in _exposed(row):
-                add("radar_no_ais", sym, escalation_direction(sym), region)
+        # radar_no_ais is retired (11 Nov 2026, reports/Unmeasurable signals.md fix 7): 80 episodes on 6 instruments, 4 of them
+        # futures, so no cell could reach 20 independent units. Its tag is still written by the enricher and its rows stay in
+        # the archive; it is no longer derived as a signal family.
         if "quieter_than_usual" in tags:
             for sym in _exposed(row):
                 add("radar_traffic_drop", sym, escalation_direction(sym), region)

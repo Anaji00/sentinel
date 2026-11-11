@@ -379,14 +379,24 @@ class CellResult:
         return {k: v for k, v in self.__dict__.items()}
 
 
-def evaluate_cell(family: str, horizon: str, measured: Sequence[Measured], n_episodes: int) -> CellResult:
-    """Everything except the cross-cell FDR step, which needs every cell's p."""
+def evaluate_cell(family: str, horizon: str, measured: Sequence[Measured], n_episodes: int,
+                  first_episode_age_days: Optional[float] = None) -> CellResult:
+    """Everything except the cross-cell FDR step, which needs every cell's p.
+
+    `first_episode_age_days` is how long ago the family's oldest episode happened. When that is shorter than the horizon,
+    nothing can have matured yet, and the cell says so ("too young") instead of blaming missing prices."""
     h = HORIZONS[horizon]
     instruments = sorted({m.episode.instrument for m in measured})
     us = units(measured, h)
     res = CellResult(family=family, horizon=horizon, episodes=n_episodes, units=len(us), instruments=instruments)
     if not measured:
-        res.verdict, res.reason = "unmeasurable", "no price history around these episodes"
+        horizon_days = h.total_seconds() / 86400.0
+        if first_episode_age_days is not None and first_episode_age_days < horizon_days:
+            res.verdict = "unmeasurable"
+            res.reason = (f"too young: the family's first episode is {first_episode_age_days:.0f} days old and "
+                          f"this horizon needs {horizon_days:.0f}")
+        else:
+            res.verdict, res.reason = "unmeasurable", "no price history around these episodes"
         return res
     if len(us) < MIN_UNITS:
         res.verdict, res.reason = "insufficient_data", f"{len(us)} independent units of the {MIN_UNITS} needed"

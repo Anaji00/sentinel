@@ -304,6 +304,36 @@ def _instrument_in_name(rule_name):
     return None
 
 
+# Market themes a rule name can claim. A trigger can filter only on event type, anomaly size and region, so a name
+# such as "US10Y Yield Drop and Zillow Valuation Surge" is tested by nothing: it fired 1,995 times on 981 stocks in
+# 48 hours (reports/Divergence alert.md). The theme must appear in a clause's tags, or the rule is not allowed to say it.
+_THEME_WORDS = (
+    "yield", "yields", "oil", "crude", "brent", "wti", "gold", "dollar", "usd", "treasury", "treasuries",
+    "inflation", "volatility", "vix", "rates", "bitcoin", "natgas", "energy", "fuel",
+)
+
+
+def _theme_in_name(rule_name):
+    """The market theme a rule name claims, if any."""
+    tokens = {t.strip(".,:;()&'-").lower() for t in (rule_name or "").replace("‑", " ").replace("-", " ").split()}
+    for word in _THEME_WORDS:
+        if word in tokens:
+            return word
+    return None
+
+
+def _clause_tags_cover(rule, theme):
+    for clause in (getattr(rule, "correlations", None) or []):
+        tags = getattr(clause, "tags", None)
+        if isinstance(clause, dict):
+            tags = clause.get("tags")
+        for tag in (tags or []):
+            low = str(tag).lower()
+            if theme in {w.strip(".,:;_-") for w in low.replace("_", " ").replace("-", " ").split()}:
+                return True
+    return False
+
+
 def _is_reusable_rule(rule):
     """Return a rejection reason, or None if the rule describes a pattern.
 
@@ -345,6 +375,13 @@ def _is_reusable_rule(rule):
         return (
             "rule_name names instrument " + repr(named_instrument) +
             " but a rule cannot filter on one name; it would match every name"
+        )
+
+    named_theme = _theme_in_name(rname)
+    if named_theme and not _clause_tags_cover(rule, named_theme):
+        return (
+            "rule_name claims the theme " + repr(named_theme) + " but no clause filters on it; "
+            "the trigger cannot, so the name would be untested"
         )
 
     # A cross-domain clause that declares no join.

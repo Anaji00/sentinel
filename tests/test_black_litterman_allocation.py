@@ -116,3 +116,19 @@ def test_a_bullish_view_moves_weight_toward_its_subject():
     assert tilted["optimal_weights"]["AAA"] > base["optimal_weights"]["AAA"], (
         "a bullish view on AAA must not reduce its allocation"
     )
+
+
+def test_shrunk_covariance_is_well_conditioned_where_the_sample_one_is_not_and_fades_with_data() -> None:
+    import numpy as np
+    from shared.utils.quant_calc import shrunk_covariance
+    rng = np.random.default_rng(5)
+    few = rng.normal(0, 0.01, (12, 8))                        # 12 assets, 8 observations: the sample covariance is singular
+    sample = np.cov(few)
+    shrunk = np.array(shrunk_covariance(few.tolist()))
+    assert np.linalg.matrix_rank(sample) < 12 and np.linalg.cond(shrunk) < 1e3 and np.all(np.linalg.eigvalsh(shrunk) > 0)
+    assert np.allclose(shrunk, shrunk.T)
+    many = rng.normal(0, 0.01, (3, 5000))
+    assert np.allclose(np.array(shrunk_covariance(many.tolist())), np.cov(many), atol=2e-6)      # plenty of data: almost no shrinkage
+    assert shrunk_covariance([[0.01, 0.02, 0.03]]) is not None and shrunk_covariance([[0.01]]) is None
+    assert shrunk_covariance([[0.01, float("nan")], [0.0, 0.1]]) is None and shrunk_covariance("x") is None
+    assert shrunk_covariance([[1.0, 2.0], [3.0]]) is None

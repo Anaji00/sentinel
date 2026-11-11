@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
+from shared.utils import tradable_cells
+
 PROVEN_WEIGHT = 1.0
 UNSTUDIED_WEIGHT = 0.25
 NO_EDGE_WEIGHT = 0.0
@@ -61,7 +63,7 @@ def family_record(cells: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """The best-evidenced study cell per family: a proven horizon if any, else
     the one with the most independent units."""
     best: Dict[str, Dict[str, Any]] = {}
-    for c in cells:
+    for c in tradable_cells.gate_cells(cells):          # G4: a proven cell that is not tradable is shadow, weight 0
         fam = c.get("family")
         if not fam:
             continue
@@ -80,10 +82,12 @@ def status_of(record: Optional[Dict[str, Any]]) -> str:
         return "proven"
     if v == "no_edge":
         return "no_edge"
+    if v == tradable_cells.SHADOW:
+        return "shadow"
     return "unstudied"
 
 
-WEIGHTS = {"proven": PROVEN_WEIGHT, "unstudied": UNSTUDIED_WEIGHT, "no_edge": NO_EDGE_WEIGHT}
+WEIGHTS = {"proven": PROVEN_WEIGHT, "unstudied": UNSTUDIED_WEIGHT, "no_edge": NO_EDGE_WEIGHT, "shadow": 0.0}
 
 # Families that read one underlying source; agreement is counted per source.
 SOURCE_OF = {

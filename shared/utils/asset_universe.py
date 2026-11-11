@@ -67,6 +67,16 @@ def classify(name: str) -> str:
     return "stock"
 
 
+def priceable_now(symbol: str, meta: Optional[Dict[str, list]]) -> bool:
+    """Can the free feed be expected to serve this instrument today? Alpaca lists it as an active stock or fund. Names it does
+    not list (delisted, foreign OTC lines, placeholders, joined fields) and warrants, units and rights are not: asking for their
+    bars only inflates the gap. With no listing to read (meta None or empty) nothing is ruled out."""
+    if not meta:
+        return True
+    row = meta.get(str(symbol).upper())
+    return bool(row) and row[0] in ("stock", "fund")
+
+
 def compact(assets: Any) -> Dict[str, list]:
     """Alpaca asset records -> {symbol: [kind, shortable, easy_to_borrow, name]}."""
     out: Dict[str, list] = {}

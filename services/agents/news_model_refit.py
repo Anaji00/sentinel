@@ -26,6 +26,7 @@ import numpy as np
 from shared.utils import news_embed as ne
 from shared.utils import news_embed_fit as nf
 from shared.utils import stock_news as sn
+from shared.utils.champion_gate import challenger_may_replace
 from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger("agents.news_model_refit")
@@ -160,9 +161,20 @@ class NewsModelRefit:
                  "trained_through": months[-1] if months else None, "samples": int(sum(s.n for s in by_month.values())),
                  "fitted_at": datetime.now(timezone.utc).isoformat(), "trial": "M, refit monthly"}
         published = nf.passes(summ) and slope > 0
+        held_over = None
+        if published:
+            try:
+                cur = json.loads(await self.raw.get(ne.MODEL_KEY) or "{}")
+            except ValueError:
+                cur = {}
+            if cur.get("beta"):
+                replace, why = challenger_may_replace(cur.get("oos_mean_ic"), cur.get("oos_ic_t"), summ["mean_ic"], True)
+                if not replace:
+                    published, held_over = False, why
         if published:
             await self.raw.set(ne.MODEL_KEY, json.dumps(model))
-        out = {**{k: v for k, v in model.items() if k != "beta"}, "published": published, "oos_rows": len(oos_rows)}
+        out = {**{k: v for k, v in model.items() if k != "beta"}, "published": published, "oos_rows": len(oos_rows),
+               "held_over": held_over}
         logger.info("News model refit: %s", out)
         return out
 

@@ -96,6 +96,8 @@ from shared.utils.instrument_reach import exposure_tags
 from shared.utils.metrics import MetricsCollector
 from shared.utils.rule_feedback import deprecated_by_evidence
 from shared.utils import rule_probation
+from shared.utils import alert_dedup
+from shared.utils import exposure_gate
 from shared.utils.counterparty import is_null_address
 from shared.models.events import event_domain
 
@@ -117,6 +119,23 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.quiet_failures import dropped, swallowed
 
 _dynamic_rules_cache = {}
+
+_EXPOSURE_CACHE: dict = {"at": 0.0, "table": {}}
+_EXPOSURE_TTL_SEC = 600
+
+
+async def _exposure_table() -> dict:
+    """Measured macro exposures (macro_exposures), refreshed every ten minutes. {} when unreadable: the gate then stands aside, counted."""
+    if time.time() - _EXPOSURE_CACHE["at"] < _EXPOSURE_TTL_SEC:
+        return _EXPOSURE_CACHE["table"]
+    try:
+        db = await get_timescale()
+        rows = await db.query("SELECT ticker, macro, partial_corr FROM macro_exposures")
+        _EXPOSURE_CACHE.update(at=time.time(), table=exposure_gate.build_table(rows))
+    except Exception as exc:
+        swallowed("correlation.exposure_table", exc, logger)
+        _EXPOSURE_CACHE["at"] = time.time() - _EXPOSURE_TTL_SEC + 60       # retry in a minute, keep the last table
+    return _EXPOSURE_CACHE["table"]
 
 # Bumped whenever a shipped rule definition changes.
 #
@@ -2554,6 +2573,27 @@ async def main():
 
             dynamic_clusters = await evaluate_dynamic_rules(event, store)
             for c in dynamic_clusters:
+                # A macro-themed alert on a stock needs a measured exposure to that theme (shared/utils/exposure_gate.py).
+                try:
+                    _tbl = await _exposure_table()
+                    if _tbl:
+                        _ok, _why = exposure_gate.passes(c.rule_name, c.primary_entity_id, _tbl)
+                        if not _ok:
+                            dropped("correlation.macro_exposure_gate", f"macro-themed alert without measured exposure: {_why}", logger,
+                                    detail=f"{c.primary_entity_id} {c.rule_id}")
+                            continue
+                except Exception as _exc:
+                    swallowed("correlation.macro_exposure_gate", _exc, logger)
+                # One per stock, rule family and session unless more severe (shared/utils/alert_dedup.py).
+                try:
+                    _dd_raw = getattr(getattr(store, "_redis", None), "raw", getattr(store, "_redis", None))
+                    if _dd_raw is not None and not await alert_dedup.admit(
+                            _dd_raw, c.primary_entity_id, c.rule_name, getattr(event, "occurred_at", None), c.alert_tier):
+                        dropped("correlation.dynamic_rule_session_dedup", "same stock, rule family and session already alerted",
+                                logger, detail=f"{c.primary_entity_id} {c.rule_id}")
+                        continue
+                except Exception as _exc:
+                    swallowed("correlation.dynamic_rule_session_dedup", _exc, logger)
                 await store.save_correlation(c)
                 await producer.send(
                     Topics.CORRELATIONS,

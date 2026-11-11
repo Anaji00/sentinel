@@ -74,6 +74,18 @@ def prob_above(level: float, s: float, t: float, mu: float, sigma: float) -> flo
     return _ncdf((math.log(s / level) + (mu - 0.5 * sigma * sigma) * t) / sd)
 
 
+def tail_probabilities(s: float, t: float, sigma: float, move: float) -> Optional[Dict[str, float]]:
+    """What an at-the-money implied volatility says about a large move by expiry: P(S_T >= S(1+move)) and
+    P(S_T <= S(1-move)), with no drift. Lognormal, so it carries the ATM level only and nothing of the skew:
+    a stock whose puts are dearer than its calls has a fatter left tail than this shows. For scenario priors, as a
+    floor on how likely the market thinks a move is, not an estimate of it. None when an input cannot support it."""
+    vals = (s, t, sigma, move)
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vals) or s <= 0 or t <= 0 or sigma <= 0 or not 0 < move < 1:
+        return None
+    return {"up": round(prob_above(s * (1.0 + move), s, t, 0.0, sigma), 4),
+            "down": round(1.0 - prob_above(s * (1.0 - move), s, t, 0.0, sigma), 4)}
+
+
 def _structure(name: str, legs: Sequence[Tuple[str, Quote]], s: float, t: float, mu: float,
                sigma: float) -> Optional[Dict[str, Any]]:
     """EV, risk, breakeven and probability of profit for a set of (side, quote)
@@ -254,5 +266,5 @@ def best(direction: int, by_expiry: Dict[str, List[Quote]], dte: Dict[str, int],
     return pick
 
 
-__all__ = ["drift_to", "settle", "vol_to", "CONTRACT", "KELLY_FRACTION", "MIN_EV_PER_RISK", "MIN_PROB_PROFIT", "Quote",
+__all__ = ["tail_probabilities", "drift_to", "settle", "vol_to", "CONTRACT", "KELLY_FRACTION", "MIN_EV_PER_RISK", "MIN_PROB_PROFIT", "Quote",
            "best", "candidates", "expected_payoff", "kelly_share", "prob_above"]

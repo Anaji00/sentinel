@@ -41,8 +41,10 @@ from shared.models.events import EventType
 from shared.utils.confidence_calibration import record_outcome
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.market_session import Session, instrument_closed_at, session_label_at
+from shared.utils.asset_universe import load_asset_meta, priceable_now
 from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.short_data import HARD_TO_BORROW_FEE
+from shared.utils import tradable_cells
 from shared.utils.reaction_study import (
     HORIZONS, SIZE_BENCHMARKS, CellResult, Series, combine, cost_bps, evaluate_cell, finalize, size_benchmark,
     trailing_dollar_volume,
@@ -52,7 +54,8 @@ from shared.utils.signal_families import (
     FAMILY_DESCRIPTIONS, PRICE_DIRECTED, episodes, observations,
 )
 from shared.utils.signal_store import (
-    ACTIVE_KEY, AWAITING_KEY, CURSOR_KEY, EVIDENCE_KEY, MAX_NEEDS_BARS, NEEDS_BARS_KEY, OUTCOMES_KEY, STUDY_KEY,
+    ACTIVE_KEY, AWAITING_KEY, CURSOR_KEY, EVIDENCE_KEY, MAX_NEEDS_BARS, MAX_NEEDS_DAILY, NEEDS_BARS_KEY, NEEDS_DAILY_KEY,
+    OUTCOMES_KEY, STUDY_KEY,
 )
 from shared.utils.tasks import safe_create_task
 
@@ -61,6 +64,8 @@ logger = logging.getLogger("agent.signal_engine")
 
 STUDY_INTERVAL_SEC = 6 * 3600
 LIVE_INTERVAL_SEC = 60
+SHADOW_KEY = "sentinel:signals:shadow"      # would-be signals from proven cells G4 did not clear, kept for research
+SHADOW_CAP = 5000
 # The study reads the permanent archive (signal_event_archive), so its window
 # is no longer capped by the 90-day retention on events; it deepens as history
 # accrues, up to this.
@@ -215,6 +220,9 @@ class SignalEngine:
         self.redis = redis_client
         self.flags = FeatureFlagManager(redis_client)
         self._cells: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._liquidity: Dict[str, Tuple[Any, Optional[float]]] = {}
+        self._asset_meta: Optional[Dict[str, list]] = None
+        self._asset_meta_at = 0.0
         self._producer: Optional[SentinelProducer] = None
 
     async def run(self) -> None:
@@ -356,6 +364,12 @@ class SignalEngine:
         ranked = [(i, by_inst[i]) for i in sorted(intel)] + [(i, by_inst[i]) for i in tape_only]
         skipped_instruments = len(by_inst) - len(ranked)
         needs_bars: List[Tuple[str, int]] = []
+        untradeable = 0
+        try:
+            asset_meta = await load_asset_meta(self.redis.raw)
+        except Exception as exc:
+            swallowed("agents.signal_engine.study_asset_meta", exc, logger)
+            asset_meta = None
         for inst, inst_eps in ranked:
             intraday = await self._series(inst, since - timedelta(days=1))
             # Years of adjusted daily closes ahead of the intraday bars, so the
@@ -366,7 +380,12 @@ class SignalEngine:
             series = merge_daily(await self._daily_series(inst, min(since, first) - timedelta(days=7)), intraday)
             if series is None:
                 if inst in intel and not inst.endswith("=F"):
-                    needs_bars.append((inst, len(inst_eps)))
+                    # A name the free feed cannot serve (delisted, foreign OTC, placeholder, warrant) is counted as
+                    # untradeable, not as a gap to fill: delisted history has its own job (collector _delisted_backfill).
+                    if priceable_now(inst, asset_meta):
+                        needs_bars.append((inst, len(inst_eps)))
+                    else:
+                        untradeable += 1
                 continue
             marks = [e.known_at.timestamp() for e in inst_eps]
             dv = await self._dollar_volume(inst, min(since, first) - timedelta(days=40))
@@ -385,9 +404,15 @@ class SignalEngine:
             del series, intraday
 
         cells: List[CellResult] = []
+        now_utc = datetime.now(timezone.utc)
+        first_seen: Dict[str, datetime] = {}
+        for e in eps:
+            if e.family not in first_seen or e.known_at < first_seen[e.family]:
+                first_seen[e.family] = e.known_at
         for fam, n in per_family.items():
+            age = (now_utc - first_seen[fam]).total_seconds() / 86400.0 if fam in first_seen else None
             for hname in HORIZONS:
-                cells.append(evaluate_cell(fam, hname, measured.get((fam, hname), []), n))
+                cells.append(evaluate_cell(fam, hname, measured.get((fam, hname), []), n, first_episode_age_days=age))
         finalize(cells)
 
         table = [c.as_dict() for c in cells]
@@ -404,6 +429,7 @@ class SignalEngine:
             "instruments": len(by_inst),
             "instruments_not_studied": skipped_instruments,
             "instruments_without_bars": len(needs_bars),
+            "instruments_untradeable": untradeable,
             "verdicts": verdicts,
             "cells": table,
         }
@@ -413,6 +439,11 @@ class SignalEngine:
         await self.redis.raw.delete(NEEDS_BARS_KEY)
         if wanted:
             await self.redis.raw.sadd(NEEDS_BARS_KEY, *wanted)
+        # The longer, daily-only list (the collector backfills these without minute bars).
+        ranked_needs = [i for i, _n in sorted(needs_bars, key=lambda x: -x[1])[:MAX_NEEDS_DAILY]]
+        await self.redis.raw.delete(NEEDS_DAILY_KEY)
+        if ranked_needs:
+            await self.redis.raw.sadd(NEEDS_DAILY_KEY, *ranked_needs)
         self._cells = {(c.family, c.horizon): c.as_dict() for c in cells}
         return {"episodes": len(eps), "cells": len(cells), "verdicts": verdicts}
 
@@ -422,7 +453,43 @@ class SignalEngine:
             if blob:
                 for c in json.loads(blob).get("cells", []):
                     self._cells[(c["family"], c["horizon"])] = c
-        return {k: v for k, v in self._cells.items() if v.get("verdict") == "proven"}
+        return {k: v for k, v in self._cells.items() if v.get("verdict") == "proven" and tradable_cells.is_tradable_cell(*k)}
+
+    async def _shadow_cells(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Proven cells G4 did not clear (reports/Event backtest scope.md): measured and recorded, never raised."""
+        await self._proven()
+        return {k: v for k, v in self._cells.items() if v.get("verdict") == "proven" and not tradable_cells.is_tradable_cell(*k)}
+
+    async def _record_shadow(self, family: str, hname: str, instrument: str, direction: int, event_id: Any, why: str, now: datetime) -> None:
+        """A would-be signal kept for research: a capped sorted set, no evidence key, nothing published."""
+        try:
+            entry = {"family": family, "horizon": hname, "instrument": instrument, "direction": direction,
+                     "event_id": str(event_id), "why": why, "at": now.isoformat()}
+            await self.redis.raw.zadd(SHADOW_KEY, {json.dumps(entry): now.timestamp()})
+            await self.redis.raw.zremrangebyrank(SHADOW_KEY, 0, -SHADOW_CAP - 1)
+            await self.redis.raw.expire(SHADOW_KEY, 45 * 86400)
+        except Exception as exc:
+            swallowed("agents.signal_engine.shadow_record", exc, logger)
+
+    async def _instrument_ok(self, instrument: str, direction: int, now: datetime) -> Tuple[bool, str]:
+        """G4's instrument gate: liquid, and for a short shortable and easy to borrow. Unknown is not a pass."""
+        day = now.date()
+        hit = self._liquidity.get(instrument)
+        if hit is None or hit[0] != day:
+            series = await self._dollar_volume(instrument, now - timedelta(days=45))
+            vals = list(series[1])[-30:] if series else []
+            hit = (day, (sum(vals) / len(vals)) if vals else None)
+            self._liquidity[instrument] = hit
+        asset = None
+        if direction < 0:
+            if self._asset_meta is None or now.timestamp() - self._asset_meta_at > 3600:
+                try:
+                    self._asset_meta = await load_asset_meta(self.redis.raw)
+                    self._asset_meta_at = now.timestamp()
+                except Exception as exc:
+                    swallowed("agents.signal_engine.asset_meta", exc, logger)
+            asset = (self._asset_meta or {}).get(instrument)
+        return tradable_cells.instrument_ok(hit[1], direction, asset)
 
     # -- the live loop --------------------------------------------------------
 
@@ -447,7 +514,8 @@ class SignalEngine:
         rows = await self.db.query(_EVENTS_SQL, cursor, now, SIGNAL_EVENT_TYPES)
         await raw.set(CURSOR_KEY, now.isoformat())
         proven = await self._proven()
-        if not rows or not proven:
+        shadow = await self._shadow_cells()
+        if not rows or not (proven or shadow):
             return 0
 
         touched = set()
@@ -458,6 +526,9 @@ class SignalEngine:
                 for hname in HORIZONS:
                     cell = proven.get((o.family, hname))
                     if not cell:
+                        if (o.family, hname) in shadow:
+                            await self._record_shadow(o.family, hname, o.instrument, o.direction, o.event_id,
+                                                      "proven cell not cleared by G4", now)
                         continue
                     if o.instrument not in recent_cache:
                         recent_cache[o.instrument] = await self._series(o.instrument, now - timedelta(days=4))
@@ -471,6 +542,12 @@ class SignalEngine:
                             continue
                         direction = (1 if pm > 0 else -1) * int(cell.get("sign") or 1)
                     if direction == 0:
+                        continue
+                    ok, why = await self._instrument_ok(o.instrument, direction, now)
+                    if not ok:
+                        dropped("agents.signal_engine.not_tradable", f"signal withheld, instrument not tradable: {why}", logger,
+                                detail=f"{o.instrument} {o.family} {hname}")
+                        await self._record_shadow(o.family, hname, o.instrument, direction, o.event_id, why, now)
                         continue
                     evidence = {
                         "family": o.family, "direction": direction, "event_id": o.event_id,

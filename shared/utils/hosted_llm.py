@@ -26,17 +26,20 @@ Pure parsing and request shaping up top; the network call at the bottom.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("sentinel.hosted_llm")
 
@@ -49,6 +52,10 @@ CHARS_PER_TOKEN = 4
 HOSTED_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("LLM_HOSTED_TIMEOUT_SEC", "60")))
 DEFAULT_MAX_TOKENS = 1024
 COOLDOWN_KEY = "sentinel:hosted_llm:cooldown:{step}"
+DUP_KEY = "sentinel:hosted_llm:dup:{day}"          # hash: site|calls, site|repeats (measured before any cache is built)
+DUP_WINDOW_SEC = 600
+FAILURE_COOLDOWN_SEC = 30       # a timeout, connection error or 5xx: stop sending to that step for a while
+REFUSED_COOLDOWN_SEC = 300      # a 400, 401, 403 or 404: a bad key or a retired model does not fix itself in seconds
 BUCKET_KEY = "sentinel:hosted_llm:{step}:{unit}:{window}"
 
 
@@ -101,6 +108,49 @@ def windows(now: float) -> Dict[str, str]:
     """The minute and UTC-day a request is counted in."""
     t = datetime.fromtimestamp(now, timezone.utc)
     return {"m": t.strftime("%Y%m%d%H%M"), "d": t.strftime("%Y%m%d")}
+
+
+def prev_minute(now: float) -> str:
+    """The minute before the one `now` is in, in the same form as windows()['m']."""
+    return datetime.fromtimestamp(now - 60, timezone.utc).strftime("%Y%m%d%H%M")
+
+
+def prev_weight(now: float) -> float:
+    """How much of the previous minute still lies inside a sliding minute ending at `now`."""
+    return 1.0 - (now % 60.0) / 60.0
+
+
+def sliding(used: Dict[str, int], prev: Dict[str, int], now: float) -> Dict[str, int]:
+    """`used` with the share of last minute's requests and tokens that a 60-second window ending now still covers.
+
+    Counters are kept per calendar minute. Checked as they stand, a provider that limits per rolling minute
+    sees twice the limit when a burst straddles a minute boundary (8,000 tokens at :59 and 8,000 at :00 is
+    16,000 in two seconds), which is the 429 pattern seen on Groq at 22:00, 22:15 and 23:16 UTC on 6 Nov 2026."""
+    w = prev_weight(now)
+    out = dict(used)
+    out["rm"] = used.get("rm", 0) + int(round(prev.get("rm", 0) * w))
+    out["tm"] = used.get("tm", 0) + int(round(prev.get("tm", 0) * w))
+    return out
+
+
+_RETRY_DELAY = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+
+
+def retry_seconds(retry_after: Optional[str], body: str = "", now: Optional[float] = None) -> Optional[int]:
+    """Seconds a provider asks us to wait: the Retry-After header (seconds or an HTTP date), else Google's
+    retryDelay in an error body. None when neither is usable."""
+    if retry_after:
+        t = retry_after.strip()
+        try:
+            return max(0, int(float(t)))
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(t)
+                return max(0, int(dt.timestamp() - (now if now is not None else time.time())))
+            except (TypeError, ValueError) as exc:
+                swallowed("utils.hosted_llm.retry_after_date", exc)      # an unreadable date falls through to the body's delay
+    m = _RETRY_DELAY.search(body or "")
+    return int(float(m.group(1))) + 1 if m else None
 
 
 def over_quota(used: Dict[str, int], q: Quota, tokens: int) -> Optional[str]:
@@ -190,25 +240,31 @@ _local_counts: Dict[str, int] = {}
 _local_cooldown: Dict[str, float] = {}
 
 
-async def _reserve(raw: Any, step: str, q: Optional[Quota], tokens: int) -> Optional[str]:
+async def _reserve(raw: Any, step: str, q: Optional[Quota], tokens: int, now: Optional[float] = None) -> Optional[str]:
     """Counts this request against the step's buckets, unless it would overflow
     one; returns the limit it would break. Redis when the process has it, so the
-    containers share one quota; in-process otherwise."""
+    containers share one quota; in-process otherwise. `now` fixes the moment the
+    request is counted at, so _release can give back to the same minute."""
     if q is None:
         return None
-    w = windows(time.time())
+    now = time.time() if now is None else now
+    w = windows(now)
+    pm = prev_minute(now)
     keys = {"rm": BUCKET_KEY.format(step=step, unit="r", window=w["m"]),
             "rd": BUCKET_KEY.format(step=step, unit="r", window=w["d"]),
             "tm": BUCKET_KEY.format(step=step, unit="t", window=w["m"]),
             "td": BUCKET_KEY.format(step=step, unit="t", window=w["d"])}
+    prev_keys = {"rm": BUCKET_KEY.format(step=step, unit="r", window=pm), "tm": BUCKET_KEY.format(step=step, unit="t", window=pm)}
     adds = {"rm": 1, "rd": 1, "tm": tokens, "td": tokens}
     if raw is None:
         # Windows that have passed are dropped, or a long-lived process would
-        # keep four keys for every minute it ever called a hosted model.
-        live = (w["m"], w["d"])
+        # keep four keys for every minute it ever called a hosted model. The
+        # minute before this one is kept: the sliding minute still counts part of it.
+        live = (w["m"], w["d"], pm)
         for stale in [k for k in _local_counts if not k.endswith(live)]:
             del _local_counts[stale]
-        used = {k: _local_counts.get(v, 0) for k, v in keys.items()}
+        used = sliding({k: _local_counts.get(v, 0) for k, v in keys.items()},
+                       {k: _local_counts.get(v, 0) for k, v in prev_keys.items()}, now)
         broken = over_quota(used, q, tokens)
         if broken:
             return broken
@@ -225,6 +281,11 @@ async def _reserve(raw: Any, step: str, q: Optional[Quota], tokens: int) -> Opti
         res = await pipe.execute()
     after = {k: int(res[2 * i]) for i, k in enumerate(keys)}
     before = {k: after[k] - adds[k] for k in keys}
+    try:
+        pv = await raw.mget(list(prev_keys.values()))
+        before = sliding(before, {k: int(v or 0) for k, v in zip(prev_keys, pv)}, now)
+    except Exception as exc:                 # without the previous minute the check is the old fixed window
+        swallowed("utils.hosted_llm.previous_window", exc, logger, detail=step)
     broken = over_quota(before, q, tokens)
     if broken:
         async with raw.pipeline() as pipe:
@@ -244,8 +305,12 @@ def unused_tokens(reserved: int, usage: Optional[Dict[str, Any]]) -> int:
     return max(0, reserved - used) if used else 0
 
 
-async def _release(raw: Any, step: str, q: Optional[Quota], tokens: int) -> None:
-    """Gives unused tokens back to the step's minute and day buckets.
+async def _release(raw: Any, step: str, q: Optional[Quota], tokens: int, at: Optional[float] = None) -> None:
+    """Gives unused tokens back to the step's minute and day buckets, the ones the request was counted in (`at`).
+
+    Given back to the minute the call returned in, a request that straddled a minute boundary left its own minute
+    over-counted and drove the next one negative (minute buckets of -1,193 to -6,080 tokens were found on 11 Nov 2026),
+    which let that later minute pass the provider's limit.
 
     A request reserves its prompt plus max_tokens, and nothing gave back what
     it did not use: headline scoring reserved ~2,300 a call and used ~1,280,
@@ -253,7 +318,7 @@ async def _release(raw: Any, step: str, q: Optional[Quota], tokens: int) -> None
     scenario behind them was skipped (36 such skips on 30 Oct 2026)."""
     if q is None or tokens <= 0:
         return
-    w = windows(time.time())
+    w = windows(time.time() if at is None else at)
     keys = [BUCKET_KEY.format(step=step, unit="t", window=w["m"]), BUCKET_KEY.format(step=step, unit="t", window=w["d"])]
     if raw is None:
         for k in keys:
@@ -300,15 +365,20 @@ async def has_capacity(raw: Any, local_model: str, tokens: int = 1000, reserve: 
             q = quotas.get(step)
             if q is None:
                 return True
-            w = windows(time.time())
+            now = time.time()
+            w = windows(now)
+            pm = prev_minute(now)
             keys = {"rm": BUCKET_KEY.format(step=step, unit="r", window=w["m"]),
                     "rd": BUCKET_KEY.format(step=step, unit="r", window=w["d"]),
                     "tm": BUCKET_KEY.format(step=step, unit="t", window=w["m"]),
-                    "td": BUCKET_KEY.format(step=step, unit="t", window=w["d"])}
+                    "td": BUCKET_KEY.format(step=step, unit="t", window=w["d"]),
+                    "prm": BUCKET_KEY.format(step=step, unit="r", window=pm),
+                    "ptm": BUCKET_KEY.format(step=step, unit="t", window=pm)}
             if raw is None:
-                used = {k: _local_counts.get(v, 0) for k, v in keys.items()}
+                got = {k: _local_counts.get(v, 0) for k, v in keys.items()}
             else:
-                used = {k: int(v or 0) for k, v in zip(keys, await raw.mget(list(keys.values())))}
+                got = {k: int(v or 0) for k, v in zip(keys, await raw.mget(list(keys.values())))}
+            used = sliding({k: got[k] for k in ("rm", "rd", "tm", "td")}, {"rm": got["prm"], "tm": got["ptm"]}, now)
             share = max(0.0, 1.0 - float(reserve))
             q_avail = Quota(*(int(v * share) if v else 0 for v in (q.rpm, q.rpd, q.tpm, q.tpd))) if reserve else q
             if over_quota(used, q_avail, tokens) is None:
@@ -316,6 +386,29 @@ async def has_capacity(raw: Any, local_model: str, tokens: int = 1000, reserve: 
         except Exception as exc:
             logger.debug("Hosted capacity check for %s failed: %s", step, exc)
     return False
+
+
+async def _note_prompt(raw: Any, site: str, text: str) -> None:
+    """Counts, by caller, the calls and the calls whose exact prompt was seen in the last DUP_WINDOW_SEC.
+
+    Measurement only. A prompt-level response cache would also answer the schema-retry path (the same prompt
+    sent again to get a new sample) with the same malformed text, so none is built until this says how often
+    prompts repeat and from which callers."""
+    if raw is None:
+        return
+    try:
+        digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:20]
+        fresh = await raw.set(f"sentinel:hosted_llm:seen:{digest}", "1", nx=True, ex=DUP_WINDOW_SEC)
+        key = DUP_KEY.format(day=datetime.now(timezone.utc).strftime("%Y%m%d"))
+        name = site or "unknown"
+        async with raw.pipeline() as pipe:
+            pipe.hincrby(key, f"{name}|calls", 1)
+            if not fresh:
+                pipe.hincrby(key, f"{name}|repeats", 1)
+            pipe.expire(key, 3 * 86400)
+            await pipe.execute()
+    except Exception as exc:
+        swallowed("utils.hosted_llm.prompt_repeat_count", exc, logger)
 
 
 async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_model: str, prompt: str,
@@ -330,6 +423,7 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
         return None
     quotas = parse_quotas(os.getenv("LLM_QUOTAS", ""))
     mt = int(max_tokens or DEFAULT_MAX_TOKENS)
+    await _note_prompt(raw, site, f"{system or ''}|{prompt}")
     own = session is None
     sess = session or aiohttp.ClientSession()
     try:
@@ -343,7 +437,8 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
                 if await _cooling(raw, step):
                     continue
                 reserved = estimate_tokens((system or "") + prompt, mt)
-                broken = await _reserve(raw, step, quotas.get(step), reserved)
+                reserved_at = time.time()
+                broken = await _reserve(raw, step, quotas.get(step), reserved, now=reserved_at)
                 if broken:
                     logger.info("Hosted %s skipped: %s quota would be exceeded", step, broken)
                     continue
@@ -353,12 +448,19 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
                     async with sess.post(url, json=request_body(model, prompt, temperature, fmt, mt, system),
                                          headers={"Authorization": f"Bearer {key}"}, timeout=HOSTED_TIMEOUT) as resp:
                         if resp.status == 429:
-                            retry = resp.headers.get("retry-after", "60")
-                            await _cool(raw, step, int(float(retry)) if retry.replace(".", "", 1).isdigit() else 60)
-                            logger.warning("Hosted %s rate-limited (429); cooling down", step)
+                            wait = retry_seconds(resp.headers.get("retry-after"), (await resp.text())[:600])
+                            await _cool(raw, step, wait if wait is not None else 60)
+                            logger.warning("Hosted %s rate-limited (429); cooling down %ss", step, wait if wait is not None else 60)
                             continue
                         if resp.status != 200:
-                            logger.warning("Hosted %s HTTP %s: %s", step, resp.status, (await resp.text())[:200])
+                            # Any other refusal also cools the step, or every following call re-sends to it: a 503
+                            # for the provider's own wait, a 5xx without one for FAILURE_COOLDOWN_SEC, a 400 to 404
+                            # (bad key, retired model) for REFUSED_COOLDOWN_SEC.
+                            body = (await resp.text())[:200]
+                            wait = retry_seconds(resp.headers.get("retry-after"), body)
+                            await _cool(raw, step, wait if wait is not None
+                                        else (FAILURE_COOLDOWN_SEC if resp.status >= 500 else REFUSED_COOLDOWN_SEC))
+                            dropped("utils.hosted_llm.refused", f"{step} answered HTTP {resp.status}", logger, detail=body)
                             continue
                         data = await resp.json(content_type=None)
                     usage = usage_as_ollama(data, time.monotonic() - t0)
@@ -369,9 +471,11 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
                     return text, step, usage
                 finally:
                     # What the request did not use goes back to the bucket.
-                    await _release(raw, step, quotas.get(step), unused_tokens(reserved, usage))
+                    await _release(raw, step, quotas.get(step), unused_tokens(reserved, usage), at=reserved_at)
             except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
-                logger.warning("Hosted %s failed: %s", step, exc)
+                # A timeout cost this call HOSTED_TIMEOUT already; the cooldown stops the next one paying it too.
+                swallowed("utils.hosted_llm.step_failed", exc, logger, detail=step)
+                await _cool(raw, step, FAILURE_COOLDOWN_SEC)
                 continue
         return None
     finally:
@@ -380,4 +484,5 @@ async def complete(session: Optional[aiohttp.ClientSession], raw: Any, local_mod
 
 
 __all__ = ["PROVIDERS", "Quota", "complete", "estimate_tokens", "fallback_chain", "is_hosted", "mode", "over_quota", "parse_quotas",
-           "parse_routes", "reply_text", "request_body", "route_for", "usage_as_ollama", "windows"]
+           "parse_routes", "prev_minute", "prev_weight", "reply_text", "request_body", "retry_seconds", "route_for", "sliding",
+           "usage_as_ollama", "windows"]

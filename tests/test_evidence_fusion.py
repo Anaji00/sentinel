@@ -21,9 +21,11 @@ def _o(fam, inst, d, i=0):
     return Observation(fam, inst, d, T0 + timedelta(minutes=i), f"e{fam}{i}", f"{fam}|{i}|{inst}")
 
 
+# The proven family is 8k_dilution at 30d, one of the five G4 survivors (shared/utils/tradable_cells.py): since 11 Nov 2026 a
+# proven cell outside that list is shadow and carries no weight, so a fixture family that is not on it would not rank.
 CELLS = [
-    {"family": "insider_cluster", "horizon": "5d", "verdict": "proven", "units": 31, "hit_rate": 0.61, "mean_bps": 85},
-    {"family": "insider_cluster", "horizon": "1h", "verdict": "insufficient_data", "units": 4},
+    {"family": "8k_dilution", "horizon": "30d", "verdict": "proven", "units": 31, "hit_rate": 0.61, "mean_bps": 85},
+    {"family": "8k_dilution", "horizon": "1h", "verdict": "insufficient_data", "units": 4},
     {"family": "sector_news_positive", "horizon": "1d", "verdict": "no_edge", "units": 76},
 ]
 
@@ -37,7 +39,7 @@ def test_a_family_counts_once_however_many_events() -> None:
 
 def test_independent_families_converge_and_proven_ranks_first() -> None:
     obs = [
-        _o("insider_cluster", "ACME", 1), _o("options_call_sweep", "ACME", 1),
+        _o("8k_dilution", "ACME", 1), _o("options_call_sweep", "ACME", 1),
         _o("options_call_sweep", "ZZZ", 1), _o("institutional_accumulation", "ZZZ", 1),
     ]
     ds = build_dossiers(obs, family_record(CELLS))
@@ -57,7 +59,7 @@ def test_a_family_with_no_edge_is_shown_but_not_counted() -> None:
 
 def test_disagreement_is_reported_as_mixed() -> None:
     obs = [
-        _o("insider_cluster", "ACME", 1), _o("options_call_sweep", "ACME", 1),
+        _o("8k_dilution", "ACME", 1), _o("options_call_sweep", "ACME", 1),
         _o("institutional_distribution", "ACME", -1),
     ]
     d = build_dossiers(obs, family_record(CELLS))["ACME"]

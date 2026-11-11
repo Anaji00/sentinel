@@ -28,8 +28,10 @@ from services.agents.radar_agent import RadarAgent
 from services.agents.rule_agent import RuleSynthesizerAgent
 from services.agents.supervisor import GraphSupervisor
 from services.agents.consensus_engine import ConsensusEngine
-from services.agents.adversarial_wargamer import AdversarialWargamerAgent
+from services.agents.adversarial_wargamer import AdversarialWargamerAgent, WARGAMER_V2_NAME
 from services.agents.edge_validator import EdgeValidatorAgent
+from services.agents.divergence_watch import DivergenceWatch
+from services.agents.factor_watchdog import FactorWatchdog
 from services.agents.signal_engine import SignalEngine
 from services.agents.stock_correlation_agent import StockCorrelationAgent
 from services.agents.analyst_agent import AnalystAgent
@@ -420,6 +422,21 @@ async def main():
         fallback_model=FAST_FALLBACK,
     )
 
+    # The wargamer again on a free hosted model, under its own producer id (approved 11 Nov 2026). The local
+    # `adversarial_wargamer` stays cut by policy and its 218 graded predictions stay under that name; this one
+    # starts a new series, so the two are never blended. No local fallback: past its daily cap or its hosted quota
+    # it does nothing. Built only when WARGAMER_HOSTED_MODEL names a hosted model (provider/model).
+    wargamer_model = os.getenv("WARGAMER_HOSTED_MODEL", "").strip()
+    adversarial_wargamer_v2 = build_agent(
+        AdversarialWargamerAgent,
+        agent_name=WARGAMER_V2_NAME,
+        input_topics=[Topics.RAW_NEWS, Topics.CORRELATIONS, Topics.INTEL_BRIEFS, Topics.SCENARIOS_GENERATED],
+        group_id="agent-adversarial-wargamer-v2",
+        shared_infra=shared_infra,
+        model=wargamer_model,
+        fallback_model=None,
+    ) if is_hosted(wargamer_model) else None
+
     edge_validator_agent = build_agent(
         EdgeValidatorAgent,
         agent_name="edge_validator",
@@ -531,6 +548,9 @@ async def main():
     if analyst_shadow is not None:
         agents_by_name["analyst_shadow"] = analyst_shadow
         agent_tier_map.append(("analyst_shadow", analyst_shadow, "heavy"))
+    if adversarial_wargamer_v2 is not None:
+        agents_by_name[WARGAMER_V2_NAME] = adversarial_wargamer_v2
+        agent_tier_map.append((WARGAMER_V2_NAME, adversarial_wargamer_v2, "heavy"))
 
     # Agents cut by policy are not launched; see shared.utils.llm_policy.
     active_agents = {
@@ -553,9 +573,19 @@ async def main():
         tasks.append(safe_create_task(
             SignalEngine(shared_infra["db"], shared_infra["redis"]).run(), name="signal_engine",
         ))
+        # A liquid stock moving against its peers on its own news (reports/Divergence alert.md); no model call.
+        tasks.append(safe_create_task(
+            DivergenceWatch(shared_infra["db"], shared_infra["redis"]).run(), name="divergence_watch",
+        ))
         # The nightly cross-sectional ranking model runs as its own service
         # (factor-model in docker-compose.yml): its panel does not fit in this
         # container's memory budget beside the agents.
+    # Watches the factor engine's heartbeat from outside its container and halts new paper orders when it goes silent
+    # (shared/utils/engine_liveness.py). In the fast tier so it is not in the same container as the work it watches.
+    if tier_filter in ("all", "fast"):
+        tasks.append(safe_create_task(
+            FactorWatchdog(shared_infra["db"], shared_infra["redis"]).run(), name="factor_watchdog",
+        ))
     # The task-queue worker is not started.
     #
     # It ran a BLPOP across sentinel:tasks:high/normal/low on a one-second

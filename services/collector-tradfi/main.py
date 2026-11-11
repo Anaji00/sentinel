@@ -2812,7 +2812,7 @@ async def _signal_backfill_loop(redis_client) -> None:
         return
     from shared.db import get_timescale
     from shared.utils.signal_families import backfill_universe
-    from shared.utils.signal_store import BARS_BACKFILLED_KEY, DAILY_DEEP_KEY, NEEDS_BARS_KEY
+    from shared.utils.signal_store import BARS_BACKFILLED_KEY, DAILY_DEEP_KEY, NEEDS_BARS_KEY, NEEDS_DAILY_KEY
 
     raw = getattr(redis_client, "raw", redis_client)
     await asyncio.sleep(SIGNAL_BACKFILL_FIRST_DELAY_SEC)
@@ -2863,6 +2863,13 @@ async def _signal_backfill_loop(redis_client) -> None:
             )
             deep = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
                     for m in (await raw.smembers(DAILY_DEEP_KEY) or [])}
+            # The study's longer daily-only list (up to 1,500 names it could not price), same symbol filter: it was
+            # capped at 300 names with minute bars before, so most of the gap was never asked for.
+            asked = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                     for m in (await raw.smembers(NEEDS_DAILY_KEY) or [])}
+            daily_universe = sorted(set(daily_universe) | {
+                t for t in asked if t and "=" not in t and "-" not in t and not t.endswith("USDT")
+                and t.replace(".", "").isalpha() and len(t) <= 6})
             shallow = [t for t in daily_universe if t not in deep]
             if shallow:
                 rep_deep = await backfill_daily_bars(db, shallow, lookback_days=365 * DAILY_DEEP_YEARS + 7)
@@ -3271,7 +3278,8 @@ async def _corporate_actions_loop(redis_client) -> None:
     from datetime import date as _date
     from historical_backfill import DAILY_DEEP_YEARS, _credentials, backfill_bars, backfill_daily_bars
     from shared.db import get_timescale
-    from shared.utils.corporate_actions import affected
+    from shared.utils.corporate_actions import affected, split_events
+    from shared.utils.ownership import SPLIT_DATES_KEY
 
     raw = getattr(redis_client, "raw", redis_client)
     await asyncio.sleep(20 * 60)
@@ -3293,6 +3301,12 @@ async def _corporate_actions_loop(redis_client) -> None:
                     async with aiohttp.ClientSession() as session:
                         body = await _fetch_corporate_actions(session, headers, window_start, window_end)
                     hits = affected(body, today)
+                    # Split dates are kept for the 13F flows: shares as filed are unadjusted, so a split reads as every
+                    # holder adding or cutting (shared/utils/ownership.py split_tickers_in).
+                    for sym, dates in split_events(body, today).items():
+                        old = await raw.hget(SPLIT_DATES_KEY, sym)
+                        merged = sorted(set(json.loads(old) if old else []) | set(dates))
+                        await raw.hset(SPLIT_DATES_KEY, sym, json.dumps(merged))
                     held = {str(r["ticker"]).upper() for r in await db.query(
                         "SELECT DISTINCT ticker FROM daily_bars WHERE ticker = ANY($1::text[])", sorted(hits)) or []}
                     names = sorted(held)

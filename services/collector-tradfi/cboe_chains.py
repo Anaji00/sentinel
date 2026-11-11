@@ -11,6 +11,7 @@ minutes. Cboe asks for nothing but a polite pace; there is no key.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
@@ -33,6 +34,8 @@ NY = ZoneInfo("America/New_York")
 RUN_AFTER_NY_HOUR = 17           # an hour after the close: the delayed day is complete
 REQUEST_GAP_SEC = 1.0
 DONE_KEY = "sentinel:cboe_chains:day"
+GEX_KEY = "sentinel:gex:history:{ticker}"          # hash: day -> {net_gex, gamma_flip, spot}
+GEX_HISTORY = ("SPY", "QQQ", "IWM")
 UPSERT_SQL = """
     INSERT INTO option_chain_daily (ticker, day, call_volume, put_volume, call_oi, put_oi, pcr_volume, pcr_oi,
         iv30, atm_iv, skew_25d, expiry_days, contracts, spot, source, fetched_at)
@@ -74,6 +77,12 @@ async def run_once(session: aiohttp.ClientSession, raw: Any, day) -> int:
             if s:
                 await db.execute(UPSERT_SQL, *row(t, s))
                 written += 1
+                if t in GEX_HISTORY and s.get("net_gex") is not None:
+                    # A history to test against: the daily table keeps totals only, so net gamma and the flip are
+                    # kept here until a test says they belong in a column (shared/utils/gex.py).
+                    key = GEX_KEY.format(ticker=t)
+                    await raw.hset(key, str(day), json.dumps({"net_gex": s["net_gex"], "gamma_flip": s["gamma_flip"], "spot": s["spot"]}))
+                    await raw.expire(key, 450 * 86400)
         except Exception as e:
             swallowed("collector.tradfi.cboe_chains.fetch", e, logger, detail=t)
         await asyncio.sleep(REQUEST_GAP_SEC)

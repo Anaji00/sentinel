@@ -63,4 +63,23 @@ def affected(body: Mapping[str, Any], today: Optional[date] = None) -> Dict[str,
     return out
 
 
-__all__ = ["DIVIDEND_TYPES", "PRICE_ACTION_TYPES", "SPLIT_TYPES", "affected"]
+def split_events(body: Mapping[str, Any], today: Optional[date] = None) -> Dict[str, list]:
+    """{symbol: [ISO ex-dates]} for splits, reverse splits and unit splits only: the actions that change a share count.
+
+    Spin-offs and dividends re-adjust prices but a holder's shares are unchanged, so they are not here. Used to keep a
+    split out of the 13F flows (shared/utils/ownership.py split_tickers_in)."""
+    today = today or date.today()
+    out: Dict[str, list] = {}
+    for group in ("forward_splits", "reverse_splits", "unit_splits"):
+        for a in (body.get("corporate_actions") or {}).get(group) or []:
+            ex = _d(a.get("ex_date"))
+            if ex is None or ex > today:
+                continue
+            for key in ("symbol", "old_symbol", "new_symbol"):
+                sym = str(a.get(key) or "").upper()
+                if _TICKER.match(sym) and ex.isoformat() not in out.setdefault(sym, []):
+                    out[sym].append(ex.isoformat())
+    return {k: sorted(v) for k, v in out.items()}
+
+
+__all__ = ["DIVIDEND_TYPES", "PRICE_ACTION_TYPES", "SPLIT_TYPES", "affected", "split_events"]

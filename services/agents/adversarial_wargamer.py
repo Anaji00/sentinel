@@ -14,6 +14,7 @@ and cross-agent bulletin integration.
 
 import json
 import logging
+import os
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
@@ -21,11 +22,25 @@ from pydantic import BaseModel, Field
 from services.agents.base import SentinelAgent, SchemaViolationError, InferenceError, InferenceShed
 from shared.kafka import Topics
 from shared.models.events import Domain, EventType
+from shared.utils import hosted_llm
 from shared.utils.tasks import safe_create_task
 from shared.utils.text import clip
-from shared.utils.quiet_failures import swallowed
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.adversarial_wargamer")
+
+# The hosted wargamer's producer id. Its graded series is separate from the local `adversarial_wargamer` (218 graded
+# predictions, agent switched off by policy), so a new model never inherits or overwrites the old record.
+WARGAMER_V2_NAME = "adversarial_wargamer_v2_hosted"
+DAILY_CAP_KEY = "sentinel:wargamer:daily:{agent}:{day}"
+
+
+def daily_cap() -> int:
+    """Hosted wargames a day (WARGAMER_DAILY_CAP, default 150); an unreadable value uses the default."""
+    try:
+        return max(0, int(os.getenv("WARGAMER_DAILY_CAP", "150")))
+    except ValueError:
+        return 150
 
 
 class SimulationMove(BaseModel):
@@ -208,6 +223,20 @@ class AdversarialWargamerAgent(SentinelAgent):
     def output_topic(self) -> str:
         return Topics.AGENTS_PREDICTIONS
 
+    async def _within_daily_cap(self) -> bool:
+        """Counts one hosted wargame against today's cap; False once it is spent. A store that cannot be read stops the
+        call rather than letting it through: a cap that fails open is not a cap."""
+        raw = getattr(self.redis, "raw", self.redis)
+        key = DAILY_CAP_KEY.format(agent=self.name, day=datetime.now(timezone.utc).strftime("%Y%m%d"))
+        try:
+            n = int(await raw.incr(key))
+            if n == 1:
+                await raw.expire(key, 2 * 86400)
+        except Exception as exc:
+            swallowed("agents.adversarial_wargamer.daily_cap", exc, self.logger)
+            return False
+        return n <= daily_cap()
+
     async def handle(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Robust multi-key entity extraction across CorrelationCluster, Scenario, IntelBrief, and trade events
         raw_eids = message.get("entity_ids") or []
@@ -260,7 +289,16 @@ class AdversarialWargamerAgent(SentinelAgent):
         # (b) Is there capacity at all? Peeking does not claim the slot -- the
         #     atomic claim still happens at the inference call -- it just avoids
         #     building context for work that cannot run.
-        if not await self.capacity_or_defer(message):
+        #
+        #     A hosted model does not use the local slot, so it is held to a hard daily cap instead
+        #     (WARGAMER_DAILY_CAP, 150 by default); the hosted quotas and the agent's hourly share
+        #     still apply at the call.
+        if hosted_llm.is_hosted(getattr(self, "model", "") or ""):
+            if not await self._within_daily_cap():
+                dropped("agents.adversarial_wargamer.not_allowed", f"hosted wargame not run: daily cap {daily_cap()} spent or its counter unreadable",
+                        self.logger)
+                return None
+        elif not await self.capacity_or_defer(message):
             return None
 
         self.logger.info(f"⚔️ WARGAME SIMULATION | Targets: {entity_ids} | Description: {description[:70]}...")

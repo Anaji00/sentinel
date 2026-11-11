@@ -15,6 +15,7 @@ downstream can mistake them for evidence.
 from __future__ import annotations
 
 import asyncio
+import time
 import bisect
 import json
 import logging
@@ -718,7 +719,23 @@ async def main() -> None:
 
     from services.agents.news_model_refit import NewsModelRefit
 
+    from shared.utils import engine_liveness as el
+    from shared.utils.heartbeat import start_heartbeat_task
+
+    beat = {"last": time.monotonic()}
+
+    def beat_meta() -> Dict[str, Any]:
+        """How late this beat is against its schedule: a loop that was blocked shows it here before it goes silent."""
+        now = time.monotonic()
+        lag = max(0.0, now - beat["last"] - el.HEARTBEAT_SEC)
+        beat["last"] = now
+        return {"loop_lag_seconds": round(lag, 1), "interval_seconds": el.HEARTBEAT_SEC}
+
     await asyncio.gather(FactorEngine(db, redis).run(), RecommendationEngine(db, redis).run(),
+                         # The beat the watchdog (services/agents/factor_watchdog.py) and the trader read. On this loop
+                         # on purpose: a blocked loop silences it.
+                         start_heartbeat_task(redis, el.COMPONENT, interval=el.HEARTBEAT_SEC, ttl=el.HEARTBEAT_TTL_SEC,
+                                              metadata=beat_meta),
                          DossierEngine(db, redis).run(), Grader(db, redis).run(),
                          EarningsReactionEngine(db, redis).run(), PortfolioEngine(db, redis).run(),
                          FilingExtractor(db, redis).run(),

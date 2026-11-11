@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import IO, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import IO, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -329,19 +329,73 @@ def holding_changes(previous, current):
     return out
 
 
-def aggregate_changes(per_filer, filers=FLOW_FILERS):
+SPLIT_DATES_KEY = "sentinel:corporate_actions:splits"      # hash: ticker -> JSON list of split ex-dates (ISO)
+
+
+def period_of_tags(tags: Optional[Iterable[str]]) -> str:
+    """The quarter end a flow event's `period:YYYY-MM-DD` tag names, or ''."""
+    return next((str(t).split(":", 1)[1] for t in tags or [] if str(t).startswith("period:")), "")
+
+
+def published_flow_keys(archived: Iterable[Mapping[str, Any]]) -> Set[Tuple[str, str]]:
+    """{(ticker, quarter)} of 13F flow events already in the archive. Rows carry `ticker` and `tags`."""
+    out: Set[Tuple[str, str]] = set()
+    for r in archived:
+        period = period_of_tags(r.get("tags"))
+        if period and r.get("ticker"):
+            out.add((str(r["ticker"]).upper(), period))
+    return out
+
+
+def unpublished_flows(rows: Iterable[Sequence[Any]], published: Set[Tuple[str, str]]) -> List[Sequence[Any]]:
+    """The history path's rows (ticker at index 5, tags at index 4) minus any ticker and quarter the live path already
+    archived. The two paths use different event ids, so ON CONFLICT never caught the overlap: 25 quarters were archived twice."""
+    return [r for r in rows if (str(r[5]).upper(), period_of_tags(r[4])) not in published]
+
+
+def previous_period(period):
+    """The quarter end before `period` ("2026-06-30" -> "2026-03-31")."""
+    from datetime import date as _date
+    d = _date.fromisoformat(period)
+    m = d.month - 3
+    y = d.year - (1 if m <= 0 else 0)
+    m = m + 12 if m <= 0 else m
+    nxt = _date(y + (m == 12), (m % 12) + 1, 1)
+    return (nxt - __import__("datetime").timedelta(days=1)).isoformat()
+
+
+def split_tickers_in(split_dates, start, end):
+    """Tickers with a split or reverse split whose ex-date falls in (start, end].
+
+    13F reports shares held at the quarter end, unadjusted. A 2-for-1 split between two quarter ends reads as every
+    holder adding 100%, and the aggregate then called it institutional accumulation. `split_dates` maps a ticker to its
+    ISO ex-dates (SPLIT_DATES_KEY, filled from the broker's corporate-actions feed); `start` and `end` are ISO dates."""
+    out = set()
+    for ticker, dates in (split_dates or {}).items():
+        for d in dates or []:
+            if start < str(d) <= end:
+                out.add(str(ticker).upper())
+                break
+    return frozenset(out)
+
+
+def aggregate_changes(per_filer, filers=FLOW_FILERS, split_tickers=frozenset()):
     """Across filers: {ticker: {"buyers": [...], "sellers": [...], "flow": +1|-1|0}}.
 
     `per_filer` maps a filer name to its `holding_changes`; only names in
     `filers` count (None counts all). `flow` is +1 (accumulation) or -1
     (distribution) only when at least MIN_FILERS_AGREEING filers moved that way
     and they outnumber the other side at least MIN_AGREEMENT_RATIO times over.
+    `split_tickers` (split_tickers_in) are tickers whose share count changed by a split in the period: their adds and
+    cuts are not holder decisions and are left out; new and exited lines are not affected by a split.
     """
     out = {}
     for filer, changes in per_filer.items():
         if filers is not None and filer not in filers:
             continue
         for t, ch in changes.items():
+            if t in split_tickers and ch["kind"] in ("add", "cut"):
+                continue
             if ch["kind"] in ("add", "cut") and abs(ch.get("change") or 0.0) < FLOW_MIN_CHANGE:
                 continue
             row = out.setdefault(t, {"buyers": [], "sellers": [], "flow": 0})

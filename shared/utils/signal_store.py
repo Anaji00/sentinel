@@ -37,8 +37,12 @@ EVIDENCE_CACHE_PREFIX = "sentinel:signals:evidence:"
 NEEDS_BARS_KEY = "sentinel:signals:needs_bars"
 BARS_BACKFILLED_KEY = "sentinel:signals:bars_backfilled"
 MAX_NEEDS_BARS = 300
+# Instruments the study needs daily history for, beyond the 300 that also get minute bars: daily bars only (the 1d, 5d and
+# 30d horizons read nothing finer), so the list can be five times longer at a fraction of the cost.
+NEEDS_DAILY_KEY = "sentinel:signals:needs_daily"
+MAX_NEEDS_DAILY = 1500
 
 __all__ = [
     "ACTIVE_KEY", "AWAITING_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "SIGNAL_MATRIX_INDEX_KEY", "PRODUCER_GRADES_KEY", "SIGNAL_MATRIX_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
-    "NEEDS_BARS_KEY", "OUTCOMES_KEY", "STUDY_KEY",
+    "NEEDS_BARS_KEY", "NEEDS_DAILY_KEY", "MAX_NEEDS_DAILY", "OUTCOMES_KEY", "STUDY_KEY",
 ]

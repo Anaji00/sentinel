@@ -37,6 +37,7 @@ from shared.utils.audit_ledger import AuditLedger, AuditLedgerUnavailable
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils import scenario_requests as sr
 from shared.utils.scenario_requests import ScenarioRequest
+from shared.utils.alert_view import divergence_view
 
 # Client-facing shape of a correlation record. Keeps the response contract
 # independent of the `correlations` table layout.
@@ -49,6 +50,13 @@ CORRELATION_FIELDS = (
     "tags",
     "scenario",
     "evidence_trail",
+    # Divergence alerts only (shared/utils/alert_view.py): where the situation stands and the seven-section brief.
+    "situation",
+    "brief",
+    "horizon",
+    "breadth",
+    "beta",
+    "relative_volume",
 )
 
 logger = logging.getLogger("api-gateway.scenarios")
@@ -218,7 +226,7 @@ async def get_correlations(
     # 2. Query TimescaleDB correlations table
     try:
         rows = await db.query("""
-            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario 
+            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario, metrics_summary
             FROM correlations 
             WHERE alert_tier >= $1 
             ORDER BY detected_at DESC LIMIT $2
@@ -236,6 +244,7 @@ async def get_correlations(
                 scen = {}
 
             item["evidence_trail"] = item.get("evidence_trail") or scen.get("evidence_trail") or []
+            item.update(divergence_view(item.pop("metrics_summary", None)))
 
             # Explicit field allowlist rather than spreading the row: the query
             # selects from `correlations`, and a schema change there would

@@ -135,8 +135,9 @@ def test_the_swarm_endpoint_reports_emptiness_honestly():
 def test_navigation_is_grouped_not_a_flat_list_of_thirteen():
     src = _src(SIDEBAR)
     assert "NAV_GROUPS" in src
-    # "Watch" was "Intelligence" until 4 Nov 2026: a wording change, the grouping is the point.
-    for group in ("Overview", "Markets", "Watch", "Reference"):
+    # 11 Nov 2026: the user asked for four workspaces named for what you are doing. Every page keeps its link; the
+    # grouping is still the point, and a flat list is still what this test refuses.
+    for group in ("Desk", "Book", "Radar", "Audit"):
         assert f"label: '{group}'" in src
 
 

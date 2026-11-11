@@ -1385,6 +1385,30 @@ def twap(prices: List[float]) -> float:
 # SECTION 8: ADVANCED ADVISORY & PORTFOLIO RISK MODELS
 # ════════════════════════════════════════════════════════════════════════════════
 
+def shrunk_covariance(returns: Sequence[Sequence[float]]) -> Optional[List[List[float]]]:
+    """Ledoit-Wolf (2004) covariance of asset returns, shrunk toward a scaled identity. Assets in rows, observations in columns.
+
+    A sample covariance of a dozen assets over a few weeks of returns is noisy and can be near singular, and the
+    Black-Litterman step inverts it. The intensity is estimated from the data, not chosen: delta = b2 / d2 with
+    d2 the spread of the sample covariance around mu*I and b2 the sampling error of the sample covariance, so more
+    observations mean less shrinkage. None for fewer than 2 observations, a non-finite value, or a ragged input."""
+    try:
+        x = np.asarray(returns, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if x.ndim != 2 or x.shape[1] < 2 or x.shape[0] < 1 or not np.all(np.isfinite(x)):
+        return None
+    p, n = x.shape
+    x = (x - x.mean(axis=1, keepdims=True)).T                    # n x p, demeaned
+    s = x.T @ x / n
+    mu = float(np.trace(s) / p)
+    d2 = float(np.sum((s - mu * np.eye(p)) ** 2) / p)
+    b2 = float(sum(np.sum((np.outer(r, r) - s) ** 2) for r in x) / (n * n * p))
+    delta = 0.0 if d2 <= 0 else min(1.0, b2 / d2)
+    out = delta * mu * np.eye(p) + (1.0 - delta) * s
+    return out.tolist()
+
+
 def black_litterman_optimization(
     market_caps: Dict[str, float],
     cov_matrix: List[List[float]],

@@ -91,3 +91,33 @@ def test_the_prominent_filer_roster_names_current_leaders() -> None:
     src = (Path(__file__).resolve().parents[1] / "services/collector-filings/thirteen_f.py").read_text(encoding="utf-8")
     assert '"manager": "Greg Abel / Warren Buffett (chair)"' in src
     assert "Ray Dalio" not in src.split("PROMINENT_FILERS")[1].split("_DYNAMIC_TITLE_TO_TICKER")[0].replace("Ray Dalio has fully exited", "")
+
+
+def test_divergence_alerts_show_their_stage_and_all_seven_brief_sections() -> None:
+    feed = _read("components/IntelligenceFeed.tsx")
+    assert "<StageBadge situation={c.situation}" in feed and "<DivergenceBrief" in feed
+    words = _read("lib/divergence.ts")
+    for key in ("what_happened", "catalyst", "peers", "evidence", "positioning", "watch", "limits"):
+        assert f"'{key}'" in words, key
+    assert "NOT_PROVIDED" in words and "isNotMeasured" in words, "'not measured' is shown, never hidden"
+
+
+def test_the_look_is_flat_and_the_live_pieces_are_wired() -> None:
+    import re
+    css = _read("app/globals.css")
+    assert "--radius: 6px;" in css and "radial-gradient" not in css, "square hairline panes, no decorative glow"
+    for rel in ("components", "app"):
+        for p in (SRC / rel).rglob("*.tsx"):
+            text = p.read_text(encoding="utf-8")
+            assert not re.search(r"\brounded-(?:[tblr]-)?(?:xl|2xl)\b|backdrop-blur|shadow-(?:lg|xl|2xl)\b", text), f"{p.name}: puffy card styling is back"
+    assert "<MarketMood />" in _read("components/ui/Header.tsx")
+    feed = _read("components/IntelligenceFeed.tsx")
+    assert "ALERT_KINDS.map" in feed and "filterAlerts(" in feed
+
+
+def test_two_stocks_can_be_compared_from_the_address_the_drawer_and_the_desk() -> None:
+    assert "useCompare" in _read("components/RelatedStocks.tsx") and "Compare" in _read("components/RelatedStocks.tsx")
+    assert "<ComparePanel" in _read("components/StockDrawer.tsx") and "<ComparePanel" in _read("components/Desk.tsx")
+    panel = _read("components/ComparePanel.tsx")
+    assert "/predictions/closes/" in panel and "failedWithout(" in panel and "do not share enough trading days" in panel
+    assert "next.delete('c')" in _read("components/StockDrawer.tsx"), "closing the drawer drops the comparison"

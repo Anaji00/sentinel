@@ -312,6 +312,9 @@ async def test_resolved_forecast_leaves_the_pending_pool():
 def test_search_routes_are_registered():
     from services.api_gateway.routes.main import app
     paths = {r.path for r in app.routes if hasattr(r, "path")}
+    # FastAPI wraps each included router in an object with no `.path`, so `app.routes` alone misses nested routes; the
+    # OpenAPI document lists every served path (same fix as tests/test_frontend_api_contract.py, 11 Nov 2026).
+    paths.update(app.openapi().get("paths", {}))
     assert "/api/v1/search/similar/{event_id}" in paths
     assert "/api/v1/search/status" in paths
 

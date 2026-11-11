@@ -124,6 +124,45 @@ def alert_risk_weights(names: Iterable[str], flagged: Set[str], scale: float) ->
     return {str(t).upper(): (s if str(t).upper() in flagged else 1.0) for t in names}
 
 
+# Alert-based weights are set when the book is rebuilt and held until the next rebuild (approved 11 Nov 2026): re-deriving
+# them every session put about 30% of the book in drift trades on 30 Oct. The one exception is a hard risk-off veto, which
+# only ever reduces exposure and stays in force until the next rebuild, so the name is not bought back and sold again.
+VETO_8K_ITEMS = frozenset({"3.01", "1.03", "4.02"})      # delisting notice, bankruptcy, non-reliance on financials
+VETO_DIVERGENCE_Z = 3.0                                  # a peer divergence this many sigma, against the position
+
+
+def veto_names(long: Iterable[str], short: Iterable[str], eight_k: Iterable[Mapping[str, Any]],
+               divergences: Iterable[Mapping[str, Any]], z_min: float = VETO_DIVERGENCE_Z) -> Dict[str, str]:
+    """{ticker: reason} for book names with a hard adverse event: an 8-K naming one of VETO_8K_ITEMS, or a peer
+    divergence of at least `z_min` sigma that moves against the position (a long that fell against its peers, a short that
+    rose). `eight_k` rows carry ticker and item codes; `divergences` rows carry ticker, ret and z."""
+    longs, shorts = {str(t).upper() for t in long}, {str(t).upper() for t in short}
+    out: Dict[str, str] = {}
+    for r in eight_k:
+        t = str(r.get("ticker") or "").upper()
+        hit = sorted(set(r.get("items") or []) & VETO_8K_ITEMS)
+        if t in (longs | shorts) and hit and t not in out:
+            out[t] = f"8-K item {', '.join(hit)}"
+    for r in divergences:
+        t = str(r.get("ticker") or "").upper()
+        try:
+            ret, z = float(r["ret"]), float(r["z"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(ret) and math.isfinite(z)) or abs(z) < z_min or t in out:
+            continue
+        if (t in longs and ret < 0) or (t in shorts and ret > 0):
+            out[t] = f"adverse peer divergence {abs(z):.1f} sigma"
+    return out
+
+
+def apply_vetoes(weights: Mapping[str, float], vetoes: Mapping[str, str], scale: float) -> Dict[str, float]:
+    """The weights with each vetoed name cut to `scale` of its weight (0 = exit). Applied after the leg is normalised, so
+    the freed weight stays in cash and is not spread over the other names, which would be a purchase."""
+    s = min(1.0, max(0.0, float(scale)))
+    return {t: (w * s if t in vetoes else w) for t, w in weights.items()}
+
+
 def whole_share_leg(dollars: Mapping[str, float], prices: Mapping[str, float]) -> Dict[str, int]:
     """Whole shares for one leg's dollar targets (positive), totalling as near
     the leg's dollars as whole shares allow."""

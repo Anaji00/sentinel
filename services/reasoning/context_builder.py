@@ -29,6 +29,7 @@ from shared.utils.instrument_reach import (
 )
 from shared.utils.ownership import holders_line, read_holders
 from shared.utils.quiet_failures import swallowed
+from shared.utils.untrusted_text import sanitize_untrusted
  
 logger = logging.getLogger("reasoning.context")
 
@@ -130,7 +131,8 @@ class ContextBuilder:
                 "rule": cluster.rule_name,
                 "tier": cluster.alert_tier.value,
                 "detected_at": cluster.detected_at.isoformat(),
-                "description": cluster.description,
+                # Rule text can carry a feed's words (an alert description quotes the headline that fired it).
+                "description": sanitize_untrusted(cluster.description, max_chars=600),
                 "tags": cluster.tags,
             },
             "trigger_event": trigger,
@@ -181,7 +183,7 @@ class ContextBuilder:
 
             headline = evt.get("headline") or evt.get("summary")
             if headline:
-                detail = str(headline)[:60]
+                detail = sanitize_untrusted(headline, max_chars=60)       # ingested text: injection forms stripped
                 # The headline is prose and carries none of the structured
                 # fields the enrichment layer works to attach. A financial
                 # event always has one, so this branch made the financial
@@ -446,7 +448,7 @@ class ContextBuilder:
                    LIMIT 10""",
                 cutoff, cluster.detected_at
             )
-            return [r["headline"] for r in rows if r.get("headline")]
+            return [sanitize_untrusted(r["headline"]) for r in rows if r.get("headline")]
         except Exception as e:
             logger.error(f"Error fetching recent news: {e}")
             return []

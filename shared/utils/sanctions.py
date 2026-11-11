@@ -519,8 +519,9 @@ def check_sanctions(name: str, mmsi: str = "", imo: str = "") -> List[str]:
         # which is the same arbitrary-provenance defect the exact path above
         # was already repaired for.
         if best_kw is not None and best_score >= FUZZY_MATCH_THRESHOLD:
-            if "sanctioned_ofac" not in flags:
-                flags.append("sanctioned_ofac")
+            # A spelling that is close to a listed name is a lead, not a listing: it is recorded as
+            # sanctioned_fuzzy ("similar" in sanctions_strength) but does not set sanctioned_ofac, the flag
+            # that raises the tier. Only an identifier match (MMSI or IMO, above) or an exact listed name does.
             flags.append(f"sanctioned_fuzzy:{best_kw}")
 
     prefix = (mmsi or "")[:3]

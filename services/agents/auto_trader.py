@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
@@ -25,6 +26,7 @@ from zoneinfo import ZoneInfo
 from shared.broker.alpaca import AlpacaBroker
 from shared.broker.base import OrderSide, OrderStatus, OrderType
 from shared.utils import auto_trade as at
+from shared.utils import engine_liveness as el
 from shared.utils import model_portfolio as mp
 from shared.utils import market_cap as mc
 from shared.utils.quiet_failures import dropped, swallowed
@@ -65,6 +67,20 @@ _RECENT_ALERTS_SQL = f"""
     SELECT DISTINCT primary_entity_id AS ticker, rule_name FROM correlations
     WHERE detected_at > NOW() - INTERVAL '{ALERT_RISK_DAYS} days' AND primary_entity_id = ANY($1::text[])
       AND rule_id IS DISTINCT FROM 'USER_SCENARIO_REQUEST'
+"""
+# Hard risk-off vetoes between rebuilds (shared/utils/auto_trade.py veto_names): an 8-K on a book name, or a peer
+# divergence from the divergence watch (services/agents/divergence_watch.py) against the position.
+_EIGHT_K_ITEM = re.compile(r"\b(\d\.\d\d):")
+_VETO_8K_SQL = """
+    SELECT primary_entity_id AS ticker, summary FROM events
+    WHERE type = 'filing' AND summary LIKE 'Material 8-K Event%' AND created_at > NOW() - INTERVAL '3 days'
+      AND primary_entity_id = ANY($1::text[])
+"""
+_VETO_DIVERGENCE_SQL = """
+    SELECT primary_entity_id AS ticker, (metrics_summary->>'return')::float AS ret, (metrics_summary->>'z')::float AS z
+    FROM correlations
+    WHERE rule_id IN ('DIVERGENCE_NEWS', 'DIVERGENCE_UNEXPLAINED') AND detected_at > NOW() - INTERVAL '3 days'
+      AND primary_entity_id = ANY($1::text[])
 """
 _LOG_SQL = """
     INSERT INTO auto_trade_orders (day, portfolio, symbol, side, qty, reason, order_id, status, error, ref_price, client_order_id)
@@ -131,6 +147,14 @@ def alert_risk_scale() -> float:
         return min(1.0, max(0.0, float(os.getenv("B1_ALERT_RISK_SCALE", "0.5"))))
     except ValueError:
         return 0.5
+
+
+def veto_scale() -> float:
+    """B1_VETO_SCALE: the share of a vetoed name's weight that is kept (default 0 = exit; 1 = vetoes off)."""
+    try:
+        return min(1.0, max(0.0, float(os.getenv("B1_VETO_SCALE", "0"))))
+    except ValueError:
+        return 0.0
 
 
 def capital_cap() -> Optional[float]:
@@ -216,6 +240,23 @@ class AutoTrader:
             logger.info("Auto-trader: recorded %s order outcomes", stored)
         return stored
 
+    async def _engine_stale(self) -> Optional[str]:
+        """Why the factor engine is considered silent, or None. Reads the watchdog's flag and, as a second check, the beat
+        itself (the beat task could die while this loop lives). A store that cannot be read does not stop trading: counted."""
+        if self.raw is None:
+            return None
+        try:
+            flag = await self.raw.get(el.HALT_KEY)
+            if flag:
+                return flag.decode() if isinstance(flag, bytes) else str(flag)
+            if await self.raw.get(el.SEEN_KEY):
+                state, why = el.verdict(el.heartbeat_age(await self.raw.get(f"sentinel:heartbeat:{el.COMPONENT}")))
+                if state != "ok":
+                    return why
+        except Exception as exc:
+            swallowed("agents.auto_trader.engine_stale_read", exc, logger)
+        return None
+
     async def _done(self, today: date) -> bool:
         if self.raw is None:
             return False
@@ -247,8 +288,14 @@ class AutoTrader:
             return {"day": str(today), "orders": 0, "skipped": "no market-cap table"}
         allowed = (stocks & large) if stocks is not None else large
         book = {**book, "long": at.picks_only(book["long"], allowed), "short": at.picks_only(book["short"], allowed)}
-        weights = at.target_weights(book["long"], book["short"], leg_fraction(),
-                                    weights=await self._risk_weights(list(book["long"]) + list(book["short"])))
+        # Alert-based weights are set once, when the book is rebuilt, and held (shared/utils/auto_trade.py): re-deriving
+        # them each session was drift churn. A hard risk-off veto may still cut a name between rebuilds.
+        book = await self._freeze_alert_weights(book)
+        weights = at.target_weights(book["long"], book["short"], leg_fraction(), weights=book.get("risk_weights") or None)
+        vetoes = await self._vetoes(book)
+        if vetoes:
+            logger.warning("B1 risk-off veto: %s", "; ".join(f"{t} ({why})" for t, why in sorted(vetoes.items())[:10]))
+            weights = at.apply_vetoes(weights, vetoes, veto_scale())
         account = await self.broker.get_account()
         positions = await self.broker.get_positions()
         held = {p.symbol.upper(): float(p.qty) for p in positions}
@@ -272,6 +319,12 @@ class AutoTrader:
         halted = await self._halted()
         if halted:
             return {"day": today.isoformat(), "halted": halted}
+        # A silent factor engine means betas and scores may be stale (watchdog: services/agents/factor_watchdog.py). Transient:
+        # no persistent halt is written, so trading resumes by itself on the next fresh beat; nothing held is sold.
+        stale = await self._engine_stale()
+        if stale:
+            dropped("agents.auto_trader.engine_stale", f"orders skipped, factor engine silent: {stale}", logger)
+            return {"day": today.isoformat(), "halted": f"factor engine: {stale}"}
         if reasons:
             await self._halt("; ".join(reasons))
             return {"day": today.isoformat(), "halted": "; ".join(reasons)}
@@ -354,6 +407,46 @@ class AutoTrader:
             swallowed("agents.auto_trader.asset_meta", exc, logger)
             return None
         return {t.upper() for t, m in meta.items() if m and m[0] == "stock"} or None
+
+    async def _freeze_alert_weights(self, book: Dict[str, Any]) -> Dict[str, Any]:
+        """The book with its alert-based weights fixed at the rebuild. A book without them (new, or stored before this
+        rule) gets them now, once, and keeps them to the next rebuild. A lookup that fails freezes equal weights, and is
+        counted by _risk_weights."""
+        if "risk_weights" in book:
+            return book
+        names = [str(n).upper() for n in list(book["long"]) + list(book["short"])]
+        rw = await self._risk_weights(names)
+        frozen = {**book, "risk_weights": {t: w for t, w in (rw or {}).items() if w != 1.0}, "vetoes": book.get("vetoes") or {}}
+        if self.raw is not None:
+            # Only the new keys go into the stored book: `book` here may be the day's filtered copy (picks, large caps).
+            stored = _json(await self.raw.get(BOOK_KEY), None)
+            if isinstance(stored, dict):
+                stored["risk_weights"], stored["vetoes"] = frozen["risk_weights"], frozen["vetoes"]
+                await self.raw.set(BOOK_KEY, json.dumps(stored))
+        logger.info("B1 alert weights fixed until the next rebuild: %s names scaled", len(frozen["risk_weights"]))
+        return frozen
+
+    async def _vetoes(self, book: Dict[str, Any]) -> Dict[str, str]:
+        """Hard risk-off vetoes in force: the ones recorded in the book since its rebuild, plus any found now. New ones are
+        saved to the book so they hold until the next rebuild. A lookup that fails adds none and is counted."""
+        held = {str(k).upper(): str(v) for k, v in (book.get("vetoes") or {}).items()}
+        names = [str(n).upper() for n in list(book["long"]) + list(book["short"])]
+        try:
+            eight = [{"ticker": r["ticker"], "items": _EIGHT_K_ITEM.findall(str(r["summary"] or ""))}
+                     for r in await self.db.query(_VETO_8K_SQL, names) or []]
+            divs = [{"ticker": r["ticker"], "ret": r["ret"], "z": r["z"]}
+                    for r in await self.db.query(_VETO_DIVERGENCE_SQL, names) or []]
+            found = at.veto_names(book["long"], book["short"], eight, divs)
+        except Exception as exc:
+            swallowed("agents.auto_trader.vetoes", exc, logger)
+            return held
+        new = {t: why for t, why in found.items() if t not in held}
+        if new and self.raw is not None:
+            stored = _json(await self.raw.get(BOOK_KEY), None)
+            if isinstance(stored, dict):
+                stored["vetoes"] = {**(stored.get("vetoes") or {}), **new}
+                await self.raw.set(BOOK_KEY, json.dumps(stored))
+        return {**held, **new}
 
     async def _risk_weights(self, names: List[str]) -> Optional[Dict[str, float]]:
         """Smaller weights for names with a recent alert from a family graded to

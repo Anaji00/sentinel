@@ -141,6 +141,8 @@ ALL_KNOWN_COMPONENTS = [
     # are legitimately OFFLINE in analyst mode rather than failed.
     "agents-heavy",
     "agents-fast",
+    # The nightly model, the paper-account trader and ~30 jobs on one loop (shared/utils/engine_liveness.py).
+    "factor-engine",
 ]
 
 # Components that only run under an opt-in compose profile. Absence is a

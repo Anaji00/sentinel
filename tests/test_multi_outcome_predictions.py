@@ -415,3 +415,16 @@ def test_a_few_dollars_on_kalshi_is_not_a_whale(enricher):
     assert enricher.kalshi_floor(34.0, 0.0, 0.89, 3.0, 0.0) == (0.3, 0.0, 0.0)
     assert enricher.kalshi_floor(40_000.0, 0.0, 0.89, 3.0, 0.0) == (0.89, 3.0, 0.0)   # real money
     assert enricher.kalshi_floor(10.0, 0.05, 0.8, 0.0, 2.6) == (0.8, 0.0, 2.6)        # real move in the odds
+
+
+def test_a_field_with_one_winner_is_scaled_to_sum_to_one_and_thin_prices_are_pulled_to_the_prior() -> None:
+    from shared.utils.prediction_markets import devig, shrink_to_prior
+    out = devig([0.52, 0.31, 0.22])                          # an overround of 1.05
+    assert out is not None and abs(sum(out) - 1.0) < 1e-12 and out[0] < 0.52
+    assert devig([0.5, 0.5]) == [0.5, 0.5]
+    for bad in ([0.5], [0.5, -0.1], [0.0, 0.0], [0.5, float("nan")], None, ["x", 1]):
+        assert devig(bad) is None
+    assert shrink_to_prior(0.9, 50) < 0.55                    # almost nothing traded: near the prior
+    assert shrink_to_prior(0.9, 2_000_000) > 0.89             # heavily traded: the price stands
+    assert abs(shrink_to_prior(0.9, 2000) - 0.7) < 1e-9
+    assert shrink_to_prior(1.5, 100) is None and shrink_to_prior(0.5, -1) is None and shrink_to_prior("x", 10) is None

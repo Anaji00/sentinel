@@ -40,7 +40,7 @@ if str(ROOT) not in sys.path:
 from shared.utils.ownership import (  # noqa: E402
     FILER_KEY, HOLDERS_KEY, MCAP_KEY, OWNERSHIP_FILERS, aggregate_by_cusip, index_entries, iter_infotable,
     DEFENSE_PRIMES, OSINT_SECTORS, stake_pct, value_scale,
-    CHANGES_KEY, aggregate_changes, holding_changes,
+    CHANGES_KEY, SPLIT_DATES_KEY, aggregate_changes, holding_changes, previous_period, split_tickers_in,
 )
 from shared.kafka import Topics  # noqa: E402
 from shared.models import NormalizedEvent, RawEvent  # noqa: E402
@@ -363,7 +363,10 @@ async def publish_flows(producer: Any, raw: Any) -> int:
             (f.decode() if isinstance(f, bytes) else f): json.loads(v)
             for f, v in (await raw.hgetall(key) or {}).items()
         }
-        for ticker, row in aggregate_changes(per_filer).items():
+        split_dates = {(k.decode() if isinstance(k, bytes) else k): json.loads(v)
+                       for k, v in (await raw.hgetall(SPLIT_DATES_KEY) or {}).items()}
+        in_split = split_tickers_in(split_dates, previous_period(period), period)
+        for ticker, row in aggregate_changes(per_filer, split_tickers=in_split).items():
             if not row["flow"]:
                 continue
             marker = f"sentinel:ownership:flow_published:{period}:{ticker}"

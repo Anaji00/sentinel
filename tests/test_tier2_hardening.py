@@ -357,7 +357,9 @@ def test_deployment_profiles_fit_the_memory_budget():
     # Each bound below raised by 2 on 29 Oct 2026 for the factor model's 6G -> 8G:
     # its run restarted silently at 18:43 near the 6G cap, and the rerun passed
     # 5.74 GiB mid-run while the whole stack used 18.9 GiB of the 26 GiB VM.
-    assert ceiling({"agents"}) < WSL_BUDGET_GIB + 6.0, "reasoning mode must stay within a bounded overcommit"
+    # Raised by 2 on 11 Nov 2026 for agents-heavy 1G -> 3G, by decision: with the study reading ten years of history it ran
+    # at 817 MiB of its 1G and was restarted three times by 02:00 UTC on 7 Nov; the 3G is a ceiling for that one read.
+    assert ceiling({"agents"}) < WSL_BUDGET_GIB + 8.0, "reasoning mode must stay within a bounded overcommit"
 
     # Collectors and agents together previously exceeded the budget, and this
     # asserted the incompatibility to keep it deliberate. Ceilings were then
@@ -365,12 +367,12 @@ def test_deployment_profiles_fit_the_memory_budget():
     # 143MiB of 2G, agents-heavy 705MiB of 2.5G -- and every mode now fits.
     # The full stack (collectors and agents, which is how it runs) used 17.7 GiB
     # on 28 Oct 2026 against limits that now sum past the VM; the same bounded
-    # overcommit as above, sized to the full stack's limits.
-    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB + 9.0, (
+    # overcommit as above, sized to the full stack's limits (raised by 2 on 11 Nov 2026 with agents-heavy, see above).
+    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB + 11.0, (
         "collectors and agents must co-exist"
     )
     # Observability adds its own ceilings on top (not running on 28 Oct 2026).
-    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB + 10.0, (
+    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB + 12.0, (      # +2 on 11 Nov 2026, as above
         "the full stack including observability must fit"
     )
 

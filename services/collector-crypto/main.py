@@ -154,7 +154,7 @@ async def stream_coinbase_market_data(producer: SentinelProducer):
                             await producer.send(Topics.RAW_CRYPTO, raw_event.model_dump(), key=symbol)
                             _collector_metrics("collector-crypto").ingested()
         except Exception as e:
-            logger.error(f"Error handling Coinbase WS message: {e}")
+            swallowed("collector_crypto.coinbase_ws_message", e, logger)
 
     async def candle_emitter():
         while True:
@@ -176,7 +176,7 @@ async def stream_coinbase_market_data(producer: SentinelProducer):
                         _collector_metrics("collector-crypto").ingested()
                         candles[sym] = {"o": None, "h": 0, "l": float('inf'), "c": 0, "v": 0}
             except Exception as err:
-                logger.error(f"Coinbase candle emitter error: {err}")
+                swallowed("collector_crypto.coinbase_candle_emitter", err, logger)
 
     client = ResilientWebSocketClient(
         url=COINBASE_WS_URL,
@@ -227,7 +227,7 @@ async def stream_binance_liquidations(producer: SentinelProducer):
             await producer.send(Topics.RAW_CRYPTO, event.model_dump(), key=symbol)
             _collector_metrics("collector-crypto").ingested()
         except Exception as e:
-            logger.error(f"Error handling Binance Liquidation WS message: {e}")
+            swallowed("collector_crypto.binance_liquidation_message", e, logger)
 
     client = ResilientWebSocketClient(
         url=url,
@@ -362,7 +362,7 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
                     )
 
         except Exception as e:
-            logger.error(f"Error handling Binance markPrice WS message: {e}")
+            swallowed("collector_crypto.binance_markprice_message", e, logger)
 
     client = ResilientWebSocketClient(
         url=url,
@@ -548,7 +548,7 @@ async def poll_okx_perpetuals(producer: SentinelProducer, redis_client):
                         emitted, len(top), top[0].get("instId"),
                     )
             except Exception as e:
-                logger.error("OKX perpetual poller error: %s", e)
+                swallowed("collector_crypto.okx_perp_poller", e, logger)
 
             await asyncio.sleep(OKX_POLL_INTERVAL_SEC)
 

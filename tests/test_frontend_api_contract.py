@@ -47,7 +47,12 @@ def _tsx_files():
 def _gateway_paths() -> set[str]:
     """Every path the gateway actually serves, from the app's own router."""
     from services.api_gateway.routes.main import app
-    return {r.path for r in app.routes if getattr(r, "path", None)}
+    # FastAPI 0.16x wraps every included router in an `_IncludedRouter` that has no `.path`, so reading
+    # `app.routes` alone sees only the handful of routes declared on the app itself and reports every
+    # panel's endpoint as missing. The OpenAPI document lists every served path whatever the nesting.
+    served = {r.path for r in app.routes if getattr(r, "path", None)}
+    served.update(app.openapi().get("paths", {}))
+    return served
 
 
 # ── 1. Every URL the frontend fetches must exist ────────────────────────────

@@ -1,5 +1,6 @@
 """A name match has to say something, and the list behind it has to be right and stay loaded."""
 import asyncio
+import pathlib
 import json
 
 import pytest
@@ -201,3 +202,17 @@ def test_an_imo_is_not_read_as_a_country() -> None:
 
 def strength_of(name: str, mmsi: str = "", imo: str = "") -> str:
     return sn.sanctions_strength(sn.check_sanctions(name, mmsi, imo=imo))
+
+
+def test_a_close_spelling_is_a_lead_and_does_not_raise_the_tier_but_an_identifier_does() -> None:
+    """Hardening phase 3: a fuzzy name match alone must not set sanctioned_ofac (the flag that raises the tier)."""
+    flags = sn.check_sanctions("akademik cherskij", "")                       # one letter off a listed name
+    if any(f.startswith("sanctioned_fuzzy") for f in flags):
+        assert "sanctioned_ofac" not in flags and sn.sanctions_strength(flags) == "similar"
+    # The same near-spelling with a confirmed IMO does flag, as an identified listing.
+    sn.set_vessel_index({"mmsi": {}, "imo": {"9999999": "AKADEMIK CHERSKIY"}, "names": set()})
+    flags = sn.check_sanctions("akademik cherskij", "", "9999999")
+    assert "sanctioned_ofac" in flags and sn.sanctions_strength(flags) == "identified"
+    src = (pathlib.Path(__file__).resolve().parents[1] / "shared/utils/sanctions.py").read_text(encoding="utf-8")
+    fuzzy = src.split("if best_kw is not None and best_score >= FUZZY_MATCH_THRESHOLD:")[1].split("prefix =")[0]
+    assert "sanctioned_ofac" not in fuzzy.replace("sanctioned_ofac, the flag", "")

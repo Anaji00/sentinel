@@ -25,9 +25,12 @@ import re
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from shared.utils import gex as gx
+
 OCC = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
 TARGET_DAYS = 30
 MIN_DAYS = 7
+GEX_MAX_DAYS = 45             # most of a chain's gamma sits in the next few expiries
 
 
 def _f(x: Any) -> Optional[float]:
@@ -71,12 +74,18 @@ def summarize(chain: Mapping[str, Any], as_of: date) -> Optional[Dict[str, Any]]
         return None
     cv = pv = coi = poi = 0.0
     by_exp: Dict[date, List[Tuple[str, Mapping[str, Any]]]] = {}
+    gex_rows: List[Tuple[str, float, float, Optional[float], Optional[float]]] = []   # right, strike, oi, iv, years
+    gamma_rows: List[Tuple[str, float, Optional[float]]] = []
     for o in options:
         parsed = parse_contract(o.get("option"))
         if parsed is None:
             continue
         expiry, right, _strike = parsed
         vol, oi = _f(o.get("volume")) or 0.0, _f(o.get("open_interest")) or 0.0
+        days = (expiry - as_of).days
+        if 0 < days <= GEX_MAX_DAYS:
+            gamma_rows.append((right, oi, _f(o.get("gamma"))))
+            gex_rows.append((right, _strike, oi, _f(o.get("iv")), days / 365.0))
         if right == "C":
             cv, coi = cv + vol, coi + oi
         else:
@@ -97,8 +106,13 @@ def summarize(chain: Mapping[str, Any], as_of: date) -> Optional[Dict[str, Any]]
         if c25 is not None and p25 is not None:
             skew = p25 - c25
     iv30 = _f((data or {}).get("iv30"))
+    spot = _f((data or {}).get("current_price"))
+    net = gx.net_gex(spot or 0.0, gamma_rows)
+    flip = gx.gamma_flip(spot, gex_rows) if net is not None and spot else None
     return {
         "day": as_of,
+        "net_gex": round(net) if net is not None else None,
+        "gamma_flip": round(flip, 2) if flip is not None else None,
         "call_volume": cv, "put_volume": pv, "call_oi": coi, "put_oi": poi,
         "pcr_volume": round(pv / cv, 4) if cv > 0 else None,
         "pcr_oi": round(poi / coi, 4) if coi > 0 else None,
