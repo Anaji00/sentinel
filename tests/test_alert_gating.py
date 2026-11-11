@@ -93,3 +93,10 @@ def test_a_granger_edge_is_retested_as_granger_not_as_a_correlation() -> None:
     assert p_ab < 0.01 and f_ab > f_ba
     r, p = retest_statistic("pearson", list(a), list(b))
     assert r is not None and p is not None
+
+def test_the_semantic_producer_passes_the_grade_cap_and_its_name_matches_the_rule() -> None:
+    src = (ROOT / "services/correlation/main.py").read_text(encoding="utf-8")
+    i = src.index('rule_id="SEMANTIC_001"')
+    assert 'rule_name="Cross-Domain Semantic Convergence"' in src[i:i + 200]
+    cap = src.index('"Cross-Domain Semantic Convergence", tier,')
+    assert cap < i and "_tier_after_grades(" in src[cap - 120:cap]

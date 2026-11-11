@@ -3003,6 +3003,10 @@ async def main():
                         and semantic_domain_count > 1
                         else AlertTier.ALERT
                     )
+                    # Graded uninformative: capped like every other producer (the one path that skipped it).
+                    tier = _tier_after_grades(
+                        "Cross-Domain Semantic Convergence", tier,
+                        await _retired_rules(getattr(store, "_redis", None)))
 
                     # The busiest publisher in the file, scored the same way as
                     # every other one.
