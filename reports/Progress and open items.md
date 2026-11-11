@@ -1,72 +1,79 @@
-# Progress and open items (7 November 2026)
+# Progress and open items (updated 11 November 2026)
 
-Saved mid-session. Nothing is committed. The same list is on the Sentinel State artifact.
+Nothing is committed. Status is as of the evening of 11 Nov. Done = built or run and checked; Dated = waits for a date or sample, nothing to build; Decision = needs your call; Open = can be worked now.
 
-## Running now
+## Decisions taken 11 Nov and built (all five deployed 14:50 UTC)
 
-| Item | Where | Next |
-|---|---|---|
-| G1 follow-up: add insider_cluster to the study's deep history | session g1-headline-history, signal_engine.py | Without it the 14,215 rebuilt clusters are not read; then the 6-hourly study measures buy-side cluster cells |
-| Write up the G5 stability result | pass finished: daily-horizon cells stable, the G4 survivors cannot be rated (too few units per half-year) | G5 session to append its note to the scope report; explain the stored-vs-rerun mismatch for negative news 1d (799 vs 247 units) |
-| Background watcher for the model run | this session | It dies with the session: if no note arrives, use the resume commands on the page |
+G4 gate (5 cells live, the rest shadow), factor-engine heartbeat and stale watchdog, hosted wargamer under its own producer id (150 a day), P1 session and 5-session rule in the live divergence watch, alert weights fixed at rebuilds with a hard-veto exception. Details and tests: `reports/Hardening audit - twelve-layer brief.md`.
 
-## Waiting on a trigger or a date
+Closed afterwards (11 Nov, 16:30 UTC, deployed): the generic energy- and fuel-named rules (6 removed; "energy" and "fuel" added to the theme guard and the exposure gate, 36 stored rules, none failing); the 13F history path now skips a ticker and quarter the live path already archived; the insider-cluster rate gap (live is 2.9 a day in November against about 3 a day in the rebuilt history, October was the low month); Gemini quotas (no 429 logged, 2 to 9 calls a day against 250 to 500, so no widening); and a hosted-LLM accounting bug found on the way (unused tokens were given back to the minute the call returned in, leaving minute buckets of -1,193 to -6,080; now given back to the minute reserved).
 
-| Item | Where | Next |
-|---|---|---|
-| Check the insert rate gap: 14,215 rebuilt insider clusters against the live agent | inserted 7 Nov; rebuilt about 3 a day, live about 1 a day since 5 Oct | Find whether the live agent misses filings or the rebuild includes filers it drops; remove with DELETE FROM signal_event_archive WHERE source = 'insider_cluster_g3_history' |
-| Apply the deeper study (G1 headlines and insider clusters, G2 EDGAR to 2016) | code in signal_engine.py; all EDGAR history is loaded; not live | Set SIGNAL_STUDY_HISTORY_DAYS=3995, then recreate agents-heavy. Its limit is 1 GiB and it ran at 817 MiB: raise the limit first. The first run replaces the stored study, so proven cells may change |
-| RB1: plain momentum-minus-volatility rule against B1 | registered in MODEL_TRIALS.md, not run; the model run has ended so CPU is free | Needs a script on the 6 GB panel (own container); within 0.15 Sharpe of B1 means the model has not beaten a rule |
-| Option flow at 150 seconds against 60 | scripts/options_poll_compare.py | After the 11 Nov close |
-| B1 rebuild with fills recorded | paper account | About 30 Nov: traded dollars against $171k, cost against the 10 bps assumed |
-| Model-switch margin follow-up | registered test | After 30 nights under the margin |
-| Nightly lab and model-switch watch | 7 Nov run done: lgbm_rank kept, margin 0.1 live, lab on simple returns | Read the next nights; return-theme neutrality stays adopted (1.32 against 1.03) |
-| Short leg on real borrow data | borrow file collected since 9 Oct | From January 2027, about three months |
-| Grade forecasting agents against chance | track record has the chance rate | Needs 20 independent periods; today every horizon reads too few |
-| LLM ablation: with and without LLM features | forward only, headline scoring since 29 Oct | About six months, after the model's cutoff |
-| Cells waiting for sample length | insider_cluster, options, guidance, news fade | 30-day cells need about 19 months; 5-day cells about 100 days |
+Also closed 11 Nov (afternoon): RB1 (the plain rule scores -0.28 against B1's 0.40 over eight calendars: B1 leads by 0.68, the model earns its place; MODEL_TRIALS.md); G3 fix 1 (a family younger than the horizon now says "too young") and fix 7 (`radar_no_ais` retired); the IRM brief wording (the brief now states the bar of the rule that fired).
 
-## Needs your decision
+Also closed 11 Nov (evening): G3 fixes 4 to 6. Names Alpaca does not list (delisted, foreign OTC, placeholders, warrants) are now counted `instruments_untradeable` in the study instead of as a gap; the study writes a second, daily-only list of up to 1,500 names (`sentinel:signals:needs_daily`) that the collector backfills without minute bars, against 300 before; delisted history was already done by the collector's `_delisted_backfill` (done-flag set). The unreachable-entry-points guard allowance is 4 (the G2 one-off backfill is a documented operator tool); two gateway route tests read the OpenAPI paths, as FastAPI now wraps included routers.
 
-| Item | Where | Next |
-|---|---|---|
-| Raise reaction-study signals only where they survive G4 | 5 of 16 proven cells survive on liquid, borrowable names; 8 fail (negative news, 1d and 5d delisting and dilution, auditor changes) | Gate the live signal engine by liquidity and borrowability; changes which signals the idea layer sees |
-| Heartbeat for the factor engine | it ran silent for 54 minutes on 6 Nov | Adds monitoring to the process that runs the trader |
-| Apply alert-based weights only at rebuilds | drift trades were about 30% of the book on 30 Oct | Changes sizing, so it needs approval |
-| Trade timing and passive-first orders | needs real fills first | Later |
-| More LLM providers | Mistral free tier (needs a key); OpenRouter (one-off $10 for 1,000 a day); OpenAI has no free tier | Your call on keys and spend |
-| Commit the work | a large uncommitted tree, nothing committed this session | Say when |
+Still open (nothing buildable remains): the unknown GMAB order and today's fills (recorded after 21:05 UTC); the dated items; your decisions on trade timing, more LLM providers and the commit. Superseded: G3 fixes 4 to 6 (lift the 300-name needs-bars cap and add ETFs; mark untradeable names; delisted history; 0 verdict changes, they load the free price API); daily closes in the tradfi view; bar-less instruments gap; the unknown GMAB order (resolves after the close); fills after 21:05 UTC; the remaining dated items; decisions on trade timing, more LLM providers and the commit.
 
-## Proposed, not started
+Left from them: watch the first veto, the first hosted wargame and tomorrow's weight freeze; the 5-session horizon fires 20 to 30 a day on 1,000 names while dispersion is high.
 
-| Item | Where | Next |
-|---|---|---|
-| Buy-signal program (reports/Buy signals.md) | nothing on the buy side is proven; opportunistic insider buys and positive earnings run the wrong way | Order: insider clusters (now), activist 13D (after G2), opening call buys (about Feb 2027), buyback authorizations (needs an 8-K parser), contract awards (last) |
-| Average gbm and lgbm_rank instead of choosing | needs its own pre-registered trial | After the margin test |
-| Borrow fees for the surviving shorts | G4 uses an easy-to-borrow flag and a 10 bps cost; delisting and dilution shorts usually cost far more | Test with the borrow file once enough history exists |
-| Fails-to-deliver exclusion and N-PORT signal | data loaded; rule to be registered first | Adds trials |
-| G6: one ledger for rules, models and agent calls | MODEL_TRIALS.md | Extend with trial counts across everything |
-| G3 fixes 1 and 4 to 7 | relabel 'too young', lift the 300-name bars cap, mark untradeable names, delisted history, retire radar_no_ais | See reports/Unmeasurable signals.md |
-| Audit the other layers | collection lag by source; enrichment tags checked by two models; alert families against matched no-alert days | Rules first, as with the connection tests |
-| Connection strategies left | pairs found by several methods; partial-correlation graph; intraday lead-lag (C5) | Each with its test first |
-| Widen the new Gemini quotas | started low (250 a day) because Google does not show limits | From logged 429 messages |
-| Customer links: stronger name matching | two alias collisions removed by name only; OTC lines have no prices | Name must resemble the ticker's company |
+## Done since 7 Nov (closed)
 
-## Known problems not solved
+| Item | Result |
+|---|---|
+| G1 follow-up: insider_cluster in the deep history | In `DEEP_HISTORY_TYPES`; the deeper study read 464,802 episodes |
+| G5 write-up | In reports/Event backtest scope.md |
+| Apply the deeper study (G1, G2 to 2016) | `SIGNAL_STUDY_HISTORY_DAYS=3995` live; 18 proven cells |
+| agents-heavy memory | Limit raised from 1 GiB to 3 GiB |
+| Customer links: stronger name matching | Name gate in `customer_links.py`; 44 rows and 14 edges removed |
+| G3 fix 2 (insider cluster history) and ticker hygiene | `insider_clusters.py`, `ticker_hygiene.py`, backfill script |
+| Heavy alert noise (Yield/Oil rules, repeats, wrong peers) | 17 rules removed; theme guard; per-session dedup; macro exposure gate; peer-alert cooldown |
+| 13F split contamination; 25 duplicate flow rows | Fixed live, in history and in the archive |
+| Hosted-LLM fallbacks and quotas | Chains, limits, cooldowns live |
+| Divergence detector, situation stages, brief | Built (reports/Divergence alert.md, reports/Hardening audit - twelve-layer brief.md) |
 
-| Item | Where | Next |
-|---|---|---|
-| Daily closes in the tradfi view | 13% of liquid and 18% of other stock-days are off the SIP close by more than 0.2% (the tile said 8% on 29 Oct) | The model and the study read daily_bars and are unaffected; fix or retire the view for closes |
-| agents-heavy memory | restarted three times by 02:00 UTC on 7 Nov during heavy reads; limit 1 GiB | Raise the limit or move the study before G1 and G2 deepen it |
-| Bar-less instruments: 1,937 stored against 3,146 re-counted | gap unexplained | Re-check after the next study run |
-| B1 for real capital | no model passes the 0.95 gate; best estimate Sharpe about 0.40; short leg unmeasured with real borrow | Gate, measured borrow and 24 months forward record |
-| Frontend test failing | tests/test_frontend_entity_spacing.py (frontend session's FollowTheMoney.tsx) | Frontend session |
-| Model run time | 8 hours when other jobs compete for CPU, 4.5 when they do not | Keep side jobs off the 22:00 to 06:00 window |
+## Dated (nothing to build; waits for a date or sample)
 
-## What changed in the code and data this week
+| Item | When |
+|---|---|
+| Option flow at 150 seconds against 60 | Judge after the 11 Nov close, with `scripts/options_poll_compare.py` |
+| B1 rebuild with fills recorded | About 30 Nov |
+| Model-switch margin follow-up | After 30 nights under the margin |
+| Nightly lab and model-switch watch | Read each morning |
+| Short leg on real borrow data | From January 2027 |
+| Grade forecasting agents against chance | Needs 20 independent periods |
+| LLM ablation | About six months |
+| Cells waiting for sample length | 5-day cells about 100 days, 30-day cells about 19 months |
+| Borrow fees for the surviving shorts; fails-to-deliver exclusion and N-PORT signal | Need borrow history and a registered rule |
+| GEX sign test; days-to-cover test on the short cells | After 60 sessions of GEX history; days-to-cover is registered and can run any time |
+| Factor-model recreate (champion gate) | After the 14:43 UTC trader run; a watcher is running |
+| B1 for real capital | Gate, measured borrow and 24 months of forward record |
 
-- Backtest books and the portfolio lab are scored on simple returns; model-switch margin 0.10; order status and fill recording; chance rate in the track record.
-- Hosted LLM layer: fallback chains for scenarios, a wider small-model route (Groq gpt-oss-20b, qwen3.8-27b; Gemini 3.5 and 3.1 flash-lite; safeguard-20b). Reasoning service is live; factor-model loads it on recreate.
-- Customer links: name gate in `shared/utils/customer_links.py`; 44 bad rows and 14 graph edges removed (rows saved in the scratchpad).
-- Audits: `reports/Intelligence audit.md` (connections C1 to C4, precision), `reports/Event backtest scope.md` (G1 to G6), `reports/Unmeasurable signals.md`, `reports/Free LLM providers.md`.
-- Scripts: `scripts/audit_connections.py`, `scripts/audit_tradable_signals.py`; sessions G1 to G5 are adding `scripts/audit_unmeasurable.py` and `scripts/audit_signal_stability.py`.
+## Decision (yours)
+
+| Item | Note |
+|---|---|
+| Gate the live signal engine to liquid, borrowable names (G4: 5 of 16 proven cells survive) | Changes which signals the idea layer sees |
+| Heartbeat for the factor engine | Adds monitoring to the trader's process |
+| Apply alert-based weights only at rebuilds | Changes sizing: approval needed |
+| Trade timing and passive-first orders | Needs real fills first |
+| More LLM providers (Mistral key; OpenRouter $10 one-off) | Keys and spend |
+| Route the wargamer or researcher to a hosted model | Resets that producer's grading series; needs a daily cap |
+| Move the P1 session and 5-session rule into the live divergence watch | Passes its rate test; changes a deployed detector |
+| Commit the work | Large uncommitted tree |
+
+## Open (can be worked now)
+
+| Item | Next |
+|---|---|
+| RB1: momentum-minus-volatility rule against B1 | Registered in MODEL_TRIALS.md, not run; needs a script on the 6 GB panel in its own container, outside 22:00 to 06:00 UTC |
+| Insert rate gap: 14,215 rebuilt insider clusters against about 1 a day live | Find whether the live agent misses filings or the rebuild includes filers it drops |
+| Widen the Gemini quotas | From logged 429 messages |
+| G3 fixes 1 and 4 to 7 | Relabel 'too young', lift the 300-name bars cap, mark untradeable names, delisted history, retire radar_no_ais |
+| Daily closes in the tradfi view | 13% and 18% of stock-days off the SIP close; model and study read daily_bars and are unaffected |
+| Bar-less instruments: 1,937 stored against 3,146 re-counted | Re-check after the next study run |
+| Retire the generic energy-named rules ("Macro Energy Price Headline ...", three copies) | Not covered by the theme list |
+| History path should skip a quarter the live path already published | Stops 13F duplicates recurring |
+| Audit the other layers; remaining connection strategies; G6 single ledger | Rules first, tests first |
+| Buy-signal program; average gbm and lgbm_rank | Each needs its own pre-registered trial |
+| Frontend: render situation and brief; failing tests `test_frontend_entity_spacing`, `test_frontend_api_contract` | Handed to the frontend session on 11 Nov |
+| Intraday 15-minute and 1-hour scanning | Dropped by the P2 test; do not build without a new registration |
