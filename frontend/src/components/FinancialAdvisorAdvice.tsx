@@ -266,7 +266,7 @@ export default function FinancialAdvisorAdvice() {
     >
       {/* Execution Toast Notification */}
       {toastMessage && (
-        <div className="absolute top-12 left-3 right-3 z-30 bg-positive/10 border border-positive/30 p-3 rounded-xl text-positive text-xs shadow-panel flex items-center justify-between animate-pulse">
+        <div className="absolute top-12 left-3 right-3 z-30 bg-positive/10 border border-positive/30 p-3 rounded-md text-positive text-xs shadow-panel flex items-center justify-between animate-pulse">
           <div className="flex items-center gap-2">
             <span className="text-positive font-bold text-sm">
               <IconCheck className="inline-block shrink-0" />
@@ -285,7 +285,7 @@ export default function FinancialAdvisorAdvice() {
 
       <div className="p-3.5 space-y-3 flex-1 overflow-y-auto text-xs">
         {/* Portfolio Risk Telemetry HUD */}
-        <div className="grid grid-cols-4 gap-2 bg-inset p-2.5 rounded-xl border border-line text-micro">
+        <div className="grid grid-cols-4 gap-2 bg-inset p-2.5 rounded-md border border-line text-micro">
           <div className="p-1.5 rounded bg-page/80 border border-line space-y-1">
             <div className="flex items-center justify-between">
               <span
@@ -392,7 +392,7 @@ export default function FinancialAdvisorAdvice() {
         </div>
 
         {/* Black-Litterman Portfolio Target Weight Bar */}
-        <div className="p-2.5 rounded-xl bg-page border border-line space-y-1.5 text-micro">
+        <div className="p-2.5 rounded-md bg-page border border-line space-y-1.5 text-micro">
           <div className="flex items-center justify-between text-ink-dim">
             <span className="font-semibold text-ink text-xs">Black-Litterman target weights</span>
             <span className="text-accent font-bold">Suggested allocation</span>
@@ -438,7 +438,7 @@ export default function FinancialAdvisorAdvice() {
         </div>
 
         {/* Hedging Strategy Briefing */}
-        <div className="p-2.5 rounded-xl bg-inset border border-line text-xs space-y-1">
+        <div className="p-2.5 rounded-md bg-inset border border-line text-xs space-y-1">
           <div className="flex items-center justify-between text-accent font-bold text-micro">
             <span className="flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping" />
@@ -498,7 +498,7 @@ export default function FinancialAdvisorAdvice() {
               <div
                 key={idx}
                 onClick={() => setSelectedPlay(p)}
-                className="p-3 rounded-xl bg-page border border-line hover:border-line-accent hover:bg-raised/80 cursor-pointer transition-all space-y-2 group shadow-md"
+                className="p-3 rounded-md bg-page border border-line hover:border-line-accent hover:bg-raised/80 cursor-pointer transition-all space-y-2 group shadow-md"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -610,7 +610,7 @@ export default function FinancialAdvisorAdvice() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-line-accent rounded-2xl max-w-xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto"
+            className="bg-raised border border-line-accent rounded-md max-w-xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto"
             {...dialog.panelProps}
           >
             {/* Modal Header */}
@@ -639,7 +639,7 @@ export default function FinancialAdvisorAdvice() {
             </div>
 
             {/* Position Size Calculator Inputs */}
-            <div className="p-3 bg-page rounded-xl border border-line space-y-2">
+            <div className="p-3 bg-page rounded-md border border-line space-y-2">
               <div className="flex items-center justify-between gap-3 text-micro">
                 <span className="flex min-w-0 flex-col">
                   <span className="text-ink-dim">Capital to size against</span>
@@ -704,7 +704,7 @@ export default function FinancialAdvisorAdvice() {
             </div>
 
             {/* Moving Average Distance Breakdown Grid */}
-            <div className="p-3 bg-page border border-line rounded-xl space-y-2 text-micro">
+            <div className="p-3 bg-page border border-line rounded-md space-y-2 text-micro">
               <div className="flex items-center justify-between">
                 <span className="text-accent font-bold">
                   Distance from moving averages
@@ -749,7 +749,7 @@ export default function FinancialAdvisorAdvice() {
 
             {/* GARCH Volatility Cone Tranche Exits */}
             {selectedPlay.volatility_cone && (
-              <div className="p-3 bg-page rounded-xl border border-caution/30 space-y-1.5 text-micro">
+              <div className="p-3 bg-page rounded-md border border-caution/30 space-y-1.5 text-micro">
                 <div className="flex items-center justify-between text-caution font-bold">
                   <span>GARCH(1,1) VOLATILITY CONE TRANCHE EXITS</span>
                   <span>
@@ -789,7 +789,7 @@ export default function FinancialAdvisorAdvice() {
             )}
 
             {/* Trade Levels & Risk Metrics */}
-            <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line text-micro">
+            <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-md border border-line text-micro">
               <div>
                 <span className="text-ink-dim">Entry price:</span>{' '}
                 <span className="text-ink font-bold">${selectedPlay.entry_level}</span>
@@ -813,7 +813,7 @@ export default function FinancialAdvisorAdvice() {
             {/* Rationale */}
             <div className="space-y-1">
               <span className="text-ink-dim block text-micro">Why the model suggests it:</span>
-              <p className="text-ink font-sans text-micro leading-relaxed bg-page p-3 rounded-xl border border-line">
+              <p className="text-ink font-sans text-micro leading-relaxed bg-page p-3 rounded-md border border-line">
                 {selectedPlay.quantitative_rationale}
               </p>
             </div>
@@ -823,7 +823,7 @@ export default function FinancialAdvisorAdvice() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => handleExecuteOrder(selectedPlay)}
-                  className="flex-1 py-3 rounded-xl bg-positive text-page font-extrabold text-xs hover:brightness-110 transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2"
+                  className="flex-1 py-3 rounded-md bg-positive text-page font-extrabold text-xs hover:brightness-110 transition-colors cursor-pointer flex items-center justify-center gap-2"
                 >
                   <span>
                     <IconSignal className="inline-block shrink-0" />
@@ -832,7 +832,7 @@ export default function FinancialAdvisorAdvice() {
                 </button>
                 <button
                   onClick={() => setSelectedPlay(null)}
-                  className="py-3 px-4 rounded-xl bg-raised text-ink-dim border border-line-strong text-xs font-bold hover:bg-overlay cursor-pointer"
+                  className="py-3 px-4 rounded-md bg-raised text-ink-dim border border-line-strong text-xs font-bold hover:bg-overlay cursor-pointer"
                 >
                   CANCEL
                 </button>
@@ -840,7 +840,7 @@ export default function FinancialAdvisorAdvice() {
 
               <button
                 onClick={() => setExplainingSignal(selectedPlay.ticker)}
-                className="w-full py-2 rounded-xl bg-accent-dim border border-line-accent text-accent text-xs font-bold hover:bg-accent-dim transition-colors cursor-pointer flex items-center justify-center gap-2"
+                className="w-full py-2 rounded-md bg-accent-dim border border-line-accent text-accent text-xs font-bold hover:bg-accent-dim transition-colors cursor-pointer flex items-center justify-center gap-2"
               >
                 <span>
                   <IconTarget className="inline-block shrink-0" />

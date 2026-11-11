@@ -131,7 +131,7 @@ export default function LoginPage() {
       <div className="relative w-full max-w-md bg-raised/90 border border-accent/40 rounded-3xl p-8 z-10 space-y-6">
         {/* Brand Header */}
         <div className="text-center space-y-2">
-          <div className="inline-flex h-14 w-14 rounded-2xl bg-accent-dim border border-accent/60 items-center justify-center mb-2">
+          <div className="inline-flex h-14 w-14 rounded-md bg-accent-dim border border-accent/60 items-center justify-center mb-2">
             <span className="text-accent font-black text-2xl tracking-tighter drop-">S</span>
           </div>
           <h1 className="text-xl font-semibold text-ink">Welcome back to Sentinel</h1>
@@ -169,7 +169,7 @@ export default function LoginPage() {
           {notice && !errorMsg && (
             <div
               role="status"
-              className="rounded-xl border border-line-strong bg-raised p-3 text-micro text-ink-dim"
+              className="rounded-md border border-line-strong bg-raised p-3 text-micro text-ink-dim"
             >
               {notice}
             </div>
@@ -178,7 +178,7 @@ export default function LoginPage() {
           {errorMsg && (
             <div
               role="alert"
-              className="rounded-xl border border-negative/40 bg-negative/10 p-3 text-micro font-medium text-negative"
+              className="rounded-md border border-negative/40 bg-negative/10 p-3 text-micro font-medium text-negative"
             >
               {errorMsg}
             </div>
@@ -188,7 +188,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={isLoading || isSuccess}
-            className="w-full py-3.5 mt-2 rounded-xl bg-accent hover:brightness-110 text-page font-semibold text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+            className="w-full py-3.5 mt-2 rounded-md bg-accent hover:brightness-110 text-page font-semibold text-sm transition-all disabled:opacity-50 flex items-center justify-center gap-2"
           >
             {isLoading ? (
               <span className="flex items-center gap-2">
@@ -218,7 +218,7 @@ export default function LoginPage() {
               type="button"
               onClick={startSso}
               disabled={ssoBusy || isLoading || isSuccess}
-              className="w-full py-3 rounded-xl border border-line-strong hover:border-line-accent text-ink font-medium text-sm transition-all disabled:opacity-50"
+              className="w-full py-3 rounded-md border border-line-strong hover:border-line-accent text-ink font-medium text-sm transition-all disabled:opacity-50"
             >
               {ssoBusy ? 'Redirecting…' : sso.label}
             </button>

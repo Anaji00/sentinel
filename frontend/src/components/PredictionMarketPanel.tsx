@@ -154,7 +154,7 @@ export default function PredictionMarketPanel() {
                 <div
                   key={e.event_id || i}
                   onClick={() => setSelectedEvent(e)}
-                  className="p-3 bg-raised/70 rounded-xl border border-line hover:border-line-accent transition-all cursor-pointer hover:bg-raised/95 shadow-panel"
+                  className="p-3 bg-raised/70 rounded-md border border-line hover:border-line-accent transition-all cursor-pointer hover:bg-raised/95 shadow-panel"
                 >
                   <div className="flex justify-between items-center mb-1.5">
                     <div className="flex items-center gap-2">
@@ -200,7 +200,7 @@ export default function PredictionMarketPanel() {
           ) : failedWithout(predError, predEvents) ? (
             <PanelError what="prediction markets" onRetry={() => void retryPred()} />
           ) : (
-            <div className="p-8 text-center border border-dashed border-line rounded-xl text-ink-dim text-xs">
+            <div className="p-8 text-center border border-dashed border-line rounded-md text-ink-dim text-xs">
               No matching prediction market contracts found.
             </div>
           )}
@@ -214,7 +214,7 @@ export default function PredictionMarketPanel() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-line-accent rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
+            className="bg-raised border border-line-accent rounded-md max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-3">
@@ -244,7 +244,7 @@ export default function PredictionMarketPanel() {
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line">
+              <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-md border border-line">
                 <div>
                   <span className="text-ink-dim">Event ID:</span>{' '}
                   <span className="text-accent font-bold block truncate">
@@ -270,7 +270,7 @@ export default function PredictionMarketPanel() {
               </div>
 
               {selectedEvent.prediction_market_data && (
-                <div className="p-3 bg-page rounded-xl border border-line space-y-2">
+                <div className="p-3 bg-page rounded-md border border-line space-y-2">
                   <span className="text-accent font-bold block text-micro">
                     Odds and volume
                   </span>
@@ -316,7 +316,7 @@ export default function PredictionMarketPanel() {
 
             <button
               onClick={() => setSelectedEvent(null)}
-              className="w-full py-2 bg-raised text-accent border border-line-accent rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
+              className="w-full py-2 bg-raised text-accent border border-line-accent rounded-md text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
             >
               DISMISS
             </button>

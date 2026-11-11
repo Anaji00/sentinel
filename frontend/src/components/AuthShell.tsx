@@ -24,7 +24,7 @@ export default function AuthShell({
 
       <div className="relative w-full max-w-md bg-raised/90 border border-accent/40 rounded-3xl p-8 z-10 space-y-6">
         <div className="text-center space-y-2">
-          <div className="inline-flex h-14 w-14 rounded-2xl bg-accent-dim border border-accent/60 items-center justify-center mb-2">
+          <div className="inline-flex h-14 w-14 rounded-md bg-accent-dim border border-accent/60 items-center justify-center mb-2">
             <span className="text-accent font-black text-2xl tracking-tighter drop-">S</span>
           </div>
           <h1 className="text-xl font-semibold text-ink">{title}</h1>
@@ -38,9 +38,9 @@ export default function AuthShell({
 
 /** Shared input styling, so the four forms stay visually identical. */
 export const fieldClass =
-  'w-full bg-page/80 border border-line-strong rounded-xl px-4 py-3 text-sm text-ink' +
+  'w-full bg-page/80 border border-line-strong rounded-md px-4 py-3 text-sm text-ink' +
   'placeholder:text-ink-mute focus:border-line-accent focus:outline-none focus:ring-1 focus:ring-accent/40';
 
 export const buttonClass =
-  'w-full py-3 rounded-xl bg-accent text-page text-sm font-semibold' +
+  'w-full py-3 rounded-md bg-accent text-page text-sm font-semibold' +
   ' hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed';

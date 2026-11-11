@@ -11,6 +11,8 @@ import { fetcher } from '../lib/api';
 import { formatNumber } from '../lib/format';
 import { emptyRelated, relatedKey, shortDate, type RelatedStocks as Related } from '../lib/related';
 import { StockLink } from './StockDrawer';
+import { Button } from './ui/Button';
+import { useCompare } from '../lib/useCompare';
 import { POLL } from './ui/DataProvider';
 import { EmptyState } from './ui/EmptyState';
 import { LoadingLines } from './ui/Skeleton';
@@ -19,9 +21,10 @@ const row = 'flex items-baseline justify-between gap-3 text-sm';
 
 export default function RelatedStocks({ ticker }: { ticker: string }) {
   const { data, error, isLoading } = useSWR<Related>(relatedKey(ticker), fetcher, { refreshInterval: POLL.rare });
+  const cmp = useCompare();
 
   return (
-    <section className="space-y-3 rounded-xl border border-line bg-inset p-4">
+    <section className="space-y-3 rounded-md border border-line bg-inset p-4">
       <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">Stocks that move with it</h3>
       {isLoading ? (
         <LoadingLines lines={3} label="Finding related stocks" />
@@ -39,11 +42,13 @@ export default function RelatedStocks({ ticker }: { ticker: string }) {
                     <StockLink ticker={p.ticker} className="font-mono font-semibold text-ink hover:text-accent" />{' '}
                     <span className="text-ink-mute">{p.name !== p.ticker ? p.name : ''}</span>
                   </span>
-                  <span
-                    className="shrink-0 text-right text-micro text-ink-dim"
-                    title={`Correlation ${formatNumber(p.correlation, { decimals: 2 })} over ${p.sessions} trading days`}
-                  >
-                    {p.closeness}
+                  <span className="flex shrink-0 items-center gap-2">
+                    <span className="text-right text-micro text-ink-dim" title={`Correlation ${formatNumber(p.correlation, { decimals: 2 })} over ${p.sessions} trading days`}>
+                      {p.closeness}
+                    </span>
+                    <Button variant="outline" size="sm" pressed={cmp.other === p.ticker} onClick={() => cmp.pin(p.ticker)} title={`Compare ${ticker} with ${p.ticker}`}>
+                      Compare
+                    </Button>
                   </span>
                 </li>
               ))}

@@ -176,7 +176,7 @@ export function ModelPortfolio() {
   const latest = data?.orders.length ? data.orders[0].decided_on : null;
   const latestOrders = (data?.orders ?? []).filter((o) => o.decided_on === latest);
   return (
-    <section className="bg-raised border border-line rounded-xl p-5 space-y-4 text-xs">
+    <section className="bg-raised border border-line rounded-md p-5 space-y-4 text-xs">
       <div className="flex flex-wrap items-baseline gap-x-3">
         <h2 className="font-semibold text-ink text-head">Model portfolio</h2>
         <Updated source="/predictions/model-portfolio" pollMs={60_000} />

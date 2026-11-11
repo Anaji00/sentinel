@@ -157,7 +157,7 @@ export function CommandCenterGrid() {
           )}
 
           {visibleFeeds.movers && (
-            <div className="flex flex-col rounded-xl overflow-hidden min-h-0 h-full w-full transition-all">
+            <div className="flex flex-col rounded-md overflow-hidden min-h-0 h-full w-full transition-all">
               <div className="flex-1 min-h-0 relative">
                 <Suspense fallback={<PanelSkeleton title="Movers Loading..." />}>
                   <MoversBoard />

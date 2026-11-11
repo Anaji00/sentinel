@@ -92,7 +92,7 @@ export default function ChipPrices() {
       </p>
       <div className="grid gap-5 xl:grid-cols-2">
         {data.sections.map((s) => (
-          <section key={s.key} aria-label={s.title} className="space-y-3 rounded-xl border border-line bg-raised p-4">
+          <section key={s.key} aria-label={s.title} className="space-y-3 rounded-md border border-line bg-raised p-4">
             <div>
               <h2 className="text-head font-semibold text-ink">{s.title}</h2>
               <p className="text-xs text-ink-mute">{s.note}</p>

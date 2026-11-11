@@ -174,7 +174,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   if (rows.length === 0) {
     return (
       <div
-        className={`px-3 py-4 text-center text-micro text-ink-mute border border-line rounded-xl bg-page/60 ${className}`}
+        className={`px-3 py-4 text-center text-micro text-ink-mute border border-line rounded-md bg-page/60 ${className}`}
       >
         {emptyLabel}
       </div>
@@ -183,7 +183,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
   return (
     <dl
-      className={`divide-y divide-line/70 border border-line rounded-xl bg-page/60 overflow-hidden ${className}`}
+      className={`divide-y divide-line/70 border border-line rounded-md bg-page/60 overflow-hidden ${className}`}
     >
       {rows.map(({ path, label, value }) => (
         <div key={path} className="flex items-start justify-between gap-3 px-3 py-1.5 text-micro">

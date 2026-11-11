@@ -328,7 +328,7 @@ export default function QuantRadarPanel() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-accent/50 rounded-xl max-w-md w-full p-5 space-y-3 text-xs"
+            className="bg-raised border border-accent/50 rounded-md max-w-md w-full p-5 space-y-3 text-xs"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-2.5">

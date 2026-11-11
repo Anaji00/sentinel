@@ -26,7 +26,7 @@ export default function SourceFacts({ ticker }: { ticker: string }) {
   const groups = React.useMemo(() => groupFacts(data), [data]);
 
   return (
-    <section aria-label={`Facts behind ${ticker}`} className="space-y-2 rounded-xl border border-line p-3">
+    <section aria-label={`Facts behind ${ticker}`} className="space-y-2 rounded-md border border-line p-3">
       <h3 className="stat-label">Facts behind the call</h3>
       {missing ? (
         <p className="text-sm text-ink-mute">

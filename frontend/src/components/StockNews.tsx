@@ -103,7 +103,7 @@ export function StockNews({ ticker }: { ticker?: string }) {
     refreshInterval: POLL.slow,
   });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-3 text-xs">
       <h2 className="text-sm font-semibold text-ink">{ticker ? `News on ${ticker}` : "Today's company news"}</h2>
       <p className="text-ink-dim">
         The latest company news, each headline marked positive, negative or neutral by an AI trained on financial news.

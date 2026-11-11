@@ -91,7 +91,7 @@ export default function IntegrationsPanel() {
             operator should never infer it from the absence of a warning. */}
         {exec && (
           <div
-            className={`p-3 rounded-xl border flex items-start gap-2.5 ${
+            className={`p-3 rounded-md border flex items-start gap-2.5 ${
               exec.is_live_capital ? 'bg-negative/10 border-negative/30' : 'bg-page/70 border-line'
             }`}
           >
@@ -143,7 +143,7 @@ export default function IntegrationsPanel() {
               return (
                 <div
                   key={item.key}
-                  className={`p-2.5 bg-page/70 border rounded-xl space-y-1.5 ${
+                  className={`p-2.5 bg-page/70 border rounded-md space-y-1.5 ${
                     isRequired ? 'border-negative/30' : 'border-caution/30'
                   }`}
                 >

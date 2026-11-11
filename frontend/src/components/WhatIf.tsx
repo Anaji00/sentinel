@@ -56,7 +56,7 @@ export default function WhatIf() {
   };
 
   return (
-    <section aria-label="Ask a what-if" className="space-y-3 rounded-xl border border-line bg-raised p-4">
+    <section aria-label="Ask a what-if" className="space-y-3 rounded-md border border-line bg-raised p-4">
       <div>
         <h2 className="text-head font-semibold text-ink">What if…</h2>
         <p className="text-xs text-ink-mute">

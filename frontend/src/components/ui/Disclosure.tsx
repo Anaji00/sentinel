@@ -43,7 +43,7 @@ export function Disclosure({
   };
 
   return (
-    <details open={open} onToggle={toggle} className={variant === 'row' ? 'rounded-xl border border-line bg-inset' : ''}>
+    <details open={open} onToggle={toggle} className={variant === 'row' ? 'rounded-md border border-line bg-inset' : ''}>
       {variant === 'row' ? (
         <summary className="flex cursor-pointer list-none select-none items-center justify-between gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
           <span className="text-sm font-semibold text-ink">{label}</span>

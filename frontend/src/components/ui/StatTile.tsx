@@ -18,7 +18,7 @@ export function StatTile({
   hint?: string;
 }) {
   return (
-    <div className="rounded-xl border border-line bg-inset px-3.5 py-2.5" title={hint}>
+    <div className="rounded-md border border-line bg-inset px-3.5 py-2.5" title={hint}>
       <div className={`font-mono text-head leading-none ${tone}`}>{value}</div>
       <div className="mt-1 text-micro text-ink-mute">{label}</div>
     </div>
@@ -28,7 +28,7 @@ export function StatTile({
 /** A short explanation in the place a tile would go: what the panel's terms mean. */
 export function NoteTile({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-dashed border-line px-3.5 py-2.5">
+    <div className="rounded-md border border-dashed border-line px-3.5 py-2.5">
       <div className="text-micro font-semibold text-ink-dim">{title}</div>
       <div className="mt-0.5 text-micro leading-snug text-ink-mute">{children}</div>
     </div>

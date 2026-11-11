@@ -151,7 +151,7 @@ function Diagram({ view, onOpen }: { view: EntityView; onOpen: (name: string) =>
   const dense = view.nodes.length > 18;
   return (
     <div className="space-y-2">
-      <svg viewBox={`0 0 ${SIZE} ${SIZE}`} className="w-full max-h-[70vh] rounded-xl border border-line bg-inset" role="group" aria-label={`Connections of ${view.center}`}>
+      <svg viewBox={`0 0 ${SIZE} ${SIZE}`} className="w-full max-h-[70vh] rounded-md border border-line bg-inset" role="group" aria-label={`Connections of ${view.center}`}>
         {view.edges.map((e, i) => {
           const a = pos.get(e.from);
           const b = pos.get(e.to);
@@ -312,7 +312,7 @@ export default function Connections() {
       </div>
 
       {entity && target && (
-        <section aria-label="How they are linked" className="space-y-2 rounded-xl border border-line bg-raised p-4">
+        <section aria-label="How they are linked" className="space-y-2 rounded-md border border-line bg-raised p-4">
           <h2 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">
             {entity} and {target}
           </h2>
@@ -330,7 +330,7 @@ export default function Connections() {
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {groups.map((g) => (
-              <section key={g.type} aria-label={g.type} className="space-y-2 rounded-xl border border-line bg-raised p-4">
+              <section key={g.type} aria-label={g.type} className="space-y-2 rounded-md border border-line bg-raised p-4">
                 <h2 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">Most connected {pluralKind(g.type)}</h2>
                 <ul className="space-y-1">
                   {g.hubs.map((h) => (

@@ -121,7 +121,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
     // A container query, not a window breakpoint: the same header shows full
     // width on /ticker and in the 560px stock drawer.
     <div className="@container">
-    <section className="grid gap-4 rounded-2xl border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1.3fr_1fr_1.2fr]">
+    <section className="grid gap-4 rounded-md border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1.3fr_1fr_1.2fr]">
       <div className="space-y-2 min-w-0">
         <div className="flex items-baseline gap-2">
           <h2 className="font-mono text-lead font-semibold text-ink">{t}</h2>
@@ -232,7 +232,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
             horizonLabel={LABEL[call.horizon]?.split(' (')[0] ?? call.horizon}
           />
         ) : (
-          <div className="flex h-full flex-col justify-center gap-2 rounded-2xl border border-dashed border-line p-4">
+          <div className="flex h-full flex-col justify-center gap-2 rounded-md border border-dashed border-line p-4">
             <p className="text-sm text-ink">Not on today&apos;s calls</p>
             <p className="text-xs text-ink-mute">
               The model only calls the strongest and weakest names in each industry. Everything it

@@ -39,7 +39,7 @@ export function LiveTape() {
       title="Latest price, and the change across the most recent readings"
       // shrink-0: the page is a flex column, and the tape shrank to its own
       // scrollbar (18px) with every price hidden.
-      className="flex shrink-0 items-center gap-6 overflow-x-auto rounded-xl border border-line bg-inset px-4 py-2"
+      className="flex shrink-0 items-center gap-6 overflow-x-auto rounded-md border border-line bg-inset px-4 py-2"
     >
       <span className="flex shrink-0 items-center gap-1.5 text-micro font-semibold uppercase tracking-[0.1em] text-positive">
         <span className="h-1.5 w-1.5 rounded-full bg-positive" aria-hidden />

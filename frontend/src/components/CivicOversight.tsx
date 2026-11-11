@@ -56,7 +56,7 @@ export function CivicOversight({ onOpenPortal }: { onOpenPortal: (slug: string) 
   const share = data.documented_agencies ? (data.covered_agencies / data.documented_agencies) * 100 : null;
   return (
     <div className="space-y-4">
-      <div className="rounded-xl border border-line bg-inset p-4 flex flex-wrap items-end gap-6">
+      <div className="rounded-md border border-line bg-inset p-4 flex flex-wrap items-end gap-6">
         <div>
           <div className="text-3xl font-semibold font-mono text-caution">
             {formatNumber(data.covered_agencies, { decimals: 0 })}

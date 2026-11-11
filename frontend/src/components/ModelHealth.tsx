@@ -87,7 +87,7 @@ export function ModelHealth() {
   const { data: regime } = useSWR<EquityRegime>('/predictions/equity-regime', fetcher, { refreshInterval: POLL.slow });
   const { data: news } = useSWR<NewsModel>('/predictions/news-model', fetcher, { refreshInterval: POLL.slow });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-2 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-2 text-xs">
       <h2 className="text-sm font-semibold text-ink">Is the model still working?</h2>
       <p className="text-ink-dim">
         Each night&apos;s rankings are checked once the holding period has passed: did the stocks it ranked highest

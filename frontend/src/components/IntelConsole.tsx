@@ -28,7 +28,7 @@ export default function IntelConsole() {
   const hours = WINDOW_STEPS[step];
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-4 rounded-2xl border border-line bg-raised px-4 py-3">
+      <div className="flex flex-wrap items-center gap-4 rounded-md border border-line bg-raised px-4 py-3">
         <label htmlFor="intel-window" className="text-sm text-ink-dim">
           Show the last
         </label>
@@ -47,12 +47,12 @@ export default function IntelConsole() {
         <span className="text-xs text-ink-mute">Narrows the map and the feed together.</span>
       </div>
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(360px,1fr)]">
-        <div className="relative h-[70vh] min-h-[520px] overflow-hidden rounded-2xl border border-line bg-page">
+        <div className="relative h-[70vh] min-h-[520px] overflow-hidden rounded-md border border-line bg-page">
           <ErrorBoundary fallbackTitle="The world map could not be drawn">
             <GlobalMap windowHours={hours} />
           </ErrorBoundary>
         </div>
-        <div className="relative h-[70vh] min-h-[520px] overflow-hidden rounded-2xl border border-line bg-raised">
+        <div className="relative h-[70vh] min-h-[520px] overflow-hidden rounded-md border border-line bg-raised">
           <IntelligenceFeed windowHours={hours} />
         </div>
       </div>

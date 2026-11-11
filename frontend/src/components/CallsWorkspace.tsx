@@ -88,7 +88,7 @@ function UnusualList({ selected, onSelect }: { selected: string | null; onSelect
   const { data, error } = useSWR<{ board: BoardRow[] }>('/signals/matrix', fetcher, { refreshInterval: POLL.standard });
   const rows = useMemo(() => rankBoard(data?.board ?? [], tier).slice(0, 40), [data, tier]);
   return (
-    <section aria-label="Unusual activity" className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-line bg-raised">
+    <section aria-label="Unusual activity" className="flex min-h-0 flex-col overflow-hidden rounded-md border border-line bg-raised">
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2.5">
         <div>
           <h2 className="text-sm font-semibold text-ink">Stocks to look at</h2>
@@ -160,7 +160,7 @@ export default function CallsWorkspace() {
       </div>
       <aside
         aria-label="Evidence"
-        className="space-y-3 rounded-2xl border border-line-accent bg-raised p-4 xl:sticky xl:top-0"
+        className="space-y-3 rounded-md border border-line-accent bg-raised p-4 xl:sticky xl:top-0"
       >
         {ticker ? (
           <>

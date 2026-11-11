@@ -74,7 +74,7 @@ export function IdeaCard({
   const o = i.option;
   return (
     <article
-      className={`lift wash group relative flex flex-col gap-3 overflow-hidden rounded-2xl border bg-raised p-4 hover:border-line-accent ${
+      className={`lift wash group relative flex flex-col gap-3 overflow-hidden rounded-md border bg-raised p-4 hover:border-line-accent ${
         long ? 'border-positive/25 text-positive' : 'border-negative/25 text-negative'
       }`}
     >
@@ -146,7 +146,7 @@ export function IdeaCard({
       <ConvictionMeter p={odds} />
 
       {!compact && (
-        <div className="grid grid-cols-3 gap-2 rounded-xl bg-inset px-3 py-2">
+        <div className="grid grid-cols-3 gap-2 rounded-md bg-inset px-3 py-2">
           <Stat
             label="Suggested size"
             value={
@@ -171,7 +171,7 @@ export function IdeaCard({
           with the reasoning on full cards: the card leads with direction,
           move, odds and size. Compact cards have no toggle and keep it. */}
       {o && (compact || open) ? (
-        <div className="rounded-xl border border-line px-3 py-2 text-xs">
+        <div className="rounded-md border border-line px-3 py-2 text-xs">
           <div className="flex items-center justify-between gap-2">
             <span className="text-ink">{optionHeadline(o)}</span>
             {o.prob_profit != null && (

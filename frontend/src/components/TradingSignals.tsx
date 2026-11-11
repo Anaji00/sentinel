@@ -227,7 +227,7 @@ function GroupCard({ g }: { g: SignalGroup }) {
   const SHOWN = 18;
   return (
     <article
-      className={`rounded-2xl border border-line bg-raised p-4 space-y-3 border-t-2 ${up ? 'border-t-positive/70' : 'border-t-negative/70'}`}
+      className={`rounded-md border border-line bg-raised p-4 space-y-3 border-t-2 ${up ? 'border-t-positive/70' : 'border-t-negative/70'}`}
     >
       <header className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -302,7 +302,7 @@ function GroupCard({ g }: { g: SignalGroup }) {
 
 function Stat({ label, value, sub, tone = 'text-ink' }: { label: string; value: string; sub?: string; tone?: string }) {
   return (
-    <div className="rounded-xl border border-line bg-inset px-4 py-3">
+    <div className="rounded-md border border-line bg-inset px-4 py-3">
       <div className="text-micro text-ink-mute">{label}</div>
       <div className={`mt-1 font-mono text-lead leading-none ${tone}`}>{value}</div>
       {sub && <div className="mt-1 text-micro text-ink-mute">{sub}</div>}
@@ -338,7 +338,7 @@ export default function TradingSignals() {
 
   return (
     <div className="space-y-4 text-xs">
-      <section className="bg-raised border border-line rounded-2xl p-4 sm:p-5 space-y-4">
+      <section className="bg-raised border border-line rounded-md p-4 sm:p-5 space-y-4">
         <div className="flex items-start justify-between gap-3 flex-wrap">
           <div className="max-w-3xl space-y-1">
             <div className="flex items-center gap-2">
@@ -393,7 +393,7 @@ export default function TradingSignals() {
       {failedWithout(signalsError, data) ? (
         <PanelError what="the live signals" onRetry={() => void retrySignals()} />
       ) : active === 0 ? (
-        <section className="rounded-2xl border border-dashed border-line p-5 text-ink-mute">
+        <section className="rounded-md border border-dashed border-line p-5 text-ink-mute">
           No live signals.{' '}
           {proven === 0
             ? 'No pattern has yet proven an edge, so nothing is allowed to raise a signal. That is the gate working, not a fault.'
@@ -409,7 +409,7 @@ export default function TradingSignals() {
 
       <ConvergingEvidence />
 
-      <section className="bg-raised border border-line rounded-2xl p-4 sm:p-5 space-y-3">
+      <section className="bg-raised border border-line rounded-md p-4 sm:p-5 space-y-3">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div>
             <h3 className="text-sm font-semibold text-ink">The study behind it</h3>

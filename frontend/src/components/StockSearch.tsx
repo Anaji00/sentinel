@@ -39,7 +39,7 @@ export default function StockSearch() {
   return (
     <section
       aria-label="Look up a stock"
-      className="flex flex-wrap items-end gap-x-5 gap-y-2 rounded-xl border border-line bg-raised p-3"
+      className="flex flex-wrap items-end gap-x-5 gap-y-2 rounded-md border border-line bg-raised p-3"
     >
       <form onSubmit={submit} noValidate className="flex flex-wrap items-start gap-2">
         <Input

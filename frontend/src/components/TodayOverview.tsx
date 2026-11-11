@@ -19,8 +19,6 @@ import { ABSENT, formatNumber } from '../lib/format';
 import { PALETTE } from '../lib/palette';
 import { TopCalls } from './TopCalls';
 import { WhoIsWatching } from './WhoIsWatching';
-import { MyCorner } from './MyCorner';
-import { Welcome } from './Welcome';
 import { usePreferences } from '../lib/preferences';
 import { LoadingLines } from './ui/Skeleton';
 
@@ -90,7 +88,7 @@ function Card({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-line bg-raised p-4 flex flex-col gap-3 min-h-[15rem]">
+    <section className="rounded-md border border-line bg-raised p-4 flex flex-col gap-3 min-h-[15rem]">
       <h2 className="text-sm font-semibold text-ink">{title}</h2>
       <div className="flex-1 min-h-0">{children}</div>
       <Link href={href} className="text-xs text-accent hover:underline self-start">
@@ -266,20 +264,17 @@ export function TodayOverview() {
           ))}
         </nav>
       </header>
-      <Welcome />
       {/* What leads follows what this person said they came for (the welcome's
           choice, saved on the account); "both" keeps the two halves at equal
           weight, stocks first. */}
       {focus === 'civic' ? (
         <>
           <WhoIsWatching />
-          <MyCorner />
           <TopCalls />
         </>
       ) : (
         <>
           <TopCalls />
-          <MyCorner />
           <WhoIsWatching />
         </>
       )}

@@ -128,7 +128,7 @@ export function TradeIdeas() {
           </p>
         </div>
         <div
-          className="inline-flex rounded-xl border border-line bg-inset p-1"
+          className="inline-flex rounded-md border border-line bg-inset p-1"
           role="tablist"
           aria-label="How long to hold"
         >
@@ -157,7 +157,7 @@ export function TradeIdeas() {
       ) : !data ? (
         <div className="grid gap-3 @md:grid-cols-2 @4xl:grid-cols-4">
           {[0, 1, 2, 3].map((n) => (
-            <div key={n} className="h-64 rounded-2xl border border-line bg-inset animate-pulse" />
+            <div key={n} className="h-64 rounded-md border border-line bg-inset animate-pulse" />
           ))}
         </div>
       ) : !h ? (
@@ -200,7 +200,7 @@ export function TradeIdeas() {
                   <BetsMeter bets={c.bets} of={c.of} />
                 </div>
                 {c.ideas.length === 0 ? (
-                  <p className="rounded-2xl border border-dashed border-line p-4 text-xs text-ink-mute">
+                  <p className="rounded-md border border-dashed border-line p-4 text-xs text-ink-mute">
                     None for this holding period.
                   </p>
                 ) : (
@@ -221,7 +221,7 @@ export function TradeIdeas() {
             ))}
           </div>
           {(data.consensus ?? []).some((c) => c.horizons.length > 1) && (
-            <div className="rounded-xl border border-line px-3 py-2 text-micro space-y-1">
+            <div className="rounded-md border border-line px-3 py-2 text-micro space-y-1">
               <div className="text-ink font-semibold">Called for more than one holding period</div>
               <div className="flex flex-wrap gap-1.5">
                 {(data.consensus ?? [])
@@ -245,7 +245,7 @@ export function TradeIdeas() {
               </div>
             </div>
           )}
-          <details className="rounded-xl border border-line px-3 py-2 text-micro text-ink-dim">
+          <details className="rounded-md border border-line px-3 py-2 text-micro text-ink-dim">
             <summary className="cursor-pointer text-ink">How these are built</summary>
             <div className="mt-2 space-y-1.5 leading-relaxed">
               <p>

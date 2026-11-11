@@ -202,7 +202,7 @@ function Spotlight({ rows, side }: { rows: BoardRow[]; side: 1 | -1 }) {
         <p className="text-micro text-ink-mute">Higher confidence and the most votes, among stocks over $5 that are cheap to trade.</p>
       </div>
       {rows.length === 0 ? (
-        <p className="rounded-xl border border-dashed border-line p-3 text-micro text-ink-mute">
+        <p className="rounded-md border border-dashed border-line p-3 text-micro text-ink-mute">
           Nothing leans this way with higher confidence right now.
         </p>
       ) : (
@@ -211,7 +211,7 @@ function Spotlight({ rows, side }: { rows: BoardRow[]; side: 1 | -1 }) {
             <StockLink
               key={r.ticker}
               ticker={r.ticker}
-              className={`group block rounded-xl border border-line bg-raised p-3 space-y-2 border-t-2 hover:border-line-strong ${
+              className={`group block rounded-md border border-line bg-raised p-3 space-y-2 border-t-2 hover:border-line-strong ${
                 up ? 'border-t-positive/60' : 'border-t-negative/60'
               }`}
               title={r.why}
@@ -429,7 +429,7 @@ export function SignalBoard() {
               { n: tally.bear, label: 'lean down', tone: 'text-negative' },
               { n: tally.proven, label: 'backed by tested patterns', tone: 'text-accent' },
             ].map((s) => (
-              <div key={s.label} className="rounded-xl border border-line bg-raised px-3 py-2 min-w-[84px]">
+              <div key={s.label} className="rounded-md border border-line bg-raised px-3 py-2 min-w-[84px]">
                 <div className={`font-mono text-lead leading-none ${s.tone}`}>{formatNumber(s.n, { decimals: 0 })}</div>
                 <div className="mt-1 text-micro text-ink-mute">{s.label}</div>
               </div>
@@ -443,7 +443,7 @@ export function SignalBoard() {
       ) : !data ? (
         <div className="grid gap-3 lg:grid-cols-2">
           {[0, 1].map((n) => (
-            <div key={n} className="h-48 rounded-xl border border-line bg-inset animate-pulse" />
+            <div key={n} className="h-48 rounded-md border border-line bg-inset animate-pulse" />
           ))}
         </div>
       ) : !board.length ? (
@@ -500,7 +500,7 @@ export function SignalBoard() {
             </div>
           </details>
 
-          <div className="overflow-x-auto rounded-xl border border-line bg-raised">
+          <div className="overflow-x-auto rounded-md border border-line bg-raised">
             <table className="w-full text-left">
               <thead className="text-micro text-ink-mute">
                 <tr className="border-b border-line">

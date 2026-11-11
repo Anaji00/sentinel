@@ -137,7 +137,7 @@ export default function OsintThreatMatrix() {
         {filteredEvents.map((item) => (
           <div
             key={item.id}
-            className="p-3.5 rounded-xl bg-raised/60 border border-line hover:border-accent/50 transition-all hover:bg-raised/90 glass-panel-hover"
+            className="p-3.5 rounded-md bg-raised/60 border border-line hover:border-accent/50 transition-all hover:bg-raised/90 glass-panel-hover"
           >
             <div className="flex items-center justify-between gap-2 mb-2">
               <div className="flex items-center gap-2 flex-wrap text-micro">

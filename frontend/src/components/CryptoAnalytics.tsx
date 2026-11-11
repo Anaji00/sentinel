@@ -160,7 +160,7 @@ export default function CryptoAnalytics() {
                 <div
                   key={e.event_id || i}
                   onClick={() => setSelectedEvent(e)}
-                  className={`p-3 bg-raised/70 rounded-xl border transition-all cursor-pointer hover:bg-raised/95 ${
+                  className={`p-3 bg-raised/70 rounded-md border transition-all cursor-pointer hover:bg-raised/95 ${
                     isHighSeverity
                       ? 'border-negative/30 hover:border-negative/30 shadow-panel'
                       : 'border-line hover:border-caution/30'
@@ -270,7 +270,7 @@ export default function CryptoAnalytics() {
           ) : failedWithout(cryptoError, cryptoEvents) ? (
             <PanelError what="crypto activity" onRetry={() => void retryCrypto()} />
           ) : (
-            <div className="p-8 text-center border border-dashed border-caution/30 rounded-xl text-ink-dim text-xs">
+            <div className="p-8 text-center border border-dashed border-caution/30 rounded-md text-ink-dim text-xs">
               No matching crypto events found.
             </div>
           )}
@@ -284,7 +284,7 @@ export default function CryptoAnalytics() {
           {...dialog.overlayProps}
         >
           <div
-            className="bg-raised border border-caution/30 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
+            className="bg-raised border border-caution/30 rounded-md max-w-xl w-full p-5 space-y-4 shadow-panel text-xs text-ink"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-caution/30 pb-3">
@@ -314,7 +314,7 @@ export default function CryptoAnalytics() {
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-xl border border-line">
+              <div className="grid grid-cols-2 gap-2 bg-page p-3 rounded-md border border-line">
                 <div>
                   <span className="text-ink-dim">Event ID:</span>{' '}
                   <span className="text-caution font-bold block truncate">
@@ -340,7 +340,7 @@ export default function CryptoAnalytics() {
               </div>
 
               {selectedEvent.crypto_data && (
-                <div className="p-3 bg-page rounded-xl border border-line space-y-2">
+                <div className="p-3 bg-page rounded-md border border-line space-y-2">
                   <span className="text-accent font-bold block text-micro">
                     Crypto derivatives
                   </span>
@@ -405,7 +405,7 @@ export default function CryptoAnalytics() {
 
             <button
               onClick={() => setSelectedEvent(null)}
-              className="w-full py-2 bg-raised text-caution border border-caution/30 rounded-xl text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
+              className="w-full py-2 bg-raised text-caution border border-caution/30 rounded-md text-xs font-bold hover:bg-overlay transition-colors cursor-pointer"
             >
               DISMISS
             </button>

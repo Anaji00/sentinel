@@ -43,7 +43,7 @@ const Field: React.FC<{ label: string; value: React.ReactNode; tone?: string; hi
   tone = 'text-ink',
   hint,
 }) => (
-  <div className="p-3 bg-raised/60 rounded-xl border border-line">
+  <div className="p-3 bg-raised/60 rounded-md border border-line">
     <span className="text-micro text-ink-dim uppercase tracking-wider font-semibold">{label}</span>
     <p className={`text-xs font-bold mt-1 ${tone}`}>{value}</p>
     {hint && <p className="text-micro text-ink-mute mt-0.5 font-normal">{hint}</p>}
@@ -164,13 +164,13 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
       {...dialog.overlayProps}
     >
       <div
-        className="relative w-full max-w-2xl bg-raised border border-accent/40 rounded-2xl overflow-hidden text-ink"
+        className="relative w-full max-w-2xl bg-raised border border-accent/40 rounded-md overflow-hidden text-ink"
         {...dialog.panelProps}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 bg-page/80 border-b border-line">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-accent-dim border border-line-accent flex items-center justify-center text-accent font-bold text-lg">
+            <div className="h-10 w-10 rounded-md bg-accent-dim border border-line-accent flex items-center justify-center text-accent font-bold text-lg">
               {initials}
             </div>
             <div>
@@ -227,7 +227,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
 
         <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto">
           {error && (
-            <div className="p-3 bg-negative/10 border border-negative/30 rounded-xl text-micro text-negative">
+            <div className="p-3 bg-negative/10 border border-negative/30 rounded-md text-micro text-negative">
               {error} —{' '}
               <button onClick={load} className="underline hover:text-negative">
                 retry
@@ -268,7 +268,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 />
               </div>
 
-              <div className="p-4 bg-raised/50 border border-line rounded-xl">
+              <div className="p-4 bg-raised/50 border border-line rounded-md">
                 <h4 className="text-xs font-bold text-ink-dim">Where it runs</h4>
                 <p className="text-micro text-ink-dim mt-1 leading-relaxed">
                   On one machine you control. All AI runs on it, and no usage data leaves it. The AI
@@ -281,7 +281,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
 
           {activeTab === 'access' && (
             <div className="space-y-4">
-              <div className="p-3 bg-raised/60 rounded-xl border border-line space-y-2">
+              <div className="p-3 bg-raised/60 rounded-md border border-line space-y-2">
                 <span className="text-micro font-bold text-ink-dim">Session authentication</span>
                 <ul className="text-micro text-ink-dim space-y-1 list-disc list-inside leading-relaxed">
                   <li>
@@ -298,7 +298,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 </ul>
               </div>
 
-              <div className="p-3 bg-raised/60 rounded-xl border border-line space-y-2">
+              <div className="p-3 bg-raised/60 rounded-md border border-line space-y-2">
                 <span className="text-micro font-bold text-ink-dim">Rate limit</span>
                 <div className="grid grid-cols-2 gap-3 text-micro mt-1">
                   <div>
@@ -321,7 +321,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 </p>
               </div>
 
-              <div className="p-3 bg-caution/10 border border-caution/30 rounded-xl">
+              <div className="p-3 bg-caution/10 border border-caution/30 rounded-md">
                 <span className="text-micro font-bold text-caution">API key</span>
                 <p className="text-micro text-ink-dim mt-1 leading-relaxed">
                   The gateway API key is held server-side and is deliberately not exposed to this
@@ -379,7 +379,7 @@ export const AccountProfileModal: React.FC<AccountProfileModalProps> = ({ isOpen
                 />
               </div>
 
-              <div className="p-3 bg-raised/60 rounded-xl border border-line">
+              <div className="p-3 bg-raised/60 rounded-md border border-line">
                 <span className="text-micro font-bold text-ink-dim">Agent tiers</span>
                 {platform && Object.keys(platform.reportingTiers).length > 0 ? (
                   <div className="mt-2 space-y-1">

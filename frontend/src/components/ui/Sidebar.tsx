@@ -59,47 +59,42 @@ interface NavGroup {
 
 const NAV_GROUPS: NavGroup[] = [
   {
-    label: 'Overview',
-    items: [{ href: '/', label: 'Home', icon: LayoutDashboard }],
-  },
-  {
-    // Eleven pages became four: Calls (stock calls, signal board, trade
-    // signals), Markets (markets & economy, crypto, options & flow),
-    // Performance (portfolio & record, research) and Intel below. Each old
-    // address redirects to its view; see next.config.ts.
-    label: 'Markets',
+    // Four workspaces, named for what you are doing: look at the market, check the book, scan the world, check the work.
+    // Every page keeps its own link; each old address still redirects to its view (see next.config.ts).
+    label: 'Desk',
     items: [
+      { href: '/', label: 'Home', icon: LayoutDashboard },
       { href: '/calls', label: 'Calls', icon: Crosshair },
       { href: '/markets', label: 'Markets', icon: LineChart },
-      // Any ticker also opens the stock drawer in place (?t=); this is the full page.
-      { href: '/filings', label: 'Filings & Fund Holdings', icon: FileText },
-      { href: '/performance', label: 'Performance', icon: Gauge },
     ],
   },
   {
-    label: 'Watch',
+    label: 'Book',
+    items: [
+      { href: '/performance', label: 'Performance', icon: Gauge },
+      // Who owns the companies, who owns the owners, and who pays whom.
+      { href: '/money', label: 'Follow the Money', icon: Landmark, civic: true },
+    ],
+  },
+  {
+    label: 'Radar',
     items: [
       // News & intel, the world map and investigations, on one time window.
       { href: '/intel', label: 'Intel', icon: ShieldAlert },
-      // Who owns the companies, who owns the owners, and who pays whom.
-      { href: '/money', label: 'Follow the Money', icon: Landmark, civic: true },
       // Who is linked to whom: companies, ships, flags and places, and how two are joined.
       { href: '/connections', label: 'Connections', icon: Network },
+      { href: '/filings', label: 'Filings & Fund Holdings', icon: FileText },
       // Watching the watchers: who surveils the public, and how to push back.
-      // One entry, not five: its sections have their own tabs on the page.
       { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
-      { href: '/agents', label: 'AI Analysts', icon: Bot },
     ],
   },
   {
-    label: 'Reference',
+    label: 'Audit',
     items: [
+      { href: '/agents', label: 'AI Analysts', icon: Bot },
       { href: '/methodology', label: 'How It Works', icon: BookOpen },
-      // The three surfaces that need a person: the merge queue, the rule
-      // feedback loop and the dead-letter backlog. All were served and
-      // none was reachable.
+      // The three surfaces that need a person: the merge queue, the rule feedback loop and the dead-letter backlog.
       { href: '/operations', label: 'Operations', icon: Wrench, operator: true },
-      // The modal claimed a hash-chained ledger; nothing could open it.
       { href: '/audit', label: 'Audit Trail', icon: ScrollText, operator: true },
     ],
   },

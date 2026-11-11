@@ -53,7 +53,7 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
 
   if (patienceSpent) {
     return (
-      <div className="w-full h-full p-4 glass-panel rounded-xl flex flex-col items-center justify-center gap-1.5 text-center">
+      <div className="w-full h-full p-4 glass-panel rounded-md flex flex-col items-center justify-center gap-1.5 text-center">
         <p className="text-micro font-medium text-caution/90" role="alert">
           {title.replace(/\.\.\.$|â€¦$/, '')} is not responding
         </p>
@@ -67,7 +67,7 @@ export const PanelSkeleton: React.FC<{ title?: string }> = ({ title = 'Loadingâ€
 
   return (
     <div
-      className="w-full h-full p-4 glass-panel rounded-xl flex flex-col gap-4"
+      className="w-full h-full p-4 glass-panel rounded-md flex flex-col gap-4"
       role="status"
       aria-live="polite"
       aria-label={title}

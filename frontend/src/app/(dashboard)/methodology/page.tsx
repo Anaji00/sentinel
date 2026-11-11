@@ -210,7 +210,7 @@ export default function MethodologyPage() {
         </div>
 
         {/* Detailed Methodology View */}
-        <div className="md:col-span-3 flex flex-col gap-5 bg-raised/80 border border-line rounded-xl p-6">
+        <div className="md:col-span-3 flex flex-col gap-5 bg-raised/80 border border-line rounded-md p-6">
           {failed ? (
             <EmptyState
               kind="error"

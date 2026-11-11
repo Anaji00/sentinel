@@ -148,7 +148,7 @@ export default function StockPredictions({ withIdeas = true }: { withIdeas?: boo
   return (
     <div className="space-y-4 text-xs">
       {withIdeas && <TradeIdeas />}
-      <section className="bg-raised border border-line rounded-xl p-4 space-y-3">
+      <section className="bg-raised border border-line rounded-md p-4 space-y-3">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <h2 className="text-sm font-bold text-ink">How the calls have done</h2>
           <div className="flex gap-1">
@@ -231,7 +231,7 @@ export default function StockPredictions({ withIdeas = true }: { withIdeas?: boo
 
       <ModelRanking />
 
-      <section className="bg-raised border border-line rounded-xl p-4 space-y-2">
+      <section className="bg-raised border border-line rounded-md p-4 space-y-2">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <h3 className="font-bold text-ink">Open calls</h3>
           <Input
@@ -341,7 +341,7 @@ export default function StockPredictions({ withIdeas = true }: { withIdeas?: boo
       </section>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        <section className="bg-raised border border-line rounded-xl p-4 space-y-2">
+        <section className="bg-raised border border-line rounded-md p-4 space-y-2">
           <h3 className="font-bold text-ink">Does its confidence mean anything?</h3>
           <p className="text-ink-dim">
             When the analysts say they are 70% sure, are they right about 70% of the time? If the
@@ -395,7 +395,7 @@ export default function StockPredictions({ withIdeas = true }: { withIdeas?: boo
           </ul>
         </section>
 
-        <section className="bg-raised border border-line rounded-xl p-4 space-y-2">
+        <section className="bg-raised border border-line rounded-md p-4 space-y-2">
           <h3 className="font-bold text-ink">Recently resolved</h3>
           {(data?.recent.length ?? 0) === 0 ? (
             <p className="text-ink-mute">Nothing resolved in this window.</p>

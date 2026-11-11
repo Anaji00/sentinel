@@ -142,7 +142,7 @@ export default function OwnershipPanel() {
   }
 
   return (
-    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-xl p-5 text-ink">
+    <div className="flex flex-col gap-4 bg-raised/90 border border-line rounded-md p-5 text-ink">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line pb-4">
         <div>
           <div className="flex items-center gap-2">

@@ -24,10 +24,12 @@ export default function BookExposure() {
   const limit = (data?.limit ?? 0) * 100;
 
   return (
-    <section aria-label="What a market shock would do to the book" className="space-y-3 rounded-xl border border-line bg-raised p-5 text-xs">
+    <section aria-label="What a market shock would do to the book" className="space-y-3 rounded-md border border-line bg-raised p-5 text-xs">
       <div>
         <h2 className="text-head font-semibold text-ink">If markets move</h2>
-        <p className="text-ink-mute">What a standard shock would do to the paper book, from how its holdings have behaved. Estimates, not forecasts. <Updated source="/portfolio/exposure" /></p>
+        <p className="text-ink-mute">What a standard shock would do to the paper book, from how its holdings have behaved. Estimates, not forecasts.{' '}
+          <Updated source="/portfolio/exposure" />
+        </p>
       </div>
       {failedWithout(error, data) ? (
         <PanelError what="the book's exposure" onRetry={() => void mutate()} />

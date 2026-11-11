@@ -118,13 +118,13 @@ export default function ExplainabilityModal({
       {...dialog.overlayProps}
     >
       <div
-        className="bg-raised border border-accent/40 rounded-2xl max-w-2xl w-full p-6 space-y-5 text-xs text-ink max-h-[90vh] overflow-y-auto custom-scrollbar"
+        className="bg-raised border border-accent/40 rounded-md max-w-2xl w-full p-6 space-y-5 text-xs text-ink max-h-[90vh] overflow-y-auto custom-scrollbar"
         {...dialog.panelProps}
       >
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b border-line/80 pb-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-accent-dim border border-line text-accent">
+            <div className="p-2 rounded-md bg-accent-dim border border-line text-accent">
               <Cpu className="w-5 h-5" />
             </div>
             <div>
@@ -175,7 +175,7 @@ export default function ExplainabilityModal({
           <div className="space-y-5">
             {/* Overall Anomaly & Governance Status Banner */}
             <div className="grid grid-cols-3 gap-3">
-              <div className="bg-page/60 border border-line/80 rounded-xl p-3">
+              <div className="bg-page/60 border border-line/80 rounded-md p-3">
                 <div className="text-micro uppercase tracking-wider text-ink-dim">
                   Anomaly Score
                 </div>
@@ -197,7 +197,7 @@ export default function ExplainabilityModal({
                 )}
               </div>
 
-              <div className="bg-page/60 border border-line/80 rounded-xl p-3">
+              <div className="bg-page/60 border border-line/80 rounded-md p-3">
                 <div className="text-micro uppercase tracking-wider text-ink-dim">
                   Model Stability
                 </div>
@@ -225,7 +225,7 @@ export default function ExplainabilityModal({
                 </div>
               </div>
 
-              <div className="bg-page/60 border border-line/80 rounded-xl p-3">
+              <div className="bg-page/60 border border-line/80 rounded-md p-3">
                 <div className="text-micro uppercase tracking-wider text-ink-dim">
                   Latency & Hash
                 </div>
@@ -243,7 +243,7 @@ export default function ExplainabilityModal({
             </div>
 
             {/* Factor Attribution Waterfall */}
-            <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
+            <div className="bg-page/40 border border-line/80 rounded-md p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
                   <Layers className="w-4 h-4 text-accent" />
@@ -273,7 +273,7 @@ export default function ExplainabilityModal({
             </div>
 
             {/* Step-by-Step Score Derivation Timeline */}
-            <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
+            <div className="bg-page/40 border border-line/80 rounded-md p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
                   <Clock className="w-4 h-4 text-caution" />
@@ -321,7 +321,7 @@ export default function ExplainabilityModal({
             </div>
 
             {/* Model Card Metadata */}
-            <div className="bg-page/40 border border-line/80 rounded-xl p-4 space-y-3">
+            <div className="bg-page/40 border border-line/80 rounded-md p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-ink uppercase tracking-wider flex items-center gap-2">
                   <Database className="w-4 h-4 text-positive" />

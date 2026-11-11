@@ -57,7 +57,7 @@ export default function WhatChanged({ ticker }: { ticker: string }) {
   const [allItems, setAllItems] = React.useState(false);
 
   return (
-    <section aria-label={`What changed for ${ticker}`} className="space-y-3.5 rounded-xl border border-line bg-inset p-4">
+    <section aria-label={`What changed for ${ticker}`} className="space-y-3.5 rounded-md border border-line bg-inset p-4">
       <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">
         What changed{data ? ` in the last ${data.window_days} days` : ''}
       </h3>

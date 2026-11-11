@@ -143,11 +143,11 @@ export default function FeatureFlagManager() {
   const isMasterActive = data?.master_kill_switch?.active;
 
   return (
-    <div className="bg-raised/90 border border-line/80 rounded-2xl p-5 space-y-5 text-xs text-ink">
+    <div className="bg-raised/90 border border-line/80 rounded-md p-5 space-y-5 text-xs text-ink">
       {/* Header & Master Control */}
       <div className="flex items-center justify-between border-b border-line/80 pb-4">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-xl bg-accent-dim border border-line text-accent">
+          <div className="p-2 rounded-md bg-accent-dim border border-line text-accent">
             <Sliders className="w-5 h-5" />
           </div>
           <div>
@@ -169,7 +169,7 @@ export default function FeatureFlagManager() {
             isMasterActive ? handleResetKillSwitch('MASTER') : handleTripKillSwitch('MASTER')
           }
           disabled={processingFlag === 'MASTER'}
-          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl font-bold text-xs border transition-all cursor-pointer shadow-lg ${
+          className={`flex items-center gap-2 px-3.5 py-2 rounded-md font-bold text-xs border transition-all cursor-pointer ${
             isMasterActive
               ? 'bg-positive/10 text-positive border-positive/30 hover:bg-positive/10'
               : 'bg-negative/10 text-negative border-negative/30 hover:bg-negative/10 hover:shadow-negative/20'
@@ -181,7 +181,7 @@ export default function FeatureFlagManager() {
       </div>
 
       {actionMessage && (
-        <div className="px-3.5 py-2 rounded-xl bg-accent-dim border border-line-accent text-accent text-micro flex items-center gap-2 animate-fadeIn">
+        <div className="px-3.5 py-2 rounded-md bg-accent-dim border border-line-accent text-accent text-micro flex items-center gap-2 animate-fadeIn">
           <CheckCircle2 className="w-4 h-4 text-accent" />
           {actionMessage}
         </div>
@@ -200,7 +200,7 @@ export default function FeatureFlagManager() {
           return (
             <div
               key={key}
-              className={`p-4 rounded-xl border transition-all space-y-3 ${
+              className={`p-4 rounded-md border transition-all space-y-3 ${
                 isKilled
                   ? 'bg-page/40 border-negative/30 text-ink-dim'
                   : 'bg-raised/40 border-line/80 hover:border-line-strong/80 text-ink'

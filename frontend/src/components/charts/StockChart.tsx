@@ -192,7 +192,7 @@ export function StockChart({ ticker, height = 240 }: StockChartProps) {
 
           {/* Hover Tooltip */}
           {hoverPoint && (
-            <div className="absolute top-2 right-2 bg-raised/90 border border-line-accent text-accent p-2 rounded text-micro shadow-lg">
+            <div className="absolute top-2 right-2 bg-raised/90 border border-line-accent text-accent p-2 rounded text-micro">
               <div className="font-bold">${hoverPoint.price.toFixed(2)}</div>
               <div className="text-micro text-ink-dim">
                 <ClockTime value={hoverPoint.time} />

@@ -16,8 +16,9 @@ export const MAX_LIVE_EVENTS = 300;
 // Reconnect backoff limits (ms)
 export const RECONNECT_INITIAL_MS = 1000;
 export const RECONNECT_MAX_MS = 30000;
-// 1000ms sliding window buffer to reduce React re-render flooding from AIS/ADS-B telemetry
-export const FLUSH_MS = 1000;
+// Events collect in a bounded buffer and reach React in one batch four times a second (250ms), so a burst at the open
+// never floods rendering and a new event is on screen within a quarter of a second.
+export const FLUSH_MS = 250;
 /**
  * How long the socket outlives its last subscriber.
  *

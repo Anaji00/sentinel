@@ -206,7 +206,7 @@ function AssetSparklineCard({
   return (
     <div
       onClick={() => onExpand(config)}
-      className={`lift wash group relative bg-raised border border-line hover:border-line-accent rounded-2xl p-4 cursor-pointer overflow-hidden font-mono flex flex-col justify-between ${
+      className={`lift wash group relative bg-raised border border-line hover:border-line-accent rounded-md p-4 cursor-pointer overflow-hidden font-mono flex flex-col justify-between ${
         hasData ? (pctChange >= 0 ? 'text-positive' : 'text-negative') : ''
       }`}
     >
@@ -265,7 +265,7 @@ function AssetSparklineCard({
       </div>
 
       {/* SVG Sparkline or Live Waiting State */}
-      <div className="relative h-28 w-full bg-page rounded-xl border border-line/80 p-2 overflow-hidden flex items-center justify-center">
+      <div className="relative h-28 w-full bg-page rounded-md border border-line/80 p-2 overflow-hidden flex items-center justify-center">
         {hasData ? (
           <svg
             viewBox="0 0 400 120"
@@ -646,7 +646,7 @@ export default function MarketCharts() {
             {/* Modal Header Bar */}
             <div className="flex items-center justify-between px-6 py-4 bg-raised border-b border-line">
               <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-xl bg-accent-dim border border-line-accent flex items-center justify-center text-accent font-extrabold text-sm">
+                <div className="h-10 w-10 rounded-md bg-accent-dim border border-line-accent flex items-center justify-center text-accent font-extrabold text-sm">
                   {expandedAsset.symbol.substring(0, 3)}
                 </div>
                 <div>
@@ -664,7 +664,7 @@ export default function MarketCharts() {
 
               <div className="flex items-center gap-3">
                 {/* Timeframe Selector */}
-                <div className="flex items-center gap-1 bg-page p-1 rounded-xl border border-line">
+                <div className="flex items-center gap-1 bg-page p-1 rounded-md border border-line">
                   {['1H', '4H', '1D', '1W'].map((tf) => (
                     <button
                       key={tf}
@@ -678,7 +678,7 @@ export default function MarketCharts() {
 
                 <button
                   onClick={() => setExpandedAsset(null)}
-                  className="p-2 rounded-xl bg-raised border border-line text-ink-dim hover:text-ink hover:bg-overlay cursor-pointer transition-colors"
+                  className="p-2 rounded-md bg-raised border border-line text-ink-dim hover:text-ink hover:bg-overlay cursor-pointer transition-colors"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -691,7 +691,7 @@ export default function MarketCharts() {
                 <>
                   {/* Telemetry Summary Cards */}
                   <div className="grid grid-cols-4 gap-4">
-                    <div className="p-4 bg-raised border border-line rounded-2xl">
+                    <div className="p-4 bg-raised border border-line rounded-md">
                       <span className="text-ink-dim text-micro font-bold uppercase">
                         Current Price
                       </span>
@@ -703,7 +703,7 @@ export default function MarketCharts() {
                       </div>
                     </div>
 
-                    <div className="p-4 bg-raised border border-line rounded-2xl">
+                    <div className="p-4 bg-raised border border-line rounded-md">
                       <span className="text-ink-dim text-micro font-bold uppercase">
                         Price Trajectory
                       </span>
@@ -715,7 +715,7 @@ export default function MarketCharts() {
                       </div>
                     </div>
 
-                    <div className="p-4 bg-raised border border-line rounded-2xl">
+                    <div className="p-4 bg-raised border border-line rounded-md">
                       <span className="text-ink-dim text-micro font-bold uppercase">
                         24H High / Low Range
                       </span>
@@ -724,7 +724,7 @@ export default function MarketCharts() {
                       </div>
                     </div>
 
-                    <div className="p-4 bg-raised border border-line rounded-2xl">
+                    <div className="p-4 bg-raised border border-line rounded-md">
                       <span className="text-ink-dim text-micro font-bold uppercase">
                         Anomaly Risk Score
                       </span>
@@ -737,7 +737,7 @@ export default function MarketCharts() {
                   </div>
 
                   {/* Moving Average Telemetry HUD */}
-                  <div className="p-3 bg-raised border border-line rounded-2xl flex items-center justify-between text-micro">
+                  <div className="p-3 bg-raised border border-line rounded-md flex items-center justify-between text-micro">
                     <div className="flex items-center gap-2">
                       <span className="font-extrabold text-ink uppercase text-micro">
                         Ma alignment:
@@ -784,7 +784,7 @@ export default function MarketCharts() {
                   </div>
 
                   {/* Large Interactive SVG Chart */}
-                  <div className="bg-inset border border-line rounded-2xl p-4 relative h-[360px] flex flex-col justify-between overflow-hidden">
+                  <div className="bg-inset border border-line rounded-md p-4 relative h-[360px] flex flex-col justify-between overflow-hidden">
                     <div className="flex justify-between items-center text-micro text-ink-mute mb-2">
                       <span>MAX: ${maxPrice.toFixed(2)}</span>
                       <span>
@@ -888,7 +888,7 @@ export default function MarketCharts() {
                 </>
               ) : (
                 <div className="bg-inset border border-dashed border-caution/30 rounded-3xl p-12 flex flex-col items-center justify-center text-center space-y-3">
-                  <div className="h-12 w-12 rounded-2xl bg-caution/10 border border-caution/30 flex items-center justify-center">
+                  <div className="h-12 w-12 rounded-md bg-caution/10 border border-caution/30 flex items-center justify-center">
                     <Radio className="w-6 h-6 text-caution animate-pulse" />
                   </div>
                   <h3 className="text-base font-semibold text-caution">
@@ -912,7 +912,7 @@ export default function MarketCharts() {
               </div>
               <button
                 onClick={() => setExpandedAsset(null)}
-                className="px-4 py-1.5 bg-raised text-ink rounded-xl font-bold border border-line-strong hover:bg-overlay cursor-pointer"
+                className="px-4 py-1.5 bg-raised text-ink rounded-md font-bold border border-line-strong hover:bg-overlay cursor-pointer"
               >
                 Close View
               </button>

@@ -26,7 +26,7 @@ export default function OilRoutes() {
   const watched = data?.series?.length ?? 0;
 
   return (
-    <section aria-label="Unusual activity on oil routes" className="space-y-3 rounded-xl border border-line bg-raised p-5 text-xs">
+    <section aria-label="Unusual activity on oil routes" className="space-y-3 rounded-md border border-line bg-raised p-5 text-xs">
       <div>
         <h2 className="text-head font-semibold text-ink">Oil routes: what looks unusual</h2>
         <p className="text-ink-mute">

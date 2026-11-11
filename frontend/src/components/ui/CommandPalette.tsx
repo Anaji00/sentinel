@@ -175,12 +175,12 @@ export function CommandPalette() {
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center bg-black/70 backdrop-blur-sm pt-[12vh] px-4"
+      className="fixed inset-0 z-[100] flex items-start justify-center bg-black/70 pt-[12vh] px-4"
       onClick={() => setOpen(false)}
       role="presentation"
     >
       <div
-        className="w-full max-w-xl rounded-xl border border-line-strong bg-inset overflow-hidden"
+        className="w-full max-w-xl rounded-md border border-line-strong bg-inset overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"

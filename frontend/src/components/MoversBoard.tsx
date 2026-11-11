@@ -87,7 +87,7 @@ export default function MoversBoard() {
   }, [data?.sector_concentration]);
 
   return (
-    <div className="h-full flex flex-col bg-raised rounded-xl border border-line overflow-hidden">
+    <div className="h-full flex flex-col bg-raised rounded-md border border-line overflow-hidden">
       <div className="flex items-center justify-between px-3.5 py-2 border-b border-line shrink-0">
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-accent animate-pulse" />

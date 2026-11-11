@@ -1,5 +1,9 @@
 'use client';
 
+import { DivergenceBrief, StageBadge } from './DivergenceBrief';
+import { ZWhisker } from './ui/ZWhisker';
+import { ALERT_KINDS, filterAlerts, type AlertKind, type Brief, type Situation } from '../lib/divergence';
+import { Button } from './ui/Button';
 import WhatIf from './WhatIf';
 import React, { useMemo, useState } from 'react';
 import { Input } from './ui/Input';
@@ -42,6 +46,13 @@ interface CorrelationCluster {
   description: string;
   tags?: string[];
   evidence_trail?: EvidenceContributor[];
+  /** Divergence alerts only: where the situation stands, and the seven-section brief. */
+  situation?: Situation | null;
+  brief?: Brief | null;
+  horizon?: string | null;
+  breadth?: number | null;
+  beta?: number | null;
+  relative_volume?: number | null;
 }
 
 // Helper to derive clean domain tag + icon
@@ -390,16 +401,21 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
 
   return (
     <div className="p-3 rounded-lg bg-raised/80 border border-caution/30 hover:border-caution/30 transition-all space-y-1.5">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
         <span className="font-semibold text-caution text-xs flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-caution animate-ping" />
           Rule: {c.rule_name}
         </span>
-        <span className="px-2 py-0.5 rounded text-micro font-bold bg-caution/10 text-caution border border-caution/30">
-          TIER {c.alert_tier}
+        <span className="flex items-center gap-1.5">
+          <ZWhisker z={c.situation?.last_z} prior={c.situation?.peak_z != null && c.situation?.last_z != null && c.situation.peak_z !== Math.abs(c.situation.last_z) ? c.situation.peak_z * Math.sign(c.situation.last_z) : null} />
+          <StageBadge situation={c.situation} horizon={c.horizon} />
+          <span className="px-2 py-0.5 rounded text-micro font-bold bg-caution/10 text-caution border border-caution/30">
+            TIER {c.alert_tier}
+          </span>
         </span>
       </div>
       <p className="text-xs text-ink font-sans leading-snug">{c.description}</p>
+      <DivergenceBrief situation={c.situation} brief={c.brief} id={c.correlation_id} measures={c} />
 
       {/* The first step of a loop that had every other step built: the
           scorecard, the aggregate, the console panel and the retirement agent
@@ -460,6 +476,7 @@ CorrelationCard.displayName = 'CorrelationCard';
 /** `windowHours` narrows the event list to recent reports (the Intel console's slider). */
 export default function IntelligenceFeed({ windowHours }: { windowHours?: number } = {}) {
   const [activeTab, setActiveTab] = useState<'events' | 'scenarios' | 'correlations'>('events');
+  const [alertKind, setAlertKind] = useState<AlertKind>('all');
   const [selectedDomain, setSelectedDomain] = useState<string>('all');
   const [scenarioStatus, setScenarioStatus] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -484,11 +501,14 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
   });
 
   // Fetch Raw Correlation Clusters
+  // The Alerts tab looks further back: a few dozen recent alerts from busy rules can push the rarer
+  // stock-vs-peers ones out of view, and the route has no server-side filter.
   const { data: correlations, error: correlationsError } = useSWR<CorrelationCluster[]>(
-    '/correlations?limit=30&min_tier=1',
+    `/correlations?limit=${activeTab === 'correlations' ? 200 : 30}&min_tier=1`,
     fetcher,
     { refreshInterval: POLL.standard },
   );
+  const shownAlerts = React.useMemo(() => filterAlerts(correlations ?? [], alertKind), [correlations, alertKind]);
 
   // Dynamic Event domain fetches
   const { data: tradfiEvents } = useSWR<NormalizedEvent[]>(
@@ -644,7 +664,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
   return (
     <div className="space-y-4 max-w-[1600px] mx-auto font-sans">
       {/* Header Bar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 bg-raised border border-line rounded-xl shadow-panel">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 bg-raised border border-line rounded-md shadow-panel">
         <div>
           {/* The page already carries the title. This was a second <h1> with a
               louder version of the same words directly beneath the first -- two
@@ -738,7 +758,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
       {activeTab === 'events' && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {sortedEvents.length === 0 ? (
-            <div className="col-span-full p-8 text-center bg-page/60 rounded-xl border border-line/80 text-ink-dim text-xs">
+            <div className="col-span-full p-8 text-center bg-page/60 rounded-md border border-line/80 text-ink-dim text-xs">
               <span className="h-2 w-2 rounded-full bg-accent inline-block animate-ping mr-2" />
               Waiting for the first event. The stream is connected and quiet, which before the open
               is the correct answer.
@@ -754,7 +774,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
       {activeTab === 'scenarios' && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {!scenarios || scenarios.length === 0 ? (
-            <div className="col-span-full p-8 text-center bg-page/60 rounded-xl border border-line/80 text-ink-dim text-xs">
+            <div className="col-span-full p-8 text-center bg-page/60 rounded-md border border-line/80 text-ink-dim text-xs">
               {/* Not the same statement as "the request failed", and this line
                   was making it for both. The status filter returned a 500 on
                   every request for as long as it existed -- the SQL called
@@ -767,7 +787,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
               <div
                 key={s.scenario_id}
                 onClick={() => setSelectedScenario(s)}
-                className="p-4 rounded-xl bg-inset border border-line hover:border-line-accent transition-all cursor-pointer space-y-2 group glass-panel-hover font-mono"
+                className="p-4 rounded-md bg-inset border border-line hover:border-line-accent transition-all cursor-pointer space-y-2 group glass-panel-hover font-mono"
               >
                 <div className="flex items-center justify-between text-micro">
                   <span className="px-2 py-0.5 rounded bg-accent-dim text-accent font-bold uppercase border border-line-accent">
@@ -802,25 +822,36 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
 
       {/* TAB CONTENT: Raw Correlations */}
       {activeTab === 'correlations' && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {!correlations || correlations.length === 0 ? (
-            <div className="col-span-full p-8 text-center bg-page/60 rounded-xl border border-line/80 text-ink-dim text-xs">
-              {describeApiError(correlationsError) ?? 'No correlation clusters yet.'}
-            </div>
-          ) : (
-            correlations.map((c) => <CorrelationCard key={c.correlation_id} c={c} />)
-          )}
+        <div className="space-y-3">
+          <div role="group" aria-label="Which alerts to show" className="flex flex-wrap items-center gap-1.5">
+            {ALERT_KINDS.map((k) => (
+              <Button key={k.id} variant={alertKind === k.id ? 'secondary' : 'outline'} size="sm" pressed={alertKind === k.id} title={k.hint} onClick={() => setAlertKind(k.id)}>
+                {k.label}
+                {correlations ? ` (${filterAlerts(correlations, k.id).length})` : ''}
+              </Button>
+            ))}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {!correlations || shownAlerts.length === 0 ? (
+              <div className="col-span-full p-8 text-center bg-page/60 rounded-md border border-line/80 text-ink-dim text-xs">
+                {describeApiError(correlationsError) ??
+                  (correlations && correlations.length > 0 ? 'No alerts of this kind right now.' : 'No correlation clusters yet.')}
+              </div>
+            ) : (
+              shownAlerts.map((c) => <CorrelationCard key={c.correlation_id} c={c} />)
+            )}
+          </div>
         </div>
       )}
 
       {/* Event Detail Forensic Inspector Modal */}
       {selectedEvent && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
           {...eventDialog.overlayProps}
         >
           <div
-            className="bg-raised border border-accent/40 rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
+            className="bg-raised border border-accent/40 rounded-md max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
             {...eventDialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-3">
@@ -953,11 +984,11 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
       {/* Scenario Detail Modal */}
       {selectedScenario && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
           {...scenarioDialog.overlayProps}
         >
           <div
-            className="bg-inset border border-line-accent rounded-xl max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
+            className="bg-inset border border-line-accent rounded-md max-w-2xl w-full p-5 space-y-4 shadow-panel max-h-[85vh] overflow-y-auto"
             {...scenarioDialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-3">

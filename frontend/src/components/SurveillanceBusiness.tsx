@@ -30,7 +30,7 @@ interface Lobbying {
 
 function Fact({ value, label }: { value: string; label: string }) {
   return (
-    <div className="rounded-xl border border-civic/20 bg-page/40 px-3 py-2">
+    <div className="rounded-md border border-civic/20 bg-page/40 px-3 py-2">
       <div className="font-mono text-head leading-none text-ink">{value}</div>
       <div className="mt-1 text-micro text-ink-dim">{label}</div>
     </div>
@@ -54,7 +54,7 @@ export function SurveillanceBusiness({ ticker }: { ticker: string }) {
   const loading = (c.money && !money) || (c.maker && !summary) || (c.lobby && !lobby);
 
   return (
-    <section className="rounded-2xl border border-civic/30 bg-gradient-to-br from-civic-dim via-raised to-raised p-4 sm:p-5 space-y-3">
+    <section className="rounded-md border border-civic/30 bg-gradient-to-br from-civic-dim via-raised to-raised p-4 sm:p-5 space-y-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div>
           <div className="text-micro font-semibold uppercase tracking-wider text-civic">Surveillance business</div>

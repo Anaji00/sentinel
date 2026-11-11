@@ -89,7 +89,7 @@ export function PortfolioLab() {
   return (
     // Research detail, folded: most readers need the one-line answer, and the
     // table is there for anyone who wants to check it.
-    <details className="group bg-raised border border-line rounded-xl p-4 text-xs">
+    <details className="group bg-raised border border-line rounded-md p-4 text-xs">
       <summary className="cursor-pointer list-none space-y-1">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <h2 className="text-sm font-semibold text-ink">

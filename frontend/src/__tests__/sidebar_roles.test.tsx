@@ -23,8 +23,8 @@ describe('sidebar by role', () => {
     role = 'VIEWER';
     const hrefs = links(renderToStaticMarkup(<Sidebar />));
     expect(hrefs).toEqual([
-      '/', '/calls', '/markets', '/filings', '/performance',
-      '/intel', '/money', '/connections', '/watch', '/agents', '/methodology',
+      '/', '/calls', '/markets', '/performance', '/money',
+      '/intel', '/connections', '/filings', '/watch', '/agents', '/methodology',
     ]);
   });
 

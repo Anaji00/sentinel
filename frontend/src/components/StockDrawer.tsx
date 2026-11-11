@@ -24,6 +24,8 @@ import { Disclosure } from './ui/Disclosure';
 import { IconClose } from './ui/icons';
 import { LoadingLines } from './ui/Skeleton';
 import FirstLook from './FirstLook';
+import ComparePanel from './ComparePanel';
+import { useCompare } from '../lib/useCompare';
 import RelatedStocks from './RelatedStocks';
 import SourceFacts from './SourceFacts';
 import ThesisPanel from './ThesisPanel';
@@ -47,7 +49,7 @@ function Owners({ ticker }: { ticker: string }) {
   const top = (data?.holders ?? []).filter((h) => (h.pct_outstanding ?? 0) > 0).slice(0, 4);
   if (!top.length) return null;
   return (
-    <section className="space-y-2 rounded-xl border border-line bg-inset p-4">
+    <section className="space-y-2 rounded-md border border-line bg-inset p-4">
       <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">Who owns it</h3>
       <p className="text-sm text-ink-dim">
         {top.map((h, i) => (
@@ -69,6 +71,7 @@ function Owners({ ticker }: { ticker: string }) {
 
 function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
   const dialog = useDialog(true, onClose, `${ticker} details`);
+  const cmp = useCompare();
   const [detail, setDetail] = React.useState(false);
   return (
     <div className="fade-in fixed inset-0 z-50 bg-black/60" {...dialog.overlayProps}>
@@ -95,6 +98,7 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
         </div>
         <FirstLook />
         <TickerHero symbol={ticker} />
+        {cmp.other && <ComparePanel a={ticker} b={cmp.other} onSwap={cmp.swap} onClear={cmp.clear} />}
         <WhatChanged ticker={ticker} />
         <ThesisPanel ticker={ticker} />
         <Disclosure variant="row" label={`More about ${ticker}`} hint="owners, facts, related stocks" storageKey="drawer:more">
@@ -123,6 +127,7 @@ export function StockDrawer() {
   const close = () => {
     const next = new URLSearchParams(params?.toString() ?? '');
     next.delete('t');
+    next.delete('c');
     const q = next.toString();
     router.replace(q ? `${pathname}?${q}` : pathname || '/', { scroll: false });
   };

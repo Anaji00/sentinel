@@ -77,7 +77,7 @@ export default async function MarketsPage({
       {view.key === 'crypto' && (
         <>
           <CryptoPriceChartIsland />
-          <div className="flex min-h-[450px] flex-col overflow-hidden rounded-2xl border border-line bg-raised">
+          <div className="flex min-h-[450px] flex-col overflow-hidden rounded-md border border-line bg-raised">
             <CryptoAnalyticsIsland />
           </div>
         </>
@@ -88,7 +88,7 @@ export default async function MarketsPage({
         </div>
       )}
       {view.key === 'radar' && (
-        <div className="flex min-h-[450px] flex-col overflow-hidden rounded-2xl border border-line bg-raised">
+        <div className="flex min-h-[450px] flex-col overflow-hidden rounded-md border border-line bg-raised">
           <QuantRadarIsland />
         </div>
       )}

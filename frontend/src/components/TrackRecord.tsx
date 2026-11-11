@@ -116,7 +116,7 @@ export function FreshnessStrip() {
 export function TrackRecord() {
   const { data, error } = useSWR<Record_>('/predictions/track-record', fetcher, { refreshInterval: POLL.slow });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-3 text-xs">
       <h2 className="font-bold text-ink text-sm">Track record</h2>
       <p className="text-ink-dim">
         Every trade idea graded over its horizon from the price it was given at, and every signal-board row graded one
@@ -207,7 +207,7 @@ interface Ledger {
 export function PaperLedger() {
   const { data, error } = useSWR<Ledger>('/predictions/paper-ledger', fetcher, { refreshInterval: POLL.slow });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-3 text-xs">
       <h2 className="font-bold text-ink text-sm">Paper ledger</h2>
       <p className="text-ink-dim">
         What the trade ideas would actually have made: each one bought or sold at the next morning&apos;s open, $250,000
@@ -381,7 +381,7 @@ export function ProducerGrades() {
     refreshInterval: POLL.slow,
   });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-3 text-xs">
       <h2 className="font-bold text-ink text-sm">Graded against prices</h2>
       <p className="text-ink-dim">
         Correlation alerts, scenarios and agent calls, checked against what prices did. &ldquo;Move vs usual&rdquo; compares

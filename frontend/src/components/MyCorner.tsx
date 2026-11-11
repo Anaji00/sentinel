@@ -89,7 +89,7 @@ function MyStocks() {
   }));
   const onCalls = rows.filter((r) => r.call).length;
   return (
-    <section className="rounded-2xl border border-line bg-raised p-4 space-y-3">
+    <section className="rounded-md border border-line bg-raised p-4 space-y-3">
       <div className="flex items-baseline justify-between gap-2">
         <h2 className="text-sm font-semibold text-ink">Your stocks</h2>
         <span className="text-micro text-ink-mute">{prefs ? callsLine(onCalls, tickers.length) : ''}</span>
@@ -185,7 +185,7 @@ function MyTownCard() {
   const { prefs } = usePreferences();
   const town = prefs?.town ?? null;
   return (
-    <section className="rounded-2xl border border-civic/25 bg-raised p-4 space-y-3">
+    <section className="rounded-md border border-civic/25 bg-raised p-4 space-y-3">
       <div className="flex items-baseline justify-between gap-2">
         <h2 className="text-sm font-semibold text-ink">Your town</h2>
         <Link href="/watch" className="text-micro text-civic hover:underline">

@@ -33,6 +33,8 @@ import { useNav } from './NavContext';
 import { TIMEZONES, useTimeZone } from './TimeZoneContext';
 import { useSession } from './SessionContext';
 import { HeaderSearch } from './HeaderSearch';
+import { MarketMood } from './MarketMood';
+import { DeskFigures } from './DeskFigures';
 
 /** Initials for the avatar, from whatever the session actually gives us. */
 function initialsFor(email?: string | null): string {
@@ -184,6 +186,8 @@ export const Header: React.FC = () => {
             <span className={streamTone}>{isConnected ? 'on' : streamIdle ? 'resting' : 'connecting…'}</span>
           )}
         </span>
+        <MarketMood />
+        <DeskFigures />
       </div>
 
       {/* Controls */}

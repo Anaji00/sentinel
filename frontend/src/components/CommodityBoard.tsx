@@ -133,7 +133,7 @@ export default function CommodityBoard() {
       </p>
       <div className="grid gap-5 xl:grid-cols-2">
         {data.categories.map((c) => (
-          <section key={c.key} aria-label={c.title} className="space-y-2 rounded-xl border border-line bg-raised p-4">
+          <section key={c.key} aria-label={c.title} className="space-y-2 rounded-md border border-line bg-raised p-4">
             <div className="flex items-baseline justify-between gap-3">
               <h2 className="text-head font-semibold text-ink">{c.title}</h2>
               <div className="hidden gap-1 text-micro text-ink-mute sm:flex" aria-hidden>

@@ -87,11 +87,11 @@ export function TopCalls({ count = 4 }: { count?: number }) {
       ) : !data ? (
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {Array.from({ length: count }, (_, n) => (
-            <div key={n} className="h-56 rounded-2xl border border-line bg-inset animate-pulse" />
+            <div key={n} className="h-56 rounded-md border border-line bg-inset animate-pulse" />
           ))}
         </div>
       ) : calls.length === 0 ? (
-        <p className="rounded-2xl border border-dashed border-line p-4 text-xs text-ink-mute">
+        <p className="rounded-md border border-dashed border-line p-4 text-xs text-ink-mute">
           {data.note ?? 'No calls yet: the model runs each evening after the close.'}
         </p>
       ) : (

@@ -68,7 +68,7 @@ export function autoTradeLine(d: AutoTrade): string {
 export default function AutoTradePanel() {
   const { data, error } = useSWR<AutoTrade>('/predictions/auto-trade', fetcher, { refreshInterval: POLL.slow });
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-3 text-xs">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-3 text-xs">
       <div className="flex flex-wrap items-baseline gap-2">
         <h2 className="font-bold text-ink text-sm">Positions taken automatically</h2>
         <Updated source="/predictions/auto-trade" pollMs={60_000} />

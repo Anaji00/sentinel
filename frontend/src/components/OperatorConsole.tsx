@@ -24,7 +24,7 @@ export function OperatorConsole() {
   };
 
   return (
-    <details className="group rounded-2xl border border-line bg-raised" onToggle={onToggle}>
+    <details className="group rounded-md border border-line bg-raised" onToggle={onToggle}>
       <summary className="flex cursor-pointer items-baseline justify-between gap-2 px-4 py-3">
         <span id="console-heading" className="text-sm font-semibold text-ink">
           Operator console{' '}

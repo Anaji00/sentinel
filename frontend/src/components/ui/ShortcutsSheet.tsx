@@ -29,7 +29,7 @@ function Sheet({ onClose }: { onClose: () => void }) {
   ];
   return (
     <div className="fade-in fixed inset-0 z-[90] flex items-start justify-center bg-black/60 px-4 pt-[14vh]" {...dialog.overlayProps}>
-      <div className="drawer-in w-full max-w-sm rounded-xl border border-line-strong bg-raised p-5 shadow-overlay" {...dialog.panelProps}>
+      <div className="drawer-in w-full max-w-sm rounded-md border border-line-strong bg-raised p-5 shadow-overlay" {...dialog.panelProps}>
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-head font-semibold text-ink">Keyboard shortcuts</h2>
           <Button variant="outline" size="sm" onClick={onClose}>

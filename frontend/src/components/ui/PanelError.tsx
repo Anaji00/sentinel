@@ -29,7 +29,7 @@ export function PanelError({ what, onRetry, inline = false }: { what: string; on
       {body}
     </span>
   ) : (
-    <div role="status" className="rounded-xl border border-dashed border-caution/30 p-6 text-center text-xs text-caution">
+    <div role="status" className="rounded-md border border-dashed border-caution/30 p-6 text-center text-xs text-caution">
       {body}
     </div>
   );

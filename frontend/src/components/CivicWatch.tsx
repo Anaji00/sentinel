@@ -549,8 +549,8 @@ function Explore({
   const active = subs.some(([k]) => k === view) ? view : subs[0][0];
   const meta = SECTIONS.find((s) => s.id === section)!;
   return (
-    <section id="explore" className="scroll-mt-4 rounded-2xl border border-line bg-raised">
-      <div className="sticky top-0 z-10 rounded-t-2xl border-b border-line bg-raised/95 backdrop-blur-sm px-4 pt-3">
+    <section id="explore" className="scroll-mt-4 rounded-md border border-line bg-raised">
+      <div className="sticky top-0 z-10 rounded-t-md border-b border-line bg-raised/95 px-4 pt-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div role="tablist" aria-label="Explore" className="flex flex-wrap gap-1">
             {SECTIONS.map((s) => (
@@ -830,7 +830,7 @@ export function CivicWatch() {
           back keeps water blue-ish and land dark, with no second tile source. */}
       <style>{`.civic-tiles{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.45)}:root[data-theme="light"] .civic-tiles{filter:saturate(.8)}.leaflet-container{background:var(--bg-inset)}`}</style>
 
-      <header className="rounded-2xl border border-line bg-raised p-5 space-y-4 bg-[radial-gradient(ellipse_70%_120%_at_0%_0%,var(--accent-dim),transparent)]">
+      <header className="rounded-md border border-line bg-raised p-5 space-y-4 bg-[radial-gradient(ellipse_70%_120%_at_0%_0%,var(--accent-dim),transparent)]">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="space-y-1 max-w-2xl">
             <h1 className="text-lead font-semibold text-ink">Who&apos;s watching your town?</h1>
@@ -860,9 +860,9 @@ export function CivicWatch() {
             -- Platform health opened underneath the map. Its own stacking
             context keeps those numbers inside the map, where the legend's
             z-[500] still sits above the tiles. */}
-        <div className="relative isolate rounded-2xl border border-line overflow-hidden h-[68vh] min-h-[480px]">
+        <div className="relative isolate rounded-md border border-line overflow-hidden h-[68vh] min-h-[480px]">
           <div ref={mapEl} className="absolute inset-0" />
-          <div className="absolute left-3 top-3 z-[500] rounded-xl border border-line bg-overlay/95 p-2.5 text-xs space-y-1.5 shadow-overlay">
+          <div className="absolute left-3 top-3 z-[500] rounded-md border border-line bg-overlay/95 p-2.5 text-xs space-y-1.5 shadow-overlay">
             <div className="text-micro uppercase tracking-wider text-ink-mute">On the map</div>
             {toggles.map(([k, label, color]) => (
               <label key={k} className="flex items-center gap-2 cursor-pointer text-ink-dim hover:text-ink">
@@ -885,7 +885,7 @@ export function CivicWatch() {
           )}
         </div>
 
-        <aside className="rounded-2xl border border-line bg-raised p-4 overflow-y-auto h-[68vh] min-h-[480px]" aria-live="polite">
+        <aside className="rounded-md border border-line bg-raised p-4 overflow-y-auto h-[68vh] min-h-[480px]" aria-live="polite">
           {trail.length > 0 && (
             <nav aria-label="Trail" className="mb-3 flex flex-wrap items-center gap-1 text-micro text-ink-mute">
               <button type="button" onClick={() => setTrail([])} className="hover:text-accent">

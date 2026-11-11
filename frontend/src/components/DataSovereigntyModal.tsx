@@ -165,7 +165,7 @@ export const DataSovereigntyModal: React.FC = () => {
           {...dialog.overlayProps}
         >
           <div
-            className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-2xl border border-line-strong bg-raised p-6 text-ink"
+            className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-md border border-line-strong bg-raised p-6 text-ink"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-4">
@@ -199,7 +199,7 @@ export const DataSovereigntyModal: React.FC = () => {
                 {/* The integrity block, first, because it is the only part of
                     this manifest that can change without anyone editing code
                     -- and the only part that can be false. */}
-                <div className="space-y-2 rounded-xl border border-line bg-page p-3.5">
+                <div className="space-y-2 rounded-md border border-line bg-page p-3.5">
                   <span className="stat-label flex items-center gap-1.5">
                     <IconLock />
                     Integrity
@@ -259,7 +259,7 @@ export const DataSovereigntyModal: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="space-y-2 rounded-xl border border-negative/30 bg-page p-3.5">
+                <div className="space-y-2 rounded-md border border-negative/30 bg-page p-3.5">
                   <span className="stat-label flex items-center gap-1.5 tone-negative">
                     <IconBlocked />
                     Never collected ({data.prohibited_categories.length})

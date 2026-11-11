@@ -85,7 +85,7 @@ export function RunBacktest() {
           {...dialog.overlayProps}
         >
           <div
-            className="w-full max-w-md space-y-4 rounded-2xl border border-line-strong bg-raised p-6 text-ink"
+            className="w-full max-w-md space-y-4 rounded-md border border-line-strong bg-raised p-6 text-ink"
             {...dialog.panelProps}
           >
             <div className="flex items-center justify-between border-b border-line pb-3">

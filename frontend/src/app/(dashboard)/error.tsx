@@ -30,7 +30,7 @@ export default function DashboardError({
 
   return (
     <div role="alert" className="flex h-full w-full items-center justify-center p-6">
-      <div className="w-full max-w-md rounded-xl border border-negative/30 bg-negative/10 p-6">
+      <div className="w-full max-w-md rounded-md border border-negative/30 bg-negative/10 p-6">
         <div className="flex items-center gap-2.5">
           <AlertTriangle className="h-4 w-4 shrink-0 text-negative" />
           <h2 className="text-sm font-bold text-negative">This view could not be loaded</h2>

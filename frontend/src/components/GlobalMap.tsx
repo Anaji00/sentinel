@@ -814,9 +814,9 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
   // remove. The cyber domain is retired from the platform altogether.
 
   return (
-    <div className="w-full h-full bg-inset relative overflow-hidden text-ink rounded-xl border border-accent/20 shadow-panel">
+    <div className="w-full h-full bg-inset relative overflow-hidden text-ink rounded-md border border-accent/20 shadow-panel">
       {/* Top Bar Navigation & Multi-Domain Layer Toggles */}
-      <div className="absolute top-3 left-3 right-3 z-10 bg-page/90 px-3.5 py-2 rounded-lg border border-accent/30 text-xs flex flex-wrap items-center justify-between gap-2 shadow-2xl">
+      <div className="absolute top-3 left-3 right-3 z-10 bg-page/90 px-3.5 py-2 rounded-lg border border-accent/30 text-xs flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-accent animate-ping" />
           <span className="text-accent font-semibold">Global map</span>
@@ -928,7 +928,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
 
       {/* Object Inspector Drawer Modal */}
       {selectedObject && (
-        <div className="absolute top-14 left-3 z-20 bg-page/95 border border-accent/50 p-4 rounded-xl max-w-sm text-xs shadow-2xl space-y-2.5">
+        <div className="absolute top-14 left-3 z-20 bg-page/95 border border-accent/50 p-4 rounded-md max-w-sm text-xs space-y-2.5">
           <div className="flex items-center justify-between border-b border-accent/30 pb-2">
             <span className="font-bold text-accent">
               {selectedObject.type === 'vessel' &&
@@ -1304,7 +1304,7 @@ export default function GlobalMap({ windowHours }: { windowHours?: number } = {}
 
       {/* Conflict zones: the list, or one zone's detail. */}
       {showZones && conflict && conflict.zones.length > 0 && (
-        <div className="absolute top-24 right-3 z-20 bg-page/95 border border-negative/40 p-3 rounded-xl w-80 max-h-[calc(100%-9rem)] overflow-y-auto text-xs shadow-2xl">
+        <div className="absolute top-24 right-3 z-20 bg-page/95 border border-negative/40 p-3 rounded-md w-80 max-h-[calc(100%-9rem)] overflow-y-auto text-xs">
           {selectedZone ? (
             <ConflictZoneDetail zone={selectedZone} onBack={() => setSelectedZoneId(null)} />
           ) : (

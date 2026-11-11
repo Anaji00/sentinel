@@ -55,7 +55,7 @@ export function Welcome() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" {...dialog.overlayProps}>
-      <div className="w-full max-w-2xl space-y-5 rounded-2xl border border-line bg-raised p-6 shadow-overlay" {...dialog.panelProps}>
+      <div className="w-full max-w-2xl space-y-5 rounded-md border border-line bg-raised p-6 shadow-overlay" {...dialog.panelProps}>
         <div className="space-y-1.5">
           <h2 className="text-lead font-semibold text-ink">Welcome to Sentinel</h2>
           <p className="text-sm text-ink-dim">
@@ -69,7 +69,7 @@ export function Welcome() {
               key={c.focus}
               type="button"
               onClick={() => choose(c.focus, c.go)}
-              className={`rounded-xl border bg-inset p-4 text-left transition-colors ${c.tone}`}
+              className={`rounded-md border bg-inset p-4 text-left transition-colors ${c.tone}`}
             >
               <div className="text-sm font-semibold text-ink">{c.title}</div>
               <p className="mt-1 text-xs text-ink-dim">{c.text}</p>

@@ -21,7 +21,7 @@ export default function FirstLook() {
     setShow(false);
   };
   return (
-    <section aria-label="How to read this page" className="space-y-2 rounded-xl border border-line-accent bg-accent-dim p-4">
+    <section aria-label="How to read this page" className="space-y-2 rounded-md border border-line-accent bg-accent-dim p-4">
       <div className="flex items-start justify-between gap-3">
         <h3 className="text-sm font-semibold text-ink">How to read this</h3>
         <Button variant="outline" size="sm" onClick={close}>

@@ -11,7 +11,7 @@ const TONE: Record<HeadlineTone, string> = { positive: 'text-positive', negative
 
 export function Headline({ view }: { view: HeadlineView }) {
   return (
-    <section aria-label="Headline" className="flex flex-wrap items-end gap-x-5 gap-y-1 rounded-xl border border-line bg-raised px-5 py-4">
+    <section aria-label="Headline" className="flex flex-wrap items-end gap-x-5 gap-y-1 rounded-md border border-line bg-raised px-5 py-4">
       <div className={`font-mono text-display font-semibold leading-none ${TONE[view.tone]}`}>{view.value}</div>
       <div className="min-w-0">
         <div className="text-sm font-medium text-ink">{view.label}</div>

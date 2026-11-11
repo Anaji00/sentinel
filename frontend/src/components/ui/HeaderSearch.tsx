@@ -166,7 +166,7 @@ export function HeaderSearch(): React.ReactElement {
             id={listId}
             role="listbox"
             aria-label="Stock suggestions"
-            className="absolute left-0 right-0 top-full z-50 mt-1 max-h-80 overflow-auto rounded-lg border border-line-strong bg-inset py-1 shadow-lg"
+            className="absolute left-0 right-0 top-full z-50 mt-1 max-h-80 overflow-auto rounded-lg border border-line-strong bg-inset py-1"
           >
             {results.map((s, i) => (
               <li

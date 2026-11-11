@@ -72,7 +72,7 @@ function Fact({ value, label, href }: { value: string; label: string; href: stri
   return (
     <Link
       href={href}
-      className="group rounded-xl border border-civic/20 bg-page/40 px-4 py-3 hover:border-civic/50"
+      className="group rounded-md border border-civic/20 bg-page/40 px-4 py-3 hover:border-civic/50"
     >
       <div className="font-mono text-lead leading-none text-ink group-hover:text-civic">{value}</div>
       <div className="mt-1.5 text-micro leading-snug text-ink-dim">{label}</div>
@@ -102,7 +102,7 @@ export function WhoIsWatching() {
   return (
     <section
       aria-labelledby="who-is-watching"
-      className="rounded-2xl border border-civic/25 bg-gradient-to-br from-civic-dim via-raised to-raised p-4 sm:p-5 space-y-5"
+      className="rounded-md border border-civic/25 bg-gradient-to-br from-civic-dim via-raised to-raised p-4 sm:p-5 space-y-5"
     >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="max-w-2xl space-y-1">

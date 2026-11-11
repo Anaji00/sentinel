@@ -179,7 +179,7 @@ export function NotificationBell() {
         <div
           role="region"
           aria-label="Notifications"
-          className="fixed inset-x-2 top-14 z-50 flex max-h-[80vh] flex-col overflow-hidden rounded-xl border border-line-strong bg-raised shadow-overlay sm:absolute sm:inset-x-auto sm:right-0 sm:top-10 sm:w-96"
+          className="fixed inset-x-2 top-14 z-50 flex max-h-[80vh] flex-col overflow-hidden rounded-md border border-line-strong bg-raised shadow-overlay sm:absolute sm:inset-x-auto sm:right-0 sm:top-10 sm:w-96"
         >
           <div className="flex items-center justify-between gap-2 border-b border-line px-4 py-2.5">
             <h2 className="text-sm font-semibold text-ink">Notifications</h2>

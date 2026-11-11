@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
   public render() {
     if (this.state.hasError) {
       return (
-        <div className="flex flex-col items-center justify-center h-full w-full p-6 bg-inset border border-caution/30 rounded-xl text-center">
+        <div className="flex flex-col items-center justify-center h-full w-full p-6 bg-inset border border-caution/30 rounded-md text-center">
           <div className="h-10 w-10 rounded-full bg-caution/10 text-caution flex items-center justify-center font-bold text-lg mb-3 border border-caution/30 animate-pulse">
             <IconAlert className="inline-block shrink-0" />
           </div>

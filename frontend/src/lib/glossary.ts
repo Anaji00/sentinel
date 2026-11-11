@@ -13,6 +13,7 @@ export const GLOSSARY: Record<string, string> = {
   'information ratio': 'Gain over the S&P 500 for each unit of difference from it. Above 0.5 is good.',
   turnover: 'How much of the portfolio is replaced each time it rebalances. High turnover means more trading costs.',
   beta: 'How much a stock or portfolio moves when the market moves. 1 moves with the market; 0.5 moves half as much.',
+  correlation: 'How closely two stocks\u2019 daily moves track each other. 1 means they move in lockstep, 0 means unrelated, and below 0 means they tend to move opposite ways.',
   drawdown: 'The biggest fall from a high point before it recovered.',
 };
 

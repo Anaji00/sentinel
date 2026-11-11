@@ -61,7 +61,7 @@ export default function ThesisPanel({ ticker }: { ticker: string }) {
   };
 
   return (
-    <section aria-label="Bull and bear case" className="space-y-3 rounded-xl border border-line bg-inset p-4">
+    <section aria-label="Bull and bear case" className="space-y-3 rounded-md border border-line bg-inset p-4">
       <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">Bull case and bear case</h3>
 
       {isLoading ? (

@@ -148,7 +148,7 @@ export function ConvergingEvidence() {
   });
 
   return (
-    <section className="bg-raised border border-line rounded-xl p-4 space-y-2">
+    <section className="bg-raised border border-line rounded-md p-4 space-y-2">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <h3 className="font-bold text-ink">Where the evidence agrees</h3>
         <div className="flex gap-1">

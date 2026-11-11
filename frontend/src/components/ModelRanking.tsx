@@ -157,7 +157,7 @@ export function ModelRanking() {
   return (
     // The model's research record, folded: readers need the one-line answer;
     // the IC, Sharpe and turnover table is there for anyone checking it.
-    <details className="group bg-raised border border-line rounded-xl p-4 space-y-3">
+    <details className="group bg-raised border border-line rounded-md p-4 space-y-3">
       <summary className="cursor-pointer list-none space-y-1">
         <div className="text-sm font-semibold text-ink">
           Behind the scenes: how the ranking model is tested{' '}

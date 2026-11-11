@@ -83,23 +83,23 @@ function Hero({ o }: { o: OwnershipOverview }) {
         </h1>
         <p className="max-w-2xl text-base text-ink-dim">
           Vanguard is the single largest shareholder of {vanguard} of {c.companies} companies, BlackRock of{' '}
-          {blackrock} more. Much of that sits in index funds, including people&apos;s retirement accounts, and these firms usually vote the shares.
+          {blackrock}{' '}more. Much of that sits in index funds, including people&apos;s retirement accounts, and these firms usually vote the shares.
         </p>
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <div className="rounded-2xl border border-line bg-raised p-5">
+        <div className="rounded-md border border-line bg-raised p-5">
           <div className="font-mono text-display font-semibold text-ink tabular">{two}</div>
           <div className="text-sm text-ink-dim">
             of {c.companies} companies where Vanguard or BlackRock is owner number one
           </div>
         </div>
-        <div className="rounded-2xl border border-line bg-raised p-5">
+        <div className="rounded-md border border-line bg-raised p-5">
           <div className="font-mono text-display font-semibold text-ink tabular">{pct1(c.median_big_three_pct)}</div>
           <div className="text-sm text-ink-dim">
             of a typical company held by just three firms: BlackRock, Vanguard and State Street
           </div>
         </div>
-        <div className="rounded-2xl border border-line bg-raised p-5">
+        <div className="rounded-md border border-line bg-raised p-5">
           <div className="font-mono text-display font-semibold text-ink tabular">{c.notable}</div>
           <div className="text-sm text-ink-dim">
             companies where those three hold {formatNumber(c.notable_threshold_pct ?? 15, { decimals: 0 })}% or more
@@ -120,7 +120,7 @@ function OwnerLookup() {
   const holders = (data?.holders ?? []).filter((h) => (h.pct_outstanding ?? 0) > 0).slice(0, 10);
   const max = holders.length ? (holders[0].pct_outstanding ?? 1) : 1;
   return (
-    <div className="rounded-2xl border border-line bg-raised p-5 space-y-4">
+    <div className="rounded-md border border-line bg-raised p-5 space-y-4">
       <form
         className="flex flex-wrap items-end gap-2"
         onSubmit={(e) => {
@@ -192,7 +192,7 @@ function Rivals({ rivals }: { rivals: OwnershipOverview['rivals'] }) {
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
       {rivals.slice(0, 8).map((r) => (
-        <article key={`${r.a}-${r.b}`} className="rounded-2xl border border-line bg-raised p-5 space-y-3">
+        <article key={`${r.a}-${r.b}`} className="rounded-md border border-line bg-raised p-5 space-y-3">
           <div className="space-y-0.5">
             <div className="text-base font-semibold text-ink">
               {r.a_name ?? r.a} <span className="font-normal text-ink-mute">vs</span> {r.b_name ?? r.b}
@@ -222,7 +222,7 @@ function Network({ rows }: { rows: CrossHolding[] }) {
   const strongest = [...rows].sort((a, b) => b.pct - a.pct).slice(0, 5);
   return (
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
-      <div className="overflow-x-auto rounded-2xl border border-line bg-raised p-3">
+      <div className="overflow-x-auto rounded-md border border-line bg-raised p-3">
         <svg
           viewBox={`0 0 ${size} ${size}`}
           className="mx-auto block w-full max-w-[560px]"
@@ -269,7 +269,7 @@ function Network({ rows }: { rows: CrossHolding[] }) {
         </p>
         <ul className="space-y-2">
           {strongest.map((r) => (
-            <li key={`${r.holder}-${r.held}`} className="rounded-xl border border-line bg-raised px-4 py-3 text-sm">
+            <li key={`${r.holder}-${r.held}`} className="rounded-md border border-line bg-raised px-4 py-3 text-sm">
               <span className="text-ink">{shortName(r.holder)}</span> <span className="text-ink-mute">owns</span>{' '}
               <span className="font-mono text-civic">{pct1(r.pct)}</span> <span className="text-ink-mute">of</span>{' '}
               <span className="text-ink">{shortName(r.held)}</span>
@@ -294,7 +294,7 @@ function Dependence({ groups }: { groups: SupplyGroup[] }) {
   return (
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
       {walmart && (
-        <div className="rounded-2xl border border-line bg-raised p-5 space-y-4">
+        <div className="rounded-md border border-line bg-raised p-5 space-y-4">
           <p className="text-sm text-ink-dim">
             Share of each company&apos;s sales that goes to <span className="text-ink">Walmart</span>, as each one
             reported it to the SEC.
@@ -316,7 +316,7 @@ function Dependence({ groups }: { groups: SupplyGroup[] }) {
       )}
       <div className="space-y-3">
         {rest.map((g) => (
-          <div key={g.buyer} className="rounded-xl border border-line bg-raised px-4 py-3 space-y-1.5">
+          <div key={g.buyer} className="rounded-md border border-line bg-raised px-4 py-3 space-y-1.5">
             <div className="text-sm text-ink">{g.buyer_name} buys</div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
               {g.suppliers.map((s) => (
@@ -339,7 +339,7 @@ function PublicMoney({ money, lobbying }: { money?: CivicMoney; lobbying?: Lobby
   const maxL = lobby[0]?.total ?? 1;
   return (
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-      <div className="rounded-2xl border border-line bg-raised p-5 space-y-3">
+      <div className="rounded-md border border-line bg-raised p-5 space-y-3">
         <h3 className="text-sm font-semibold text-ink">Federal contracts to surveillance vendors</h3>
         {contracts.length === 0 ? (
           <p className="text-sm text-ink-mute">No awards matched yet.</p>
@@ -360,7 +360,7 @@ function PublicMoney({ money, lobbying }: { money?: CivicMoney; lobbying?: Lobby
           </ul>
         )}
       </div>
-      <div className="rounded-2xl border border-line bg-raised p-5 space-y-3">
+      <div className="rounded-md border border-line bg-raised p-5 space-y-3">
         <h3 className="text-sm font-semibold text-ink">Spent lobbying Congress</h3>
         {lobby.length === 0 ? (
           <p className="text-sm text-ink-mute">No lobbying filings matched yet.</p>
@@ -393,7 +393,7 @@ function Interlocks({ rows }: { rows?: Interlock[] }) {
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
       {list.map((r) => (
-        <div key={r.person} className="rounded-xl border border-line bg-raised px-4 py-3 space-y-1.5">
+        <div key={r.person} className="rounded-md border border-line bg-raised px-4 py-3 space-y-1.5">
           <div className="flex items-baseline justify-between gap-3">
             <span className="truncate text-sm text-ink">{r.person}</span>
             <span className="shrink-0 font-mono text-lead font-semibold text-civic tabular">{r.companies.length}</span>

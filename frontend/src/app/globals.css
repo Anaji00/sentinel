@@ -138,7 +138,7 @@
     --shadow-panel-value: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-overlay-value: 0 8px 32px rgba(0, 0, 0, 0.55);
 
-    --radius: 14px;
+    --radius: 6px;
 
     /* Five steps, and a floor.
        Twelve distinct sizes were in use, four of them arbitrary pixel values,
@@ -211,10 +211,7 @@
     overflow: hidden;
     /* One faint gradient for depth. The 32px grid overlay it replaced added
        texture behind every table row and made small type harder to read. */
-    background-image:
-      radial-gradient(ellipse 75% 50% at 50% -14%, color-mix(in srgb, var(--accent) 16%, transparent), transparent),
-      radial-gradient(ellipse 45% 35% at 100% 100%, color-mix(in srgb, var(--civic) 5%, transparent), transparent);
-    background-attachment: fixed;
+    /* A flat tinted canvas: no glow, so nothing but data draws the eye. */
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
@@ -238,12 +235,10 @@
   /* ── Panel: the single container primitive ──────────────────────────────── */
 
   .panel {
-    /* A lit top edge and a faint top-down tint: the surface reads as raised
-       rather than as a flat rectangle, with no blur and no glow. */
-    background: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3%, var(--bg-raised)), var(--bg-raised) 40%);
+    contain: layout style paint;
+    background: var(--bg-raised);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius);
-    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent), var(--shadow-panel);
   }
 
   /* Hover is a hint of interactivity, not an event. */
@@ -337,11 +332,9 @@
      tone here, not by a halo. */
 
   .glass-panel {
-    background: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3%, var(--bg-raised)), var(--bg-raised) 40%);
+    contain: layout style paint;
+    background: var(--bg-raised);
     border: 1px solid var(--border-subtle);
-    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent), var(--shadow-panel);
-    /* No backdrop-filter: sixteen blurred layers cost frame time and take
-       contrast away from the text on top of them. */
   }
 
   .glass-panel-hover { transition: border-color 150ms ease, background-color 150ms ease; }
@@ -355,32 +348,16 @@
 }
 
 @layer utilities {
-  /* Every raised surface gets the same lit edge and tint as .panel, so the
-     many cards written as `bg-raised` match the ones that use the class.
-     Elements that are not containers (inputs, chips) are left flat. */
-  :where(section, article, aside, div).bg-raised {
-    background-image: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 3.5%, transparent), transparent 45%);
-    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 6%, transparent);
-  }
-
-  /* A card that opens something lifts a little under the pointer. */
+  /* A card that opens something answers the pointer with a firmer border. */
   .lift {
-    transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+    transition: border-color 160ms ease;
   }
   .lift:hover {
-    transform: translateY(-2px);
-    box-shadow: var(--shadow-overlay);
+    border-color: var(--border-strong);
   }
 
-  /* A coloured wash from the top of a card, for a direction (up, down) or a state.
-     The colour comes from the element's own `color`, so a tone class sets it. */
-  .wash {
-    background-image: linear-gradient(180deg, color-mix(in srgb, currentColor 9%, transparent), transparent 55%);
-  }
-  /* On white the same percentage reads as pink or mint, so the light theme uses less. */
-  :root[data-theme="light"] .wash {
-    background-image: linear-gradient(180deg, color-mix(in srgb, currentColor 4%, transparent), transparent 50%);
-  }
+  /* .wash is kept as a name so existing cards still resolve; it paints nothing. Direction is the top rule and the figure colour. */
+  .wash { background-image: none; }
 
   /* Scrollbars recede until the region is hovered. */
   ::-webkit-scrollbar { width: 10px; height: 10px; }

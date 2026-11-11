@@ -274,7 +274,7 @@ export default function OperationsConsole() {
         {waiting.map((w) => (
           <div
             key={w.label}
-            className={`rounded-xl border px-4 py-3 ${w.n ? 'border-caution/30 bg-caution/5' : 'border-line bg-raised'}`}
+            className={`rounded-md border px-4 py-3 ${w.n ? 'border-caution/30 bg-caution/5' : 'border-line bg-raised'}`}
           >
             <div
               className={`font-mono text-lead leading-none ${w.n ? 'text-caution' : 'text-ink'}`}
