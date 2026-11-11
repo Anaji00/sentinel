@@ -316,6 +316,28 @@ Score = z(12-1 momentum) minus z(126-day volatility), equal weights, no model. B
 the model has not been shown to add value over a rule. If B1 leads by 0.15 or more on the mean and on 5 of 8 calendars, the model earns its place. Descriptive, with no
 change to the trader either way. Adds 1 trial.
 
+**Amendment RB1a, written before the run (11 Nov 2026).** The panel computes 63-day volatility (`vol_63`), not 126-day, so RB1 uses `vol_63`; the two are highly
+correlated and nothing else changes. It runs through the same walk-forward book code as B1 (`factor_model.walk_forward`, model name `rb1_rule`, names with a missing
+feature kept as in B1's tree models and scored 0, so never picked), on the eight monthly calendars 0, 5, 10, 15 and 2, 7, 12, 17 sessions. The walk-forward's own net Sharpe
+has no borrow fee, so the 0.44% a month short fee is subtracted afterwards: the spread's per-period volatility is recovered as net mean / per-period Sharpe, and
+Sharpe = (net mean - 44 bps) / that volatility x sqrt(12). B1 is not re-run (eight lgbm_rank walk-forwards do not fit beside the stack in memory): it is compared as published
+above, mean 0.40 over the eight (0.47 on 0, 5, 10, 15; 0.34, 0.49, 0.19, 0.28 on 2, 7, 12, 17). Because the per-calendar B1 values for 0, 5, 10, 15 were not kept, the
+"B1 leads on 5 of 8 calendars" half of the reading is judged on the four fresh calendars only (leads on at least 3 of 4) and said so.
+
+### RB1 result (11 Nov 2026; `scripts/run_rb1.py`, own 9 GiB container, about 100 out-of-sample months a calendar)
+
+| Calendar (sessions) | 0 | 5 | 10 | 15 | 2 | 7 | 12 | 17 | Mean |
+|---|---|---|---|---|---|---|---|---|---|
+| RB1 rank IC | 0.017 | 0.030 | 0.034 | 0.033 | 0.023 | 0.039 | 0.033 | 0.028 | 0.030 |
+| RB1 net Sharpe, no borrow fee | -0.15 | 0.02 | -0.02 | 0.02 | -0.06 | -0.04 | -0.02 | -0.05 | -0.04 |
+| **RB1 net Sharpe after the 0.44% fee** | -0.39 | -0.23 | -0.26 | -0.20 | -0.33 | -0.28 | -0.24 | -0.28 | **-0.28** |
+| B1, as published | | | | 0.47 on 0, 5, 10, 15 | 0.34 | 0.49 | 0.19 | 0.28 | 0.40 |
+
+**Reading: B1 leads by 0.68 on the mean (the bar was 0.15) and by at least 0.15 on all four fresh calendars. The model earns its place over this rule.** The rule's ranks do carry
+information (positive rank IC on every calendar, 0.017 to 0.039, in the range the model's own IC is judged against), but the long-short spread they give is roughly zero before costs, so it cannot pay
+the borrow fee. Limits: B1 is the published figure, not re-run on this code path; the fee is subtracted after the fact from the report's mean and per-period Sharpe; 63-day volatility stands in for 126-day (RB1a).
+Descriptive: no change to the trader. Adds 1 trial.
+
 ## More history: what exists (6 November 2026)
 
 `daily_bars` runs from 4 Jan 2016, which is as far back as the free Alpaca plan serves, and the engine already reads 11 years (O1's gain). 13,108 tickers, of which

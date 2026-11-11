@@ -115,6 +115,9 @@ OPTIONAL_FEATURES = {"dtc", "ear", "ind_mom", "ind_rev_21", "mom_on_12_1", "id_2
 # a tree can learn the difference. Ridge and the rank average cannot take a
 # missing value, so they keep the neutral fill.
 NAN_NATIVE_MODELS = {"gbm", "lgbm_rank", "lgbm_rank2", "avg2"}
+# Models whose names with a missing optional feature stay in the cross-section: the trees (which read the gap) and the RB1
+# rule (which scores a missing input 0), so RB1 ranks the same names B1 does.
+NAN_OK_MODELS = NAN_NATIVE_MODELS | {"rb1_rule"}
 RANK_LABELS = 5                 # the ranker's relevance grades: the day's quintiles
 RANK_TRUNCATION = 5000          # above any day's ranked names, so every pair counts
 HORIZON = 5                 # trading days ahead
@@ -1052,9 +1055,26 @@ class ModelReport:
     exposures: Dict[str, Any] = field(default_factory=dict)
 
 
+def rb1_rule(mom: np.ndarray, vol: np.ndarray) -> np.ndarray:
+    """RB1 (MODEL_TRIALS.md, registered 6 Nov 2026): the cross-section's z of 12-1 momentum minus its z of volatility, equal
+    weights, no model. A name missing either input scores 0 (the middle), so it is never picked for either leg."""
+    def z(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        ok = np.isfinite(x)
+        out = np.zeros_like(x)
+        if ok.sum() > 2 and np.std(x[ok]) > 0:
+            out[ok] = (x[ok] - x[ok].mean()) / x[ok].std()
+        return out
+    return z(mom) - z(vol)
+
+
 def _predict(model_name: str, est, X: np.ndarray) -> np.ndarray:
     if model_name == "momentum":
         return X[:, FEATURES.index("mom_12_1")]
+    if model_name == "rb1_rule":
+        # vol_63 stands in for the registered 126-day volatility, which the panel does not compute (amendment RB1a,
+        # MODEL_TRIALS.md, written before the run).
+        return rb1_rule(X[:, FEATURES.index("mom_12_1")], X[:, FEATURES.index("vol_63")])
     return est.predict(X)
 
 
@@ -1124,7 +1144,7 @@ def walk_forward(panel: Panel, model_name: str, horizon: int = HORIZON,
                  feats: Optional[Dict[str, np.ndarray]] = None,
                  collect: Optional[List[Tuple[int, int, int, float, float]]] = None,
                  collect_preds: Optional[List[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]] = None,
-                 target_mode: str = "excess") -> ModelReport:
+                 target_mode: str = "excess", offset: int = 0) -> ModelReport:
     """Out-of-sample evaluation, refit each fold on purged history.
 
     `target_mode` (training_target) changes what each fold is trained on; the
@@ -1140,7 +1160,8 @@ def walk_forward(panel: Panel, model_name: str, horizon: int = HORIZON,
     train_target = target if target_mode == "excess" else training_target(panel, horizon, feats, target_mode)
     T = len(panel.dates)
     train_sampled = list(range(MIN_HISTORY, T - horizon, sp.train_every))
-    sampled = list(range(MIN_HISTORY, T - horizon, sp.test_every))
+    # `offset` shifts the test calendar by that many sessions (the trials' calendars 0, 5, 10, 15 and 2, 7, 12, 17); 0 is the live one.
+    sampled = list(range(MIN_HISTORY + offset, T - horizon, sp.test_every))
     if len(train_sampled) < sp.min_train_dates + 4:
         return ModelReport(model_name, 0, 0, None, None, None, None, None, None, None, False,
                            ["not enough history to validate"])
@@ -1169,14 +1190,14 @@ def walk_forward(panel: Panel, model_name: str, horizon: int = HORIZON,
             continue
         est = _make(model_name)
         if est is not None:
-            X, y, _r, _d = design(panel, feats, train_target, train_rows, nan_ok=model_name in NAN_NATIVE_MODELS)
+            X, y, _r, _d = design(panel, feats, train_target, train_rows, nan_ok=model_name in NAN_OK_MODELS)
             if len(y) < 1000:
                 continue
             _fit(model_name, est, X, y, _d)
         this_fold: List[float] = []
         for i in test_rows:
             X, y, raw, _d, cols = design(panel, feats, target, [i], return_cols=True,
-                                         nan_ok=model_name in NAN_NATIVE_MODELS)
+                                         nan_ok=model_name in NAN_OK_MODELS)
             if len(y) < MIN_NAMES:
                 continue
             pred = _predict(model_name, est, X)
@@ -1299,12 +1320,12 @@ def score_latest(panel: Panel, model_name: str, horizon: int = HORIZON,
     train_rows = [i for i in range(MIN_HISTORY, T - horizon, sp.train_every) if i + horizon + sp.embargo <= last]
     est = _make(model_name)
     if est is not None:
-        X, y, _r, _d = design(panel, feats, target, train_rows, nan_ok=model_name in NAN_NATIVE_MODELS)
+        X, y, _r, _d = design(panel, feats, target, train_rows, nan_ok=model_name in NAN_OK_MODELS)
         if len(y) < 1000:
             return {}
         _fit(model_name, est, X, y, _d)
     hist_ok = _eligible(panel, last)
-    X = _cross_section(feats, last, hist_ok, nan_ok=model_name in NAN_NATIVE_MODELS)
+    X = _cross_section(feats, last, hist_ok, nan_ok=model_name in NAN_OK_MODELS)
     ok = hist_ok & _complete(X)
     if ok.sum() < MIN_NAMES:
         return {}
