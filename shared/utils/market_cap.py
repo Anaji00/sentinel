@@ -39,8 +39,10 @@ from typing import Any, Dict, Iterable, Optional, Set
 # week is the error this accepts.
 MARKET_CAP_TTL_SEC = 7 * 24 * 3600
 
-# What the gate defaults to. One billion US dollars.
-DEFAULT_MIN_MARKET_CAP_USD = 1_000_000_000.0
+# What the gate defaults to for calls, peers and the dashboard movers: ten billion US dollars (11 Nov 2026; one
+# billion before). The trader and the model's feature jobs keep the one-billion floor they were validated on.
+DEFAULT_MIN_MARKET_CAP_USD = 10_000_000_000.0
+MODEL_MIN_MARKET_CAP_USD = 1_000_000_000.0
 
 MARKET_CAP_PREFIX = "sentinel:marketcap:usd:"
 
@@ -226,6 +228,7 @@ __all__ = [
     "is_large_cap",
     "large_caps",
     "DEFAULT_MIN_MARKET_CAP_USD",
+    "MODEL_MIN_MARKET_CAP_USD",
     "MARKET_CAP_PREFIX",
     "MARKET_CAP_TTL_SEC",
     "NOT_A_COMPANY",

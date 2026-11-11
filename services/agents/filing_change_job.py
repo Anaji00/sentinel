@@ -74,7 +74,7 @@ class FilingChangeJob:
             ranked = set(json.loads(_s(await self.raw.get(factor_scores_key("monthly"))) or "{}"))
         except ValueError:
             ranked = set()
-        large = await mc.large_caps(self.raw) or set()
+        large = await mc.large_caps(self.raw, mc.MODEL_MIN_MARKET_CAP_USD) or set()
         return sorted(t.upper() for t in ranked if t.upper() in large)
 
     async def _get(self, session: aiohttp.ClientSession, url: str, as_json: bool) -> Any:

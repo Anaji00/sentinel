@@ -113,7 +113,7 @@ class SympathyJob:
         if not stocks:
             # No classification is not "every symbol is a stock": keep the stored set.
             return {"stocks": 0, "rows": 0, "skipped": 1}
-        # And companies of $1bn and up: peers and exposures feed calls, which
+        # And companies of $10bn and up: peers and exposures feed calls, which
         # are kept to that size (market_cap.large_caps); no table, no rebuild.
         large = await mc.large_caps(self.raw)
         if not large:

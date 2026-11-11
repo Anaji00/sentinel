@@ -750,10 +750,10 @@ class StockCorrelationAgent(SentinelAgent):
             # "measured relationship" gate below was then satisfied by the
             # stock's competitor and peer edges, so the model was asked to
             # explain a macro link nobody had measured (29 Oct 2026 review).
-            # Calls only on companies of $1bn and up, checked before any inference.
+            # Calls only on companies of $10bn and up, checked before any inference.
             if not await is_large_cap(self.redis, ticker):
                 dropped("agents.stock_correlation_agent.below_min_market_cap",
-                        "company under $1bn: no assessment", logger, variant="below_min_market_cap")
+                        "company under $10bn: no assessment", logger, variant="below_min_market_cap")
                 return None
             exposures = await self._macro_exposures(ticker)
             exposures = [e for e in exposures if e["macro"] in price_map

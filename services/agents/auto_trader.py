@@ -279,10 +279,10 @@ class AutoTrader:
         # Picks only, checked daily so a stored book drops funds too: a fund
         # held from an earlier book gets a target of zero and is closed.
         stocks = await self._stocks()
-        # Companies of $1bn and up only (30 Oct 2026); a name that falls out is
+        # Companies of $1bn and up only (30 Oct 2026; the calls floor is $10bn since 11 Nov, the book's is not); a name that falls out is
         # closed like any other dropped from the book. Without the table there
         # is no trading today: unknown size is not a pass.
-        large = await mc.large_caps(self.raw)
+        large = await mc.large_caps(self.raw, mc.MODEL_MIN_MARKET_CAP_USD)
         if not large:
             dropped("agents.auto_trader.no_market_caps", "no market-cap table; nothing traded today", logger)
             return {"day": str(today), "orders": 0, "skipped": "no market-cap table"}

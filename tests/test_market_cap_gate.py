@@ -1,4 +1,4 @@
-"""Calls only on companies of at least $1bn (30 Oct 2026): the best-known cap
+"""Calls only on companies of at least $10bn (raised from $1bn on 11 Nov 2026): the best-known cap
 table, and the gates that read it."""
 import asyncio
 import pathlib
@@ -28,8 +28,9 @@ def test_the_larger_estimate_wins_and_unknown_is_not_large():
 
 
 def test_large_caps_and_is_large_cap():
-    raw = _Raw({"AAA": "2e9", "BBB": "5e8"})
+    raw = _Raw({"AAA": "2e10", "BBB": "5e9"})                      # BBB clears the model floor, not the calls floor
     assert asyncio.run(mc.large_caps(raw)) == {"AAA"}
+    assert asyncio.run(mc.large_caps(raw, mc.MODEL_MIN_MARKET_CAP_USD)) == {"AAA", "BBB"}
     assert asyncio.run(mc.is_large_cap(raw, "aaa")) is True
     assert asyncio.run(mc.is_large_cap(raw, "BBB")) is False
     assert asyncio.run(mc.is_large_cap(raw, "ZZZ")) is False      # unknown is not large
@@ -45,7 +46,7 @@ def test_every_call_path_is_gated():
     assert "is_large_cap(self.redis, ticker)" in src["services/agents/analyst_agent.py"]
     assert "is_large_cap(self.redis, ticker)" in src["services/agents/stock_correlation_agent.py"]
     assert "mc.large_caps(self.raw)" in src["services/agents/sympathy_job.py"]
-    assert "mc.large_caps(self.raw)" in src["services/agents/auto_trader.py"]
+    assert "mc.large_caps(self.raw, mc.MODEL_MIN_MARKET_CAP_USD)" in src["services/agents/auto_trader.py"]
 
 
 def test_a_readable_event_id_maps_to_the_uuid_the_events_writer_stores():

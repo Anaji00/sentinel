@@ -364,12 +364,12 @@ class PredictionScoringMixin:
         count, and it double-weights the scorecard that the consensus engine
         reads -- an agent repeating itself would outrank one that was right.
         """
-        # Calls only on companies of at least $1bn (30 Oct 2026). Macro
+        # Calls only on companies of at least $10bn (raised from $1bn 11 Nov 2026). Macro
         # instruments and crypto are not company stocks and are not gated; an
         # unknown capitalisation is not large (market_cap.is_large_cap).
         if prediction_kind == "price" and not is_macro_asset(ticker) and not is_major_crypto(ticker) \
                 and not await is_large_cap(self.redis, ticker):
-            dropped(f"agents.{self.name}.below_min_market_cap", "a call on a company under $1bn; not recorded",
+            dropped(f"agents.{self.name}.below_min_market_cap", "a call on a company under $10bn; not recorded",
                     self.logger, detail=str(ticker))
             return ""
 

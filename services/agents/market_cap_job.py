@@ -67,7 +67,7 @@ class MarketCapJob:
             pipe.rename(tmp, mc.CAPS_KEY)
             await pipe.execute()
         return {"tickers": len(tickers), "with_cap": len(best),
-                "at_least_1bn": sum(v >= mc.DEFAULT_MIN_MARKET_CAP_USD for v in best.values())}
+                "at_least_1bn": sum(v >= mc.MODEL_MIN_MARKET_CAP_USD for v in best.values())}
 
 
 __all__ = ["MarketCapJob"]

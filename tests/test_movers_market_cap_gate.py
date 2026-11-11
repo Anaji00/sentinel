@@ -54,10 +54,12 @@ def test_unknown_is_not_small():
     assert parse_market_cap(b"10330000000.0") == 10330000000.0
 
 
-def test_the_default_floor_is_a_billion():
-    from shared.utils.market_cap import DEFAULT_MIN_MARKET_CAP_USD
+def test_the_default_floor_is_ten_billion_and_the_model_floor_stays_a_billion():
+    # Raised from one billion on 11 Nov 2026; the trader and the model's feature jobs keep MODEL_MIN_MARKET_CAP_USD.
+    from shared.utils.market_cap import DEFAULT_MIN_MARKET_CAP_USD, MODEL_MIN_MARKET_CAP_USD
 
-    assert DEFAULT_MIN_MARKET_CAP_USD == 1_000_000_000.0
+    assert DEFAULT_MIN_MARKET_CAP_USD == 10_000_000_000.0
+    assert MODEL_MIN_MARKET_CAP_USD == 1_000_000_000.0
 
 
 def test_a_resolved_absence_is_remembered():
@@ -73,7 +75,7 @@ def test_a_resolved_absence_is_remembered():
 def test_the_endpoint_gates_and_says_so():
     code = RADAR_ROUTE.read_text(encoding="utf-8")
     assert "min_market_cap_usd" in code
-    assert "DEFAULT_MIN_MARKET_CAP_USD" in code, "the floor must default to a billion"
+    assert "DEFAULT_MIN_MARKET_CAP_USD" in code, "the floor must have a default"
     assert '"min_market_cap_usd": min_market_cap_usd' in code, (
         "a client must be able to tell a quiet board from a gate nothing passed"
     )

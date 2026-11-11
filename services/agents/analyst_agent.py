@@ -79,7 +79,7 @@ class AnalystAgent(SentinelAgent):
         # engine's play, not this. The view lives in the predictions table
         # (graded) and in VIEWS_KEY (shown).
         if await self.analyse(message) is None:
-            dropped("agents.analyst_agent.handle", "not analysed: under $1bn, no ranked stock, seen today, over the "
+            dropped("agents.analyst_agent.handle", "not analysed: under $10bn, no ranked stock, seen today, over the "
                     "daily cap, or no grounded answer", self.logger)
 
     async def analyse(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -87,7 +87,7 @@ class AnalystAgent(SentinelAgent):
         if not _TICKER.match(ticker):
             return None
         if not await is_large_cap(self.redis, ticker):
-            return None                       # calls only on companies of $1bn and up (market_cap.is_large_cap)
+            return None                       # calls only on companies of $10bn and up (market_cap.is_large_cap)
         raw = self.redis.raw
         # The daily cap went to the first alerts to arrive, whatever their
         # family; most families are graded uninformative against prices, so
