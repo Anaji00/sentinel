@@ -1076,16 +1076,34 @@ async def get_candles(
             timeframe = normalize_timeframe(timeframe)
             if timeframe in cagg_map:
                 table_name, time_col = cagg_map[timeframe]
-                rows = await db.query(
-                    f"""
-                    SELECT {time_col} as ts, open, high, low, close, volume
-                    FROM {table_name}
-                    WHERE ticker = $1
-                    ORDER BY {time_col} DESC
-                    LIMIT $2;
-                    """,
-                    ticker, limit
-                )
+                rows = []
+                if timeframe == "1d":
+                    # Official consolidated daily bars first: the 1d aggregate
+                    # buckets by UTC day, so its close is the last after-hours print.
+                    rows = await db.query(
+                        """
+                        SELECT day AS ts, open, high, low, close, volume
+                        FROM daily_bars
+                        WHERE ticker = $1 AND open IS NOT NULL AND high IS NOT NULL
+                          AND low IS NOT NULL AND volume IS NOT NULL
+                        ORDER BY day DESC
+                        LIMIT $2;
+                        """,
+                        ticker, limit
+                    ) or []
+                    if rows:
+                        table_name = "daily_bars"
+                if not rows:
+                    rows = await db.query(
+                        f"""
+                        SELECT {time_col} as ts, open, high, low, close, volume
+                        FROM {table_name}
+                        WHERE ticker = $1
+                        ORDER BY {time_col} DESC
+                        LIMIT $2;
+                        """,
+                        ticker, limit
+                    )
                 if rows:
                     source = f"timescale:{table_name}"
                 for r in rows:
