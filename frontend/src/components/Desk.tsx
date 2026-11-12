@@ -27,6 +27,8 @@ import WhatChanged from './WhatChanged';
 import RelatedStocks from './RelatedStocks';
 import SourceFacts from './SourceFacts';
 import ComparePanel from './ComparePanel';
+import HeldBack from './HeldBack';
+import { nextRowIndex } from '../lib/rowKeys';
 import { useCompare } from '../lib/useCompare';
 import type { Brief, Situation } from '../lib/divergence';
 
@@ -93,7 +95,17 @@ export default function Desk() {
           ) : list.length === 0 ? (
             <EmptyState kind="empty" title="No stock is moving against its peers right now" detail="An alert appears when a stock moves 2.5 or more usual-sized moves away from its peers. Checked every 10 minutes on weekdays." />
           ) : (
-            <ul>
+            <ul
+              aria-label="Situations. Arrow keys move between rows."
+              onKeyDown={(e) => {
+                const rows = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('button'));
+                const to = nextRowIndex(e.key, rows.indexOf(document.activeElement as HTMLButtonElement), rows.length);
+                if (to === null) return;
+                e.preventDefault();
+                rows[to]?.focus();
+                setPicked(list[to]?.ticker ?? '');
+              }}
+            >
               {list.map((a) => {
                 const on = a.ticker === current?.ticker;
                 return (
@@ -146,6 +158,7 @@ export default function Desk() {
             <DivergenceBrief id={`desk-${current.correlation_id}`} situation={current.situation} brief={current.brief} measures={current} />
             <WhatChanged ticker={current.ticker} />
             <RelatedStocks ticker={current.ticker} />
+            <HeldBack ticker={current.ticker} />
             <SourceFacts ticker={current.ticker} />
           </div>
         ) : (

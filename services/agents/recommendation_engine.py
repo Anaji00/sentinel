@@ -462,12 +462,14 @@ class RecommendationEngine:
                     bal = boards.get(t) or {}
                     # For the cards: the last quarter of closes, the live price, and
                     # its move since the last completed close.
-                    prev_close = px["close"][-1] if px["day"][-1] < today else (
-                        px["close"][-2] if len(px["close"]) > 1 else None)
+                    prev_close, base_day = rc.change_base(px["day"], px["close"], today, current_session() == Session.REGULAR)
                     row = {**idea, **plan, "forecast": forecast, "realized_vol": round(rv, 4) if rv else None,
                            "spark": [round(float(c), 2) for c in px["close"][-63:]],
                            "price": round(float(price), 2) if price else None,
                            "change_pct": round((price / prev_close - 1.0) * 100, 2) if price and prev_close else None,
+                           # The close that move is measured from, and its date.
+                           "change_pct_base": round(prev_close, 2) if prev_close else None,
+                           "change_pct_base_date": str(base_day) if prev_close and base_day else None,
                            "cp_iv_spread": pos.get("cp_iv_spread"), "iv_skew": pos.get("iv_skew"),
                            "option": option,
                            # Why, in words: the model's own contributions (linear models).
@@ -517,10 +519,8 @@ class RecommendationEngine:
         # The day's backdrop for the home page: the regime gauge, the sizing
         # dial the ideas carry (momentum-volatility scaling), and SPY today.
         spy_bars = (await self._prices(["SPY"])).get("SPY") or {}
-        spy_prev = None
-        if spy_bars.get("close"):
-            spy_prev = spy_bars["close"][-1] if spy_bars["day"][-1] < today else (
-                spy_bars["close"][-2] if len(spy_bars["close"]) > 1 else None)
+        spy_prev, _spy_day = rc.change_base(spy_bars.get("day") or [], spy_bars.get("close") or [], today,
+                                            current_session() == Session.REGULAR)
         out["pulse"] = {"regime": gauge.get("level"), "sizing_scale": round(mom_scale, 3),
                         "momentum_vol_scale": gauge.get("momentum_vol_scale"),
                         "spy": round(float(spy_now), 2) if spy_now else None,

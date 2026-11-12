@@ -21,8 +21,16 @@ const W = 600;
 const H = 180;
 const PAD = 6;
 
-function useCloses(ticker: string) {
-  return useSWR<{ closes: Close[] }>(`/predictions/closes/${encodeURIComponent(ticker)}?days=90`, fetcher, { revalidateOnFocus: false });
+/** The windows offered, in calendar days of history asked for (the route allows up to 400). */
+const RANGES = [
+  { label: '1 month', days: 31 },
+  { label: '3 months', days: 90 },
+  { label: '6 months', days: 180 },
+  { label: '1 year', days: 365 },
+] as const;
+
+function useCloses(ticker: string, days: number) {
+  return useSWR<{ closes: Close[] }>(`/predictions/closes/${encodeURIComponent(ticker)}?days=${days}`, fetcher, { revalidateOnFocus: false });
 }
 
 const pct = (v: number | null) => (v == null ? '—' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${formatNumber(Math.abs(v), { decimals: 1 })}%`);
@@ -46,8 +54,9 @@ function Lines({ a, b, aTicker, bTicker }: { a: number[]; b: number[]; aTicker: 
 }
 
 export default function ComparePanel({ a, b, onSwap, onClear }: { a: string; b: string; onSwap: () => void; onClear: () => void }) {
-  const ra = useCloses(a);
-  const rb = useCloses(b);
+  const [days, setDays] = React.useState<number>(90);
+  const ra = useCloses(a, days);
+  const rb = useCloses(b, days);
   const aligned = React.useMemo(() => alignCloses(ra.data?.closes, rb.data?.closes), [ra.data, rb.data]);
   const c = React.useMemo(() => compare(aligned), [aligned]);
 
@@ -65,6 +74,13 @@ export default function ComparePanel({ a, b, onSwap, onClear }: { a: string; b: 
             Stop comparing
           </Button>
         </span>
+      </div>
+      <div role="group" aria-label="How far back" className="flex gap-1.5">
+        {RANGES.map((r) => (
+          <Button key={r.days} variant="outline" size="sm" pressed={days === r.days} onClick={() => setDays(r.days)}>
+            {r.label}
+          </Button>
+        ))}
       </div>
       {failedWithout(ra.error, ra.data) || failedWithout(rb.error, rb.data) ? (
         <PanelError what="the price history" inline />

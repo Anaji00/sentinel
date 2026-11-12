@@ -530,8 +530,24 @@ def risk_terms(direction: int, entry: Optional[float], stop: Optional[float], ad
     return out
 
 
+def change_base(days: Sequence[date], closes: Sequence[float], today: date, session_open: bool) -> Tuple[Optional[float], Optional[date]]:
+    """(close, its date) that a live price's move is measured from: the last COMPLETED session's close.
+
+    A daily bar dated today is still forming while the regular session is open, so the base is the close before it. Once the
+    session has ended (after hours, overnight) that bar is final and is the base: measuring from the day before reported an
+    after-hours print as a move since two closes ago (NVDA, 11 Nov 2026: -5.94% against 168.89, not -8.56% against 173.73).
+    No earlier close to use gives (None, None)."""
+    if not closes or not days:
+        return None, None
+    if days[-1] < today or not session_open:
+        return float(closes[-1]), days[-1]
+    if len(closes) > 1:
+        return float(closes[-2]), days[-2]
+    return None, None
+
+
 __all__ = [
-    "EARNINGS_CYCLE_DAYS", "earnings_inside", "next_earnings", "risk_terms",
+    "change_base", "EARNINGS_CYCLE_DAYS", "earnings_inside", "next_earnings", "risk_terms",
     "EVENT_GROUPS", "EVIDENCE_WEIGHTS", "EXPIRY_WINDOWS", "Leg", "atr", "evidence_balance", "event_led", "idea_screen",
     "build_option_idea", "choose_structure", "iv_regime", "overruled", "realized_vol", "stock_ideas",
     "stock_plan", "tradable_chain",

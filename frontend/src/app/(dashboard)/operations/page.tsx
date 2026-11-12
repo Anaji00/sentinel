@@ -1,5 +1,6 @@
 import React from 'react';
 import OperationsConsole from '@/components/OperationsConsole';
+import ModelQuota from '@/components/ModelQuota';
 import { PageHeader } from '@/components/ui/PageHeader';
 
 export default function OperationsPage() {
@@ -11,6 +12,7 @@ export default function OperationsPage() {
         related={[{ href: '/audit', label: 'Audit trail' }, { href: '/agents', label: 'AI analysts' }]}
       />
       <OperationsConsole />
+      <ModelQuota />
     </div>
   );
 }

@@ -18,10 +18,10 @@
  *   The same panel shows both, and an operator who has been reading a paper
  *   book all week must not be able to submit into a real one by habit.
  *
- *   It names the whole order back before submitting -- symbol, side, quantity,
- *   type, and the notional if that can be computed -- because an order is not
- *   reversible and a confirmation that says "Are you sure?" is not a
- *   confirmation.
+ *   It goes in three steps -- enter, review, confirm. Review names the whole
+ *   order back in words, with anything worth a second look; arming opens a
+ *   ten-second window in which Confirm is live, and any edit starts over.
+ *   An order is not reversible and "Are you sure?" is not a confirmation.
  *
  *   It refuses before the wire on anything the server would refuse anyway, so
  *   a mistake is a message rather than a 422.
@@ -31,9 +31,11 @@ import React from 'react';
 import useSWR, { mutate as globalMutate } from 'swr';
 import { apiClient, describeApiError, fetcher } from '../lib/api';
 import { useFeedback } from './ui/Feedback';
+import { Button } from './ui/Button';
 import { POLL } from './ui/DataProvider';
 import { IconAlert, IconBlocked } from './ui/icons';
-import { formatCurrency, formatNumber, isPresent } from '../lib/format';
+import { formatCurrency, isPresent } from '../lib/format';
+import { ARM_SECONDS, armedSecondsLeft, describeOrder, orderWarnings, type OrderStep } from '../lib/orderSteps';
 
 const SIDES = ['BUY', 'SELL'] as const;
 /** `OrderType` in shared/broker/base.py. The two a person places by hand. */
@@ -56,13 +58,16 @@ interface OrderTicketProps {
 }
 
 export function OrderTicket({ isLive, marks = {}, onPlaced }: OrderTicketProps) {
-  const { toast, confirm } = useFeedback();
+  const { toast } = useFeedback();
   const [symbol, setSymbol] = React.useState('');
   const [qty, setQty] = React.useState('');
   const [side, setSide] = React.useState<Side>('BUY');
   const [type, setType] = React.useState<OrderType>('MARKET');
   const [limit, setLimit] = React.useState('');
   const [busy, setBusy] = React.useState(false);
+  const [step, setStep] = React.useState<OrderStep>('enter');
+  const [armedAt, setArmedAt] = React.useState(0);
+  const [now, setNow] = React.useState(0);
 
   // The kill switch, read rather than assumed. The gateway refuses with 423
   // when execution is halted; showing that here means an operator learns it
@@ -89,25 +94,42 @@ export function OrderTicket({ isLive, marks = {}, onPlaced }: OrderTicketProps) 
   const notional =
     isPresent(reference) && Number.isFinite(quantity) && quantity > 0 ? reference * quantity : null;
 
-  const submit = async () => {
-    if (problems.length > 0 || halted) return;
+  const draft = {
+    side,
+    type,
+    symbol: cleanSymbol,
+    quantity,
+    limitPrice,
+    mark: isPresent(mark) ? mark : null,
+    isLive,
+  };
+  const warnings = step === 'enter' ? [] : orderWarnings(draft);
+  const secondsLeft = step === 'armed' ? armedSecondsLeft(armedAt, now) : ARM_SECONDS;
 
-    // The whole order, named back. "Are you sure?" is not a confirmation.
-    const ok = await confirm({
-      title: isLive ? 'Place this order against real capital?' : 'Place this paper order?',
-      body:
-        `${side} ${formatNumber(quantity, { decimals: 0 })} ${cleanSymbol} as a ` +
-        `${type.toLowerCase()} order` +
-        (type === 'LIMIT' ? ` at ${formatCurrency(limitPrice)}` : '') +
-        (notional !== null ? `, about ${formatCurrency(notional, { decimals: 0 })}` : '') +
-        `. ${
-          isLive
-            ? 'This book reaches a real venue. The order cannot be recalled once filled.'
-            : 'This is the simulated book; no order reaches a venue.'
-        }`,
-      confirmLabel: `${side} ${cleanSymbol}`,
-    });
-    if (!ok) return;
+  // Any edit, a halt, or a run-out armed window puts the ticket back at the start.
+  React.useEffect(() => {
+    setStep('enter');
+  }, [cleanSymbol, qty, side, type, limit, halted]);
+
+  React.useEffect(() => {
+    if (step !== 'armed') return;
+    const id = window.setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (armedSecondsLeft(armedAt, t) === 0) setStep('review');
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [step, armedAt]);
+
+  const arm = () => {
+    const t = Date.now();
+    setArmedAt(t);
+    setNow(t);
+    setStep('armed');
+  };
+
+  const submit = async () => {
+    if (problems.length > 0 || halted || step !== 'armed') return;
 
     setBusy(true);
     try {
@@ -122,6 +144,7 @@ export function OrderTicket({ isLive, marks = {}, onPlaced }: OrderTicketProps) 
       setSymbol('');
       setQty('');
       setLimit('');
+      setStep('enter');
       await Promise.all([
         globalMutate('/portfolio/positions'),
         globalMutate('/portfolio/account'),
@@ -245,14 +268,62 @@ export function OrderTicket({ isLive, marks = {}, onPlaced }: OrderTicketProps) 
           </label>
         )}
 
-        <button
-          onClick={submit}
-          disabled={problems.length > 0 || halted || busy}
-          className="rounded-md border border-line-accent bg-accent-dim px-3 py-1 text-micro font-semibold text-accent transition-colors enabled:cursor-pointer enabled:hover:border-accent disabled:opacity-40"
-        >
-          {busy ? 'Submitting…' : 'Review'}
-        </button>
+        {step === 'enter' && (
+          <Button variant="primary" size="sm" onClick={() => setStep('review')} disabled={problems.length > 0 || halted}>
+            Review order
+          </Button>
+        )}
       </div>
+
+      <ol className="flex gap-3 text-micro text-ink-mute" aria-label="Order steps">
+        {(['enter', 'review', 'armed'] as const).map((k, i) => (
+          <li key={k} aria-current={step === k ? 'step' : undefined} className={step === k ? 'font-semibold text-accent' : ''}>
+            {i + 1}. {k === 'enter' ? 'Enter' : k === 'review' ? 'Review' : 'Confirm'}
+          </li>
+        ))}
+      </ol>
+
+      {step !== 'enter' && (
+        <div role="group" aria-label="Review this order" className="space-y-2 rounded-sm border border-line-accent bg-inset p-3">
+          <p className="text-xs font-semibold text-ink">
+            {describeOrder(draft, notional, (v) => formatCurrency(v, { decimals: v < 1000 ? 2 : 0 }))}
+          </p>
+          <p className="text-micro text-ink-dim">
+            {isLive ? 'Live book: real money.' : 'Paper book: practice money, nothing reaches a real venue.'}
+          </p>
+          {warnings.length > 0 && (
+            <ul className="space-y-1 text-micro tone-caution">
+              {warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {step === 'review' ? (
+              <>
+                <Button variant="outline" size="sm" onClick={() => setStep('enter')}>
+                  Back
+                </Button>
+                <Button variant="secondary" size="sm" onClick={arm}>
+                  Arm to confirm
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" size="sm" onClick={() => setStep('review')}>
+                  Cancel
+                </Button>
+                <Button variant="danger" size="sm" loading={busy} onClick={submit}>
+                  {`Confirm ${side} ${cleanSymbol}`}
+                </Button>
+                <span role="status" className="text-micro text-ink-mute">
+                  Live for {secondsLeft}s
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       <p className="text-micro text-ink-mute">
         {/* What is missing, or what this will cost. Both are more useful than

@@ -25,6 +25,7 @@ import { IconClose } from './ui/icons';
 import { LoadingLines } from './ui/Skeleton';
 import FirstLook from './FirstLook';
 import ComparePanel from './ComparePanel';
+import HeldBack from './HeldBack';
 import { useCompare } from '../lib/useCompare';
 import RelatedStocks from './RelatedStocks';
 import SourceFacts from './SourceFacts';
@@ -105,6 +106,7 @@ function Drawer({ ticker, onClose }: { ticker: string; onClose: () => void }) {
           <Owners ticker={ticker} />
           <SourceFacts ticker={ticker} />
           <RelatedStocks ticker={ticker} />
+          <HeldBack ticker={ticker} />
         </Disclosure>
         {detail && (
           <>

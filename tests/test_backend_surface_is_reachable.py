@@ -44,10 +44,6 @@ NOT_A_UI_SURFACE = {
     "/api/v1/feedback/interaction",
     # Stripe posts here. A browser never does.
     "/api/v1/billing/webhook",
-    # Built 12 Nov 2026 for the dashboard (held-back reasons on a stock, free-tier model quota); the frontend session is
-    # wiring them. Drop both entries once a component calls them.
-    "/api/v1/signals/held-back/{ticker}",
-    "/api/v1/health/model-quota",
     # Container probes. A credential-free liveness check is the point.
     "/api/v1/health/liveness",
     "/api/v1/health/readiness",

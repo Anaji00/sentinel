@@ -3,7 +3,14 @@
 export interface ScenarioHypothesis {
   label?: string;
   mechanism?: string;
+  /** 0 to 100. */
   probability?: number;
+  beneficiaries?: string[];
+  /** What would confirm it. */
+  watch_signals?: string[];
+  /** What would rule it out. */
+  deny_signals?: string[];
+  time_horizon?: string;
 }
 
 /** One agent's contribution to a consensus evidence trail.

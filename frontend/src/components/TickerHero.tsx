@@ -15,7 +15,9 @@ import { ABSENT, formatNumber } from '../lib/format';
 import { LABEL, rankWords, type Idea, type Recommendations } from '../lib/ideas';
 import { IdeaCard } from './IdeaCard';
 import { POLL } from './ui/DataProvider';
-import { Sparkline } from './ui/Sparkline';
+import CandleChart from './CandleChart';
+import { barLabel } from '../lib/candles';
+import { headlinePrice } from '../lib/heroPrice';
 import { IconFollow } from './ui/icons';
 import { toggleTicker, usePreferences } from '../lib/preferences';
 
@@ -102,17 +104,14 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
   const closes = (history.data?.closes ?? [])
     .map((c) => c.close)
     .filter((c) => Number.isFinite(c));
+  const lastDay = history.data?.closes?.length ? history.data.closes[history.data.closes.length - 1].day : null;
   const call = ideaFor(recs.data, t);
-  // The live price when today's calls carry one, else the last close.
-  const live = call?.idea.price ?? null;
-  const last = live ?? (closes.length ? closes[closes.length - 1] : null);
-  const prev = closes.length > 1 ? closes[closes.length - 2] : null;
-  const change =
-    live != null && call?.idea.change_pct != null
-      ? call.idea.change_pct
-      : last != null && prev
-        ? (last / prev - 1) * 100
-        : null;
+  // The price and its change are worked out from the same daily closes the chart draws, so the header and the last
+  // candle cannot disagree. A newer trade, when there is one, is shown as that and measured from the last close.
+  const price = headlinePrice(closes, call?.idea.price ?? null);
+  const last = price?.price ?? null;
+  const change = price?.changePct ?? null;
+  const closeLabel = lastDay ? barLabel(`${lastDay}T00:00:00Z`, '1d') : null;
   const quarter = closes.length > 1 ? (closes[closes.length - 1] / closes[0] - 1) * 100 : null;
   const row = board.data?.board.find((r) => r.ticker === t);
   const e = model.data?.entry;
@@ -120,7 +119,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
   return (
     // A container query, not a window breakpoint: the same header shows full
     // width on /ticker and in the 560px stock drawer.
-    <div className="@container">
+    <div className="@container space-y-3">
     <section className="grid gap-4 rounded-md border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1.3fr_1fr_1.2fr]">
       <div className="space-y-2 min-w-0">
         <div className="flex items-baseline gap-2">
@@ -152,17 +151,12 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
               {formatNumber(change, { decimals: 2 })}%
             </span>
           )}
-          {live == null && last != null && (
-            <span className="text-micro text-ink-mute">at the last close</span>
+          {price && (
+            <span className="text-micro text-ink-mute">
+              {price.kind === 'trade' ? `latest trade, from the ${closeLabel ?? 'last'} close` : `close ${closeLabel ?? ''}`.trim()}
+            </span>
           )}
         </div>
-        <Sparkline
-          values={closes}
-          width={360}
-          height={72}
-          label={`${t}, last 90 sessions`}
-          className="w-full max-w-[360px]"
-        />
         <p className="text-micro text-ink-mute">
           Last {closes.length || ABSENT} sessions
           {quarter != null && (
@@ -245,6 +239,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
         )}
       </div>
     </section>
+    <CandleChart ticker={t} />
     </div>
   );
 }

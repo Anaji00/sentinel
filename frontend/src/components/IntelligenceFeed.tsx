@@ -5,6 +5,7 @@ import { ZWhisker } from './ui/ZWhisker';
 import { ALERT_KINDS, filterAlerts, type AlertKind, type Brief, type Situation } from '../lib/divergence';
 import { Button } from './ui/Button';
 import WhatIf from './WhatIf';
+import ScenarioPaths from './ScenarioPaths';
 import React, { useMemo, useState } from 'react';
 import { Input } from './ui/Input';
 import useSWR from 'swr';
@@ -1055,6 +1056,8 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
                   </p>
                 </div>
               )}
+
+              <ScenarioPaths scenario={selectedScenario} />
 
               {selectedScenarioTrail.length > 0 && (
                 <div>
