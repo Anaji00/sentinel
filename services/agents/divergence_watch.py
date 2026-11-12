@@ -28,6 +28,7 @@ from services.correlation.event_store import EventStore
 from shared.kafka import SentinelProducer, Topics
 from shared.models.events import AlertTier, CorrelationCluster
 from shared.utils import divergence as dv
+from services.agents import regime_annotation
 from services.agents import peer_residual_scan
 from shared.utils import intel_brief, situation
 from shared.utils.quiet_failures import dropped, swallowed
@@ -284,6 +285,8 @@ class DivergenceWatch:
         state = await self._situation(d, now.astimezone(_NY).date().isoformat())
         peer_rets = [(m, ret[m]) for m in d.members if ret and m in ret]
         brief = intel_brief.build(d, article, state, peer_rets)
+        # A rule-based regime label from filings, surprises, insiders and short interest; it annotates the alert and changes no order.
+        regime = await regime_annotation.annotate(self.db, d.ticker, datetime.now(timezone.utc), d.z, int((article or {}).get("n") or 0))
         cluster = CorrelationCluster(
             rule_id="DIVERGENCE_NEWS" if d.news else "DIVERGENCE_UNEXPLAINED",
             rule_name="Stock Moving Against Its Peers on News" if d.news else "Stock Moving Against Its Peers, No News",
@@ -294,7 +297,7 @@ class DivergenceWatch:
             supporting_headlines=[headline_text] if headline_text else [],
             metrics_summary={"return": round(d.ret, 5), "reference_return": round(d.ref_ret, 5), "gap": round(d.gap, 5),
                              "z": round(d.z, 2), "reference": d.reference, "news_articles": int((article or {}).get("n") or 0),
-                             "members": list(d.members[:8]), "situation": state, "brief": brief,
+                             "members": list(d.members[:8]), "situation": state, "brief": brief, "regime": regime,
                              **({"horizon": d.horizon, "breadth": round(d.breadth, 2), "beta": round(d.beta, 2),
                                  "relative_volume": round(d.rvol, 2) if d.rvol else None}
                                 if isinstance(d, dv.PeerDivergence) else {})},
@@ -307,7 +310,8 @@ class DivergenceWatch:
             description=d.description() + "\n\n" + intel_brief.render(brief),
             tags=["divergence", f"ticker:{d.ticker}", f"reference:{d.reference}", "news" if d.news else "no_news"]
                  + ([f"horizon:{d.horizon}"] if isinstance(d, dv.PeerDivergence) else [])
-                 + ([f"situation:{state['stage'].lower()}"] if state else []),
+                 + ([f"situation:{state['stage'].lower()}"] if state else [])
+                 + ([f"regime:{regime['label'].lower()}"] if regime else []),
         )
         try:
             await EventStore(self.redis, self.db).save_correlation(cluster)
