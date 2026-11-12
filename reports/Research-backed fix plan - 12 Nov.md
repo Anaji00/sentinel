@@ -57,3 +57,41 @@ Binance funding and open interest (already attached to liquidation events). 10-K
 The host was asleep from 03:10 to 17:50 UTC on 12 Nov, so the containers stopped: the nightly model run froze mid-way, the 14:43 trader
 run did not happen, and the first attempt after wake-up failed on name resolution (it retried five minutes later and placed 101 orders).
 The first live risk-off vetoes (5 names) and alert-weight scaling (60 of 179 names) fired in that run. A keep-awake setting would prevent a repeat.
+
+
+## Follow-up, evening of 12 Nov
+
+**Event-loop measurement, corrected.** asyncio's debug mode records the creation stack of every callback, and it accounted for 509 of 600
+seconds in the first run, so the first figure (20% of the time blocked) was mostly the instrument. The watch now uses the stack sampler
+alone (debug mode is opt-in). Clean result over 10 minutes: agents-fast held the loop about 1.5 seconds in total, nothing to fix.
+agents-heavy about 20 seconds, nearly all in the signal study: database row sanitising on the loop (12.8 s), headline mapping (5.6 s) and
+episode building (1.4 s). All three now run in worker threads with identical output (`tests/test_loop_offload.py`).
+
+**Calibration check.** Filings: the score is a materiality class by form and item, not an anomaly. 8-K item 2.02 (earnings results) is 53% of
+8-Ks at about 0.82, 424B2, 424B3 and 424B5 are a constant 0.20, Schedule 13G is 0.25 or 0.40 and 13D about 0.85, so a third of filings clear
+0.8 by construction. Equity blocks: the score rises with dollar size (mean 0.65, 0.79, 0.90 across three size buckets), so it is a sound
+size-aware score; a quarter of the smallest bucket clears 0.8, concentrated in a handful of tickers (NVDA 746 of about 3,000).
+
+**Output gaps are deliberate.** The scenario generator prunes signals it cannot ground in the evidence, so some hypotheses legitimately end
+with no watch or deny signal. The quant engine's four confidence values are conviction tiers, not a rounding defect. Neither is changed.
+
+**Daily market-neutral correlation lane (shadow).** `shared/utils/residual_corr.py`: remove the market component, correlate residuals, control
+the false-discovery rate across every pair, then require an effect-size floor and split-half stability. On 246 common stocks over 250
+sessions: 30,135 pairs tested; 54.6% significant raw, 42.7% after removing the market (the p-value alone is not selective at this sample
+size); 1,580 stable pairs (5.2%) after the floor and stability. They are recognisable peer groups: refiners MPC-VLO-PSX, E&Ps
+COP-EOG-DVN-OXY-CVX-XOM, semicap AMAT-LRCX-KLAC, defense LMT-RTX-GD, payments MA-V, airlines DAL-UAL, CRWD-PANW, quantum QBTS-RGTI-IONQ.
+CVX, GD, LMT, OXY and RTX are now testable. Share-class twins (GOOG-GOOGL) need excluding before any use.
+
+**The live discovery engine publishes market-beta links.** At 18:15 UTC it reported Pearson 200 of 298 pairs significant and published
+links such as IONQ-SPY, EWY-SPY, MU-QQQ and ES=F-SPY. A stock's correlation with the index it belongs to is the market factor and says
+little about the company, which is what the research on daily pair tests warns about. Next step: publish market-neutral links instead.
+
+**Time-of-day replay (registered test, offline).** 29,125 stored market-anomaly events in 14 days; 9,181 could be scored three ways.
+A flat all-day volume baseline fails the registered parity bar badly (bucket ratios 3.09, 0.29, 0.16, 0.16, 1.30). The live score's
+top 5% is spread within the bar (ratios 0.57 to 1.39), so its ranking is not badly distorted; the near-zero share above the absolute 0.8
+cut at midday is a calibration of the cut, not of the ranking. The same-slot baseline could not be judged: after-hours bars dominated its
+top 5%. Result: bar 1 is not the problem it appeared to be. No change made; a better replay ranks within each bucket and needs per-ticker
+slot history.
+
+**Operational mistake, mine.** I loaded a second FinBERT into the 2 GiB correlation container for a comparison; the container restarted at
+18:19 UTC and came back healthy with no tracebacks. Comparisons that load a model now run in agents-heavy.
