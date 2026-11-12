@@ -47,7 +47,9 @@ def test_fills_are_summed_per_bucket_and_side_once():
 
 
 def test_scores_and_exposures():
-    assert liq.burst_score(3) == 0.5 and liq.burst_score(5) == 0.7 and liq.burst_score(20) == 0.9
+    # 12 Nov 2026: above 7x the score keeps rising to 0.97 (it was capped at 0.9, which put 59% of bursts on one value); 7x and below are unchanged.
+    assert liq.burst_score(3) == 0.5 and liq.burst_score(5) == 0.7 and liq.burst_score(7) == 0.9
+    assert 0.9 < liq.burst_score(10) < liq.burst_score(20) < liq.burst_score(60) <= 0.97
     assert "exposes:MSTR" in crypto_exposure_tags("BTCUSDT")
     assert crypto_exposure_tags("ETH") == ["exposes:COIN", "exposes:HOOD"]
     assert crypto_exposure_tags("SOL") == []

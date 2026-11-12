@@ -45,6 +45,14 @@ LARGE_DOLLAR_VOLUME = 50e6
 SIZE_LOOKBACK = 20
 _NY = ZoneInfo("America/New_York")
 
+
+def reaction_score(ear: float) -> float:
+    """Anomaly score of an earnings announcement return: 0.8 at an 8% move, as before, and still rising above it.
+
+    It was min(1, |ear| x 10), which hit 1.000 at a 10% move: 42% of live reactions scored exactly 1.0 (12 Nov audit). This keeps
+    0.8 at 8%, so the same events clear the 0.8 cut, and gives larger moves room: 16% scores 0.96, 24% scores 0.99."""
+    return round(1.0 - 5.0 ** (-abs(float(ear)) / 0.08), 3)
+
 _RELEASES_SQL = """
     SELECT primary_entity_id AS ticker, occurred_at FROM signal_event_archive
     WHERE type = 'filing' AND summary LIKE '%2.02:%' AND occurred_at > $1 AND primary_entity_id IS NOT NULL
@@ -179,7 +187,7 @@ class EarningsReactionEngine:
             if rows:
                 await self.db.execute_many(_ARCHIVE_SQL, rows)
                 archived += len(rows)
-            fresh = [(*row, min(1.0, abs(e["ear"]) * 10)) for row, e in zip(rows, evs) if e["known_at"] > recent_cut]
+            fresh = [(*row, reaction_score(e["ear"])) for row, e in zip(rows, evs) if e["known_at"] > recent_cut]
             if fresh:
                 await self.db.execute_many(_EVENTS_SQL, fresh)
                 live += len(fresh)

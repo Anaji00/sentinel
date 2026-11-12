@@ -14,6 +14,7 @@ a five-minute bucket at several times its asset-and-side median.
 
 from __future__ import annotations
 
+import math
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -78,5 +79,11 @@ def burst_multiple(total: float, history: List[float]) -> Optional[float]:
 
 
 def burst_score(multiple: float) -> float:
-    """3x scores 0.50, 5x 0.70, 7x and up 0.90."""
-    return round(min(0.90, 0.20 + 0.10 * float(multiple)), 3)
+    """3x scores 0.50, 5x 0.70, 7x 0.90, as before; above 7x it keeps rising toward 0.97 instead of stopping.
+
+    The cap at 0.90 put 59% of live bursts on one value (12 Nov audit). Nothing below 7x moves, so no event crosses a cut it did not
+    already cross."""
+    m = float(multiple)
+    if m <= 7.0:
+        return round(0.20 + 0.10 * m, 3)
+    return round(0.90 + 0.07 * (1.0 - math.exp(-(m - 7.0) / 8.0)), 3)
