@@ -69,7 +69,8 @@ ANALYTICAL DIRECTIVES:
 - Formulate 3 distinct hypotheses spanning baseline, alternative, and high-impact tail risks.
 - Prioritize cross-domain convergence (e.g. maritime AIS dark + insider options sweep + cyber CVE).
 - Ensure watch/deny signals specify concrete, observable events (entities, tickers, MMSI, locations, thresholds).
-- Calibrate prior probabilities to sum to 100%.
+- Calibrate prior probabilities to sum to 100%. Derive each one from the signals you cite, not from habit: the same split on every
+  case (55/30/15, 45/30/25) carries no information, and a case with one dominant explanation should say so.
 
 OUTPUT RULES:
 1. Return ONLY valid JSON matching the schema. No markdown wrappers or preamble.
@@ -98,7 +99,7 @@ One hypothesis, shown in full. Produce exactly 3 in the "hypotheses" array.
   "hypotheses": [
     {
       "label": "<name this hypothesis>",
-      "probability": 45,
+      "probability": "<integer percent, 1 to 99, from the weight of the evidence you cite>",
       "mechanism": "<how the signals above cause one another. Name at least one signal from the SIGNAL section by its actual value.>",
       "beneficiaries": ["<who gains if this is true>"],
       "watch_signals": [{"entity": "<the ticker/wallet/vessel this is about>", "observable": "<what would be seen>", "comparator": "above|below|occurs|absent", "threshold": 5.0, "unit": "%"}],
@@ -107,7 +108,7 @@ One hypothesis, shown in full. Produce exactly 3 in the "hypotheses" array.
     }
   ],
   "recommended_monitoring": ["<specific track, ticker, wallet, or sensor feed>"],
-  "confidence_overall": 62,
+  "confidence_overall": "<integer 0 to 100: how well the evidence supports the headline>",
   "confidence_rationale": "<key evidence against the intelligence gaps>"
 }
 

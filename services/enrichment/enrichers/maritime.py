@@ -12,6 +12,7 @@ import uuid
 import logging
 import asyncio
 import time
+from shared.utils.sts_score import sts_score
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import dropped, swallowed
 from datetime import datetime, timezone
@@ -483,7 +484,8 @@ def _sts_event(raw, mmsi, vessel, lat, lon, region, partner, vtype=None, extra_t
         tags=["maritime", "vessel_sts", "co_location"] + (["sanctioned"] if flags else [])
              + list(extra_tags or []),
         named_entities=[str(name), str(partner["mmsi"])],
-        anomaly_score=0.78,
+        # From the geometry (shared/utils/sts_score.py); it was a constant 0.78 for every event.
+        anomaly_score=sts_score(partner["dwell_hours"], partner["separation_nm"], partner["speed_knots"], bool(flags), bool(region)),
     )
 
 
