@@ -121,12 +121,16 @@ class BlockedLoopSampler(threading.Thread):
         return out
 
 
-def install(loop: asyncio.AbstractEventLoop, threshold_ms: float, logger: logging.Logger, interval_sec: float = 600.0) -> SlowCallbackLog:
-    """Turn on slow-callback detection at `threshold_ms` and log a ranked summary every `interval_sec`."""
+def install(loop: asyncio.AbstractEventLoop, threshold_ms: float, logger: logging.Logger, interval_sec: float = 600.0, debug: bool = False) -> SlowCallbackLog:
+    """Watch for a blocked loop: the stack sampler always, asyncio's own slow-callback log only with `debug`.
+
+    Debug mode records the creation stack of every callback, which cost 509 of 600 seconds on the agents loop (12 Nov measurement), so
+    it inflates what it measures and is off by default; the sampler costs one thread waking every 10 ms."""
     handler = SlowCallbackLog()
     logging.getLogger("asyncio").addHandler(handler)
-    loop.set_debug(True)
-    loop.slow_callback_duration = max(0.001, float(threshold_ms) / 1000.0)
+    if debug:
+        loop.set_debug(True)
+        loop.slow_callback_duration = max(0.001, float(threshold_ms) / 1000.0)
     sampler = BlockedLoopSampler(loop, threading.get_ident(), threshold_ms)
     sampler.start()
     handler.sampler = sampler

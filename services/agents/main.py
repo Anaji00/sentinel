@@ -193,7 +193,7 @@ async def main():
     # Off unless LOOP_SLOW_CALLBACK_MS is set: names the jobs that hold the event loop longer than that many milliseconds.
     _slow_ms = loop_watch.threshold_from_env(dict(os.environ))
     if _slow_ms:
-        loop_watch.install(asyncio.get_running_loop(), _slow_ms, logger)
+        loop_watch.install(asyncio.get_running_loop(), _slow_ms, logger, debug=os.getenv("LOOP_WATCH_DEBUG", "").strip() == "1")
         logger.info("Slow-callback watch on at %.0f ms", _slow_ms)
 
     shared_infra = {

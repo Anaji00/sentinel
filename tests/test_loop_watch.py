@@ -38,7 +38,7 @@ def test_the_threshold_comes_from_the_environment_and_off_means_none() -> None:
 
 def test_installing_it_catches_a_real_blocking_call() -> None:
     async def scenario() -> list:
-        h = lw.install(asyncio.get_running_loop(), 20, logging.getLogger("t"), interval_sec=3600)
+        h = lw.install(asyncio.get_running_loop(), 20, logging.getLogger("t"), interval_sec=3600, debug=True)
 
         async def blocker() -> None:
             time.sleep(0.15)                     # the kind of call that has to move to a thread
@@ -77,3 +77,11 @@ def test_the_soft_correlator_imports_its_heavy_libraries_off_the_event_loop() ->
     body = src[i:i + 2500]
     assert "run_in_executor(None, _heavy_imports)" in body
     assert "\n                import sentence_transformers\n" not in body          # no import statement runs on the loop
+
+
+def test_debug_mode_is_off_by_default_because_it_inflates_what_it_measures() -> None:
+    async def scenario() -> bool:
+        lw.install(asyncio.get_running_loop(), 50, logging.getLogger("t"), interval_sec=3600)
+        return asyncio.get_running_loop().get_debug()
+
+    assert asyncio.run(scenario()) is False
