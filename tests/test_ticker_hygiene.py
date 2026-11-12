@@ -57,3 +57,16 @@ def test_crypto_pair_exposure_is_not_an_instrument_of_company_news():
     row = {"event_id": "1", "type": "headline", "source": "alpaca_news", "created_at": NOW,
            "tags": ["stock_news", "tone_positive", "exposes:BTCUSD", "exposes:COIN"]}
     assert {o.instrument for o in observations(row)} == {"COIN"}
+
+
+def test_wrapped_and_venue_prefixed_symbols_are_unwrapped() -> None:
+    # Found in the 11 Nov bar-less investigation (reports/Bar-less instruments.md).
+    for raw, want in (("(CALX)", "CALX"), ("[DXPE]", "DXPE"), ('"""TELA"""', "TELA"), ("?RDW?", "RDW"),
+                      ("NASDAQ:SVC", "SVC"), ("(NYSE:FBC)", "FBC"), ("NYSE:EVC", "EVC"), ("NMFC]", "NMFC")):
+        assert clean_symbols(raw) == [want], raw
+    assert clean_symbols("TSX:D") != ["D"]                       # a foreign venue is not stripped to a US ticker
+
+
+def test_bare_berkshire_and_brown_forman_map_to_their_priced_class() -> None:
+    assert clean_symbols("BRK") == ["BRK.B"] and clean_symbols("BF") == ["BF.B"]
+    assert clean_symbols("BRK.A") == ["BRK.A"] and clean_symbols("BRK, BRK.B") == ["BRK.B"]

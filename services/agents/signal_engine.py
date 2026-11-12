@@ -41,7 +41,7 @@ from shared.models.events import EventType
 from shared.utils.confidence_calibration import record_outcome
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.market_session import Session, instrument_closed_at, session_label_at
-from shared.utils.asset_universe import load_asset_meta, priceable_now
+from shared.utils.asset_universe import exchange_of, load_asset_meta, priceable_now
 from shared.utils.quiet_failures import dropped, swallowed
 from shared.utils.short_data import HARD_TO_BORROW_FEE
 from shared.utils import tradable_cells
@@ -430,6 +430,8 @@ class SignalEngine:
             "instruments_not_studied": skipped_instruments,
             "instruments_without_bars": len(needs_bars),
             "instruments_untradeable": untradeable,
+            # Queued names Alpaca lists only over the counter: its free feed serves bars for about a third of them.
+            "instruments_otc_without_bars": sum(1 for i, _n in needs_bars if exchange_of(i, asset_meta) == "OTC"),
             "verdicts": verdicts,
             "cells": table,
         }

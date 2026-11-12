@@ -120,3 +120,13 @@ def test_without_keys_the_asset_list_stays_empty_and_makes_no_call(monkeypatch):
     for name in ("ALPACA_API_KEY", "APCA_API_KEY_ID", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET", "APCA_API_SECRET_KEY"):
         monkeypatch.delenv(name, raising=False)
     assert asyncio.run(au.load_asset_meta(Raw())) == {}
+
+
+def test_compact_keeps_the_exchange_and_an_older_cache_reads_as_unknown() -> None:
+    from shared.utils.asset_universe import exchange_of
+
+    out = compact([{"symbol": "eadsy", "name": "AIRBUS SE ADR - Unsponsored", "exchange": "OTC"},
+                   {"symbol": "aapl", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ"}])
+    assert out["EADSY"][4] == "OTC" and exchange_of("eadsy", out) == "OTC" and exchange_of("AAPL", out) == "NASDAQ"
+    assert exchange_of("ZZZZ", out) is None and exchange_of("AAPL", None) is None
+    assert exchange_of("OLD", {"OLD": ["stock", True, True, "Old Co"]}) is None      # cached before the field existed

@@ -77,15 +77,22 @@ def priceable_now(symbol: str, meta: Optional[Dict[str, list]]) -> bool:
     return bool(row) and row[0] in ("stock", "fund")
 
 
+def exchange_of(symbol: str, meta: Optional[Dict[str, list]]) -> Optional[str]:
+    """The venue Alpaca lists a symbol on ('OTC', 'NASDAQ', ...), or None if unlisted or cached without it."""
+    row = (meta or {}).get(str(symbol).upper())
+    return (row[4] or None) if row and len(row) > 4 else None
+
+
 def compact(assets: Any) -> Dict[str, list]:
-    """Alpaca asset records -> {symbol: [kind, shortable, easy_to_borrow, name]}."""
+    """Alpaca asset records -> {symbol: [kind, shortable, easy_to_borrow, name, exchange]}. A list cached before the exchange
+    was added has four elements; exchange_of reads that as unknown."""
     out: Dict[str, list] = {}
     for a in assets or []:
         sym = str(a.get("symbol") or "").upper()
         if not sym:
             continue
         name = str(a.get("name") or "")
-        out[sym] = [classify(name), bool(a.get("shortable")), bool(a.get("easy_to_borrow")), name[:80]]
+        out[sym] = [classify(name), bool(a.get("shortable")), bool(a.get("easy_to_borrow")), name[:80], str(a.get("exchange") or "")]
     return out
 
 
@@ -187,6 +194,6 @@ async def fetch_assets(session: Any, headers: Optional[Dict[str, str]], status: 
 
 __all__ = [
     "bankrupt_roots",
-    "ASSET_META_KEY", "LISTED_EXCHANGES", "classify", "compact", "delisted_stocks", "fetch_assets",
+    "ASSET_META_KEY", "LISTED_EXCHANGES", "classify", "compact", "exchange_of", "delisted_stocks", "fetch_assets",
     "load_asset_meta", "refresh_asset_meta",
 ]

@@ -25,8 +25,9 @@ queued: 60 of the 277 OTC names and 41 of the 42 exchange-listed ones. So about 
 names fill on the next backfill pass. "Listed by Alpaca" is not "has bars": `priceable_now` treats every listed stock as
 priceable.
 
+## Done 12 Nov, on approval
+- The asset meta carries the exchange as a fifth element (`exchange_of` reads an older four-element cache as unknown); the cache was rewritten in place. The study reports `instruments_otc_without_bars` from its next run.
+- `clean_symbols` unwraps quotes, brackets and `?`, strips US venue prefixes (NYSE:, NASDAQ:) and maps bare BRK and BF to BRK.B and BF.B. Foreign prefixes (TSX:) are left as written. This applies to the study's instruments; other producers of the bare names are untouched.
+
 ## Not done
-- Exchange is not in the asset meta, so OTC names cannot be told apart in the count. Adding it as a fifth list element would make
-  the count honest; nothing reads past index 3.
-- Cleaning brackets and exchange prefixes at the source and mapping BRK to BRK.B recovers about 20 names and 109 episodes.
 - The earlier "1,937 against 3,146" figures cannot be reproduced: the study population has since grown.
