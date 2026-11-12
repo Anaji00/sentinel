@@ -301,10 +301,17 @@ class SoftCorrelator:
         async with self._load_lock:
             if self._enabled: return  # Double-check locking
             try:
-                import sentence_transformers
-                from qdrant_client import AsyncQdrantClient
-                from qdrant_client.http import models
                 loop = asyncio.get_running_loop()
+
+                def _heavy_imports():
+                    # Importing torch and sentence_transformers took 38 s on the event loop (11 Nov loop watch), stalling every
+                    # task in the process, the heartbeat included; imports are synchronous, so they go to the executor too.
+                    import sentence_transformers as _st
+                    from qdrant_client import AsyncQdrantClient as _client
+                    from qdrant_client.http import models as _models
+                    return _st, _client, _models
+
+                sentence_transformers, AsyncQdrantClient, models = await loop.run_in_executor(None, _heavy_imports)
                 if not self._model:
                     self._model = await loop.run_in_executor(
                         None, 

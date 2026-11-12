@@ -7,9 +7,12 @@ worker thread are found by measurement. Switched on with LOOP_SLOW_CALLBACK_MS; 
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import re
+import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 _TOOK = re.compile(r"took ([0-9.]+) seconds")
@@ -37,6 +40,7 @@ class SlowCallbackLog(logging.Handler):
         super().__init__(level=logging.WARNING)
         self._lock = threading.Lock()
         self.stats: Dict[str, List[float]] = {}          # job -> [count, worst seconds, total seconds]
+        self.sampler: Optional["BlockedLoopSampler"] = None
 
     def emit(self, record: logging.LogRecord) -> None:
         got = parse(record.getMessage())
@@ -59,12 +63,73 @@ class SlowCallbackLog(logging.Handler):
         return out
 
 
+_SKIP = ("asyncio/", "utils/loop_watch.py", "threading.py")
+
+
+class BlockedLoopSampler(threading.Thread):
+    """Records the exact line the event loop is stuck on while it is blocked.
+
+    The loop schedules a tick every `tick_ms`. A thread watches the time since the last tick; once it exceeds `threshold_ms` it
+    samples the loop thread's stack every `sample_ms`, so a call that blocks for a second is seen about 1000/sample_ms times at its
+    own line. Names from asyncio's slow-callback log say which task was held; this says where."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, loop_thread_id: int, threshold_ms: float, sample_ms: float = 10.0, tick_ms: float = 10.0) -> None:
+        super().__init__(name="loop-watch-sampler", daemon=True)
+        self._loop, self._tid = loop, loop_thread_id
+        self._threshold, self._sample, self._tick = threshold_ms / 1000.0, sample_ms / 1000.0, tick_ms / 1000.0
+        self._last = time.monotonic()
+        self._stop_flag = threading.Event()
+        self._lock = threading.Lock()
+        self.counts: "collections.Counter[str]" = collections.Counter()
+        self.sample_s = sample_ms / 1000.0
+
+    def _beat(self) -> None:
+        self._last = time.monotonic()
+        if not self._stop_flag.is_set():
+            self._loop.call_later(self._tick, self._beat)
+
+    def start(self) -> None:                                           # type: ignore[override]
+        self._loop.call_soon(self._beat)
+        super().start()
+
+    def stop(self) -> None:
+        self._stop_flag.set()
+
+    def run(self) -> None:
+        while not self._stop_flag.is_set():
+            time.sleep(self._sample)
+            if time.monotonic() - self._last < self._threshold:
+                continue
+            frame = sys._current_frames().get(self._tid)
+            parts: List[str] = []
+            while frame is not None and len(parts) < 3:
+                code = frame.f_code
+                path = code.co_filename.replace("\\", "/")
+                if not any(k in path for k in _SKIP):
+                    parts.append(f"{path.rsplit('/app/', 1)[-1]}:{frame.f_lineno} {code.co_name}")
+                frame = frame.f_back
+            if parts:
+                with self._lock:
+                    self.counts[" <- ".join(parts)] += 1
+
+    def summary(self, top: int = 8, reset: bool = False) -> List[str]:
+        with self._lock:
+            rows = self.counts.most_common(top)
+            out = [f"{where}: {n * self.sample_s:.1f}s" for where, n in rows]
+            if reset:
+                self.counts = collections.Counter()
+        return out
+
+
 def install(loop: asyncio.AbstractEventLoop, threshold_ms: float, logger: logging.Logger, interval_sec: float = 600.0) -> SlowCallbackLog:
     """Turn on slow-callback detection at `threshold_ms` and log a ranked summary every `interval_sec`."""
     handler = SlowCallbackLog()
     logging.getLogger("asyncio").addHandler(handler)
     loop.set_debug(True)
     loop.slow_callback_duration = max(0.001, float(threshold_ms) / 1000.0)
+    sampler = BlockedLoopSampler(loop, threading.get_ident(), threshold_ms)
+    sampler.start()
+    handler.sampler = sampler
 
     async def report() -> None:
         while True:
@@ -72,6 +137,9 @@ def install(loop: asyncio.AbstractEventLoop, threshold_ms: float, logger: loggin
             lines = handler.summary(reset=True)
             if lines:
                 logger.warning("Event loop held over %.0f ms in the last %.0f s: %s", threshold_ms, interval_sec, " | ".join(lines))
+            where = sampler.summary(reset=True)
+            if where:
+                logger.warning("Where the loop was blocked (seconds, newest frame first): %s", " | ".join(where))
 
     loop.create_task(report(), name="loop_watch_report")
     return handler
@@ -86,4 +154,4 @@ def threshold_from_env(env: Dict[str, Any]) -> Optional[float]:
     return v if v > 0 else None
 
 
-__all__ = ["SlowCallbackLog", "install", "parse", "threshold_from_env"]
+__all__ = ["BlockedLoopSampler", "SlowCallbackLog", "install", "parse", "threshold_from_env"]

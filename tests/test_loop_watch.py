@@ -50,3 +50,30 @@ def test_installing_it_catches_a_real_blocking_call() -> None:
 
     out = asyncio.run(scenario())
     assert out and "blocker" in out[0]
+
+
+def test_the_sampler_names_the_function_that_blocks_the_loop() -> None:
+    import threading
+
+    def heavy_synchronous_work() -> None:
+        time.sleep(0.4)
+
+    async def scenario() -> list:
+        s = lw.BlockedLoopSampler(asyncio.get_running_loop(), threading.get_ident(), threshold_ms=30, sample_ms=5, tick_ms=5)
+        s.start()
+        await asyncio.sleep(0.05)
+        heavy_synchronous_work()                   # holds the loop for 0.4 s
+        await asyncio.sleep(0.05)
+        s.stop()
+        return s.summary()
+
+    out = asyncio.run(scenario())
+    assert out and "heavy_synchronous_work" in out[0] or any("heavy_synchronous_work" in line for line in out)
+
+
+def test_the_soft_correlator_imports_its_heavy_libraries_off_the_event_loop() -> None:
+    src = (ROOT / "services/correlation/soft_correlator.py").read_text(encoding="utf-8")
+    i = src.index("async def _load(self)")
+    body = src[i:i + 2500]
+    assert "run_in_executor(None, _heavy_imports)" in body
+    assert "\n                import sentence_transformers\n" not in body          # no import statement runs on the loop
