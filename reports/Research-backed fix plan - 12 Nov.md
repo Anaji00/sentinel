@@ -103,3 +103,42 @@ FinBERT is a financial-text model: it reads "US election results could be positi
 while the lexicon misses "Webull expands in Europe" and "Tidewater initiates 2027 revenue guidance". Neither is clearly right. No switch.
 The only fair judge is the outcome: re-derive the sector and country news cells under each scorer and compare forward returns, which needs
 the signal-families study run twice; not done. Until then both stay as they are and the lexicon's zero means "no word matched".
+
+
+## Phases 2 to 7: what was built (12 Nov evening)
+
+**Phase 3, shadow, no live change.**
+- `shared/utils/diurnal.py`: the registered session buckets, a median-and-MAD z that never contains the observation it scores, and a streaming
+  same-bucket baseline that scores before it adds. Not wired into the live scorer: the offline replay already showed the live ranking is
+  within the parity bar, so the hot path stays as it is.
+- Hawkes timestamps (`scripts/measure_hawkes_timestamps.py`): 76% of a week's events carry a stamp within 2 seconds of collection, which is
+  simply real time for live streams, so that share cannot trigger the registered 10% rule. A one-second de-duplication was tried and removed:
+  crypto genuinely arrives about 4.7 times a second and the existing guard test records it. What is identifiable is a derived, back-filled
+  type: earnings_reaction rows (66% stored over an hour after the release, one batch of 422 in a second). They no longer feed the Hawkes fit.
+- Contagion (`shared/utils/contagion.py`, replay `scripts/shadow_contagion.py`): damped multi-hop propagation with provenance paths. Replay over
+  618 sessions on 219 customer links: 411 second-order episodes, 5-session sign agreement 50.6% against the registered 55% bar; after a
+  customer drop 46.2%, after a rise 55.2%; first half 48.8%, second half 52.4%. Bar not met, so it stays in shadow and emits nothing. This
+  matches the research that customer momentum is weak and partly a small-versus-large lead-lag.
+
+**Phase 4, live as an annotation only.** `shared/utils/regime_packet.py` builds a numbers-first packet and `classify` gives one of the four
+labels by rules, with no tokens; an input that was not measured is never read as "none found". `services/agents/regime_annotation.py` fills the
+packet from filings, earnings reactions, insider clusters and short interest, and the divergence watch now adds `regime` to each alert's
+metrics and a `regime:<label>` tag. It changes no order. On the last 14 days of divergence alerts (58): 27 unexplained dislocation, 15
+confirmed catalyst drift, 8 fundamental impairment trap, 8 crowded or no edge; every input was measured. NVDA, the original case, abstains
+(41 articles and no filing or surprise to read them against); MCHP and QXO (both vetoed by the trader today) read as impairment trap and drift.
+No model explanation calls were added; the grading of each label on its 5-session excess return starts from the first labelled alert.
+
+**Phase 5, simulator built, run pending.** `shared/utils/b1_variants.py` simulates the five variants on daily paths from the walk-forward's
+collected positions (accrual half-life, 3-sigma adverse exit, shrinkage min-variance weights, trailing stop; exits cost 5 bps and leave cash
+idle, every variant pays the same 44 bps short fee); `scripts/run_b1_variants.py` applies the registered bar (beat V0 on 6 of 8 calendars and
+by 0.10 on average). It needs the whole panel, so it runs in its own capped container after 06:00 UTC, not during the nightly model run.
+
+**Phase 2, module built, shadow run in progress.** `shared/utils/hier_bayes.py`: three levels (zero, family at a horizon, size band) with
+method-of-moments prior strengths, floored so a null world is not reported as certain, a cell never surer than its parent, effective N from the
+brief's formula, and the registered release rule (posterior probability 0.95, effective N 30, false-discovery step). `scripts/shadow_cap_cells.py`
+re-reads the study's archive and splits every cell by point-in-time size band (daily dollar volume against the four size benchmarks).
+The gate is untouched.
+
+**Phase 7.** Frontend: `tsc --noEmit` clean, 70 files and 449 tests pass. `check_constructor_arity`: 2 calls in collector-crypto omit
+`on_connect` (introduced in 1.1.5 and 1.1.7, not by today's work). `check_reachability`: the 4 known entry points that no service runs
+(supervisor, debug_check, deep_history_backfill, ofac_sync), matching the guard test's allowance.
