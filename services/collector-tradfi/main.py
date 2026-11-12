@@ -2878,7 +2878,7 @@ async def _signal_backfill_loop(redis_client) -> None:
             # Every name already loaded deep is kept current, not only the ones
             # the platform happens to stream.
             deep_now = {(m.decode() if isinstance(m, bytes) else str(m)).upper()
-                        for m in (await raw.smembers(DAILY_DEEP_KEY) or [])}
+                        for m in (await raw.smembers(DAILY_DEEP_KEY) or [])} | await _tracked_daily_names(db)
             await backfill_daily_bars(db, sorted(set(daily_universe) | deep_now), lookback_days=DAILY_TOPUP_DAYS)
         except Exception as e:
             swallowed("collector.tradfi.signal_backfill", e, logger)
@@ -3248,6 +3248,20 @@ POST_CLOSE_TOPUP_NY = (16, 35)
 POST_CLOSE_TOPUP_DAYS = 5
 
 
+TRACKED_DAILY_DAYS = 45
+
+
+async def _tracked_daily_names(db) -> set:
+    """Every name that has had a daily bar in the last TRACKED_DAILY_DAYS days.
+
+    The post-close and twelve-hourly top-ups read only DAILY_DEEP_KEY, about 7,400 names, while 12,060 names had a bar each day until 6 Nov.
+    The other 5,800 (SANA, GTR, DIM and the like) were loaded in bulk and never joined that set, so since 9 Nov they got no new bars; the factor
+    model then dropped sessions 9 to 11 Nov as incomplete (coverage 52%) and its scores stayed as of 6 Nov. A name already tracked is kept
+    current whether or not it is in the set."""
+    rows = await db.query("SELECT DISTINCT ticker FROM daily_bars WHERE day > CURRENT_DATE - $1::int", TRACKED_DAILY_DAYS)
+    return {str(r["ticker"]).upper() for r in rows or [] if r.get("ticker")}
+
+
 async def _post_close_daily_loop(redis_client) -> None:
     from zoneinfo import ZoneInfo
     from shared.db import get_timescale
@@ -3262,10 +3276,11 @@ async def _post_close_daily_loop(redis_client) -> None:
             now = datetime.now(timezone.utc).astimezone(ny)
             today = now.date().isoformat()
             if now.weekday() < 5 and (now.hour, now.minute) >= POST_CLOSE_TOPUP_NY and done_for != today:
-                names = sorted((m.decode() if isinstance(m, bytes) else str(m)).upper()
-                               for m in (await raw.smembers(DAILY_DEEP_KEY) or []))
+                db = await get_timescale()
+                names = sorted({(m.decode() if isinstance(m, bytes) else str(m)).upper()
+                                for m in (await raw.smembers(DAILY_DEEP_KEY) or [])} | await _tracked_daily_names(db))
                 if names:
-                    rep = await backfill_daily_bars(await get_timescale(), names, lookback_days=POST_CLOSE_TOPUP_DAYS)
+                    rep = await backfill_daily_bars(db, names, lookback_days=POST_CLOSE_TOPUP_DAYS)
                     logger.info("Post-close daily bars: %s bars for %s names", rep.get("bars_written"),
                                 rep.get("tickers_with_data"))
                 done_for = today
