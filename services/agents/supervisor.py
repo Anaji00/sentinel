@@ -387,6 +387,29 @@ class GraphSupervisor(SentinelAgent):
             logger.warning("Lock release failed for %s: %s", entity_id, e)
             return False
 
+    async def renew_lock(self, entity_id: str, token: str) -> bool:
+        """Extends the lease only if this caller still holds the lock (atomic compare-and-expire); False once it has been lost."""
+        try:
+            return bool(await self.redis.raw.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1, f"sentinel:lock:neo4j:{entity_id}", token, LOCK_TTL_SEC,
+            ))
+        except Exception as e:
+            swallowed("agents.supervisor.renew_lock", e, logger, detail=entity_id)
+            return False
+
+    async def _renew_locks(self, held: Dict[str, str]) -> None:
+        """Keeps every lock in `held` alive while a batch is in flight.
+
+        A batch takes each entity's lock, then commits. With many entities the commit outlasts the 15 s lease, so the first locks
+        expired mid-batch (10 lease overruns and 16 timeouts in 6,000 log lines, 12 Nov 2026). A lease that can lapse during the
+        work it protects has to be renewed (Kleppmann, "How to do distributed locking"); renewal is a third of the lease apart."""
+        while True:
+            await asyncio.sleep(LOCK_TTL_SEC / 3.0)
+            for eid, token in list(held.items()):
+                if not await self.renew_lock(eid, token):
+                    held.pop(eid, None)             # lost: the release will report it; nothing more to extend
+
     async def execute_batch_proposals(self, proposals: List[dict]) -> int:
         """Commits a batch of proposals. Returns how many rows were written.
 
@@ -408,6 +431,7 @@ class GraphSupervisor(SentinelAgent):
                 entity_ids.add(tid)
 
         acquired_locks: Dict[str, str] = {}
+        renewer = safe_create_task(self._renew_locks(acquired_locks), name=f"{self.name}-lock-renewal")
         for eid in entity_ids:
             token = await self.acquire_lock(eid)
             if token:
@@ -584,7 +608,8 @@ class GraphSupervisor(SentinelAgent):
             logger.error(f"UNWIND batch commit failed: {e}")
             raise
         finally:
-            for eid, token in acquired_locks.items():
+            renewer.cancel()
+            for eid, token in list(acquired_locks.items()):
                 await self.release_lock(eid, token)
 
     async def execute_proposal(self, payload: dict) -> bool:
