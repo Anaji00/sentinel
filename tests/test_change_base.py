@@ -18,7 +18,7 @@ def test_after_the_close_the_base_is_todays_final_close_not_the_day_before() -> 
     # NVDA on 11 Nov 2026, 19:58 ET: the bar dated today is final; the 158.85 print is after hours.
     base, day = rc.change_base(DAYS, CLOSES, date(2026, 11, 11), session_open=False)
     assert (base, day) == (173.73, date(2026, 11, 11))
-    assert round((158.85 / base - 1) * 100, 2) == -8.56
+    assert round((158.85 / base - 1) * 100, 2) == -8.57        # -8.565 rounded; reported as -8.56 when truncated
 
 
 def test_during_the_session_the_bar_dated_today_is_partial_so_the_base_is_the_close_before() -> None:

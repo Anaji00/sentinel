@@ -535,7 +535,7 @@ def change_base(days: Sequence[date], closes: Sequence[float], today: date, sess
 
     A daily bar dated today is still forming while the regular session is open, so the base is the close before it. Once the
     session has ended (after hours, overnight) that bar is final and is the base: measuring from the day before reported an
-    after-hours print as a move since two closes ago (NVDA, 11 Nov 2026: -5.94% against 168.89, not -8.56% against 173.73).
+    after-hours print as a move since two closes ago (NVDA, 11 Nov 2026: -5.94% against 168.89, not -8.57% against 173.73).
     No earlier close to use gives (None, None)."""
     if not closes or not days:
         return None, None
