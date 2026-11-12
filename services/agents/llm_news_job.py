@@ -11,6 +11,9 @@ a model may remember what prices did before its cutoff. Hosted only: the local
 models are BERT-to-7B sized, the tier that showed no skill, and the CPU is the
 platform's scarcest resource. With no hosted key the job does nothing.
 
+Admission: only stocks of $1bn and over (market_cap.MODEL_MIN_MARKET_CAP_USD), the universe the model ranks; a name with no cap on file is not
+large. Before 12 Nov 2026 every single-stock headline was scored, and 53% of the tokens went to stocks the book never trades.
+
 Paced: BATCH headlines a request, at most MAX_REQUESTS_PER_PASS a pass, every
 INTERVAL_SEC; the hosted router's own quota buckets bound the day.
 """
@@ -26,7 +29,8 @@ import aiohttp
 
 from shared.utils import hosted_llm
 from shared.utils import llm_news as ln
-from shared.utils.quiet_failures import swallowed
+from shared.utils import market_cap as mc
+from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.llm_news")
 
@@ -40,7 +44,7 @@ MODEL = os.getenv("NEWS_LLM_MODEL", "gemini/gemini-3.5-flash-lite")
 _UNSCORED_SQL = f"""
     SELECT n.id, n.symbols[1] AS ticker, n.created_at, n.headline FROM stock_news n
     WHERE n.created_at > NOW() - INTERVAL '{LOOKBACK_HOURS} hours' AND cardinality(n.symbols) = 1
-      AND n.symbols[1] ~ '^[A-Z]{{1,5}}$'
+      AND n.symbols[1] ~ '^[A-Z]{{1,5}}$' AND n.symbols[1] = ANY($3::text[])
       AND NOT EXISTS (SELECT 1 FROM stock_news_llm s WHERE s.news_id = n.id AND s.model IN ($1, $1 || '#stale'))
     ORDER BY n.created_at DESC LIMIT $2
 """
@@ -98,7 +102,13 @@ class LlmNewsJob:
 
     async def run_once(self, llm: Any) -> Dict[str, int]:
         scored = requests = 0
-        rows = await self.db.query(_UNSCORED_SQL, MODEL, ln.BATCH * MAX_REQUESTS_PER_PASS) or []
+        large = await mc.large_caps(self.raw, mc.MODEL_MIN_MARKET_CAP_USD)
+        if large:
+            rows = await self.db.query(_UNSCORED_SQL, MODEL, ln.BATCH * MAX_REQUESTS_PER_PASS, sorted(large)) or []
+        else:
+            # Unknown size is not a pass: without the cap table nothing is scored this pass.
+            dropped("agents.llm_news.no_market_caps", "no market-cap table; no headlines scored this pass", logger)
+            rows = []
         # Near-repeats of the stock's previous headlines are recorded under the
         # stale label and not scored (llm_news.stale_ids), so a syndicated
         # story counts once in the 30-day mean and costs one call.
