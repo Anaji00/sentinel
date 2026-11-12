@@ -41,8 +41,10 @@ MAX_NEEDS_BARS = 300
 # 30d horizons read nothing finer), so the list can be five times longer at a fraction of the cost.
 NEEDS_DAILY_KEY = "sentinel:signals:needs_daily"
 MAX_NEEDS_DAILY = 1500
+# Would-be signals from proven cells the tradability gate (G4) did not clear, kept for research (sorted set, newest last).
+SHADOW_KEY = "sentinel:signals:shadow"
 
 __all__ = [
     "ACTIVE_KEY", "AWAITING_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "SIGNAL_MATRIX_INDEX_KEY", "PRODUCER_GRADES_KEY", "SIGNAL_MATRIX_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
-    "NEEDS_BARS_KEY", "NEEDS_DAILY_KEY", "MAX_NEEDS_DAILY", "OUTCOMES_KEY", "STUDY_KEY",
+    "NEEDS_BARS_KEY", "NEEDS_DAILY_KEY", "MAX_NEEDS_DAILY", "OUTCOMES_KEY", "SHADOW_KEY", "STUDY_KEY",
 ]

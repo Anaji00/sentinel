@@ -1,6 +1,9 @@
 import logging
 from fastapi import APIRouter, Depends, Request
+from typing import Any, Dict
+
 from services.api_gateway.dependencies import get_redis_client, get_redis_optional
+from shared.utils.rbac import Role, require_role
 from shared.utils.config import config
 
 logger = logging.getLogger("api-gateway.system")
@@ -153,3 +156,18 @@ async def get_mechanism_liveness(redis=Depends(get_redis_optional)):
         "never": [{"mechanism": r["mechanism"], "describes": r["describes"]} for r in never],
         "mechanisms": rows,
     }
+
+
+@router.get("/model-quota")
+async def model_quota(
+    redis=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """Where each free-tier hosted model stands against its per-minute and per-day limits, most used first.
+    Read only. `status` is ok, near limit (80% of any limit), at limit, cooling down (the provider refused a call) or no key set."""
+    from shared.utils import model_quota as mq
+
+    raw = getattr(redis, "raw", redis)
+    models = await mq.snapshot(raw)
+    return {"count": len(models), "models": models,
+            "note": None if models else "No hosted-model limits are configured."}

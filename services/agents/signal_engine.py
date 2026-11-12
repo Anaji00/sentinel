@@ -55,7 +55,7 @@ from shared.utils.signal_families import (
 )
 from shared.utils.signal_store import (
     ACTIVE_KEY, AWAITING_KEY, CURSOR_KEY, EVIDENCE_KEY, MAX_NEEDS_BARS, MAX_NEEDS_DAILY, NEEDS_BARS_KEY, NEEDS_DAILY_KEY,
-    OUTCOMES_KEY, STUDY_KEY,
+    OUTCOMES_KEY, SHADOW_KEY, STUDY_KEY,
 )
 from shared.utils.tasks import safe_create_task
 
@@ -64,7 +64,6 @@ logger = logging.getLogger("agent.signal_engine")
 
 STUDY_INTERVAL_SEC = 6 * 3600
 LIVE_INTERVAL_SEC = 60
-SHADOW_KEY = "sentinel:signals:shadow"      # would-be signals from proven cells G4 did not clear, kept for research
 SHADOW_CAP = 5000
 # The study reads the permanent archive (signal_event_archive), so its window
 # is no longer capped by the 90-day retention on events; it deepens as history

@@ -27,11 +27,12 @@ from services.api_gateway.dependencies import get_db, get_redis_client
 from shared.utils.evidence_fusion import (
     EVIDENCE_EVENT_TYPES, EVIDENCE_EVENTS_SQL, build_dossiers, convergence, family_record,
 )
-from shared.utils.signal_families import observations
+from shared.utils.signal_families import FAMILY_DESCRIPTIONS, observations
+from shared.utils.held_back import for_ticker as held_back_for
 from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils.quiet_failures import swallowed
 from shared.utils.rbac import Role, require_role
-from shared.utils.signal_store import ACTIVE_KEY, EVIDENCE_CACHE_PREFIX, OUTCOMES_KEY, STUDY_KEY, SIGNAL_MATRIX_INDEX_KEY, SIGNAL_MATRIX_KEY
+from shared.utils.signal_store import ACTIVE_KEY, EVIDENCE_CACHE_PREFIX, OUTCOMES_KEY, SHADOW_KEY, STUDY_KEY, SIGNAL_MATRIX_INDEX_KEY, SIGNAL_MATRIX_KEY
 
 logger = logging.getLogger("api.signals")
 
@@ -250,6 +251,27 @@ async def signal_matrix_ticker(
     if not blob:
         return {"ticker": t, "signals": [], "note": "Not anomalous in the last three days, or not yet built."}
     return json.loads(_decode(blob))
+
+
+@router.get("/held-back/{ticker}")
+async def held_back(
+    ticker: str,
+    limit: int = Query(20, ge=1, le=100),
+    redis_client=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """Signals that were not raised on this stock, and which test held each one back, with the numbers where measured.
+    Newest first, from the last 45 days. An empty list means nothing was held back, not that the stock is clear."""
+    raw = getattr(redis_client, "raw", redis_client)
+    t = ticker.strip().upper()
+    try:
+        items = await raw.zrevrange(SHADOW_KEY, 0, -1)
+    except Exception as exc:
+        swallowed("api.signals.held_back", exc, logger)
+        return {"ticker": t, "count": 0, "held_back": [], "note": "The held-back record could not be read just now."}
+    rows = held_back_for(items, t, FAMILY_DESCRIPTIONS, limit)
+    note = None if rows else "Nothing recorded as held back for this stock in the last 45 days."
+    return {"ticker": t, "count": len(rows), "held_back": rows, "note": note}
 
 
 # Source -> (SQL for its newest record, seconds after which it is stale in a session).
