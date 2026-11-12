@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 import warnings
+from shared.utils import loop_watch
 from shared.utils.logging import setup_sentinel_logging
 
 logger = setup_sentinel_logging("agents.main", level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
@@ -188,6 +189,12 @@ async def main():
     logger.info("=" * 60)
     logger.info("SENTINEL AGENT SWARM INITIALIZING")
     logger.info("=" * 60)
+
+    # Off unless LOOP_SLOW_CALLBACK_MS is set: names the jobs that hold the event loop longer than that many milliseconds.
+    _slow_ms = loop_watch.threshold_from_env(dict(os.environ))
+    if _slow_ms:
+        loop_watch.install(asyncio.get_running_loop(), _slow_ms, logger)
+        logger.info("Slow-callback watch on at %.0f ms", _slow_ms)
 
     shared_infra = {
         "redis": await get_redis(),
