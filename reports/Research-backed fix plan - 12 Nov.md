@@ -95,3 +95,11 @@ slot history.
 
 **Operational mistake, mine.** I loaded a second FinBERT into the 2 GiB correlation container for a comparison; the container restarted at
 18:19 UTC and came back healthy with no tracebacks. Comparisons that load a model now run in agents-heavy.
+
+**FinBERT against the lexicon on world headlines (400 sampled, shadow).** FinBERT sees a tone in 60.8%, the lexicon in 42.5%. When FinBERT
+sees a tone the lexicon agrees 37.9%, calls it neutral 51.4% and is opposite 10.7%. When the lexicon sees a tone FinBERT agrees only 54.1% and
+is opposite 15.3%. So on world news the two disagree far more than on company news (where the lexicon was opposite 3 to 4% of the time).
+FinBERT is a financial-text model: it reads "US election results could be positive for Lebanon" as +0.86, which is not a market statement,
+while the lexicon misses "Webull expands in Europe" and "Tidewater initiates 2027 revenue guidance". Neither is clearly right. No switch.
+The only fair judge is the outcome: re-derive the sector and country news cells under each scorer and compare forward returns, which needs
+the signal-families study run twice; not done. Until then both stay as they are and the lexicon's zero means "no word matched".
