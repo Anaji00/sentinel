@@ -621,6 +621,11 @@ class CrossDomainHawkesCorrelator:
             logger.error(f"Hawkes MLE refit failed: {e}", exc_info=True)
             return None
 
+    # Event types that are derived and written in batches by an agent, not arrivals in the world: earnings_reaction rows are computed
+    # after the fact (66% were stored over an hour after the release; one batch stamped 422 in a second, 12 Nov measurement). Counted as
+    # arrivals they inflate the financial domain's self-excitation. Fast genuine streams (crypto at about 4.7 a second) are not touched.
+    DERIVED_TYPES = frozenset({"earnings_reaction"})
+
     async def _load_historical_events(self) -> Dict[str, List[float]]:
         """
         Load event timestamps from Redis event cache or TimescaleDB.
@@ -663,6 +668,8 @@ class CrossDomainHawkesCorrelator:
                         # fallback. Reconstructing it from a prefix here would
                         # rebuild the pseudo-domains from history even after the
                         # live recording path was corrected.
+                        if str(e.get("type", "")) in self.DERIVED_TYPES:
+                            continue
                         domain = e.get("domain") or canonical_domain(e.get("type", ""))
                         if domain in streams:
                             # Extract timestamp from the event
@@ -696,6 +703,8 @@ class CrossDomainHawkesCorrelator:
 
                 streams = {d: [] for d in SENTINEL_DOMAINS}
                 for row in rows:
+                    if str(row.get("event_type", "")) in self.DERIVED_TYPES:
+                        continue
                     domain = canonical_domain(str(row.get("event_type", "")))
                     if domain in streams:
                         ts = row.get("occurred_at")
