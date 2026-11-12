@@ -150,3 +150,13 @@ positive net return 0.944, just under the 0.95 bar). The first run found 79 rele
 so probabilities came out at 1.000 and effective N in the thousands: overlapping episodes (one filing wave, one earnings week) are not
 independent evidence. Rerun with each family-horizon-band-week collapsed to one unit, as the live study's independent units do; its result
 replaces the 79 and is the only one that counts. No gate change either way.
+
+**Phase 2 size-band study, corrected result (weekly units).** 302 cells with 10 or more weekly units; the 79 release candidates of the first run
+fall to **48** once overlapping episodes are collapsed. The five tradable cells: 8-K delisting notice 30d is positive in every band (+313 to
++1,538 bps, probability 1.000) and 8-K dilution 30d too (+615 to +886 bps). **Insider opportunistic sell 30d is fragile**: large +72 bps
+(probability 0.970), small +99 bps (0.995), micro +223 bps (1.000), but mid only +36 bps with probability 0.828, so it is not a candidate
+there. Candidates outside the five that sit in the bands the liquidity gate allows (large and mid) are 8-K auditor change 30d (+362 and
++372 bps), earnings reaction down 30d (+201 and +203 bps), earnings fade large 30d (+150 bps), stock news negative 30d mid (+239 bps),
+8-K dilution 5d (+157 and +156 bps) and 8-K delisting notice 5d (+177 and +191 bps). These are mostly short signals, so each still needs
+the instrument's borrow and liquidity check; the micro and small bands fail the $140.8M-a-day liquidity gate whatever their posterior. The
+results are before borrow fees. No gate change: the rule makes them candidates for the next gate review, which needs your approval.
