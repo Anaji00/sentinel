@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 
 def _local(tag: str) -> str:
@@ -127,3 +129,24 @@ def headline(parsed: Dict[str, Any], ticker: str, filer: str, previous_pct: Opti
     if pct is not None and previous_pct is not None and abs(pct - previous_pct) >= 0.01:
         change = f" (from {previous_pct:.2f}%)"
     return f"{kind}: {filer} reports {stake} of {ticker}{change}"
+
+
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def filed_at(value: Any) -> Optional[datetime]:
+    """The moment EDGAR lists a filing (the feed's `updated`), as an aware UTC time; None if absent or unreadable."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=_EASTERN)).astimezone(timezone.utc)
+
+
+def filing_date(value: Any) -> Optional[str]:
+    """The ISO date (US Eastern, where EDGAR keeps its calendar) of a filing time; None if it cannot be read."""
+    dt = filed_at(value)
+    return dt.astimezone(_EASTERN).date().isoformat() if dt else None

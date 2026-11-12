@@ -108,3 +108,29 @@ def test_the_feed_pairs_subject_and_filer_by_accession():
     ev = job.schedule_event("000119380526001332", g, parse_schedule(SCHEDULE_13D), "CVRX", None)
     assert ev.anomaly_score == 0.85 and "activist" in ev.tags and "exposes:CVRX" in ev.tags
     assert ev.source == "sec_13d"
+
+
+def test_a_13d_or_13g_event_carries_the_edgar_filing_time_and_date() -> None:
+    # The 13D and 13G rows had no filing_date, report_date or acceptance_time, and occurred_at was the poll time (12 Nov 2026).
+    from shared.utils.beneficial import filed_at, filing_date
+
+    assert filed_at("2026-11-10T21:30:00-05:00").isoformat() == "2026-11-11T02:30:00+00:00"
+    assert filing_date("2026-11-10T21:30:00-05:00") == "2026-11-10"          # EDGAR's calendar is Eastern
+    assert filing_date("2026-11-11T02:30:00+00:00") == "2026-11-10" and filing_date("") is None and filing_date(None) is None
+    import importlib.util, pathlib, sys
+    path = pathlib.Path(__file__).resolve().parents[1] / "services" / "collector-filings" / "beneficial.py"
+    spec = importlib.util.spec_from_file_location("beneficial_job_dates", path)
+    job = importlib.util.module_from_spec(spec)
+    sys.modules["beneficial_job_dates"] = job
+    spec.loader.exec_module(job)
+    link = "https://www.sec.gov/Archives/edgar/data/1235912/000119380526001332/0001193805-26-001332-index.htm"
+    groups = job.group_entries([
+        {"title": "SCHEDULE 13D - CVRx, Inc. (0001235912) (Subject)", "link": link, "updated": "2026-11-10T21:30:00-05:00"},
+        {"title": "SCHEDULE 13D - Fund GP LLC (0002042077) (Filed by)", "link": link, "updated": "2026-11-10T21:31:00-05:00"}])
+    g = groups["000119380526001332"]
+    assert g["filed_at"] == "2026-11-10T21:30:00-05:00"                       # the first entry's time is kept
+    ev = job.schedule_event("000119380526001332", g, parse_schedule(SCHEDULE_13D), "CVRX", None)
+    assert ev.filing_data.filing_date == "2026-11-10" and ev.filing_data.acceptance_time == "2026-11-11T02:30:00+00:00"
+    assert ev.occurred_at.isoformat() == "2026-11-11T02:30:00+00:00"
+    undated = job.schedule_event("000119380526001332", {**g, "filed_at": None}, parse_schedule(SCHEDULE_13D), "CVRX", None)
+    assert undated.filing_data.filing_date is None and undated.filing_data.acceptance_time is None

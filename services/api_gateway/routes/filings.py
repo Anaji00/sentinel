@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional
 from shared.db import get_redis
+from shared.utils import beneficial
 from shared.utils.rbac import require_role, Role
 
 logger = logging.getLogger("api-gateway.filings")
@@ -41,9 +42,13 @@ class FilingItemSummary(BaseModel):
     company_name: str
     form_type: str
     filing_date: str
+    # "sec" when the filing carries its own date, "collected" when it is the day the platform stored it (older
+    # Schedule 13D and 13G rows), "" when there is none.
+    filing_date_source: str = ""
     is_material_8k: bool
     items: List[str] = Field(default_factory=list)
-    summary: str
+    # One plain sentence, or null when there is none; never the filing's own legal text.
+    summary: Optional[str] = None
     primary_doc_url: str
 
 
@@ -78,6 +83,25 @@ class ConsensusHoldersResponse(BaseModel):
     derived_from_filings: bool = False
 
 
+def _date_or_fallback(fd: Dict[str, Any], row: Dict[str, Any]) -> tuple:
+    """(ISO date, source): the filing's own date, else the Eastern date it was stored, else ("", "")."""
+    own = str(fd.get("filing_date") or "").strip()
+    if own:
+        return own, "sec"
+    stored = beneficial.filing_date(row.get("occurred_at"))
+    return (stored, "collected") if stored else ("", "")
+
+
+def _plain_summary(fd: Dict[str, Any], row: Dict[str, Any]) -> Optional[str]:
+    """One plain sentence. Schedule 13D and 13G carry the filer's legal text in `description`, so they use the platform's own
+    headline; other forms use their short description, else the headline; None when there is nothing."""
+    headline = str(row.get("headline") or "").strip()
+    form = str(fd.get("form_type") or "").upper()
+    if form.startswith("SCHEDULE 13"):
+        return headline or None
+    return str(fd.get("description") or "").strip() or headline or None
+
+
 @router.get("/latest", response_model=List[FilingItemSummary])
 async def get_latest_filings(
     form_type: Optional[str] = Query(None, description="Filter by form type (e.g. 8-K, 10-K, 13F)"),
@@ -109,7 +133,7 @@ async def get_latest_filings(
     args.append(limit)
 
     query = (
-        "SELECT primary_entity_id, primary_entity_name, url, filing_data "
+        "SELECT primary_entity_id, primary_entity_name, url, filing_data, headline, occurred_at "
         "FROM events WHERE " + " AND ".join(clauses) +
         f" ORDER BY occurred_at DESC LIMIT ${len(args)}"
     )
@@ -137,10 +161,11 @@ async def get_latest_filings(
                 ticker=str(fd.get("ticker") or r.get("primary_entity_id") or ""),
                 company_name=str(fd.get("company_name") or r.get("primary_entity_name") or ""),
                 form_type=str(fd.get("form_type") or ""),
-                filing_date=str(fd.get("filing_date") or ""),
+                filing_date=_date_or_fallback(fd, r)[0],
+                filing_date_source=_date_or_fallback(fd, r)[1],
                 is_material_8k=bool(fd.get("is_material_8k", False)),
                 items=list(fd.get("items") or []),
-                summary=str(fd.get("description") or ""),
+                summary=_plain_summary(fd, r),
                 primary_doc_url=str(doc_url),
             )
         )

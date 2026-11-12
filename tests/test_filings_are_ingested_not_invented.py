@@ -101,3 +101,18 @@ def test_the_filer_summary_carries_the_synthetic_flag():
     view dropped the field and presented them as filed data."""
     assert "is_synthetic" in mod.FilerSummaryItem.model_fields
     assert mod.FilerSummaryItem.model_fields["is_synthetic"].default is False
+
+
+def test_a_row_without_its_own_date_shows_the_day_it_was_stored_and_13d_g_use_the_plain_headline() -> None:
+    from services.api_gateway.routes import filings as mod
+
+    fd = {"form_type": "SCHEDULE 13G/A", "description": None, "filing_date": None}
+    row = {"occurred_at": "2026-11-11T03:05:22+00:00", "headline": "Passive 13G amendment: J.H. Whitney reports 7.50% of AVAH"}
+    assert mod._date_or_fallback(fd, row) == ("2026-11-10", "collected")                  # 03:05 UTC is still 10 Nov in New York
+    assert mod._date_or_fallback({"filing_date": "2026-11-09"}, row) == ("2026-11-09", "sec")
+    assert mod._date_or_fallback({}, {}) == ("", "")
+    assert mod._plain_summary(fd, row) == row["headline"]
+    legal = {"form_type": "SCHEDULE 13D/A", "description": "Mr. Hoge currently serves as a director of the issuer. As a ..."}
+    assert mod._plain_summary(legal, row) == row["headline"]                               # never the filer's legal text
+    assert mod._plain_summary({"form_type": "8-K", "description": "Item 5.02 departure of a director"}, row) == "Item 5.02 departure of a director"
+    assert mod._plain_summary({"form_type": "8-K", "description": ""}, {}) is None

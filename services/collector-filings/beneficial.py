@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
 from shared.kafka import Topics  # noqa: E402
 from shared.models import Entity, EntityType, EventType, NormalizedEvent, RawEvent  # noqa: E402
 from shared.models.events import FilingData  # noqa: E402
-from shared.utils.beneficial import headline, is_common_equity, parse_schedule, score_schedule  # noqa: E402
+from shared.utils.beneficial import filed_at, filing_date, headline, is_common_equity, parse_schedule, score_schedule  # noqa: E402
 from shared.utils.quiet_failures import dropped, swallowed  # noqa: E402
 
 logger = logging.getLogger("collector.filings.beneficial")
@@ -56,6 +56,7 @@ def group_entries(entries) -> Dict[str, Dict[str, Any]]:
         if not m or not acc:
             continue
         g = out.setdefault(acc.group(1), {"form": m.group("form"), "link": e.get("link")})
+        g.setdefault("filed_at", e.get("updated") or e.get("published"))        # when EDGAR lists it
         key = "subject" if m.group("role") == "Subject" else "filer"
         g[key] = (m.group("name").strip(), str(int(m.group("cik"))))
     return {a: g for a, g in out.items() if "subject" in g and "filer" in g}
@@ -65,6 +66,7 @@ def schedule_event(acc: str, group: Dict[str, Any], parsed: Dict[str, Any], tick
                    previous_pct: Optional[float]) -> NormalizedEvent:
     filer_name = group["filer"][0]
     score = score_schedule(parsed, previous_pct)
+    filed = filed_at(group.get("filed_at"))
     tags = ["beneficial_ownership", "schedule_13d" if parsed["is_13d"] else "schedule_13g",
             f"exposes:{ticker}", f"holder:{filer_name.lower()[:60]}"]
     if parsed["is_13d"]:
@@ -80,7 +82,8 @@ def schedule_event(acc: str, group: Dict[str, Any], parsed: Dict[str, Any], tick
         # correlations that cite it.
         event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"sec-schedule-13:{acc}")),
         type=EventType.FILING,
-        occurred_at=datetime.now(timezone.utc),
+        # When EDGAR lists the filing, not when this poll ran; the poll time only if the feed gave none.
+        occurred_at=filed or datetime.now(timezone.utc),
         collected_at=datetime.now(timezone.utc),
         source="sec_13d",
         source_reliability=0.99,
@@ -90,6 +93,7 @@ def schedule_event(acc: str, group: Dict[str, Any], parsed: Dict[str, Any], tick
         anomaly_score=score,
         filing_data=FilingData(ticker=ticker, cik=group["subject"][1], company_name=group["subject"][0],
                                form_type=group["form"], accession_number=acc,
+                               filing_date=filing_date(filed), acceptance_time=filed.isoformat() if filed else None,
                                primary_doc_url=group.get("link"), description=parsed.get("purpose") or None),
         tags=tags,
         named_entities=[ticker, filer_name],
