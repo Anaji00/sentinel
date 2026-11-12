@@ -42,7 +42,7 @@ async def main() -> None:
         if etf not in size_bench:
             size_bench[etf] = se.merge_daily(await eng._daily_series(etf, daily_since), await eng._series(etf, since - timedelta(days=1)))
     intel = {i for i, es in by_inst.items() if any(e.family not in PRICE_DIRECTED for e in es)}
-    cells = collections.defaultdict(list)
+    cells = collections.defaultdict(lambda: collections.defaultdict(list))          # (family, horizon, band) -> ISO week -> aligned returns
     done = 0
     for inst in sorted(intel):
         if inst.endswith("=F"):
@@ -62,23 +62,27 @@ async def main() -> None:
                 etf = size_benchmark(trailing_dollar_volume(dv, e.known_at.timestamp()))
                 m = measure(e, h, series, size_bench.get(etf) or bench_merged, stats)
                 if m is not None:
-                    cells[(e.family, hname, BAND_NAME.get(etf, etf))].append(m.abnormal * m.direction)
+                    wk = e.known_at.isocalendar()[:2]
+                    cells[(e.family, hname, BAND_NAME.get(etf, etf))][wk].append(m.abnormal * m.direction)
         done += 1
         if done % 1000 == 0:
             print(f"  {done} instruments, {time.time() - t0:.0f}s", flush=True)
+    # Overlapping episodes are not independent evidence (one filing wave, one earnings week). Each family-horizon-band-week is one unit:
+    # the mean of its episodes, as the live study's independent units do.
+    cells = {k: [sum(v) / len(v) for v in weeks.values()] for k, weeks in cells.items()}
     cost = COST_BPS_EQUITY / 1e4
     posts = hb.shrink(cells, cost=cost, min_cell_n=10)
     cand = hb.release_candidates(posts)
-    print(f"cells with 10+ episodes: {len(posts)} | release candidates under the registered rule: {len(cand)} | cost per observation {COST_BPS_EQUITY} bps")
+    print(f"cells with 10+ weekly units: {len(posts)} | release candidates under the registered rule: {len(cand)} | cost per observation {COST_BPS_EQUITY} bps")
     tradable = {(f, h) for f, h in tradable_cells.TRADABLE_CELLS}
     print("\nthe five tradable cells, by size band (raw mean -> posterior, P(net > 0), effective N):")
     for p in sorted(posts, key=lambda x: x.key):
         if (p.key[0], p.key[1]) in tradable:
-            print(f"  {p.key[0]:30s} {p.key[1]:4s} {p.key[2]:6s} n={p.n:6d} raw {p.raw_mean * 1e4:+7.1f} bps -> {p.post_mean * 1e4:+7.1f} bps  P={p.p_positive:.3f}  Neff={p.n_eff:8.0f}  {'CANDIDATE' if p.release_candidate else ''}")
+            print(f"  {p.key[0]:30s} {p.key[1]:4s} {p.key[2]:6s} units={p.n:5d} raw {p.raw_mean * 1e4:+7.1f} bps -> {p.post_mean * 1e4:+7.1f} bps  P={p.p_positive:.3f}  Neff={p.n_eff:8.0f}  {'CANDIDATE' if p.release_candidate else ''}")
     print("\nrelease candidates that are NOT among the five tradable cells:")
     for p in sorted(cand, key=lambda x: -x.p_positive):
         if (p.key[0], p.key[1]) not in tradable:
-            print(f"  {p.key[0]:30s} {p.key[1]:4s} {p.key[2]:6s} n={p.n:6d} raw {p.raw_mean * 1e4:+7.1f} bps -> {p.post_mean * 1e4:+7.1f} bps  P={p.p_positive:.3f}  Neff={p.n_eff:8.0f}")
+            print(f"  {p.key[0]:30s} {p.key[1]:4s} {p.key[2]:6s} units={p.n:5d} raw {p.raw_mean * 1e4:+7.1f} bps -> {p.post_mean * 1e4:+7.1f} bps  P={p.p_positive:.3f}  Neff={p.n_eff:8.0f}")
     print(f"\ntotal {time.time() - t0:.0f}s")
 
 

@@ -142,3 +142,11 @@ The gate is untouched.
 **Phase 7.** Frontend: `tsc --noEmit` clean, 70 files and 449 tests pass. `check_constructor_arity`: 2 calls in collector-crypto omit
 `on_connect` (introduced in 1.1.5 and 1.1.7, not by today's work). `check_reachability`: the 4 known entry points that no service runs
 (supervisor, debug_check, deep_history_backfill, ofac_sync), matching the guard test's allowance.
+
+**Phase 2 size-band study, first run (episodes treated as independent) and its correction.** 423 cells (family x horizon x size band) with 10
+or more episodes. All five tradable cells are positive after shrinkage in every size band: 8-K delisting notice 30d +547 to +1,760 bps,
+8-K dilution 30d +705 to +1,091 bps, insider opportunistic sell 30d +24 to +151 bps (the mid band is the weakest: +24 bps, probability of a
+positive net return 0.944, just under the 0.95 bar). The first run found 79 release candidates, but it treated each episode as independent,
+so probabilities came out at 1.000 and effective N in the thousands: overlapping episodes (one filing wave, one earnings week) are not
+independent evidence. Rerun with each family-horizon-band-week collapsed to one unit, as the live study's independent units do; its result
+replaces the 79 and is the only one that counts. No gate change either way.
