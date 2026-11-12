@@ -96,3 +96,13 @@ it and the sizing and execution change is approved.
 Switch on `LOOP_SLOW_CALLBACK_MS=50` in the agents containers (done 12 Nov 02:48 UTC). After 30 minutes of normal operation, rank jobs by
 total time holding the loop. A job is moved to a worker thread if it holds the loop over 50 ms more than once an hour. The change
 must not alter any result; each moved job gets a test that its output is identical.
+
+## Days-to-cover trial on the short signal cells (registered 12 Nov, before it was run)
+
+**Question.** Do crowded shorts (high days to cover) earn less than uncrowded ones on the tradable short signals, as a squeeze would predict?
+**Cells.** 8-K delisting notice, 8-K dilution, insider opportunistic sell, 8-K auditor change, earnings reaction down and stock news negative,
+at 5 and 30 days. **Design.** Each family-horizon-week is one unit (the mean of its episodes), aligned so a positive return is the signal
+being right. Days to cover is the latest FINRA figure published at least 14 days before the signal. Crowded is 8 or more days to cover.
+**Bar.** A cell shows a crowding effect only if the crowded units earn at least 50 bps less than the uncrowded ones with a Welch t of at least
+2 in magnitude, in the same direction in both halves of the sample. Fewer than 30 crowded units in a cell: not judged. **If met,** a crowding
+filter becomes a candidate for the gate review; **if not,** the finding stands that the B1 leg trial's +0.05 Sharpe was not enough either.
