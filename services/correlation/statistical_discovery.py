@@ -25,6 +25,7 @@ import numpy as np
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models.ontology import is_valid_predicate
+from shared.utils.residual_corr import is_market_beta_pair
 from shared.utils import quant_calc
 from shared.utils.feature_flags import FeatureFlagManager
 from services.correlation.sector_hawkes import IntraTradFiHawkesCorrelator, GICS_SECTORS
@@ -618,7 +619,14 @@ class StatisticalDiscoveryEngine:
                     label_b = "MacroFactor" if ticker_b.startswith("MACRO:") else "Company"
 
                     # A. Statistical Correlation Edge
-                    if abs(r_pearson) >= thresholds["min_correlation_coef"] and pearson_significant:
+                    #
+                    # Not published between a stock and a broad-market index (IONQ-SPY, MU-QQQ, ES=F-SPY at r of 0.7 to 0.98 on 12 Nov): that
+                    # is the market factor, which says nothing about the company. Counted; the Granger lead-lag edge below is unaffected.
+                    beta_link = is_market_beta_pair(ticker_a, ticker_b)
+                    if beta_link and abs(r_pearson) >= thresholds["min_correlation_coef"] and pearson_significant:
+                        dropped("correlation.statistical_discovery.market_beta_link", "correlation with a broad-market index is the market factor, not a link",
+                                logger, detail=f"{ticker_a} {ticker_b}")
+                    if abs(r_pearson) >= thresholds["min_correlation_coef"] and pearson_significant and not beta_link:
                         rel_type = "STATISTICALLY_CORRELATED_WITH"
                         published = await self._gate_edge(
                             EdgeSurvivalTracker.edge_id(ticker_a, ticker_b, "pearson"),

@@ -14,6 +14,13 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 MIN_OBS = 120
+# Broad-market index instruments. A stock's correlation with the index it belongs to is the market factor, not a link between companies.
+MARKET_INDEX_ANCHORS = frozenset({"SPY", "QQQ", "IWM", "DIA", "VOO", "IVV", "ES=F", "NQ=F", "YM=F", "RTY=F"})
+
+
+def is_market_beta_pair(a: str, b: str) -> bool:
+    """True if either side is a broad-market index instrument, so a correlation between them measures the market, not the company."""
+    return str(a).upper() in MARKET_INDEX_ANCHORS or str(b).upper() in MARKET_INDEX_ANCHORS
 
 
 def daily_returns(closes: Sequence[float]) -> np.ndarray:
@@ -113,4 +120,4 @@ def stable_pairs(closes: Dict[str, Sequence[float]], market: Sequence[float], q:
     return out
 
 
-__all__ = ["MIN_OBS", "benjamini_hochberg", "corr_p", "daily_returns", "market_neutral_pairs", "residuals", "stable_pairs"]
+__all__ = ["MARKET_INDEX_ANCHORS", "MIN_OBS", "is_market_beta_pair", "benjamini_hochberg", "corr_p", "daily_returns", "market_neutral_pairs", "residuals", "stable_pairs"]

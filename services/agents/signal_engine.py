@@ -206,6 +206,15 @@ def _ts(v: Any) -> Optional[float]:
         return None
 
 
+
+def _observations_of(rows: list) -> list:
+    """Every observation of a batch of archived event rows, in order; pure, so it can run in a worker thread."""
+    out: list = []
+    for r in rows:
+        out.extend(observations(_row(r)))
+    return out
+
+
 class SignalEngine:
     """Scheduled, not reactive: the reaction study and the live signal loop.
 
@@ -316,8 +325,8 @@ class SignalEngine:
         while day < end:
             nxt = min(end, day + timedelta(days=step_days))
             rows = await self.db.query(_STUDY_EVENTS_SQL, day, nxt, types or SIGNAL_EVENT_TYPES)
-            for r in rows:
-                obs.extend(observations(_row(r)))
+            # Headline mapping and observation building are CPU work: in a thread, not on the loop (12 Nov measurement, 5.6 s in 600 s).
+            obs.extend(await asyncio.to_thread(_observations_of, rows))
             day = nxt
         return obs
 
@@ -333,7 +342,7 @@ class SignalEngine:
         deep_since = now - timedelta(days=HISTORY_LOOKBACK_DAYS)
         if deep_since < since:
             obs += await self._load_observations(deep_since, since, DEEP_HISTORY_TYPES, step_days=30)
-        eps = episodes(obs)
+        eps = await asyncio.to_thread(episodes, obs)
         per_family: Dict[str, int] = {}
         by_inst: Dict[str, list] = {}
         for e in eps:

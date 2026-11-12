@@ -69,3 +69,16 @@ def test_stable_pairs_keep_a_persistent_link_and_drop_one_that_appeared_in_one_h
     got = {(x, y) for x, y, *_ in out["stable"]}
     assert ("A", "B") in got                              # holds in both halves
     assert ("C", "D") not in got and "_residuals" not in out
+
+
+def test_a_correlation_with_a_broad_market_index_is_a_market_link_not_a_company_link() -> None:
+    for a, b in (("IONQ", "SPY"), ("QQQ", "MU"), ("ES=F", "SPY"), ("spy", "AAPL")):
+        assert rc.is_market_beta_pair(a, b)
+    for a, b in (("CVX", "XOM"), ("CL=F", "XLE"), ("TLT", "AAPL"), ("GC=F", "NEM")):
+        assert not rc.is_market_beta_pair(a, b)                    # cross-asset anchors and peer pairs stay
+
+
+def test_the_discovery_engine_skips_market_beta_pearson_links_and_counts_them() -> None:
+    src = (ROOT / "services/correlation/statistical_discovery.py").read_text(encoding="utf-8")
+    assert "beta_link = is_market_beta_pair(ticker_a, ticker_b)" in src and "and not beta_link" in src
+    assert "correlation.statistical_discovery.market_beta_link" in src

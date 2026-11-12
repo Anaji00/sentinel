@@ -32,6 +32,9 @@ from shared.utils.quiet_failures import swallowed
 
 logger = logging.getLogger(__name__)
 
+# Result sets larger than this are sanitised in a worker thread.
+SANITIZE_OFFLOAD_ROWS = 500
+
 # --- Redis Async Client ---
 class RedisClient:
     def __init__(self):
@@ -297,7 +300,14 @@ class TimescaleClient:
             params = params[0]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
-            return [self._sanitize_row(r) for r in rows]
+        # A large result is converted in a thread: row by row on the event loop it held it for seconds at a time while the signal study
+        # read its archive (12 Nov measurement, 12.8 s in 600 s). The connection is already released.
+        if len(rows) > SANITIZE_OFFLOAD_ROWS:
+            return await asyncio.to_thread(self._sanitize_rows, rows)
+        return self._sanitize_rows(rows)
+
+    def _sanitize_rows(self, rows) -> List[Dict]:
+        return [self._sanitize_row(r) for r in rows]
 
     async def query_one(self, sql: str, *params) -> Optional[Dict]:
         if len(params) == 1 and isinstance(params[0], tuple):
